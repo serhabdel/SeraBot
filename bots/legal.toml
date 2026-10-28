@@ -1,0 +1,7 @@
+name = "legal"
+trigger = "command"
+system_prompt = "prompts/legal.txt"
+skills = ["legal-rag"]
+tools = ["rag_search"]
+require_approval = []
+enabled = false

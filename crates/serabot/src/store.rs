@@ -1,0 +1,1192 @@
+use std::path::{Path, PathBuf};
+use std::sync::Once;
+use std::time::Duration;
+
+use chrono::{DateTime, SecondsFormat, Utc};
+use r2d2::{Pool, PooledConnection};
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::{OptionalExtension, Row, params};
+use serde_json::Value;
+
+use crate::domain::{
+    Action, Approval, AuditEntry, Event, Id, LlmMessage, Role, StoredMessage, Task, Turn, new_id,
+    utc_now,
+};
+use crate::error::{Result, SeraError};
+
+const MIGRATION_1: &str = include_str!("../migrations/0001_core.sql");
+
+pub type StoreConnection = PooledConnection<SqliteConnectionManager>;
+
+static INIT_VEC: Once = Once::new();
+
+fn init_sqlite_vec() {
+    INIT_VEC.call_once(|| unsafe {
+        use rusqlite::ffi::sqlite3_auto_extension;
+        // sqlite-vec exposes the standard SQLite extension entry point; the
+        // pointer cast is required by the C API and cannot be typed more
+        // narrowly through rustc's signature inference.
+        #[allow(clippy::missing_transmute_annotations)]
+        sqlite3_auto_extension(Some(std::mem::transmute(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
+    });
+}
+
+#[derive(Clone)]
+pub struct Store {
+    pool: Pool<SqliteConnectionManager>,
+    path: PathBuf,
+    dimension: usize,
+}
+
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store")
+            .field("path", &self.path)
+            .field("dimension", &self.dimension)
+            .finish()
+    }
+}
+
+impl Store {
+    pub fn open(path: impl AsRef<Path>, dimension: usize, busy_timeout_ms: u32) -> Result<Self> {
+        init_sqlite_vec();
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let manager = SqliteConnectionManager::file(&path).with_init(move |connection| {
+            connection.busy_timeout(Duration::from_millis(busy_timeout_ms as u64))?;
+            connection.execute_batch(
+                "PRAGMA journal_mode=WAL;\
+                 PRAGMA synchronous=FULL;\
+                 PRAGMA foreign_keys=ON;\
+                 PRAGMA temp_store=MEMORY;",
+            )?;
+            Ok(())
+        });
+        let pool = Pool::builder().max_size(8).build(manager)?;
+        let store = Self {
+            pool,
+            path,
+            dimension,
+        };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    pub fn open_in_memory(dimension: usize) -> Result<Self> {
+        init_sqlite_vec();
+        let manager = SqliteConnectionManager::memory().with_init(|connection| {
+            connection.busy_timeout(Duration::from_millis(5000))?;
+            connection.execute_batch(
+                "PRAGMA foreign_keys=ON;\
+                 PRAGMA temp_store=MEMORY;",
+            )?;
+            Ok(())
+        });
+        let pool = Pool::builder().max_size(1).build(manager)?;
+        let store = Self {
+            pool,
+            path: PathBuf::from(":memory:"),
+            dimension,
+        };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    pub fn connection(&self) -> Result<StoreConnection> {
+        self.pool.get().map_err(SeraError::from)
+    }
+
+    pub fn health(&self) -> Result<()> {
+        let connection = self.connection()?;
+        connection.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))?;
+        Ok(())
+    }
+
+    fn migrate(&self) -> Result<()> {
+        let connection = self.connection()?;
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 1 {
+            connection.execute_batch(MIGRATION_1)?;
+            connection.pragma_update(None, "user_version", 1)?;
+        }
+        let stored_dimension: Option<String> = connection
+            .query_row(
+                "SELECT value FROM kv WHERE key = 'embedding_dimension'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(stored) = stored_dimension {
+            let stored: usize = stored
+                .parse()
+                .map_err(|_| SeraError::Internal("invalid stored embedding dimension".into()))?;
+            if stored != self.dimension {
+                return Err(SeraError::Config(format!(
+                    "embedding dimension changed from {stored} to {}; reindex required",
+                    self.dimension
+                )));
+            }
+        } else {
+            connection.execute(
+                "INSERT INTO kv(key, value, updated_at) VALUES ('embedding_dimension', ?1, ?2)",
+                params![self.dimension.to_string(), now_string()],
+            )?;
+        }
+        connection.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vectors USING vec0(chunk_id TEXT PRIMARY KEY, embedding float[{}]);",
+            self.dimension
+        ))?;
+        Ok(())
+    }
+
+    pub fn upsert_bot(&self, name: &str, config: &Value, enabled: bool) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO bots(name, config_json, enabled, updated_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(name) DO UPDATE SET config_json=excluded.config_json, enabled=excluded.enabled, updated_at=excluded.updated_at",
+            params![name, serde_json::to_string(config)?, enabled as i64, now_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row("SELECT value FROM kv WHERE key = ?1", params![key], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
+    pub fn kv_set(&self, key: &str, value: &str) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO kv(key, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            params![key, value, now_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_message(&self, message: &StoredMessage) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO messages(id, conversation_id, turn_id, role, content, name, tool_call_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                message.id,
+                message.conversation_id,
+                message.turn_id,
+                message.role.as_str(),
+                message.content,
+                message.name,
+                message.tool_call_id,
+                to_string(message.created_at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn append_message(
+        &self,
+        conversation_id: &str,
+        turn_id: Option<&str>,
+        role: Role,
+        content: &str,
+    ) -> Result<StoredMessage> {
+        let message = StoredMessage {
+            id: new_id(),
+            conversation_id: conversation_id.to_owned(),
+            turn_id: turn_id.map(str::to_owned),
+            role,
+            content: content.to_owned(),
+            name: None,
+            tool_call_id: None,
+            created_at: utc_now(),
+        };
+        self.insert_message(&message)?;
+        Ok(message)
+    }
+
+    pub fn list_messages(&self, conversation_id: &str, limit: usize) -> Result<Vec<StoredMessage>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, conversation_id, turn_id, role, content, name, tool_call_id, created_at
+             FROM messages WHERE conversation_id = ?1 ORDER BY created_at DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![conversation_id, limit as i64], |row| {
+            Ok(StoredMessage {
+                id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                turn_id: row.get(2)?,
+                role: parse_role(&row.get::<_, String>(3)?),
+                content: row.get(4)?,
+                name: row.get(5)?,
+                tool_call_id: row.get(6)?,
+                created_at: parse_datetime(&row.get::<_, String>(7)?),
+            })
+        })?;
+        let mut messages = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        messages.reverse();
+        Ok(messages)
+    }
+
+    pub fn history_for_llm(&self, conversation_id: &str, limit: usize) -> Result<Vec<LlmMessage>> {
+        Ok(self
+            .list_messages(conversation_id, limit)?
+            .into_iter()
+            .filter(|message| message.role != Role::System)
+            .map(|message| LlmMessage {
+                role: message.role,
+                content: Some(message.content),
+                tool_calls: Vec::new(),
+                tool_call_id: message.tool_call_id,
+                name: message.name,
+            })
+            .collect())
+    }
+
+    pub fn create_turn(
+        &self,
+        task_id: &str,
+        bot: &str,
+        conversation_id: &str,
+        state: &Value,
+    ) -> Result<Turn> {
+        let turn = Turn {
+            id: new_id(),
+            task_id: task_id.to_owned(),
+            bot: bot.to_owned(),
+            conversation_id: conversation_id.to_owned(),
+            status: "active".into(),
+            state: state.clone(),
+            created_at: utc_now(),
+            updated_at: utc_now(),
+        };
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO turns(id, task_id, bot, conversation_id, status, state_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                turn.id,
+                turn.task_id,
+                turn.bot,
+                turn.conversation_id,
+                turn.status,
+                serde_json::to_string(&turn.state)?,
+                to_string(turn.created_at),
+                to_string(turn.updated_at),
+            ],
+        )?;
+        Ok(turn)
+    }
+
+    pub fn get_turn(&self, id: &str) -> Result<Turn> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT id, task_id, bot, conversation_id, status, state_json, created_at, updated_at
+                 FROM turns WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(Turn {
+                        id: row.get(0)?,
+                        task_id: row.get(1)?,
+                        bot: row.get(2)?,
+                        conversation_id: row.get(3)?,
+                        status: row.get(4)?,
+                        state: serde_json::from_str(&row.get::<_, String>(5)?)
+                            .unwrap_or(Value::Null),
+                        created_at: parse_datetime(&row.get::<_, String>(6)?),
+                        updated_at: parse_datetime(&row.get::<_, String>(7)?),
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| SeraError::NotFound(format!("turn {id}")))
+    }
+
+    pub fn get_turn_by_task(&self, task_id: &str) -> Result<Option<Turn>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT id, task_id, bot, conversation_id, status, state_json, created_at, updated_at
+                 FROM turns WHERE task_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                params![task_id],
+                |row| {
+                    Ok(Turn {
+                        id: row.get(0)?,
+                        task_id: row.get(1)?,
+                        bot: row.get(2)?,
+                        conversation_id: row.get(3)?,
+                        status: row.get(4)?,
+                        state: serde_json::from_str(&row.get::<_, String>(5)?)
+                            .unwrap_or(Value::Null),
+                        created_at: parse_datetime(&row.get::<_, String>(6)?),
+                        updated_at: parse_datetime(&row.get::<_, String>(7)?),
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn update_turn(&self, id: &str, status: &str, state: &Value) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE turns SET status=?1, state_json=?2, updated_at=?3 WHERE id=?4",
+            params![status, serde_json::to_string(state)?, now_string(), id],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_audit(
+        &self,
+        actor: &str,
+        event: &str,
+        tool: Option<&str>,
+        task_id: Option<&str>,
+        approval_id: Option<&str>,
+        action_id: Option<&str>,
+        policy_version: Option<&str>,
+        details: Option<&Value>,
+    ) -> Result<i64> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO audit_log(at, actor, event, tool, task_id, approval_id, action_id, policy_version, details_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                now_string(),
+                actor,
+                event,
+                tool,
+                task_id,
+                approval_id,
+                action_id,
+                policy_version,
+                details.map(serde_json::to_string).transpose()?,
+            ],
+        )?;
+        Ok(connection.last_insert_rowid())
+    }
+
+    pub fn list_audit(&self, limit: usize) -> Result<Vec<AuditEntry>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, at, actor, event, tool, task_id, approval_id, action_id, policy_version, details_json
+             FROM audit_log ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit as i64], |row| {
+            Ok(AuditEntry {
+                id: row.get(0)?,
+                at: parse_datetime(&row.get::<_, String>(1)?),
+                actor: row.get(2)?,
+                event: row.get(3)?,
+                tool: row.get(4)?,
+                task_id: row.get(5)?,
+                approval_id: row.get(6)?,
+                action_id: row.get(7)?,
+                policy_version: row.get(8)?,
+                details: row
+                    .get::<_, Option<String>>(9)?
+                    .and_then(|value| serde_json::from_str(&value).ok()),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn append_event(&self, kind: &str, payload: &Value) -> Result<i64> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO events(at, kind, payload_json) VALUES (?1, ?2, ?3)",
+            params![now_string(), kind, serde_json::to_string(payload)?],
+        )?;
+        Ok(connection.last_insert_rowid())
+    }
+
+    pub fn events_after(&self, after_id: i64, limit: usize) -> Result<Vec<Event>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, at, kind, payload_json FROM events WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![after_id, limit as i64], |row| {
+            Ok(Event {
+                id: row.get(0)?,
+                at: parse_datetime(&row.get::<_, String>(1)?),
+                kind: row.get(2)?,
+                payload: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or(Value::Null),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn prune_events(&self, before: DateTime<Utc>) -> Result<usize> {
+        let connection = self.connection()?;
+        Ok(connection.execute(
+            "DELETE FROM events WHERE at < ?1",
+            params![to_string(before)],
+        )?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_action(
+        &self,
+        tool: &str,
+        task_id: Option<&str>,
+        turn_id: Option<&str>,
+        canonical_args: &str,
+        canonical_hash: &str,
+        destination: Option<&str>,
+        artifact_hash: Option<&str>,
+        policy_version: &str,
+    ) -> Result<Action> {
+        let action = Action {
+            id: new_id(),
+            tool: tool.to_owned(),
+            task_id: task_id.map(str::to_owned),
+            turn_id: turn_id.map(str::to_owned),
+            canonical_args: canonical_args.to_owned(),
+            canonical_hash: canonical_hash.to_owned(),
+            destination: destination.map(str::to_owned),
+            artifact_hash: artifact_hash.map(str::to_owned),
+            policy_version: policy_version.to_owned(),
+            status: "pending_approval".into(),
+            outcome: None,
+            created_at: utc_now(),
+            updated_at: utc_now(),
+        };
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO actions(id, tool, task_id, turn_id, canonical_args, canonical_hash, destination, artifact_hash, policy_version, status, outcome_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?12)",
+            params![
+                action.id,
+                action.tool,
+                action.task_id,
+                action.turn_id,
+                action.canonical_args,
+                action.canonical_hash,
+                action.destination,
+                action.artifact_hash,
+                action.policy_version,
+                action.status,
+                to_string(action.created_at),
+                to_string(action.updated_at),
+            ],
+        )?;
+        Ok(action)
+    }
+
+    pub fn get_action(&self, id: &str) -> Result<Action> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT id, tool, task_id, turn_id, canonical_args, canonical_hash, destination, artifact_hash, policy_version, status, outcome_json, created_at, updated_at
+                 FROM actions WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(Action {
+                        id: row.get(0)?,
+                        tool: row.get(1)?,
+                        task_id: row.get(2)?,
+                        turn_id: row.get(3)?,
+                        canonical_args: row.get(4)?,
+                        canonical_hash: row.get(5)?,
+                        destination: row.get(6)?,
+                        artifact_hash: row.get(7)?,
+                        policy_version: row.get(8)?,
+                        status: row.get(9)?,
+                        outcome: row
+                            .get::<_, Option<String>>(10)?
+                            .and_then(|value| serde_json::from_str(&value).ok()),
+                        created_at: parse_datetime(&row.get::<_, String>(11)?),
+                        updated_at: parse_datetime(&row.get::<_, String>(12)?),
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| SeraError::NotFound(format!("action {id}")))
+    }
+
+    pub fn update_action(&self, id: &str, status: &str, outcome: Option<&Value>) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE actions SET status=?1, outcome_json=?2, updated_at=?3 WHERE id=?4",
+            params![
+                status,
+                outcome.map(serde_json::to_string).transpose()?,
+                now_string(),
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn transition_action(&self, id: &str, from: &str, to: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE actions SET status=?1, updated_at=?2 WHERE id=?3 AND status=?4",
+            params![to, now_string(), id, from],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn create_approval(
+        &self,
+        action_id: &str,
+        tool: &str,
+        summary: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Approval> {
+        let approval = Approval {
+            id: new_id(),
+            action_id: action_id.to_owned(),
+            tool: tool.to_owned(),
+            summary: summary.to_owned(),
+            state: "pending".into(),
+            scope: None,
+            expires_at,
+            created_at: utc_now(),
+            decided_at: None,
+            note: None,
+        };
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO approvals(id, action_id, tool, summary, state, scope, expires_at, created_at, decided_at, note)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL, NULL)",
+            params![
+                approval.id,
+                approval.action_id,
+                approval.tool,
+                approval.summary,
+                approval.state,
+                to_string(approval.expires_at),
+                to_string(approval.created_at),
+            ],
+        )?;
+        Ok(approval)
+    }
+
+    pub fn get_approval(&self, id: &str) -> Result<Approval> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT id, action_id, tool, summary, state, scope, expires_at, created_at, decided_at, note
+                 FROM approvals WHERE id = ?1",
+                params![id],
+                map_approval,
+            )
+            .optional()?
+            .ok_or_else(|| SeraError::NotFound(format!("approval {id}")))
+    }
+
+    pub fn list_pending_approvals(&self, limit: usize) -> Result<Vec<Approval>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, action_id, tool, summary, state, scope, expires_at, created_at, decided_at, note
+             FROM approvals WHERE state='pending' ORDER BY created_at ASC LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit as i64], map_approval)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn transition_approval(
+        &self,
+        id: &str,
+        to: &str,
+        scope: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        let now = now_string();
+        let changed = connection.execute(
+            "UPDATE approvals SET state=?1, scope=?2, note=?3, decided_at=?4
+             WHERE id=?5 AND state='pending' AND expires_at > ?4",
+            params![to, scope, note, now, id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn expire_approvals(&self) -> Result<usize> {
+        let connection = self.connection()?;
+        let now = now_string();
+        let transaction = connection.unchecked_transaction()?;
+        let expiring: Vec<(String, String, Option<String>)> = {
+            let mut statement = transaction.prepare(
+                "SELECT ap.id, ap.action_id, ac.task_id
+                 FROM approvals ap JOIN actions ac ON ac.id = ap.action_id
+                 WHERE ap.state='pending' AND ap.expires_at <= ?1",
+            )?;
+            let rows = statement.query_map(params![now], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (approval_id, action_id, task_id) in &expiring {
+            transaction.execute(
+                "UPDATE approvals SET state='expired', decided_at=?1 WHERE id=?2 AND state='pending'",
+                params![now, approval_id],
+            )?;
+            transaction.execute(
+                "UPDATE actions SET status='expired', updated_at=?1 WHERE id=?2 AND status='pending_approval'",
+                params![now, action_id],
+            )?;
+            if let Some(task_id) = task_id {
+                transaction.execute(
+                    "UPDATE tasks SET status='failed', last_error='approval expired', lease_until=NULL, worker_id=NULL, updated_at=?1
+                     WHERE id=?2 AND status='awaiting_approval'",
+                    params![now, task_id],
+                )?;
+                transaction.execute(
+                    "UPDATE turns SET status='approval_expired', updated_at=?1
+                     WHERE task_id=?2 AND status='awaiting_approval'",
+                    params![now, task_id],
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(expiring.len())
+    }
+
+    pub fn invalidate_approvals_for_old_policy(&self, current_policy: &str) -> Result<usize> {
+        let connection = self.connection()?;
+        Ok(connection.execute(
+            "UPDATE approvals SET state='invalidated', decided_at=?1
+             WHERE state='pending' AND action_id IN (
+               SELECT id FROM actions WHERE policy_version <> ?2
+             )",
+            params![now_string(), current_policy],
+        )?)
+    }
+
+    pub fn insert_grant(
+        &self,
+        tool: &str,
+        canonical_hash: &str,
+        destination: Option<&str>,
+        policy_version: &str,
+        approval_id: &str,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO standing_grants(id, tool, canonical_hash, destination, policy_version, approval_id, revoked_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
+            params![
+                new_id(),
+                tool,
+                canonical_hash,
+                destination,
+                policy_version,
+                approval_id,
+                now_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn matching_grant(
+        &self,
+        tool: &str,
+        canonical_hash: &str,
+        destination: Option<&str>,
+        policy_version: &str,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM standing_grants
+             WHERE tool=?1 AND canonical_hash=?2 AND policy_version=?3 AND revoked_at IS NULL
+               AND ((destination IS NULL AND ?4 IS NULL) OR destination = ?4)",
+            params![tool, canonical_hash, policy_version, destination],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn revoke_grants(&self) -> Result<usize> {
+        let connection = self.connection()?;
+        Ok(connection.execute(
+            "UPDATE standing_grants SET revoked_at=?1 WHERE revoked_at IS NULL",
+            params![now_string()],
+        )?)
+    }
+
+    pub fn record_telegram_update(&self, update_id: i64) -> Result<bool> {
+        let connection = self.connection()?;
+        let inserted = connection.execute(
+            "INSERT OR IGNORE INTO telegram_updates(update_id, received_at) VALUES (?1, ?2)",
+            params![update_id, now_string()],
+        )?;
+        Ok(inserted == 1)
+    }
+
+    pub fn claim_task(&self, worker_id: &str, lease_secs: u64) -> Result<Option<Task>> {
+        let connection = self.connection()?;
+        let now = utc_now();
+        let lease_until = now + chrono::Duration::seconds(lease_secs as i64);
+        let transaction = connection.unchecked_transaction()?;
+        let task = transaction
+            .query_row(
+                "UPDATE tasks SET status='running', worker_id=?1, lease_until=?2,
+                    fencing_token=fencing_token+1, attempts=attempts+1, updated_at=?3
+                 WHERE id = (
+                    SELECT id FROM tasks
+                    WHERE status='queued' AND run_after <= ?3
+                    ORDER BY priority DESC, created_at ASC LIMIT 1
+                 )
+                 RETURNING id, kind, bot, payload_json, status, priority, attempts, max_attempts,
+                    run_after, lease_until, worker_id, fencing_token, uncertain, last_error,
+                    created_at, updated_at",
+                params![worker_id, to_string(lease_until), to_string(now)],
+                map_task,
+            )
+            .optional()?;
+        transaction.commit()?;
+        Ok(task)
+    }
+
+    pub fn complete_task(&self, id: &str, fencing_token: i64) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE tasks SET status='done', lease_until=NULL, worker_id=NULL, updated_at=?1
+             WHERE id=?2 AND fencing_token=?3 AND status='running'",
+            params![now_string(), id, fencing_token],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn fail_task(
+        &self,
+        id: &str,
+        fencing_token: i64,
+        error: &str,
+        retry_backoff_secs: u64,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        let now = utc_now();
+        let task = connection
+            .query_row(
+                "SELECT attempts, max_attempts, uncertain FROM tasks WHERE id=?1 AND fencing_token=?2",
+                params![id, fencing_token],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((attempts, max_attempts, uncertain)) = task else {
+            return Ok(false);
+        };
+        let (status, run_after) = if uncertain || attempts >= max_attempts {
+            ("failed", now)
+        } else {
+            let delay = retry_backoff_secs.saturating_mul(attempts.max(1) as u64);
+            (
+                "queued",
+                now + chrono::Duration::seconds(delay.min(3600) as i64),
+            )
+        };
+        let changed = connection.execute(
+            "UPDATE tasks SET status=?1, last_error=?2, run_after=?3, lease_until=NULL, worker_id=NULL, updated_at=?4
+             WHERE id=?5 AND fencing_token=?6 AND status='running'",
+            params![status, truncate(error, 2000), to_string(run_after), to_string(now), id, fencing_token],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn fail_task_final(&self, id: &str, fencing_token: i64, error: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE tasks SET status='failed', last_error=?1, lease_until=NULL, worker_id=NULL, updated_at=?2
+             WHERE id=?3 AND fencing_token=?4 AND status='running'",
+            params![truncate(error, 2000), now_string(), id, fencing_token],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn await_approval_task(&self, id: &str, fencing_token: i64) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE tasks SET status='awaiting_approval', lease_until=NULL, worker_id=NULL, updated_at=?1
+             WHERE id=?2 AND fencing_token=?3 AND status='running'",
+            params![now_string(), id, fencing_token],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn requeue_task(&self, id: &str, run_after: DateTime<Utc>) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE tasks SET status='queued', run_after=?1, lease_until=NULL, worker_id=NULL, updated_at=?2
+             WHERE id=?3 AND status IN ('awaiting_approval','running')",
+            params![to_string(run_after), now_string(), id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn recover_expired_tasks(&self) -> Result<usize> {
+        let connection = self.connection()?;
+        Ok(connection.execute(
+            "UPDATE tasks SET
+                status=CASE WHEN uncertain=1 THEN 'failed' ELSE 'queued' END,
+                last_error=CASE WHEN uncertain=1 THEN 'outcome unknown after worker lease expiry' ELSE last_error END,
+                lease_until=NULL, worker_id=NULL, updated_at=?1
+             WHERE status='running' AND lease_until IS NOT NULL AND lease_until < ?1",
+            params![now_string()],
+        )?)
+    }
+
+    pub fn get_task(&self, id: &str) -> Result<Task> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT id, kind, bot, payload_json, status, priority, attempts, max_attempts,
+                        run_after, lease_until, worker_id, fencing_token, uncertain, last_error,
+                        created_at, updated_at
+                 FROM tasks WHERE id=?1",
+                params![id],
+                map_task,
+            )
+            .optional()?
+            .ok_or_else(|| SeraError::NotFound(format!("task {id}")))
+    }
+
+    pub fn enqueue_task(
+        &self,
+        kind: &str,
+        bot: &str,
+        payload: &Value,
+        priority: i64,
+        run_after: DateTime<Utc>,
+    ) -> Result<Task> {
+        let now = utc_now();
+        let id = new_id();
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO tasks(id, kind, bot, payload_json, status, priority, attempts, max_attempts,
+                run_after, lease_until, worker_id, fencing_token, uncertain, last_error, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, 0, 5, ?6, NULL, NULL, 0, 0, NULL, ?7, ?7)",
+            params![id, kind, bot, serde_json::to_string(payload)?, priority, to_string(run_after), to_string(now)],
+        )?;
+        drop(connection);
+        self.get_task(&id)
+    }
+
+    pub fn pending_task_count(&self) -> Result<i64> {
+        let connection = self.connection()?;
+        Ok(connection.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE status IN ('queued','running','awaiting_approval')",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn cancel_task(&self, id: &str, reason: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE tasks SET status='cancelled', last_error=?1, lease_until=NULL, worker_id=NULL, updated_at=?2
+             WHERE id=?3 AND status IN ('queued','running','awaiting_approval')",
+            params![truncate(reason, 2000), now_string(), id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Actions that were dispatched before a crash must never be replayed blindly.
+    pub fn reconcile_dispatching_actions(&self) -> Result<usize> {
+        let connection = self.connection()?;
+        Ok(connection.execute(
+            "UPDATE actions SET status='outcome_unknown', outcome_json=?1, updated_at=?2
+             WHERE status='dispatching'",
+            params![
+                serde_json::to_string(&serde_json::json!({
+                    "error": "process stopped after dispatch; external outcome must be reconciled by the owner"
+                }))?,
+                now_string()
+            ],
+        )?)
+    }
+
+    /// Create a consistent SQLite backup without overwriting an existing file.
+    pub fn backup_to(&self, destination: &Path) -> Result<()> {
+        if destination.exists() {
+            return Err(SeraError::Validation(
+                "backup destination already exists".into(),
+            ));
+        }
+        if let Some(parent) = destination.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let connection = self.connection()?;
+        connection.execute("VACUUM INTO ?1", params![destination.to_string_lossy()])?;
+        Ok(())
+    }
+}
+
+fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
+    Ok(Task {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        bot: row.get(2)?,
+        payload: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or(Value::Null),
+        status: row.get(4)?,
+        priority: row.get(5)?,
+        attempts: row.get(6)?,
+        max_attempts: row.get(7)?,
+        run_after: parse_datetime(&row.get::<_, String>(8)?),
+        lease_until: row
+            .get::<_, Option<String>>(9)?
+            .map(|value| parse_datetime(&value)),
+        worker_id: row.get(10)?,
+        fencing_token: row.get(11)?,
+        uncertain: row.get::<_, i64>(12)? != 0,
+        last_error: row.get(13)?,
+        created_at: parse_datetime(&row.get::<_, String>(14)?),
+        updated_at: parse_datetime(&row.get::<_, String>(15)?),
+    })
+}
+
+fn map_approval(row: &Row<'_>) -> rusqlite::Result<Approval> {
+    Ok(Approval {
+        id: row.get(0)?,
+        action_id: row.get(1)?,
+        tool: row.get(2)?,
+        summary: row.get(3)?,
+        state: row.get(4)?,
+        scope: row.get(5)?,
+        expires_at: parse_datetime(&row.get::<_, String>(6)?),
+        created_at: parse_datetime(&row.get::<_, String>(7)?),
+        decided_at: row
+            .get::<_, Option<String>>(8)?
+            .map(|value| parse_datetime(&value)),
+        note: row.get(9)?,
+    })
+}
+
+fn parse_role(value: &str) -> Role {
+    value.parse().unwrap_or(Role::User)
+}
+
+fn to_string(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn now_string() -> String {
+    to_string(utc_now())
+}
+
+fn parse_datetime(value: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|value| value.with_timezone(&Utc))
+        .unwrap_or_else(|_| utc_now())
+}
+
+fn truncate(value: &str, max: usize) -> String {
+    value.chars().take(max).collect()
+}
+
+pub fn insert_outbox(store: &Store, kind: &str, destination: &str, payload: &Value) -> Result<Id> {
+    let id = new_id();
+    let connection = store.connection()?;
+    connection.execute(
+        "INSERT INTO outbox(id, kind, destination, payload_json, status, attempts, last_error, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'pending', 0, NULL, ?5, ?5)",
+        params![id, kind, destination, serde_json::to_string(payload)?, now_string()],
+    )?;
+    Ok(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> Store {
+        // File-backed tests exercise the same multi-connection pool as production;
+        // `:memory:` with a one-connection pool can deadlock on nested lookups.
+        Store::open(
+            std::env::temp_dir().join(format!("serabot-store-test-{}.db", new_id())),
+            384,
+            5000,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn applies_migrations_and_vector_table() {
+        let store = store();
+        store.health().unwrap();
+        let connection = store.connection().unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        connection
+            .execute(
+                "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES ('x', ?1)",
+                params![
+                    vec![0.0f32; 384]
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect::<Vec<u8>>()
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn claims_competing_tasks_once() {
+        let store = store();
+        store
+            .enqueue_task("turn", "main", &serde_json::json!({"x": 1}), 0, utc_now())
+            .unwrap();
+        let first = store.claim_task("a", 30).unwrap();
+        let second = store.claim_task("b", 30).unwrap();
+        assert!(first.is_some());
+        assert!(second.is_none());
+    }
+
+    #[test]
+    fn fencing_prevents_stale_completion() {
+        let store = store();
+        let task = store
+            .enqueue_task("turn", "main", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        let claimed = store.claim_task("worker", 30).unwrap().unwrap();
+        assert!(
+            !store
+                .complete_task(&task.id, claimed.fencing_token + 1)
+                .unwrap()
+        );
+        assert!(
+            store
+                .complete_task(&task.id, claimed.fencing_token)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn duplicate_telegram_updates_are_ignored() {
+        let store = store();
+        assert!(store.record_telegram_update(42).unwrap());
+        assert!(!store.record_telegram_update(42).unwrap());
+    }
+
+    #[test]
+    fn approval_is_single_use_and_expires() {
+        let store = store();
+        let action = store
+            .create_action(
+                "onedrive_upload",
+                None,
+                None,
+                "{}",
+                "hash",
+                Some("folder"),
+                None,
+                "p1",
+            )
+            .unwrap();
+        let approval = store
+            .create_approval(
+                &action.id,
+                "onedrive_upload",
+                "upload",
+                utc_now() + chrono::Duration::hours(1),
+            )
+            .unwrap();
+        assert!(
+            store
+                .transition_approval(&approval.id, "approved_once", None, None)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .transition_approval(&approval.id, "denied", None, None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn expired_approvals_cancel_suspended_tasks() {
+        let store = store();
+        let task = store
+            .enqueue_task("turn", "main", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        let claimed = store.claim_task("worker", 30).unwrap().unwrap();
+        store
+            .await_approval_task(&task.id, claimed.fencing_token)
+            .unwrap();
+        let action = store
+            .create_action(
+                "upload",
+                Some(&task.id),
+                None,
+                "{}",
+                "hash",
+                Some("folder"),
+                None,
+                "p1",
+            )
+            .unwrap();
+        let approval = store
+            .create_approval(
+                &action.id,
+                "upload",
+                "upload",
+                utc_now() - chrono::Duration::minutes(1),
+            )
+            .unwrap();
+        assert_eq!(store.expire_approvals().unwrap(), 1);
+        assert_eq!(store.get_approval(&approval.id).unwrap().state, "expired");
+        assert_eq!(store.get_action(&action.id).unwrap().status, "expired");
+        assert_eq!(store.get_task(&task.id).unwrap().status, "failed");
+    }
+
+    #[test]
+    fn backup_refuses_to_overwrite() {
+        let store = store();
+        let destination = std::env::temp_dir().join(format!("serabot-backup-test-{}.db", new_id()));
+        store.backup_to(&destination).unwrap();
+        assert!(destination.exists());
+        assert!(store.backup_to(&destination).is_err());
+        let _ = std::fs::remove_file(destination);
+    }
+
+    #[test]
+    fn uncertain_expired_tasks_are_not_replayed() {
+        let store = store();
+        let task = store
+            .enqueue_task("turn", "main", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        let claimed = store.claim_task("worker", 1).unwrap().unwrap();
+        let connection = store.connection().unwrap();
+        connection
+            .execute(
+                "UPDATE tasks SET lease_until=?1, uncertain=1 WHERE id=?2",
+                params![to_string(utc_now() - chrono::Duration::seconds(5)), task.id],
+            )
+            .unwrap();
+        drop(connection);
+        store.recover_expired_tasks().unwrap();
+        let recovered = store.get_task(&task.id).unwrap();
+        assert_eq!(recovered.status, "failed");
+        assert_eq!(recovered.fencing_token, claimed.fencing_token);
+    }
+}

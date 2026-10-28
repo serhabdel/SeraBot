@@ -1,0 +1,12 @@
+# Monitoring sources. Keep private source lists out of public repositories.
+# Example (disabled by default):
+#
+# [[sources]]
+# name = "example-portal"
+# url = "https://example.com/tenders"
+# kind = "html"
+# enabled = false
+# item_selector = "article"
+# title_selector = "h2, h3, a"
+# date_selector = "time"
+# link_selector = "a[href]"

@@ -1,0 +1,59 @@
+[package]
+name = "serabot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "serabot"
+path = "src/main.rs"
+
+[dependencies]
+age = { version = "0.11", features = ["armor"] }
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+calamine = "0.24"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.9"
+clap = { version = "4", features = ["derive", "env"] }
+fastembed = { version = "4", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
+futures = "0.3"
+hex = "0.4"
+lopdf = "0.34"
+printpdf = "0.7"
+rand = "0.8"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "stream"] }
+rss = "2"
+rusqlite = { version = "0.31", features = ["bundled", "chrono", "serde_json"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
+rust_decimal = { version = "1", features = ["serde"] }
+scraper = "0.20"
+secrecy = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlite-vec = "0.1.9"
+subtle = "2"
+text-splitter = "0.16"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net", "fs", "process"] }
+tokio-util = { version = "0.7", features = ["io"] }
+toml = "0.8"
+tower-http = { version = "0.6", features = ["trace", "limit", "timeout"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+unicode-normalization = "0.1"
+url = "2"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+zeroize = "1"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+wiremock = "0.6"

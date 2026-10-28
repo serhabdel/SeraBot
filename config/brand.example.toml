@@ -1,0 +1,20 @@
+# ALPHA PLACEHOLDER - NOT PRODUCTION BRANDING
+#
+# Every value below is synthetic. It is not real company, product, or brand
+# data, and this file makes no brand-compliance claim. Copy it to
+# config/brand.toml and replace the four colours and initials with values you
+# are allowed to use.
+#
+# The renderer supports four colours, 1-4 monogram characters, and the
+# built-in Helvetica family only. Colours must be #RRGGBB.
+
+name = "Example Atelier (alpha placeholder)"
+monogram_text = "EA"
+footer = "Alpha placeholder deck - synthetic branding for testing"
+font_family = "helvetica"
+
+[palette]
+background = "#F5F1E8"
+foreground = "#1F2933"
+accent = "#2F6F6A"
+muted = "#6B7280"

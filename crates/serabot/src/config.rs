@@ -1,0 +1,898 @@
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{Result, SeraError};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    #[serde(default)]
+    pub server: ServerConfig,
+    #[serde(default)]
+    pub database: DatabaseConfig,
+    #[serde(default)]
+    pub secrets: SecretsConfig,
+    #[serde(default)]
+    pub llm: LlmConfig,
+    #[serde(default)]
+    pub embeddings: EmbeddingsConfig,
+    #[serde(default)]
+    pub telegram: TelegramConfig,
+    #[serde(default)]
+    pub api: ApiConfig,
+    #[serde(default)]
+    pub policy: PolicyConfig,
+    #[serde(default)]
+    pub watcher: WatcherConfig,
+    #[serde(default)]
+    pub onedrive: OneDriveConfig,
+    #[serde(default)]
+    pub render: RenderConfig,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
+    #[serde(default)]
+    pub schedule: ScheduleConfig,
+    #[serde(default)]
+    pub documents: DocumentsConfig,
+    #[serde(skip)]
+    pub base_dir: PathBuf,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            server: ServerConfig::default(),
+            database: DatabaseConfig::default(),
+            secrets: SecretsConfig::default(),
+            llm: LlmConfig::default(),
+            embeddings: EmbeddingsConfig::default(),
+            telegram: TelegramConfig::default(),
+            api: ApiConfig::default(),
+            policy: PolicyConfig::default(),
+            watcher: WatcherConfig::default(),
+            onedrive: OneDriveConfig::default(),
+            render: RenderConfig::default(),
+            runtime: RuntimeConfig::default(),
+            schedule: ScheduleConfig::default(),
+            documents: DocumentsConfig::default(),
+            base_dir: PathBuf::from("."),
+        }
+    }
+}
+
+impl Config {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let raw = std::fs::read_to_string(path)?;
+        let mut config: Self = toml::from_str(&raw)
+            .map_err(|error| SeraError::Config(format!("{}: {error}", path.display())))?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        config.base_dir = parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf());
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.server.bind.is_empty() {
+            return Err(SeraError::Config("server.bind must not be empty".into()));
+        }
+        if self.database.path.is_empty() {
+            return Err(SeraError::Config("database.path must not be empty".into()));
+        }
+        if self.api.enabled
+            && (self.api.token_hash.len() != 64
+                || !self.api.token_hash.chars().all(|c| c.is_ascii_hexdigit()))
+        {
+            return Err(SeraError::Config(
+                "api.token_hash must be a 64-character hex SHA-256 hash".into(),
+            ));
+        }
+        if !self.server.bind.starts_with("127.")
+            && !self.server.bind.starts_with("localhost")
+            && !self.server.bind.starts_with("[::1]")
+            && !self.server.allow_non_loopback
+        {
+            return Err(SeraError::Config(
+                "non-loopback server bind is disabled; terminate TLS in a reverse proxy or set server.allow_non_loopback explicitly"
+                    .into(),
+            ));
+        }
+        if self.llm.base_url.is_empty() || self.llm.model.is_empty() {
+            return Err(SeraError::Config(
+                "llm.base_url and llm.model are required".into(),
+            ));
+        }
+        if self.embeddings.dimension == 0 || self.embeddings.dimension > 4096 {
+            return Err(SeraError::Config(
+                "embeddings.dimension must be between 1 and 4096".into(),
+            ));
+        }
+        if self.telegram.enabled
+            && (self.telegram.owner_user_id <= 0 || self.telegram.owner_chat_id == 0)
+        {
+            return Err(SeraError::Config(
+                "telegram.owner_user_id and telegram.owner_chat_id are required".into(),
+            ));
+        }
+        if self.runtime.max_concurrent_turns == 0 || self.runtime.max_concurrent_turns > 2 {
+            return Err(SeraError::Config(
+                "runtime.max_concurrent_turns must be 1 or 2".into(),
+            ));
+        }
+        if self.render.max_pages == 0 || self.render.max_pages > 200 {
+            return Err(SeraError::Config(
+                "render.max_pages must be between 1 and 200".into(),
+            ));
+        }
+        if self.documents.chunk_chars < 200
+            || self.documents.chunk_overlap >= self.documents.chunk_chars
+        {
+            return Err(SeraError::Config(
+                "documents.chunk_chars must be at least 200 and exceed chunk_overlap".into(),
+            ));
+        }
+        if self.schedule.timezone.parse::<chrono_tz::Tz>().is_err() {
+            return Err(SeraError::Config(
+                "schedule.timezone must be a valid IANA timezone".into(),
+            ));
+        }
+        for time in
+            std::iter::once(&self.schedule.brief_time).chain(self.schedule.watch_times.iter())
+        {
+            parse_hhmm(time).ok_or_else(|| {
+                SeraError::Config(format!("invalid schedule time '{time}'; expected HH:MM"))
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn path(&self, value: impl AsRef<Path>) -> PathBuf {
+        let value = value.as_ref();
+        if value.is_absolute() {
+            value.to_path_buf()
+        } else {
+            self.base_dir.join(value)
+        }
+    }
+
+    pub fn secrets_path(&self) -> PathBuf {
+        self.path(&self.secrets.encrypted_file)
+    }
+
+    pub fn identity_path(&self) -> PathBuf {
+        self.path(&self.secrets.identity_file)
+    }
+
+    pub fn artifacts_dir(&self) -> PathBuf {
+        self.path(&self.render.artifacts_dir)
+    }
+
+    pub fn database_path(&self) -> PathBuf {
+        self.path(&self.database.path)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    #[serde(default = "default_bind")]
+    pub bind: String,
+    #[serde(default = "default_body_limit")]
+    pub body_limit_bytes: usize,
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout_secs: u64,
+    #[serde(default = "default_rate_limit")]
+    pub rate_limit_per_minute: u32,
+    #[serde(default = "default_event_retention_days")]
+    pub event_retention_days: i64,
+    #[serde(default)]
+    pub allow_non_loopback: bool,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_bind(),
+            body_limit_bytes: default_body_limit(),
+            request_timeout_secs: default_request_timeout(),
+            rate_limit_per_minute: default_rate_limit(),
+            event_retention_days: default_event_retention_days(),
+            allow_non_loopback: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseConfig {
+    #[serde(default = "default_db_path")]
+    pub path: String,
+    #[serde(default = "default_db_connections")]
+    pub max_connections: u32,
+    #[serde(default = "default_busy_timeout")]
+    pub busy_timeout_ms: u32,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            path: default_db_path(),
+            max_connections: default_db_connections(),
+            busy_timeout_ms: default_busy_timeout(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretsConfig {
+    #[serde(default = "default_secrets_file")]
+    pub encrypted_file: String,
+    #[serde(default = "default_identity_file")]
+    pub identity_file: String,
+}
+
+impl Default for SecretsConfig {
+    fn default() -> Self {
+        Self {
+            encrypted_file: default_secrets_file(),
+            identity_file: default_identity_file(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmConfig {
+    #[serde(default = "default_llm_base_url")]
+    pub base_url: String,
+    #[serde(default = "default_llm_model")]
+    pub model: String,
+    #[serde(default = "default_llm_key_secret")]
+    pub api_key_secret: String,
+    #[serde(default = "default_llm_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_max_tool_rounds")]
+    pub max_tool_rounds: usize,
+    #[serde(default = "default_max_output_tokens")]
+    pub max_output_tokens: u32,
+    #[serde(default = "default_data_egress_approved")]
+    pub data_egress_approved: bool,
+    #[serde(default)]
+    pub bot_models: BTreeMap<String, String>,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            base_url: default_llm_base_url(),
+            model: default_llm_model(),
+            api_key_secret: default_llm_key_secret(),
+            timeout_secs: default_llm_timeout(),
+            max_tool_rounds: default_max_tool_rounds(),
+            max_output_tokens: default_max_output_tokens(),
+            data_egress_approved: false,
+            bot_models: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingsConfig {
+    #[serde(default = "default_embedding_model")]
+    pub model: String,
+    #[serde(default = "default_embedding_dimension")]
+    pub dimension: usize,
+    #[serde(default = "default_embedding_cache")]
+    pub cache_dir: String,
+    #[serde(default = "default_embedding_batch")]
+    pub batch_size: usize,
+}
+
+impl Default for EmbeddingsConfig {
+    fn default() -> Self {
+        Self {
+            model: default_embedding_model(),
+            dimension: default_embedding_dimension(),
+            cache_dir: default_embedding_cache(),
+            batch_size: default_embedding_batch(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_telegram_secret")]
+    pub bot_token_secret: String,
+    #[serde(default)]
+    pub owner_user_id: i64,
+    #[serde(default)]
+    pub owner_chat_id: i64,
+    #[serde(default = "default_poll_timeout")]
+    pub poll_timeout_secs: u64,
+}
+
+impl Default for TelegramConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token_secret: default_telegram_secret(),
+            owner_user_id: 0,
+            owner_chat_id: 0,
+            poll_timeout_secs: default_poll_timeout(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiConfig {
+    #[serde(default = "default_api_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub token_hash: String,
+    #[serde(default = "default_approval_expiry")]
+    pub approval_expiry_hours: i64,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_api_enabled(),
+            token_hash: String::new(),
+            approval_expiry_hours: default_approval_expiry(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyConfig {
+    #[serde(default = "default_blocklist_file")]
+    pub blocklist_file: String,
+    #[serde(default)]
+    pub notify_owner_on_violation: bool,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            blocklist_file: default_blocklist_file(),
+            notify_owner_on_violation: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatcherConfig {
+    #[serde(default = "default_sources_file")]
+    pub sources_file: String,
+    #[serde(default = "default_user_agent")]
+    pub user_agent: String,
+    #[serde(default = "default_fetch_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_fetch_bytes")]
+    pub max_response_bytes: usize,
+    #[serde(default)]
+    pub morning_brief_enabled: bool,
+}
+
+impl Default for WatcherConfig {
+    fn default() -> Self {
+        Self {
+            sources_file: default_sources_file(),
+            user_agent: default_user_agent(),
+            timeout_secs: default_fetch_timeout(),
+            max_response_bytes: default_fetch_bytes(),
+            morning_brief_enabled: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OneDriveConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_graph_base")]
+    pub graph_base: String,
+    #[serde(default = "default_tenant")]
+    pub tenant: String,
+    #[serde(default = "default_graph_client_secret")]
+    pub client_id_secret: String,
+    #[serde(default = "default_graph_refresh_secret")]
+    pub refresh_token_secret: String,
+    #[serde(default = "default_onedrive_folder")]
+    pub folder: String,
+    #[serde(default = "default_conflict_behavior")]
+    pub conflict_behavior: String,
+}
+
+impl Default for OneDriveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            graph_base: default_graph_base(),
+            tenant: default_tenant(),
+            client_id_secret: default_graph_client_secret(),
+            refresh_token_secret: default_graph_refresh_secret(),
+            folder: default_onedrive_folder(),
+            conflict_behavior: default_conflict_behavior(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenderConfig {
+    #[serde(default = "default_brand_file")]
+    pub brand_file: String,
+    #[serde(default = "default_artifacts_dir")]
+    pub artifacts_dir: String,
+    #[serde(default = "default_max_deck_pages")]
+    pub max_pages: usize,
+}
+
+impl Default for RenderConfig {
+    fn default() -> Self {
+        Self {
+            brand_file: default_brand_file(),
+            artifacts_dir: default_artifacts_dir(),
+            max_pages: default_max_deck_pages(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    #[serde(default = "default_max_turns")]
+    pub max_concurrent_turns: usize,
+    #[serde(default = "default_max_tool_calls")]
+    pub max_tool_calls_per_turn: usize,
+    #[serde(default = "default_tool_iterations")]
+    pub max_tool_iterations: usize,
+    #[serde(default = "default_lease")]
+    pub task_lease_secs: u64,
+    #[serde(default = "default_poll")]
+    pub worker_poll_ms: u64,
+    #[serde(default = "default_history_limit")]
+    pub history_limit: usize,
+    #[serde(default)]
+    pub owner_standing_consent: bool,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_turns: 2,
+            max_tool_calls_per_turn: 8,
+            max_tool_iterations: 6,
+            task_lease_secs: default_lease(),
+            worker_poll_ms: default_poll(),
+            history_limit: default_history_limit(),
+            owner_standing_consent: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleConfig {
+    #[serde(default = "default_tick")]
+    pub tick_secs: u64,
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+    #[serde(default = "default_brief_time")]
+    pub brief_time: String,
+    #[serde(default = "default_source_stagger")]
+    pub source_stagger_secs: u64,
+    #[serde(default = "default_watch_times")]
+    pub watch_times: Vec<String>,
+}
+
+impl Default for ScheduleConfig {
+    fn default() -> Self {
+        Self {
+            tick_secs: default_tick(),
+            timezone: default_timezone(),
+            brief_time: default_brief_time(),
+            source_stagger_secs: default_source_stagger(),
+            watch_times: default_watch_times(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentsConfig {
+    #[serde(default = "default_watch_dir")]
+    pub watch_dir: String,
+    #[serde(default = "default_max_document_bytes")]
+    pub max_bytes: u64,
+    #[serde(default = "default_chunk_chars")]
+    pub chunk_chars: usize,
+    #[serde(default = "default_chunk_overlap")]
+    pub chunk_overlap: usize,
+    #[serde(default = "default_retrieval_k")]
+    pub retrieval_k: usize,
+}
+
+impl Default for DocumentsConfig {
+    fn default() -> Self {
+        Self {
+            watch_dir: default_watch_dir(),
+            max_bytes: default_max_document_bytes(),
+            chunk_chars: default_chunk_chars(),
+            chunk_overlap: default_chunk_overlap(),
+            retrieval_k: default_retrieval_k(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BotConfig {
+    pub name: String,
+    #[serde(default = "default_trigger")]
+    pub trigger: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub system_prompt: String,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub require_approval: Vec<String>,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedBot {
+    pub config: BotConfig,
+    pub prompt: String,
+}
+
+pub fn load_bots(config: &Config, dir: impl AsRef<Path>) -> Result<Vec<LoadedBot>> {
+    let dir = config.path(dir);
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .collect();
+    paths.sort();
+
+    let mut bots = Vec::new();
+    for path in paths {
+        let raw = std::fs::read_to_string(&path)?;
+        let bot: BotConfig = toml::from_str(&raw)
+            .map_err(|error| SeraError::Config(format!("{}: {error}", path.display())))?;
+        if bot.name.is_empty() || bot.name.len() > 64 {
+            return Err(SeraError::Config(format!(
+                "{}: invalid bot name",
+                path.display()
+            )));
+        }
+        if !matches!(bot.trigger.as_str(), "command" | "cron" | "file") {
+            return Err(SeraError::Config(format!(
+                "{}: trigger must be command, cron, or file",
+                path.display()
+            )));
+        }
+        if bot.system_prompt.is_empty() {
+            return Err(SeraError::Config(format!(
+                "{}: system_prompt is required",
+                path.display()
+            )));
+        }
+        let prompt_path = config.path(&bot.system_prompt);
+        let canonical = prompt_path.canonicalize().map_err(|error| {
+            SeraError::Config(format!(
+                "{}: cannot resolve prompt {}: {error}",
+                path.display(),
+                prompt_path.display()
+            ))
+        })?;
+        if !canonical.starts_with(&config.base_dir) {
+            return Err(SeraError::Config(format!(
+                "{}: prompt escapes the configuration directory",
+                path.display()
+            )));
+        }
+        let prompt = std::fs::read_to_string(&canonical)?;
+        if prompt.len() > 100_000 {
+            return Err(SeraError::Config(format!(
+                "{}: prompt is too large",
+                path.display()
+            )));
+        }
+        bots.push(LoadedBot {
+            config: bot,
+            prompt,
+        });
+    }
+
+    let mut names = std::collections::HashSet::new();
+    for bot in &bots {
+        if !names.insert(bot.config.name.clone()) {
+            return Err(SeraError::Config(format!(
+                "duplicate bot name: {}",
+                bot.config.name
+            )));
+        }
+    }
+    Ok(bots)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceConfig {
+    pub name: String,
+    pub url: String,
+    #[serde(default = "default_source_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_source_selectors")]
+    pub item_selector: String,
+    #[serde(default = "default_title_selector")]
+    pub title_selector: String,
+    #[serde(default = "default_date_selector")]
+    pub date_selector: String,
+    #[serde(default = "default_link_selector")]
+    pub link_selector: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SourcesFile {
+    #[serde(default)]
+    pub sources: Vec<SourceConfig>,
+}
+
+pub fn load_sources(config: &Config) -> Result<Vec<SourceConfig>> {
+    let path = config.path(&config.watcher.sources_file);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = std::fs::read_to_string(&path)?;
+    let file: SourcesFile = toml::from_str(&raw)
+        .map_err(|error| SeraError::Config(format!("{}: {error}", path.display())))?;
+    let mut names = std::collections::HashSet::new();
+    for source in &file.sources {
+        if source.name.is_empty() || !names.insert(source.name.clone()) {
+            return Err(SeraError::Config("source names must be unique".into()));
+        }
+        if !matches!(source.kind.as_str(), "html" | "rss") {
+            return Err(SeraError::Config(format!(
+                "source {}: kind must be html or rss",
+                source.name
+            )));
+        }
+    }
+    Ok(file.sources)
+}
+
+fn default_bind() -> String {
+    "127.0.0.1:8787".into()
+}
+fn default_body_limit() -> usize {
+    2 * 1024 * 1024
+}
+fn default_request_timeout() -> u64 {
+    30
+}
+fn default_rate_limit() -> u32 {
+    60
+}
+fn default_event_retention_days() -> i64 {
+    30
+}
+fn default_db_path() -> String {
+    "data/serabot.db".into()
+}
+fn default_db_connections() -> u32 {
+    4
+}
+fn default_busy_timeout() -> u32 {
+    5000
+}
+fn default_secrets_file() -> String {
+    "private/secrets.age".into()
+}
+fn default_identity_file() -> String {
+    "private/age-identity.txt".into()
+}
+fn default_llm_base_url() -> String {
+    "https://api.mistral.ai/v1".into()
+}
+fn default_llm_model() -> String {
+    "mistral-large-latest".into()
+}
+fn default_llm_key_secret() -> String {
+    "llm_api_key".into()
+}
+fn default_llm_timeout() -> u64 {
+    120
+}
+fn default_max_tool_rounds() -> usize {
+    6
+}
+fn default_max_output_tokens() -> u32 {
+    4096
+}
+fn default_data_egress_approved() -> bool {
+    false
+}
+fn default_embedding_model() -> String {
+    "multilingual-e5-small".into()
+}
+fn default_embedding_dimension() -> usize {
+    384
+}
+fn default_embedding_cache() -> String {
+    "models".into()
+}
+fn default_embedding_batch() -> usize {
+    16
+}
+fn default_telegram_secret() -> String {
+    "telegram_bot_token".into()
+}
+fn default_poll_timeout() -> u64 {
+    25
+}
+fn default_api_enabled() -> bool {
+    true
+}
+fn default_approval_expiry() -> i64 {
+    24
+}
+fn default_blocklist_file() -> String {
+    "private/blocklist.txt".into()
+}
+fn default_sources_file() -> String {
+    "config/sources.toml".into()
+}
+fn default_user_agent() -> String {
+    "SeraBot/0.1 (personal research agent)".into()
+}
+fn default_fetch_timeout() -> u64 {
+    30
+}
+fn default_fetch_bytes() -> usize {
+    5 * 1024 * 1024
+}
+fn default_graph_base() -> String {
+    "https://graph.microsoft.com/v1.0".into()
+}
+fn default_tenant() -> String {
+    "common".into()
+}
+fn default_graph_client_secret() -> String {
+    "onedrive_client_id".into()
+}
+fn default_graph_refresh_secret() -> String {
+    "onedrive_refresh_token".into()
+}
+fn default_onedrive_folder() -> String {
+    "SeraBot".into()
+}
+fn default_conflict_behavior() -> String {
+    "rename".into()
+}
+fn default_brand_file() -> String {
+    "config/brand.toml".into()
+}
+fn default_artifacts_dir() -> String {
+    "data/artifacts".into()
+}
+fn default_max_deck_pages() -> usize {
+    30
+}
+fn default_max_turns() -> usize {
+    2
+}
+fn default_max_tool_calls() -> usize {
+    8
+}
+fn default_tool_iterations() -> usize {
+    6
+}
+fn default_lease() -> u64 {
+    300
+}
+fn default_poll() -> u64 {
+    500
+}
+fn default_history_limit() -> usize {
+    30
+}
+fn default_tick() -> u64 {
+    30
+}
+fn default_timezone() -> String {
+    "Europe/Rome".into()
+}
+fn default_brief_time() -> String {
+    "08:00".into()
+}
+fn default_source_stagger() -> u64 {
+    20
+}
+fn default_watch_times() -> Vec<String> {
+    vec!["07:45".into(), "13:00".into(), "18:00".into()]
+}
+fn parse_hhmm(value: &str) -> Option<(u32, u32)> {
+    let (hour, minute) = value.split_once(':')?;
+    let hour: u32 = hour.parse().ok()?;
+    let minute: u32 = minute.parse().ok()?;
+    (hour < 24 && minute < 60).then_some((hour, minute))
+}
+fn default_watch_dir() -> String {
+    "data/inbox".into()
+}
+fn default_max_document_bytes() -> u64 {
+    50 * 1024 * 1024
+}
+fn default_chunk_chars() -> usize {
+    1200
+}
+fn default_chunk_overlap() -> usize {
+    150
+}
+fn default_retrieval_k() -> usize {
+    8
+}
+fn default_trigger() -> String {
+    "command".into()
+}
+fn default_enabled() -> bool {
+    true
+}
+fn default_source_kind() -> String {
+    "html".into()
+}
+fn default_source_selectors() -> String {
+    "article".into()
+}
+fn default_title_selector() -> String {
+    "h2, h3, a".into()
+}
+fn default_date_selector() -> String {
+    "time".into()
+}
+fn default_link_selector() -> String {
+    "a[href]".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_empty_llm_config() {
+        let mut config = Config::default();
+        config.llm.model.clear();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_api_hash() {
+        let mut config = Config::default();
+        config.api.enabled = true;
+        config.api.token_hash = "not-a-hash".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn parses_minimal_config() {
+        let raw = r#"
+[llm]
+model = "test-model"
+[api]
+enabled = false
+"#;
+        let config: Config = toml::from_str(raw).unwrap();
+        assert_eq!(config.llm.model, "test-model");
+        assert!(!config.api.enabled);
+    }
+}

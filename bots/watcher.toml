@@ -1,0 +1,7 @@
+name = "watcher"
+trigger = "cron"
+system_prompt = "prompts/watcher.txt"
+skills = ["deadlines", "brief"]
+tools = ["fetch_url", "watch_now"]
+require_approval = []
+enabled = true

@@ -1,0 +1,45 @@
+[Unit]
+Description=SeraBot single-operator agent
+Documentation=file:///opt/serabot/serabot.toml
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=serabot
+Group=serabot
+WorkingDirectory=/var/lib/serabot
+ExecStart=/opt/serabot/serabot --config /etc/serabot/serabot.toml run
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+Environment=RUST_LOG=serabot=info,tower_http=warn
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UMask=0077
+
+ReadWritePaths=/var/lib/serabot
+ReadOnlyPaths=/opt/serabot /etc/serabot
+
+MemoryMax=1400M
+CPUQuota=180%
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,27 @@
+# Local only: never commit private operating material.
+the-agent-project-strategic-dossier-v1-oct-2026.md
+private/
+config/local.toml
+config/*.local.toml
+config/brand.toml
+config/sources.toml
+models/
+data/
+target/
+dist/
+*.tar.gz
+*.db
+*.db-wal
+*.db-shm
+*.pdf
+*.docx
+*.xlsx
+*.pptx
+.env
+.env.*
+*.age
+*.key
+*.pem
+*.log
+.DS_Store
+Thumbs.db

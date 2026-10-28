@@ -1,0 +1,7 @@
+name = "main"
+trigger = "command"
+system_prompt = "prompts/main.txt"
+skills = ["triage", "ask"]
+tools = ["rag_search"]
+require_approval = []
+enabled = true

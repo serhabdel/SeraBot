@@ -1,0 +1,7 @@
+name = "analyst"
+trigger = "file"
+system_prompt = "prompts/analyst.txt"
+skills = ["synthesis", "transcript", "xlsx", "timesheets", "ask"]
+tools = ["rag_search", "xlsx_analyze", "timesheet_analyze", "document_index"]
+require_approval = []
+enabled = true
