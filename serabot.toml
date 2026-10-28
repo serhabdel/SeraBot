@@ -40,6 +40,15 @@ max_tool_rounds = 6
 max_output_tokens = 4096
 # Set true only after you accept that selected prompt/document passages leave this host.
 data_egress_approved = false
+# [llm] is the reserved "default" provider. Its model and bot overrides are allowed too.
+models = []
+# Optional synthetic profile; selection never grants consent or triggers fallback.
+# Store this key in the encrypted secret store before enabling the profile.
+# [llm.providers.secondary]
+# base_url = "https://api.example.com/v1"
+# api_key_secret = "secondary_llm_key"
+# models = ["example-model"]
+# data_egress_approved = false
 
 [embeddings]
 model = "multilingual-e5-small"

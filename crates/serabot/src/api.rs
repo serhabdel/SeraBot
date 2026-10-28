@@ -9,7 +9,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,7 @@ use crate::domain::Task;
 use crate::error::{Result, SeraError};
 use crate::gateway::Decision;
 use crate::maker::ArtifactStore;
+use crate::model_router::ModelSelection;
 use crate::runtime::{ApprovalNotice, Notifier, Runtime};
 use crate::store::Store;
 use crate::util::{constant_time_eq, sha256_hex, truncate_chars};
@@ -106,6 +107,12 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
         .route("/v1/messages", post(send_message))
+        .route("/v1/models", get(models))
+        .route("/v1/conversations/{id}/model", put(select_model))
+        .route(
+            "/v1/conversations/{id}/messages",
+            get(conversation_messages),
+        )
         .route("/v1/tasks/{id}", get(task))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}/decide", post(decide_approval))
@@ -191,21 +198,94 @@ async fn send_message(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<MessageRequest>,
 ) -> Result<Json<Value>> {
-    if request.conversation_id.is_empty()
-        || request.conversation_id.len() > 128
-        || !request
-            .conversation_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'))
-    {
-        return Err(SeraError::Validation("invalid conversation_id".into()));
-    }
+    validate_conversation_id(&request.conversation_id)?;
     let task = state.runtime.submit_text(
         &request.conversation_id,
         &request.text,
         request.bot.as_deref(),
     )?;
     Ok(Json(json!({"task": task_view(&task)})))
+}
+
+fn validate_conversation_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'))
+    {
+        return Err(SeraError::Validation("invalid conversation_id".into()));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelQuery {
+    conversation_id: String,
+    bot: Option<String>,
+}
+
+async fn models(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<ModelQuery>,
+) -> Result<Json<Value>> {
+    validate_conversation_id(&query.conversation_id)?;
+    let selection = state.runtime.model_selection(
+        &query.conversation_id,
+        query.bot.as_deref().unwrap_or("main"),
+    )?;
+    Ok(Json(
+        json!({"providers": state.runtime.model_catalog()?, "selection": selection}),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelectModelRequest {
+    provider: String,
+    model: String,
+}
+
+async fn select_model(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(request): Json<SelectModelRequest>,
+) -> Result<Json<Value>> {
+    validate_conversation_id(&id)?;
+    let selection = state.runtime.select_model(
+        &id,
+        ModelSelection {
+            provider: request.provider,
+            model: request.model,
+        },
+    )?;
+    Ok(Json(json!({"selection": selection})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryQuery {
+    limit: Option<usize>,
+}
+
+async fn conversation_messages(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<Value>> {
+    validate_conversation_id(&id)?;
+    let messages = state.store.list_visible_messages(&id, query.limit.unwrap_or(100).clamp(1, 200))?
+        .into_iter()
+        .map(|message| {
+            let content = if state.runtime.scan_owner_output(&message.content).is_ok() {
+                message.content
+            } else {
+                "[Content withheld by policy]".to_owned()
+            };
+            json!({"id": message.id, "role": message.role, "content": content, "created_at": message.created_at})
+        }).collect::<Vec<_>>();
+    Ok(Json(json!({"messages": messages})))
 }
 
 fn task_view(task: &Task) -> Value {
@@ -498,10 +578,17 @@ mod tests {
     use tower::ServiceExt;
 
     fn app() -> (Router, Arc<Config>, Store) {
+        app_with_policy(true, Policy::empty())
+    }
+
+    fn app_with_policy(egress_approved: bool, policy: Policy) -> (Router, Arc<Config>, Store) {
         let mut config = Config::default();
         config.api.enabled = true;
         config.api.token_hash = sha256_hex("test-token-that-is-long-enough-123");
-        config.llm.data_egress_approved = true;
+        config.llm.data_egress_approved = egress_approved;
+        config.llm.model = "test".into();
+        config.llm.base_url = "https://example.com/v1".into();
+        config.llm.models = vec!["test-alternative".into()];
         config.base_dir = std::env::current_dir().unwrap();
         let config = Arc::new(config);
         let store = Store::open(
@@ -526,7 +613,7 @@ mod tests {
         };
         let gateway = Gateway::new(
             store.clone(),
-            Arc::new(Policy::empty()),
+            Arc::new(policy),
             ToolRegistry::default(),
             1,
             false,
@@ -538,7 +625,11 @@ mod tests {
             config.clone(),
             store.clone(),
             gateway,
-            llm,
+            crate::model_router::ModelRouter::new(
+                &config.llm,
+                std::collections::BTreeMap::from([("default".into(), llm)]),
+            )
+            .unwrap(),
             vec![bot],
             Arc::new(NullNotifier),
             tokio_util::sync::CancellationToken::new(),
@@ -671,5 +762,295 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn selection_is_persistent_and_applies_only_to_future_tasks() {
+        let (app, _, store) = app();
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/messages",
+                true,
+                Some(json!({"conversation_id":"owner", "text":"first"})),
+            ))
+            .await
+            .unwrap();
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let original = store
+            .get_task(value["task"]["id"].as_str().unwrap())
+            .unwrap();
+        let selection = json!({"provider":"default", "model":"test-alternative"});
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PUT",
+                "/v1/conversations/owner/model",
+                true,
+                Some(selection.clone()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            store.get_task(&original.id).unwrap().payload,
+            original.payload
+        );
+        assert!(store.kv_get("model_selection:owner").unwrap().is_some());
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/models?conversation_id=owner",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["selection"], selection);
+    }
+
+    #[tokio::test]
+    async fn selection_does_not_grant_egress_consent() {
+        let (app, _, store) = app_with_policy(false, Policy::empty());
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PUT",
+                "/v1/conversations/owner/model",
+                true,
+                Some(json!({"provider":"default", "model":"test-alternative"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(store.kv_get("model_selection:owner").unwrap().is_none());
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/models?conversation_id=owner",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn history_redacts_content_blocked_by_current_policy() {
+        let (app, _, store) = app_with_policy(true, Policy::from_text("synthetic blocked phrase"));
+        store
+            .append_message(
+                "owner",
+                None,
+                crate::domain::Role::User,
+                "synthetic blocked phrase",
+            )
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/conversations/owner/messages",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["messages"][0]["content"],
+            "[Content withheld by policy]"
+        );
+    }
+
+    #[tokio::test]
+    async fn selection_rejects_client_supplied_endpoint() {
+        let (app, _, store) = app();
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PUT",
+                "/v1/conversations/owner/model",
+                true,
+                Some(
+                    json!({"provider":"default", "model":"test", "base_url":"https://example.com"}),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(store.kv_get("model_selection:owner").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn model_catalog_requires_authentication() {
+        let (app, _, _) = app();
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/models?conversation_id=windows-owner",
+                false,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn lists_configured_models_without_endpoint_or_credentials() {
+        let (app, config, _) = app();
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/models?conversation_id=windows-owner",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["selection"]["provider"], "default");
+        assert_eq!(value["selection"]["model"], config.llm.model);
+        assert_eq!(value["providers"][0]["id"], "default");
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!text.contains("base_url"));
+        assert!(!text.contains("api_key"));
+        assert!(!text.contains(&config.llm.base_url));
+    }
+
+    #[tokio::test]
+    async fn model_selection_rejects_unknown_provider_without_changing_state() {
+        let (app, _, store) = app();
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PUT",
+                "/v1/conversations/owner/model",
+                true,
+                Some(json!({"provider":"missing", "model":"invented"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(store.kv_get("model_selection:owner").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn history_returns_only_visible_messages_from_requested_conversation() {
+        let (app, _, store) = app();
+        store
+            .append_message("owner", None, crate::domain::Role::User, "hello")
+            .unwrap();
+        store
+            .append_message("owner", None, crate::domain::Role::Assistant, "bonjour")
+            .unwrap();
+        store
+            .append_message(
+                "owner",
+                None,
+                crate::domain::Role::System,
+                "private system prompt",
+            )
+            .unwrap();
+        store
+            .append_message(
+                "other",
+                None,
+                crate::domain::Role::User,
+                "other conversation",
+            )
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/conversations/owner/messages?limit=100",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let messages = value["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], "hello");
+        assert_eq!(messages[1]["content"], "bonjour");
+        assert!(messages.iter().all(|message| message.get("name").is_none()));
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!text.contains("private system prompt"));
+        assert!(!text.contains("other conversation"));
+    }
+
+    #[tokio::test]
+    async fn new_conversation_routes_validate_identity_and_require_authentication() {
+        let (app, _, _) = app();
+        for uri in [
+            "/v1/models?conversation_id=bad%20id",
+            "/v1/conversations/bad%20id/messages",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(&app, "GET", uri, true, None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        for (method, uri, body) in [
+            ("GET", "/v1/conversations/owner/messages", None),
+            (
+                "PUT",
+                "/v1/conversations/owner/model",
+                Some(json!({"provider":"default", "model":"test"})),
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(&app, method, uri, false, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
     }
 }

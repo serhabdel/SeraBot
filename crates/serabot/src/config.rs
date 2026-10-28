@@ -262,6 +262,19 @@ pub struct LlmConfig {
     pub data_egress_approved: bool,
     #[serde(default)]
     pub bot_models: BTreeMap<String, String>,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    pub base_url: String,
+    pub api_key_secret: String,
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub data_egress_approved: bool,
 }
 
 impl Default for LlmConfig {
@@ -275,6 +288,8 @@ impl Default for LlmConfig {
             max_output_tokens: default_max_output_tokens(),
             data_egress_approved: false,
             bot_models: BTreeMap::new(),
+            models: Vec::new(),
+            providers: BTreeMap::new(),
         }
     }
 }

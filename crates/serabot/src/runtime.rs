@@ -16,7 +16,7 @@ use crate::error::{Result, SeraError};
 use crate::gateway::{
     Decision, DecisionResult, Gateway, Tool, ToolContext, ToolOutcome, ToolOutput, ToolSpec,
 };
-use crate::llm::LlmClient;
+use crate::model_router::{ModelRouter, ModelSelection, PinnedRoute, ProviderView};
 use crate::retrieval::{RetrievedChunk, Retriever, evidence_block};
 use crate::store::Store;
 use crate::util::truncate_chars;
@@ -30,6 +30,8 @@ pub struct TurnPayload {
     pub source: String,
     #[serde(default)]
     pub ask_mode: bool,
+    #[serde(default)]
+    pub route: Option<PinnedRoute>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +58,8 @@ struct TurnState {
     evidence: Vec<RetrievedChunk>,
     #[serde(default)]
     ask_mode: bool,
+    #[serde(default)]
+    route: Option<PinnedRoute>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,7 +212,7 @@ pub struct Runtime {
     config: Arc<Config>,
     store: Store,
     gateway: Gateway,
-    llm: LlmClient,
+    router: ModelRouter,
     bots: Arc<HashMap<String, LoadedBot>>,
     notifier: Arc<dyn Notifier>,
     semaphore: Arc<Semaphore>,
@@ -227,7 +231,7 @@ impl Runtime {
         config: Arc<Config>,
         store: Store,
         gateway: Gateway,
-        llm: LlmClient,
+        mut router: ModelRouter,
         bots: Vec<LoadedBot>,
         notifier: Arc<dyn Notifier>,
         shutdown: CancellationToken,
@@ -236,6 +240,11 @@ impl Runtime {
             return Err(SeraError::Config(
                 "runtime.max_concurrent_turns must be positive".into(),
             ));
+        }
+        for bot in &bots {
+            if let Some(model) = &bot.config.model {
+                router.add_default_model(model)?;
+            }
         }
         let bot_map: HashMap<String, LoadedBot> = bots
             .into_iter()
@@ -246,7 +255,7 @@ impl Runtime {
             config,
             store,
             gateway,
-            llm,
+            router,
             bots: Arc::new(bot_map),
             notifier,
             semaphore,
@@ -263,8 +272,79 @@ impl Runtime {
         &self.config
     }
 
-    pub fn llm(&self) -> &LlmClient {
-        &self.llm
+    pub fn scan_owner_output(&self, text: &str) -> Result<()> {
+        self.gateway.scan_egress(text)
+    }
+
+    pub fn model_catalog(&self) -> Result<Vec<ProviderView>> {
+        let catalog = self.router.catalog();
+        self.gateway
+            .scan_egress(&serde_json::to_string(&catalog)?)?;
+        Ok(catalog)
+    }
+
+    pub fn model_selection(&self, conversation_id: &str, bot: &str) -> Result<ModelSelection> {
+        validate_conversation_id(conversation_id)?;
+        let bot = self
+            .bots
+            .get(bot)
+            .ok_or_else(|| SeraError::NotFound("bot not found".into()))?;
+        let selection = match self
+            .store
+            .kv_get(&format!("model_selection:{conversation_id}"))?
+        {
+            Some(value) => serde_json::from_str(&value)
+                .map_err(|_| SeraError::InvalidState("stored model selection is invalid".into()))?,
+            None => self
+                .router
+                .default_selection(bot.config.model.as_deref().or_else(|| {
+                    self.config
+                        .llm
+                        .bot_models
+                        .get(&bot.config.name)
+                        .map(String::as_str)
+                })),
+        };
+        self.router.validate_selection(&selection)?;
+        self.gateway
+            .scan_egress(&serde_json::to_string(&selection)?)?;
+        Ok(selection)
+    }
+
+    pub fn select_model(
+        &self,
+        conversation_id: &str,
+        selection: ModelSelection,
+    ) -> Result<ModelSelection> {
+        validate_conversation_id(conversation_id)?;
+        self.router.pin(&selection)?;
+        let value = serde_json::to_string(&selection)?;
+        self.gateway.scan_egress(&value)?;
+        self.store.record_audit(
+            "owner",
+            "model.selected",
+            None,
+            None,
+            None,
+            None,
+            Some(self.gateway.policy().version()),
+            Some(&serde_json::to_value(&selection)?),
+        )?;
+        self.store
+            .kv_set(&format!("model_selection:{conversation_id}"), &value)?;
+        Ok(selection)
+    }
+
+    fn checked_route<'a>(&self, route: &'a Option<PinnedRoute>) -> Result<&'a PinnedRoute> {
+        let route = route.as_ref().ok_or_else(|| {
+            SeraError::Forbidden(
+                "turn has no pinned model route; owner must resubmit the request".into(),
+            )
+        })?;
+        self.router.validate_pinned(route)?;
+        self.gateway
+            .scan_egress(&serde_json::to_string(&route.selection)?)?;
+        Ok(route)
     }
 
     pub fn submit_text(
@@ -273,6 +353,7 @@ impl Runtime {
         text: &str,
         bot_override: Option<&str>,
     ) -> Result<Task> {
+        validate_conversation_id(conversation_id)?;
         let text = text.trim();
         if text.is_empty() {
             return Err(SeraError::Validation("message is empty".into()));
@@ -359,12 +440,15 @@ impl Runtime {
         if !self.bots.contains_key(&bot) {
             return Err(SeraError::NotFound(format!("bot {bot}")));
         }
+        let selection = self.model_selection(conversation_id, &bot)?;
+        let route = self.router.pin(&selection)?;
         let payload = TurnPayload {
             conversation_id: conversation_id.to_owned(),
             text,
             bot: bot.clone(),
             source: "owner".into(),
             ask_mode,
+            route: Some(route),
         };
         let task = self.store.enqueue_task(
             "turn",
@@ -647,6 +731,8 @@ impl Runtime {
     async fn run_turn(&self, task: &Task) -> Result<TurnOutcome> {
         let payload: TurnPayload = serde_json::from_value(task.payload.clone())
             .map_err(|error| SeraError::Validation(format!("invalid turn payload: {error}")))?;
+        validate_conversation_id(&payload.conversation_id)?;
+        self.checked_route(&payload.route)?;
         let bot = self
             .bots
             .get(&payload.bot)
@@ -665,6 +751,12 @@ impl Runtime {
             }
             let state: TurnState = serde_json::from_value(existing.state.clone())
                 .map_err(|_| SeraError::InvalidState("stored turn state is invalid".into()))?;
+            self.checked_route(&state.route)?;
+            if state.route != payload.route {
+                return Err(SeraError::Forbidden(
+                    "turn route does not match queued route".into(),
+                ));
+            }
             if let Some(pending) = &state.pending {
                 let action = self.store.get_action(&pending.action_id)?;
                 if action.status == "outcome_unknown" {
@@ -696,6 +788,7 @@ impl Runtime {
             pending: None,
             evidence: Vec::new(),
             ask_mode: payload.ask_mode,
+            route: payload.route.clone(),
         };
         state.messages.push(LlmMessage::system(
             self.system_prompt(bot, payload.ask_mode),
@@ -714,6 +807,7 @@ impl Runtime {
         let turn = self.store.get_turn(&payload.turn_id)?;
         let mut state: TurnState = serde_json::from_value(turn.state.clone())
             .map_err(|_| SeraError::InvalidState("stored turn state is invalid".into()))?;
+        self.checked_route(&state.route)?;
         let bot = self
             .bots
             .get(&turn.bot)
@@ -800,27 +894,34 @@ impl Runtime {
             .into_iter()
             .filter(|spec| context.allowed_tools.contains(&spec.name))
             .collect::<Vec<_>>();
-        let model = bot
-            .config
-            .model
-            .clone()
-            .or_else(|| self.config.llm.bot_models.get(&bot.config.name).cloned());
         let temperature = bot.config.temperature;
-        if !self.config.llm.data_egress_approved {
-            return Err(SeraError::Forbidden(
-                "hosted model data-egress consent is not configured".into(),
-            ));
-        }
+        self.checked_route(&state.route)?;
 
         for _ in 0..self.config.runtime.max_tool_iterations.max(1) {
             if self.shutdown.is_cancelled() {
                 return Err(SeraError::Internal("shutting down".into()));
             }
+            let route = self.checked_route(&state.route)?;
             self.scan_model_messages(&state.messages)?;
+            self.gateway
+                .scan_egress(&serde_json::to_string(&tool_specs)?)?;
             let response = self
-                .llm
-                .complete(&state.messages, &tool_specs, model.as_deref(), temperature)
+                .router
+                .complete(route, &state.messages, &tool_specs, temperature)
                 .await?;
+            self.store.record_audit(
+                "system",
+                "model.used",
+                None,
+                Some(&task.id),
+                None,
+                None,
+                Some(self.gateway.policy().version()),
+                Some(&json!({
+                    "provider": route.selection.provider, "model": route.selection.model,
+                    "usage": response.usage,
+                })),
+            )?;
             let assistant = response.message;
             if assistant.tool_calls.is_empty() {
                 let mut text = assistant.content.unwrap_or_default();
@@ -1086,7 +1187,15 @@ impl Runtime {
                 combined.push_str(content);
                 combined.push('\n');
             }
+            for value in [&message.name, &message.tool_call_id].into_iter().flatten() {
+                combined.push_str(value);
+                combined.push('\n');
+            }
             for call in &message.tool_calls {
+                combined.push_str(&call.id);
+                combined.push('\n');
+                combined.push_str(&call.name);
+                combined.push('\n');
                 combined.push_str(&call.arguments.to_string());
                 combined.push('\n');
             }
@@ -1095,11 +1204,24 @@ impl Runtime {
     }
 }
 
+fn validate_conversation_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b':'))
+    {
+        return Err(SeraError::Validation("invalid conversation id".into()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::BotConfig;
     use crate::gateway::{ApprovalDetails, ToolRegistry};
+    use crate::llm::LlmClient;
     use crate::store::Store;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -1213,6 +1335,7 @@ mod tests {
         let mut config = Config::default();
         config.llm.data_egress_approved = true;
         config.llm.base_url = server_uri.into();
+        config.llm.model = "test".into();
         config.base_dir = std::env::current_dir().unwrap();
         let config = Arc::new(config);
         let store = Store::open(
@@ -1233,17 +1356,232 @@ mod tests {
         let llm = LlmClient::new(server_uri, "test", 10, 100)
             .unwrap()
             .with_model("test");
+        let router = ModelRouter::new(
+            &config.llm,
+            std::collections::BTreeMap::from([("default".into(), llm)]),
+        )
+        .unwrap();
         let runtime = Runtime::new(
             config,
             store.clone(),
             gateway,
-            llm,
+            router,
             vec![bot()],
             notifier,
             CancellationToken::new(),
         )
         .unwrap();
         (runtime, store)
+    }
+
+    fn restart(runtime: &Runtime, config: Config, bots: Vec<LoadedBot>) -> Runtime {
+        let client = LlmClient::new(&config.llm.base_url, "test", 10, 100).unwrap();
+        let router = ModelRouter::new(
+            &config.llm,
+            std::collections::BTreeMap::from([("default".into(), client)]),
+        )
+        .unwrap();
+        Runtime::new(
+            Arc::new(config),
+            runtime.store.clone(),
+            runtime.gateway.clone(),
+            router,
+            bots,
+            runtime.notifier.clone(),
+            CancellationToken::new(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bot_defaults_catalog_and_unapproved_reads_are_preserved() {
+        let server = MockServer::start().await;
+        let (runtime, store) = setup(
+            &server.uri(),
+            Arc::new(Capture::default()),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let mut config = (*runtime.config).clone();
+        config
+            .llm
+            .bot_models
+            .insert("main".into(), "configured".into());
+        config.llm.models.push("alternative".into());
+        let runtime = restart(&runtime, config.clone(), vec![bot()]);
+        assert_eq!(
+            runtime.model_selection("owner", "main").unwrap().model,
+            "configured"
+        );
+        let mut loaded_bot = bot();
+        loaded_bot.config.model = Some("loaded".into());
+        config.llm.data_egress_approved = false;
+        let runtime = restart(&runtime, config, vec![loaded_bot]);
+        assert_eq!(
+            runtime.model_selection("owner", "main").unwrap().model,
+            "loaded"
+        );
+        assert_eq!(
+            runtime.model_catalog().unwrap()[0].models,
+            vec!["alternative", "configured", "loaded", "test"]
+        );
+        assert!(
+            runtime
+                .select_model(
+                    "owner",
+                    ModelSelection {
+                        provider: "default".into(),
+                        model: "test".into()
+                    }
+                )
+                .is_err()
+        );
+        assert!(runtime.submit_text("owner", "synthetic", None).is_err());
+        assert!(store.kv_get("model_selection:owner").unwrap().is_none());
+        assert!(runtime.submit_text("owner", "/brief", None).is_ok());
+        assert!(runtime.submit_text("owner", "/watch", None).is_ok());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn endpoint_changes_reject_queued_and_resumed_routes_before_effects() {
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (runtime, store) = setup(&first.uri(), Arc::new(Capture::default()), calls.clone());
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"choices":[{"message":{"tool_calls":[{
+                    "id":"call_1", "function":{"name":"upload", "arguments":"{\"dest\":\"folder\"}"}
+                }]}}]}),
+            ))
+            .expect(1)
+            .mount(&first)
+            .await;
+        let task = runtime.submit_text("owner", "synthetic", None).unwrap();
+        assert_eq!(
+            runtime.run_turn(&task).await.unwrap(),
+            TurnOutcome::Suspended
+        );
+        let mut config = (*runtime.config).clone();
+        config.llm.base_url = second.uri();
+        let changed = restart(&runtime, config, vec![bot()]);
+        assert!(changed.run_turn(&task).await.is_err());
+        let approval = store.list_pending_approvals(1).unwrap().remove(0);
+        runtime
+            .handle_approval(&approval.id, Decision::Once)
+            .await
+            .unwrap();
+        let turn = store.get_turn_by_task(&task.id).unwrap().unwrap();
+        let mut resume = task.clone();
+        resume.kind = "resume".into();
+        resume.payload =
+            json!({"turn_id":turn.id, "action_id":approval.action_id, "decision":"approved"});
+        assert!(changed.resume_turn(&resume).await.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(second.received_requests().await.unwrap().is_empty());
+        assert_eq!(first.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn conversation_selection_is_isolated_persisted_and_pinned_at_enqueue() {
+        let server = MockServer::start().await;
+        let (mut runtime, store) = setup(
+            &server.uri(),
+            Arc::new(Capture::default()),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        runtime.router.add_default_model("alternative").unwrap();
+        let initial = runtime.model_selection("one", "main").unwrap();
+        let task = runtime.submit_text("one", "synthetic", None).unwrap();
+        let alternative = ModelSelection {
+            provider: "default".into(),
+            model: "alternative".into(),
+        };
+        runtime.select_model("one", alternative.clone()).unwrap();
+        assert_eq!(runtime.model_selection("one", "main").unwrap(), alternative);
+        assert_eq!(runtime.model_selection("two", "main").unwrap(), initial);
+        let persisted: ModelSelection =
+            serde_json::from_str(&store.kv_get("model_selection:one").unwrap().unwrap()).unwrap();
+        assert_eq!(persisted, alternative);
+        let mut config = (*runtime.config).clone();
+        config.llm.models.push("alternative".into());
+        let runtime = restart(&runtime, config, vec![bot()]);
+        assert_eq!(runtime.model_selection("one", "main").unwrap(), alternative);
+        let payload: TurnPayload = serde_json::from_value(task.payload.clone()).unwrap();
+        assert_eq!(payload.route.unwrap().selection, initial);
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::body_partial_json(
+                json!({"model":"test"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"choices":[{"message":{"content":"ok"}}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        runtime.run_turn(&task).await.unwrap();
+        for id in ["", "../owner", "with space", "é", &"a".repeat(129)] {
+            assert!(runtime.model_selection(id, "main").is_err());
+            assert!(runtime.select_model(id, alternative.clone()).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_scans_catalog_selection_and_all_message_metadata() {
+        let server = MockServer::start().await;
+        let (mut runtime, store) = setup(
+            &server.uri(),
+            Arc::new(Capture::default()),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        runtime.gateway = Gateway::new(
+            store.clone(),
+            Arc::new(crate::policy::Policy::from_text("restricted")),
+            ToolRegistry::default(),
+            1,
+            false,
+        );
+        runtime.router.add_default_model("restricted").unwrap();
+        assert!(runtime.model_catalog().is_err());
+        let selection = ModelSelection {
+            provider: "default".into(),
+            model: "restricted".into(),
+        };
+        assert!(runtime.select_model("owner", selection.clone()).is_err());
+        assert!(store.kv_get("model_selection:owner").unwrap().is_none());
+        store
+            .kv_set(
+                "model_selection:owner",
+                &serde_json::to_string(&selection).unwrap(),
+            )
+            .unwrap();
+        assert!(runtime.model_selection("owner", "main").is_err());
+        let mut message = LlmMessage::user("safe");
+        message.name = Some("restricted".into());
+        assert!(runtime.scan_model_messages(&[message]).is_err());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_unpinned_tasks_fail_closed() {
+        let server = MockServer::start().await;
+        let (runtime, store) = setup(
+            &server.uri(),
+            Arc::new(Capture::default()),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let task = store
+            .enqueue_task(
+                "turn",
+                "main",
+                &json!({"conversation_id":"owner","text":"synthetic","bot":"main"}),
+                0,
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(runtime.run_turn(&task).await.is_err());
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1297,13 +1635,23 @@ mod tests {
             .await;
         let notifier = Arc::new(Capture::default());
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (runtime, store) = setup(&server.uri(), notifier.clone(), calls.clone());
+        let (mut runtime, store) = setup(&server.uri(), notifier.clone(), calls.clone());
+        runtime.router.add_default_model("alternative").unwrap();
         runtime.submit_text("owner", "deliver it", None).unwrap();
         let task = store.claim_task("test", 30).unwrap().unwrap();
         runtime.process_task(task).await.unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         let approvals = store.list_pending_approvals(10).unwrap();
         assert_eq!(approvals.len(), 1);
+        runtime
+            .select_model(
+                "owner",
+                ModelSelection {
+                    provider: "default".into(),
+                    model: "alternative".into(),
+                },
+            )
+            .unwrap();
         runtime
             .handle_approval(&approvals[0].id, Decision::Once)
             .await
@@ -1321,5 +1669,13 @@ mod tests {
                 .any(|text| text == "delivered")
         );
         assert!(store.list_pending_approvals(10).unwrap().is_empty());
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&request.body).unwrap()["model"],
+                "test"
+            );
+        }
     }
 }

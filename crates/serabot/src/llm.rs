@@ -51,11 +51,10 @@ impl LlmClient {
         timeout_secs: u64,
         max_output_tokens: u32,
     ) -> Result<Self> {
-        let base_url = base_url.into().trim_end_matches('/').to_owned();
-        if !base_url.starts_with("https://") && !base_url.starts_with("http://127.0.0.1") {
-            return Err(SeraError::Config(
-                "llm.base_url must use https (localhost is allowed for tests)".into(),
-            ));
+        let base_url = validate_base_url(&base_url.into())?;
+        let api_key = api_key.into();
+        if api_key.trim().is_empty() {
+            return Err(SeraError::Config("LLM credential is missing".into()));
         }
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs.max(1)))
@@ -65,7 +64,7 @@ impl LlmClient {
         Ok(Self {
             http,
             base_url,
-            api_key: SecretString::new(api_key.into()),
+            api_key: SecretString::new(api_key),
             model: String::new(),
             max_output_tokens,
             max_retries: 2,
@@ -75,6 +74,10 @@ impl LlmClient {
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
         self
+    }
+
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     pub async fn complete(
@@ -157,6 +160,42 @@ impl LlmClient {
         }
         Err(last_error.unwrap_or_else(|| SeraError::External("LLM request failed".into())))
     }
+}
+
+pub(crate) fn validate_base_url(value: &str) -> Result<String> {
+    let invalid = || {
+        SeraError::Config("LLM endpoint must be HTTPS (exact loopback HTTP is allowed for fixtures), without credentials, query or fragment".into())
+    };
+    let url = url::Url::parse(value).map_err(|_| invalid())?;
+    // URL parsing normalizes aliases and drops empty userinfo; reject those in the
+    // original authority as well, rather than relying on normalized host prefixes.
+    let authority = value
+        .split_once("://")
+        .ok_or_else(invalid)?
+        .1
+        .split(['/', '?', '#'])
+        .next()
+        .ok_or_else(invalid)?;
+    let exact_loopback = authority == "127.0.0.1"
+        || authority.starts_with("127.0.0.1:")
+        || authority == "[::1]"
+        || authority.starts_with("[::1]:");
+    let loopback = matches!(url.host(), Some(url::Host::Ipv4(ip)) if ip == std::net::Ipv4Addr::LOCALHOST)
+        || matches!(url.host(), Some(url::Host::Ipv6(ip)) if ip == std::net::Ipv6Addr::LOCALHOST);
+    if url.host().is_none()
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+        || value.contains('\\')
+        || authority.contains('@')
+        || !(url.scheme() == "https" || (url.scheme() == "http" && loopback && exact_loopback))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 
 fn message_to_json(message: &LlmMessage) -> Value {
@@ -356,9 +395,26 @@ mod tests {
         assert_eq!(response.message.tool_calls[0].name, "rag_search");
     }
 
-    #[tokio::test]
-    async fn rejects_private_base_url_without_https() {
-        assert!(LlmClient::new("http://api.example.com", "secret", 10, 100).is_err());
+    #[test]
+    fn rejects_unsafe_endpoints_and_empty_credentials() {
+        for url in [
+            "http://api.example.com",
+            "http://127.0.0.1.evil",
+            "https://user:password@example.com",
+            "https://@example.com",
+            "http://127.1",
+            "http://2130706433",
+            "https://example.com?key=secret",
+            "https://example.com#fragment",
+        ] {
+            assert!(
+                LlmClient::new(url, "secret", 10, 100).is_err(),
+                "accepted {url}"
+            );
+        }
+        assert!(LlmClient::new("https://example.com", "", 10, 100).is_err());
+        assert!(LlmClient::new("http://127.0.0.1:8080/v1", "fixture", 10, 100).is_ok());
+        assert!(LlmClient::new("http://[::1]:8080/v1", "fixture", 10, 100).is_ok());
     }
 
     #[tokio::test]

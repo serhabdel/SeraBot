@@ -13,6 +13,7 @@ pub mod gateway;
 pub mod llm;
 pub mod maker;
 pub mod memory;
+pub mod model_router;
 pub mod onedrive;
 pub mod policy;
 pub mod render;

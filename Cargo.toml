@@ -1,5 +1,6 @@
 [workspace]
-members = ["crates/serabot"]
+members = ["crates/serabot", "crates/serabot-desktop"]
+default-members = ["crates/serabot"]
 resolver = "2"
 
 [workspace.package]

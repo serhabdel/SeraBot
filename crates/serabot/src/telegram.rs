@@ -356,6 +356,10 @@ impl TelegramClient {
                     .await;
                 return Ok(());
             }
+            if let Some(reply) = model_command(runtime, &message.chat.id.to_string(), text)? {
+                self.send_message(self.owner_chat_id, &reply).await?;
+                return Ok(());
+            }
             match text {
                 "/start" => {
                     self.send_message(
@@ -422,6 +426,8 @@ impl TelegramClient {
                          /timesheets <request> — timesheet analysis\n\
                          /brief — morning brief\n\
                          /status — queue and approvals\n\
+                         /models — configured providers and models\n\
+                         /model <provider> <model> — select for this conversation\n\
                          /approvals — resend pending approvals\n\
                          /approve-deck <sha256> — approve Italian deck content for French\n\
                          /revoke — revoke all standing grants",
@@ -605,6 +611,56 @@ pub struct CallbackQuery {
     pub message: Option<TelegramMessage>,
 }
 
+fn model_command(runtime: &Runtime, conversation_id: &str, text: &str) -> Result<Option<String>> {
+    let parts: Vec<_> = text.split_whitespace().collect();
+    let reply = match parts.as_slice() {
+        ["/models"] => {
+            let mut reply = String::from("Configured providers and models:\n");
+            for provider in runtime.model_catalog()? {
+                let state = if provider.data_egress_approved {
+                    "approved"
+                } else {
+                    "data sharing not approved"
+                };
+                reply.push_str(&format!(
+                    "{} ({state}): {}\n",
+                    provider.id,
+                    provider.models.join(", ")
+                ));
+            }
+            reply.push_str("\n/model <provider> <model> selects for this conversation. Future turns include this conversation's history; running turns keep their original selection.");
+            reply
+        }
+        ["/model"] => {
+            let selection = runtime.model_selection(conversation_id, "main")?;
+            format!(
+                "Current selection: {} / {}\nUse /models to list configured choices.",
+                selection.provider, selection.model
+            )
+        }
+        ["/model", provider, model] => {
+            match runtime.select_model(conversation_id, crate::model_router::ModelSelection {
+                provider: (*provider).to_owned(), model: (*model).to_owned(),
+            }) {
+                Ok(selection) => format!("Selected {} / {} for future turns in this conversation. Existing history will be sent to this provider. Running turns are unchanged.", selection.provider, selection.model),
+                Err(SeraError::Validation(_) | SeraError::NotFound(_)) => "Unknown provider or model. Use /models to see configured choices.".into(),
+                Err(SeraError::Forbidden(_)) => "This provider is not approved for data sharing. Configure approval on the server before selecting it.".into(),
+                Err(SeraError::PolicyViolation) => "Selection blocked by content policy.".into(),
+                Err(error) => return Err(error),
+            }
+        }
+        ["/model", ..] | ["/models", ..] => {
+            "Usage: /models, /model, or /model <provider> <model>".into()
+        }
+        [command, ..] if command.starts_with("/model@") || command.starts_with("/models@") => {
+            "Use /model or /models without an @username in the configured owner chat.".into()
+        }
+        _ => return Ok(None),
+    };
+    runtime.scan_owner_output(&reply)?;
+    Ok(Some(reply))
+}
+
 fn parse_callback(data: &str) -> Option<(Decision, &str)> {
     let mut parts = data.splitn(3, ':');
     if parts.next()? != "ap" {
@@ -665,6 +721,120 @@ mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn model_runtime() -> (Runtime, Store) {
+        use crate::config::{BotConfig, Config, LoadedBot};
+        use crate::gateway::{Gateway, ToolRegistry};
+        use crate::llm::LlmClient;
+        use crate::model_router::ModelRouter;
+        use crate::policy::Policy;
+        let mut config = Config::default();
+        config.llm.model = "test".into();
+        config.llm.base_url = "https://example.com/v1".into();
+        config.llm.models = vec!["alternative".into()];
+        config.llm.data_egress_approved = true;
+        let store = Store::open_in_memory(384).unwrap();
+        let llm = LlmClient::new("https://example.com/v1", "synthetic-key", 5, 100)
+            .unwrap()
+            .with_model("test");
+        let router = ModelRouter::new(
+            &config.llm,
+            std::collections::BTreeMap::from([("default".into(), llm)]),
+        )
+        .unwrap();
+        let bot = LoadedBot {
+            config: BotConfig {
+                name: "main".into(),
+                trigger: "command".into(),
+                model: None,
+                system_prompt: "unused".into(),
+                skills: vec![],
+                tools: vec![],
+                require_approval: vec![],
+                enabled: true,
+                temperature: None,
+            },
+            prompt: "test".into(),
+        };
+        let runtime = Runtime::new(
+            Arc::new(config),
+            store.clone(),
+            Gateway::new(
+                store.clone(),
+                Arc::new(Policy::empty()),
+                ToolRegistry::default(),
+                1,
+                false,
+            ),
+            router,
+            vec![bot],
+            Arc::new(crate::runtime::NullNotifier),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        (runtime, store)
+    }
+
+    #[test]
+    fn model_commands_list_select_and_keep_conversations_separate() {
+        let (runtime, store) = model_runtime();
+        let listing = model_command(&runtime, "20", "/models").unwrap().unwrap();
+        assert!(listing.contains("default"));
+        assert!(listing.contains("alternative"));
+        assert!(!listing.contains("synthetic-key"));
+        assert!(!listing.contains("example.com"));
+        let reply = model_command(&runtime, "20", "/model default alternative")
+            .unwrap()
+            .unwrap();
+        assert!(reply.contains("alternative"));
+        assert_eq!(
+            runtime.model_selection("20", "main").unwrap().model,
+            "alternative"
+        );
+        assert_eq!(runtime.model_selection("21", "main").unwrap().model, "test");
+        assert_eq!(store.pending_task_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn malformed_model_commands_do_not_change_selection_or_capture_other_commands() {
+        let (runtime, _) = model_runtime();
+        for command in [
+            "/model missing unknown",
+            "/model default",
+            "/model default alternative extra",
+        ] {
+            assert!(model_command(&runtime, "20", command).unwrap().is_some());
+            assert_eq!(runtime.model_selection("20", "main").unwrap().model, "test");
+        }
+        assert!(
+            model_command(&runtime, "20", "/model@ExampleBot default alternative")
+                .unwrap()
+                .unwrap()
+                .contains("without an @username")
+        );
+        assert_eq!(runtime.model_selection("20", "main").unwrap().model, "test");
+        assert!(
+            model_command(&runtime, "20", "/modeling")
+                .unwrap()
+                .is_none()
+        );
+        assert!(model_command(&runtime, "20", "hello").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn unauthorized_model_command_cannot_change_selection() {
+        let (runtime, store) = model_runtime();
+        let client = TelegramClient::new("123:abc", 10, 20).unwrap();
+        let update: Update = serde_json::from_value(json!({
+            "update_id": 991,
+            "message": {"message_id": 1, "chat": {"id":20}, "from":{"id":99}, "text":"/model default alternative"}
+        })).unwrap();
+        client
+            .handle_update(&runtime, &store, None, update)
+            .await
+            .unwrap();
+        assert_eq!(runtime.model_selection("20", "main").unwrap().model, "test");
+    }
 
     #[test]
     fn parses_approval_callbacks() {

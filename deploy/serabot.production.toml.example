@@ -40,6 +40,15 @@ timeout_secs = 120
 max_tool_rounds = 6
 max_output_tokens = 4096
 data_egress_approved = false
+# Extra allowed models for the reserved "default" provider (no network discovery).
+models = []
+# Optional synthetic profile: requires its encrypted key at startup.
+# Consent must be explicitly approved independently of conversation selection.
+# [llm.providers.secondary]
+# base_url = "https://api.example.com/v1"
+# api_key_secret = "secondary_llm_key"
+# models = ["example-model"]
+# data_egress_approved = false
 
 [embeddings]
 model = "multilingual-e5-small"

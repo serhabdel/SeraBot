@@ -272,6 +272,20 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.llm.max_output_tokens,
     )?
     .with_model(&config.llm.model);
+    let mut clients = std::collections::BTreeMap::from([("default".to_owned(), llm)]);
+    for (id, provider) in &config.llm.providers {
+        let api_key = secrets.require(&provider.api_key_secret)?;
+        clients.insert(
+            id.clone(),
+            LlmClient::new(
+                &provider.base_url,
+                api_key,
+                config.llm.timeout_secs,
+                config.llm.max_output_tokens,
+            )?,
+        );
+    }
+    let router = serabot::model_router::ModelRouter::new(&config.llm, clients)?;
 
     let embedder: Arc<dyn Embedder> = Arc::new(LazyEmbedder::new(
         &config.embeddings,
@@ -377,7 +391,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.clone(),
         store.clone(),
         gateway,
-        llm,
+        router,
         bots,
         notifier,
         shutdown.clone(),

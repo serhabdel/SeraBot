@@ -245,6 +245,37 @@ impl Store {
         Ok(messages)
     }
 
+    pub fn list_visible_messages(
+        &self,
+        conversation_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, conversation_id, turn_id, role, content, created_at
+             FROM messages WHERE conversation_id = ?1 AND role IN ('user', 'assistant')
+             ORDER BY created_at DESC, rowid DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(
+            params![conversation_id, limit.clamp(1, 200) as i64],
+            |row| {
+                Ok(StoredMessage {
+                    id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    turn_id: row.get(2)?,
+                    role: parse_role(&row.get::<_, String>(3)?),
+                    content: row.get(4)?,
+                    name: None,
+                    tool_call_id: None,
+                    created_at: parse_datetime(&row.get::<_, String>(5)?),
+                })
+            },
+        )?;
+        let mut messages = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        messages.reverse();
+        Ok(messages)
+    }
+
     pub fn history_for_llm(&self, conversation_id: &str, limit: usize) -> Result<Vec<LlmMessage>> {
         Ok(self
             .list_messages(conversation_id, limit)?
@@ -1026,6 +1057,49 @@ mod tests {
             5000,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn visible_history_filters_before_limiting_and_orders_timestamp_ties() {
+        let store = store();
+        let first = store
+            .append_message("owner", None, Role::User, "first")
+            .unwrap();
+        let second = store
+            .append_message("owner", None, Role::Assistant, "second")
+            .unwrap();
+        store
+            .append_message("owner", None, Role::System, "hidden")
+            .unwrap();
+        store
+            .append_message("owner", None, Role::Tool, "internal")
+            .unwrap();
+        store
+            .append_message("other", None, Role::User, "other")
+            .unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET created_at = '2026-01-01T00:00:00.000Z'",
+                [],
+            )
+            .unwrap();
+        let messages = store.list_visible_messages("owner", 2).unwrap();
+        assert_eq!(
+            messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![first.id.as_str(), second.id.as_str()]
+        );
+        assert_eq!(
+            store.list_visible_messages("owner", 1).unwrap()[0].id,
+            second.id
+        );
+        assert!(
+            store
+                .list_visible_messages("absent", 100)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
