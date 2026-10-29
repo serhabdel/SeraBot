@@ -1544,6 +1544,12 @@ impl ApiClient {
             return Err(ApiError::TooLarge);
         }
         if !status.is_success() {
+            // Keep auth and rate-limit statuses intact for the session's
+            // token-rejection and back-off paths. Other server errors may have
+            // applied the write, so they must stay "unknown".
+            if !matches!(status.as_u16(), 404 | 409 | 422) {
+                return Err(ApiError::Http(status.as_u16()));
+            }
             if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 if let Some(message) = value.get("error").and_then(|value| value.as_str()) {
                     if !message.is_empty()

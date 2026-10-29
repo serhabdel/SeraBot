@@ -507,6 +507,43 @@ fn unexpected_roles_and_overlong_history_are_rejected() {
 }
 
 #[test]
+fn admin_rejections_keep_auth_status_and_surface_safe_messages() {
+    use serabot_desktop::NewProvider;
+    let provider = NewProvider {
+        id: "work".into(),
+        kind: "openai-compatible".into(),
+        base_url: "https://api.example.com/v1".into(),
+        models: vec!["model-a".into()],
+        api_key_secret: "WORK_API_KEY".into(),
+        catalog_fetch: false,
+        api_key: None,
+    };
+    let (client, handle) = server(vec![
+        (401, r#"{"error":"unauthorized"}"#.into()),
+        (
+            422,
+            r#"{"error":"secret WORK_API_KEY is empty; provide an API key","code":"admin"}"#.into(),
+        ),
+        (201, r#"{"saved":true,"restart_required":true}"#.into()),
+    ]);
+    assert!(matches!(
+        client.admin_remove_provider("work"),
+        Err(ApiError::Http(401))
+    ));
+    match client.admin_add_provider(&provider).unwrap_err() {
+        ApiError::Rejected(message) => assert!(message.contains("WORK_API_KEY")),
+        other => panic!("expected a safe rejection, got {other:?}"),
+    }
+    assert!(
+        client
+            .admin_add_provider(&provider)
+            .unwrap()
+            .restart_required
+    );
+    handle.join().unwrap();
+}
+
+#[test]
 fn dropped_submit_response_is_unknown_and_never_resent() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = validate_endpoint(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
