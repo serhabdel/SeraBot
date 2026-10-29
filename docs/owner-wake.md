@@ -65,6 +65,11 @@ systemctl status serabot --no-pager
 journalctl -u serabot -n 50 --no-pager
 ```
 
+If `journalctl` shows a Telegram `getUpdates` URL from a build before token
+redaction, rotate that bot token in BotFather and `secrets set` it under the
+configured secret name (default `telegram_bot_token`). Do not copy the journal
+line into chat, tickets, or git.
+
 Build the release on Ubuntu 24.04 glibc, not a newer WSL userland ([deployment.md](deployment.md)).
 
 ## Configure later

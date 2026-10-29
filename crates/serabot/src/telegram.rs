@@ -57,7 +57,7 @@ impl TelegramClient {
             .timeout(Duration::from_secs(45))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|error| SeraError::External(error.to_string()))?;
+            .map_err(|error| telegram_http_error("HTTP client", error))?;
         Ok(Self {
             http,
             base_url: "https://api.telegram.org".into(),
@@ -100,19 +100,12 @@ impl TelegramClient {
             }))
             .send()
             .await
-            .map_err(|error| SeraError::External(format!("Telegram getUpdates failed: {error}")))?
+            .map_err(|error| telegram_http_error("getUpdates failed", error))?
             .json()
             .await
-            .map_err(|error| {
-                SeraError::External(format!("Telegram getUpdates response: {error}"))
-            })?;
+            .map_err(|error| telegram_http_error("getUpdates response", error))?;
         if !response.ok {
-            return Err(SeraError::External(format!(
-                "Telegram getUpdates rejected: {}",
-                response
-                    .description
-                    .unwrap_or_else(|| "unknown error".into())
-            )));
+            return Err(telegram_rejected("getUpdates", response.description));
         }
         Ok(response.result.unwrap_or_default())
     }
@@ -124,21 +117,12 @@ impl TelegramClient {
             .json(&json!({ "commands": bot_commands() }))
             .send()
             .await
-            .map_err(|error| {
-                SeraError::External(format!("Telegram setMyCommands failed: {error}"))
-            })?
+            .map_err(|error| telegram_http_error("setMyCommands failed", error))?
             .json()
             .await
-            .map_err(|error| {
-                SeraError::External(format!("Telegram setMyCommands response: {error}"))
-            })?;
+            .map_err(|error| telegram_http_error("setMyCommands response", error))?;
         if !response.ok {
-            return Err(SeraError::External(format!(
-                "Telegram setMyCommands rejected: {}",
-                response
-                    .description
-                    .unwrap_or_else(|| "unknown error".into())
-            )));
+            return Err(telegram_rejected("setMyCommands", response.description));
         }
         Ok(())
     }
@@ -177,19 +161,12 @@ impl TelegramClient {
             .json(&body)
             .send()
             .await
-            .map_err(|error| SeraError::External(format!("Telegram sendMessage failed: {error}")))?
+            .map_err(|error| telegram_http_error("sendMessage failed", error))?
             .json()
             .await
-            .map_err(|error| {
-                SeraError::External(format!("Telegram sendMessage response: {error}"))
-            })?;
+            .map_err(|error| telegram_http_error("sendMessage response", error))?;
         if !response.ok {
-            return Err(SeraError::External(format!(
-                "Telegram sendMessage rejected: {}",
-                response
-                    .description
-                    .unwrap_or_else(|| "unknown error".into())
-            )));
+            return Err(telegram_rejected("sendMessage", response.description));
         }
         Ok(())
     }
@@ -237,19 +214,12 @@ impl TelegramClient {
             }))
             .send()
             .await
-            .map_err(|error| {
-                SeraError::External(format!("Telegram approval send failed: {error}"))
-            })?
+            .map_err(|error| telegram_http_error("approval send failed", error))?
             .json()
             .await
-            .map_err(|error| SeraError::External(format!("Telegram approval response: {error}")))?;
+            .map_err(|error| telegram_http_error("approval response", error))?;
         if !response.ok {
-            return Err(SeraError::External(format!(
-                "Telegram approval rejected: {}",
-                response
-                    .description
-                    .unwrap_or_else(|| "unknown error".into())
-            )));
+            return Err(telegram_rejected("approval", response.description));
         }
         Ok(())
     }
@@ -265,12 +235,10 @@ impl TelegramClient {
             }))
             .send()
             .await
-            .map_err(|error| {
-                SeraError::External(format!("Telegram callback answer failed: {error}"))
-            })?
+            .map_err(|error| telegram_http_error("callback answer failed", error))?
             .json()
             .await
-            .map_err(|error| SeraError::External(format!("Telegram callback response: {error}")))?;
+            .map_err(|error| telegram_http_error("callback response", error))?;
         Ok(())
     }
 
@@ -284,17 +252,12 @@ impl TelegramClient {
             .json(&json!({"file_id": file_id}))
             .send()
             .await
-            .map_err(|error| SeraError::External(format!("Telegram getFile failed: {error}")))?
+            .map_err(|error| telegram_http_error("getFile failed", error))?
             .json()
             .await
-            .map_err(|error| SeraError::External(format!("Telegram getFile response: {error}")))?;
+            .map_err(|error| telegram_http_error("getFile response", error))?;
         if !response.ok {
-            return Err(SeraError::External(format!(
-                "Telegram getFile rejected: {}",
-                response
-                    .description
-                    .unwrap_or_else(|| "unknown error".into())
-            )));
+            return Err(telegram_rejected("getFile", response.description));
         }
         let file = response
             .result
@@ -321,9 +284,12 @@ impl TelegramClient {
             self.token.expose_secret(),
             file_path
         );
-        let response = self.http.get(&url).send().await.map_err(|error| {
-            SeraError::External(format!("Telegram file download failed: {error}"))
-        })?;
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|error| telegram_http_error("file download failed", error))?;
         if !response.status().is_success() {
             return Err(SeraError::External(format!(
                 "Telegram file download failed with status {}",
@@ -333,7 +299,7 @@ impl TelegramClient {
         let bytes = response
             .bytes()
             .await
-            .map_err(|error| SeraError::External(format!("Telegram file read failed: {error}")))?;
+            .map_err(|error| telegram_http_error("file read failed", error))?;
         if bytes.len() as u64 > max_bytes {
             return Err(SeraError::Validation(format!(
                 "Telegram file exceeds configured limit of {max_bytes} bytes"
@@ -361,7 +327,7 @@ impl TelegramClient {
                 safe_name
             })
             .mime_str("application/pdf")
-            .map_err(|error| SeraError::External(error.to_string()))?;
+            .map_err(|error| telegram_http_error("sendDocument mime", error))?;
         let form = reqwest::multipart::Form::new()
             .text("chat_id", chat_id.to_string())
             .text("caption", caption.chars().take(1000).collect::<String>())
@@ -372,19 +338,12 @@ impl TelegramClient {
             .multipart(form)
             .send()
             .await
-            .map_err(|error| SeraError::External(format!("Telegram sendDocument failed: {error}")))?
+            .map_err(|error| telegram_http_error("sendDocument failed", error))?
             .json()
             .await
-            .map_err(|error| {
-                SeraError::External(format!("Telegram sendDocument response: {error}"))
-            })?;
+            .map_err(|error| telegram_http_error("sendDocument response", error))?;
         if !response.ok {
-            return Err(SeraError::External(format!(
-                "Telegram sendDocument rejected: {}",
-                response
-                    .description
-                    .unwrap_or_else(|| "unknown error".into())
-            )));
+            return Err(telegram_rejected("sendDocument", response.description));
         }
         Ok(())
     }
@@ -1152,6 +1111,264 @@ fn split_message(text: &str) -> Vec<String> {
     parts
 }
 
+/// Map a Telegram HTTP failure without putting the request URL on the error.
+///
+/// Reqwest's `Display` appends ` for url (https://api.telegram.org/bot<token>/...)`.
+/// `without_url` drops that URL before the string is built. `redact_for_log` still
+/// runs so a leftover `bot<token>` segment or Authorization value cannot be logged.
+fn telegram_http_error(context: &str, error: reqwest::Error) -> SeraError {
+    let rendered = error.without_url();
+    SeraError::External(redact_for_log(&format!("Telegram {context}: {rendered}")))
+}
+
+fn telegram_rejected(context: &str, description: Option<String>) -> SeraError {
+    let detail = description.unwrap_or_else(|| "unknown error".into());
+    SeraError::External(redact_for_log(&format!(
+        "Telegram {context} rejected: {detail}"
+    )))
+}
+
+/// Remove Bot API tokens and Authorization material from text that may be logged.
+///
+/// Call this before the string is stored on an error or formatted into the journal.
+fn redact_for_log(text: &str) -> String {
+    let without_urls = strip_reqwest_urls(text);
+    let without_headers = redact_authorization_headers(&without_urls);
+    let without_schemes = redact_scheme_tokens(&without_headers);
+    let without_query = redact_query_secrets(&without_schemes);
+    redact_bot_segments(&without_query)
+}
+
+/// Reqwest writes ` for url (<request-url>)`. Telegram puts the bot token in that URL.
+fn strip_reqwest_urls(text: &str) -> String {
+    const MARKER: &str = " for url (";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find(MARKER) {
+        out.push_str(&rest[..index]);
+        let after = &rest[index + MARKER.len()..];
+        if let Some(end) = after.find(')') {
+            rest = &after[end + 1..];
+        } else {
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn redact_authorization_headers(text: &str) -> String {
+    const NEEDLE: &str = "authorization";
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while let Some(rel) = lower[i..].find(NEEDLE) {
+        let start = i + rel;
+        let prev_ok = start == 0 || !text.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let after = start + NEEDLE.len();
+        if !prev_ok {
+            out.push_str(&text[i..after]);
+            i = after;
+            continue;
+        }
+        let rest = &text[after..];
+        let ws = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+        let after_ws = &rest[ws..];
+        if after_ws.starts_with(':') || after_ws.starts_with('=') {
+            let value = &after_ws[1..];
+            let value_ws = value.len() - value.trim_start_matches([' ', '\t']).len();
+            let value_body = &value[value_ws..];
+            let value_len = value_body.find(['\r', '\n']).unwrap_or(value_body.len());
+            out.push_str(&text[i..start]);
+            out.push_str("Authorization: <redacted>");
+            i = after + ws + 1 + value_ws + value_len;
+            continue;
+        }
+        out.push_str(&text[i..after]);
+        i = after;
+    }
+    out.push_str(&text[i..]);
+    out
+}
+
+fn redact_scheme_tokens(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if let Some((scheme_len, secret_end)) = scheme_token_at(text, &lower, i) {
+            out.push_str(&text[i..i + scheme_len]);
+            out.push_str(" <redacted>");
+            i = secret_end;
+            continue;
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn scheme_token_at(text: &str, lower: &str, i: usize) -> Option<(usize, usize)> {
+    const SCHEMES: [&str; 2] = ["bearer", "basic"];
+    for scheme in SCHEMES {
+        if !lower[i..].starts_with(scheme) {
+            continue;
+        }
+        if i > 0 && text.as_bytes()[i - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        let after = i + scheme.len();
+        let rest = text.get(after..)?;
+        if !rest.starts_with(' ') && !rest.starts_with('\t') {
+            continue;
+        }
+        let ws = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+        let secret = &rest[ws..];
+        if secret.is_empty() || secret.starts_with(['\r', '\n']) {
+            continue;
+        }
+        let secret_len = secret
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(secret.len());
+        if secret_len == 0 {
+            continue;
+        }
+        return Some((scheme.len(), after + ws + secret_len));
+    }
+    None
+}
+
+fn redact_query_secrets(text: &str) -> String {
+    const NAMES: [&str; 7] = [
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "bot_token",
+        "api_key",
+        "apikey",
+        "token",
+    ];
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        let mut matched = false;
+        for name in NAMES {
+            if lower[i..].starts_with(name)
+                && text[i + name.len()..].starts_with('=')
+                && query_name_boundary(text, i, name)
+            {
+                out.push_str(&text[i..i + name.len()]);
+                out.push_str("=<redacted>");
+                let mut j = i + name.len() + 1;
+                let bytes = text.as_bytes();
+                while j < bytes.len() && !is_query_value_end(bytes[j]) {
+                    j += 1;
+                }
+                i = j;
+                matched = true;
+                break;
+            }
+        }
+        if matched {
+            continue;
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn query_name_boundary(text: &str, i: usize, name: &str) -> bool {
+    if i == 0 {
+        return name != "token";
+    }
+    let prev = text[..i].chars().next_back().unwrap();
+    if name == "token" {
+        return prev == '?' || prev == '&' || prev == ';';
+    }
+    !prev.is_ascii_alphanumeric() && prev != '_'
+}
+
+fn is_query_value_end(byte: u8) -> bool {
+    byte.is_ascii_whitespace()
+        || matches!(byte, b'&' | b'#' | b'"' | b'\'' | b')' | b'<' | b'>' | b',')
+}
+
+fn redact_bot_segments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if let Some(end) = bot_token_end(text, i) {
+            out.push_str("bot<redacted>");
+            i = end;
+            continue;
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// `bot<digits>:<secret>` as used in `/bot<token>/method` and `/file/bot<token>/...`.
+fn bot_token_end(text: &str, i: usize) -> Option<usize> {
+    let rest = text.get(i..)?;
+    let mut letters = rest.chars();
+    let (b, o, t) = (letters.next()?, letters.next()?, letters.next()?);
+    if !b.eq_ignore_ascii_case(&'b')
+        || !o.eq_ignore_ascii_case(&'o')
+        || !t.eq_ignore_ascii_case(&'t')
+    {
+        return None;
+    }
+    if !bot_segment_boundary(text, i) {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut j = i + 3;
+    if j >= bytes.len() || !bytes[j].is_ascii_digit() {
+        return None;
+    }
+    while j < bytes.len() && bytes[j].is_ascii_digit() {
+        j += 1;
+    }
+    if text[j..].starts_with("%3A") || text[j..].starts_with("%3a") {
+        j += 3;
+    } else if text[j..].starts_with(':') {
+        j += 1;
+    } else {
+        return None;
+    }
+    let secret_start = j;
+    while j < bytes.len() && is_bot_secret_char(bytes[j]) {
+        j += 1;
+    }
+    if j == secret_start {
+        return None;
+    }
+    Some(j)
+}
+
+fn bot_segment_boundary(text: &str, i: usize) -> bool {
+    if i == 0 {
+        return true;
+    }
+    if text[..i].ends_with('/') || text[..i].ends_with("%2F") || text[..i].ends_with("%2f") {
+        return true;
+    }
+    match text[..i].chars().next_back() {
+        Some(prev) => !prev.is_ascii_alphanumeric(),
+        None => true,
+    }
+}
+
+fn is_bot_secret_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1443,5 +1660,69 @@ mod tests {
             update.message.as_ref().unwrap().from.as_ref().unwrap().id,
             update.message.as_ref().unwrap().chat.id
         ));
+    }
+
+    #[test]
+    fn telegram_api_url_is_redacted_before_log_formatting() {
+        const TOKEN: &str = "000000:FAKE";
+        let sample = format!(
+            "error sending request for url (https://api.telegram.org/bot{TOKEN}/getUpdates)"
+        );
+        let logged = format!("Telegram getUpdates failed: {}", redact_for_log(&sample));
+        assert!(!logged.contains(TOKEN), "{logged}");
+        assert!(!logged.contains("bot000000"), "{logged}");
+        assert!(!logged.contains("https://"), "{logged}");
+        assert!(logged.contains("Telegram getUpdates failed"), "{logged}");
+
+        let bare = redact_for_log(&format!("https://api.telegram.org/bot{TOKEN}/getUpdates"));
+        let bare_logged = format!("Telegram getUpdates failed: {bare}");
+        assert!(!bare_logged.contains(TOKEN), "{bare_logged}");
+        assert!(
+            bare_logged.contains("/bot<redacted>/getUpdates"),
+            "{bare_logged}"
+        );
+
+        let file = redact_for_log(&format!(
+            "https://api.telegram.org/file/bot{TOKEN}/voice/note.ogg"
+        ));
+        assert!(!file.contains(TOKEN), "{file}");
+        assert!(
+            file.contains("/file/bot<redacted>/voice/note.ogg"),
+            "{file}"
+        );
+
+        let encoded = redact_for_log("https://api.telegram.org/bot000000%3AFAKE/getUpdates");
+        assert!(!encoded.contains("FAKE"), "{encoded}");
+        assert!(encoded.contains("/bot<redacted>/getUpdates"), "{encoded}");
+
+        let header = redact_for_log(&format!("Authorization: Bearer {TOKEN}"));
+        assert!(!header.contains(TOKEN), "{header}");
+        assert_eq!(header, "Authorization: <redacted>");
+
+        let bearer = redact_for_log(&format!("upstream said Bearer {TOKEN} today"));
+        assert!(!bearer.contains(TOKEN), "{bearer}");
+        assert!(bearer.contains("Bearer <redacted>"), "{bearer}");
+
+        let query = redact_for_log(&format!(
+            "https://example.test/cb?access_token={TOKEN}&ok=1"
+        ));
+        assert!(!query.contains(TOKEN), "{query}");
+        assert!(query.contains("access_token=<redacted>&ok=1"), "{query}");
+
+        let rejected = telegram_rejected(
+            "getUpdates",
+            Some(format!(
+                "Bad Request: https://api.telegram.org/bot{TOKEN}/getUpdates"
+            )),
+        );
+        let rejected_log = rejected.to_string();
+        assert!(!rejected_log.contains(TOKEN), "{rejected_log}");
+        assert!(rejected_log.contains("bot<redacted>"), "{rejected_log}");
+
+        assert_eq!(
+            redact_for_log("error sending request"),
+            "error sending request"
+        );
+        assert_eq!(redact_for_log("botanical both:no"), "botanical both:no");
     }
 }

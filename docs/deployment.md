@@ -102,6 +102,14 @@ printf '%s' "$KEY" | runuser -u serabot -- /opt/serabot/serabot --config /etc/se
 while a bare invocation waits for EOF. Adding an extra provider requires storing
 its referenced secret before the service can start.
 
+Telegram Bot API errors must not include the request URL. The bot token is a
+path segment (`/bot<token>/<method>`), and reqwest appends that URL to error
+text. SeraBot drops the URL and redacts `bot<token>` segments and Authorization
+material before an error is logged. If a journal from an older build contains
+a `getUpdates` URL, rotate the bot token with BotFather and store the new value
+with `serabot secrets set` under the configured secret name (default
+`telegram_bot_token`). Do not copy the journal line.
+
 ## OneDrive (native Graph)
 
 SeraBot uses the same Azure **public client** pattern as the existing
