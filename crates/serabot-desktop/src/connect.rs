@@ -66,7 +66,12 @@ impl Drop for ConnectState {
 ///
 /// Returns true when the owner pressed Connect or Enter. The caller owns
 /// validation messages and the actual network dispatch.
-pub fn connect_screen(ctx: &egui::Context, state: &mut ConnectState, footer: &str) -> bool {
+pub fn connect_screen(
+    ctx: &egui::Context,
+    state: &mut ConnectState,
+    theme: &mut design::ThemeMode,
+    footer: &str,
+) -> bool {
     let mut submitted = false;
     egui::CentralPanel::default()
         .frame(Frame::new().fill(design::bg()).inner_margin(Margin::symmetric(24, 24)))
@@ -163,6 +168,24 @@ pub fn connect_screen(ctx: &egui::Context, state: &mut ConnectState, footer: &st
                             submitted = true;
                         }
 
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Appearance").size(11.0).color(design::muted()));
+                            for mode in [design::ThemeMode::Dark, design::ThemeMode::Light] {
+                                if ui
+                                    .selectable_label(*theme == mode, mode.label())
+                                    .clicked()
+                                {
+                                    *theme = mode;
+                                    design::apply_theme(ui.ctx(), mode);
+                                    let _ = creds::save_settings(&creds::Settings {
+                                        server: state.server.trim().to_owned(),
+                                        theme: Some(mode.as_str().into()),
+                                    });
+                                }
+                            }
+                        });
+
                         ui.add_space(16.0);
                         ui.separator();
                         ui.add_space(12.0);
@@ -239,9 +262,11 @@ mod tests {
                 ..Default::default()
             };
             let output = ctx.run(input, |ctx| {
+                let mut theme = design::ThemeMode::Dark;
                 connect_screen(
                     ctx,
                     &mut state,
+                    &mut theme,
                     &format!("v{} · developer build", env!("CARGO_PKG_VERSION")),
                 );
             });

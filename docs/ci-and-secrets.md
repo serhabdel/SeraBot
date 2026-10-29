@@ -43,7 +43,7 @@ triggered by `ci.yml` after both test jobs pass on `main`: if the workspace
 version in `Cargo.toml` has no matching `v<version>` tag, CI creates the tag on
 that commit and dispatches `release.yml` with it. A version bump is therefore
 the release switch. A manual tag push (`git tag vX.Y.Z && git push origin
-vX.Y.Z`) or **Run workflow** with an existing tag (for example `v0.2.3`) still
+vX.Y.Z`) or **Run workflow** with an existing tag (for example `v0.2.4`) still
 works. Every job checks out that tag and publishes the GitHub Release with
 `tag_name` set to it. Asset names use the same tag value.
 

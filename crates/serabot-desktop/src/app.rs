@@ -1419,7 +1419,7 @@ impl eframe::App for Desktop {
             self.palette_window(ctx);
         } else {
             let footer = build_footer();
-            if connect_screen(ctx, &mut self.connect, &footer) {
+            if connect_screen(ctx, &mut self.connect, &mut self.theme, &footer) {
                 self.connect_now();
             }
         }

@@ -106,12 +106,12 @@ conversation column in **Chat**, and a content pane. It is responsive down to
 - **Rail** — Chat, Conversations, Memory, Providers, Connectors, Approvals,
   Fleet, and Settings. Icons are painted with the GPU painter; the build ships
   no image assets.
-- **Appearance** — a Light/Dark switch sits in the top bar as well as
-  **Settings → Appearance**. The whole console, including the connect card,
-  switches between a deep teal-black dark palette and a warm paper light
-  palette. The choice is saved locally in `settings.json`. Both use a native
-  Segoe UI typeface on Windows, gradient backdrops, elevated cards, painted
-  avatars, and soft status chips.
+- **Appearance** — a Light/Dark switch sits on the connect card, in the top bar,
+  and in **Settings → Appearance**. The whole console switches between a deep
+  teal-black dark palette and a warm paper light palette. The choice is saved
+  locally in `settings.json` and applies before the first connection. Both
+  palettes use a native Segoe UI typeface on Windows, gradient backdrops,
+  elevated cards, painted avatars, and soft status chips.
 - **Top bar** — a full-width header with the SeraBot brand, the active
   conversation title and kind, connection state, the per-conversation model
   chip, a **Bots** count, the appearance switch, an update badge, and the
