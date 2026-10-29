@@ -184,6 +184,9 @@ brief_time = "08:00"
 source_stagger_secs = 20
 watch_times = ["07:45", "13:00", "18:00"]
 
+[skills]
+dir = "skills"
+
 [documents]
 watch_dir = "data/inbox"
 max_bytes = 52428800

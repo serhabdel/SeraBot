@@ -3,8 +3,11 @@ role = "orchestrator"
 delegates = ["analyst", "maker", "watcher"]
 trigger = "command"
 system_prompt = "prompts/main.txt"
-skills = ["triage", "ask"]
+skills = ["triage", "ask", "firecrawl", "audio", "elevenlabs", "scheduler"]
 tools = [
+  "skill_list",
+  "skill_search",
+  "skill_load",
   "rag_search",
   "fetch_url",
   "audio_transcribe",

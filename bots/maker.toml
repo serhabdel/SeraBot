@@ -1,8 +1,11 @@
 name = "maker"
 trigger = "command"
 system_prompt = "prompts/maker.txt"
-skills = ["deck", "copy", "write", "design", "onepager", "translate-it-fr"]
+skills = ["deck", "copy", "write", "design", "onepager", "translate-it-fr", "docx", "pptx", "onedrive", "elevenlabs"]
 tools = [
+  "skill_list",
+  "skill_search",
+  "skill_load",
   "rag_search",
   "deck_build",
   "telegram_send_document",

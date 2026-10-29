@@ -3,6 +3,9 @@ trigger = "file"
 system_prompt = "prompts/analyst.txt"
 skills = ["synthesis", "transcript", "xlsx", "timesheets", "ask"]
 tools = [
+  "skill_list",
+  "skill_search",
+  "skill_load",
   "rag_search",
   "xlsx_analyze",
   "timesheet_analyze",
