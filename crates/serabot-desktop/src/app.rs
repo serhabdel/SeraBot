@@ -27,7 +27,36 @@ const BOT_BUBBLE: Color32 = Color32::from_rgb(30, 35, 43);
 const REQUEST_GAP: Duration = Duration::from_secs(3);
 const POLL_GAP: Duration = Duration::from_secs(5);
 const SIDEBAR_W: f32 = 268.0;
-const COMPOSER_MIN: f32 = 118.0;
+fn status_chip(ui: &mut egui::Ui, label: &str, fg: Color32, bg: Color32) {
+    Frame::new()
+        .fill(bg)
+        .corner_radius(12.0)
+        .inner_margin(Margin::symmetric(10, 5))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(RichText::new("●").size(9.0).color(fg));
+                ui.label(RichText::new(label).size(11.0).strong().color(fg));
+            });
+        });
+}
+
+fn empty_state(ui: &mut egui::Ui, title: &str, body: &str) {
+    ui.add_space(32.0);
+    ui.vertical_centered(|ui| {
+        Frame::new()
+            .fill(PANEL_ALT)
+            .stroke(Stroke::new(1.0_f32, STROKE))
+            .corner_radius(14.0)
+            .inner_margin(Margin::symmetric(28, 22))
+            .show(ui, |ui| {
+                ui.set_max_width(420.0);
+                ui.label(RichText::new(title).size(20.0).strong().color(TEXT));
+                ui.add_space(8.0);
+                ui.label(RichText::new(body).color(MUTED));
+            });
+    });
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -327,17 +356,17 @@ impl Desktop {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("SeraBot").size(22.0).strong().color(TEXT));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (label, color) = if self.pending.is_some() {
-                            ("Syncing", WARNING)
-                        } else if self.state.connected {
-                            ("Live", TEAL)
-                        } else {
-                            ("Offline", MUTED)
-                        };
-                        ui.label(RichText::new(label).size(12.0).color(color));
                         if self.pending.is_some() {
                             ui.spinner();
                         }
+                        let (label, fg, bg) = if self.pending.is_some() {
+                            ("Syncing", WARNING, Color32::from_rgb(52, 42, 28))
+                        } else if self.state.connected {
+                            ("Connected", TEAL, Color32::from_rgb(24, 44, 40))
+                        } else {
+                            ("Offline", MUTED, Color32::from_rgb(32, 36, 42))
+                        };
+                        status_chip(ui, label, fg, bg);
                     });
                 });
                 ui.label(
@@ -369,22 +398,53 @@ impl Desktop {
                     ),
                 ] {
                     let selected = self.section == section;
-                    let fill = if selected { TEAL_DIM } else { Color32::TRANSPARENT };
-                    let response = Frame::new()
-                        .fill(fill)
-                        .corner_radius(8.0)
-                        .inner_margin(Margin::symmetric(10, 8))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(
-                                RichText::new(label)
-                                    .strong()
-                                    .color(if selected { TEAL } else { TEXT }),
-                            );
-                            ui.label(RichText::new(hint).size(11.0).color(MUTED));
+                    let fill = if selected {
+                        Color32::from_rgb(32, 40, 46)
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+                    let response = ui
+                        .horizontal(|ui| {
+                            Frame::new()
+                                .fill(if selected { TEAL } else { Color32::TRANSPARENT })
+                                .show(ui, |ui| {
+                                    ui.set_min_size(Vec2::new(3.0, 44.0));
+                                });
+                            Frame::new()
+                                .fill(fill)
+                                .corner_radius(8.0)
+                                .inner_margin(Margin::symmetric(10, 8))
+                                .show(ui, |ui| {
+                                    ui.set_width((ui.available_width() - 6.0).max(0.0));
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(label)
+                                                .strong()
+                                                .size(14.0)
+                                                .color(if selected { TEAL } else { TEXT }),
+                                        );
+                                        if section == Section::Approvals
+                                            && !self.state.approvals.is_empty()
+                                        {
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    status_chip(
+                                                        ui,
+                                                        &format!("{}", self.state.approvals.len()),
+                                                        WARNING,
+                                                        Color32::from_rgb(52, 42, 28),
+                                                    );
+                                                },
+                                            );
+                                        }
+                                    });
+                                    ui.label(RichText::new(hint).size(11.0).color(MUTED));
+                                })
+                                .response
+                                .interact(egui::Sense::click())
                         })
-                        .response
-                        .interact(egui::Sense::click());
+                        .inner;
                     if response.clicked() {
                         self.section = section;
                         if section == Section::Approvals
@@ -394,13 +454,6 @@ impl Desktop {
                         {
                             self.start_request(Operation::Approvals);
                         }
-                    }
-                    if section == Section::Approvals && !self.state.approvals.is_empty() {
-                        ui.label(
-                            RichText::new(format!("{} waiting", self.state.approvals.len()))
-                                .size(11.0)
-                                .color(WARNING),
-                        );
                     }
                     ui.add_space(4.0);
                 }
@@ -702,24 +755,63 @@ impl Desktop {
         }
     }
 
+    fn section_header(&self, ui: &mut egui::Ui, title: &str, subtitle: &str) {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new(title).size(22.0).strong().color(TEXT));
+                ui.label(RichText::new(subtitle).size(12.0).color(MUTED));
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.section == Section::Chat && self.state.connected && self.active_conversation()
+                {
+                    let draft = if self.state.draft.is_auto() {
+                        "auto".into()
+                    } else {
+                        format!(
+                            "{} / {}",
+                            self.state.draft.provider, self.state.draft.model
+                        )
+                    };
+                    status_chip(
+                        ui,
+                        &draft,
+                        TEAL,
+                        Color32::from_rgb(24, 44, 40),
+                    );
+                }
+            });
+        });
+        ui.add_space(10.0);
+    }
+
     fn status_banner(&mut self, ui: &mut egui::Ui) {
         if let Some(error) = &self.state.error {
             Frame::new()
                 .fill(Color32::from_rgb(48, 32, 28))
-                .corner_radius(8.0)
-                .inner_margin(10.0)
+                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(88, 58, 48)))
+                .corner_radius(10.0)
+                .inner_margin(Margin::symmetric(12, 10))
                 .show(ui, |ui| {
-                    ui.colored_label(WARNING, error);
+                    ui.horizontal(|ui| {
+                        status_chip(ui, "Notice", WARNING, Color32::from_rgb(62, 44, 28));
+                        ui.label(RichText::new(error).color(TEXT));
+                    });
                 });
             ui.add_space(8.0);
         }
         if self.state.unknown_outcome && self.reviewed_unknown {
             Frame::new()
                 .fill(Color32::from_rgb(48, 40, 24))
-                .corner_radius(8.0)
-                .inner_margin(10.0)
+                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(88, 72, 40)))
+                .corner_radius(10.0)
+                .inner_margin(Margin::symmetric(12, 10))
                 .show(ui, |ui| {
-                    ui.label("Reads refreshed. A missing reply does not prove failure.");
+                    ui.label(
+                        RichText::new(
+                            "Reads refreshed. A missing reply does not prove failure.",
+                        )
+                        .color(TEXT),
+                    );
                     if ui
                         .button("I reviewed server state — allow new actions")
                         .clicked()
@@ -732,113 +824,53 @@ impl Desktop {
             ui.add_space(8.0);
         }
         if let Some(task) = &self.state.task {
-            let color = match task.status {
-                TaskStatus::Failed => DANGER,
-                TaskStatus::AwaitingApproval => WARNING,
-                TaskStatus::Done => TEAL,
-                _ => MUTED,
+            let (fg, bg) = match task.status {
+                TaskStatus::Failed => (DANGER, Color32::from_rgb(52, 32, 32)),
+                TaskStatus::AwaitingApproval => (WARNING, Color32::from_rgb(52, 42, 28)),
+                TaskStatus::Done => (TEAL, Color32::from_rgb(24, 44, 40)),
+                _ => (MUTED, Color32::from_rgb(32, 36, 42)),
             };
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(task.status.label()).color(color).strong());
-                ui.label(
-                    RichText::new(format!("{} · {}", task.bot, task.id))
-                        .small()
-                        .color(MUTED),
-                );
-                if task.status == TaskStatus::AwaitingApproval
-                    && ui.small_button("Open approvals").clicked()
-                {
-                    self.section = Section::Approvals;
-                }
-            });
-            ui.add_space(6.0);
+            Frame::new()
+                .fill(PANEL_ALT)
+                .stroke(Stroke::new(1.0_f32, STROKE))
+                .corner_radius(10.0)
+                .inner_margin(Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        status_chip(ui, task.status.label(), fg, bg);
+                        ui.label(
+                            RichText::new(format!("{} · {}", task.bot, task.id))
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                        if task.status == TaskStatus::AwaitingApproval {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Open approvals →").clicked() {
+                                        self.section = Section::Approvals;
+                                    }
+                                },
+                            );
+                        }
+                    });
+                });
+            ui.add_space(8.0);
         }
     }
 
-    fn chat_panel(&mut self, ui: &mut egui::Ui) {
-        self.status_banner(ui);
-        let height = (ui.available_height() - COMPOSER_MIN).max(120.0);
-        egui::ScrollArea::vertical()
-            .id_salt(("history", self.state.scope.epoch))
-            .auto_shrink([false, false])
-            .stick_to_bottom(true)
-            .max_height(height)
-            .show(ui, |ui| {
-                ui.set_min_height(height - 8.0);
-                ui.set_width(ui.available_width());
-                if self.state.messages.is_empty() {
-                    ui.add_space(40.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(
-                            RichText::new(if !self.state.connected {
-                                "Connect to your host"
-                            } else if !self.state.history_loaded {
-                                "Loading conversation"
-                            } else {
-                                "No messages yet"
-                            })
-                            .size(20.0)
-                            .strong(),
-                        );
-                        ui.label(
-                            RichText::new(if !self.state.connected {
-                                "Use an HTTPS origin or a loopback SSH tunnel, then paste the owner API token."
-                            } else {
-                                "Only visible user and assistant messages from the server appear here."
-                            })
-                            .color(MUTED),
-                        );
-                    });
-                    return;
-                }
-                for message in &self.state.messages {
-                    ui.add_space(8.0);
-                    let user = message.role == Role::User;
-                    let max_w = (ui.available_width() * 0.86).max(220.0);
-                    ui.horizontal(|ui| {
-                        if user {
-                            ui.add_space((ui.available_width() - max_w).max(0.0));
-                        }
-                        Frame::new()
-                            .fill(if user { USER_BUBBLE } else { BOT_BUBBLE })
-                            .stroke(Stroke::new(1.0_f32, STROKE))
-                            .corner_radius(12.0)
-                            .inner_margin(Margin::symmetric(14, 12))
-                            .show(ui, |ui| {
-                                ui.set_max_width(max_w);
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(if user { "You" } else { "SeraBot" })
-                                            .small()
-                                            .strong()
-                                            .color(TEAL),
-                                    );
-                                    ui.label(
-                                        RichText::new(&message.created_at)
-                                            .small()
-                                            .color(MUTED),
-                                    );
-                                });
-                                ui.add_space(4.0);
-                                ui.add(egui::Label::new(RichText::new(&message.content).color(TEXT)).wrap().selectable(true));
-                            });
-                    });
-                }
-                ui.add_space(12.0);
-            });
-
-        ui.add_space(8.0);
+    fn composer_block(&mut self, ui: &mut egui::Ui, rows: usize) {
         Frame::new()
             .fill(PANEL_ALT)
             .stroke(Stroke::new(1.0_f32, STROKE))
             .corner_radius(12.0)
             .inner_margin(Margin::symmetric(12, 10))
             .show(ui, |ui| {
-                ui.set_min_height(COMPOSER_MIN - 24.0);
+                ui.set_min_width(ui.available_width());
                 let edit = ui.add_enabled(
                     self.state.connected && self.active_conversation(),
                     egui::TextEdit::multiline(&mut self.composer)
-                        .desired_rows(3)
+                        .desired_rows(rows)
                         .desired_width(f32::INFINITY)
                         .hint_text("Message SeraBot…")
                         .char_limit(8000),
@@ -865,23 +897,137 @@ impl Desktop {
                         ui.ctx()
                             .memory_mut(|memory| *memory = Default::default());
                     }
-                    ui.label(
-                        RichText::new(format!(
-                            "Ctrl+Enter · {} / 8,000",
-                            self.composer.chars().count()
-                        ))
-                        .small()
-                        .color(MUTED),
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Ctrl+Enter · {} / 8,000",
+                                self.composer.chars().count()
+                            ))
+                            .small()
+                            .color(MUTED),
+                        );
+                    });
                     let _ = edit;
                 });
             });
     }
 
+    fn chat_panel(&mut self, ui: &mut egui::Ui) {
+        self.section_header(
+            ui,
+            "Chat",
+            if self.active_conversation() {
+                &self.conversation
+            } else {
+                "Open a conversation id from the sidebar"
+            },
+        );
+        self.status_banner(ui);
+        let composer_rows = if ui.available_height() < 420.0 { 2_usize } else { 3_usize };
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            ui.set_width(ui.available_width());
+            self.composer_block(ui, composer_rows);
+            ui.add_space(8.0);
+            let scroll_h = ui.available_height().max(96.0);
+            egui::ScrollArea::vertical()
+                .id_salt(("history", self.state.scope.epoch))
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .max_height(scroll_h)
+                .show(ui, |ui| {
+                    ui.set_min_height(scroll_h - 4.0);
+                    ui.set_width(ui.available_width());
+                    if self.state.messages.is_empty() {
+                        empty_state(
+                            ui,
+                            if !self.state.connected {
+                                "Connect to your host"
+                            } else if !self.state.history_loaded {
+                                "Loading conversation"
+                            } else {
+                                "No messages yet"
+                            },
+                            if !self.state.connected {
+                                "Use an HTTPS origin or a loopback SSH tunnel, then paste the owner API token."
+                            } else {
+                                "Only visible user and assistant messages from the server appear here."
+                            },
+                        );
+                        return;
+                    }
+                    for message in &self.state.messages {
+                        ui.add_space(10.0);
+                        let user = message.role == Role::User;
+                        let max_w = (ui.available_width() * 0.88).max(200.0);
+                        ui.horizontal(|ui| {
+                            if user {
+                                ui.add_space((ui.available_width() - max_w).max(0.0));
+                            }
+                            Frame::new()
+                                .fill(if user { USER_BUBBLE } else { BOT_BUBBLE })
+                                .stroke(Stroke::new(
+                                    1.0_f32,
+                                    if user {
+                                        Color32::from_rgb(48, 72, 68)
+                                    } else {
+                                        STROKE
+                                    },
+                                ))
+                                .corner_radius(14.0)
+                                .inner_margin(Margin::symmetric(14, 12))
+                                .show(ui, |ui| {
+                                    ui.set_max_width(max_w);
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(if user { "You" } else { "SeraBot" })
+                                                .size(12.0)
+                                                .strong()
+                                                .color(if user { TEAL } else { MUTED }),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(&message.created_at)
+                                                        .size(11.0)
+                                                        .color(MUTED),
+                                                );
+                                            },
+                                        );
+                                    });
+                                    ui.add_space(6.0);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&message.content)
+                                                .size(14.0)
+                                                .color(TEXT),
+                                        )
+                                        .wrap()
+                                        .selectable(true),
+                                    );
+                                });
+                        });
+                    }
+                    ui.add_space(12.0);
+                });
+        });
+    }
+
     fn approvals_panel(&mut self, ui: &mut egui::Ui) {
+        self.section_header(
+            ui,
+            "Approvals",
+            "Gateway consent for outbound tools and effects",
+        );
         self.status_banner(ui);
         ui.horizontal(|ui| {
-            ui.heading("Approvals");
+            ui.label(
+                RichText::new(
+                    "Decisions bind the exact payload, destination, artifact hash, policy version, and expiry.",
+                )
+                .size(12.0)
+                .color(MUTED),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add_enabled(
@@ -894,58 +1040,78 @@ impl Desktop {
                 }
             });
         });
-        ui.label(
-            RichText::new("Decisions bind the exact payload, destination, artifact hash, policy version, and expiry.")
-                .color(MUTED),
-        );
-        ui.add_space(10.0);
+        ui.add_space(12.0);
         if !self.state.connected {
-            ui.label(RichText::new("Connect to review pending approvals.").color(MUTED));
+            empty_state(
+                ui,
+                "Connect to review approvals",
+                "Pending gateway actions appear here once you are connected to the owner API.",
+            );
             return;
         }
         if !self.state.approvals_loaded {
-            ui.label(RichText::new("Loading approvals…").color(MUTED));
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("Loading approvals…").color(MUTED));
+            });
             return;
         }
         if self.state.approvals.is_empty() {
-            ui.add_space(24.0);
-            ui.vertical_centered(|ui| {
-                ui.label(RichText::new("Nothing pending").size(18.0).strong());
-                ui.label(
-                    RichText::new("When the gateway needs consent, actions appear here and in Telegram.")
-                        .color(MUTED),
-                );
-            });
+            empty_state(
+                ui,
+                "Nothing pending",
+                "When the gateway needs consent, actions appear here and in Telegram.",
+            );
             return;
         }
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 for approval in self.state.approvals.clone() {
-                    ui.add_space(8.0);
+                    ui.add_space(10.0);
                     Frame::new()
                         .fill(PANEL_ALT)
                         .stroke(Stroke::new(1.0_f32, STROKE))
-                        .corner_radius(12.0)
-                        .inner_margin(Margin::symmetric(14, 12))
+                        .corner_radius(14.0)
+                        .inner_margin(Margin::symmetric(16, 14))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new(&approval.tool).strong().color(TEAL));
-                                ui.label(
-                                    RichText::new(format!("expires {}", approval.expires_at))
-                                        .small()
-                                        .color(MUTED),
+                                status_chip(
+                                    ui,
+                                    &approval.tool,
+                                    TEAL,
+                                    Color32::from_rgb(24, 44, 40),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "expires {}",
+                                                approval.expires_at
+                                            ))
+                                            .size(11.0)
+                                            .color(MUTED),
+                                        );
+                                    },
                                 );
                             });
-                            ui.add_space(4.0);
-                            ui.label(RichText::new(&approval.summary).color(TEXT));
+                            ui.add_space(10.0);
                             ui.label(
-                                RichText::new(format!("id {}", approval.id))
-                                    .small()
+                                RichText::new(&approval.summary)
+                                    .size(14.0)
+                                    .color(TEXT),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new(format!("Approval id · {}", approval.id))
+                                    .size(11.0)
                                     .color(MUTED),
                             );
-                            ui.add_space(8.0);
+                            ui.add_space(12.0);
+                            ui.separator();
+                            ui.add_space(10.0);
                             ui.horizontal(|ui| {
                                 let can = self.ready() && !self.state.unknown_outcome;
                                 for decision in [
@@ -953,12 +1119,18 @@ impl Desktop {
                                     ApprovalDecision::Always,
                                     ApprovalDecision::Deny,
                                 ] {
-                                    let button = if decision == ApprovalDecision::Deny {
-                                        egui::Button::new(
+                                    let button = match decision {
+                                        ApprovalDecision::Deny => egui::Button::new(
                                             RichText::new(decision.label()).color(DANGER),
-                                        )
-                                    } else {
-                                        egui::Button::new(decision.label())
+                                        ),
+                                        ApprovalDecision::Once => egui::Button::new(
+                                            RichText::new(decision.label())
+                                                .strong()
+                                                .color(TEAL),
+                                        ),
+                                        ApprovalDecision::Always => {
+                                            egui::Button::new(decision.label())
+                                        }
                                     };
                                     if ui.add_enabled(can, button).clicked() {
                                         self.state.error = None;
@@ -969,10 +1141,13 @@ impl Desktop {
                                     }
                                 }
                             });
+                            ui.add_space(6.0);
                             ui.label(
-                                RichText::new("Once = this exact payload. Always = revocable grant for this exact payload.")
-                                    .size(11.0)
-                                    .color(MUTED),
+                                RichText::new(
+                                    "Once = this exact payload. Always = revocable grant for this exact payload.",
+                                )
+                                .size(11.0)
+                                .color(MUTED),
                             );
                         });
                 }
@@ -1096,7 +1271,7 @@ mod tests {
 
     #[test]
     fn native_panels_render_at_minimum_and_default_window_sizes() {
-        for size in [[720.0, 520.0], [1100.0, 740.0]] {
+        for size in [[860.0, 560.0], [720.0, 520.0], [1100.0, 740.0]] {
             let mut app = app();
             let ctx = egui::Context::default();
             let input = egui::RawInput {
