@@ -1022,6 +1022,41 @@ impl Runtime {
         Ok(())
     }
 
+    /// Post one final assistant reply on every finish path. A handoff turn
+    /// keeps the specialist name in every conversation and records
+    /// `handoff.completed`, including when a limit stops the turn. Other turns
+    /// are labeled only in rooms (see `assistant_speaker`).
+    async fn finish_reply(
+        &self,
+        conversation_id: &str,
+        task: &Task,
+        turn: &Turn,
+        state: &TurnState,
+        text: &str,
+    ) -> Result<()> {
+        self.notifier.send_text(conversation_id, text).await?;
+        if let Some(handoff) = &state.handoff {
+            self.record_assistant(conversation_id, turn, text, true)?;
+            self.store.record_audit(
+                "system",
+                "handoff.completed",
+                None,
+                Some(&task.id),
+                None,
+                None,
+                Some(self.gateway.policy().version()),
+                Some(&json!({
+                    "handoff_id": handoff.handoff_id,
+                    "parent_task_id": handoff.parent_task_id,
+                    "specialist": turn.bot,
+                })),
+            )?;
+        } else {
+            self.record_assistant(conversation_id, turn, text, false)?;
+        }
+        Ok(())
+    }
+
     async fn advance(
         &self,
         task: &Task,
@@ -1114,27 +1149,8 @@ impl Runtime {
                     "sending_response",
                     &serde_json::to_value(&state)?,
                 )?;
-                if let Some(handoff) = &state.handoff {
-                    self.notifier.send_text(conversation_id, &text).await?;
-                    self.record_assistant(conversation_id, turn, &text, true)?;
-                    self.store.record_audit(
-                        "system",
-                        "handoff.completed",
-                        None,
-                        Some(&task.id),
-                        None,
-                        None,
-                        Some(self.gateway.policy().version()),
-                        Some(&json!({
-                            "handoff_id": handoff.handoff_id,
-                            "parent_task_id": handoff.parent_task_id,
-                            "specialist": turn.bot,
-                        })),
-                    )?;
-                } else {
-                    self.notifier.send_text(conversation_id, &text).await?;
-                    self.record_assistant(conversation_id, turn, &text, false)?;
-                }
+                self.finish_reply(conversation_id, task, turn, &state, &text)
+                    .await?;
                 self.store
                     .update_turn(&turn.id, "completed", &serde_json::to_value(&state)?)?;
                 self.store.append_event(
@@ -1148,8 +1164,8 @@ impl Runtime {
             let requested = state.tool_calls + tool_calls.len();
             if requested > self.config.runtime.max_tool_calls_per_turn {
                 let text = "I stopped because this turn exceeded the tool-call limit.".to_string();
-                self.notifier.send_text(conversation_id, &text).await?;
-                self.record_assistant(conversation_id, turn, &text, false)?;
+                self.finish_reply(conversation_id, task, turn, &state, &text)
+                    .await?;
                 self.store
                     .update_turn(&turn.id, "stopped", &serde_json::to_value(&state)?)?;
                 return Ok(TurnOutcome::Completed);
@@ -1180,8 +1196,8 @@ impl Runtime {
                 .update_turn(&turn.id, "active", &serde_json::to_value(&state)?)?;
         }
         let text = "I stopped because the turn reached its tool-iteration limit.".to_string();
-        self.notifier.send_text(conversation_id, &text).await?;
-        self.record_assistant(conversation_id, turn, &text, false)?;
+        self.finish_reply(conversation_id, task, turn, &state, &text)
+            .await?;
         self.store
             .update_turn(&turn.id, "stopped", &serde_json::to_value(&state)?)?;
         Ok(TurnOutcome::Completed)
@@ -2179,5 +2195,78 @@ mod tests {
             .unwrap();
         assert_eq!(direct.bot, "analyst");
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn handoff_reply_keeps_specialist_name_when_a_limit_stops_the_turn() {
+        let server = MockServer::start().await;
+        // One more tool call than the per-turn limit stops the specialist turn
+        // before any tool runs.
+        let tool_calls: Vec<Value> = (0..13)
+            .map(|index| {
+                json!({
+                    "id": format!("call_{index}"),
+                    "type": "function",
+                    "function": {"name": "skill_list", "arguments": "{}"}
+                })
+            })
+            .collect();
+        Mock::given(method("POST"))
+            .respond_with(Sequence::new(vec![
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_delegate",
+                                "type": "function",
+                                "function": {
+                                    "name": "delegate",
+                                    "arguments": "{\"to_bot\":\"analyst\",\"objective\":\"Summarize synthetic notes.\",\"model_class\":\"routine\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                }),
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": tool_calls
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                }),
+            ]))
+            .mount(&server)
+            .await;
+        let notifier = Arc::new(Capture::default());
+        let (runtime, store) = setup_orchestration(&server.uri(), notifier);
+        runtime.submit_text("owner", "review notes", None).unwrap();
+        let parent = store.claim_task("worker", 30).unwrap().unwrap();
+        runtime.process_task(parent).await.unwrap();
+        let child = store.claim_task("worker", 30).unwrap().unwrap();
+        assert_eq!(child.bot, "analyst");
+        runtime.process_task(child).await.unwrap();
+
+        let messages = store.list_visible_messages("owner", 20).unwrap();
+        let stopped = messages
+            .iter()
+            .find(|message| message.content.contains("tool-call limit"))
+            .expect("limit reply is stored");
+        assert_eq!(stopped.name.as_deref(), Some("analyst"));
+        assert!(store.list_audit(50).unwrap().iter().any(|entry| {
+            entry.event == "handoff.completed"
+                && entry
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("specialist"))
+                    .and_then(Value::as_str)
+                    == Some("analyst")
+        }));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 }

@@ -143,8 +143,11 @@ specialist reply per orchestrator turn.
    again. Specialists cannot delegate.
 
 Direct and legacy conversations do not label the orchestrator. A handoff reply
-is still named with the specialist id, in the same conversation. There is no
-separate specialist transcript and no free-form agent-to-agent exchange.
+is still named with the specialist id, in the same conversation. That holds on
+every finish path: when a specialist turn stops on the tool-call or
+tool-iteration limit, the final message is still named with the specialist id
+and still records `handoff.completed`. There is no separate specialist
+transcript and no free-form agent-to-agent exchange.
 
 ## Runtime concurrency
 

@@ -90,18 +90,6 @@ Cloudflare tunnel alone. Before replacing a busy binary, tunnel in and read
 `GET /v1/status`. Queued turns without a pinned route fail closed. The queue
 was empty of non-terminal tasks at this deploy (15 done and 2 failed rows only).
 
-If historical journals ever contained `getUpdates` URLs (a build before
-`4464558`), rotate `telegram_bot_token` in BotFather and store the new value
-with `serabot secrets set`. Do not paste the token, the journal line, or the
-URL into chat, tickets, or git.
-
-This page does not change the binary. Roll back by restoring
-`serabot-pre-23fcb7d` onto `/opt/serabot/serabot` and restarting **only**
-`serabot.service`. Leave Docker, OpenBot, `onedrive-mcp.service`, and the
-Cloudflare tunnel alone. Before replacing a busy binary, tunnel in and read
-`GET /v1/status`. Queued turns without a pinned route fail closed. The queue
-was empty of non-terminal tasks at this deploy (done and failed rows only).
-
 The earlier read-only check (mtime `2026-10-29 01:39:08` UTC, SHA-256 prefix
 `dfbc71dd89536f4e…`) and the `795b139` binary both predate `4464558`.
 
