@@ -283,32 +283,81 @@ impl Runtime {
         Ok(catalog)
     }
 
+    pub fn model_catalog_entries(&self) -> Result<Vec<crate::model_router::CatalogEntry>> {
+        let entries = self.router.catalog_entries();
+        self.gateway
+            .scan_egress(&serde_json::to_string(&entries)?)?;
+        Ok(entries)
+    }
+
+    fn stored_model_selection(&self, conversation_id: &str) -> Result<Option<ModelSelection>> {
+        match self
+            .store
+            .kv_get(&format!("model_selection:{conversation_id}"))?
+        {
+            Some(value) => Ok(Some(
+                serde_json::from_str(&value)
+                    .map_err(|_| SeraError::InvalidState("stored model selection is invalid".into()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    fn bot_model_hint(&self, bot: &crate::config::LoadedBot) -> Option<String> {
+        bot.config
+            .model
+            .clone()
+            .or_else(|| self.config.llm.bot_models.get(&bot.config.name).cloned())
+    }
+
     pub fn model_selection(&self, conversation_id: &str, bot: &str) -> Result<ModelSelection> {
         validate_conversation_id(conversation_id)?;
         let bot = self
             .bots
             .get(bot)
             .ok_or_else(|| SeraError::NotFound("bot not found".into()))?;
-        let selection = match self
-            .store
-            .kv_get(&format!("model_selection:{conversation_id}"))?
-        {
-            Some(value) => serde_json::from_str(&value)
-                .map_err(|_| SeraError::InvalidState("stored model selection is invalid".into()))?,
+        let selection = match self.stored_model_selection(conversation_id)? {
+            Some(stored) => stored,
             None => self
                 .router
-                .default_selection(bot.config.model.as_deref().or_else(|| {
-                    self.config
-                        .llm
-                        .bot_models
-                        .get(&bot.config.name)
-                        .map(String::as_str)
-                })),
+                .default_selection(self.bot_model_hint(bot).as_deref()),
         };
+        if selection.is_auto_mode() {
+            self.gateway
+                .scan_egress(&serde_json::to_string(&selection)?)?;
+            return Ok(selection);
+        }
         self.router.validate_selection(&selection)?;
         self.gateway
             .scan_egress(&serde_json::to_string(&selection)?)?;
         Ok(selection)
+    }
+
+    pub fn effective_model_selection(
+        &self,
+        conversation_id: &str,
+        bot: &str,
+    ) -> Result<ModelSelection> {
+        validate_conversation_id(conversation_id)?;
+        let bot = self
+            .bots
+            .get(bot)
+            .ok_or_else(|| SeraError::NotFound("bot not found".into()))?;
+        let stored = match self.stored_model_selection(conversation_id)? {
+            Some(stored) => stored,
+            None => self
+                .router
+                .default_selection(self.bot_model_hint(bot).as_deref()),
+        };
+        let resolved = self.router.resolve_selection(
+            &stored,
+            bot.config.model.as_deref(),
+            &bot.config.name,
+            &self.config.llm.bot_models,
+        )?;
+        self.gateway
+            .scan_egress(&serde_json::to_string(&resolved)?)?;
+        Ok(resolved)
     }
 
     pub fn select_model(
@@ -317,8 +366,18 @@ impl Runtime {
         selection: ModelSelection,
     ) -> Result<ModelSelection> {
         validate_conversation_id(conversation_id)?;
-        self.router.pin(&selection)?;
-        let value = serde_json::to_string(&selection)?;
+        let stored = if selection.is_auto_mode() {
+            if !self.router.autoselect_available() {
+                return Err(SeraError::Forbidden(
+                    "no provider with data-egress approval is configured for autoselect".into(),
+                ));
+            }
+            ModelSelection::auto_mode()
+        } else {
+            self.router.pin(&selection)?;
+            selection
+        };
+        let value = serde_json::to_string(&stored)?;
         self.gateway.scan_egress(&value)?;
         self.store.record_audit(
             "owner",
@@ -328,11 +387,11 @@ impl Runtime {
             None,
             None,
             Some(self.gateway.policy().version()),
-            Some(&serde_json::to_value(&selection)?),
+            Some(&serde_json::to_value(&stored)?),
         )?;
         self.store
             .kv_set(&format!("model_selection:{conversation_id}"), &value)?;
-        Ok(selection)
+        Ok(stored)
     }
 
     fn checked_route<'a>(&self, route: &'a Option<PinnedRoute>) -> Result<&'a PinnedRoute> {
@@ -440,7 +499,7 @@ impl Runtime {
         if !self.bots.contains_key(&bot) {
             return Err(SeraError::NotFound(format!("bot {bot}")));
         }
-        let selection = self.model_selection(conversation_id, &bot)?;
+        let selection = self.effective_model_selection(conversation_id, &bot)?;
         let route = self.router.pin(&selection)?;
         let payload = TurnPayload {
             conversation_id: conversation_id.to_owned(),
@@ -1480,6 +1539,42 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(second.received_requests().await.unwrap().is_empty());
         assert_eq!(first.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn auto_mode_stores_explicit_preference_and_pins_resolved_route() {
+        let server = MockServer::start().await;
+        let (runtime, store) = setup(
+            &server.uri(),
+            Arc::new(Capture::default()),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        runtime
+            .select_model("owner", ModelSelection::auto_mode())
+            .unwrap();
+        assert_eq!(
+            runtime.model_selection("owner", "main").unwrap(),
+            ModelSelection::auto_mode()
+        );
+        assert_eq!(
+            runtime.effective_model_selection("owner", "main").unwrap(),
+            ModelSelection {
+                provider: "default".into(),
+                model: "test".into(),
+            }
+        );
+        let task = runtime.submit_text("owner", "synthetic", None).unwrap();
+        let payload: TurnPayload = serde_json::from_value(task.payload.clone()).unwrap();
+        assert_eq!(
+            payload.route.unwrap().selection,
+            ModelSelection {
+                provider: "default".into(),
+                model: "test".into(),
+            }
+        );
+        let persisted: ModelSelection =
+            serde_json::from_str(&store.kv_get("model_selection:owner").unwrap().unwrap()).unwrap();
+        assert_eq!(persisted, ModelSelection::auto_mode());
     }
 
     #[tokio::test]

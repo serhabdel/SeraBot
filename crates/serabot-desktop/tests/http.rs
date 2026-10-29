@@ -54,13 +54,17 @@ fn server(replies: Vec<(u16, String)>) -> (ApiClient, thread::JoinHandle<Vec<Str
 
 #[test]
 fn authenticates_and_routes_every_contract_endpoint() {
+    use serabot_desktop::ApprovalDecision;
     let task = r#"{"task":{"id":"task-1","kind":"chat","bot":"owner","status":"queued"}}"#;
     let (client, handle) = server(vec![
         (200, r#"{"ok":true,"version":"test"}"#.into()),
         (200, r#"{"providers":[],"selection":{"provider":"p","model":"m"}}"#.into()),
         (200, r#"{"messages":[{"id":"msg-1","role":"assistant","content":"Synthetic reply","created_at":"test-time"}]}"#.into()),
         (200, r#"{"selection":{"provider":"p","model":"m"}}"#.into()),
-        (202, task.into()), (200, task.into()),
+        (202, task.into()),
+        (200, task.into()),
+        (200, r#"{"approvals":[{"id":"appr-1","action_id":"act-1","tool":"web.fetch","summary":"Fetch fixture","expires_at":"2099-01-01T00:00:00Z"}]}"#.into()),
+        (200, r#"{"approval_id":"appr-1","approval_state":"approved","action_id":"act-1","action_status":"approved","resume_task":null}"#.into()),
     ]);
     assert!(client.health().unwrap().ok);
     client.models("owner:1").unwrap();
@@ -79,6 +83,10 @@ fn authenticates_and_routes_every_contract_endpoint() {
         .unwrap();
     client.submit("owner:1", "Synthetic hello").unwrap();
     client.task("task-1").unwrap();
+    assert_eq!(client.approvals().unwrap().len(), 1);
+    client
+        .decide_approval("appr-1", ApprovalDecision::Once)
+        .unwrap();
     let requests = handle.join().unwrap();
     let routes = [
         "GET /v1/health ",
@@ -87,9 +95,11 @@ fn authenticates_and_routes_every_contract_endpoint() {
         "PUT /v1/conversations/owner:1/model ",
         "POST /v1/messages ",
         "GET /v1/tasks/task-1 ",
+        "GET /v1/approvals ",
+        "POST /v1/approvals/appr-1/decide ",
     ];
     for (request, route) in requests.iter().zip(routes) {
-        assert!(request.starts_with(route), "wrong route");
+        assert!(request.starts_with(route), "wrong route: {request}");
         assert!(
             request
                 .to_lowercase()
@@ -104,6 +114,7 @@ fn authenticates_and_routes_every_contract_endpoint() {
         body(4),
         serde_json::json!({"conversation_id":"owner:1","text":"Synthetic hello"})
     );
+    assert_eq!(body(7), serde_json::json!({"decision":"once"}));
 }
 
 #[test]

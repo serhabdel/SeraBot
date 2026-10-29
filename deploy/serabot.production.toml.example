@@ -76,6 +76,19 @@ refresh_token_secret = "onedrive_refresh_token"
 folder = "SeraBot"
 conflict_behavior = "rename"
 
+[firecrawl]
+enabled = false
+api_base = "https://api.firecrawl.dev"
+api_key_secret = "firecrawl_api_key"
+timeout_secs = 120
+max_markdown_chars = 80000
+max_map_links = 500
+max_map_limit = 500
+max_search_limit = 10
+max_crawl_limit = 25
+crawl_poll_interval_ms = 2000
+crawl_max_wait_secs = 300
+
 [render]
 brand_file = "/etc/serabot/config/brand.toml"
 artifacts_dir = "/var/lib/serabot/artifacts"
@@ -103,3 +116,12 @@ max_bytes = 52428800
 chunk_chars = 1200
 chunk_overlap = 150
 retrieval_k = 8
+
+[audio]
+enabled = false
+provider = "default"
+transcription_model = "voxtral-mini-latest"
+understanding_model = "voxtral-small-latest"
+max_bytes = 52428800
+telegram_intake = false
+telegram_max_bytes = 20971520

@@ -1,5 +1,5 @@
 use crate::{
-    ApiError, Catalog, Message, Scope, Selection, Task,
+    ApiError, Approval, Catalog, Message, Scope, Selection, Task,
     worker::{OperationKind, Reply},
 };
 
@@ -12,6 +12,8 @@ pub struct State {
     pub messages: Vec<Message>,
     pub history_loaded: bool,
     pub task: Option<Task>,
+    pub approvals: Vec<Approval>,
+    pub approvals_loaded: bool,
     pub error: Option<String>,
     pub unknown_outcome: bool,
 }
@@ -30,6 +32,8 @@ impl Default for State {
             messages: Vec::new(),
             history_loaded: false,
             task: None,
+            approvals: Vec::new(),
+            approvals_loaded: false,
             error: None,
             unknown_outcome: false,
         }
@@ -90,6 +94,11 @@ impl State {
                 }
             }
             Reply::Task(task) => self.task = Some(task),
+            Reply::Approvals(approvals) => {
+                self.approvals = approvals;
+                self.approvals_loaded = true;
+            }
+            Reply::Decided => {}
         }
         true
     }
@@ -98,13 +107,16 @@ impl State {
         if !self.scope.accepts(scope) {
             return false;
         }
-        let mutation = matches!(kind, OperationKind::Submit | OperationKind::Apply);
+        let mutation = matches!(
+            kind,
+            OperationKind::Submit | OperationKind::Apply | OperationKind::Decide
+        );
         if mutation && error.unknown_outcome() {
             self.unknown_outcome = true;
-            let operation = if kind == OperationKind::Submit {
-                "submission"
-            } else {
-                "model change"
+            let operation = match kind {
+                OperationKind::Submit => "submission",
+                OperationKind::Decide => "approval decision",
+                _ => "model change",
             };
             self.error = Some(format!(
                 "Unknown {operation} outcome. It may have reached the server. Do not resend. Use Refresh / retry reads to inspect history and the saved selection. {error}"

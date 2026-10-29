@@ -9,16 +9,39 @@ use crate::gateway::ToolSpec;
 use crate::llm::{LlmClient, LlmResponse, validate_base_url};
 use crate::util::sha256_hex;
 
+/// Stored conversation preference when the owner enables automatic routing.
+pub const AUTO_PROVIDER: &str = "auto";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelSelection {
     pub provider: String,
     pub model: String,
 }
 
+impl ModelSelection {
+    pub fn auto_mode() -> Self {
+        Self {
+            provider: AUTO_PROVIDER.into(),
+            model: String::new(),
+        }
+    }
+
+    pub fn is_auto_mode(&self) -> bool {
+        self.provider == AUTO_PROVIDER
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderView {
     pub id: String,
     pub models: Vec<String>,
+    pub data_egress_approved: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogEntry {
+    pub provider: String,
+    pub model: String,
     pub data_egress_approved: bool,
 }
 
@@ -135,11 +158,112 @@ impl ModelRouter {
             .collect()
     }
 
+    pub fn catalog_entries(&self) -> Vec<CatalogEntry> {
+        self.providers
+            .iter()
+            .flat_map(|(id, provider)| {
+                provider.models.iter().map(|model| CatalogEntry {
+                    provider: id.clone(),
+                    model: model.clone(),
+                    data_egress_approved: provider.data_egress_approved,
+                })
+            })
+            .collect()
+    }
+
     pub fn default_selection(&self, bot_model: Option<&str>) -> ModelSelection {
         ModelSelection {
             provider: "default".into(),
             model: bot_model.unwrap_or(&self.default_model).to_owned(),
         }
+    }
+
+    /// Deterministic pick from configured, egress-approved provider/model pairs.
+    ///
+    /// Order: bot `model` override → `llm.bot_models` for the bot → `[llm].model` on
+    /// `default` → first approved pair sorted by provider id then model id.
+    pub fn autoselect(
+        &self,
+        bot_model: Option<&str>,
+        bot_name: &str,
+        bot_models: &BTreeMap<String, String>,
+    ) -> Result<ModelSelection> {
+        if let Some(model) = bot_model {
+            if let Some(selection) = self.find_approved_model(model, Some("default")) {
+                return Ok(selection);
+            }
+        }
+        if let Some(model) = bot_models.get(bot_name) {
+            if let Some(selection) = self.find_approved_model(model, Some("default")) {
+                return Ok(selection);
+            }
+        }
+        if let Some(selection) = self.find_approved_model(&self.default_model, Some("default")) {
+            return Ok(selection);
+        }
+        self.first_approved().ok_or_else(|| {
+            SeraError::Forbidden(
+                "no provider with data-egress approval is configured for autoselect".into(),
+            )
+        })
+    }
+
+    pub fn resolve_selection(
+        &self,
+        stored: &ModelSelection,
+        bot_model: Option<&str>,
+        bot_name: &str,
+        bot_models: &BTreeMap<String, String>,
+    ) -> Result<ModelSelection> {
+        if stored.is_auto_mode() {
+            return self.autoselect(bot_model, bot_name, bot_models);
+        }
+        self.validate_selection(stored)?;
+        Ok(stored.clone())
+    }
+
+    fn find_approved_model(
+        &self,
+        model: &str,
+        prefer_provider: Option<&str>,
+    ) -> Option<ModelSelection> {
+        if let Some(id) = prefer_provider {
+            if let Some(provider) = self.providers.get(id) {
+                if provider.data_egress_approved && provider.models.contains(model) {
+                    return Some(ModelSelection {
+                        provider: id.to_owned(),
+                        model: model.to_owned(),
+                    });
+                }
+            }
+        }
+        for (id, provider) in &self.providers {
+            if provider.data_egress_approved && provider.models.contains(model) {
+                return Some(ModelSelection {
+                    provider: id.clone(),
+                    model: model.to_owned(),
+                });
+            }
+        }
+        None
+    }
+
+    pub fn autoselect_available(&self) -> bool {
+        self.first_approved().is_some()
+    }
+
+    fn first_approved(&self) -> Option<ModelSelection> {
+        for (id, provider) in &self.providers {
+            for model in &provider.models {
+                if provider.data_egress_approved {
+                    return Some(ModelSelection {
+                        provider: id.clone(),
+                        model: model.clone(),
+                    });
+                }
+            }
+        }
+        None
     }
 
     pub fn validate_selection(&self, selection: &ModelSelection) -> Result<()> {
@@ -377,6 +501,50 @@ mod tests {
         );
         assert!(first.received_requests().await.unwrap().is_empty());
         assert!(second.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn autoselect_prefers_bot_override_then_default_provider_model() {
+        let (config, clients, _, _) = fixture().await;
+        let router = ModelRouter::new(&config, clients).unwrap();
+        let mut bot_models = BTreeMap::new();
+        bot_models.insert("main".into(), "first-model".into());
+        assert_eq!(
+            router
+                .autoselect(Some("second-model"), "other", &bot_models)
+                .unwrap(),
+            ModelSelection {
+                provider: "second".into(),
+                model: "second-model".into(),
+            }
+        );
+        assert_eq!(
+            router.autoselect(None, "main", &bot_models).unwrap(),
+            ModelSelection {
+                provider: "default".into(),
+                model: "first-model".into(),
+            }
+        );
+        assert_eq!(
+            router.autoselect(None, "other", &BTreeMap::new()).unwrap(),
+            ModelSelection {
+                provider: "default".into(),
+                model: "first-model".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn autoselect_never_picks_unapproved_providers() {
+        let (mut config, clients, _, _) = fixture().await;
+        config.data_egress_approved = false;
+        config
+            .providers
+            .get_mut("second")
+            .unwrap()
+            .data_egress_approved = false;
+        let router = ModelRouter::new(&config, clients).unwrap();
+        assert!(router.autoselect(None, "main", &BTreeMap::new()).is_err());
     }
 
     #[tokio::test]

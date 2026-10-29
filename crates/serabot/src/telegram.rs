@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use crate::audio::save_telegram_audio_bytes;
 use crate::error::{Result, SeraError};
 use crate::gateway::Decision;
 use crate::maker::ArtifactStore;
@@ -116,34 +117,84 @@ impl TelegramClient {
         Ok(response.result.unwrap_or_default())
     }
 
+    pub async fn register_commands(&self) -> Result<()> {
+        let response: TelegramResponse<Value> = self
+            .http
+            .post(self.url("setMyCommands"))
+            .json(&json!({ "commands": bot_commands() }))
+            .send()
+            .await
+            .map_err(|error| {
+                SeraError::External(format!("Telegram setMyCommands failed: {error}"))
+            })?
+            .json()
+            .await
+            .map_err(|error| {
+                SeraError::External(format!("Telegram setMyCommands response: {error}"))
+            })?;
+        if !response.ok {
+            return Err(SeraError::External(format!(
+                "Telegram setMyCommands rejected: {}",
+                response
+                    .description
+                    .unwrap_or_else(|| "unknown error".into())
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<()> {
         for part in split_message(text) {
-            let response: TelegramResponse<Value> = self
-                .http
-                .post(self.url("sendMessage"))
-                .json(&json!({
-                    "chat_id": chat_id,
-                    "text": part,
-                    "disable_web_page_preview": true,
-                }))
-                .send()
+            let html = markdown_to_telegram_html(&part);
+            match self
+                .send_message_raw(chat_id, &html, Some("HTML"))
                 .await
-                .map_err(|error| {
-                    SeraError::External(format!("Telegram sendMessage failed: {error}"))
-                })?
-                .json()
-                .await
-                .map_err(|error| {
-                    SeraError::External(format!("Telegram sendMessage response: {error}"))
-                })?;
-            if !response.ok {
-                return Err(SeraError::External(format!(
-                    "Telegram sendMessage rejected: {}",
-                    response
-                        .description
-                        .unwrap_or_else(|| "unknown error".into())
-                )));
+            {
+                Ok(()) => {}
+                Err(error) => {
+                    warn!(%error, "Telegram HTML send failed; retrying as plain text");
+                    self.send_message_raw(chat_id, &part, None).await?;
+                }
             }
+        }
+        Ok(())
+    }
+
+    async fn send_message_raw(
+        &self,
+        chat_id: i64,
+        text: &str,
+        parse_mode: Option<&str>,
+    ) -> Result<()> {
+        let mut body = json!({
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": true,
+        });
+        if let Some(mode) = parse_mode {
+            body["parse_mode"] = json!(mode);
+        }
+        let response: TelegramResponse<Value> = self
+            .http
+            .post(self.url("sendMessage"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| {
+                SeraError::External(format!("Telegram sendMessage failed: {error}"))
+            })?
+            .json()
+            .await
+            .map_err(|error| {
+                SeraError::External(format!("Telegram sendMessage response: {error}"))
+            })?;
+        if !response.ok {
+            return Err(SeraError::External(format!(
+                "Telegram sendMessage rejected: {}",
+                response
+                    .description
+                    .unwrap_or_else(|| "unknown error".into())
+            )));
         }
         Ok(())
     }
@@ -228,6 +279,77 @@ impl TelegramClient {
         Ok(())
     }
 
+    pub async fn download_attachment(&self, file_id: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        if file_id.is_empty() || file_id.len() > 256 {
+            return Err(SeraError::Validation("invalid Telegram file id".into()));
+        }
+        let response: TelegramResponse<TelegramFile> = self
+            .http
+            .post(self.url("getFile"))
+            .json(&json!({"file_id": file_id}))
+            .send()
+            .await
+            .map_err(|error| SeraError::External(format!("Telegram getFile failed: {error}")))?
+            .json()
+            .await
+            .map_err(|error| SeraError::External(format!("Telegram getFile response: {error}")))?;
+        if !response.ok {
+            return Err(SeraError::External(format!(
+                "Telegram getFile rejected: {}",
+                response
+                    .description
+                    .unwrap_or_else(|| "unknown error".into())
+            )));
+        }
+        let file = response
+            .result
+            .ok_or_else(|| SeraError::External("Telegram getFile returned no file".into()))?;
+        if let Some(size) = file.file_size {
+            if size <= 0 || size as u64 > max_bytes {
+                return Err(SeraError::Validation(format!(
+                    "Telegram file exceeds configured limit of {max_bytes} bytes"
+                )));
+            }
+        }
+        let file_path = file
+            .file_path
+            .filter(|path| !path.is_empty() && path.len() <= 512)
+            .ok_or_else(|| SeraError::External("Telegram file path is unavailable".into()))?;
+        if file_path.contains("..") || file_path.starts_with('/') {
+            return Err(SeraError::External(
+                "Telegram returned an invalid file path".into(),
+            ));
+        }
+        let url = format!(
+            "{}/file/bot{}/{}",
+            self.base_url,
+            self.token.expose_secret(),
+            file_path
+        );
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|error| SeraError::External(format!("Telegram file download failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(SeraError::External(format!(
+                "Telegram file download failed with status {}",
+                response.status().as_u16()
+            )));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| SeraError::External(format!("Telegram file read failed: {error}")))?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(SeraError::Validation(format!(
+                "Telegram file exceeds configured limit of {max_bytes} bytes"
+            )));
+        }
+        Ok(bytes.to_vec())
+    }
+
     pub async fn send_document(
         &self,
         chat_id: i64,
@@ -289,6 +411,11 @@ impl TelegramClient {
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         info!("Telegram polling started");
+        if let Err(error) = self.register_commands().await {
+            warn!(%error, "Telegram command menu registration failed");
+        } else {
+            info!("Telegram command menu registered");
+        }
         loop {
             if shutdown.is_cancelled() {
                 break;
@@ -327,6 +454,56 @@ impl TelegramClient {
         info!("Telegram polling stopped");
     }
 
+    async fn maybe_save_owner_audio(
+        &self,
+        runtime: &Runtime,
+        store: &Store,
+        message: &TelegramMessage,
+    ) -> Result<Option<String>> {
+        let config = runtime.config();
+        if !config.audio.enabled || !config.audio.telegram_intake {
+            return Ok(None);
+        }
+        if message.voice.is_none() && message.audio.is_none() {
+            return Ok(None);
+        }
+        let attachment = message
+            .voice
+            .as_ref()
+            .or(message.audio.as_ref())
+            .expect("voice or audio present");
+        let max_bytes = config.audio.telegram_max_bytes;
+        let bytes = self.download_attachment(&attachment.file_id, max_bytes).await?;
+        let extension = if message.voice.is_some() {
+            "ogg".into()
+        } else {
+            attachment
+                .file_name
+                .as_deref()
+                .and_then(|name| name.rsplit('.').next())
+                .unwrap_or("mpeg")
+                .to_ascii_lowercase()
+        };
+        let report = save_telegram_audio_bytes(
+            config,
+            message.message_id,
+            &extension,
+            &bytes,
+            max_bytes,
+        )?;
+        store.record_audit(
+            "owner",
+            "audio.telegram_intake",
+            Some(&report.relative_path),
+            None,
+            None,
+            Some(&report.sha256),
+            None,
+            Some(&json!({"bytes": report.bytes})),
+        )?;
+        Ok(Some(report.relative_path))
+    }
+
     async fn handle_update(
         &self,
         runtime: &Runtime,
@@ -345,13 +522,28 @@ impl TelegramClient {
                 warn!("ignored Telegram message from non-owner");
                 return Ok(());
             }
+            if let Some(saved) = self
+                .maybe_save_owner_audio(runtime, store, &message)
+                .await?
+            {
+                self.send_message(
+                    self.owner_chat_id,
+                    &format!(
+                        "Saved owner audio to inbox/{saved}. Use audio_transcribe or \
+                         audio_understand on that path (data-egress consent and approval required)."
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
             let text = message.text.unwrap_or_default();
             let text = text.trim();
             if text.is_empty() {
                 let _ = self
                     .send_message(
                         self.owner_chat_id,
-                        "Text messages are supported; document ingestion uses the owner API.",
+                        "Text messages are supported. Voice notes are saved when audio.telegram_intake \
+                         is enabled; otherwise drop audio into the inbox and use the analyst bot tools.",
                     )
                     .await;
                 return Ok(());
@@ -427,15 +619,19 @@ impl TelegramClient {
                          /brief — morning brief\n\
                          /status — queue and approvals\n\
                          /models — configured providers and models\n\
+                         /model auto — automatic approved model per bot\n\
                          /model <provider> <model> — select for this conversation\n\
                          /approvals — resend pending approvals\n\
-                         /approve-deck <sha256> — approve Italian deck content for French\n\
+                         /approve_deck <sha256> — approve Italian deck content for French\n\
                          /revoke — revoke all standing grants",
                     )
                     .await?;
                 }
-                _ if text.starts_with("/approve-deck") => {
-                    let hash = text.trim_start_matches("/approve-deck").trim();
+                _ if text.starts_with("/approve-deck") || text.starts_with("/approve_deck") => {
+                    let hash = text
+                        .trim_start_matches("/approve-deck")
+                        .trim_start_matches("/approve_deck")
+                        .trim();
                     let Some(artifacts) = artifacts else {
                         self.send_message(self.owner_chat_id, "Artifact store is unavailable.")
                             .await?;
@@ -587,6 +783,22 @@ pub struct TelegramMessage {
     pub chat: Chat,
     pub from: Option<TelegramUser>,
     pub text: Option<String>,
+    pub voice: Option<TelegramAttachment>,
+    pub audio: Option<TelegramAttachment>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramAttachment {
+    pub file_id: String,
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub file_size: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramFile {
+    file_path: Option<String>,
+    file_size: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -616,28 +828,51 @@ fn model_command(runtime: &Runtime, conversation_id: &str, text: &str) -> Result
     let reply = match parts.as_slice() {
         ["/models"] => {
             let mut reply = String::from("Configured providers and models:\n");
-            for provider in runtime.model_catalog()? {
-                let state = if provider.data_egress_approved {
+            for entry in runtime.model_catalog_entries()? {
+                let state = if entry.data_egress_approved {
                     "approved"
                 } else {
                     "data sharing not approved"
                 };
                 reply.push_str(&format!(
-                    "{} ({state}): {}\n",
-                    provider.id,
-                    provider.models.join(", ")
+                    "{} / {} ({state})\n",
+                    entry.provider, entry.model
                 ));
             }
-            reply.push_str("\n/model <provider> <model> selects for this conversation. Future turns include this conversation's history; running turns keep their original selection.");
+            reply.push_str("\n/model auto picks an approved model using bot defaults.\n/model <provider> <model> selects for this conversation. Future turns include this conversation's history; running turns keep their original selection.");
             reply
         }
         ["/model"] => {
             let selection = runtime.model_selection(conversation_id, "main")?;
-            format!(
-                "Current selection: {} / {}\nUse /models to list configured choices.",
-                selection.provider, selection.model
-            )
+            if selection.is_auto_mode() {
+                let effective = runtime.effective_model_selection(conversation_id, "main")?;
+                format!(
+                    "Current selection: auto (resolves to {} / {})\nUse /models to list configured choices.",
+                    effective.provider, effective.model
+                )
+            } else {
+                format!(
+                    "Current selection: {} / {}\nUse /models to list configured choices.",
+                    selection.provider, selection.model
+                )
+            }
         }
+        ["/model", "auto"] => match runtime.select_model(
+            conversation_id,
+            crate::model_router::ModelSelection::auto_mode(),
+        ) {
+            Ok(_) => {
+                let effective = runtime.effective_model_selection(conversation_id, "main")?;
+                format!(
+                    "Selected auto for future turns (currently {} / {}). Existing history will be sent to the resolved provider. Running turns are unchanged.",
+                    effective.provider, effective.model
+                )
+            }
+            Err(SeraError::Forbidden(_)) => {
+                "No approved provider is configured for autoselect.".into()
+            }
+            Err(error) => return Err(error),
+        },
         ["/model", provider, model] => {
             match runtime.select_model(conversation_id, crate::model_router::ModelSelection {
                 provider: (*provider).to_owned(), model: (*model).to_owned(),
@@ -650,7 +885,7 @@ fn model_command(runtime: &Runtime, conversation_id: &str, text: &str) -> Result
             }
         }
         ["/model", ..] | ["/models", ..] => {
-            "Usage: /models, /model, or /model <provider> <model>".into()
+            "Usage: /models, /model, /model auto, or /model <provider> <model>".into()
         }
         [command, ..] if command.starts_with("/model@") || command.starts_with("/models@") => {
             "Use /model or /models without an @username in the configured owner chat.".into()
@@ -659,6 +894,137 @@ fn model_command(runtime: &Runtime, conversation_id: &str, text: &str) -> Result
     };
     runtime.scan_owner_output(&reply)?;
     Ok(Some(reply))
+}
+
+fn bot_commands() -> Vec<Value> {
+    // Bot API allows only [a-z0-9_]; keep names aligned with typed handlers.
+    [
+        ("start", "Wake SeraBot and show quick usage"),
+        ("help", "List owner commands"),
+        ("status", "Pending tasks and approvals"),
+        ("approvals", "Resend pending approval prompts"),
+        ("ask", "Cited document Q&A — /ask <question>"),
+        ("deck", "Italian deck draft — /deck <brief>"),
+        ("xlsx", "Spreadsheet analysis — /xlsx <request>"),
+        ("timesheets", "Timesheet analysis — /timesheets <request>"),
+        ("brief", "Generate the morning brief"),
+        ("models", "List configured providers and models"),
+        ("model", "Show or set provider/model for this chat"),
+        ("remember", "Store a fact — /remember <fact>"),
+        ("memories", "List stored facts"),
+        ("forget", "Delete a fact — /forget <id>"),
+        ("approve_deck", "Approve Italian deck for French"),
+        ("revoke", "Revoke all standing grants"),
+    ]
+    .into_iter()
+    .map(|(command, description)| json!({ "command": command, "description": description }))
+    .collect()
+}
+
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(character),
+        }
+    }
+    out
+}
+
+/// Convert common Markdown used by models into Telegram HTML.
+/// Unknown markup is escaped so the API cannot be injected with raw tags.
+fn markdown_to_telegram_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(after_fence) = rest.strip_prefix("```") {
+            let body = after_fence.strip_prefix('\n').unwrap_or(after_fence);
+            if let Some((code, tail)) = body.split_once("```") {
+                let code = code.strip_suffix('\n').unwrap_or(code);
+                out.push_str("<pre>");
+                out.push_str(&escape_html(code));
+                out.push_str("</pre>");
+                rest = tail.strip_prefix('\n').unwrap_or(tail);
+                continue;
+            }
+        }
+        if rest.starts_with('`') {
+            if let Some(end) = rest[1..].find('`') {
+                let code = &rest[1..1 + end];
+                if !code.is_empty() && !code.contains('\n') {
+                    out.push_str("<code>");
+                    out.push_str(&escape_html(code));
+                    out.push_str("</code>");
+                    rest = &rest[2 + end..];
+                    continue;
+                }
+            }
+        }
+        if rest.starts_with("**") {
+            if let Some(end) = rest[2..].find("**") {
+                let inner = &rest[2..2 + end];
+                if !inner.is_empty() && !inner.contains('\n') {
+                    out.push_str("<b>");
+                    out.push_str(&markdown_to_telegram_html(inner));
+                    out.push_str("</b>");
+                    rest = &rest[4 + end..];
+                    continue;
+                }
+            }
+        }
+        if rest.starts_with('[') {
+            if let Some((label, after_label)) = rest[1..].split_once("](") {
+                if let Some((url, after_url)) = after_label.split_once(')') {
+                    if !label.is_empty()
+                        && (url.starts_with("https://") || url.starts_with("http://"))
+                        && !url.chars().any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '<'))
+                    {
+                        out.push_str("<a href=\"");
+                        out.push_str(&escape_html(url));
+                        out.push_str("\">");
+                        out.push_str(&escape_html(label));
+                        out.push_str("</a>");
+                        rest = after_url;
+                        continue;
+                    }
+                }
+            }
+        }
+        if rest.starts_with('#') {
+            let line_end = rest.find('\n').unwrap_or(rest.len());
+            let line = &rest[..line_end];
+            if line.starts_with('#')
+                && line
+                    .chars()
+                    .take_while(|c| *c == '#')
+                    .count()
+                    .saturating_mul(1)
+                    <= 6
+                && line
+                    .find(|c: char| c != '#')
+                    .is_some_and(|i| line.as_bytes().get(i) == Some(&b' '))
+            {
+                let title = line.trim_start_matches('#').trim();
+                out.push_str("<b>");
+                out.push_str(&escape_html(title));
+                out.push_str("</b>");
+                rest = &rest[line_end..];
+                continue;
+            }
+        }
+        let next = rest.chars().next().unwrap();
+        match next {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(next),
+        }
+        rest = &rest[next.len_utf8()..];
+    }
+    out
 }
 
 fn parse_callback(data: &str) -> Option<(Decision, &str)> {
@@ -779,8 +1145,8 @@ mod tests {
     fn model_commands_list_select_and_keep_conversations_separate() {
         let (runtime, store) = model_runtime();
         let listing = model_command(&runtime, "20", "/models").unwrap().unwrap();
-        assert!(listing.contains("default"));
-        assert!(listing.contains("alternative"));
+        assert!(listing.contains("default / test"));
+        assert!(listing.contains("default / alternative"));
         assert!(!listing.contains("synthetic-key"));
         assert!(!listing.contains("example.com"));
         let reply = model_command(&runtime, "20", "/model default alternative")
@@ -872,6 +1238,41 @@ mod tests {
         assert!(TelegramClient::new("123:abc", 0, 1).is_err());
     }
 
+    #[test]
+    fn bot_command_menu_covers_owner_commands() {
+        let commands = bot_commands();
+        assert!(commands.len() >= 12);
+        let names: Vec<_> = commands
+            .iter()
+            .filter_map(|command| command.get("command")?.as_str())
+            .collect();
+        for expected in [
+            "help", "status", "approvals", "ask", "models", "model", "approve_deck", "revoke",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}");
+        }
+        assert!(names.iter().all(|name| {
+            !name.is_empty()
+                && name.len() <= 32
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        }));
+    }
+
+    #[test]
+    fn markdown_becomes_telegram_html_and_escapes_raw_tags() {
+        let html = markdown_to_telegram_html(
+            "## Status\n**bold** and `code` plus [docs](https://example.com)\n<script>x</script>",
+        );
+        assert!(html.contains("<b>Status</b>"));
+        assert!(html.contains("<b>bold</b>"));
+        assert!(html.contains("<code>code</code>"));
+        assert!(html.contains("<a href=\"https://example.com\">docs</a>"));
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(!html.contains("<script>"));
+    }
+
     #[tokio::test]
     async fn sends_message_through_bot_api() {
         let server = MockServer::start().await;
@@ -886,6 +1287,54 @@ mod tests {
             .unwrap()
             .with_base_url(server.uri());
         client.send_message(20, "hello").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn registers_command_menu_via_set_my_commands() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:abc/setMyCommands"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": true})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = TelegramClient::new("123:abc", 10, 20)
+            .unwrap()
+            .with_base_url(server.uri());
+        client.register_commands().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn html_send_falls_back_to_plain_text() {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:abc/sendMessage"))
+            .and(body_partial_json(json!({"parse_mode": "HTML"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": false,
+                "description": "can't parse entities"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:abc/sendMessage"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": {}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = TelegramClient::new("123:abc", 10, 20)
+            .unwrap()
+            .with_base_url(server.uri());
+        client
+            .send_message(20, "**hello** <not-a-tag>")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

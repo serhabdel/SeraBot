@@ -54,16 +54,38 @@ will be sent to that provider on future turns.
 
 The owner selects a provider/model per conversation:
 
-- Telegram: `/models`, `/model`, `/model <provider> <model>`
+- Telegram: `/models`, `/model`, `/model auto`, `/model <provider> <model>`
 - API: `GET /v1/models` and `PUT /v1/conversations/{id}/model`
+
+Catalog responses list every configured pair as `provider / model` (API field
+`entries`, plus grouped `providers`). Responses never include endpoints or
+credentials. `selection` is the stored preference; `effective_selection` is the
+concrete route used for the requested bot on the next turn.
 
 Selection is stored server-side (`kv` key `model_selection:<conversation>`) and
 validated against the configured allowlist before it is saved. Unknown
 providers/models are rejected without changing the stored selection. Switching
 does not affect other conversations.
 
+### Default and autoselect
+
 Requests without a stored selection use the bot's configured model on the
-`default` provider.
+`default` provider when that model is allowed there; otherwise the configured
+`[llm].model` on `default`.
+
+`/model auto` (or API `{"provider":"auto"}`) stores explicit **auto** mode.
+Auto never picks unapproved providers. On each turn SeraBot resolves auto
+deterministically:
+
+1. Bot `model` override in `bots/*.toml`, if that model exists on an approved
+   provider (prefer `default`, then lowest provider id).
+2. Else `llm.bot_models[<bot>]`, with the same provider preference.
+3. Else `[llm].model` on `default` when approved.
+4. Else the first approved `provider / model` in sorted provider id, then
+   sorted model id order.
+
+Auto mode re-resolves when bot defaults change; a fixed provider/model selection
+does not.
 
 ## Pinned turns
 

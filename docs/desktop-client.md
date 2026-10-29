@@ -1,13 +1,9 @@
 # Desktop client (Windows)
 
-`crates/serabot-desktop` is a native Rust client built with `eframe`/`egui`
+`crates/serabot-desktop` is a native Rust owner console built with `eframe`/`egui`
 (OpenGL). It adds no Node runtime, web server, or web admin UI. The server
 binary is unchanged and remains the default workspace member, so server release
 builds and Linux deployments do not include the desktop GUI.
-
-> The desktop client is provisional and expected to change. Approvals and other
-> sensitive actions remain in Telegram; the desktop client is a connection,
-> provider/model selector, and chat surface.
 
 ## Build and launch (Windows, MSVC)
 
@@ -34,12 +30,19 @@ scripts\cargo-win.bat build --release -p serabot --locked
 
 ## Behaviour
 
+- Sidebar navigation: **Chat** and **Approvals**, plus conversation id, model
+  routing, and connection controls.
 - Chat history comes only from the server; there are no optimistic or demo
-  messages.
+  messages. The composer stays in a reserved bottom region so it is not clipped
+  at common window sizes.
 - Provider and model are chosen separately. A change is not applied until
   confirmed, and the confirmation states that the provider will receive this
   conversation's history. Unapproved (`data_egress_approved = false`) profiles
   are visible but cannot be selected.
+- Approvals load from `GET /v1/approvals`. Once / Always / Deny call
+  `POST /v1/approvals/{id}/decide` with the same semantics as Telegram. Decisions
+  still bind canonical arguments, destination, artifact hash, policy version,
+  and expiry.
 - Submitted messages are tracked by task id. If a submit response is lost, the
   client reports an unknown outcome and refuses to resend automatically; review
   server state first.
@@ -49,10 +52,8 @@ scripts\cargo-win.bat build --release -p serabot --locked
 
 ## Known limitations
 
-- Visual/accessibility smoke testing exposed a layout defect in the current
-  build: at some display scalings the bottom composer can be laid out below the
-  visible window. Treat the client as a prototype until the UI is redesigned.
 - The desktop client cannot cancel work already accepted by the server when it
   disconnects.
-- Approval decisions and deck approvals are not exposed in the client.
+- Deck artifact download / Italian→French approve flows remain server/Telegram
+  oriented (`/v1/artifacts/...`); they are not yet a first-class desktop panel.
 - No live provider or Telegram verification is implied by the synthetic tests.

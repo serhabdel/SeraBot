@@ -49,7 +49,11 @@ resubmitting.
   "providers": [
     {"id": "default", "models": ["mistral-large-latest"], "data_egress_approved": false}
   ],
-  "selection": {"provider": "default", "model": "mistral-large-latest"}
+  "entries": [
+    {"provider": "default", "model": "mistral-large-latest", "data_egress_approved": false}
+  ],
+  "selection": {"provider": "default", "model": "mistral-large-latest"},
+  "effective_selection": {"provider": "default", "model": "mistral-large-latest"}
 }
 ```
 
@@ -57,6 +61,12 @@ resubmitting.
 
 ```json
 {"provider": "default", "model": "mistral-large-latest"}
+```
+
+Automatic routing:
+
+```json
+{"provider": "auto"}
 ```
 
 Returns `{"selection": {...}}`. Unknown providers/models and unapproved

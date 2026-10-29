@@ -2,6 +2,17 @@ name = "analyst"
 trigger = "file"
 system_prompt = "prompts/analyst.txt"
 skills = ["synthesis", "transcript", "xlsx", "timesheets", "ask"]
-tools = ["rag_search", "xlsx_analyze", "timesheet_analyze", "document_index"]
-require_approval = []
+tools = [
+  "rag_search",
+  "xlsx_analyze",
+  "timesheet_analyze",
+  "document_index",
+  "audio_transcribe",
+  "audio_understand",
+  "firecrawl_scrape",
+  "firecrawl_map",
+  "firecrawl_search",
+  "firecrawl_crawl",
+]
+require_approval = ["firecrawl_crawl", "firecrawl_search"]
 enabled = true

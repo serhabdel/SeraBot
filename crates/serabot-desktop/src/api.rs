@@ -122,6 +122,19 @@ pub struct Selection {
     pub model: String,
 }
 
+impl Selection {
+    pub fn auto() -> Self {
+        Self {
+            provider: "auto".into(),
+            model: String::new(),
+        }
+    }
+
+    pub fn is_auto(&self) -> bool {
+        self.provider == "auto"
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Provider {
     pub id: String,
@@ -132,13 +145,35 @@ pub struct Provider {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CatalogEntry {
+    pub provider: String,
+    pub model: String,
+    #[serde(default)]
+    pub data_egress_approved: bool,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct Catalog {
     pub providers: Vec<Provider>,
+    #[serde(default)]
+    pub entries: Vec<CatalogEntry>,
     pub selection: Selection,
+    #[serde(default)]
+    pub effective_selection: Option<Selection>,
 }
 
 impl Catalog {
     pub fn allows(&self, selection: &Selection) -> bool {
+        if selection.is_auto() {
+            return self
+                .effective_selection
+                .as_ref()
+                .is_some_and(|effective| self.allows_concrete(effective));
+        }
+        self.allows_concrete(selection)
+    }
+
+    fn allows_concrete(&self, selection: &Selection) -> bool {
         self.providers.iter().any(|p| {
             p.id == selection.provider
                 && p.data_egress_approved
@@ -200,7 +235,7 @@ impl TaskStatus {
         match self {
             Self::Queued => "Queued",
             Self::Running => "Working",
-            Self::AwaitingApproval => "Awaiting approval — Review in Telegram",
+            Self::AwaitingApproval => "Awaiting approval",
             Self::Done => "Done",
             Self::Failed => "Failed",
             Self::Cancelled => "Cancelled",
@@ -216,6 +251,39 @@ pub struct Task {
     pub status: TaskStatus,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct Approval {
+    pub id: String,
+    pub action_id: String,
+    pub tool: String,
+    pub summary: String,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    Once,
+    Always,
+    Deny,
+}
+
+impl ApprovalDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Once => "once",
+            Self::Always => "always",
+            Self::Deny => "deny",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Once => "Approve once",
+            Self::Always => "Always allow",
+            Self::Deny => "Deny",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct TaskEnvelope {
     task: Task,
@@ -223,6 +291,10 @@ struct TaskEnvelope {
 #[derive(Deserialize)]
 struct SelectionEnvelope {
     selection: Selection,
+}
+#[derive(Deserialize)]
+struct ApprovalsEnvelope {
+    approvals: Vec<Approval>,
 }
 
 /// Construct and use only on a worker thread. No retries, cookies, redirects,
@@ -331,7 +403,9 @@ impl ApiClient {
     }
     pub fn select(&self, conversation: &str, selection: &Selection) -> Result<Selection, ApiError> {
         check_id(conversation)?;
-        if selection.provider.is_empty()
+        if selection.is_auto() {
+            // Server stores auto mode; model id is not used.
+        } else if selection.provider.is_empty()
             || selection.provider.len() > 128
             || selection.model.is_empty()
             || selection.model.len() > 256
@@ -379,6 +453,47 @@ impl ApiClient {
             return Err(ApiError::InvalidResponse);
         }
         Ok(task)
+    }
+
+    pub fn approvals(&self) -> Result<Vec<Approval>, ApiError> {
+        let response: ApprovalsEnvelope = self.get(&["v1", "approvals"], &[])?;
+        if response.approvals.len() > 100 {
+            return Err(ApiError::InvalidResponse);
+        }
+        for approval in &response.approvals {
+            if !valid_id(&approval.id) || !valid_id(&approval.action_id) {
+                return Err(ApiError::InvalidResponse);
+            }
+            if approval.tool.is_empty()
+                || approval.tool.len() > 128
+                || approval.summary.chars().count() > 4000
+                || approval.expires_at.len() > 64
+            {
+                return Err(ApiError::InvalidResponse);
+            }
+        }
+        Ok(response.approvals)
+    }
+
+    pub fn decide_approval(
+        &self,
+        id: &str,
+        decision: ApprovalDecision,
+    ) -> Result<(), ApiError> {
+        check_id(id)?;
+        #[derive(Serialize)]
+        struct Body {
+            decision: &'static str,
+        }
+        self.request::<serde_json::Value, Body>(
+            Method::POST,
+            &["v1", "approvals", id, "decide"],
+            &[],
+            Some(&Body {
+                decision: decision.as_str(),
+            }),
+        )?;
+        Ok(())
     }
 }
 

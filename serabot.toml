@@ -67,6 +67,21 @@ timeout_secs = 30
 max_response_bytes = 5242880
 morning_brief_enabled = true
 
+[elevenlabs]
+enabled = false
+api_base = "https://api.elevenlabs.io"
+api_key_secret = "elevenlabs_api_key"
+timeout_secs = 120
+# Optional default voice when tools omit voice_id (set after listing voices).
+default_voice_id = ""
+tts_model = "eleven_multilingual_v2"
+stt_model = "scribe_v2"
+image_model = "gemini-2.5-flash-image"
+video_model = "bytedance-seedance-v2-mini"
+max_tts_chars = 5000
+poll_interval_ms = 2000
+poll_max_attempts = 60
+
 [onedrive]
 enabled = false
 graph_base = "https://graph.microsoft.com/v1.0"
@@ -75,6 +90,21 @@ client_id_secret = "onedrive_client_id"
 refresh_token_secret = "onedrive_refresh_token"
 folder = "SeraBot"
 conflict_behavior = "rename"
+
+# Firecrawl v2 (scrape / map / search / crawl). Disabled by default.
+# Store the API key in the age secret store: serabot secrets set firecrawl_api_key
+[firecrawl]
+enabled = false
+api_base = "https://api.firecrawl.dev"
+api_key_secret = "firecrawl_api_key"
+timeout_secs = 120
+max_markdown_chars = 80000
+max_map_links = 500
+max_map_limit = 500
+max_search_limit = 10
+max_crawl_limit = 25
+crawl_poll_interval_ms = 2000
+crawl_max_wait_secs = 300
 
 [render]
 brand_file = "config/brand.example.toml"
@@ -103,3 +133,15 @@ max_bytes = 52428800
 chunk_chars = 1200
 chunk_overlap = 150
 retrieval_k = 8
+
+# Mistral Voxtral transcription + audio-in-chat understanding (outbound; requires llm.data_egress_approved).
+[audio]
+enabled = false
+provider = "default"
+# base_url = "https://api.mistral.ai/v1"
+# api_key_secret = "llm_api_key"
+transcription_model = "voxtral-mini-latest"
+understanding_model = "voxtral-small-latest"
+max_bytes = 52428800
+telegram_intake = false
+telegram_max_bytes = 20971520

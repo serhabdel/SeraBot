@@ -8,9 +8,11 @@ artifacts.
 | Document | Purpose |
 | --- | --- |
 | [Model routing](model-routing.md) | Configure providers/models, consent, selection, and pinned turns. |
+| [Audio](audio.md) | Mistral Voxtral transcription/understanding, inbox tools, Telegram intake. |
 | [Owner API](api.md) | Authenticated HTTP/SSE contract used by the owner and clients. |
 | [Desktop client](desktop-client.md) | Native Windows client build, launch, and current limitations. |
 | [Deployment](deployment.md) | Ubuntu 24.04 release build and additive install on OVH. |
+| [Firecrawl](firecrawl.md) | Optional v2 scrape/map/search/crawl tools and configuration. |
 
 Related sources of truth:
 

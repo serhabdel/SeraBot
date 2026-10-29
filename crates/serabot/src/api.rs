@@ -231,19 +231,25 @@ async fn models(
     Query(query): Query<ModelQuery>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&query.conversation_id)?;
-    let selection = state.runtime.model_selection(
-        &query.conversation_id,
-        query.bot.as_deref().unwrap_or("main"),
-    )?;
-    Ok(Json(
-        json!({"providers": state.runtime.model_catalog()?, "selection": selection}),
-    ))
+    let bot = query.bot.as_deref().unwrap_or("main");
+    let selection = state.runtime.model_selection(&query.conversation_id, bot)?;
+    let effective_selection =
+        state
+            .runtime
+            .effective_model_selection(&query.conversation_id, bot)?;
+    Ok(Json(json!({
+        "providers": state.runtime.model_catalog()?,
+        "entries": state.runtime.model_catalog_entries()?,
+        "selection": selection,
+        "effective_selection": effective_selection,
+    })))
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SelectModelRequest {
     provider: String,
+    #[serde(default)]
     model: String,
 }
 
@@ -253,13 +259,15 @@ async fn select_model(
     Json(request): Json<SelectModelRequest>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
-    let selection = state.runtime.select_model(
-        &id,
+    let selection = if request.provider == crate::model_router::AUTO_PROVIDER {
+        ModelSelection::auto_mode()
+    } else {
         ModelSelection {
             provider: request.provider,
             model: request.model,
-        },
-    )?;
+        }
+    };
+    let selection = state.runtime.select_model(&id, selection)?;
     Ok(Json(json!({"selection": selection})))
 }
 
@@ -946,7 +954,10 @@ mod tests {
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["selection"]["provider"], "default");
         assert_eq!(value["selection"]["model"], config.llm.model);
+        assert_eq!(value["effective_selection"], value["selection"]);
         assert_eq!(value["providers"][0]["id"], "default");
+        assert_eq!(value["entries"][0]["provider"], "default");
+        assert_eq!(value["entries"][0]["model"], config.llm.model);
         let text = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(!text.contains("base_url"));
         assert!(!text.contains("api_key"));

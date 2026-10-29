@@ -28,6 +28,10 @@ pub struct Config {
     #[serde(default)]
     pub onedrive: OneDriveConfig,
     #[serde(default)]
+    pub firecrawl: FirecrawlConfig,
+    #[serde(default)]
+    pub elevenlabs: ElevenLabsConfig,
+    #[serde(default)]
     pub render: RenderConfig,
     #[serde(default)]
     pub runtime: RuntimeConfig,
@@ -35,6 +39,8 @@ pub struct Config {
     pub schedule: ScheduleConfig,
     #[serde(default)]
     pub documents: DocumentsConfig,
+    #[serde(default)]
+    pub audio: AudioConfig,
     #[serde(skip)]
     pub base_dir: PathBuf,
 }
@@ -52,10 +58,13 @@ impl Default for Config {
             policy: PolicyConfig::default(),
             watcher: WatcherConfig::default(),
             onedrive: OneDriveConfig::default(),
+            firecrawl: FirecrawlConfig::default(),
+            elevenlabs: ElevenLabsConfig::default(),
             render: RenderConfig::default(),
             runtime: RuntimeConfig::default(),
             schedule: ScheduleConfig::default(),
             documents: DocumentsConfig::default(),
+            audio: AudioConfig::default(),
             base_dir: PathBuf::from("."),
         }
     }
@@ -148,6 +157,65 @@ impl Config {
             parse_hhmm(time).ok_or_else(|| {
                 SeraError::Config(format!("invalid schedule time '{time}'; expected HH:MM"))
             })?;
+        }
+        if self.firecrawl.enabled {
+            if self.firecrawl.api_key_secret.trim().is_empty() {
+                return Err(SeraError::Config(
+                    "firecrawl.api_key_secret must not be empty when firecrawl is enabled".into(),
+                ));
+            }
+            if self.firecrawl.max_crawl_limit == 0 || self.firecrawl.max_crawl_limit > 500 {
+                return Err(SeraError::Config(
+                    "firecrawl.max_crawl_limit must be between 1 and 500".into(),
+                ));
+            }
+            if self.firecrawl.max_search_limit == 0 || self.firecrawl.max_search_limit > 50 {
+                return Err(SeraError::Config(
+                    "firecrawl.max_search_limit must be between 1 and 50".into(),
+                ));
+            }
+        }
+        if self.audio.enabled {
+            if self.audio.transcription_model.is_empty() || self.audio.understanding_model.is_empty()
+            {
+                return Err(SeraError::Config(
+                    "audio.transcription_model and audio.understanding_model are required when audio is enabled"
+                        .into(),
+                ));
+            }
+            if self.audio.max_bytes == 0 {
+                return Err(SeraError::Config(
+                    "audio.max_bytes must be greater than zero".into(),
+                ));
+            }
+            if self.audio.telegram_intake && self.audio.telegram_max_bytes == 0 {
+                return Err(SeraError::Config(
+                    "audio.telegram_max_bytes must be greater than zero when telegram_intake is enabled"
+                        .into(),
+                ));
+            }
+        }
+        if self.audio.telegram_intake && !self.telegram.enabled {
+            return Err(SeraError::Config(
+                "audio.telegram_intake requires telegram.enabled".into(),
+            ));
+        }
+        if self.elevenlabs.enabled {
+            if self.elevenlabs.api_base.is_empty() {
+                return Err(SeraError::Config(
+                    "elevenlabs.api_base must not be empty when elevenlabs is enabled".into(),
+                ));
+            }
+            if self.elevenlabs.max_tts_chars == 0 {
+                return Err(SeraError::Config(
+                    "elevenlabs.max_tts_chars must be greater than zero".into(),
+                ));
+            }
+            if self.elevenlabs.poll_max_attempts == 0 {
+                return Err(SeraError::Config(
+                    "elevenlabs.poll_max_attempts must be greater than zero".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -439,6 +507,97 @@ impl Default for OneDriveConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FirecrawlConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_firecrawl_api_base")]
+    pub api_base: String,
+    #[serde(default = "default_firecrawl_key_secret")]
+    pub api_key_secret: String,
+    #[serde(default = "default_firecrawl_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_firecrawl_max_markdown")]
+    pub max_markdown_chars: usize,
+    #[serde(default = "default_firecrawl_max_map_links")]
+    pub max_map_links: usize,
+    #[serde(default = "default_firecrawl_max_map_limit")]
+    pub max_map_limit: u32,
+    #[serde(default = "default_firecrawl_max_search_limit")]
+    pub max_search_limit: u32,
+    #[serde(default = "default_firecrawl_max_crawl_limit")]
+    pub max_crawl_limit: u32,
+    #[serde(default = "default_firecrawl_crawl_poll_ms")]
+    pub crawl_poll_interval_ms: u64,
+    #[serde(default = "default_firecrawl_crawl_max_wait_secs")]
+    pub crawl_max_wait_secs: u64,
+}
+
+impl Default for FirecrawlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_base: default_firecrawl_api_base(),
+            api_key_secret: default_firecrawl_key_secret(),
+            timeout_secs: default_firecrawl_timeout(),
+            max_markdown_chars: default_firecrawl_max_markdown(),
+            max_map_links: default_firecrawl_max_map_links(),
+            max_map_limit: default_firecrawl_max_map_limit(),
+            max_search_limit: default_firecrawl_max_search_limit(),
+            max_crawl_limit: default_firecrawl_max_crawl_limit(),
+            crawl_poll_interval_ms: default_firecrawl_crawl_poll_ms(),
+            crawl_max_wait_secs: default_firecrawl_crawl_max_wait_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElevenLabsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_elevenlabs_api_base")]
+    pub api_base: String,
+    #[serde(default = "default_elevenlabs_api_key_secret")]
+    pub api_key_secret: String,
+    #[serde(default = "default_elevenlabs_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_elevenlabs_voice_id")]
+    pub default_voice_id: String,
+    #[serde(default = "default_elevenlabs_tts_model")]
+    pub tts_model: String,
+    #[serde(default = "default_elevenlabs_stt_model")]
+    pub stt_model: String,
+    #[serde(default = "default_elevenlabs_image_model")]
+    pub image_model: String,
+    #[serde(default = "default_elevenlabs_video_model")]
+    pub video_model: String,
+    #[serde(default = "default_elevenlabs_max_tts_chars")]
+    pub max_tts_chars: usize,
+    #[serde(default = "default_elevenlabs_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    #[serde(default = "default_elevenlabs_poll_max_attempts")]
+    pub poll_max_attempts: u32,
+}
+
+impl Default for ElevenLabsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_base: default_elevenlabs_api_base(),
+            api_key_secret: default_elevenlabs_api_key_secret(),
+            timeout_secs: default_elevenlabs_timeout_secs(),
+            default_voice_id: default_elevenlabs_voice_id(),
+            tts_model: default_elevenlabs_tts_model(),
+            stt_model: default_elevenlabs_stt_model(),
+            image_model: default_elevenlabs_image_model(),
+            video_model: default_elevenlabs_video_model(),
+            max_tts_chars: default_elevenlabs_max_tts_chars(),
+            poll_interval_ms: default_elevenlabs_poll_interval_ms(),
+            poll_max_attempts: default_elevenlabs_poll_max_attempts(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderConfig {
     #[serde(default = "default_brand_file")]
     pub brand_file: String,
@@ -538,6 +697,46 @@ impl Default for DocumentsConfig {
             chunk_chars: default_chunk_chars(),
             chunk_overlap: default_chunk_overlap(),
             retrieval_k: default_retrieval_k(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Reserved provider id: `default` uses [llm] credentials and egress consent.
+    #[serde(default = "default_audio_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key_secret: Option<String>,
+    #[serde(default = "default_audio_transcription_model")]
+    pub transcription_model: String,
+    #[serde(default = "default_audio_understanding_model")]
+    pub understanding_model: String,
+    #[serde(default = "default_audio_max_bytes")]
+    pub max_bytes: u64,
+    /// Save owner voice/audio messages into the inbox (Telegram only).
+    #[serde(default)]
+    pub telegram_intake: bool,
+    #[serde(default = "default_telegram_audio_max_bytes")]
+    pub telegram_max_bytes: u64,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_audio_provider(),
+            base_url: None,
+            api_key_secret: None,
+            transcription_model: default_audio_transcription_model(),
+            understanding_model: default_audio_understanding_model(),
+            max_bytes: default_audio_max_bytes(),
+            telegram_intake: false,
+            telegram_max_bytes: default_telegram_audio_max_bytes(),
         }
     }
 }
@@ -794,6 +993,36 @@ fn default_onedrive_folder() -> String {
 fn default_conflict_behavior() -> String {
     "rename".into()
 }
+fn default_firecrawl_api_base() -> String {
+    "https://api.firecrawl.dev".into()
+}
+fn default_firecrawl_key_secret() -> String {
+    "firecrawl_api_key".into()
+}
+fn default_firecrawl_timeout() -> u64 {
+    120
+}
+fn default_firecrawl_max_markdown() -> usize {
+    80_000
+}
+fn default_firecrawl_max_map_links() -> usize {
+    500
+}
+fn default_firecrawl_max_map_limit() -> u32 {
+    500
+}
+fn default_firecrawl_max_search_limit() -> u32 {
+    10
+}
+fn default_firecrawl_max_crawl_limit() -> u32 {
+    25
+}
+fn default_firecrawl_crawl_poll_ms() -> u64 {
+    2_000
+}
+fn default_firecrawl_crawl_max_wait_secs() -> u64 {
+    300
+}
 fn default_brand_file() -> String {
     "config/brand.toml".into()
 }
@@ -847,6 +1076,54 @@ fn default_watch_dir() -> String {
 }
 fn default_max_document_bytes() -> u64 {
     50 * 1024 * 1024
+}
+fn default_audio_provider() -> String {
+    "default".into()
+}
+fn default_audio_transcription_model() -> String {
+    "voxtral-mini-latest".into()
+}
+fn default_audio_understanding_model() -> String {
+    "voxtral-small-latest".into()
+}
+fn default_audio_max_bytes() -> u64 {
+    52_428_800
+}
+fn default_telegram_audio_max_bytes() -> u64 {
+    20_971_520
+}
+fn default_elevenlabs_api_base() -> String {
+    "https://api.elevenlabs.io".into()
+}
+fn default_elevenlabs_api_key_secret() -> String {
+    "elevenlabs_api_key".into()
+}
+fn default_elevenlabs_timeout_secs() -> u64 {
+    120
+}
+fn default_elevenlabs_voice_id() -> String {
+    String::new()
+}
+fn default_elevenlabs_tts_model() -> String {
+    "eleven_multilingual_v2".into()
+}
+fn default_elevenlabs_stt_model() -> String {
+    "scribe_v2".into()
+}
+fn default_elevenlabs_image_model() -> String {
+    "gemini-2.5-flash-image".into()
+}
+fn default_elevenlabs_video_model() -> String {
+    "bytedance-seedance-v2-mini".into()
+}
+fn default_elevenlabs_max_tts_chars() -> usize {
+    5_000
+}
+fn default_elevenlabs_poll_interval_ms() -> u64 {
+    2_000
+}
+fn default_elevenlabs_poll_max_attempts() -> u32 {
+    60
 }
 fn default_chunk_chars() -> usize {
     1200

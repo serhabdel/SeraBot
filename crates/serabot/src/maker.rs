@@ -51,9 +51,9 @@ impl ArtifactStore {
         }
         let hash = sha256_hex(bytes);
         let filename = safe_filename(filename)?;
-        let pdf_path = self.root.join(format!("{hash}.pdf"));
+        let data_path = artifact_bytes_path(&self.root, &hash, &filename);
         let meta_path = self.root.join(format!("{hash}.json"));
-        atomic_write(&pdf_path, bytes)?;
+        atomic_write(&data_path, bytes)?;
         let meta_bytes = serde_json::to_vec_pretty(&meta)?;
         atomic_write(&meta_path, &meta_bytes)?;
         Ok(StoredArtifact {
@@ -66,20 +66,21 @@ impl ArtifactStore {
 
     pub fn load(&self, hash: &str) -> Result<StoredArtifact> {
         validate_hash(hash)?;
-        let pdf = std::fs::read(self.root.join(format!("{hash}.pdf")))
+        let meta_raw = std::fs::read(self.root.join(format!("{hash}.json")))
+            .map_err(|_| SeraError::NotFound(format!("artifact metadata {hash}")))?;
+        let meta: ArtifactMeta = serde_json::from_slice(&meta_raw)?;
+        let data_path = artifact_bytes_path(&self.root, hash, &meta.filename);
+        let bytes = std::fs::read(&data_path)
             .map_err(|_| SeraError::NotFound(format!("artifact {hash}")))?;
-        if sha256_hex(&pdf) != hash {
+        if sha256_hex(&bytes) != hash {
             return Err(SeraError::InvalidState(
                 "artifact bytes do not match their content hash".into(),
             ));
         }
-        let meta_raw = std::fs::read(self.root.join(format!("{hash}.json")))
-            .map_err(|_| SeraError::NotFound(format!("artifact metadata {hash}")))?;
-        let meta: ArtifactMeta = serde_json::from_slice(&meta_raw)?;
         Ok(StoredArtifact {
             hash: hash.to_owned(),
             filename: meta.filename.clone(),
-            bytes: pdf,
+            bytes,
             meta,
         })
     }
@@ -108,6 +109,14 @@ impl ArtifactStore {
     pub fn is_approved(&self, store: &Store, hash: &str) -> Result<bool> {
         Ok(store.kv_get(&format!("deck_approved:{hash}"))?.as_deref() == Some("1"))
     }
+}
+
+fn artifact_bytes_path(root: &Path, hash: &str, filename: &str) -> PathBuf {
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("pdf");
+    root.join(format!("{hash}.{extension}"))
 }
 
 fn validate_hash(hash: &str) -> Result<()> {

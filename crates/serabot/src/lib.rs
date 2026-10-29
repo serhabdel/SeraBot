@@ -1,14 +1,17 @@
 pub mod analyst;
 pub mod api;
+pub mod audio;
 pub mod ask;
 pub mod brief;
 pub mod config;
 pub mod deck;
 pub mod documents;
 pub mod domain;
+pub mod elevenlabs;
 pub mod embeddings;
 pub mod error;
 pub mod fetch;
+pub mod firecrawl;
 pub mod gateway;
 pub mod llm;
 pub mod maker;

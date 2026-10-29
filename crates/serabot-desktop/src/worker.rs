@@ -1,4 +1,7 @@
-use crate::{ApiClient, ApiError, Catalog, Health, History, Scope, Selection, Task};
+use crate::{
+    ApiClient, ApiError, Approval, ApprovalDecision, Catalog, Health, History, Scope, Selection,
+    Task,
+};
 use secrecy::SecretString;
 use std::sync::{
     Arc,
@@ -21,6 +24,8 @@ pub enum OperationKind {
     Apply,
     Submit,
     Task,
+    Approvals,
+    Decide,
 }
 
 pub enum Operation {
@@ -30,6 +35,11 @@ pub enum Operation {
     Apply(Selection),
     Submit(Zeroizing<String>),
     Task(String),
+    Approvals,
+    Decide {
+        id: String,
+        decision: ApprovalDecision,
+    },
 }
 
 impl Operation {
@@ -41,6 +51,8 @@ impl Operation {
             Self::Apply(_) => OperationKind::Apply,
             Self::Submit(_) => OperationKind::Submit,
             Self::Task(_) => OperationKind::Task,
+            Self::Approvals => OperationKind::Approvals,
+            Self::Decide { .. } => OperationKind::Decide,
         }
     }
 }
@@ -51,6 +63,8 @@ pub enum Reply {
     History(History),
     Selection(Selection),
     Task(Task),
+    Approvals(Vec<Approval>),
+    Decided,
 }
 
 pub struct Job {
@@ -144,6 +158,10 @@ fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
         Operation::Apply(selection) => client.select(conversation, selection).map(Reply::Selection),
         Operation::Submit(text) => client.submit(conversation, text).map(Reply::Task),
         Operation::Task(id) => client.task(id).map(Reply::Task),
+        Operation::Approvals => client.approvals().map(Reply::Approvals),
+        Operation::Decide { id, decision } => {
+            client.decide_approval(id, *decision).map(|_| Reply::Decided)
+        }
     }
 }
 

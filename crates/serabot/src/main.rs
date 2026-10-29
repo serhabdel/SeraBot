@@ -6,13 +6,21 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use serabot::api::{ApiNotifier, ApiState};
+use serabot::audio::{
+    AudioTranscribeTool, AudioUnderstandTool, MistralAudioClient, resolve_audio_provider,
+};
 use serabot::config::{Config, load_bots};
 use serabot::deck::Brand;
 use serabot::documents::index_directory;
 use serabot::documents::ingest_file;
+use serabot::elevenlabs::{ElevenLabsClient, register_elevenlabs_tools};
 use serabot::embeddings::{Embedder, FastEmbedder, LazyEmbedder};
 use serabot::error::SeraError;
 use serabot::fetch::SafeFetcher;
+use serabot::firecrawl::{
+    FirecrawlClient, FirecrawlCrawlTool, FirecrawlLimits, FirecrawlMapTool, FirecrawlScrapeTool,
+    FirecrawlSearchTool,
+};
 use serabot::gateway::{Gateway, ToolRegistry};
 use serabot::llm::LlmClient;
 use serabot::maker::{ArtifactStore, DeckBuildTool, OneDriveUploadTool, TelegramDocumentTool};
@@ -336,6 +344,50 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     let fetcher = fetcher.allow_hosts(source_hosts);
     registry.register(FetchUrlTool::new(fetcher.clone()))?;
     registry.register(WatchNowTool::new(store.clone(), fetcher, config.clone()))?;
+    if config.audio.enabled {
+        let provider = resolve_audio_provider(&config.llm, &config.audio)?;
+        let api_key = secrets.require(&provider.api_key_secret).map_err(|error| {
+            anyhow::anyhow!(
+                "{error}; run `serabot secrets set {}` before enabling audio",
+                provider.api_key_secret
+            )
+        })?;
+        let audio_client = Arc::new(MistralAudioClient::new(
+            provider.base_url,
+            api_key,
+            config.llm.timeout_secs,
+            &config.audio,
+            provider.data_egress_approved,
+        )?);
+        registry.register(AudioTranscribeTool::new(
+            audio_client.clone(),
+            config.clone(),
+        ))?;
+        registry.register(AudioUnderstandTool::new(audio_client, config.clone()))?;
+    }
+    if config.elevenlabs.enabled {
+        let api_key = secrets
+            .require(&config.elevenlabs.api_key_secret)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "{error}; run `serabot secrets set {}` before enabling ElevenLabs",
+                    config.elevenlabs.api_key_secret
+                )
+            })?;
+        let elevenlabs = Arc::new(ElevenLabsClient::new(
+            &config.elevenlabs.api_base,
+            api_key,
+            config.elevenlabs.timeout_secs,
+        )?);
+        register_elevenlabs_tools(
+            &mut registry,
+            elevenlabs,
+            artifacts.clone(),
+            policy.clone(),
+            config.clone(),
+            config.elevenlabs.clone(),
+        )?;
+    }
 
     let shutdown = CancellationToken::new();
     let mut notifiers: Vec<Arc<dyn Notifier>> = Vec::new();
@@ -350,6 +402,31 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         notifiers.push(client.clone());
         registry.register(TelegramDocumentTool::new(client.clone(), artifacts.clone()))?;
         telegram = Some(client);
+    }
+    if config.firecrawl.enabled {
+        let api_key = secrets.require(&config.firecrawl.api_key_secret).map_err(|error| {
+            anyhow::anyhow!(
+                "{error}; run `serabot secrets set {}` first",
+                config.firecrawl.api_key_secret
+            )
+        })?;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.firecrawl.timeout_secs.max(5)))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .context("build Firecrawl HTTP client")?;
+        let client = Arc::new(FirecrawlClient::new(
+            http,
+            config.firecrawl.api_base.clone(),
+            api_key,
+            &config.firecrawl,
+        )?);
+        let limits = FirecrawlLimits::from_config(&config.firecrawl);
+        registry.register(FirecrawlScrapeTool::new(client.clone(), limits.clone()))?;
+        registry.register(FirecrawlMapTool::new(client.clone(), limits.clone()))?;
+        registry.register(FirecrawlSearchTool::new(client.clone(), limits.clone()))?;
+        registry.register(FirecrawlCrawlTool::new(client, limits))?;
     }
     if config.onedrive.enabled {
         let client_id = secrets.require(&config.onedrive.client_id_secret)?;
