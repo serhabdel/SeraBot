@@ -639,10 +639,22 @@ impl Catalog {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct Health {
     pub ok: bool,
     pub version: String,
+    #[serde(default)]
+    pub audio_enabled: bool,
+    #[serde(default)]
+    pub audio_transcription_model: String,
+    #[serde(default)]
+    pub audio_understanding_model: String,
+    #[serde(default)]
+    pub firecrawl_enabled: bool,
+    #[serde(default)]
+    pub telegram_enabled: bool,
+    #[serde(default)]
+    pub catalog_fetch: bool,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]

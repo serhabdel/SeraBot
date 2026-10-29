@@ -143,6 +143,11 @@ network work stays on the Rust worker/SSE threads, never on the UI thread.
   redirect URI, and secret names. Each card has copyable `serabot secrets set`
   commands for missing keys. Secret writes and OAuth login stay on the server
   CLI.
+- **Settings → Capabilities** — reads the authenticated health payload and
+  shows Audio (on/off with the configured transcription and understanding
+  models), Firecrawl, Telegram, and whether model catalogs are live or static.
+  These are server flags; the card points at the exact key to change when a
+  capability is off.
 - **Live updates** — the Rust core opens `GET /v1/events` on a dedicated thread
   with its own HTTP client, reconnects with backoff, and resumes from the last
   event id (`after=` / `Last-Event-ID`). Events coalesce into at most one

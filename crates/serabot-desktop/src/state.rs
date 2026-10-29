@@ -9,6 +9,12 @@ pub struct State {
     pub scope: Scope,
     pub connected: bool,
     pub version: String,
+    pub audio_enabled: bool,
+    pub audio_transcription_model: String,
+    pub audio_understanding_model: String,
+    pub firecrawl_enabled: bool,
+    pub telegram_enabled: bool,
+    pub catalog_fetch: bool,
     pub catalog: Option<Catalog>,
     pub draft: Selection,
     pub messages: Vec<Message>,
@@ -44,6 +50,12 @@ impl Default for State {
             },
             connected: false,
             version: String::new(),
+            audio_enabled: false,
+            audio_transcription_model: String::new(),
+            audio_understanding_model: String::new(),
+            firecrawl_enabled: false,
+            telegram_enabled: false,
+            catalog_fetch: false,
             catalog: None,
             draft: Selection::default(),
             messages: Vec::new(),
@@ -75,6 +87,13 @@ impl Default for State {
 impl State {
     pub fn new_scope(&mut self, conversation: String, connected: bool) {
         let epoch = self.scope.epoch.wrapping_add(1);
+        let version = self.version.clone();
+        let audio_enabled = self.audio_enabled;
+        let audio_transcription_model = self.audio_transcription_model.clone();
+        let audio_understanding_model = self.audio_understanding_model.clone();
+        let firecrawl_enabled = self.firecrawl_enabled;
+        let telegram_enabled = self.telegram_enabled;
+        let catalog_fetch = self.catalog_fetch;
         let created_bot = self.created_bot.clone();
         let created_conversation = self.created_conversation.clone();
         let created_skill = self.created_skill.clone();
@@ -97,6 +116,13 @@ impl State {
                 conversation,
             },
             connected,
+            version,
+            audio_enabled,
+            audio_transcription_model,
+            audio_understanding_model,
+            firecrawl_enabled,
+            telegram_enabled,
+            catalog_fetch,
             created_bot,
             created_conversation,
             created_skill,
@@ -153,6 +179,12 @@ impl State {
             Reply::Health(health) => {
                 self.connected = health.ok;
                 self.version = health.version;
+                self.audio_enabled = health.audio_enabled;
+                self.audio_transcription_model = health.audio_transcription_model;
+                self.audio_understanding_model = health.audio_understanding_model;
+                self.firecrawl_enabled = health.firecrawl_enabled;
+                self.telegram_enabled = health.telegram_enabled;
+                self.catalog_fetch = health.catalog_fetch;
                 if !health.ok {
                     self.error = Some("Server is not ready. Retry the connection read.".into());
                 }
@@ -304,6 +336,7 @@ mod tests {
             Reply::Health(Health {
                 ok: true,
                 version: "test".into(),
+                ..Health::default()
             }),
         );
         state.receive(&first, Reply::Catalog(catalog()));
@@ -319,7 +352,8 @@ mod tests {
             &second,
             Reply::Health(Health {
                 ok: true,
-                version: "late".into()
+                version: "late".into(),
+                ..Health::default()
             })
         ));
         assert!(!state.connected);

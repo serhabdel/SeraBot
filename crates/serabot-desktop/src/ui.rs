@@ -1365,12 +1365,18 @@ fn SettingsView(session: Signal<Session>) -> Element {
     let update = session.read().update.info.clone();
     let update_error = session.read().update.error.clone();
     let checking = session.read().update.checking;
+    let audio_enabled = session.read().state.audio_enabled;
+    let transcription = session.read().state.audio_transcription_model.clone();
+    let understanding = session.read().state.audio_understanding_model.clone();
+    let firecrawl_enabled = session.read().state.firecrawl_enabled;
+    let telegram_enabled = session.read().state.telegram_enabled;
+    let catalog_fetch = session.read().state.catalog_fetch;
     rsx! {
         div { class: "page",
             div { class: "page-head",
                 div {
                     h1 { "Settings" }
-                    p { class: "muted", "Connection, appearance and updates." }
+                    p { class: "muted", "Connection, capabilities, appearance and updates." }
                 }
             }
             div { class: "card",
@@ -1389,6 +1395,38 @@ fn SettingsView(session: Signal<Session>) -> Element {
                         class: "btn danger",
                         onclick: move |_| session.write().disconnect(),
                         "Disconnect"
+                    }
+                }
+            }
+            div { class: "card",
+                h3 { "Capabilities" }
+                div { class: "chips",
+                    span { class: if audio_enabled { "chip accent" } else { "chip warn" },
+                        if audio_enabled { "Audio on" } else { "Audio off" }
+                    }
+                    span { class: if firecrawl_enabled { "chip accent" } else { "chip" },
+                        if firecrawl_enabled { "Firecrawl on" } else { "Firecrawl off" }
+                    }
+                    span { class: if telegram_enabled { "chip accent" } else { "chip" },
+                        if telegram_enabled { "Telegram on" } else { "Telegram off" }
+                    }
+                    span { class: if catalog_fetch { "chip accent" } else { "chip" },
+                        if catalog_fetch { "Model catalogs live" } else { "Model catalogs static" }
+                    }
+                }
+                if audio_enabled {
+                    p { class: "muted small",
+                        "Transcription: {transcription}. Understanding: {understanding}."
+                    }
+                    p { class: "muted small",
+                        "Voice notes sent to the bot's Telegram intake are transcribed with the configured Mistral audio model before the turn runs."
+                    }
+                } else {
+                    p { class: "muted small", "Audio is disabled on the server (audio.enabled = false)." }
+                }
+                if !catalog_fetch {
+                    p { class: "muted small",
+                        "Enable catalog_fetch in [llm] and use Fetch models on the Providers page to pull live model lists."
                     }
                 }
             }

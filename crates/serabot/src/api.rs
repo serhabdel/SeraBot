@@ -159,6 +159,12 @@ async fn health(State(state): State<Arc<ApiState>>) -> Response {
             "ok": true,
             "version": env!("CARGO_PKG_VERSION"),
             "build": crate::web::build_sha(),
+            "audio_enabled": state.config.audio.enabled,
+            "audio_transcription_model": state.config.audio.transcription_model,
+            "audio_understanding_model": state.config.audio.understanding_model,
+            "firecrawl_enabled": state.config.firecrawl.enabled,
+            "telegram_enabled": state.config.telegram.enabled,
+            "catalog_fetch": state.config.llm.catalog_fetch,
         }))
         .into_response(),
         Err(error) => (
