@@ -8,16 +8,22 @@ chat, tickets, or git.
 
 | Item | Value |
 | --- | --- |
-| **OVH code tip** | `4464558` — *Redact Telegram bot tokens before they reach the journal.* |
+| **OVH code tip** | `dc4d2e4` — *List configured bots and label room handoff replies.* |
+| **Previous host tip** | `4464558` — *Redact Telegram bot tokens before they reach the journal.* |
 | **Routing decision** | `bd871f9` — *Record why routing stays on the in-process allowlist.* Docs only (`docs/model-routing.md`). |
-| **This checklist** | Records that host tip. The server changes in this commit (`GET /v1/bots`, named room handoff replies) are not on the host until the additive deploy below finishes. |
-| **Previous code tip** | `795b139` (OneDrive refresh rotation). Superseded on the host by `4464558`. |
+| **This checklist** | Documentation on top of `dc4d2e4`. It does not move the binary. |
 
-`4464558` (`4464558aa9ab8dd78666430760f3cc6d3c725c5c`) is the binary confirmed
-on OVH at the start of this page. Docs-only commits between `795b139` and
-`4464558` did not need their own deploy.
+`dc4d2e4` (`dc4d2e4a49cc47ad920dcbe7d484ab0892c99623`) is the binary on OVH.
+`4464558` (`4464558aa9ab8dd78666430760f3cc6d3c725c5c`) was the previous host
+tip. Docs-only commits after `dc4d2e4`, including this page, do not need
+another deploy.
 
-Landed on `main` since `795b139` (code through `4464558`):
+Landed on `main` since `4464558` (code through `dc4d2e4`):
+
+- `GET /v1/bots` lists configured bots (`id`, `role`, `enabled`, `live`, tools, skills) without prompts or secrets. Desktop Fleet has **Refresh bots**.
+- Room turns label `main`, and a `delegate` handoff keeps the specialist id on that same conversation. `GET /v1/conversations/{id}/messages` returns `name` when it is a bot id.
+
+Still on `main` since `795b139` (code through `4464558`):
 
 - Telegram request URLs are dropped, and `bot<token>` segments are redacted, before an error is logged (`4464558`).
 - `skill_load` returns workflow text, and client builds can take a server origin (`4b1f0a4`).
@@ -39,28 +45,27 @@ Still on `main` from the earlier wake note (code through `795b139`):
 
 ## OVH
 
-Confirmed on code tip **`4464558`**
-(`4464558aa9ab8dd78666430760f3cc6d3c725c5c`) before the bot-list and room-name
-changes in this commit. That commit redacts Telegram bot tokens before they
-reach the journal. `serabot` was active on it. `onedrive-mcp` was left
-untouched. Unauthenticated `GET /v1/health` returns 401. `/v1/health` reports
-crate version `0.1.0`, not a git SHA.
+Confirmed on code tip **`dc4d2e4`**
+(`dc4d2e4a49cc47ad920dcbe7d484ab0892c99623`). `serabot` is active. Binary
+SHA-256 `71f3c5fd8c6fbe549e49f1f67610aed7338a88caf19001261897472bf00a1e8d`.
+Staged at `/var/lib/serabot/releases/serabot-dc4d2e4`. The previous binary is
+`/var/lib/serabot/releases/serabot-pre-dc4d2e4` (code tip `4464558`, SHA-256
+`ff18c928f8b1f56f15a368dda555257f6ef341dcb22201e1fc3eef5b6bf2c0a0`).
+`onedrive-mcp` was left untouched and is still active. Unauthenticated
+`GET /v1/health` returns 401. `/v1/health` reports crate version `0.1.0`, not
+a git SHA.
 
-If historical journals ever contained `getUpdates` URLs, rotate
-`telegram_bot_token` in BotFather and store the new value with
-`serabot secrets set`. Do not paste the token, the journal line, or the URL
-into chat, tickets, or git.
+If historical journals ever contained `getUpdates` URLs (a build before
+`4464558`), rotate `telegram_bot_token` in BotFather and store the new value
+with `serabot secrets set`. Do not paste the token, the journal line, or the
+URL into chat, tickets, or git.
 
-This commit changes the `serabot` binary (`GET /v1/bots`, named room handoff
-replies). It is not the `4464558` binary. Finish the additive upgrade in
-[deployment.md](deployment.md): build on Ubuntu 24.04, stage
-`/var/lib/serabot/releases/serabot-<this-commit>`, back up the current binary,
-replace `/opt/serabot/serabot` only after the staged SHA-256 matches, and
-restart **only** `serabot.service`. Leave Docker, OpenBot,
-`onedrive-mcp.service`, and the Cloudflare tunnel alone. Roll back by
-restoring the backup and restarting only `serabot.service`. Before replacing
-a busy binary, tunnel in and read `GET /v1/status`. Queued turns without a
-pinned route fail closed.
+This page does not change the binary. Roll back by restoring
+`serabot-pre-dc4d2e4` onto `/opt/serabot/serabot` and restarting **only**
+`serabot.service`. Leave Docker, OpenBot, `onedrive-mcp.service`, and the
+Cloudflare tunnel alone. Before replacing a busy binary, tunnel in and read
+`GET /v1/status`. Queued turns without a pinned route fail closed. The queue
+was empty of non-terminal tasks at this deploy (done and failed rows only).
 
 The earlier read-only check (mtime `2026-10-29 01:39:08` UTC, SHA-256 prefix
 `dfbc71dd89536f4e…`) and the `795b139` binary both predate `4464558`.
@@ -132,8 +137,7 @@ allowlisted pairs and must not include endpoints or credentials. Skills
 returns on-disk summaries, not bodies. Bots returns `id`, `role`, `enabled`,
 `live`, tools, and skills — not prompts or secrets.
 
-Telegram, about five minutes. The service confirmed before this commit is
-`4464558`. After the additive deploy, repeat these on the new binary:
+Telegram, about five minutes. The service is on `dc4d2e4`:
 
 1. Owner chat — command menu populated (`setMyCommands` on poll startup).
 2. **`/providers`** — models grouped by provider. Catalogs fail closed when refresh fails.
@@ -179,8 +183,7 @@ OneDrive after the maker bot is up: **`onedrive_list`** (read), then
 Unit tests use synthetic fixtures. Treat Telegram, Firecrawl, ElevenLabs,
 voice intake, OneDrive uploads, Antigravity, connector OAuth, AgentMail, and
 browser CDP as owner-verified only after you exercise them on the real
-account. OVH was confirmed on code tip `4464558` before this commit's binary
-changes; that confirmation is the binary and the unauthenticated health check,
-not a live exercise of those tools. If journals from before `4464558` contain
-a `getUpdates` URL, rotate `telegram_bot_token` as described above. Do not
-paste the token.
+account. OVH is confirmed on code tip `dc4d2e4`; that confirmation is the
+binary and the unauthenticated health check, not a live exercise of those
+tools. If journals from before `4464558` contain a `getUpdates` URL, rotate
+`telegram_bot_token` as described above. Do not paste the token.
