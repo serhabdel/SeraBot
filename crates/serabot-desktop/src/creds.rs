@@ -239,6 +239,7 @@ fn delete_token() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(windows))]
     use secrecy::ExposeSecret;
 
     fn temp_dir(name: &str) -> PathBuf {
