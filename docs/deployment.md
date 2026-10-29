@@ -135,8 +135,6 @@ On the VPS (as a user who can read the MCP env, never paste values into chat):
      --config /etc/serabot/serabot.toml secrets set onedrive_refresh_token
    import json, os
    from pathlib import Path
-   import msal
-   load = lambda p: None
    env = Path(".env")
    cache_path = Path(".token_cache.bin")
    if env.exists():
@@ -145,19 +143,16 @@ On the VPS (as a user who can read the MCP env, never paste values into chat):
                k, v = line.split("=", 1)
                os.environ.setdefault(k.strip(), v.strip())
    cache_path = Path(os.environ.get("TOKEN_CACHE_PATH", cache_path))
-   client_id = os.environ["AZURE_CLIENT_ID"]
-   cache = msal.SerializableTokenCache()
-   cache.deserialize(cache_path.read_text())
-   app = msal.PublicClientApplication(
-       client_id, authority="https://login.microsoftonline.com/consumers", token_cache=cache
-   )
-   accounts = app.get_accounts()
-   if not accounts:
-       raise SystemExit("no MSAL account in cache; run: python server.py auth")
-   token = app.acquire_token_silent(["Files.ReadWrite.All", "User.Read"], account=accounts[0])
-   if not token or "refresh_token" not in token:
-       raise SystemExit("could not read refresh_token from MSAL cache")
-   print(token["refresh_token"], end="")
+   data = json.loads(cache_path.read_text())
+   refresh = None
+   for entry in (data.get("RefreshToken") or {}).values():
+       secret = entry.get("secret")
+       if secret:
+           refresh = secret
+           break
+   if not refresh:
+       raise SystemExit("no refresh token in MSAL cache; run: python server.py auth")
+   print(refresh, end="")
    PY
    ```
 
