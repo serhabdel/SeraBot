@@ -8,17 +8,18 @@ chat, tickets, or git.
 
 | Item | Value |
 | --- | --- |
-| **OVH code tip** | `23fcb7d` — *Keep room turns on the orchestrator and document token rotation.* |
-| **Previous host tip** | `dc4d2e4` — *List configured bots and label room handoff replies.* |
+| **OVH code tip** | `27b1018` — *Keep the specialist name when a limit stops a handoff turn.* |
+| **Previous host tip** | `23fcb7d` — *Keep room turns on the orchestrator and document token rotation.* |
 | **Pre-redaction host tip** | `4464558` — *Redact Telegram bot tokens before they reach the journal.* The last tip that ran before token redaction landed; see the rotation note below. |
 | **Routing decision** | `bd871f9` — *Record why routing stays on the in-process allowlist.* Docs only (`docs/model-routing.md`). |
-| **This checklist** | Documentation on top of `23fcb7d`. It does not move the binary. |
+| **This checklist** | Documentation on top of `27b1018`. It does not move the binary. |
 
-`23fcb7d` (`23fcb7d85ec75dbf3e5f10912c4e974b79a7aed6`) is the binary on OVH.
-`dc4d2e4` (`dc4d2e4a49cc47ad920dcbe7d484ab0892c99623`) was the previous host
-tip, and `4464558` (`4464558aa9ab8dd78666430760f3cc6d3c725c5c`) the one before
-that. Docs-only commits after `23fcb7d`, including this page, do not need
-another deploy.
+`27b1018` (`27b101819acad0502cc0b596e6e48b255175e618`) is the binary on OVH.
+`23fcb7d` (`23fcb7d85ec75dbf3e5f10912c4e974b79a7aed6`) was the previous host
+tip, `dc4d2e4` (`dc4d2e4a49cc47ad920dcbe7d484ab0892c99623`) the one before
+that, and `4464558` (`4464558aa9ab8dd78666430760f3cc6d3c725c5c`) the last
+pre-redaction build. Docs-only commits after `27b1018`, including this page,
+do not need another deploy.
 
 ### Token rotation if journals held `getUpdates` URLs
 
@@ -39,10 +40,11 @@ Do not paste the token, the journal line, or the URL anywhere. If unsure
 whether a journal line existed, rotate anyway; the cost is one BotFather step.
 This note is the same rule recorded under [OVH](#ovh) below.
 
-Landed on `main` since `4464558` (code through `23fcb7d`):
+Landed on `main` since `4464558` (code through `27b1018`):
 
 - `GET /v1/bots` lists configured bots (`id`, `role`, `enabled`, `live`, tools, skills) without prompts or secrets. Desktop Fleet has **Refresh bots**.
 - Room turns label `main`, and a `delegate` handoff keeps the specialist id on that same conversation. `GET /v1/conversations/{id}/messages` returns `name` when it is a bot id. A `bot` override on a `room:` id is ignored, so only `main` starts work there (`23fcb7d`) ([orchestration.md](orchestration.md#rooms-and-delegate)).
+- A handoff turn stopped by the tool-call or tool-iteration limit still posts its final reply under the specialist name and still records `handoff.completed`; rooms were already correct, direct and legacy conversations dropped the name on those two finish paths (`27b1018`) ([orchestration.md](orchestration.md#rooms-and-delegate)).
 - Tag pushes (`v*`) build and publish client downloads on GitHub Releases: Windows desktop exe + zip and Android APK/AAB (`.github/workflows/release.yml`). CI-only; no OVH deploy ([ci-and-secrets.md](ci-and-secrets.md#releases)).
 
 Still on `main` since `795b139` (code through `4464558`):
@@ -67,16 +69,19 @@ Still on `main` from the earlier wake note (code through `795b139`):
 
 ## OVH
 
-Confirmed on code tip **`23fcb7d`**
-(`23fcb7d85ec75dbf3e5f10912c4e974b79a7aed6`). `serabot` is active. Binary
-SHA-256 `b0cc4ca9a8dddd0f79aba44fba4c8a7740d35cb293c79b7a3239a3f354620738`.
-Staged at `/var/lib/serabot/releases/serabot-23fcb7d`. The previous binary is
-`/var/lib/serabot/releases/serabot-pre-23fcb7d` (code tip `dc4d2e4`, SHA-256
-`71f3c5fd8c6fbe549e49f1f67610aed7338a88caf19001261897472bf00a1e8d`).
-Built on the host from `23fcb7d` with `cargo build --release --locked -p serabot`
-on Ubuntu 24.04.5 (glibc 2.39). `onedrive-mcp` was left untouched and is still
-active. Unauthenticated `GET /v1/health` and `GET /v1/bots` return 401.
-`/v1/health` reports crate version `0.1.0`, not a git SHA.
+Confirmed on code tip **`27b1018`**
+(`27b101819acad0502cc0b596e6e48b255175e618`). `serabot` is active. Binary
+SHA-256 `48519539099b5235471f96295911de063de46f2ab2fff50addae1832b8c93d1d`.
+Staged at `/var/lib/serabot/releases/serabot-27b1018`. The previous binary is
+`/var/lib/serabot/releases/serabot-pre-27b1018` (code tip `23fcb7d`, SHA-256
+`b0cc4ca9a8dddd0f79aba44fba4c8a7740d35cb293c79b7a3239a3f354620738`).
+Built locally in WSL Ubuntu 24.04.5 (glibc 2.39, matching the host) with
+`cargo build --release --locked -p serabot`, uploaded, and swapped in by atomic
+rename; the running process was verified against the same SHA-256 through
+`/proc/<pid>/exe`. Only `serabot.service` was restarted. `onedrive-mcp` was
+left untouched and is still active. Unauthenticated `GET /v1/health` and
+`GET /v1/bots` return 401. `/v1/health` reports crate version `0.1.0`, not a
+git SHA.
 
 If historical journals ever contained `getUpdates` URLs (a build before
 `4464558`), rotate `telegram_bot_token` in BotFather and store the new value
@@ -84,11 +89,12 @@ with `serabot secrets set`. Do not paste the token, the journal line, or the
 URL into chat, tickets, or git.
 
 This page does not change the binary. Roll back by restoring
-`serabot-pre-23fcb7d` onto `/opt/serabot/serabot` and restarting **only**
+`serabot-pre-27b1018` onto `/opt/serabot/serabot` and restarting **only**
 `serabot.service`. Leave Docker, OpenBot, `onedrive-mcp.service`, and the
 Cloudflare tunnel alone. Before replacing a busy binary, tunnel in and read
 `GET /v1/status`. Queued turns without a pinned route fail closed. The queue
-was empty of non-terminal tasks at this deploy (15 done and 2 failed rows only).
+was empty of non-terminal tasks at this deploy (15 done and 2 failed rows,
+nothing pending).
 
 The earlier read-only check (mtime `2026-10-29 01:39:08` UTC, SHA-256 prefix
 `dfbc71dd89536f4e…`) and the `795b139` binary both predate `4464558`.
@@ -161,7 +167,7 @@ allowlisted pairs and must not include endpoints or credentials. Skills
 returns on-disk summaries, not bodies. Bots returns `id`, `role`, `enabled`,
 `live`, tools, and skills — not prompts or secrets.
 
-Telegram, about five minutes. The service is on `23fcb7d`:
+Telegram, about five minutes. The service is on `27b1018`:
 
 1. Owner chat — command menu populated (`setMyCommands` on poll startup).
 2. **`/providers`** — models grouped by provider. Catalogs fail closed when refresh fails.
@@ -208,7 +214,7 @@ OneDrive after the maker bot is up: **`onedrive_list`** (read), then
 Unit tests use synthetic fixtures. Treat Telegram, Firecrawl, ElevenLabs,
 voice intake, OneDrive uploads, Antigravity, connector OAuth, AgentMail, and
 browser CDP as owner-verified only after you exercise them on the real
-account. OVH is confirmed on code tip `23fcb7d`; that confirmation is the
+account. OVH is confirmed on code tip `27b1018`; that confirmation is the
 binary and the unauthenticated health check, not a live exercise of those
 tools. If journals from before `4464558` contain a `getUpdates` URL, rotate
 `telegram_bot_token` as described above. Do not paste the token.
