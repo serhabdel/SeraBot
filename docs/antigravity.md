@@ -43,6 +43,8 @@ Full browser UI is out of scope. Login is a loopback PKCE flow, the same shape a
 
 A refresh token you already hold can still be stored with `serabot secrets set` and refreshed on a 401. PKCE is the way to obtain one. Login does not read Antigravity CLI credential files.
 
+When Google returns a new refresh token, SeraBot writes that refresh token and the new access token back to the configured age-store keys. A failed write fails the call. The values are not logged.
+
 ## Hosts
 
 Chat and catalog contact only these origins, starting with the configured one (default first):
@@ -75,5 +77,4 @@ Function-call parts send `thoughtSignature` set to `skip_thought_signature_valid
 ## Deferred
 
 - Image generation, image edit, `googleSearch` grounding, and quota telemetry.
-- Persisting a rotated refresh token back into the age store. A new refresh token is kept for the life of the process. If refresh fails after a restart, run login again.
 - Reading tokens out of a local Antigravity CLI or IDE profile.

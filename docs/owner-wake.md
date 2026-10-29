@@ -1,94 +1,176 @@
 # Owner wake checklist (synthetic)
 
-Morning pass after the overnight work. Examples only — never paste real API keys,
-tokens, or MSAL cache contents into chat, tickets, or git.
+Morning pass after the overnight work (2026-10-29). Examples only — never paste
+real API keys, tokens, host passwords, age-store contents, or login URLs into
+chat, tickets, or git.
 
-## Git and OVH binary (evidence, not secrets)
+## What's on `main`
 
 | Item | Value |
 | --- | --- |
-| **Git `main` HEAD** | `6d718fe` — *Allowlist ElevenLabs tools on main and maker bots.* |
-| **Remote** | `origin/main` matches local `main` (clean tree at doc time) |
-| **OVH `/opt/serabot/serabot` mtime (UTC)** | `2026-10-29 01:39:08` |
-| **OVH binary SHA-256 (prefix)** | `dfbc71dd89536f4e…` (full hash from `sha256sum /opt/serabot/serabot` on host) |
-| **Mapped git SHA on binary** | **Not stamped** — compare SHA after each on-host Ubuntu 24.04 build per [deployment.md](deployment.md). Prior session noted deploy around `3504eb9`; the `01:39` UTC binary may be newer. |
+| **`origin/main` tip** | `bd871f9` — *Record why routing stays on the in-process allowlist.* Docs only (`docs/model-routing.md`). |
+| **Code tip for the binary** | `795b139` — *Persist OneDrive refresh rotation and the first connector refresh token.* |
+| **Local `main`** | Matches `origin/main` at `bd871f9` when this page was written. |
+| **Previous wake note** | `6d718fe` (ElevenLabs allowlist). Superseded by this page. |
 
-`serabot.service` was **active** on read-only SSH check. `/var/lib/serabot/releases` listing requires the `serabot` user (permission denied as login user).
+`bd871f9` does not change the server binary. A host already running `795b139`
+does not need another deploy for that commit.
 
-## Telegram (5 minutes)
+Landed on `main` since `6d718fe` (code through `795b139`):
 
-1. Open the owner chat — confirm the **command menu** is populated (bot calls `setMyCommands` on poll startup).
-2. **`/providers`** — models grouped by provider (same allowlist as flat **`/models`**). Dynamic catalogs are cached and fail closed when refresh fails.
-3. **`/model auto`** then **`/model <provider> <model>`** — confirm selection pins for this conversation ([model-routing.md](model-routing.md)).
-4. **`/help`** — lists `/brief`, `/watch`, schedules note, approvals, deck flows.
-5. **Firecrawl** — only after secrets + config below; trigger a small **`firecrawl_scrape`** and confirm approval UI (destination + policy bind).
-6. **Audio** — send a **voice note** only if `[audio] enabled = true` and `telegram_intake = true` on production; otherwise use inbox + `audio_transcribe` / `audio_understand` ([audio.md](audio.md)).
-7. **ElevenLabs** — try **`elevenlabs_list_voices`** (read-only), then a generation tool (e.g. TTS) and confirm **Once / Always / Deny** approval ([elevenlabs.md](elevenlabs.md)).
+- On-demand skills and `skill-creator`, including `POST /v1/skills` ([skills.md](skills.md)).
+- Crafting Apps notes: adapt PdfCraft patterns only ([craft-adoption.md](craft-adoption.md)).
+- Orchestrator handoffs, delegate, and the conversation tree ([orchestration.md](orchestration.md)).
+- Owner APIs for bots, conversations, and skills ([api.md](api.md)).
+- Desktop and mobile Fleet panels ([desktop-client.md](desktop-client.md), [mobile-client.md](mobile-client.md)).
+- Native provider kinds and fail-closed catalogs, with Mistral, DeepSeek, and MiniMax host-pinned ([model-routing.md](model-routing.md)).
+- Antigravity loopback PKCE login and Cloud Code chat ([antigravity.md](antigravity.md)).
+- Loopback browser CDP sessions, off by default ([browser.md](browser.md)).
+- Configure-later Google, Outlook, and Notion OAuth stubs, plus native AgentMail ([connectors.md](connectors.md)).
+- Rotated OAuth refresh tokens (OneDrive, connectors, Antigravity) written back to the age store. A failed write fails the call.
+- Public CI rules: workflows do not read owner tokens ([ci-and-secrets.md](ci-and-secrets.md)).
+- Routing decision in `bd871f9`: keep the in-process allowlist `ModelRouter`. LiteLLM, RouteLLM, and OpenRouter auto-routing stay out.
 
-Scheduler: daily routines run from SQLite via `due_routines` in the daemon loop — not separate Telegram commands. On-demand **`/brief`** and **`/watch`** are documented in **`/help`**.
+## What OVH needs after wake
 
-## Windows desktop (egui)
+A redeploy **to `795b139`** was in progress. Confirm it; do not assume the
+binary on disk is that commit. `/v1/health` reports crate version `0.1.0`, not
+a git SHA.
 
-From repo root on Windows (MSVC):
-
-```bat
-scripts\cargo-win.bat test -p serabot-desktop --locked
-scripts\cargo-win.bat run -p serabot-desktop --locked
+```mermaid
+flowchart TD
+  wake[After wake] --> hash{SHA-256 matches the Ubuntu 24.04 build of 795b139?}
+  hash -->|yes| smoke[Read-only Owner API smoke]
+  hash -->|no| stage[Stage serabot-795b139 and back up the current binary]
+  stage --> swap["Replace /opt/serabot/serabot"]
+  swap --> restart[Restart serabot.service only]
+  restart --> smoke
+  smoke --> later[Leave connectors, AgentMail, and Antigravity for later]
 ```
 
-Tunnel to OVH Owner API (example):
+Confirm the binary before the API smoke. `bd871f9` is documentation and does not change this decision.
+
+1. Read-only preflight. Do not restart other units.
+
+   ```bash
+   ssh ovh-vps 'systemctl is-active serabot; systemctl is-enabled serabot; ls -l /opt/serabot/serabot; sha256sum /opt/serabot/serabot'
+   ```
+
+2. Compare that SHA-256 with `sha256sum target/release/serabot` from an **Ubuntu 24.04** `cargo build --release --locked -p serabot` of **`795b139`**. The earlier read-only check (mtime `2026-10-29 01:39:08` UTC, SHA-256 prefix `dfbc71dd89536f4e…`) predates this redeploy. Treat it as stale until the new hash matches. Full hash: `sha256sum /opt/serabot/serabot` on the host.
+
+3. If the hash does not match, finish the additive upgrade in [deployment.md](deployment.md):
+   - Stage `/var/lib/serabot/releases/serabot-795b139`.
+   - Back up the current binary under `/var/lib/serabot/releases/`.
+   - Replace `/opt/serabot/serabot` only after the staged SHA-256 matches.
+   - Restart **only** `serabot.service`.
+   - Leave Docker, OpenBot, `onedrive-mcp.service`, and the Cloudflare tunnel alone.
+   - Roll back by restoring the backup and restarting only `serabot.service`.
+
+4. Before replacing a busy binary, tunnel in and read `GET /v1/status`. Queued turns without a pinned route fail closed. With live chat idle and an empty queue there is nothing to drain.
+
+5. New bots and skills are **not** hot-reloaded. `POST /v1/bots` and `POST /v1/skills` report `live: false`. Restart **only** `serabot.service` after those files exist, then add the skill id to a bot allowlist. A scaffolded bot stays `enabled = false` and is not added to `main.delegates` until you edit that and restart again.
+
+```bash
+systemctl status serabot --no-pager
+journalctl -u serabot -n 50 --no-pager
+```
+
+Build the release on Ubuntu 24.04 glibc, not a newer WSL userland ([deployment.md](deployment.md)).
+
+## Configure later
+
+Do these when you want the feature. Leave the sections disabled until the named
+secrets exist. `serabot secrets set <name>` reads stdin and prints nothing.
+Commands below use secret **names** only.
+
+| Item | When you are ready |
+| --- | --- |
+| **Google** (Drive, Sheets, Calendar, Gmail) | Create the Cloud OAuth client and a loopback redirect. `secrets set` `google_oauth_client_id`, `google_oauth_client_secret`, and the product refresh token (`google_drive_refresh_token`, `google_sheets_refresh_token`, `google_calendar_refresh_token`, `gmail_refresh_token`). Then `enabled = true` on that `[connectors.*]` section only. |
+| **Outlook** | Entra app with `Mail.Read` or `Calendars.Read` plus `offline_access`. Names: `outlook_client_id`, `outlook_client_secret`, `outlook_refresh_token`, `outlook_calendar_refresh_token`. |
+| **Notion** | Public integration. Names: `notion_oauth_client_id`, `notion_oauth_client_secret`, `notion_refresh_token`. |
+| **AgentMail** | `secrets set agentmail_api_key`. Set `default_inbox_id` or pass `inbox_id` (letters, digits, `_`, `-`). Enable `[connectors.agentmail]` only after the key is stored. |
+| **Enable a connector** | One section at a time, after its keys exist. Add the tool to a bot allowlist. Reads and AgentMail sends stay approval-gated. Restart **only** `serabot.service`. |
+| **Antigravity** | `secrets set antigravity_oauth_client_secret`, point `[llm.providers.*]` at `kind = "google-antigravity"`, then `serabot providers login google-antigravity`. Run that on the machine whose browser can open `127.0.0.1:51121`. Set `data_egress_approved = true` only when you intend Cloud Code to receive prompts. See [antigravity.md](antigravity.md). |
+| **GitHub Actions client builds** | `.github/workflows/clients.yml` runs desktop check/test and Flutter analyze/test and reads **no** Actions secrets. Add repository secrets only when you publish signed desktop or mobile artifacts. Never put the owner API token in a workflow, APK, or release binary ([ci-and-secrets.md](ci-and-secrets.md)). |
+| **Hot reload** | Not implemented. Restart `serabot.service` for new bots and skills (step 5 above). |
+
+Still owner-gated from the previous checklist. Same stdin rule.
+
+| Secret / flag | When needed |
+| --- | --- |
+| `firecrawl_api_key` + `[firecrawl] enabled = true` | Firecrawl tools ([firecrawl.md](firecrawl.md)) |
+| `elevenlabs_api_key` + `[elevenlabs] enabled = true` | ElevenLabs tools ([elevenlabs.md](elevenlabs.md)). The key may already be in the age store — confirm the section in `/etc/serabot/serabot.toml`. |
+| `[audio] enabled`, `telegram_intake` | Owner voice notes in Telegram ([audio.md](audio.md)) |
+| `onedrive_client_id`, `onedrive_refresh_token` | Only if rotating. Export the refresh token from the MCP MSAL cache per [deployment.md](deployment.md). Production already had `[onedrive] enabled = true`, `tenant = "consumers"`, on the last read-only check. |
+| `[browser] enabled` | Leave `false` until you want a short loopback CDP session ([browser.md](browser.md)). |
+
+Repo defaults keep `[connectors.*]` and `[browser]` at `enabled = false`.
+
+## Smoke commands
+
+Put the owner token in your shell as `TOKEN`. Do not echo it.
 
 ```bat
 ssh -L 8787:127.0.0.1:8787 ovh-vps
 ```
 
-Connect with loopback URL `http://127.0.0.1:8787`, owner API token, conversation id. See [desktop-client.md](desktop-client.md).
+Read-only, from the machine that holds the tunnel:
 
-## Flutter mobile (Android MVP)
-
-```bat
-cd apps\serabot_mobile
-flutter pub get
-flutter test
-flutter run
+```bash
+curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/v1/health
+curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/v1/status
+curl -sS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8787/v1/models?conversation_id=owner"
+curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/v1/skills
 ```
 
-Release APK: `flutter build apk --release` → `build/app/outputs/flutter-apk/`.  
-Emulator to host: `adb reverse tcp:8787 tcp:8787` then `http://127.0.0.1:8787`.  
-Details: [apps/serabot_mobile/README.md](../apps/serabot_mobile/README.md).
+Health should show `ok` true, `version` `0.1.0`, and the database up. Status
+is pending tasks, pending approvals, and the loopback API. Models lists
+allowlisted pairs and must not include endpoints or credentials. Skills
+returns on-disk summaries, not bodies.
 
-## OneDrive status
+Telegram, about five minutes, after the service is on `795b139`:
 
-| Layer | Status |
-| --- | --- |
-| **Repo default** (`serabot.toml`) | `[onedrive] enabled = false` until secrets exist |
-| **OVH production** (read-only check) | `[onedrive] enabled = true`, `tenant = "consumers"` |
-| **MCP on host** | Keep `onedrive-mcp.service` running — do not reconfigure; native Graph reuses the same public-client + refresh-token pattern ([deployment.md](deployment.md), `crates/serabot/src/onedrive.rs`) |
+1. Owner chat — command menu populated (`setMyCommands` on poll startup).
+2. **`/providers`** — models grouped by provider. Catalogs fail closed when refresh fails.
+3. **`/model auto`**, then **`/model <provider> <model>`** — selection pins for this conversation ([model-routing.md](model-routing.md)).
+4. **`/help`** — `/brief`, `/watch`, schedules, approvals, deck flows.
+5. Firecrawl, audio, and ElevenLabs only after the secret rows above. `elevenlabs_list_voices` is the read-only probe; generation stays Once / Always / Deny.
 
-Verify after maker bot is available: **`onedrive_list`** (read), then **`onedrive_upload`** with approval.
+Optional writes create files on the host the API is using. Skip them on OVH
+unless you want those files there. Ids are synthetic. Bot and skill
+responses report `live: false`. Sections do not accept turns.
 
-## Remaining secret / config steps (owner)
+```bash
+curl -sS -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"id":"notes","description":"Synthetic notes specialist.","tools":["skill_list"],"skills":["ask"]}' \
+  http://127.0.0.1:8787/v1/bots
 
-Do on OVH as `serabot` user with production config — **stdin only**, never log values.
+curl -sS -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"id":"notes-pack","description":"Synthetic notes workflow.","body":"# Notes\n\nUse allowlisted tools.\n"}' \
+  http://127.0.0.1:8787/v1/skills
 
-| Secret / flag | When needed |
-| --- | --- |
-| `firecrawl_api_key` + `[firecrawl] enabled = true` | Firecrawl tools ([firecrawl.md](firecrawl.md)) |
-| `elevenlabs_api_key` + `[elevenlabs] enabled = true` | ElevenLabs tools ([elevenlabs.md](elevenlabs.md)); key may already be in age store — confirm section enabled in `/etc/serabot/serabot.toml` |
-| `[audio] enabled`, `telegram_intake` | Owner voice notes in Telegram ([audio.md](audio.md)) |
-| `onedrive_client_id`, `onedrive_refresh_token` | Only if rotating; export refresh from MCP MSAL cache per [deployment.md](deployment.md) |
+curl -sS -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"kind":"section","slug":"finance"}' \
+  http://127.0.0.1:8787/v1/conversations
+```
 
-After any production config change: restart **only** `serabot.service`, then `journalctl -u serabot -n 50`.
-
-## Local verification (before the next deploy)
+Windows desktop and Flutter mobile launch steps are unchanged:
+[desktop-client.md](desktop-client.md), [mobile-client.md](mobile-client.md).
+Fleet on either client calls the same three endpoints. Local check before the
+next OVH build:
 
 ```bat
 scripts\cargo-win.bat check --workspace --all-targets
 scripts\cargo-win.bat test --workspace --locked
+scripts\cargo-win.bat test -p serabot-desktop --locked
 ```
 
-Linux release builds for OVH must use **Ubuntu 24.04** glibc — not WSL 26.04 native artifacts ([deployment.md](deployment.md)).
+OneDrive after the maker bot is up: **`onedrive_list`** (read), then
+**`onedrive_upload`** with approval. Keep `onedrive-mcp.service` running.
 
-## Not verified live (honest boundary)
+## Not verified live
 
-Wiremock/unit tests cover Firecrawl, ElevenLabs, OneDrive, and desktop HTTP client. Treat Telegram menus, voice intake, Firecrawl, ElevenLabs generations, and OneDrive uploads as **owner-verified** only after you exercise them on the real account.
+Unit tests use synthetic fixtures. Treat Telegram, Firecrawl, ElevenLabs,
+voice intake, OneDrive uploads, Antigravity, connector OAuth, AgentMail, and
+browser CDP as owner-verified only after you exercise them on the real
+account. This page does not record a completed `795b139` deploy.

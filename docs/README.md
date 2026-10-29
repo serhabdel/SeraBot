@@ -21,7 +21,7 @@ artifacts.
 | [CI and secrets](ci-and-secrets.md) | GitHub Actions without credential leaks. |
 | [Crafting Apps adoption](craft-adoption.md) | Storytold craft repos: adapt PdfCraft patterns only; skip film/audio/video editors. |
 | [ElevenLabs](elevenlabs.md) | Speech, STT, sound effects, and image/video flow tools. |
-| [Owner wake checklist](owner-wake.md) | Morning verification: Telegram, clients, OneDrive, secrets, OVH binary notes. |
+| [Owner wake checklist](owner-wake.md) | Morning status: `main` tip, OVH binary for `795b139`, configure-later, smoke commands. |
 
 Related sources of truth:
 
