@@ -67,12 +67,13 @@ fn App() -> Element {
         }
     });
     let connected = session.read().state.connected;
+    let restarting = session.read().restarting;
     let theme = session.read().theme.as_str();
     let _revision = revision();
     rsx! {
         style { {CSS} }
         div { class: "root", "data-theme": theme,
-            if connected {
+            if connected || restarting {
                 Shell { session }
             } else {
                 ConnectView { session }
@@ -296,6 +297,11 @@ fn Header(session: Signal<Session>) -> Element {
 fn StatusBanner(session: Signal<Session>) -> Element {
     let error = session.read().state.error.clone();
     let unknown = session.read().state.unknown_outcome;
+    let admin_error = session.read().admin_error.clone();
+    let admin_notice = session.read().admin_notice.clone();
+    let restart_pending = session.read().restart_pending;
+    let restarting = session.read().restarting;
+    let can_restart = session.read().can_admin();
     let task = session.read().state.task.as_ref().map(|task| {
         (
             task.status,
@@ -331,7 +337,44 @@ fn StatusBanner(session: Signal<Session>) -> Element {
             }
         }
     });
+    let admin_error_view = admin_error.map(|message| {
+        rsx! {
+            div { class: "banner error",
+                span { "{message}" }
+            }
+        }
+    });
+    let admin_notice_view = admin_notice.map(|message| {
+        rsx! {
+            div { class: if restart_pending { "banner accent" } else { "banner" },
+                span { "{message}" }
+                if restart_pending {
+                    button {
+                        class: "btn primary small",
+                        disabled: !can_restart,
+                        onclick: move |_| session.write().request_restart(),
+                        "Restart server and apply"
+                    }
+                }
+            }
+        }
+    });
+    let restarting_view = restarting.then(|| {
+        rsx! {
+            div { class: "banner warn",
+                span { "The server is restarting. Reconnecting automatically…" }
+                button {
+                    class: "btn ghost small",
+                    onclick: move |_| session.write().connect_now(),
+                    "Reconnect now"
+                }
+            }
+        }
+    });
     rsx! {
+        {admin_error_view}
+        {admin_notice_view}
+        {restarting_view}
         {error_view}
         {unknown_view}
         {task_view}
@@ -924,30 +967,36 @@ fn ApprovalsView(session: Signal<Session>) -> Element {
 fn ProvidersView(session: Signal<Session>) -> Element {
     let providers = session.read().state.providers.clone();
     let loaded = session.read().state.providers_loaded;
-    let mut prov_id = use_signal(|| "custom".to_owned());
-    let mut prov_base = use_signal(|| "https://api.example.com/v1".to_owned());
-    let mut prov_models = use_signal(|| "model-1, model-2".to_owned());
-    let mut prov_secret = use_signal(|| "custom_api_key".to_owned());
-    let models = prov_models()
-        .split(',')
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .map(|model| format!("\"{model}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let snippet = format!(
-        "[llm.providers.{}]\nkind = \"openai-compatible\"\nbase_url = \"{}\"\nmodels = [{}]\napi_key_secret = \"{}\"\ndata_egress_approved = true\ncatalog_fetch = true",
-        prov_id(),
-        prov_base(),
-        models,
-        prov_secret()
-    );
+    let id = session.read().provider.id.clone();
+    let kind = session.read().provider.kind.clone();
+    let base_url = session.read().provider.base_url.clone();
+    let models = session.read().provider.models.clone();
+    let secret_name = session.read().provider.secret_name.clone();
+    let api_key = session.read().provider.api_key.clone();
+    let catalog_fetch = session.read().provider.catalog_fetch;
+    let can_save = session.read().can_admin();
+    let mut confirm = use_signal(|| Option::<String>::None);
+    let kinds = [
+        "openai-compatible",
+        "mistral",
+        "deepseek",
+        "minimax",
+        "minimax-cn",
+        "openai",
+        "groq",
+        "together",
+        "fireworks",
+        "openrouter",
+        "xai",
+        "cerebras",
+        "moonshot",
+    ];
     rsx! {
         div { class: "page",
             div { class: "page-head",
                 div {
                     h1 { "Providers" }
-                    p { class: "muted", "Select an approved model and manage provider catalogs." }
+                    p { class: "muted", "Add a provider, pull its live models, and pick the route per conversation." }
                 }
                 div { class: "row",
                     button {
@@ -973,7 +1022,12 @@ fn ProvidersView(session: Signal<Session>) -> Element {
                 for provider in providers {
                     div { class: "card", key: "{provider.id}",
                         div { class: "row between",
-                            h3 { "{provider.id}" }
+                            div {
+                                h3 { "{provider.id}" }
+                                if provider.managed {
+                                    span { class: "pill accent", "managed here" }
+                                }
+                            }
                             span { class: "pill", "{provider.kind}" }
                         }
                         div { class: "chips",
@@ -985,7 +1039,7 @@ fn ProvidersView(session: Signal<Session>) -> Element {
                                 span { class: "pill", "static models" }
                             }
                             if provider.data_egress_approved {
-                                span { class: "pill ok", "egress approved" }
+                                span { class: "pill ok", "ready" }
                             } else {
                                 span { class: "pill warn", "egress blocked" }
                             }
@@ -1003,45 +1057,101 @@ fn ProvidersView(session: Signal<Session>) -> Element {
                                 }
                             }
                         }
+                        if provider.managed {
+                            if confirm() == Some(provider.id.clone()) {
+                                div { class: "row",
+                                    span { class: "muted small", "Remove {provider.id}? Conversations pinned to it must pick another route." }
+                                    button {
+                                        class: "btn danger small",
+                                        disabled: !can_save,
+                                        onclick: {
+                                            let id = provider.id.clone();
+                                            move |_| {
+                                                session.write().remove_provider(id.clone());
+                                                confirm.set(None);
+                                            }
+                                        },
+                                        "Remove"
+                                    }
+                                    button {
+                                        class: "btn ghost small",
+                                        onclick: move |_| confirm.set(None),
+                                        "Cancel"
+                                    }
+                                }
+                            } else {
+                                button {
+                                    class: "btn ghost small",
+                                    onclick: {
+                                        let id = provider.id.clone();
+                                        move |_| confirm.set(Some(id.clone()))
+                                    },
+                                    "Remove provider"
+                                }
+                            }
+                        }
                     }
                 }
             }
-            details { class: "card form-card",
-                summary { "Add a provider (server config)" }
+            div { class: "card form-card",
+                h3 { "Add or update a provider" }
                 p { class: "muted small",
-                    "The app never writes config or secrets. Generate the block, save it on the server, store the key, then restart serabot."
+                    "Saved next to the database, never in serabot.toml. Keys go straight to the encrypted store and are never shown again. Any OpenAI-compatible /chat/completions endpoint works, including gateways that front Anthropic models."
                 }
                 div { class: "form-grid",
                     input {
                         class: "input",
-                        value: "{prov_id}",
-                        placeholder: "provider id",
-                        oninput: move |event| prov_id.set(event.value()),
+                        value: "{id}",
+                        placeholder: "provider id (for example work)",
+                        oninput: move |event| session.write().provider.id = event.value(),
+                    }
+                    select {
+                        class: "input",
+                        value: "{kind}",
+                        onchange: move |event| session.write().provider.kind = event.value(),
+                        for item in kinds {
+                            option { value: "{item}", "{item}" }
+                        }
                     }
                     input {
                         class: "input",
-                        value: "{prov_base}",
+                        value: "{base_url}",
                         placeholder: "https://api.example.com/v1",
-                        oninput: move |event| prov_base.set(event.value()),
+                        oninput: move |event| session.write().provider.base_url = event.value(),
                     }
                     input {
                         class: "input",
-                        value: "{prov_models}",
+                        value: "{models}",
                         placeholder: "model ids, comma separated",
-                        oninput: move |event| prov_models.set(event.value()),
+                        oninput: move |event| session.write().provider.models = event.value(),
                     }
                     input {
                         class: "input",
-                        value: "{prov_secret}",
-                        placeholder: "api key secret name",
-                        oninput: move |event| prov_secret.set(event.value()),
+                        value: "{secret_name}",
+                        placeholder: "secret name (for example WORK_API_KEY)",
+                        oninput: move |event| session.write().provider.secret_name = event.value(),
+                    }
+                    input {
+                        class: "input",
+                        type: "password",
+                        value: "{api_key}",
+                        placeholder: "API key (leave empty if already stored)",
+                        oninput: move |event| session.write().provider.api_key = event.value(),
                     }
                 }
-                code { "{snippet}" }
-                code { "serabot secrets set {prov_secret()}" }
-                code { "sudo systemctl restart serabot" }
-                p { class: "muted small",
-                    "Supported now: openai-compatible and the built-in kinds. Anthropic-compatible chat is the next provider protocol."
+                label { class: "check",
+                    input {
+                        "type": "checkbox",
+                        checked: catalog_fetch,
+                        onchange: move |event| session.write().provider.catalog_fetch = event.checked(),
+                    }
+                    span { "Fetch the live model list (/models)" }
+                }
+                button {
+                    class: "btn primary",
+                    disabled: !can_save,
+                    onclick: move |_| session.write().save_provider(),
+                    "Save provider"
                 }
             }
         }
@@ -1052,12 +1162,13 @@ fn ProvidersView(session: Signal<Session>) -> Element {
 fn ConnectorsView(session: Signal<Session>) -> Element {
     let connectors = session.read().state.connectors.clone();
     let loaded = session.read().state.connectors_loaded;
+    let can_save = session.read().can_admin();
     rsx! {
         div { class: "page",
             div { class: "page-head",
                 div {
                     h1 { "Connectors" }
-                    p { class: "muted", "Google, Microsoft, Notion and AgentMail status." }
+                    p { class: "muted", "Enable Google, Microsoft, Notion and AgentMail, and store their credentials." }
                 }
                 button {
                     class: "btn ghost",
@@ -1070,31 +1181,86 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
             }
             div { class: "cards",
                 for connector in connectors {
-                    div { class: "card", key: "{connector.id}",
-                        div { class: "row between",
-                            h3 { "{connector.id}" }
-                            span { class: if connector.enabled { "pill ok" } else { "pill" },
-                                if connector.enabled { "enabled" } else { "disabled" }
-                            }
-                        }
-                        if let Some(uri) = connector.redirect_uri {
-                            code { "{uri}" }
-                        }
-                        div { class: "chips",
-                            for (role, secret) in &connector.secrets {
-                                span { class: if secret.configured { "chip accent" } else { "chip warn" },
-                                    "{role}: {secret.name.clone().unwrap_or_default()}"
+                    {
+                        let id = connector.id.clone();
+                        let enabled = session
+                            .read()
+                            .connector_drafts
+                            .get(&id)
+                            .map(|draft| draft.enabled)
+                            .unwrap_or(connector.enabled);
+                        let values = session
+                            .read()
+                            .connector_drafts
+                            .get(&id)
+                            .map(|draft| draft.values.clone())
+                            .unwrap_or_default();
+                        rsx! {
+                            div { class: "card", key: "{id}",
+                                div { class: "row between",
+                                    div {
+                                        h3 { "{id}" }
+                                        span { class: "pill", "{connector.kind}" }
+                                    }
+                                    span { class: if enabled { "pill ok" } else { "pill" },
+                                        if enabled { "enabled" } else { "disabled" }
+                                    }
+                                }
+                                if let Some(uri) = connector.redirect_uri.clone() {
+                                    code { "{uri}" }
+                                }
+                                div { class: "chips",
+                                    for (role, secret) in &connector.secrets {
+                                        span { class: if secret.configured { "chip accent" } else { "chip warn" },
+                                            "{role}: {secret.name.clone().unwrap_or_default()}"
+                                        }
+                                    }
+                                }
+                                div { class: "form-grid",
+                                    for (role, secret) in &connector.secrets {
+                                        {
+                                            let role = role.clone();
+                                            let name = secret.name.clone().unwrap_or_default();
+                                            let value = values.get(&role).cloned().unwrap_or_default();
+                                            rsx! {
+                                                input {
+                                                    class: "input",
+                                                    "type": "password",
+                                                    value: "{value}",
+                                                    placeholder: if secret.configured { format!("replace {name}") } else { format!("set {name}") },
+                                                    oninput: {
+                                                        let id = id.clone();
+                                                        let role = role.clone();
+                                                        move |event| session.write().set_connector_value(&id, &role, event.value())
+                                                    },
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                p { class: "muted small",
+                                    "Enabling makes the connector available; grant its tools to a bot in Fleet. Reads and sends stay approval-gated."
+                                }
+                                div { class: "row",
+                                    button {
+                                        class: if enabled { "btn ghost" } else { "btn primary" },
+                                        onclick: {
+                                            let id = id.clone();
+                                            move |_| session.write().toggle_connector(&id)
+                                        },
+                                        if enabled { "Disable" } else { "Enable" }
+                                    }
+                                    button {
+                                        class: "btn ghost",
+                                        disabled: !can_save,
+                                        onclick: {
+                                            let id = id.clone();
+                                            move |_| session.write().save_connector(id.clone())
+                                        },
+                                        "Save connector"
+                                    }
                                 }
                             }
-                        }
-                        details {
-                            summary { class: "muted small", "Setup commands" }
-                            for (_, secret) in &connector.secrets {
-                                if !secret.configured {
-                                    code { "serabot secrets set {secret.name.clone().unwrap_or_default()}" }
-                                }
-                            }
-                            code { "sudo systemctl restart serabot" }
                         }
                     }
                 }
@@ -1381,6 +1547,10 @@ fn SettingsView(session: Signal<Session>) -> Element {
     let firecrawl_enabled = session.read().state.firecrawl_enabled;
     let telegram_enabled = session.read().state.telegram_enabled;
     let catalog_fetch = session.read().state.catalog_fetch;
+    let audio_on = session.read().audio.enabled;
+    let audio_transcription = session.read().audio.transcription_model.clone();
+    let audio_understanding = session.read().audio.understanding_model.clone();
+    let can_admin = session.read().can_admin();
     rsx! {
         div { class: "page",
             div { class: "page-head",
@@ -1446,6 +1616,37 @@ fn SettingsView(session: Signal<Session>) -> Element {
                     p { class: "muted small",
                         "Enable catalog_fetch in [llm] and use Fetch models on the Providers page to pull live model lists."
                     }
+                }
+                div { class: "form-grid",
+                    input {
+                        class: "input",
+                        value: "{audio_transcription}",
+                        placeholder: "transcription model",
+                        oninput: move |event| session.write().audio.transcription_model = event.value(),
+                    }
+                    input {
+                        class: "input",
+                        value: "{audio_understanding}",
+                        placeholder: "understanding model",
+                        oninput: move |event| session.write().audio.understanding_model = event.value(),
+                    }
+                }
+                p { class: "muted small",
+                    "Audio uses the Mistral credentials already stored for the provider. Add a separate audio key in serabot.toml only if you need one."
+                }
+                label { class: "check",
+                    input {
+                        "type": "checkbox",
+                        checked: audio_on,
+                        onchange: move |event| session.write().audio.enabled = event.checked(),
+                    }
+                    span { "Enable audio transcription and understanding" }
+                }
+                button {
+                    class: "btn primary",
+                    disabled: !can_admin,
+                    onclick: move |_| session.write().save_audio(),
+                    "Save audio settings"
                 }
             }
             div { class: "card",

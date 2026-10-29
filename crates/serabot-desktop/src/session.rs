@@ -4,11 +4,13 @@
 //! the worker and SSE threads, never on the UI thread.
 
 use crate::{
-    ApiError, ApprovalDecision, ConversationKind, MAX_SKILL_BODY_BYTES,
-    MAX_SKILL_DESCRIPTION_CHARS, SPECIALIST_TOOLS, Selection, TaskStatus,
+    ApiError, ApprovalDecision, AudioUpdate, ConnectorUpdate, ConversationKind,
+    MAX_SKILL_BODY_BYTES, MAX_SKILL_DESCRIPTION_CHARS, NewProvider, SPECIALIST_TOOLS, Selection,
+    TaskStatus,
     api::{
-        MEMORY_KINDS, valid_conversation_title, valid_memory_content, valid_memory_kind,
-        valid_memory_source,
+        MEMORY_KINDS, valid_conversation_title, valid_credential, valid_memory_content,
+        valid_memory_kind, valid_memory_source, valid_model_id, valid_provider_id,
+        valid_secret_name,
     },
     creds,
     events::{EventStream, EventUpdate},
@@ -20,6 +22,7 @@ use crate::{
 };
 use secrecy::ExposeSecret;
 use std::{
+    collections::BTreeMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -162,6 +165,58 @@ impl Drop for MemoryDraft {
     }
 }
 
+pub struct ProviderDraft {
+    pub id: String,
+    pub kind: String,
+    pub base_url: String,
+    pub models: String,
+    pub secret_name: String,
+    pub api_key: String,
+    pub catalog_fetch: bool,
+}
+
+impl Default for ProviderDraft {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: "openai-compatible".into(),
+            base_url: String::new(),
+            models: String::new(),
+            secret_name: String::new(),
+            api_key: String::new(),
+            catalog_fetch: true,
+        }
+    }
+}
+
+impl Drop for ProviderDraft {
+    fn drop(&mut self) {
+        self.api_key.zeroize();
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct ConnectorDraft {
+    pub enabled: bool,
+    pub values: BTreeMap<String, String>,
+    pub saving: bool,
+}
+
+impl Drop for ConnectorDraft {
+    fn drop(&mut self) {
+        for value in self.values.values_mut() {
+            value.zeroize();
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct AudioDraft {
+    pub enabled: bool,
+    pub transcription_model: String,
+    pub understanding_model: String,
+}
+
 pub struct RenameDraft {
     pub id: String,
     pub title: String,
@@ -194,11 +249,19 @@ pub struct Session {
     pub composer: String,
     pub fleet: FleetDraft,
     pub memory: MemoryDraft,
+    pub provider: ProviderDraft,
+    pub connector_drafts: BTreeMap<String, ConnectorDraft>,
+    pub audio: AudioDraft,
+    pub admin_notice: Option<String>,
+    pub admin_error: Option<String>,
+    pub restart_pending: bool,
+    pub restarting: bool,
     pub rename: Option<RenameDraft>,
     pub archive_confirm: Option<String>,
     pub update: UpdateUi,
     pub toast: Option<String>,
     pending: Option<OperationKind>,
+    reconnect_at: Option<Instant>,
     scheduled: Option<(Instant, Operation)>,
     next_request: Instant,
     refreshing: bool,
@@ -241,11 +304,19 @@ impl Session {
             composer: String::new(),
             fleet: FleetDraft::default(),
             memory: MemoryDraft::default(),
+            provider: ProviderDraft::default(),
+            connector_drafts: BTreeMap::new(),
+            audio: AudioDraft::default(),
+            admin_notice: None,
+            admin_error: None,
+            restart_pending: false,
+            restarting: false,
             rename: None,
             archive_confirm: None,
             update: UpdateUi::default(),
             toast: None,
             pending: None,
+            reconnect_at: None,
             scheduled: None,
             next_request: Instant::now(),
             refreshing: false,
@@ -311,6 +382,11 @@ impl Session {
         self.connecting = false;
         self.connect_error = None;
         self.state.error = None;
+        self.reconnect_at = None;
+        self.admin_notice = None;
+        self.admin_error = None;
+        self.restart_pending = false;
+        self.restarting = false;
     }
 
     pub fn forget_token(&mut self) {
@@ -325,6 +401,7 @@ impl Session {
         self.credentials = None;
         self.token.zeroize();
         self.connecting = false;
+        self.reconnect_at = None;
         if !origin.is_empty() {
             self.server = origin;
         }
@@ -344,6 +421,7 @@ impl Session {
         self.credentials = None;
         self.token.zeroize();
         self.connecting = false;
+        self.reconnect_at = None;
         if !origin.is_empty() {
             self.server = origin;
         }
@@ -498,6 +576,15 @@ impl Session {
         self.receive();
         self.flush_events();
         self.poll_updates();
+        if let Some(at) = self.reconnect_at {
+            if Instant::now() >= at {
+                self.reconnect_at = None;
+                self.connect_error = None;
+                self.state.error = None;
+                self.connect_now();
+            }
+            return;
+        }
         if self.pending.is_some() {
             return;
         }
@@ -662,15 +749,27 @@ impl Session {
                     self.poll_paused = true;
                     self.reject_token();
                 }
+                Err(error)
+                    if matches!(
+                        completion.kind,
+                        OperationKind::AdminWrite | OperationKind::AdminRestart
+                    ) =>
+                {
+                    self.admin_error = Some(error.to_string());
+                    self.scheduled = None;
+                }
                 Err(error) => {
+                    let message = error.to_string();
+                    let rate_limited = error == ApiError::Http(429);
                     self.state.fail(&completion.scope, completion.kind, error);
                     self.refreshing = false;
                     self.scheduled = None;
                     self.poll_paused = true;
                     if !self.state.connected {
-                        self.connect_error = Some(error.to_string());
+                        self.connect_error = Some(message);
+                        self.restarting = false;
                     }
-                    if error == ApiError::Http(429) {
+                    if rate_limited {
                         self.next_request = Instant::now() + Duration::from_secs(60);
                     }
                 }
@@ -681,6 +780,13 @@ impl Session {
                     match completion.kind {
                         OperationKind::Health if self.state.connected => {
                             self.connect_error = None;
+                            self.sync_audio_draft();
+                            if self.restarting {
+                                self.restarting = false;
+                                self.restart_pending = false;
+                                self.admin_notice =
+                                    Some("Server is back. The saved settings are active.".into());
+                            }
                             self.persist_credentials();
                             self.start_events();
                             self.schedule(Operation::Catalog, Duration::ZERO);
@@ -782,6 +888,33 @@ impl Session {
                                 .is_some_and(|t| t.status == TaskStatus::AwaitingApproval) =>
                         {
                             self.schedule(Operation::Approvals, Duration::ZERO)
+                        }
+                        OperationKind::Connectors => self.sync_connector_drafts(),
+                        OperationKind::AdminWrite => {
+                            self.provider.api_key.zeroize();
+                            for draft in self.connector_drafts.values_mut() {
+                                for value in draft.values.values_mut() {
+                                    value.zeroize();
+                                }
+                            }
+                            self.admin_error = None;
+                            self.admin_notice =
+                                Some("Saved. Restart the server to apply the change.".into());
+                            self.restart_pending = true;
+                        }
+                        OperationKind::AdminRestart => {
+                            self.admin_error = None;
+                            self.admin_notice = Some(
+                                "Restarting the server. The console reconnects automatically."
+                                    .into(),
+                            );
+                            self.restart_pending = false;
+                            self.restarting = true;
+                            self.state.connected = false;
+                            self.stop_events();
+                            self.refreshing = false;
+                            self.scheduled = None;
+                            self.reconnect_at = Some(Instant::now() + Duration::from_secs(8));
                         }
                         _ => {}
                     }
@@ -965,6 +1098,174 @@ impl Session {
         self.start_request(Operation::Connectors);
     }
 
+    pub fn can_admin(&self) -> bool {
+        self.ready() && self.state.connected
+    }
+
+    pub fn toggle_connector(&mut self, id: &str) {
+        let draft = self.connector_drafts.entry(id.to_owned()).or_default();
+        draft.enabled = !draft.enabled;
+    }
+
+    pub fn set_connector_value(&mut self, id: &str, role: &str, value: String) {
+        self.connector_drafts
+            .entry(id.to_owned())
+            .or_default()
+            .values
+            .insert(role.to_owned(), value);
+    }
+
+    pub fn save_provider(&mut self) {
+        self.admin_error = None;
+        self.admin_notice = None;
+        let id = self.provider.id.trim().to_owned();
+        let kind = self.provider.kind.trim().to_owned();
+        let base_url = self.provider.base_url.trim().to_owned();
+        let secret = self.provider.secret_name.trim().to_owned();
+        let models = model_csv(&self.provider.models);
+        let api_key = self.provider.api_key.trim().to_owned();
+        let problem = if !valid_provider_id(&id) {
+            Some("Provider id must be 1–64 letters, digits, '_' or '-'.")
+        } else if kind.is_empty() || kind.len() > 32 {
+            Some("Choose a provider kind.")
+        } else if base_url.is_empty() || base_url.len() > 2_048 {
+            Some("Enter the provider base URL.")
+        } else if models.is_empty() || models.len() > 256 {
+            Some("List at least one model id.")
+        } else if models.iter().any(|model| !valid_model_id(model)) {
+            Some("Model ids cannot be empty or contain control characters.")
+        } else if models
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != models.len()
+        {
+            Some("Each model id can be listed once.")
+        } else if !valid_secret_name(&secret) {
+            Some("Secret name must be 1–128 letters, digits, '_' or '-'.")
+        } else if !api_key.is_empty() && !valid_credential(&api_key) {
+            Some("The API key contains control characters or is too long.")
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            self.admin_error = Some(problem.into());
+            return;
+        }
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        let request = NewProvider {
+            id,
+            kind,
+            base_url,
+            models,
+            api_key_secret: secret,
+            catalog_fetch: self.provider.catalog_fetch,
+            api_key: (!api_key.is_empty()).then_some(api_key),
+        };
+        self.start_request(Operation::AdminSaveProvider(request));
+    }
+
+    pub fn remove_provider(&mut self, id: String) {
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.admin_error = None;
+        self.start_request(Operation::AdminRemoveProvider(id));
+    }
+
+    pub fn save_connector(&mut self, id: String) {
+        self.admin_error = None;
+        self.admin_notice = None;
+        let Some(draft) = self.connector_drafts.get(&id) else {
+            return;
+        };
+        let enabled = draft.enabled;
+        let values = draft
+            .values
+            .iter()
+            .filter_map(|(role, value)| {
+                let value = value.trim();
+                (!value.is_empty()).then(|| (role.clone(), value.to_owned()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if values.values().any(|value| !valid_credential(value)) {
+            self.admin_error = Some("Check the connector credential values.".into());
+            return;
+        }
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.start_request(Operation::AdminSetConnector {
+            id,
+            update: ConnectorUpdate { enabled, values },
+        });
+    }
+
+    pub fn save_audio(&mut self) {
+        self.admin_error = None;
+        self.admin_notice = None;
+        let transcription = self.audio.transcription_model.trim().to_owned();
+        let understanding = self.audio.understanding_model.trim().to_owned();
+        if self.audio.enabled
+            && (!valid_model_id(&transcription) || !valid_model_id(&understanding))
+        {
+            self.admin_error = Some("Enter both audio model names.".into());
+            return;
+        }
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.start_request(Operation::AdminSetAudio(AudioUpdate {
+            enabled: self.audio.enabled,
+            transcription_model: (!transcription.is_empty()).then_some(transcription),
+            understanding_model: (!understanding.is_empty()).then_some(understanding),
+        }));
+    }
+
+    pub fn request_restart(&mut self) {
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.admin_error = None;
+        self.start_request(Operation::AdminRestart);
+    }
+
+    fn sync_connector_drafts(&mut self) {
+        let mut seen = std::collections::BTreeSet::new();
+        for connector in &self.state.connectors {
+            seen.insert(connector.id.clone());
+            let draft = self
+                .connector_drafts
+                .entry(connector.id.clone())
+                .or_default();
+            draft.enabled = connector.enabled;
+        }
+        self.connector_drafts.retain(|id, _| seen.contains(id));
+    }
+
+    fn sync_audio_draft(&mut self) {
+        if let Some(enabled) = self.state.audio_enabled {
+            self.audio.enabled = enabled;
+        }
+        if let Some(model) = &self.state.audio_transcription_model {
+            if !model.is_empty() {
+                self.audio.transcription_model = model.clone();
+            }
+        }
+        if let Some(model) = &self.state.audio_understanding_model {
+            if !model.is_empty() {
+                self.audio.understanding_model = model.clone();
+            }
+        }
+    }
+
     pub fn refresh_approvals(&mut self) {
         self.start_request(Operation::Approvals);
     }
@@ -1090,4 +1391,12 @@ impl Drop for Session {
         self.credentials = None;
         self.stop_events();
     }
+}
+
+fn model_csv(raw: &str) -> Vec<String> {
+    raw.split([',', '\n', ';'])
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned)
+        .collect()
 }

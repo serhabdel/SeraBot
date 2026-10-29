@@ -140,6 +140,10 @@ h3 { font-size: 16px; }
 .chip.warn { color: var(--accent-2); background: color-mix(in srgb, var(--accent-2) 13%, transparent); border-color: color-mix(in srgb, var(--accent-2) 28%, transparent); }
 .pill.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); border-color: color-mix(in srgb, var(--ok) 25%, transparent); }
 .pill.warn { color: var(--accent-2); background: color-mix(in srgb, var(--accent-2) 12%, transparent); border-color: color-mix(in srgb, var(--accent-2) 25%, transparent); }
+.pill.accent { color: var(--accent); background: color-mix(in srgb, var(--accent) 11%, transparent); border-color: color-mix(in srgb, var(--accent) 25%, transparent); }
+
+.check { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; cursor: pointer; }
+.check input { width: 16px; height: 16px; accent-color: var(--accent); }
 
 .btn {
   border: 1px solid var(--line); background: color-mix(in srgb, var(--text) 5%, transparent);
@@ -240,7 +244,7 @@ code {
 .banner { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 16px; border-bottom: 1px solid var(--line-soft); flex-wrap: wrap; }
 .banner.warn { background: color-mix(in srgb, var(--accent-2) 10%, transparent); color: var(--accent-2); }
 .banner.error { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); }
-.banner.update { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.banner.update, .banner.accent { background: color-mix(in srgb, var(--accent) 10%, transparent); }
 
 details summary { cursor: pointer; }
 .form-card summary { font-weight: 600; }

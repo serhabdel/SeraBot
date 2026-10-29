@@ -13,9 +13,11 @@ use zeroize::{Zeroize, Zeroizing};
 
 const MAX_RESPONSE: u64 = 2 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApiError {
     Validation(&'static str),
+    /// A safe, server-authored administration message. Never contains a secret.
+    Rejected(String),
     Http(u16),
     Transport,
     InvalidResponse,
@@ -23,9 +25,12 @@ pub enum ApiError {
 }
 
 impl ApiError {
-    pub fn unknown_outcome(self) -> bool {
+    pub fn unknown_outcome(&self) -> bool {
         // In particular, a gateway/request timeout does not prove rejection.
-        !matches!(self, Self::Validation(_) | Self::Http(400..=407 | 409..=499))
+        !matches!(
+            self,
+            Self::Validation(_) | Self::Rejected(_) | Self::Http(400..=407 | 409..=499)
+        )
     }
 }
 
@@ -33,6 +38,7 @@ impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Validation(message) => f.write_str(message),
+            Self::Rejected(message) => f.write_str(message),
             Self::Http(401) => {
                 f.write_str("Unauthorized (401). Disconnect and check your API token.")
             }
@@ -78,17 +84,17 @@ pub fn validate_endpoint(raw: &str) -> Result<Url, ApiError> {
         .chars()
         .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
     {
-        return Err(invalid);
+        return Err(invalid.clone());
     }
-    let (scheme, rest) = raw.split_once("://").ok_or(invalid)?;
+    let (scheme, rest) = raw.split_once("://").ok_or_else(|| invalid.clone())?;
     if !matches!(scheme, "http" | "https") {
-        return Err(invalid);
+        return Err(invalid.clone());
     }
-    let authority = rest.split('/').next().ok_or(invalid)?;
+    let authority = rest.split('/').next().ok_or_else(|| invalid.clone())?;
     if authority.contains('@') {
-        return Err(invalid);
+        return Err(invalid.clone());
     }
-    let url = Url::parse(raw).map_err(|_| invalid)?;
+    let url = Url::parse(raw).map_err(|_| invalid.clone())?;
     if url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -96,17 +102,17 @@ pub fn validate_endpoint(raw: &str) -> Result<Url, ApiError> {
         || url.fragment().is_some()
         || url.path() != "/"
     {
-        return Err(invalid);
+        return Err(invalid.clone());
     }
     if scheme == "http" {
         let host = if authority.starts_with('[') {
-            let end = authority.find(']').ok_or(invalid)?;
+            let end = authority.find(']').ok_or_else(|| invalid.clone())?;
             &authority[..=end]
         } else {
-            authority.split(':').next().ok_or(invalid)?
+            authority.split(':').next().ok_or_else(|| invalid.clone())?
         };
         if !matches!(host, "localhost" | "127.0.0.1" | "[::1]") {
-            return Err(invalid);
+            return Err(invalid.clone());
         }
     }
     Ok(url)
@@ -144,6 +150,36 @@ pub fn valid_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"_:-".contains(&b))
+}
+
+pub fn valid_provider_id(id: &str) -> bool {
+    id != "auto"
+        && id != "default"
+        && (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+pub fn valid_secret_name(name: &str) -> bool {
+    (1..=128).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+pub fn valid_credential(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 8_192
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+pub fn valid_model_id(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= 256
+        && model.trim() == model
+        && !model.chars().any(char::is_control)
 }
 
 pub fn valid_token(token: &str) -> bool {
@@ -548,6 +584,8 @@ pub struct ProviderStatus {
     #[serde(default)]
     pub catalog_verified: bool,
     #[serde(default)]
+    pub managed: bool,
+    #[serde(default)]
     pub secrets: BTreeMap<String, SecretStatus>,
 }
 
@@ -566,6 +604,49 @@ pub struct ConnectorStatus {
     pub default_inbox_id: Option<String>,
     #[serde(default)]
     pub secrets: BTreeMap<String, SecretStatus>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct NewProvider {
+    pub id: String,
+    pub kind: String,
+    pub base_url: String,
+    pub models: Vec<String>,
+    pub api_key_secret: String,
+    #[serde(default)]
+    pub catalog_fetch: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ConnectorUpdate {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub values: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct AudioUpdate {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcription_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub understanding_model: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AdminAck {
+    #[serde(default)]
+    pub saved: bool,
+    #[serde(default)]
+    pub restart_required: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AdminRestart {
+    #[serde(default)]
+    pub restarting: bool,
 }
 
 pub const MEMORY_KINDS: &[&str] = &["preference", "fact", "decision", "context", "note"];
@@ -1432,6 +1513,133 @@ impl ApiClient {
         }
         Ok(response.connectors)
     }
+
+    /// Admin writes carry a safe server-authored message on rejection so the
+    /// console can say what to fix instead of only "422".
+    fn admin_request<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        method: Method,
+        route: &[&str],
+        body: &B,
+    ) -> Result<T, ApiError> {
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .map_err(|_| ApiError::InvalidResponse)?
+            .clear()
+            .extend(route);
+        let response = self
+            .client
+            .request(method, url)
+            .bearer_auth(self.token.expose_secret())
+            .json(body)
+            .send()
+            .map_err(|_| ApiError::Transport)?;
+        let status = response.status();
+        let mut bytes = Zeroizing::new(Vec::new());
+        response
+            .take(MAX_RESPONSE + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ApiError::Transport)?;
+        if bytes.len() as u64 > MAX_RESPONSE {
+            return Err(ApiError::TooLarge);
+        }
+        if !status.is_success() {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if let Some(message) = value.get("error").and_then(|value| value.as_str()) {
+                    if !message.is_empty()
+                        && message.len() <= 512
+                        && !message.chars().any(char::is_control)
+                    {
+                        return Err(ApiError::Rejected(message.to_owned()));
+                    }
+                }
+            }
+            return Err(ApiError::Http(status.as_u16()));
+        }
+        serde_json::from_slice(&bytes).map_err(|_| ApiError::InvalidResponse)
+    }
+
+    pub fn admin_add_provider(&self, request: &NewProvider) -> Result<AdminAck, ApiError> {
+        if !valid_provider_id(&request.id)
+            || request.models.is_empty()
+            || request.models.len() > 256
+            || request.models.iter().any(|model| !valid_model_id(model))
+            || !valid_secret_name(&request.api_key_secret)
+            || request.kind.is_empty()
+            || request.kind.len() > 32
+            || !request
+                .kind
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            || request.base_url.is_empty()
+            || request.base_url.len() > 2_048
+            || request
+                .api_key
+                .as_deref()
+                .is_some_and(|key| !valid_credential(key))
+        {
+            return Err(ApiError::Validation(
+                "Check the provider id, kind, base URL, models, secret name and key.",
+            ));
+        }
+        self.admin_request(Method::POST, &["v1", "admin", "providers"], request)
+    }
+
+    pub fn admin_remove_provider(&self, id: &str) -> Result<AdminAck, ApiError> {
+        if !valid_provider_id(id) {
+            return Err(ApiError::Validation("Provider id is not valid."));
+        }
+        self.admin_request(
+            Method::DELETE,
+            &["v1", "admin", "providers", id],
+            &serde_json::json!({}),
+        )
+    }
+
+    pub fn admin_set_connector(
+        &self,
+        id: &str,
+        update: &ConnectorUpdate,
+    ) -> Result<AdminAck, ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Connector id is not valid."));
+        }
+        for (role, value) in &update.values {
+            if !matches!(
+                role.as_str(),
+                "client_id" | "client_secret" | "refresh_token" | "api_key"
+            ) || !valid_credential(value)
+            {
+                return Err(ApiError::Validation(
+                    "Check the connector credential values.",
+                ));
+            }
+        }
+        self.admin_request(Method::PUT, &["v1", "admin", "connectors", id], update)
+    }
+
+    pub fn admin_set_audio(&self, update: &AudioUpdate) -> Result<AdminAck, ApiError> {
+        if update
+            .transcription_model
+            .as_deref()
+            .is_some_and(|model| !valid_model_id(model))
+            || update
+                .understanding_model
+                .as_deref()
+                .is_some_and(|model| !valid_model_id(model))
+        {
+            return Err(ApiError::Validation("Check the audio model names."));
+        }
+        self.admin_request(Method::PUT, &["v1", "admin", "audio"], update)
+    }
+
+    pub fn admin_restart(&self) -> Result<AdminRestart, ApiError> {
+        self.admin_request(
+            Method::POST,
+            &["v1", "admin", "restart"],
+            &serde_json::json!({"confirm": true}),
+        )
+    }
 }
 
 fn check_id(id: &str) -> Result<(), ApiError> {
@@ -1695,6 +1903,20 @@ mod tests {
             archived_at: None,
             accepts_turns,
         }
+    }
+
+    #[test]
+    fn admin_inputs_reject_reserved_ids_and_unsafe_values() {
+        assert!(valid_provider_id("work"));
+        assert!(!valid_provider_id("auto"));
+        assert!(!valid_provider_id("default"));
+        assert!(!valid_provider_id("work/../etc"));
+        assert!(valid_secret_name("WORK_API_KEY"));
+        assert!(!valid_secret_name("bad name"));
+        assert!(valid_credential("synthetic-key-123"));
+        assert!(!valid_credential("bad\nvalue"));
+        assert!(valid_model_id("mistral-large-latest"));
+        assert!(!valid_model_id("bad\nmodel"));
     }
 
     #[test]

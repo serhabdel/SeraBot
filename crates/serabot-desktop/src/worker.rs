@@ -1,8 +1,8 @@
 use crate::{
-    ApiClient, ApiError, Approval, ApprovalDecision, BotSummary, Catalog, ConnectorStatus,
-    ConversationKind, ConversationPage, ConversationSummary, CreatedBot, CreatedConversation,
-    CreatedSkill, Health, History, MemoryEntry, ProviderStatus, Scope, Selection, SkillSummary,
-    Task,
+    ApiClient, ApiError, Approval, ApprovalDecision, AudioUpdate, BotSummary, Catalog,
+    ConnectorStatus, ConnectorUpdate, ConversationKind, ConversationPage, ConversationSummary,
+    CreatedBot, CreatedConversation, CreatedSkill, Health, History, MemoryEntry, NewProvider,
+    ProviderStatus, Scope, Selection, SkillSummary, Task,
 };
 use secrecy::SecretString;
 use std::sync::{
@@ -41,6 +41,8 @@ pub enum OperationKind {
     DeleteMemory,
     Providers,
     Connectors,
+    AdminWrite,
+    AdminRestart,
 }
 
 pub enum Operation {
@@ -96,6 +98,14 @@ pub enum Operation {
     },
     Providers,
     Connectors,
+    AdminSaveProvider(NewProvider),
+    AdminRemoveProvider(String),
+    AdminSetConnector {
+        id: String,
+        update: ConnectorUpdate,
+    },
+    AdminSetAudio(AudioUpdate),
+    AdminRestart,
 }
 
 impl Operation {
@@ -122,6 +132,11 @@ impl Operation {
             Self::DeleteMemory { .. } => OperationKind::DeleteMemory,
             Self::Providers => OperationKind::Providers,
             Self::Connectors => OperationKind::Connectors,
+            Self::AdminSaveProvider(_)
+            | Self::AdminRemoveProvider(_)
+            | Self::AdminSetConnector { .. }
+            | Self::AdminSetAudio(_) => OperationKind::AdminWrite,
+            Self::AdminRestart => OperationKind::AdminRestart,
         }
     }
 }
@@ -147,6 +162,8 @@ pub enum Reply {
     DeletedMemory(String),
     Providers(Vec<ProviderStatus>),
     Connectors(Vec<ConnectorStatus>),
+    AdminSaved,
+    AdminRestarted,
 }
 
 pub struct Job {
@@ -301,6 +318,25 @@ fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
             .map(|_| Reply::DeletedMemory(id.clone())),
         Operation::Providers => client.providers().map(Reply::Providers),
         Operation::Connectors => client.connectors().map(Reply::Connectors),
+        Operation::AdminSaveProvider(request) => client
+            .admin_add_provider(request)
+            .map(|_| Reply::AdminSaved),
+        Operation::AdminRemoveProvider(id) => {
+            client.admin_remove_provider(id).map(|_| Reply::AdminSaved)
+        }
+        Operation::AdminSetConnector { id, update } => client
+            .admin_set_connector(id, update)
+            .map(|_| Reply::AdminSaved),
+        Operation::AdminSetAudio(update) => {
+            client.admin_set_audio(update).map(|_| Reply::AdminSaved)
+        }
+        Operation::AdminRestart => client.admin_restart().map(|ack| {
+            if ack.restarting {
+                Reply::AdminRestarted
+            } else {
+                Reply::AdminSaved
+            }
+        }),
     }
 }
 

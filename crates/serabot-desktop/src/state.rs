@@ -265,6 +265,7 @@ impl State {
                 self.connectors = connectors;
                 self.connectors_loaded = true;
             }
+            Reply::AdminSaved | Reply::AdminRestarted => {}
         }
         true
     }
@@ -592,6 +593,7 @@ mod tests {
                 data_egress_approved: true,
                 catalog_fetch: false,
                 catalog_verified: false,
+                managed: false,
                 secrets: std::collections::BTreeMap::from([(
                     "api_key".into(),
                     SecretStatus {
