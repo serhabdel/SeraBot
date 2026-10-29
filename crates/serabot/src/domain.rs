@@ -81,6 +81,9 @@ pub struct StoredMessage {
     pub role: Role,
     pub content: String,
     pub name: Option<String>,
+    /// Bot that produced an assistant message, resolved from its turn.
+    #[serde(default)]
+    pub bot: Option<String>,
     pub tool_call_id: Option<String>,
     pub created_at: DateTime<Utc>,
 }

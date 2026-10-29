@@ -546,8 +546,22 @@ impl Runtime {
             )
         } else {
             // Rooms always run as the orchestrator; only a handoff names a specialist.
+            // A `dir:<bot>` conversation talks to that bot one-to-one.
             let bot = match parse_conversation_scope(conversation_id) {
                 Ok(scope) if scope.kind == ConversationKind::Room => ORCHESTRATOR_BOT,
+                Ok(scope) if scope.kind == ConversationKind::Direct && bot_override.is_none() => {
+                    match conversation_id.strip_prefix("dir:") {
+                        Some(id) if self.bots.contains_key(id) => {
+                            if !self.bots[id].config.enabled {
+                                return Err(SeraError::InvalidState(format!(
+                                    "bot {id} is disabled"
+                                )));
+                            }
+                            id
+                        }
+                        _ => ORCHESTRATOR_BOT,
+                    }
+                }
                 _ => bot_override.unwrap_or(ORCHESTRATOR_BOT),
             };
             (bot.to_string(), text.to_string(), false)
@@ -2198,6 +2212,21 @@ mod tests {
             ]
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn direct_bot_chats_bind_without_an_override() {
+        let (runtime, store) =
+            setup_orchestration("http://127.0.0.1:9", Arc::new(Capture::default()));
+        let direct = runtime
+            .submit_text("dir:analyst", "synthetic", None)
+            .unwrap();
+        assert_eq!(direct.bot, "analyst");
+        let unknown = runtime
+            .submit_text("dir:unknown", "synthetic", None)
+            .unwrap();
+        assert_eq!(unknown.bot, "main");
+        assert_eq!(store.pending_task_count().unwrap(), 2);
     }
 
     #[tokio::test]

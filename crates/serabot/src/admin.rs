@@ -30,6 +30,20 @@ pub struct AdminOverlay {
     pub connectors: BTreeMap<String, bool>,
     #[serde(default)]
     pub audio: Option<AudioOverlay>,
+    #[serde(default)]
+    pub bots: BTreeMap<String, BotProfile>,
+}
+
+/// Owner-facing identity for a bot. The bot file stays authoritative for
+/// behavior; this only changes how the console presents the bot.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BotProfile {
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub avatar: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +138,50 @@ impl AdminStore {
             .unwrap_or_else(|error| error.into_inner())
             .providers
             .contains_key(id)
+    }
+
+    pub fn bot_profile(&self, id: &str) -> Option<BotProfile> {
+        self.overlay
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .bots
+            .get(id)
+            .cloned()
+    }
+
+    pub fn set_bot_profile(&self, id: &str, profile: BotProfile) -> Result<()> {
+        let display_name = profile.display_name.trim();
+        if display_name.is_empty()
+            || display_name.chars().count() > 64
+            || display_name.chars().any(char::is_control)
+        {
+            return Err(SeraError::Validation(
+                "bot display name must be 1-64 visible characters".into(),
+            ));
+        }
+        if profile.description.chars().count() > 2_000
+            || profile
+                .description
+                .chars()
+                .any(|c| c != '\n' && c != '\r' && c != '\t' && c.is_control())
+        {
+            return Err(SeraError::Validation(
+                "bot description is too long or contains control characters".into(),
+            ));
+        }
+        if profile.avatar.chars().count() > 16 || profile.avatar.chars().any(char::is_control) {
+            return Err(SeraError::Validation(
+                "bot avatar must be a short label or emoji".into(),
+            ));
+        }
+        let profile = BotProfile {
+            display_name: display_name.to_owned(),
+            ..profile
+        };
+        self.mutate(|overlay| {
+            overlay.bots.insert(id.to_owned(), profile);
+            Ok(())
+        })
     }
 
     pub fn add_provider(

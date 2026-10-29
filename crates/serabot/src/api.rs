@@ -20,7 +20,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 
-use crate::admin::AdminStore;
+use crate::admin::{AdminStore, BotProfile};
 use crate::config::{Config, OAuthConnectorSettings, ProviderConfig, scaffold_specialist_bot};
 use crate::domain::Task;
 use crate::error::{Result, SeraError};
@@ -135,6 +135,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/admin/providers/{id}", delete(admin_remove_provider))
         .route("/v1/admin/connectors/{id}", put(admin_set_connector))
         .route("/v1/admin/audio", put(admin_set_audio))
+        .route("/v1/admin/bots/{id}", put(admin_set_bot_profile))
         .route("/v1/admin/restart", post(admin_restart))
         .route("/v1/connectors", get(list_connectors))
         .route("/v1/models", get(models))
@@ -173,6 +174,9 @@ async fn health(State(state): State<Arc<ApiState>>) -> Response {
             "firecrawl_enabled": state.config.firecrawl.enabled,
             "telegram_enabled": state.config.telegram.enabled,
             "catalog_fetch": state.config.llm.catalog_fetch,
+            "bot_chat_binding": true,
+            "bot_profiles": true,
+            "conversation_titles": true,
         }))
         .into_response(),
         Err(error) => (
@@ -333,6 +337,15 @@ async fn conversation_messages(
             {
                 if state.runtime.scan_owner_output(name).is_ok() {
                     body["name"] = json!(name);
+                }
+            }
+            if let Some(bot) = message
+                .bot
+                .as_deref()
+                .filter(|bot| crate::orchestration::safe_bot_label(bot))
+            {
+                if state.runtime.scan_owner_output(bot).is_ok() {
+                    body["bot"] = json!(bot);
                 }
             }
             body
@@ -589,11 +602,19 @@ async fn list_bots(State(state): State<Arc<ApiState>>) -> Result<Json<Value>> {
     let bots = configured
         .into_iter()
         .map(|bot| {
+            let profile = state
+                .admin
+                .as_ref()
+                .and_then(|admin| admin.bot_profile(&bot.id));
             json!({
                 "id": bot.id,
                 "role": bot.role,
                 "enabled": bot.enabled,
                 "live": state.runtime.bot_loaded(&bot.id),
+                "model": bot.model,
+                "display_name": profile.as_ref().map(|p| p.display_name.clone()).filter(|name| !name.is_empty()),
+                "description": profile.as_ref().map(|p| p.description.clone()).filter(|text| !text.is_empty()),
+                "avatar": profile.as_ref().map(|p| p.avatar.clone()).filter(|avatar| !avatar.is_empty()),
                 "tools": bot.tools,
                 "skills": bot.skills,
                 "require_approval": bot.require_approval,
@@ -672,6 +693,8 @@ struct CreateConversationRequest {
     slug: String,
     #[serde(default)]
     parent_id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
 }
 
 async fn create_conversation(
@@ -699,9 +722,17 @@ async fn create_conversation(
             "group conversations require a section parent".into(),
         ));
     }
+    let title = match request.title.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => {
+            let title = normalize_conversation_title(raw)?;
+            state.runtime.scan_owner_output(&title)?;
+            Some(title)
+        }
+    };
     state
         .store
-        .create_conversation(&id, kind.as_str(), parent_id)?;
+        .create_conversation_titled(&id, kind.as_str(), parent_id, title.as_deref())?;
     let record = state
         .store
         .get_conversation(&id)?
@@ -718,6 +749,7 @@ async fn create_conversation(
             "id": record.id,
             "kind": record.kind,
             "parent_id": record.parent_id,
+            "title": record.title,
             "accepts_turns": kind.accepts_turns(),
         })),
     )?;
@@ -800,6 +832,22 @@ fn parse_conversation_cursor(cursor: &str) -> Result<(DateTime<Utc>, String)> {
     Ok((at, id.to_owned()))
 }
 
+fn normalize_conversation_title(raw: &str) -> Result<String> {
+    let title = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.is_empty() {
+        return Err(SeraError::Validation(
+            "conversation title must not be empty".into(),
+        ));
+    }
+    let length = title.chars().count();
+    if length > 120 {
+        return Err(SeraError::Validation(format!(
+            "conversation title has {length} characters; maximum is 120"
+        )));
+    }
+    Ok(title)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RenameConversationRequest {
@@ -812,22 +860,7 @@ async fn rename_conversation(
     Json(request): Json<RenameConversationRequest>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
-    let title = request
-        .title
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if title.is_empty() {
-        return Err(SeraError::Validation(
-            "conversation title must not be empty".into(),
-        ));
-    }
-    let length = title.chars().count();
-    if length > 120 {
-        return Err(SeraError::Validation(format!(
-            "conversation title has {length} characters; maximum is 120"
-        )));
-    }
+    let title = normalize_conversation_title(&request.title)?;
     state.runtime.scan_owner_output(&title)?;
     if !state.store.rename_conversation(&id, &title)? {
         return Err(SeraError::NotFound(format!("conversation {id}")));
@@ -1080,6 +1113,10 @@ fn admin_error(error: SeraError) -> (StatusCode, Json<Value>) {
         SeraError::Validation(message) | SeraError::Config(message) => {
             (StatusCode::UNPROCESSABLE_ENTITY, message.clone())
         }
+        SeraError::PolicyViolation => (
+            StatusCode::FORBIDDEN,
+            "blocked by the content policy".to_owned(),
+        ),
         _ => {
             warn!(%error, "admin request failed");
             (
@@ -1237,6 +1274,47 @@ async fn admin_set_audio(
         json!({"enabled": request.enabled}),
     )?;
     Ok(Json(json!({"saved": true, "restart_required": true})))
+}
+
+#[derive(Deserialize)]
+struct BotProfileRequest {
+    display_name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    avatar: String,
+}
+
+async fn admin_set_bot_profile(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(request): Json<BotProfileRequest>,
+) -> AdminResult<Json<Value>> {
+    let admin = admin_store(&state)?;
+    if !state.runtime.bot_loaded(&id) {
+        let configured = crate::config::list_configured_bots(&state.config).map_err(admin_error)?;
+        if !configured.iter().any(|bot| bot.id == id) {
+            return Err(admin_error(SeraError::NotFound(format!("bot {id}"))));
+        }
+    }
+    for value in [&request.display_name, &request.description, &request.avatar] {
+        state
+            .runtime
+            .scan_owner_output(value)
+            .map_err(admin_error)?;
+    }
+    admin
+        .set_bot_profile(
+            &id,
+            BotProfile {
+                display_name: request.display_name,
+                description: request.description,
+                avatar: request.avatar,
+            },
+        )
+        .map_err(admin_error)?;
+    audit_config(&state, "config.bot_profile_saved", json!({"bot": id}))?;
+    Ok(Json(json!({"saved": true, "restart_required": false})))
 }
 
 #[derive(Deserialize)]
@@ -1420,7 +1498,12 @@ mod tests {
     }
 
     fn app_with_policy(egress_approved: bool, policy: Policy) -> (Router, Arc<Config>, Store) {
-        app_with_root(egress_approved, policy, std::env::current_dir().unwrap())
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::env::current_dir().unwrap());
+        app_with_root(egress_approved, policy, root)
     }
 
     fn app_with_root(
@@ -1436,8 +1519,9 @@ mod tests {
         config.llm.base_url = "https://example.com/v1".into();
         config.llm.models = vec!["test-alternative".into()];
         config.base_dir = base_dir;
-        let database =
-            std::env::temp_dir().join(format!("serabot-api-{}.db", uuid::Uuid::new_v4()));
+        let directory = std::env::temp_dir().join(format!("serabot-api-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let database = directory.join("serabot.db");
         config.database.path = database.to_string_lossy().into_owned();
         let config = Arc::new(config);
         let store = Store::open(&database, 384, 5000).unwrap();
@@ -2954,7 +3038,9 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(saved.status(), StatusCode::CREATED);
+        let status = saved.status();
+        let saved_body = read_json(saved).await;
+        assert_eq!(status, StatusCode::CREATED, "{saved_body}");
         let overlay =
             crate::admin::AdminOverlay::load(&crate::admin::AdminOverlay::path_for(&config))
                 .unwrap();
@@ -2986,6 +3072,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unconfirmed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn bot_profiles_and_titled_conversations_are_owner_editable() {
+        let (app, _, _) = app();
+        let saved = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PUT",
+                "/v1/admin/bots/main",
+                true,
+                Some(json!({
+                    "display_name": "Chief of Staff",
+                    "description": "Synthetic orchestrator profile.",
+                    "avatar": "CS"
+                })),
+            ))
+            .await
+            .unwrap();
+        let status = saved.status();
+        let saved_body = read_json(saved).await;
+        assert_eq!(status, StatusCode::OK, "{saved_body}");
+        let bots = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/bots", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let main = bots["bots"]
+            .as_array()
+            .unwrap_or_else(|| panic!("bots payload: {bots}"))
+            .iter()
+            .find(|bot| bot["id"] == "main")
+            .unwrap_or_else(|| panic!("bots payload: {bots}"));
+        assert_eq!(main["display_name"], "Chief of Staff");
+        assert_eq!(main["avatar"], "CS");
+        assert_eq!(main["description"], "Synthetic orchestrator profile.");
+
+        let missing = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PUT",
+                "/v1/admin/bots/nobody",
+                true,
+                Some(json!({"display_name": "Nobody"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let created = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/conversations",
+                true,
+                Some(json!({
+                    "kind": "section",
+                    "slug": "finance",
+                    "title": "Finance"
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let body = read_json(created).await;
+        assert_eq!(body["conversation"]["title"], "Finance");
+        assert_eq!(body["conversation"]["id"], "sec:finance");
     }
 
     #[tokio::test]

@@ -337,6 +337,7 @@ impl Store {
             role,
             content: content.to_owned(),
             name: name.map(str::to_owned),
+            bot: None,
             tool_call_id: None,
             created_at: utc_now(),
         };
@@ -345,6 +346,16 @@ impl Store {
     }
 
     pub fn create_conversation(&self, id: &str, kind: &str, parent_id: Option<&str>) -> Result<()> {
+        self.create_conversation_titled(id, kind, parent_id, None)
+    }
+
+    pub fn create_conversation_titled(
+        &self,
+        id: &str,
+        kind: &str,
+        parent_id: Option<&str>,
+        title: Option<&str>,
+    ) -> Result<()> {
         use crate::orchestration::{
             ConversationKind, parse_conversation_scope, validate_conversation_id,
         };
@@ -383,9 +394,9 @@ impl Store {
         let connection = self.connection()?;
         connection
             .execute(
-                "INSERT INTO conversations(id, kind, parent_id, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?4)",
-                params![id, kind, parent_id, now_string()],
+                "INSERT INTO conversations(id, kind, parent_id, title, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                params![id, kind, parent_id, title, now_string()],
             )
             .map_err(map_conversation_write)?;
         Ok(())
@@ -501,6 +512,7 @@ impl Store {
                 role: parse_role(&row.get::<_, String>(3)?),
                 content: row.get(4)?,
                 name: row.get(5)?,
+                bot: None,
                 tool_call_id: row.get(6)?,
                 created_at: parse_datetime(&row.get::<_, String>(7)?),
             })
@@ -517,9 +529,11 @@ impl Store {
     ) -> Result<Vec<StoredMessage>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, conversation_id, turn_id, role, content, name, created_at
-             FROM messages WHERE conversation_id = ?1 AND role IN ('user', 'assistant')
-             ORDER BY created_at DESC, rowid DESC LIMIT ?2",
+            "SELECT m.id, m.conversation_id, m.turn_id, m.role, m.content, m.name,
+                    m.created_at, t.bot
+             FROM messages m LEFT JOIN turns t ON t.id = m.turn_id
+             WHERE m.conversation_id = ?1 AND m.role IN ('user', 'assistant')
+             ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?2",
         )?;
         let rows = statement.query_map(
             params![conversation_id, limit.clamp(1, 200) as i64],
@@ -531,6 +545,7 @@ impl Store {
                     role: parse_role(&row.get::<_, String>(3)?),
                     content: row.get(4)?,
                     name: row.get(5)?,
+                    bot: row.get(7)?,
                     tool_call_id: None,
                     created_at: parse_datetime(&row.get::<_, String>(6)?),
                 })
@@ -1478,6 +1493,28 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].name.as_deref(), Some("analyst"));
         assert_eq!(messages[0].content, "from analyst");
+    }
+
+    #[test]
+    fn visible_history_attributes_assistant_messages_to_the_turn_bot() {
+        let store = store();
+        let task = store
+            .enqueue_task("turn", "analyst", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        let turn = store
+            .create_turn(&task.id, "analyst", "dir:analyst", &serde_json::json!({}))
+            .unwrap();
+        store
+            .append_message(
+                "dir:analyst",
+                Some(&turn.id),
+                Role::Assistant,
+                "from analyst",
+            )
+            .unwrap();
+        let messages = store.list_visible_messages("dir:analyst", 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].bot.as_deref(), Some("analyst"));
     }
 
     #[test]
