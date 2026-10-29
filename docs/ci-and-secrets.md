@@ -41,3 +41,37 @@ flutter build apk --release \
 | Server | `[api].token_hash` locally | `serabot hash-token` |
 
 Never bake owner token values into APKs or release binaries.
+
+## Releases (`.github/workflows/release.yml`)
+
+Any tag push matching `v*` builds the clients and posts a GitHub Release with
+generated notes:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+| Asset | Built on | Command |
+| --- | --- | --- |
+| `serabot-desktop-<tag>-windows-x64.zip` | `windows-latest` | `cargo build --release --locked -p serabot-desktop`, zipped |
+| `serabot-desktop.exe` | `windows-latest` | Same build, bare binary |
+| `serabot-mobile-<tag>.apk` | `ubuntu-latest` | `flutter build apk --release` in `apps/serabot_mobile` |
+| `serabot-mobile-<tag>.aab` | `ubuntu-latest` | `flutter build appbundle --release` (Play bundle) |
+
+Download from the repository **Releases** page (latest tag on top). Windows:
+unzip and run `serabot-desktop.exe`. Android: allow "install unknown apps" and
+sideload the APK. The APK and AAB are signed with the Android **debug** key
+(the TODO in `apps/serabot_mobile/android/app/build.gradle.kts`), so they
+sideload fine but are not Play Store uploads. A real signing config would add
+keystore secrets; that is a follow-up and is not wired here.
+
+Release secrets — the same optional names as the client CI, nothing else:
+
+| Secret name | Read by the release workflow | Effect |
+| --- | --- | --- |
+| `SERABOT_OWNER_API_URL` | Yes | Compiled into the desktop binary and passed to Flutter as `--dart-define=SERABOT_DEFAULT_SERVER_URL`. Origin only. Empty or invalid values are ignored at runtime, so unset secrets still produce working clients with a generic server field. |
+| `SERABOT_OWNER_TOKEN` | **No** | Never read, compiled, or embedded. The clients name it so the owner knows which secret to type at runtime. |
+
+`GITHUB_TOKEN` needs no setup: the workflow declares `permissions: contents:
+write` and creates the release from the tag. No other secrets are required for
+public artifacts.

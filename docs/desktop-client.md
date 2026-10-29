@@ -32,6 +32,9 @@ scripts\cargo-win.bat build --release -p serabot-desktop --locked
 target\release\serabot-desktop.exe
 ```
 
+Prebuilt Windows clients (exe + zip) are attached to GitHub Releases on tag
+pushes (`v*`); see [CI and secrets](ci-and-secrets.md#releases).
+
 Build the server only with:
 
 ```bat

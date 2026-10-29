@@ -10,13 +10,15 @@ chat, tickets, or git.
 | --- | --- |
 | **OVH code tip** | `dc4d2e4` — *List configured bots and label room handoff replies.* |
 | **Previous host tip** | `4464558` — *Redact Telegram bot tokens before they reach the journal.* This is the last tip that ran before token redaction landed; see the rotation note below. |
+| **Main code tip** | `23fcb7d` — *Keep room turns on the orchestrator.* Past `dc4d2e4`; on `main` only until the next authorized OVH deploy. |
 | **Routing decision** | `bd871f9` — *Record why routing stays on the in-process allowlist.* Docs only (`docs/model-routing.md`). |
-| **This checklist** | Documentation on top of `dc4d2e4`. It does not move the binary. |
+| **This checklist** | Documentation and CI on top of `23fcb7d`. Neither moves the deployed binary. |
 
 `dc4d2e4` (`dc4d2e4a49cc47ad920dcbe7d484ab0892c99623`) is the binary on OVH.
 `4464558` (`4464558aa9ab8dd78666430760f3cc6d3c725c5c`) was the previous host
-tip. Docs-only commits after `dc4d2e4`, including this page, do not need
-another deploy.
+tip. `23fcb7d` is a code commit after `dc4d2e4` and is on `main` only; OVH
+stays on `dc4d2e4` until you authorize the next deploy. Docs-only and CI-only
+commits on top, including this page, do not need another deploy.
 
 ### Token rotation if journals held `getUpdates` URLs
 
@@ -37,10 +39,11 @@ Do not paste the token, the journal line, or the URL anywhere. If unsure
 whether a journal line existed, rotate anyway; the cost is one BotFather step.
 This note is the same rule recorded under [OVH](#ovh) below.
 
-Landed on `main` since `4464558` (code through `dc4d2e4`):
+Landed on `main` since `4464558` (code through `23fcb7d`):
 
 - `GET /v1/bots` lists configured bots (`id`, `role`, `enabled`, `live`, tools, skills) without prompts or secrets. Desktop Fleet has **Refresh bots**.
-- Room turns label `main`, and a `delegate` handoff keeps the specialist id on that same conversation. `GET /v1/conversations/{id}/messages` returns `name` when it is a bot id. A `bot` override on a `room:` id is ignored, so only `main` starts work there ([orchestration.md](orchestration.md#rooms-and-delegate)).
+- Room turns label `main`, and a `delegate` handoff keeps the specialist id on that same conversation. `GET /v1/conversations/{id}/messages` returns `name` when it is a bot id. A `bot` override on a `room:` id is ignored, so only `main` starts work there (`23fcb7d`) ([orchestration.md](orchestration.md#rooms-and-delegate)).
+- Tag pushes (`v*`) build and publish client downloads on GitHub Releases: Windows desktop exe + zip and Android APK/AAB (`.github/workflows/release.yml`). CI-only; no OVH deploy ([ci-and-secrets.md](ci-and-secrets.md#releases)).
 
 Still on `main` since `795b139` (code through `4464558`):
 
@@ -118,6 +121,7 @@ Commands below use secret **names** only.
 | **Enable a connector** | One section at a time, after its keys exist. Add the tool to a bot allowlist. Reads and AgentMail sends stay approval-gated. Restart **only** `serabot.service`. |
 | **Antigravity** | `secrets set antigravity_oauth_client_secret`, point `[llm.providers.*]` at `kind = "google-antigravity"`, then `serabot providers login google-antigravity`. Run that on the machine whose browser can open `127.0.0.1:51121`. Set `data_egress_approved = true` only when you intend Cloud Code to receive prompts. See [antigravity.md](antigravity.md). |
 | **GitHub Actions client builds** | `.github/workflows/clients.yml` accepts optional secrets `SERABOT_OWNER_API_URL` (synthetic shape `https://owner.example`, baked as the client default) and documents `SERABOT_OWNER_TOKEN`. The workflow does **not** read the token secret and does not compile a token. Unset secrets leave CI green. Never commit secret values ([ci-and-secrets.md](ci-and-secrets.md)). |
+| **GitHub Releases (client downloads)** | `git tag v0.1.0 && git push origin v0.1.0` runs `.github/workflows/release.yml`: builds `serabot-desktop` (Windows exe + zip) and `apps/serabot_mobile` (APK + AAB) and posts them to the Releases page. Reads only the optional `SERABOT_OWNER_API_URL` secret; the token is never read or compiled. APK/AAB are debug-signed (sideload only) until a keystore secret exists. See [ci-and-secrets.md](ci-and-secrets.md#releases). |
 | **Hot reload** | Not implemented. Restart `serabot.service` for new bots and skills (OVH section above). |
 
 Still owner-gated from the previous checklist. Same stdin rule.
@@ -182,8 +186,9 @@ curl -sS -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   http://127.0.0.1:8787/v1/conversations
 ```
 
-Windows desktop and Flutter mobile launch steps are unchanged:
-[desktop-client.md](desktop-client.md), [mobile-client.md](mobile-client.md).
+Prebuilt Windows and Android clients download from GitHub Releases (tag `v*`);
+local launch steps are unchanged: [desktop-client.md](desktop-client.md),
+[mobile-client.md](mobile-client.md).
 Desktop Fleet refreshes skills with `GET /v1/skills` and bots with
 `GET /v1/bots`. Mobile Fleet still submits the three POST endpoints. Local
 check before the next OVH build:

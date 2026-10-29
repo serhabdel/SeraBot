@@ -1,0 +1,97 @@
+name: release
+
+# Client downloads. Push a tag to publish:
+#   git tag v0.1.0 && git push origin v0.1.0
+# The workflow builds the Windows desktop client and the Android app, then
+# posts both to the GitHub Releases page for that tag. No secrets are required
+# for the artifacts themselves; only the optional SERABOT_OWNER_API_URL prefill
+# secret is read (see docs/ci-and-secrets.md). The owner token is never read,
+# compiled, or embedded.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  desktop:
+    runs-on: windows-latest
+    env:
+      # Optional repository secret (synthetic example: https://owner.example).
+      # Unset expands to empty; the binary then compiles with an empty prefill
+      # and the server field stays generic.
+      SERABOT_OWNER_API_URL: ${{ secrets.SERABOT_OWNER_API_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Release build
+        run: cargo build --release --locked -p serabot-desktop
+      - name: Zip the client
+        run: |
+          $tag = "${{ github.ref_name }}"
+          Compress-Archive -Path target\release\serabot-desktop.exe -DestinationPath "serabot-desktop-$tag-windows-x64.zip"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-assets
+          path: |
+            serabot-desktop-${{ github.ref_name }}-windows-x64.zip
+            target/release/serabot-desktop.exe
+
+  mobile:
+    runs-on: ubuntu-latest
+    env:
+      # Optional repository secret, origin only. Never the token.
+      SERABOT_OWNER_API_URL: ${{ secrets.SERABOT_OWNER_API_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Dependencies
+        working-directory: apps/serabot_mobile
+        run: flutter pub get
+      - name: Build release APK
+        working-directory: apps/serabot_mobile
+        run: |
+          flutter build apk --release \
+            --dart-define=SERABOT_DEFAULT_SERVER_URL="${SERABOT_OWNER_API_URL}" \
+            --dart-define=SERABOT_OWNER_TOKEN_SECRET_NAME=SERABOT_OWNER_TOKEN
+          cp build/app/outputs/flutter-apk/app-release.apk "serabot-mobile-${{ github.ref_name }}.apk"
+      - name: Build release app bundle
+        working-directory: apps/serabot_mobile
+        run: |
+          flutter build appbundle --release \
+            --dart-define=SERABOT_DEFAULT_SERVER_URL="${SERABOT_OWNER_API_URL}" \
+            --dart-define=SERABOT_OWNER_TOKEN_SECRET_NAME=SERABOT_OWNER_TOKEN
+          cp build/app/outputs/bundle/release/app-release.aab "serabot-mobile-${{ github.ref_name }}.aab"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile-assets
+          path: |
+            apps/serabot_mobile/serabot-mobile-${{ github.ref_name }}.apk
+            apps/serabot_mobile/serabot-mobile-${{ github.ref_name }}.aab
+
+  publish:
+    needs: [desktop, mobile]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

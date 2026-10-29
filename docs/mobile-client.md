@@ -19,6 +19,10 @@ flutter build apk --release \
 
 `https://owner.example` is a synthetic origin. CI reads the optional repository secret `SERABOT_OWNER_API_URL` and passes it as `SERABOT_DEFAULT_SERVER_URL`. An invalid origin is ignored and the field stays `https://`. See `docs/ci-and-secrets.md`.
 
+Prebuilt APKs (and AABs) are attached to GitHub Releases on tag pushes (`v*`);
+see [CI and secrets](ci-and-secrets.md#releases). The release APK is signed
+with the Android debug key, so sideload it rather than uploading to Play.
+
 ## Fleet
 
 The **Fleet** tab calls `POST /v1/bots`, `POST /v1/skills`, and
