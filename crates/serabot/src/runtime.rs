@@ -276,6 +276,29 @@ impl Runtime {
         self.gateway.scan_egress(text)
     }
 
+    pub async fn refresh_model_catalogs(&self) -> Result<()> {
+        for report in self.router.refresh_catalogs().await? {
+            if !report.fetched {
+                continue;
+            }
+            self.store.record_audit(
+                "owner",
+                "model.catalog_refreshed",
+                None,
+                None,
+                None,
+                None,
+                Some(self.gateway.policy().version()),
+                Some(&json!({
+                    "provider": report.provider,
+                    "verified": report.verified,
+                    "model_count": report.model_count,
+                })),
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn model_catalog(&self) -> Result<Vec<ProviderView>> {
         let catalog = self.router.catalog();
         self.gateway
@@ -375,6 +398,7 @@ impl Runtime {
             ModelSelection::auto_mode()
         } else {
             self.router.pin(&selection)?;
+            self.router.catalog_gate(&selection)?;
             selection
         };
         let value = serde_json::to_string(&stored)?;
@@ -1387,6 +1411,8 @@ mod tests {
                 require_approval: vec![],
                 enabled: true,
                 temperature: None,
+                role: Default::default(),
+                delegates: vec![],
             },
             prompt: "test prompt".into(),
         }

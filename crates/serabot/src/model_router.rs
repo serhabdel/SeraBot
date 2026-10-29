@@ -1,12 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{LlmConfig, ProviderConfig};
+use crate::config::LlmConfig;
 use crate::domain::LlmMessage;
 use crate::error::{Result, SeraError};
 use crate::gateway::ToolSpec;
-use crate::llm::{LlmClient, LlmResponse, validate_base_url};
+use crate::llm::{LlmClient, LlmResponse};
+use crate::providers::{
+    AuthPlan, auth_plan, canonical_kind, check_profile, resolve_base_url, valid_model_id,
+};
 use crate::util::sha256_hex;
 
 /// Stored conversation preference when the owner enables automatic routing.
@@ -36,6 +41,9 @@ pub struct ProviderView {
     pub id: String,
     pub models: Vec<String>,
     pub data_egress_approved: bool,
+    pub kind: String,
+    pub catalog_fetch: bool,
+    pub catalog_verified: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,6 +51,21 @@ pub struct CatalogEntry {
     pub provider: String,
     pub model: String,
     pub data_egress_approved: bool,
+    pub catalog_verified: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CatalogRefresh {
+    pub provider: String,
+    pub fetched: bool,
+    pub verified: bool,
+    pub model_count: usize,
+}
+
+#[derive(Clone)]
+enum CatalogSnapshot {
+    Closed,
+    Verified { at: Instant, models: BTreeSet<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,12 +80,17 @@ struct Provider {
     models: BTreeSet<String>,
     data_egress_approved: bool,
     fingerprint: String,
+    kind: String,
+    catalog_fetch: bool,
+    catalog_ttl: Duration,
+    catalog: Arc<Mutex<CatalogSnapshot>>,
 }
 
 #[derive(Clone)]
 pub struct ModelRouter {
     providers: BTreeMap<String, Provider>,
     default_model: String,
+    classes: BTreeMap<String, Vec<String>>,
 }
 
 impl ModelRouter {
@@ -72,15 +100,7 @@ impl ModelRouter {
                 "provider id 'default' is reserved for [llm]".into(),
             ));
         }
-        let default = ProviderConfig {
-            base_url: config.base_url.clone(),
-            api_key_secret: config.api_key_secret.clone(),
-            models: std::iter::once(config.model.clone())
-                .chain(config.models.iter().cloned())
-                .chain(config.bot_models.values().cloned())
-                .collect(),
-            data_egress_approved: config.data_egress_approved,
-        };
+        let default = config.default_provider();
         let mut providers = BTreeMap::new();
         for (id, profile) in std::iter::once(("default", &default)).chain(
             config
@@ -96,7 +116,17 @@ impl ModelRouter {
             {
                 return Err(SeraError::Config("invalid provider id".into()));
             }
-            let endpoint = validate_base_url(&profile.base_url)?;
+            let kind = canonical_kind(&profile.kind)?;
+            check_profile(
+                &kind,
+                &profile.base_url,
+                &profile.auth,
+                &profile.refresh_token_secret,
+                &profile.oauth_client_secret_secret,
+                profile.catalog_fetch,
+                profile.catalog_ttl_secs,
+            )?;
+            let endpoint = resolve_base_url(&kind, &profile.base_url)?;
             if profile.api_key_secret.trim().is_empty() || profile.models.is_empty() {
                 return Err(SeraError::Config(
                     "providers require a secret reference and explicit allowed models".into(),
@@ -113,10 +143,17 @@ impl ModelRouter {
                     "provider client endpoint does not match its configuration".into(),
                 ));
             }
+            let auth_label = match auth_plan(&kind, &profile.auth)? {
+                AuthPlan::ApiKey => "api_key",
+                AuthPlan::OAuth { .. } => "oauth",
+            };
             let fingerprint = sha256_hex(serde_json::to_vec(&(
-                endpoint,
+                &endpoint,
                 &profile.api_key_secret,
                 profile.data_egress_approved,
+                &kind,
+                profile.catalog_fetch,
+                auth_label,
             ))?);
             providers.insert(
                 id.to_owned(),
@@ -125,15 +162,40 @@ impl ModelRouter {
                     models: profile.models.iter().cloned().collect(),
                     data_egress_approved: profile.data_egress_approved,
                     fingerprint,
+                    kind,
+                    catalog_fetch: profile.catalog_fetch,
+                    catalog_ttl: Duration::from_secs(profile.catalog_ttl_secs.max(1)),
+                    catalog: Arc::new(Mutex::new(CatalogSnapshot::Closed)),
                 },
             );
         }
         if !clients.is_empty() {
             return Err(SeraError::Config("unconfigured provider client".into()));
         }
+        let mut classes = BTreeMap::new();
+        let mut allowed_models = BTreeSet::new();
+        for provider in providers.values() {
+            allowed_models.extend(provider.models.iter().cloned());
+        }
+        for (class_name, models) in &config.classes {
+            if class_name.is_empty() || class_name.len() > 64 {
+                return Err(SeraError::Config("invalid llm class name".into()));
+            }
+            for model in models {
+                validate_model(model)?;
+                if !allowed_models.contains(model) {
+                    return Err(SeraError::Config(format!(
+                        "llm.classes.{class_name} lists model not in the allowlist: {model}"
+                    )));
+                }
+            }
+            classes.insert(class_name.clone(), models.clone());
+        }
+
         Ok(Self {
             providers,
             default_model: config.model.clone(),
+            classes,
         })
     }
 
@@ -152,8 +214,11 @@ impl ModelRouter {
             .iter()
             .map(|(id, provider)| ProviderView {
                 id: id.clone(),
-                models: provider.models.iter().cloned().collect(),
+                models: provider.advertised(),
                 data_egress_approved: provider.data_egress_approved,
+                kind: provider.kind.clone(),
+                catalog_fetch: provider.catalog_fetch,
+                catalog_verified: provider.catalog_verified(),
             })
             .collect()
     }
@@ -162,13 +227,95 @@ impl ModelRouter {
         self.providers
             .iter()
             .flat_map(|(id, provider)| {
-                provider.models.iter().map(|model| CatalogEntry {
+                let verified = provider.catalog_verified();
+                provider.advertised().into_iter().map(move |model| CatalogEntry {
                     provider: id.clone(),
-                    model: model.clone(),
+                    model,
                     data_egress_approved: provider.data_egress_approved,
+                    catalog_verified: verified,
                 })
             })
             .collect()
+    }
+
+    pub async fn refresh_catalogs(&self) -> Result<Vec<CatalogRefresh>> {
+        let mut reports = Vec::new();
+        for id in self.providers.keys() {
+            if !self.providers[id].catalog_fetch {
+                continue;
+            }
+            reports.push(self.refresh_provider(id).await?);
+        }
+        Ok(reports)
+    }
+
+    pub fn catalog_gate(&self, selection: &ModelSelection) -> Result<()> {
+        let provider = self
+            .providers
+            .get(&selection.provider)
+            .ok_or_else(|| SeraError::Validation("unknown model provider".into()))?;
+        if !provider.catalog_fetch || !provider.data_egress_approved {
+            return Ok(());
+        }
+        if provider.verified_contains(&selection.model) {
+            return Ok(());
+        }
+        Err(SeraError::Forbidden(
+            "model is not in the verified provider catalog".into(),
+        ))
+    }
+
+    async fn refresh_provider(&self, id: &str) -> Result<CatalogRefresh> {
+        let provider = &self.providers[id];
+        if !provider.catalog_fetch || !provider.data_egress_approved {
+            return Ok(CatalogRefresh {
+                provider: id.to_owned(),
+                fetched: false,
+                verified: false,
+                model_count: provider.advertised().len(),
+            });
+        }
+        if provider.is_fresh() {
+            return Ok(CatalogRefresh {
+                provider: id.to_owned(),
+                fetched: false,
+                verified: true,
+                model_count: provider.advertised().len(),
+            });
+        }
+        match provider.client.list_models().await {
+            Ok(models) => {
+                let model_count = provider
+                    .models
+                    .intersection(&models)
+                    .count();
+                *provider
+                    .catalog
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = CatalogSnapshot::Verified {
+                    at: Instant::now(),
+                    models,
+                };
+                Ok(CatalogRefresh {
+                    provider: id.to_owned(),
+                    fetched: true,
+                    verified: true,
+                    model_count,
+                })
+            }
+            Err(_) => {
+                *provider
+                    .catalog
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = CatalogSnapshot::Closed;
+                Ok(CatalogRefresh {
+                    provider: id.to_owned(),
+                    fetched: true,
+                    verified: false,
+                    model_count: 0,
+                })
+            }
+        }
     }
 
     pub fn default_selection(&self, bot_model: Option<&str>) -> ModelSelection {
@@ -208,6 +355,47 @@ impl ModelRouter {
         })
     }
 
+    /// Resolve a logical model class (`routine`, `synthesis`) to an approved route.
+    ///
+    /// When `class` is missing, empty, or has no approved models, falls back to
+    /// [`Self::autoselect`].
+    pub fn select_class(
+        &self,
+        class: Option<&str>,
+        bot_model: Option<&str>,
+        bot_name: &str,
+        bot_models: &BTreeMap<String, String>,
+    ) -> Result<ModelSelection> {
+        let Some(class_name) = class.filter(|name| !name.is_empty()) else {
+            return self.autoselect(bot_model, bot_name, bot_models);
+        };
+        let Some(models) = self.classes.get(class_name) else {
+            return self.autoselect(bot_model, bot_name, bot_models);
+        };
+        if models.is_empty() {
+            return self.autoselect(bot_model, bot_name, bot_models);
+        }
+        if let Some(model) = bot_model {
+            if models.iter().any(|m| m == model) {
+                if let Some(selection) = self.find_approved_model(model, Some("default")) {
+                    return Ok(selection);
+                }
+                if let Some(selection) = self.find_approved_model(model, None) {
+                    return Ok(selection);
+                }
+            }
+        }
+        for model in models {
+            if let Some(selection) = self.find_approved_model(model, Some("default")) {
+                return Ok(selection);
+            }
+            if let Some(selection) = self.find_approved_model(model, None) {
+                return Ok(selection);
+            }
+        }
+        self.autoselect(bot_model, bot_name, bot_models)
+    }
+
     pub fn resolve_selection(
         &self,
         stored: &ModelSelection,
@@ -229,7 +417,7 @@ impl ModelRouter {
     ) -> Option<ModelSelection> {
         if let Some(id) = prefer_provider {
             if let Some(provider) = self.providers.get(id) {
-                if provider.data_egress_approved && provider.models.contains(model) {
+                if provider.is_routable(model) {
                     return Some(ModelSelection {
                         provider: id.to_owned(),
                         model: model.to_owned(),
@@ -238,7 +426,7 @@ impl ModelRouter {
             }
         }
         for (id, provider) in &self.providers {
-            if provider.data_egress_approved && provider.models.contains(model) {
+            if provider.is_routable(model) {
                 return Some(ModelSelection {
                     provider: id.clone(),
                     model: model.to_owned(),
@@ -254,11 +442,11 @@ impl ModelRouter {
 
     fn first_approved(&self) -> Option<ModelSelection> {
         for (id, provider) in &self.providers {
-            for model in &provider.models {
-                if provider.data_egress_approved {
+            for model in provider.advertised() {
+                if provider.is_routable(&model) {
                     return Some(ModelSelection {
                         provider: id.clone(),
-                        model: model.clone(),
+                        model,
                     });
                 }
             }
@@ -311,22 +499,81 @@ impl ModelRouter {
         temperature: Option<f32>,
     ) -> Result<LlmResponse> {
         self.validate_pinned(route)?;
-        self.providers[&route.selection.provider]
+        let provider = &self.providers[&route.selection.provider];
+        if provider.catalog_fetch {
+            self.refresh_provider(&route.selection.provider).await?;
+            if !provider.verified_contains(&route.selection.model) {
+                return Err(SeraError::Forbidden(
+                    "model is not in the verified provider catalog".into(),
+                ));
+            }
+        }
+        provider
             .client
             .complete(messages, tools, Some(&route.selection.model), temperature)
             .await
     }
 }
 
-fn validate_model(model: &str) -> Result<()> {
-    if model.is_empty()
-        || model.len() > 256
-        || model.trim() != model
-        || model.chars().any(char::is_control)
-    {
-        return Err(SeraError::Config("invalid configured model id".into()));
+impl Provider {
+    fn lock_catalog(&self) -> std::sync::MutexGuard<'_, CatalogSnapshot> {
+        self.catalog.lock().unwrap_or_else(|error| error.into_inner())
     }
-    Ok(())
+
+    fn is_fresh(&self) -> bool {
+        match &*self.lock_catalog() {
+            CatalogSnapshot::Verified { at, .. } => at.elapsed() < self.catalog_ttl,
+            CatalogSnapshot::Closed => false,
+        }
+    }
+
+    fn catalog_verified(&self) -> bool {
+        self.catalog_fetch && self.data_egress_approved && self.is_fresh()
+    }
+
+    fn advertised(&self) -> Vec<String> {
+        let allow: Vec<String> = self.models.iter().cloned().collect();
+        if !self.catalog_fetch || !self.data_egress_approved {
+            return allow;
+        }
+        match &*self.lock_catalog() {
+            CatalogSnapshot::Verified { at, models } if at.elapsed() < self.catalog_ttl => allow
+                .into_iter()
+                .filter(|model| models.contains(model))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn verified_contains(&self, model: &str) -> bool {
+        if !self.models.contains(model) {
+            return false;
+        }
+        if !self.catalog_fetch {
+            return true;
+        }
+        if !self.data_egress_approved {
+            return false;
+        }
+        match &*self.lock_catalog() {
+            CatalogSnapshot::Verified { at, models } => {
+                at.elapsed() < self.catalog_ttl && models.contains(model)
+            }
+            CatalogSnapshot::Closed => false,
+        }
+    }
+
+    fn is_routable(&self, model: &str) -> bool {
+        self.data_egress_approved && self.verified_contains(model)
+    }
+}
+
+fn validate_model(model: &str) -> Result<()> {
+    if valid_model_id(model) {
+        Ok(())
+    } else {
+        Err(SeraError::Config("invalid configured model id".into()))
+    }
 }
 
 #[cfg(test)]
@@ -334,7 +581,7 @@ mod tests {
     use super::*;
     use crate::config::ProviderConfig;
     use serde_json::json;
-    use wiremock::matchers::{body_partial_json, header, method};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     async fn fixture() -> (
@@ -356,6 +603,7 @@ mod tests {
                     api_key_secret: "second_key".into(),
                     models: vec!["second-model".into()],
                     data_egress_approved: true,
+                    ..ProviderConfig::default()
                 },
             )]),
             ..LlmConfig::default()
@@ -535,6 +783,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn select_class_without_config_matches_autoselect() {
+        let (config, clients, _, _) = fixture().await;
+        let router = ModelRouter::new(&config, clients).unwrap();
+        let bot_models = BTreeMap::new();
+        assert_eq!(
+            router
+                .select_class(None, None, "other", &bot_models)
+                .unwrap(),
+            router.autoselect(None, "other", &bot_models).unwrap()
+        );
+        assert_eq!(
+            router
+                .select_class(Some("missing"), None, "other", &bot_models)
+                .unwrap(),
+            router.autoselect(None, "other", &bot_models).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn select_class_skips_unapproved_models_in_class() {
+        let (mut config, clients, _, _) = fixture().await;
+        config.classes.insert(
+            "routine".into(),
+            vec!["second-model".into(), "first-model".into()],
+        );
+        config
+            .providers
+            .get_mut("second")
+            .unwrap()
+            .data_egress_approved = false;
+        let router = ModelRouter::new(&config, clients).unwrap();
+        assert_eq!(
+            router
+                .select_class(Some("routine"), None, "other", &BTreeMap::new())
+                .unwrap(),
+            ModelSelection {
+                provider: "default".into(),
+                model: "first-model".into(),
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn autoselect_never_picks_unapproved_providers() {
         let (mut config, clients, _, _) = fixture().await;
         config.data_egress_approved = false;
@@ -556,5 +847,188 @@ mod tests {
         config.providers.insert("bad/id".into(), profile);
         clients.insert("bad/id".into(), client);
         assert!(ModelRouter::new(&config, clients).is_err());
+    }
+
+    fn chat_ok() -> serde_json::Value {
+        json!({"choices":[{"message":{"content":"ok"}}]})
+    }
+
+    #[tokio::test]
+    async fn dynamic_catalog_intersects_allowlist_and_hides_unknown_models() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "kept"}, {"id": "extra"}, {"id": " bad"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_ok()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = LlmConfig {
+            base_url: server.uri(),
+            model: "kept".into(),
+            data_egress_approved: true,
+            kind: "openai-compatible".into(),
+            catalog_fetch: true,
+            catalog_ttl_secs: 60,
+            models: vec!["missing".into()],
+            ..LlmConfig::default()
+        };
+        let clients = BTreeMap::from([(
+            "default".into(),
+            LlmClient::new(server.uri(), "synthetic-key", 1, 100).unwrap(),
+        )]);
+        let router = ModelRouter::new(&config, clients).unwrap();
+        let reports = router.refresh_catalogs().await.unwrap();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].fetched && reports[0].verified);
+        assert_eq!(reports[0].model_count, 1);
+        assert_eq!(router.catalog()[0].models, vec!["kept".to_string()]);
+        assert!(router.catalog()[0].catalog_verified);
+        assert!(
+            router
+                .catalog_gate(&ModelSelection {
+                    provider: "default".into(),
+                    model: "missing".into(),
+                })
+                .is_err()
+        );
+        let kept = router
+            .pin(&ModelSelection {
+                provider: "default".into(),
+                model: "kept".into(),
+            })
+            .unwrap();
+        router
+            .complete(&kept, &[LlmMessage::user("synthetic")], &[], None)
+            .await
+            .unwrap();
+        let missing = router
+            .pin(&ModelSelection {
+                provider: "default".into(),
+                model: "missing".into(),
+            })
+            .unwrap();
+        assert!(
+            router
+                .complete(&missing, &[LlmMessage::user("synthetic")], &[], None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_catalog_refresh_does_not_send_chat() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let config = LlmConfig {
+            base_url: server.uri(),
+            model: "kept".into(),
+            data_egress_approved: true,
+            catalog_fetch: true,
+            catalog_ttl_secs: 60,
+            ..LlmConfig::default()
+        };
+        let clients = BTreeMap::from([(
+            "default".into(),
+            LlmClient::new(server.uri(), "synthetic-key", 1, 100).unwrap(),
+        )]);
+        let router = ModelRouter::new(&config, clients).unwrap();
+        let reports = router.refresh_catalogs().await.unwrap();
+        assert!(reports[0].fetched && !reports[0].verified);
+        assert!(router.catalog()[0].models.is_empty());
+        let route = router
+            .pin(&ModelSelection {
+                provider: "default".into(),
+                model: "kept".into(),
+            })
+            .unwrap();
+        assert!(
+            router
+                .complete(&route, &[LlmMessage::user("synthetic")], &[], None)
+                .await
+                .is_err()
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|request| request.url.path() != "/chat/completions"));
+    }
+
+    #[tokio::test]
+    async fn unapproved_catalog_fetch_does_not_leave_the_host() {
+        let server = MockServer::start().await;
+        let config = LlmConfig {
+            base_url: server.uri(),
+            model: "kept".into(),
+            data_egress_approved: false,
+            catalog_fetch: true,
+            catalog_ttl_secs: 60,
+            ..LlmConfig::default()
+        };
+        let clients = BTreeMap::from([(
+            "default".into(),
+            LlmClient::new(server.uri(), "synthetic-key", 1, 100).unwrap(),
+        )]);
+        let router = ModelRouter::new(&config, clients).unwrap();
+        let reports = router.refresh_catalogs().await.unwrap();
+        assert!(!reports[0].fetched);
+        assert_eq!(router.catalog()[0].models, vec!["kept".to_string()]);
+        assert!(!router.catalog()[0].catalog_verified);
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(
+            router
+                .pin(&ModelSelection {
+                    provider: "default".into(),
+                    model: "kept".into(),
+                })
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_catalog_is_not_reused_after_a_failed_refresh() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data": [{"id": "kept"}]})),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        let config = LlmConfig {
+            base_url: server.uri(),
+            model: "kept".into(),
+            data_egress_approved: true,
+            catalog_fetch: true,
+            catalog_ttl_secs: 1,
+            ..LlmConfig::default()
+        };
+        let clients = BTreeMap::from([(
+            "default".into(),
+            LlmClient::new(server.uri(), "synthetic-key", 1, 100).unwrap(),
+        )]);
+        let router = ModelRouter::new(&config, clients).unwrap();
+        router.refresh_catalogs().await.unwrap();
+        assert_eq!(router.catalog()[0].models, vec!["kept".to_string()]);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        router.refresh_catalogs().await.unwrap();
+        assert!(router.catalog()[0].models.is_empty());
+        assert!(!router.catalog()[0].catalog_verified);
     }
 }

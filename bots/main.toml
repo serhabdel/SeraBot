@@ -1,4 +1,6 @@
 name = "main"
+role = "orchestrator"
+delegates = ["analyst", "maker", "watcher"]
 trigger = "command"
 system_prompt = "prompts/main.txt"
 skills = ["triage", "ask"]

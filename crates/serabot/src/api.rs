@@ -231,6 +231,7 @@ async fn models(
     Query(query): Query<ModelQuery>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&query.conversation_id)?;
+    state.runtime.refresh_model_catalogs().await?;
     let bot = query.bot.as_deref().unwrap_or("main");
     let selection = state.runtime.model_selection(&query.conversation_id, bot)?;
     let effective_selection =
@@ -259,6 +260,7 @@ async fn select_model(
     Json(request): Json<SelectModelRequest>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
+    state.runtime.refresh_model_catalogs().await?;
     let selection = if request.provider == crate::model_router::AUTO_PROVIDER {
         ModelSelection::auto_mode()
     } else {
@@ -616,6 +618,8 @@ mod tests {
                 require_approval: vec![],
                 enabled: true,
                 temperature: None,
+                role: Default::default(),
+                delegates: vec![],
             },
             prompt: "test prompt".into(),
         };

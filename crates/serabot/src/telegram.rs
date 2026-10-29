@@ -548,6 +548,9 @@ impl TelegramClient {
                     .await;
                 return Ok(());
             }
+            if is_model_command(text) {
+                runtime.refresh_model_catalogs().await?;
+            }
             if let Some(reply) = model_command(runtime, &message.chat.id.to_string(), text)? {
                 self.send_message(self.owner_chat_id, &reply).await?;
                 return Ok(());
@@ -825,14 +828,35 @@ pub struct CallbackQuery {
     pub message: Option<TelegramMessage>,
 }
 
+fn is_model_command(text: &str) -> bool {
+    let command = text.split_whitespace().next().unwrap_or("");
+    let command = command.split('@').next().unwrap_or(command);
+    matches!(
+        command,
+        "/model" | "/models" | "/providers" | "/providors"
+    )
+}
+
+fn provider_state(provider: &crate::model_router::ProviderView) -> String {
+    if !provider.data_egress_approved {
+        return "data sharing not approved".into();
+    }
+    if !provider.catalog_fetch {
+        return "approved".into();
+    }
+    if !provider.catalog_verified {
+        return "approved, catalog unavailable".into();
+    }
+    if provider.models.is_empty() {
+        return "approved, catalog verified, no allowlisted models matched".into();
+    }
+    "approved, catalog verified".into()
+}
+
 fn provider_catalog_reply(runtime: &Runtime) -> Result<String> {
     let mut reply = String::from("Configured providers:\n");
     for provider in runtime.model_catalog()? {
-        let state = if provider.data_egress_approved {
-            "approved"
-        } else {
-            "data sharing not approved"
-        };
+        let state = provider_state(&provider);
         reply.push_str(&format!("\n{} ({state})\n", provider.id));
         for model in &provider.models {
             reply.push_str(&format!("  - {model}\n"));
@@ -864,6 +888,14 @@ fn model_command(runtime: &Runtime, conversation_id: &str, text: &str) -> Result
                     "{} / {} ({state})\n",
                     entry.provider, entry.model
                 ));
+            }
+            for provider in runtime.model_catalog()? {
+                if provider.catalog_fetch && !provider.catalog_verified {
+                    reply.push_str(&format!(
+                        "{id}: catalog unavailable, so no models are advertised until refresh succeeds.\n",
+                        id = provider.id
+                    ));
+                }
             }
             reply.push_str(
                 "\n/model auto picks an approved model using bot defaults.\n\
@@ -910,7 +942,13 @@ fn model_command(runtime: &Runtime, conversation_id: &str, text: &str) -> Result
             }) {
                 Ok(selection) => format!("Selected {} / {} for future turns in this conversation. Existing history will be sent to this provider. Running turns are unchanged.", selection.provider, selection.model),
                 Err(SeraError::Validation(_) | SeraError::NotFound(_)) => "Unknown provider or model. Use /models to see configured choices.".into(),
-                Err(SeraError::Forbidden(_)) => "This provider is not approved for data sharing. Configure approval on the server before selecting it.".into(),
+                Err(error @ SeraError::Forbidden(_)) => {
+                    if error.to_string().contains("catalog") {
+                        "That model is not in the verified provider catalog.".into()
+                    } else {
+                        "This provider is not approved for data sharing. Configure approval on the server before selecting it.".into()
+                    }
+                }
                 Err(SeraError::PolicyViolation) => "Selection blocked by content policy.".into(),
                 Err(error) => return Err(error),
             }
@@ -1157,6 +1195,8 @@ mod tests {
                 require_approval: vec![],
                 enabled: true,
                 temperature: None,
+                role: Default::default(),
+                delegates: vec![],
             },
             prompt: "test".into(),
         };
