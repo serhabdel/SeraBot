@@ -127,7 +127,10 @@ A room is one conversation (`room:<slug>`). It does not start a chat between
 models. Multi-bot presence is the owner, `main`, and at most one named
 specialist reply per orchestrator turn.
 
-1. The owner posts to the room. That turn runs as `main`.
+1. The owner posts to the room. That turn runs as `main`; a `bot` override on
+   `POST /v1/messages` for a `room:` id is ignored, so only the orchestrator can
+   start work there. Slash commands (`/deck`, `/xlsx`, `/timesheets`, `/brief`)
+   still route to their own specialist as in any other conversation.
 2. `main` may call `delegate` once. The tool queues one specialist task on the
    same conversation id and the orchestrator turn ends. In a room, that parent
    reply is stored with `name` `main` (for example `Queued handoff to analyst.`).

@@ -20,7 +20,8 @@ use crate::gateway::{
 use crate::memory;
 use crate::model_router::{ModelRouter, ModelSelection, PinnedRoute, ProviderView};
 use crate::orchestration::{
-    BotRole, HandoffContext, ORCHESTRATOR_BOT, assistant_speaker, validate_conversation_id,
+    BotRole, ConversationKind, HandoffContext, ORCHESTRATOR_BOT, assistant_speaker,
+    parse_conversation_scope, validate_conversation_id,
 };
 use crate::retrieval::{RetrievedChunk, Retriever, evidence_block};
 use crate::skills::on_demand_skill_clause;
@@ -544,11 +545,12 @@ impl Runtime {
                 false,
             )
         } else {
-            (
-                bot_override.unwrap_or("main").to_string(),
-                text.to_string(),
-                false,
-            )
+            // Rooms always run as the orchestrator; only a handoff names a specialist.
+            let bot = match parse_conversation_scope(conversation_id) {
+                Ok(scope) if scope.kind == ConversationKind::Room => ORCHESTRATOR_BOT,
+                _ => bot_override.unwrap_or(ORCHESTRATOR_BOT),
+            };
+            (bot.to_string(), text.to_string(), false)
         };
         if !self.bots.contains_key(&bot) {
             return Err(SeraError::NotFound(format!("bot {bot}")));
@@ -2099,5 +2101,83 @@ mod tests {
             .expect("specialist message");
         assert_eq!(specialist.content, "Synthetic analyst summary.");
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn room_turn_names_main_then_the_specialist() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(Sequence::new(vec![
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_delegate",
+                                "type": "function",
+                                "function": {
+                                    "name": "delegate",
+                                    "arguments": "{\"to_bot\":\"analyst\",\"objective\":\"Summarize synthetic room notes.\",\"model_class\":\"routine\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                }),
+                json!({
+                    "choices": [{"message": {"role": "assistant", "content": "Synthetic room summary."}, "finish_reason": "stop"}]
+                }),
+            ]))
+            .mount(&server)
+            .await;
+        let notifier = Arc::new(Capture::default());
+        let (runtime, store) = setup_orchestration(&server.uri(), notifier);
+        runtime
+            .submit_text("room:review", "review the notes", None)
+            .unwrap();
+        let parent = store.claim_task("worker", 30).unwrap().unwrap();
+        assert_eq!(parent.bot, "main");
+        runtime.process_task(parent).await.unwrap();
+        let child = store.claim_task("worker", 30).unwrap().unwrap();
+        assert_eq!(child.bot, "analyst");
+        runtime.process_task(child).await.unwrap();
+
+        let messages = store.list_visible_messages("room:review", 20).unwrap();
+        let speakers = messages
+            .iter()
+            .map(|message| {
+                (
+                    message.role,
+                    message.name.as_deref(),
+                    message.content.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            speakers,
+            vec![
+                (Role::User, None, "review the notes"),
+                (Role::Assistant, Some("main"), "Queued handoff to analyst."),
+                (Role::Assistant, Some("analyst"), "Synthetic room summary."),
+            ]
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn room_turns_ignore_bot_override() {
+        let server = MockServer::start().await;
+        let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
+        let task = runtime
+            .submit_text("room:review", "synthetic", Some("analyst"))
+            .unwrap();
+        assert_eq!(task.bot, "main");
+        assert_eq!(store.pending_task_count().unwrap(), 1);
+        let direct = runtime
+            .submit_text("dir:analyst", "synthetic", Some("analyst"))
+            .unwrap();
+        assert_eq!(direct.bot, "analyst");
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 }

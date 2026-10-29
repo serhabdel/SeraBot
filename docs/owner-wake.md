@@ -9,7 +9,7 @@ chat, tickets, or git.
 | Item | Value |
 | --- | --- |
 | **OVH code tip** | `dc4d2e4` — *List configured bots and label room handoff replies.* |
-| **Previous host tip** | `4464558` — *Redact Telegram bot tokens before they reach the journal.* |
+| **Previous host tip** | `4464558` — *Redact Telegram bot tokens before they reach the journal.* This is the last tip that ran before token redaction landed; see the rotation note below. |
 | **Routing decision** | `bd871f9` — *Record why routing stays on the in-process allowlist.* Docs only (`docs/model-routing.md`). |
 | **This checklist** | Documentation on top of `dc4d2e4`. It does not move the binary. |
 
@@ -18,10 +18,29 @@ chat, tickets, or git.
 tip. Docs-only commits after `dc4d2e4`, including this page, do not need
 another deploy.
 
+### Token rotation if journals held `getUpdates` URLs
+
+`4464558` drops the Bot API request URL and redacts `bot<token>` segments
+before an error is logged. Builds **before** it could write a `getUpdates`
+URL — which embeds the bot token — into the journal. The `4464558` binary ran
+until `dc4d2e4` replaced it, so anything logged before that swap is in scope.
+
+If any historical journal line contains a `getUpdates` URL:
+
+1. Rotate `telegram_bot_token` in **BotFather** (`/revoke` on that bot).
+2. Store the new value with `serabot secrets set telegram_bot_token`, reading
+   stdin. Never pass it as an argument and never paste it into chat, tickets,
+   or git.
+3. Restart **only** `serabot.service`.
+
+Do not paste the token, the journal line, or the URL anywhere. If unsure
+whether a journal line existed, rotate anyway; the cost is one BotFather step.
+This note is the same rule recorded under [OVH](#ovh) below.
+
 Landed on `main` since `4464558` (code through `dc4d2e4`):
 
 - `GET /v1/bots` lists configured bots (`id`, `role`, `enabled`, `live`, tools, skills) without prompts or secrets. Desktop Fleet has **Refresh bots**.
-- Room turns label `main`, and a `delegate` handoff keeps the specialist id on that same conversation. `GET /v1/conversations/{id}/messages` returns `name` when it is a bot id.
+- Room turns label `main`, and a `delegate` handoff keeps the specialist id on that same conversation. `GET /v1/conversations/{id}/messages` returns `name` when it is a bot id. A `bot` override on a `room:` id is ignored, so only `main` starts work there ([orchestration.md](orchestration.md#rooms-and-delegate)).
 
 Still on `main` since `795b139` (code through `4464558`):
 
