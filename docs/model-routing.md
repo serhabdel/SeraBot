@@ -170,3 +170,19 @@ Model content is not written to the audit log.
 - Muse has device login and key mint. It has no separate catalog protocol beyond the pinned `GET /v1/models`.
 - openai, groq, together, fireworks, openrouter, xai, cerebras, and moonshot are not host-pinned.
 - The catalog cache is process memory. A restart fetches again when egress is approved.
+
+## Options considered
+
+Keep the in-process allowlist `ModelRouter`. Do not adopt LiteLLM, RouteLLM, or OpenRouter auto-routing.
+
+**Current design.** Each profile lists the models it may call. Auto mode walks a fixed order: the bot `model` override, then `llm.bot_models`, then `[llm].model` on `default`, then the first egress-approved pair in sorted provider id and model id order. Orchestration resolves `routine` and `synthesis` with `ModelRouter::select_class`, which stays on that allowlist and falls back to the same order when the class is missing, empty, or unapproved. A turn pins the provider, model, and configuration fingerprint (endpoint, secret reference, and consent) and re-checks the pin on every call. Live catalogs fail closed: a failed, malformed, or stale refresh advertises no models and refuses chat.
+
+**LiteLLM.** Rejected. It adds a Python process, and its fallback chains can change provider or model after the turn is pinned.
+
+**OpenRouter auto-routing and failover.** Rejected. Routing would leave this process for a third party, and a marketplace catalog is a weaker gate than the allowlist. A static profile with `kind = "openrouter"` and explicit model ids remains valid; that path does not use OpenRouter's auto router.
+
+**RouteLLM.** Rejected. It steers each prompt between a strong model and a weak model and depends on Python. Class choice here is configuration (`routine` / `synthesis`) resolved by `select_class`.
+
+**Optional later fine-tune.** Offline training on owner labels only. The classifier may emit only `routine`, `synthesis`, or abstain, and that label still goes through `select_class`. An embedded 8B router stays out of the process. This does not put a fine-tuned chat model on the deployment host.
+
+**Deferred.** Host-pinning `openrouter` and the other loose kinds, keyword class hints, a learned router, and cross-provider retry.
