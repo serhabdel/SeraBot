@@ -82,82 +82,228 @@ impl ConnectorsConfig {
     }
 
     pub fn any_enabled(&self) -> bool {
-        self.google_drive.oauth.enabled
-            || self.google_sheets.oauth.enabled
-            || self.google_calendar.oauth.enabled
-            || self.gmail.oauth.enabled
-            || self.outlook.oauth.enabled
-            || self.outlook_calendar.oauth.enabled
-            || self.notion.oauth.enabled
+        self.google_drive.enabled
+            || self.google_sheets.enabled
+            || self.google_calendar.enabled
+            || self.gmail.enabled
+            || self.outlook.enabled
+            || self.outlook_calendar.enabled
+            || self.notion.enabled
             || self.agentmail.enabled
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OAuthConnectorSecrets {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_oauth_client_id_secret")]
-    pub client_id_secret: String,
-    #[serde(default = "default_oauth_client_secret_secret")]
-    pub client_secret_secret: String,
-    #[serde(default = "default_oauth_refresh_secret")]
-    pub refresh_token_secret: String,
+/// Secret-store key names for one OAuth connector. Values stay in the age store.
+pub trait OAuthConnectorSettings {
+    fn oauth_enabled(&self) -> bool;
+    fn client_id_secret_name(&self) -> &str;
+    fn client_secret_secret_name(&self) -> &str;
+    fn refresh_token_secret_name(&self) -> &str;
+    fn redirect_uri(&self) -> &str;
 }
 
-impl Default for OAuthConnectorSecrets {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            client_id_secret: default_oauth_client_id_secret(),
-            client_secret_secret: default_oauth_client_secret_secret(),
-            refresh_token_secret: default_oauth_refresh_secret(),
+fn validate_oauth_connector(
+    label: &str,
+    enabled: bool,
+    client_id_secret: &str,
+    client_secret_secret: &str,
+    refresh_token_secret: &str,
+    redirect_uri: &str,
+) -> Result<()> {
+    if !redirect_uri.trim().is_empty() {
+        validate_oauth_redirect_uri(redirect_uri)?;
+    }
+    if !enabled {
+        return Ok(());
+    }
+    for (field, value) in [
+        ("client_id_secret", client_id_secret),
+        ("client_secret_secret", client_secret_secret),
+        ("refresh_token_secret", refresh_token_secret),
+    ] {
+        if !valid_secret_name(value) {
+            return Err(SeraError::Config(format!(
+                "connectors.{label}.{field} must be a secret-store key name (letters, digits, '_' or '-')"
+            )));
         }
     }
+    Ok(())
 }
 
-impl OAuthConnectorSecrets {
-    fn validate_enabled(&self, label: &str) -> Result<()> {
-        if !self.enabled {
-            return Ok(());
-        }
-        for (field, value) in [
-            ("client_id_secret", self.client_id_secret.as_str()),
-            ("client_secret_secret", self.client_secret_secret.as_str()),
-            ("refresh_token_secret", self.refresh_token_secret.as_str()),
-        ] {
-            if value.trim().is_empty() {
-                return Err(SeraError::Config(format!(
-                    "connectors.{label}.{field} must not be empty when enabled"
-                )));
-            }
-        }
-        Ok(())
+/// Loopback redirect only. Empty is allowed at config time and rejected when building an authorize URL.
+pub(crate) fn validate_oauth_redirect_uri(redirect: &str) -> Result<()> {
+    let redirect = redirect.trim();
+    let url = url::Url::parse(redirect).map_err(|_| {
+        SeraError::Config(
+            "connectors redirect_uri must be http://127.0.0.1:<port>/<path> or http://localhost:<port>/<path>"
+                .into(),
+        )
+    })?;
+    let host = url.host_str().unwrap_or("");
+    let loopback = host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost");
+    let path_ok = url.path().starts_with('/')
+        && url.path() != "/"
+        && !url.path().contains("//")
+        && !url.path().contains("..");
+    if url.scheme() != "http"
+        || !loopback
+        || url.port().is_none_or(|port| port == 0)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !path_ok
+    {
+        return Err(SeraError::Config(
+            "connectors redirect_uri must be http://127.0.0.1:<port>/<path> or http://localhost:<port>/<path> with no query, fragment, or credentials"
+                .into(),
+        ));
     }
+    Ok(())
+}
+
+pub(crate) fn valid_secret_name(name: &str) -> bool {
+    let name = name.trim();
+    (1..=128).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 macro_rules! oauth_connector {
-    ($name:ident, $label:literal) => {
-        #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-        pub struct $name {
-            #[serde(flatten)]
-            pub oauth: OAuthConnectorSecrets,
+    (
+        $name:ident,
+        $label:literal,
+        $id_fn:ident = $id_path:literal = $id:literal,
+        $secret_fn:ident = $secret_path:literal = $secret:literal,
+        $refresh_fn:ident = $refresh_path:literal = $refresh:literal
+    ) => {
+        fn $id_fn() -> String {
+            $id.into()
         }
+        fn $secret_fn() -> String {
+            $secret.into()
+        }
+        fn $refresh_fn() -> String {
+            $refresh.into()
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct $name {
+            #[serde(default)]
+            pub enabled: bool,
+            #[serde(default = $id_path)]
+            pub client_id_secret: String,
+            #[serde(default = $secret_path)]
+            pub client_secret_secret: String,
+            #[serde(default = $refresh_path)]
+            pub refresh_token_secret: String,
+            /// Loopback OAuth redirect. Empty until the owner registers one.
+            #[serde(default)]
+            pub redirect_uri: String,
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self {
+                    enabled: false,
+                    client_id_secret: $id_fn(),
+                    client_secret_secret: $secret_fn(),
+                    refresh_token_secret: $refresh_fn(),
+                    redirect_uri: String::new(),
+                }
+            }
+        }
+
         impl $name {
             fn validate_enabled(&self) -> Result<()> {
-                self.oauth.validate_enabled($label)
+                validate_oauth_connector(
+                    $label,
+                    self.enabled,
+                    &self.client_id_secret,
+                    &self.client_secret_secret,
+                    &self.refresh_token_secret,
+                    &self.redirect_uri,
+                )
+            }
+        }
+
+        impl OAuthConnectorSettings for $name {
+            fn oauth_enabled(&self) -> bool {
+                self.enabled
+            }
+            fn client_id_secret_name(&self) -> &str {
+                &self.client_id_secret
+            }
+            fn client_secret_secret_name(&self) -> &str {
+                &self.client_secret_secret
+            }
+            fn refresh_token_secret_name(&self) -> &str {
+                &self.refresh_token_secret
+            }
+            fn redirect_uri(&self) -> &str {
+                &self.redirect_uri
             }
         }
     };
 }
 
-oauth_connector!(GoogleDriveConnectorConfig, "google_drive");
-oauth_connector!(GoogleSheetsConnectorConfig, "google_sheets");
-oauth_connector!(GoogleCalendarConnectorConfig, "google_calendar");
-oauth_connector!(GmailConnectorConfig, "gmail");
-oauth_connector!(OutlookConnectorConfig, "outlook");
-oauth_connector!(OutlookCalendarConnectorConfig, "outlook_calendar");
-oauth_connector!(NotionConnectorConfig, "notion");
+oauth_connector!(
+    GoogleDriveConnectorConfig,
+    "google_drive",
+    google_drive_client_id_secret = "google_drive_client_id_secret" = "google_oauth_client_id",
+    google_drive_client_secret_secret =
+        "google_drive_client_secret_secret" = "google_oauth_client_secret",
+    google_drive_refresh_secret = "google_drive_refresh_secret" = "google_drive_refresh_token"
+);
+oauth_connector!(
+    GoogleSheetsConnectorConfig,
+    "google_sheets",
+    google_sheets_client_id_secret = "google_sheets_client_id_secret" = "google_oauth_client_id",
+    google_sheets_client_secret_secret =
+        "google_sheets_client_secret_secret" = "google_oauth_client_secret",
+    google_sheets_refresh_secret = "google_sheets_refresh_secret" = "google_sheets_refresh_token"
+);
+oauth_connector!(
+    GoogleCalendarConnectorConfig,
+    "google_calendar",
+    google_calendar_client_id_secret =
+        "google_calendar_client_id_secret" = "google_oauth_client_id",
+    google_calendar_client_secret_secret =
+        "google_calendar_client_secret_secret" = "google_oauth_client_secret",
+    google_calendar_refresh_secret =
+        "google_calendar_refresh_secret" = "google_calendar_refresh_token"
+);
+oauth_connector!(
+    GmailConnectorConfig,
+    "gmail",
+    gmail_client_id_secret = "gmail_client_id_secret" = "google_oauth_client_id",
+    gmail_client_secret_secret = "gmail_client_secret_secret" = "google_oauth_client_secret",
+    gmail_refresh_secret = "gmail_refresh_secret" = "gmail_refresh_token"
+);
+oauth_connector!(
+    OutlookConnectorConfig,
+    "outlook",
+    outlook_client_id_secret = "outlook_client_id_secret" = "outlook_client_id",
+    outlook_client_secret_secret = "outlook_client_secret_secret" = "outlook_client_secret",
+    outlook_refresh_secret = "outlook_refresh_secret" = "outlook_refresh_token"
+);
+oauth_connector!(
+    OutlookCalendarConnectorConfig,
+    "outlook_calendar",
+    outlook_calendar_client_id_secret = "outlook_calendar_client_id_secret" = "outlook_client_id",
+    outlook_calendar_client_secret_secret =
+        "outlook_calendar_client_secret_secret" = "outlook_client_secret",
+    outlook_calendar_refresh_secret =
+        "outlook_calendar_refresh_secret" = "outlook_calendar_refresh_token"
+);
+oauth_connector!(
+    NotionConnectorConfig,
+    "notion",
+    notion_client_id_secret = "notion_client_id_secret" = "notion_oauth_client_id",
+    notion_client_secret_secret = "notion_client_secret_secret" = "notion_oauth_client_secret",
+    notion_refresh_secret = "notion_refresh_secret" = "notion_refresh_token"
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentMailConnectorConfig {
@@ -190,14 +336,26 @@ impl AgentMailConnectorConfig {
         if !self.enabled {
             return Ok(());
         }
-        if self.api_key_secret.trim().is_empty() {
+        if !valid_secret_name(&self.api_key_secret) {
             return Err(SeraError::Config(
-                "connectors.agentmail.api_key_secret must not be empty when enabled".into(),
+                "connectors.agentmail.api_key_secret must be a secret-store key name (letters, digits, '_' or '-')"
+                    .into(),
             ));
         }
-        if !self.api_base.starts_with("https://") {
+        let base = self.api_base.trim();
+        let url = url::Url::parse(base).map_err(|_| {
+            SeraError::Config("connectors.agentmail.api_base must be an https URL".into())
+        })?;
+        if url.scheme() != "https"
+            || url.host_str().is_none_or(str::is_empty)
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
             return Err(SeraError::Config(
-                "connectors.agentmail.api_base must be HTTPS".into(),
+                "connectors.agentmail.api_base must be https without credentials, a query, or a fragment"
+                    .into(),
             ));
         }
         Ok(())
@@ -219,17 +377,8 @@ fn default_browser_neo_base() -> String {
 fn default_browser_timeout() -> u64 {
     30
 }
-fn default_oauth_client_id_secret() -> String {
-    "oauth_client_id".into()
-}
-fn default_oauth_client_secret_secret() -> String {
-    "oauth_client_secret".into()
-}
-fn default_oauth_refresh_secret() -> String {
-    "oauth_refresh_token".into()
-}
 fn default_agentmail_api_base() -> String {
-    "https://api.agentmail.to".into()
+    "https://api.agentmail.to/v0".into()
 }
 fn default_agentmail_api_key_secret() -> String {
     "agentmail_api_key".into()

@@ -16,7 +16,7 @@ artifacts.
 | [Deployment](deployment.md) | Ubuntu 24.04 release build and additive install on OVH. |
 | [Firecrawl](firecrawl.md) | Optional v2 scrape/map/search/crawl tools and configuration. |
 | [Browser sessions](browser.md) | Loopback CDP browsing vs BrowserOS neo / Firecrawl. |
-| [Connectors](connectors.md) | Google, Microsoft, Notion scaffolds; native AgentMail. |
+| [Connectors](connectors.md) | Configure-later Google, Microsoft, and Notion OAuth; native AgentMail. |
 | [Mobile client](mobile-client.md) | Flutter Android owner console. |
 | [CI and secrets](ci-and-secrets.md) | GitHub Actions without credential leaks. |
 | [Crafting Apps adoption](craft-adoption.md) | Storytold craft repos: adapt PdfCraft patterns only; skip film/audio/video editors. |

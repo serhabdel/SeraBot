@@ -226,47 +226,56 @@ browseros_neo_base = "http://127.0.0.1:7333"
 user_data_dir = ""
 request_timeout_secs = 30
 
+# OAuth connectors stay off until the age store has the named keys.
+# redirect_uri, when set, must be loopback http://127.0.0.1:<port>/<path>.
 [connectors.google_drive]
 enabled = false
 client_id_secret = "google_oauth_client_id"
 client_secret_secret = "google_oauth_client_secret"
 refresh_token_secret = "google_drive_refresh_token"
+redirect_uri = ""
 
 [connectors.google_sheets]
 enabled = false
 client_id_secret = "google_oauth_client_id"
 client_secret_secret = "google_oauth_client_secret"
 refresh_token_secret = "google_sheets_refresh_token"
+redirect_uri = ""
 
 [connectors.google_calendar]
 enabled = false
 client_id_secret = "google_oauth_client_id"
 client_secret_secret = "google_oauth_client_secret"
 refresh_token_secret = "google_calendar_refresh_token"
+redirect_uri = ""
 
 [connectors.gmail]
 enabled = false
 client_id_secret = "google_oauth_client_id"
 client_secret_secret = "google_oauth_client_secret"
 refresh_token_secret = "gmail_refresh_token"
+redirect_uri = ""
 
 [connectors.outlook]
 enabled = false
 client_id_secret = "outlook_client_id"
 client_secret_secret = "outlook_client_secret"
 refresh_token_secret = "outlook_refresh_token"
+redirect_uri = ""
 
 [connectors.outlook_calendar]
 enabled = false
 client_id_secret = "outlook_client_id"
 client_secret_secret = "outlook_client_secret"
 refresh_token_secret = "outlook_calendar_refresh_token"
+redirect_uri = ""
 
 [connectors.notion]
 enabled = false
 client_id_secret = "notion_oauth_client_id"
 client_secret_secret = "notion_oauth_client_secret"
 refresh_token_secret = "notion_refresh_token"
+redirect_uri = ""
 
 [connectors.agentmail]
 enabled = false

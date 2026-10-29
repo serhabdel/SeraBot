@@ -1082,6 +1082,13 @@ const EXTERNAL_EFFECT_TOOLS: &[&str] = &[
     "browser_session_start",
     "browser_session_stop",
     "browser_navigate",
+    "google_drive_list",
+    "google_sheets_read",
+    "google_calendar_list_events",
+    "gmail_list_messages",
+    "outlook_list_messages",
+    "outlook_calendar_list_events",
+    "notion_query_database",
     "agentmail_inboxes_list",
     "agentmail_send",
 ];
@@ -1812,5 +1819,55 @@ enabled = false
         );
         assert!(!root.join("bots").join("other.toml").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn connector_defaults_name_secret_keys_and_reject_bad_redirects() {
+        let config = ConnectorsConfig::default();
+        assert!(!config.any_enabled());
+        assert_eq!(
+            config.google_drive.client_id_secret,
+            "google_oauth_client_id"
+        );
+        assert_eq!(
+            config.google_drive.client_secret_secret,
+            "google_oauth_client_secret"
+        );
+        assert_eq!(
+            config.google_drive.refresh_token_secret,
+            "google_drive_refresh_token"
+        );
+        assert_eq!(
+            config.google_sheets.refresh_token_secret,
+            "google_sheets_refresh_token"
+        );
+        assert_eq!(config.gmail.refresh_token_secret, "gmail_refresh_token");
+        assert_eq!(config.outlook.client_id_secret, "outlook_client_id");
+        assert_eq!(
+            config.outlook_calendar.refresh_token_secret,
+            "outlook_calendar_refresh_token"
+        );
+        assert_eq!(
+            config.notion.client_secret_secret,
+            "notion_oauth_client_secret"
+        );
+        assert_eq!(config.notion.refresh_token_secret, "notion_refresh_token");
+        assert_eq!(config.agentmail.api_base, "https://api.agentmail.to/v0");
+        assert_eq!(config.agentmail.api_key_secret, "agentmail_api_key");
+
+        let parsed: ConnectorsConfig = toml::from_str("[gmail]\nenabled = false\n").unwrap();
+        assert_eq!(parsed.gmail.client_id_secret, "google_oauth_client_id");
+        assert_eq!(parsed.gmail.refresh_token_secret, "gmail_refresh_token");
+
+        let mut enabled = ConnectorsConfig::default();
+        enabled.google_drive.enabled = true;
+        enabled.google_drive.client_id_secret.clear();
+        assert!(enabled.validate().is_err());
+
+        let mut redirect = ConnectorsConfig::default();
+        redirect.google_calendar.redirect_uri = "https://example.com/callback".into();
+        assert!(redirect.validate().is_err());
+        redirect.google_calendar.redirect_uri = "http://127.0.0.1:8765/callback".into();
+        assert!(redirect.validate().is_ok());
     }
 }
