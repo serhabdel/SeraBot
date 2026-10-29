@@ -412,12 +412,25 @@ impl Desktop {
                                     );
                                 }
                             });
-                            ui.label(design::meta(format!(
-                                "tools · {}   skills · {}",
-                                fleet_names(&bot.tools),
-                                fleet_names(&bot.skills)
-                            )));
-                            ui.add_space(4.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new("tools").size(10.0).color(design::muted_dim()),
+                                );
+                                for tool in &bot.tools {
+                                    design::chip(ui, tool, design::muted(), design::panel_alt());
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new("skills")
+                                        .size(10.0)
+                                        .color(design::muted_dim()),
+                                );
+                                for skill in &bot.skills {
+                                    design::chip(ui, skill, design::accent(), design::ok_bg());
+                                }
+                            });
+                            ui.add_space(6.0);
                         }
                     });
             }
@@ -578,13 +591,6 @@ impl Desktop {
             self.start_request(Operation::ListSkills);
         }
     }
-}
-
-fn fleet_names(items: &[String]) -> String {
-    if items.is_empty() {
-        return "none".into();
-    }
-    skill_blurb(&items.join(", "))
 }
 
 fn skill_blurb(text: &str) -> String {

@@ -2,7 +2,7 @@
 
 use super::*;
 use eframe::egui::{Align2, CornerRadius, Rect, StrokeKind, pos2, vec2};
-use serabot_desktop::Message;
+use serabot_desktop::{BotSummary, Message};
 use std::sync::Arc;
 
 const ROW_GAP: f32 = 10.0;
@@ -332,9 +332,12 @@ impl Desktop {
         let epoch = self.state.scope.epoch;
         let messages = &self.state.messages;
         let loaded = self.state.history_loaded;
+        let bots = &self.state.listed_bots;
+        let bots_loaded = self.state.bots_loaded;
         let chat = &mut self.chat;
         let jump = std::mem::take(&mut chat.scroll_to_bottom);
         let mut copy: Option<Arc<str>> = None;
+        let mut goto: Option<Section> = None;
         egui::ScrollArea::vertical()
             .id_salt(("history", epoch))
             .auto_shrink([false, false])
@@ -343,26 +346,17 @@ impl Desktop {
             .show_viewport(ui, |ui, viewport| {
                 let width = ui.available_width();
                 if messages.is_empty() {
-                    design::empty_state(
-                        ui,
-                        if loaded { "No messages yet" } else { "Loading conversation" },
-                        if loaded {
-                            "Send a message below. Only visible user and assistant messages appear here."
-                        } else {
-                            "Fetching the recent history from your host."
-                        },
-                    );
+                    chat_hero(ui, bots, bots_loaded, loaded, &mut goto);
                     return;
                 }
                 chat.layout.ensure(ui, messages, width, epoch);
                 let origin = ui.cursor().min;
                 let mut y = 0.0;
                 for row in &chat.layout.rows {
-                    let rect = Rect::from_min_size(
-                        pos2(origin.x, origin.y + y),
-                        vec2(width, row.height),
-                    );
-                    if rect.max.y >= viewport.min.y && rect.min.y <= viewport.max.y
+                    let rect =
+                        Rect::from_min_size(pos2(origin.x, origin.y + y), vec2(width, row.height));
+                    if rect.max.y >= viewport.min.y
+                        && rect.min.y <= viewport.max.y
                         && paint_row(ui, rect, row, epoch)
                     {
                         copy = Some(Arc::clone(&row.content));
@@ -384,6 +378,9 @@ impl Desktop {
         if let Some(content) = copy {
             ui.ctx().copy_text(content.to_string());
             self.show_toast("Copied message");
+        }
+        if let Some(section) = goto {
+            self.open_section(section);
         }
     }
 
@@ -468,6 +465,87 @@ impl Desktop {
                 }
             });
     }
+}
+
+fn chat_hero(
+    ui: &mut egui::Ui,
+    bots: &[BotSummary],
+    bots_loaded: bool,
+    loaded: bool,
+    goto: &mut Option<Section>,
+) {
+    ui.add_space(18.0);
+    ui.vertical_centered(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(140.0, 64.0), Sense::hover());
+        let painter = ui.painter();
+        painter.circle_filled(rect.center() + vec2(-20.0, 0.0), 26.0, design::accent_dim());
+        painter.circle_filled(rect.center() + vec2(20.0, 0.0), 26.0, design::warning_bg());
+        design::nav_icon(
+            painter,
+            Rect::from_center_size(rect.center(), vec2(30.0, 30.0)),
+            design::NavIcon::Chat,
+            design::accent(),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(if loaded {
+                "A quiet desk."
+            } else {
+                "Loading conversation"
+            })
+            .size(23.0)
+            .strong()
+            .color(design::text()),
+        );
+        ui.label(design::meta(if loaded {
+            "Start a turn below, or open a room with your specialists."
+        } else {
+            "Fetching recent history from your host."
+        }));
+        if !loaded {
+            return;
+        }
+        ui.add_space(12.0);
+        if !bots_loaded {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(design::meta("Loading specialists…"));
+            });
+        } else if bots.is_empty() {
+            ui.label(design::meta("No specialists configured yet."));
+        } else {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                for bot in bots.iter().take(5) {
+                    ui.vertical(|ui| {
+                        let (rect, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
+                        design::paint_avatar(
+                            ui.painter(),
+                            rect.center(),
+                            14.0,
+                            &bot.id,
+                            design::accent_dim(),
+                            design::accent(),
+                        );
+                        ui.label(RichText::new(&bot.id).size(9.5).color(design::muted()));
+                    });
+                }
+            });
+        }
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui.add(design::primary("Open conversations")).clicked() {
+                *goto = Some(Section::Conversations);
+            }
+            if ui.button("Memory").clicked() {
+                *goto = Some(Section::Memory);
+            }
+            if ui.button("Providers").clicked() {
+                *goto = Some(Section::Providers);
+            }
+        });
+    });
+    ui.add_space(18.0);
 }
 
 fn paint_row(ui: &egui::Ui, rect: Rect, row: &RowLayout, epoch: u64) -> bool {
@@ -647,5 +725,33 @@ mod tests {
             });
         });
         assert_eq!(layout.epoch, 8);
+    }
+
+    #[test]
+    fn the_empty_chat_hero_renders_the_roster_in_both_themes() {
+        let bots = vec![BotSummary {
+            id: "analyst".into(),
+            role: "specialist".into(),
+            enabled: true,
+            live: true,
+            tools: Vec::new(),
+            skills: Vec::new(),
+        }];
+        for mode in [design::ThemeMode::Dark, design::ThemeMode::Light] {
+            let ctx = egui::Context::default();
+            design::apply_theme(&ctx, mode);
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(900.0, 600.0))),
+                ..Default::default()
+            };
+            let mut goto = None;
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    chat_hero(ui, &bots, true, true, &mut goto);
+                });
+            });
+            assert!(!output.shapes.is_empty());
+            assert!(goto.is_none());
+        }
     }
 }

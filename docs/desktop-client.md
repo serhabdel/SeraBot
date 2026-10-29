@@ -106,20 +106,25 @@ conversation column in **Chat**, and a content pane. It is responsive down to
 - **Rail** — Chat, Conversations, Memory, Providers, Connectors, Approvals,
   Fleet, and Settings. Icons are painted with the GPU painter; the build ships
   no image assets.
-- **Appearance** — **Settings → Appearance** switches the whole console between
-  a deep teal-black dark palette and a warm paper light palette. The choice is
-  saved locally in `settings.json`. Both use gradient backdrops, elevated cards,
-  painted avatars, and soft status chips.
-- **Top bar** — the active conversation title and kind, connection state, the
-  per-conversation model chip, an update badge, and the command palette
-  (`Ctrl+K`).
+- **Appearance** — a Light/Dark switch sits in the top bar as well as
+  **Settings → Appearance**. The whole console, including the connect card,
+  switches between a deep teal-black dark palette and a warm paper light
+  palette. The choice is saved locally in `settings.json`. Both use a native
+  Segoe UI typeface on Windows, gradient backdrops, elevated cards, painted
+  avatars, and soft status chips.
+- **Top bar** — a full-width header with the SeraBot brand, the active
+  conversation title and kind, connection state, the per-conversation model
+  chip, a **Bots** count, the appearance switch, an update badge, and the
+  command palette (`Ctrl+K`).
 - **Chat** — the conversation column lists server metadata (title, kind,
   last-message time) and supports search, open, and new direct threads. Messages
   are bubbles by bot with avatars, tails, and timestamps; clicking a bubble
-  copies its text. The message list is virtualized: only visible rows are drawn,
-  and wrapped galleys are cached by message id and width, so scrolling and
-  resizing do not re-wrap the whole history. `stick_to_bottom` keeps the newest
-  message in view unless you scroll away; **Latest** returns to it.
+  copies its text. An empty conversation shows the specialist roster with quick
+  links to Conversations, Memory, and Providers. The message list is virtualized:
+  only visible rows are drawn, and wrapped galleys are cached by message id and
+  width, so scrolling and resizing do not re-wrap the whole history.
+  `stick_to_bottom` keeps the newest message in view unless you scroll away;
+  **Latest** returns to it.
 - **Composer** — `Ctrl+Enter` sends; **Send** is enabled only when the catalog
   selection is saved and approved, no unknown outcome is pending, and the
   conversation accepts turns. Sections and groups are read-only structure.

@@ -826,7 +826,18 @@ impl Desktop {
 
     fn missing_section_op(&self) -> Option<Operation> {
         match self.section {
-            Section::Chat | Section::Conversations => {
+            Section::Chat => {
+                if !self.state.conversations_loaded {
+                    Some(Operation::ListConversations {
+                        include_archived: false,
+                    })
+                } else if !self.state.bots_loaded {
+                    Some(Operation::ListBots)
+                } else {
+                    None
+                }
+            }
+            Section::Conversations => {
                 (!self.state.conversations_loaded).then(|| Operation::ListConversations {
                     include_archived: false,
                 })
@@ -979,24 +990,7 @@ impl Desktop {
             )
             .show(ctx, |ui| {
                 design::paint_rail_backdrop(ui);
-                ui.vertical_centered(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(Vec2::new(36.0, 36.0), Sense::hover());
-                    ui.painter()
-                        .circle_filled(rect.center(), 15.0, design::accent_dim());
-                    ui.painter().circle_stroke(
-                        rect.center(),
-                        15.0,
-                        Stroke::new(1.0_f32, design::accent()),
-                    );
-                    ui.painter().text(
-                        rect.center(),
-                        Align2::CENTER_CENTER,
-                        "S",
-                        FontId::proportional(15.0),
-                        design::accent(),
-                    );
-                });
-                ui.add_space(6.0);
+                ui.add_space(2.0);
                 for section in Section::NAV {
                     if design::rail_item(
                         ui,
@@ -1057,8 +1051,15 @@ impl Desktop {
                 self.section.label().to_owned()
             };
             ui.label(
+                RichText::new("SeraBot")
+                    .size(18.0)
+                    .strong()
+                    .color(design::accent()),
+            );
+            ui.label(RichText::new("·").size(16.0).color(design::muted_dim()));
+            ui.label(
                 RichText::new(heading)
-                    .size(15.0)
+                    .size(16.0)
                     .strong()
                     .color(design::text()),
             );
@@ -1107,6 +1108,35 @@ impl Desktop {
                 {
                     self.open_section(Section::Settings);
                 }
+                let target_theme = match self.theme {
+                    design::ThemeMode::Dark => design::ThemeMode::Light,
+                    design::ThemeMode::Light => design::ThemeMode::Dark,
+                };
+                if ui
+                    .small_button(
+                        RichText::new(target_theme.label())
+                            .size(10.0)
+                            .color(design::accent()),
+                    )
+                    .on_hover_text("Switch appearance")
+                    .clicked()
+                {
+                    self.set_theme(ctx, target_theme);
+                }
+                if self.section == Section::Chat {
+                    let bots = if self.state.bots_loaded {
+                        format!("Bots {}", self.state.listed_bots.len())
+                    } else {
+                        "Bots".into()
+                    };
+                    if ui
+                        .small_button(RichText::new(bots).size(10.0).color(design::muted()))
+                        .on_hover_text("Open the fleet roster")
+                        .clicked()
+                    {
+                        self.open_section(Section::Fleet);
+                    }
+                }
                 if self.section == Section::Chat
                     && ui
                         .small_button(
@@ -1119,7 +1149,6 @@ impl Desktop {
                 {
                     self.model_open = true;
                 }
-                let _ = ctx;
             });
         });
     }
@@ -1353,19 +1382,19 @@ impl eframe::App for Desktop {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.state.connected {
             self.handle_shortcuts(ctx);
+            egui::TopBottomPanel::top("topbar")
+                .exact_height(56.0)
+                .frame(
+                    Frame::new()
+                        .fill(design::panel())
+                        .stroke(Stroke::new(1.0_f32, design::stroke_soft()))
+                        .inner_margin(Margin::symmetric(16, 10)),
+                )
+                .show(ctx, |ui| self.top_bar(ui, ctx));
             self.rail(ctx);
             if self.section == Section::Chat {
                 self.conversation_column(ctx);
             }
-            egui::TopBottomPanel::top("topbar")
-                .exact_height(50.0)
-                .frame(
-                    Frame::new()
-                        .fill(design::bg())
-                        .stroke(Stroke::new(1.0_f32, design::stroke_soft()))
-                        .inner_margin(Margin::symmetric(14, 9)),
-                )
-                .show(ctx, |ui| self.top_bar(ui, ctx));
             egui::CentralPanel::default()
                 .frame(
                     Frame::new()
@@ -1800,11 +1829,11 @@ mod tests {
                     ..Default::default()
                 };
                 let output = ctx.run(input, |ctx| {
+                    egui::TopBottomPanel::top("topbar").show(ctx, |ui| app.top_bar(ui, ctx));
                     app.rail(ctx);
                     if app.section == Section::Chat {
                         app.conversation_column(ctx);
                     }
-                    egui::TopBottomPanel::top("topbar").show(ctx, |ui| app.top_bar(ui, ctx));
                     egui::CentralPanel::default().show(ctx, |ui| match app.section {
                         Section::Chat => app.chat_screen(ui),
                         Section::Conversations => app.conversations_screen(ui),

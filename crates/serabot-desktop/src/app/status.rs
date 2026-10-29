@@ -32,6 +32,38 @@ impl Desktop {
                     ui.add_space(6.0);
                     self.model_block(ui);
                 });
+                ui.add_space(10.0);
+                design::card(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Add or change a provider")
+                                .size(14.0)
+                                .strong()
+                                .color(design::text()),
+                        );
+                        design::chip(
+                            ui,
+                            "server-side",
+                            design::muted(),
+                            design::panel_alt(),
+                        );
+                    });
+                    ui.label(design::meta(
+                        "The desktop selects from the server catalog. Provider blocks, keys and egress approval stay in /etc/serabot/serabot.toml and the age store.",
+                    ));
+                    ui.label(
+                        RichText::new("serabot secrets set <api_key_secret>")
+                            .size(11.0)
+                            .monospace()
+                            .color(design::accent()),
+                    );
+                    ui.label(
+                        RichText::new("sudo systemctl restart serabot")
+                            .size(11.0)
+                            .monospace()
+                            .color(design::accent()),
+                    );
+                });
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     ui.label(
@@ -142,12 +174,7 @@ impl Desktop {
         let ready = self.ready()
             && self.active_conversation()
             && self.conversation_accepts_turns()
-            && !self.state.unknown_outcome
-            && self
-                .state
-                .task
-                .as_ref()
-                .is_none_or(|task| task.status.terminal());
+            && !self.state.unknown_outcome;
         let Some(catalog) = &self.state.catalog else {
             ui.label(design::meta("Connect to load the provider catalog."));
             return;
@@ -289,6 +316,11 @@ impl Desktop {
             )
         };
         ui.label(design::meta(format!("Saved {saved}")));
+        ui.label(
+            RichText::new("Applies to the next turn; a running turn keeps its pinned route.")
+                .size(10.0)
+                .color(design::muted_dim()),
+        );
         ui.checkbox(
             &mut self.confirmed_egress,
             RichText::new("Provider will receive this conversation history").size(11.0),

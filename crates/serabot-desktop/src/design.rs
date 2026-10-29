@@ -195,6 +195,7 @@ pub enum NavIcon {
 
 /// Install the selected palette and matching egui visuals.
 pub fn apply_theme(ctx: &egui::Context, mode: ThemeMode) {
+    install_fonts(ctx);
     let palette = match mode {
         ThemeMode::Dark => Palette::DARK,
         ThemeMode::Light => Palette::LIGHT,
@@ -239,29 +240,65 @@ pub fn apply_theme(ctx: &egui::Context, mode: ThemeMode) {
         style.spacing.window_margin = egui::Margin::same(12);
         style
             .text_styles
-            .insert(egui::TextStyle::Heading, FontId::proportional(21.0));
+            .insert(egui::TextStyle::Heading, FontId::proportional(22.0));
         style
             .text_styles
-            .insert(egui::TextStyle::Body, FontId::proportional(13.0));
+            .insert(egui::TextStyle::Body, FontId::proportional(14.0));
         style
             .text_styles
-            .insert(egui::TextStyle::Button, FontId::proportional(13.0));
+            .insert(egui::TextStyle::Button, FontId::proportional(13.5));
         style
             .text_styles
-            .insert(egui::TextStyle::Small, FontId::proportional(11.0));
+            .insert(egui::TextStyle::Small, FontId::proportional(12.0));
     });
 }
 
+/// Prefer the native Windows UI font so the console does not read like a
+/// 2012 toolkit. Missing files fall back to egui's bundled fonts.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let mut loaded = false;
+    for (name, path) in [
+        ("segoe", r"C:\Windows\Fonts\segoeui.ttf"),
+        ("consolas", r"C:\Windows\Fonts\consola.ttf"),
+    ] {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts
+                .font_data
+                .insert(name.into(), egui::FontData::from_owned(bytes).into());
+            loaded = true;
+        }
+    }
+    if !loaded {
+        return;
+    }
+    if fonts.font_data.contains_key("segoe") {
+        fonts
+            .families
+            .get_mut(&egui::FontFamily::Proportional)
+            .expect("proportional family")
+            .insert(0, "segoe".into());
+    }
+    if fonts.font_data.contains_key("consolas") {
+        fonts
+            .families
+            .get_mut(&egui::FontFamily::Monospace)
+            .expect("monospace family")
+            .insert(0, "consolas".into());
+    }
+    ctx.set_fonts(fonts);
+}
+
 pub fn title(text: impl Into<String>) -> RichText {
-    RichText::new(text).size(21.0).strong().color(self::text())
+    RichText::new(text).size(22.0).strong().color(self::text())
 }
 
 pub fn subtitle(text: impl Into<String>) -> RichText {
-    RichText::new(text).size(12.0).color(muted())
+    RichText::new(text).size(13.0).color(muted())
 }
 
 pub fn meta(text: impl Into<String>) -> RichText {
-    RichText::new(text).size(11.0).color(muted())
+    RichText::new(text).size(12.0).color(muted())
 }
 
 pub fn primary(text: impl Into<String>) -> egui::Button<'static> {
