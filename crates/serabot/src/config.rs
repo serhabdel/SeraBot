@@ -98,6 +98,10 @@ impl Config {
             .canonicalize()
             .unwrap_or_else(|_| parent.to_path_buf());
         config.validate()?;
+        let overlay =
+            crate::admin::AdminOverlay::load(&crate::admin::AdminOverlay::path_for(&config))?;
+        overlay.apply(&mut config)?;
+        config.validate()?;
         Ok(config)
     }
 

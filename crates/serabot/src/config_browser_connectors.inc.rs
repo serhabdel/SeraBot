@@ -69,6 +69,23 @@ pub struct ConnectorsConfig {
 }
 
 impl ConnectorsConfig {
+    pub fn set_enabled(&mut self, id: &str, enabled: bool) -> Result<()> {
+        match id {
+            "google_drive" => self.google_drive.enabled = enabled,
+            "google_sheets" => self.google_sheets.enabled = enabled,
+            "google_calendar" => self.google_calendar.enabled = enabled,
+            "gmail" => self.gmail.enabled = enabled,
+            "outlook" => self.outlook.enabled = enabled,
+            "outlook_calendar" => self.outlook_calendar.enabled = enabled,
+            "notion" => self.notion.enabled = enabled,
+            "agentmail" => self.agentmail.enabled = enabled,
+            _ => {
+                return Err(SeraError::Config(format!("unknown connector '{id}'")));
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.google_drive.validate_enabled()?;
         self.google_sheets.validate_enabled()?;

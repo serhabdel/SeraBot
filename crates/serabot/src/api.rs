@@ -20,6 +20,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 
+use crate::admin::AdminStore;
 use crate::config::{Config, OAuthConnectorSettings, ProviderConfig, scaffold_specialist_bot};
 use crate::domain::Task;
 use crate::error::{Result, SeraError};
@@ -86,6 +87,7 @@ pub struct ApiState {
     token_hash: String,
     rate: Arc<Mutex<VecDeque<Instant>>>,
     rate_limit: usize,
+    admin: Option<AdminStore>,
 }
 
 impl ApiState {
@@ -104,6 +106,7 @@ impl ApiState {
             token_hash: config.api.token_hash.to_ascii_lowercase(),
             rate: Arc::new(Mutex::new(VecDeque::new())),
             rate_limit: config.server.rate_limit_per_minute.max(1) as usize,
+            admin: AdminStore::open(&config).ok(),
             config,
         }
     }
@@ -128,6 +131,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/memories", get(list_memories).post(add_memory))
         .route("/v1/memories/{id}", delete(delete_memory))
         .route("/v1/providers", get(list_providers))
+        .route("/v1/admin/providers", post(admin_add_provider))
+        .route("/v1/admin/providers/{id}", delete(admin_remove_provider))
+        .route("/v1/admin/connectors/{id}", put(admin_set_connector))
+        .route("/v1/admin/audio", put(admin_set_audio))
+        .route("/v1/admin/restart", post(admin_restart))
         .route("/v1/connectors", get(list_connectors))
         .route("/v1/models", get(models))
         .route("/v1/conversations/{id}/model", put(select_model))
@@ -976,6 +984,10 @@ async fn list_providers(State(state): State<Arc<ApiState>>) -> Result<Json<Value
     let providers = catalog
         .into_iter()
         .map(|provider| {
+            let managed = state
+                .admin
+                .as_ref()
+                .is_some_and(|admin| admin.manages_provider(&provider.id));
             let config = settings.get(&provider.id);
             let routing_classes = llm
                 .classes
@@ -995,6 +1007,7 @@ async fn list_providers(State(state): State<Arc<ApiState>>) -> Result<Json<Value
                 "data_egress_approved": provider.data_egress_approved,
                 "catalog_fetch": provider.catalog_fetch,
                 "catalog_verified": provider.catalog_verified,
+                "managed": managed,
                 "secrets": {
                     "api_key": secret_status(&state.secrets, config.map(|c| c.api_key_secret.as_str())),
                     "refresh_token": secret_status(&state.secrets, config.map(|c| c.refresh_token_secret.as_str())),
@@ -1054,6 +1067,206 @@ fn oauth_connector_view(
             "refresh_token": secret_status(&state.secrets, Some(connector.refresh_token_secret_name())),
         },
     })
+}
+
+type AdminResult<T> = std::result::Result<T, (StatusCode, Json<Value>)>;
+
+/// Admin rejections carry our own safe message so the console can explain the
+/// fix (for example a missing secret name) without exposing provider bodies.
+fn admin_error(error: SeraError) -> (StatusCode, Json<Value>) {
+    let (status, message) = match &error {
+        SeraError::NotFound(message) => (StatusCode::NOT_FOUND, message.clone()),
+        SeraError::InvalidState(message) => (StatusCode::CONFLICT, message.clone()),
+        SeraError::Validation(message) | SeraError::Config(message) => {
+            (StatusCode::UNPROCESSABLE_ENTITY, message.clone())
+        }
+        _ => {
+            warn!(%error, "admin request failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "administration failed".to_owned(),
+            )
+        }
+    };
+    (status, Json(json!({"error": message, "code": "admin"})))
+}
+
+fn admin_store(state: &ApiState) -> AdminResult<&AdminStore> {
+    state
+        .admin
+        .as_ref()
+        .ok_or_else(|| admin_error(SeraError::Internal("administration is unavailable".into())))
+}
+
+fn audit_config(state: &ApiState, event: &str, details: Value) -> AdminResult<()> {
+    state
+        .store
+        .record_audit(
+            "owner",
+            event,
+            None,
+            None,
+            None,
+            None,
+            Some(state.runtime.policy_version()),
+            Some(&details),
+        )
+        .map_err(admin_error)?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct AddProviderRequest {
+    id: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default)]
+    api_key_secret: String,
+    #[serde(default)]
+    catalog_fetch: bool,
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+async fn admin_add_provider(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<AddProviderRequest>,
+) -> AdminResult<(StatusCode, Json<Value>)> {
+    let admin = admin_store(&state)?;
+    let profile = ProviderConfig {
+        base_url: request.base_url,
+        api_key_secret: request.api_key_secret,
+        models: request.models,
+        data_egress_approved: true,
+        kind: request.kind,
+        catalog_fetch: request.catalog_fetch,
+        ..ProviderConfig::default()
+    };
+    let kind = profile.kind.clone();
+    let catalog_fetch = profile.catalog_fetch;
+    admin
+        .add_provider(
+            &state.config,
+            &state.secrets,
+            &request.id,
+            profile,
+            request.api_key.as_deref(),
+        )
+        .map_err(admin_error)?;
+    audit_config(
+        &state,
+        "config.provider_saved",
+        json!({"provider": request.id, "kind": kind, "catalog_fetch": catalog_fetch}),
+    )?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({"saved": true, "restart_required": true})),
+    ))
+}
+
+async fn admin_remove_provider(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> AdminResult<Json<Value>> {
+    let admin = admin_store(&state)?;
+    admin.remove_provider(&id).map_err(admin_error)?;
+    audit_config(&state, "config.provider_removed", json!({"provider": id}))?;
+    Ok(Json(json!({"removed": id, "restart_required": true})))
+}
+
+#[derive(Deserialize)]
+struct ConnectorRequest {
+    enabled: bool,
+    #[serde(default)]
+    values: BTreeMap<String, String>,
+}
+
+async fn admin_set_connector(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(request): Json<ConnectorRequest>,
+) -> AdminResult<Json<Value>> {
+    let admin = admin_store(&state)?;
+    admin
+        .set_connector(
+            &state.config,
+            &state.secrets,
+            &id,
+            request.enabled,
+            &request.values,
+        )
+        .map_err(admin_error)?;
+    audit_config(
+        &state,
+        "config.connector_saved",
+        json!({"connector": id, "enabled": request.enabled, "credentials": request.values.keys().collect::<Vec<_>>()}),
+    )?;
+    Ok(Json(json!({"saved": true, "restart_required": true})))
+}
+
+#[derive(Deserialize)]
+struct AudioRequest {
+    enabled: bool,
+    #[serde(default)]
+    transcription_model: Option<String>,
+    #[serde(default)]
+    understanding_model: Option<String>,
+}
+
+async fn admin_set_audio(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<AudioRequest>,
+) -> AdminResult<Json<Value>> {
+    let admin = admin_store(&state)?;
+    admin
+        .set_audio(
+            &state.config,
+            &state.secrets,
+            request.enabled,
+            request.transcription_model,
+            request.understanding_model,
+        )
+        .map_err(admin_error)?;
+    audit_config(
+        &state,
+        "config.audio_saved",
+        json!({"enabled": request.enabled}),
+    )?;
+    Ok(Json(json!({"saved": true, "restart_required": true})))
+}
+
+#[derive(Deserialize)]
+struct RestartRequest {
+    #[serde(default)]
+    confirm: bool,
+}
+
+async fn admin_restart(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<RestartRequest>,
+) -> AdminResult<(StatusCode, Json<Value>)> {
+    if !request.confirm {
+        return Err(admin_error(SeraError::Validation(
+            "restart requires explicit confirmation".into(),
+        )));
+    }
+    let pending = state.store.pending_task_count().map_err(admin_error)?;
+    if pending > 0 {
+        return Err(admin_error(SeraError::InvalidState(format!(
+            "{pending} task(s) are still in flight; wait for them to finish"
+        ))));
+    }
+    audit_config(&state, "config.restart_requested", Value::Null)?;
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        tracing::warn!("restart requested by the owner console; exiting for systemd");
+        std::process::exit(1);
+    });
+    Ok((StatusCode::ACCEPTED, Json(json!({"restarting": true}))))
 }
 
 /// Names only. Secret values never leave the age store.
@@ -1223,13 +1436,11 @@ mod tests {
         config.llm.base_url = "https://example.com/v1".into();
         config.llm.models = vec!["test-alternative".into()];
         config.base_dir = base_dir;
+        let database =
+            std::env::temp_dir().join(format!("serabot-api-{}.db", uuid::Uuid::new_v4()));
+        config.database.path = database.to_string_lossy().into_owned();
         let config = Arc::new(config);
-        let store = Store::open(
-            std::env::temp_dir().join(format!("serabot-api-{}.db", uuid::Uuid::new_v4())),
-            384,
-            5000,
-        )
-        .unwrap();
+        let store = Store::open(&database, 384, 5000).unwrap();
         let bot = LoadedBot {
             config: BotConfig {
                 name: "main".into(),
@@ -2686,6 +2897,95 @@ mod tests {
         )
         .await;
         assert!(listed["memories"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_provider_writes_are_owner_gated_and_persist_an_overlay() {
+        let (app, config, _) = app();
+        let payload = json!({
+            "id": "aux",
+            "kind": "openai-compatible",
+            "base_url": "https://api.example.com/v1",
+            "models": ["aux-model"],
+            "api_key_secret": "llm_api_key"
+        });
+        let unauthorized = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/admin/providers",
+                false,
+                Some(payload.clone()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let missing = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/admin/providers",
+                true,
+                Some(json!({
+                    "id": "aux",
+                    "kind": "openai-compatible",
+                    "base_url": "https://api.example.com/v1",
+                    "models": ["aux-model"],
+                    "api_key_secret": "NOT_CONFIGURED"
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = read_json(missing).await;
+        assert!(body["error"].as_str().unwrap().contains("NOT_CONFIGURED"));
+
+        let saved = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/admin/providers",
+                true,
+                Some(payload),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::CREATED);
+        let overlay =
+            crate::admin::AdminOverlay::load(&crate::admin::AdminOverlay::path_for(&config))
+                .unwrap();
+        assert!(overlay.providers.contains_key("aux"));
+        assert!(overlay.providers["aux"].data_egress_approved);
+
+        let removed = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "DELETE",
+                "/v1/admin/providers/aux",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), StatusCode::OK);
+
+        let unconfirmed = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/admin/restart",
+                true,
+                Some(json!({"confirm": false})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unconfirmed.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

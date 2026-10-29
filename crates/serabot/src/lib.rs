@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod analyst;
 pub mod api;
 pub mod ask;
