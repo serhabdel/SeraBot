@@ -4,7 +4,8 @@
 
 use dioxus::prelude::*;
 use serabot_desktop::{
-    ApprovalDecision, ConversationKind, Role, Selection, TaskStatus,
+    ApprovalDecision, ConversationKind, Role, SPECIALIST_TOOLS, Selection, TaskStatus,
+    parse_skill_list,
     session::{Section, Session, Theme},
 };
 
@@ -216,6 +217,8 @@ fn Shell(session: Signal<Session>) -> Element {
             }
             main { class: "main",
                 Header { session }
+                StatusBanner { session }
+                UpdateBanner { session }
                 div { class: "content",
                     {match section {
                         Section::Chat => rsx! { ChatView { session } },
@@ -284,6 +287,102 @@ fn Header(session: Signal<Session>) -> Element {
                 span { class: if connected { "status on" } else { "status" },
                     if connected { "Online" } else { "Offline" }
                 }
+            }
+        }
+    }
+}
+
+#[component]
+fn StatusBanner(session: Signal<Session>) -> Element {
+    let error = session.read().state.error.clone();
+    let unknown = session.read().state.unknown_outcome;
+    let task = session.read().state.task.as_ref().map(|task| {
+        (
+            task.status,
+            task.status.label().to_owned(),
+            task.bot.clone(),
+            task.id.clone(),
+        )
+    });
+    let error_view = error.map(|message| {
+        rsx! {
+            div { class: "banner error", span { "{message}" } }
+        }
+    });
+    let unknown_view = unknown.then(|| {
+        rsx! {
+            div { class: "banner warn",
+                span { "A previous action has an unknown outcome. Refresh reads before acting again." }
+            }
+        }
+    });
+    let task_view = task.map(|(status, label, bot, id)| {
+        rsx! {
+            div { class: "banner",
+                span { class: "pill", "{label}" }
+                span { class: "muted small", "{bot} · {id}" }
+                if status == TaskStatus::AwaitingApproval {
+                    button {
+                        class: "btn ghost small",
+                        onclick: move |_| session.write().open_section(Section::Approvals),
+                        "Review approvals"
+                    }
+                }
+            }
+        }
+    });
+    rsx! {
+        {error_view}
+        {unknown_view}
+        {task_view}
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes as f64 >= MB {
+        format!("{:.1} MB", bytes as f64 / MB)
+    } else {
+        format!("{} KB", bytes.div_ceil(1024))
+    }
+}
+
+#[component]
+fn UpdateBanner(session: Signal<Session>) -> Element {
+    let mut dismissed = use_signal(|| false);
+    let info = session.read().update.info.clone();
+    let Some(info) = info else {
+        return rsx! {};
+    };
+    if dismissed() {
+        return rsx! {};
+    }
+    let version = info.version.to_string();
+    let size = format_size(info.size);
+    let notes = info.notes.clone();
+    let install = info.clone();
+    rsx! {
+        div { class: "banner update",
+            span { strong { "Update v{version} available" } span { class: "muted small", " · {size}" } }
+            div { class: "row",
+                button {
+                    class: "btn primary small",
+                    onclick: move |_| {
+                        if session.write().apply_update(&install).is_ok() {
+                            std::process::exit(0);
+                        }
+                    },
+                    "Install and restart"
+                }
+                button {
+                    class: "btn ghost small",
+                    onclick: move |_| dismissed.set(true),
+                    "Later"
+                }
+            }
+            details {
+                summary { "Release notes" }
+                p { class: "muted small", "{notes}" }
             }
         }
     }
@@ -594,6 +693,12 @@ fn FleetView(session: Signal<Session>) -> Element {
         })
         .collect();
     let bots_empty = bots.is_empty();
+    let mut bot_id = use_signal(String::new);
+    let mut bot_desc = use_signal(String::new);
+    let mut bot_skills = use_signal(String::new);
+    let mut skill_id = use_signal(String::new);
+    let mut skill_desc = use_signal(String::new);
+    let mut skill_body = use_signal(String::new);
     rsx! {
         div { class: "page",
             div { class: "page-head",
@@ -606,6 +711,98 @@ fn FleetView(session: Signal<Session>) -> Element {
                     onclick: move |_| session.write().refresh_bots(),
                     Icon { name: "refresh".to_string() }
                     "Refresh"
+                }
+            }
+            details { class: "card form-card",
+                summary { "New specialist" }
+                div { class: "form-grid",
+                    input {
+                        class: "input",
+                        value: "{bot_id}",
+                        placeholder: "bot id (lowercase slug)",
+                        oninput: move |event| bot_id.set(event.value()),
+                    }
+                    input {
+                        class: "input",
+                        value: "{bot_skills}",
+                        placeholder: "skills: ask, notes",
+                        oninput: move |event| bot_skills.set(event.value()),
+                    }
+                }
+                textarea {
+                    class: "input",
+                    value: "{bot_desc}",
+                    placeholder: "What this specialist is for",
+                    oninput: move |event| bot_desc.set(event.value()),
+                }
+                details {
+                    summary { class: "muted small", "Tools" }
+                    div { class: "tool-grid",
+                        for (index, name) in SPECIALIST_TOOLS.iter().enumerate() {
+                            label { key: "{index}",
+                                input {
+                                    "type": "checkbox",
+                                    checked: session.read().fleet.bot_tools.get(index).copied().unwrap_or(false),
+                                    onchange: move |event| {
+                                        if let Some(flag) = session.write().fleet.bot_tools.get_mut(index) {
+                                            *flag = event.checked();
+                                        }
+                                    },
+                                }
+                                "{name}"
+                            }
+                        }
+                    }
+                }
+                button {
+                    class: "btn primary",
+                    onclick: move |_| {
+                        match parse_skill_list(&bot_skills()) {
+                            Ok(skills) => {
+                                let tools = session.read().selected_tools();
+                                session.write().create_bot(bot_id(), bot_desc(), tools, skills);
+                                bot_id.set(String::new());
+                                bot_desc.set(String::new());
+                                bot_skills.set(String::new());
+                            }
+                            Err(error) => session.write().state.error = Some(error.to_string()),
+                        }
+                    },
+                    "Create disabled bot"
+                }
+                p { class: "muted small", "The bot stays disabled until serabot.service restarts." }
+            }
+            details { class: "card form-card",
+                summary { "New skill pack" }
+                div { class: "form-grid",
+                    input {
+                        class: "input",
+                        value: "{skill_id}",
+                        placeholder: "skill id",
+                        oninput: move |event| skill_id.set(event.value()),
+                    }
+                    input {
+                        class: "input",
+                        value: "{skill_desc}",
+                        placeholder: "One-line description",
+                        oninput: move |event| skill_desc.set(event.value()),
+                    }
+                }
+                textarea {
+                    class: "input",
+                    value: "{skill_body}",
+                    placeholder: "Optional markdown body",
+                    oninput: move |event| skill_body.set(event.value()),
+                }
+                button {
+                    class: "btn primary",
+                    onclick: move |_| {
+                        session.write().create_skill(skill_id(), skill_desc(), skill_body());
+                        skill_id.set(String::new());
+                        skill_desc.set(String::new());
+                        skill_body.set(String::new());
+                    },
+                    "Create skill"
                 }
             }
             div { class: "cards",
