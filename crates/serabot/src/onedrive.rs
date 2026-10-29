@@ -238,20 +238,6 @@ impl OneDriveClient {
         Ok(self)
     }
 
-    /// Upload `bytes` as `filename` below `base_folder` (and `subfolder`).
-    ///
-    /// `filename` is sanitized: directory components, control characters, and
-    /// characters OneDrive rejects are removed or replaced. `subfolder` is
-    /// relative to `base_folder` and is validated as a folder path.
-    ///
-    /// The destination folder (including the base folder) is created when
-    /// missing. Files below `SMALL_UPLOAD_LIMIT` use a single PUT; larger
-    /// files use an upload session with 5 MiB chunks. `mime` is sent as
-    /// `Content-Type` on the single-request path; upload sessions let Graph
-    /// infer the type from the file extension.
-    ///
-    /// Errors after a mutating request was dispatched may carry "outcome
-    /// unknown": the artifact may or may not have been stored.
     /// List children of `base_folder` (or `base_folder/subfolder` when set).
     ///
     /// Pagination is capped at `max_pages` (clamped to `LIST_MAX_PAGES_CAP`); each
@@ -313,6 +299,20 @@ impl OneDriveClient {
         Ok(ListFolderResult { items, truncated })
     }
 
+    /// Upload `bytes` as `filename` below `base_folder` (and `subfolder`).
+    ///
+    /// `filename` is sanitized: directory components, control characters, and
+    /// characters OneDrive rejects are removed or replaced. `subfolder` is
+    /// relative to `base_folder` and is validated as a folder path.
+    ///
+    /// The destination folder (including the base folder) is created when
+    /// missing. Files below `SMALL_UPLOAD_LIMIT` use a single PUT; larger
+    /// files use an upload session with 5 MiB chunks. `mime` is sent as
+    /// `Content-Type` on the single-request path; upload sessions let Graph
+    /// infer the type from the file extension.
+    ///
+    /// Errors after a mutating request was dispatched may carry "outcome
+    /// unknown": the artifact may or may not have been stored.
     pub async fn upload(
         &mut self,
         filename: &str,
