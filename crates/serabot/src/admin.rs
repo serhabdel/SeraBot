@@ -104,6 +104,7 @@ impl AdminOverlay {
 pub struct AdminStore {
     path: PathBuf,
     overlay: Arc<Mutex<AdminOverlay>>,
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl AdminStore {
@@ -113,6 +114,7 @@ impl AdminStore {
         Ok(Self {
             path,
             overlay: Arc::new(Mutex::new(overlay)),
+            write_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -223,13 +225,13 @@ impl AdminStore {
     }
 
     pub fn remove_provider(&self, id: &str) -> Result<()> {
-        let mut next = self.snapshot();
-        if next.providers.remove(id).is_none() {
-            return Err(SeraError::NotFound(format!("managed provider {id}")));
-        }
-        self.write(&next)?;
-        self.replace(next);
-        Ok(())
+        self.mutate(|overlay| {
+            overlay
+                .providers
+                .remove(id)
+                .map(|_| ())
+                .ok_or_else(|| SeraError::NotFound(format!("managed provider {id}")))
+        })
     }
 
     pub fn set_connector(
@@ -274,11 +276,10 @@ impl AdminStore {
             }
         }
 
-        let mut next = self.snapshot();
-        next.connectors.insert(id.to_owned(), enabled);
-        self.write(&next)?;
-        self.replace(next);
-        Ok(())
+        self.mutate(|overlay| {
+            overlay.connectors.insert(id.to_owned(), enabled);
+            Ok(())
+        })
     }
 
     pub fn set_audio(
@@ -316,15 +317,14 @@ impl AdminStore {
             )));
         }
 
-        let mut next = self.snapshot();
-        next.audio = Some(AudioOverlay {
-            enabled,
-            transcription_model: candidate.audio.transcription_model,
-            understanding_model: candidate.audio.understanding_model,
-        });
-        self.write(&next)?;
-        self.replace(next);
-        Ok(())
+        self.mutate(|overlay| {
+            overlay.audio = Some(AudioOverlay {
+                enabled,
+                transcription_model: candidate.audio.transcription_model,
+                understanding_model: candidate.audio.understanding_model,
+            });
+            Ok(())
+        })
     }
 
     pub fn connector_roles(&self, base: &Config, id: &str) -> Result<Vec<(&'static str, String)>> {
@@ -339,11 +339,24 @@ impl AdminStore {
     }
 
     fn save_provider(&self, id: &str, profile: ProviderConfig) -> Result<()> {
+        self.mutate(|overlay| {
+            overlay.providers.insert(id.to_owned(), profile);
+            Ok(())
+        })
+    }
+
+    /// Serialize read-modify-write cycles so two consoles cannot drop each
+    /// other's change. The file is only replaced after a successful write.
+    fn mutate<T>(&self, update: impl FnOnce(&mut AdminOverlay) -> Result<T>) -> Result<T> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut next = self.snapshot();
-        next.providers.insert(id.to_owned(), profile);
+        let value = update(&mut next)?;
         self.write(&next)?;
         self.replace(next);
-        Ok(())
+        Ok(value)
     }
 
     fn replace(&self, next: AdminOverlay) {
