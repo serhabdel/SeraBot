@@ -24,10 +24,12 @@
 //!
 //! # Secrets
 //!
-//! The refresh token is supplied already decrypted by the caller and is kept
-//! in memory only; it is never persisted and never logged. Access tokens are
-//! cached in memory until shortly before expiry. `Debug` output redacts both
-//! tokens and the client id.
+//! The refresh token is supplied already decrypted by the caller. When the
+//! token endpoint returns a different refresh token, that value is written
+//! back to the age store. If an access-token secret name was configured, the
+//! new access token is written in the same update. A failed write fails the
+//! call. Tokens are never logged. Access tokens otherwise stay in memory until
+//! shortly before expiry. `Debug` output redacts tokens and the client id.
 //!
 //! # Outcome semantics
 //!
@@ -48,7 +50,9 @@ use tokio::sync::Mutex;
 use tracing::debug;
 use url::Url;
 
+use crate::config::valid_secret_name;
 use crate::error::{Result, SeraError};
+use crate::secrets::SharedSecrets;
 use crate::util::sha256_hex;
 
 /// Files smaller than this use a single `PUT .../content` request.
@@ -146,14 +150,24 @@ struct TokenState {
     access_token: Option<String>,
     refresh_token: String,
     expires_at: Option<Instant>,
+    /// A new refresh token (and access token, when named) is not in the age store yet.
+    refresh_unpersisted: bool,
+}
+
+struct RefreshPersistence {
+    secrets: SharedSecrets,
+    refresh_secret_name: String,
+    access_secret_name: String,
 }
 
 /// Microsoft Graph OneDrive client for approved artifacts.
 ///
-/// Construct from already-decrypted values; this type never touches the secret
-/// store. Share it only through an owner that serializes `&mut self` calls, or
-/// wrap it in a mutex. Token refreshes are serialized internally so a shared
-/// client cannot stampede the token endpoint.
+/// Construct from already-decrypted values. Rotated credentials are written
+/// back only after [`Self::with_refresh_persistence`]. A new refresh token
+/// without that writer, or a failed store write, fails the call. Share the
+/// client through an owner that serializes `&mut self` calls, or wrap it in a
+/// mutex. Token refreshes are serialized internally so a shared client cannot
+/// stampede the token endpoint.
 pub struct OneDriveClient {
     http: reqwest::Client,
     graph_base: String,
@@ -162,6 +176,7 @@ pub struct OneDriveClient {
     base_folder: String,
     conflict_behavior: ConflictBehavior,
     tokens: Mutex<TokenState>,
+    persistence: Option<RefreshPersistence>,
 }
 
 impl fmt::Debug for OneDriveClient {
@@ -221,7 +236,40 @@ impl OneDriveClient {
                 refresh_token,
                 ..TokenState::default()
             }),
+            persistence: None,
         })
+    }
+
+    /// Write rotated refresh tokens back to the age store.
+    ///
+    /// `access_secret_name` is included in the same write when it is set.
+    /// OneDrive has no access-token secret, so production passes `None` and
+    /// only the refresh token is persisted.
+    pub fn with_refresh_persistence(
+        mut self,
+        secrets: SharedSecrets,
+        refresh_secret_name: impl Into<String>,
+        access_secret_name: Option<&str>,
+    ) -> Result<Self> {
+        let refresh_secret_name = refresh_secret_name.into();
+        let refresh_secret_name = refresh_secret_name.trim();
+        if !valid_secret_name(refresh_secret_name) {
+            return Err(SeraError::Config(
+                "onedrive refresh secret name is missing or invalid".into(),
+            ));
+        }
+        let access_secret_name = access_secret_name.unwrap_or("").trim();
+        if !access_secret_name.is_empty() && !valid_secret_name(access_secret_name) {
+            return Err(SeraError::Config(
+                "onedrive access secret name is invalid".into(),
+            ));
+        }
+        self.persistence = Some(RefreshPersistence {
+            secrets,
+            refresh_secret_name: refresh_secret_name.to_owned(),
+            access_secret_name: access_secret_name.to_owned(),
+        });
+        Ok(self)
     }
 
     /// Override the token endpoint. Intended for tests; HTTPS (or loopback
@@ -341,8 +389,16 @@ impl OneDriveClient {
 
     /// Return a cached access token, refreshing it when it is missing or
     /// within `REFRESH_SKEW` of expiry.
+    ///
+    /// A refresh token that differs from the one already held is written to
+    /// the age store before the access token is returned. The call fails if
+    /// that write fails, and the rotated token stays in memory for a retry.
     async fn access_token(&self) -> Result<String> {
         let mut state = self.tokens.lock().await;
+        if state.refresh_unpersisted {
+            self.persist_rotated(&state)?;
+            state.refresh_unpersisted = false;
+        }
 
         if let (Some(token), Some(expires_at)) = (state.access_token.as_deref(), state.expires_at) {
             if Instant::now() + REFRESH_SKEW < expires_at {
@@ -408,17 +464,64 @@ impl OneDriveClient {
             ));
         }
 
+        let rotated = match token.refresh_token {
+            Some(refresh_token) if !refresh_token.is_empty() => {
+                if !is_plausible_token(&refresh_token) {
+                    return Err(SeraError::External(
+                        "OneDrive token refresh returned an invalid refresh token".into(),
+                    ));
+                }
+                Some(refresh_token)
+            }
+            _ => None,
+        };
+
         let ttl = token.expires_in.unwrap_or(3600).clamp(1, 24 * 60 * 60);
         state.access_token = Some(access_token.clone());
         state.expires_at = Some(Instant::now() + Duration::from_secs(ttl));
-        // Token rotation: keep the new refresh token when the service returns
-        // one; otherwise the existing token remains valid.
-        if let Some(refresh_token) = token.refresh_token.filter(|value| !value.is_empty()) {
-            state.refresh_token = refresh_token;
+        if let Some(refresh_token) = rotated {
+            if refresh_token != current_refresh_token {
+                state.refresh_token = refresh_token;
+                state.refresh_unpersisted = true;
+            }
+        }
+        if state.refresh_unpersisted {
+            self.persist_rotated(&state)?;
+            state.refresh_unpersisted = false;
         }
         debug!(expires_in = ttl, "refreshed OneDrive access token");
 
         Ok(access_token)
+    }
+
+    fn persist_rotated(&self, state: &TokenState) -> Result<()> {
+        let Some(persistence) = &self.persistence else {
+            return Err(SeraError::Secrets(
+                "OneDrive rotated refresh token was not persisted".into(),
+            ));
+        };
+        let refresh = state.refresh_token.as_str();
+        if refresh.is_empty() {
+            return Err(SeraError::Secrets(
+                "OneDrive rotated refresh token was not persisted".into(),
+            ));
+        }
+        let access = state.access_token.as_deref().unwrap_or("");
+        let mut updates = vec![(persistence.refresh_secret_name.as_str(), refresh)];
+        if !persistence.access_secret_name.is_empty()
+            && persistence.access_secret_name != persistence.refresh_secret_name
+        {
+            if access.is_empty() {
+                return Err(SeraError::Secrets(
+                    "OneDrive rotated refresh token was not persisted".into(),
+                ));
+            }
+            updates.push((persistence.access_secret_name.as_str(), access));
+        }
+        persistence
+            .secrets
+            .persist(&updates)
+            .map_err(|error| redact_persist_error(error, &[refresh, access]))
     }
 
     /// Single-request upload for files below `SMALL_UPLOAD_LIMIT`.
@@ -631,7 +734,10 @@ impl OneDriveClient {
     async fn folder_exists(&self, encoded_path: &str) -> Result<bool> {
         let token = self.access_token().await?;
         let url = format!("{}/me/drive/root:/{}", self.graph_base, encoded_path);
-        match self.graph_get_with_retries(&url, &token, "folder lookup").await {
+        match self
+            .graph_get_with_retries(&url, &token, "folder lookup")
+            .await
+        {
             Ok(response) if response.status().is_success() => Ok(true),
             Ok(response) if response.status() == StatusCode::NOT_FOUND => Ok(false),
             Ok(response) => Err(graph_error(response, "folder lookup").await),
@@ -975,6 +1081,18 @@ fn sanitize_code(value: &str) -> String {
     }
 }
 
+fn redact_persist_error(error: SeraError, secrets: &[&str]) -> SeraError {
+    let message = error.to_string();
+    if secrets
+        .iter()
+        .any(|secret| secret.len() >= 8 && message.contains(secret))
+    {
+        SeraError::Secrets("OneDrive rotated refresh token was not persisted".into())
+    } else {
+        error
+    }
+}
+
 fn is_plausible_token(token: &str) -> bool {
     token.len() <= 16 * 1024 && !token.chars().any(|c| c.is_control() || c.is_whitespace())
 }
@@ -1192,8 +1310,8 @@ fn display_folder_path(folders: &[String]) -> String {
 /// Graph pagination links must stay on the configured Graph host.
 fn validate_pagination_url(url: &str, graph_base: &str) -> Result<String> {
     let url = validate_endpoint(url, "pagination", true)?;
-    let parsed =
-        Url::parse(&url).map_err(|_| SeraError::External("invalid OneDrive pagination URL".into()))?;
+    let parsed = Url::parse(&url)
+        .map_err(|_| SeraError::External("invalid OneDrive pagination URL".into()))?;
     let base = Url::parse(graph_base)
         .map_err(|_| SeraError::Config("graph_base is not a valid URL".into()))?;
     if parsed.host() != base.host() {
@@ -1213,7 +1331,10 @@ fn range_start(value: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use crate::secrets::{SecretStore, SharedSecrets, ensure_identity};
     use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
@@ -1260,6 +1381,51 @@ mod tests {
             .set_token_url(format!("{}/token", server.uri()))
             .unwrap();
         client
+    }
+
+    fn age_store(
+        pairs: &[(&str, &str)],
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        SharedSecrets,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = dir.path().join("identity.txt");
+        let path = dir.path().join("secrets.age");
+        ensure_identity(&identity).unwrap();
+        let mut store = SecretStore::open_paths(&path, &identity).unwrap();
+        for (name, value) in pairs {
+            store.set(name, value).unwrap();
+        }
+        store.save().unwrap();
+        let secrets = SharedSecrets::new(SecretStore::open_paths(&path, &identity).unwrap());
+        (dir, identity, path, secrets)
+    }
+
+    fn client_with_refresh(
+        server: &MockServer,
+        refresh: &str,
+        secrets: SharedSecrets,
+        access_secret_name: Option<&str>,
+    ) -> OneDriveClient {
+        let mut client = OneDriveClient::new(
+            reqwest::Client::new(),
+            format!("{}/v1.0", server.uri()),
+            "contoso.example".into(),
+            "client-id-value".into(),
+            refresh.into(),
+            "SeraBot".into(),
+            "rename".into(),
+        )
+        .unwrap();
+        client
+            .set_token_url(format!("{}/token", server.uri()))
+            .unwrap();
+        client
+            .with_refresh_persistence(secrets, "onedrive_refresh_token", access_secret_name)
+            .unwrap()
     }
 
     async fn mount_token(
@@ -1343,10 +1509,7 @@ mod tests {
             .await;
 
         let client = test_client(&server);
-        let result = client
-            .list_folder(Some("Deliverables"), 5)
-            .await
-            .unwrap();
+        let result = client.list_folder(Some("Deliverables"), 5).await.unwrap();
 
         assert_eq!(result.items.len(), 2);
         assert!(!result.truncated);
@@ -1380,7 +1543,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut client = test_client(&server);
+        let (_dir, _identity, _path, secrets) = age_store(&[
+            ("onedrive_refresh_token", "refresh-1"),
+            ("other_secret", "other-value"),
+        ]);
+        let mut client = test_client(&server)
+            .with_refresh_persistence(secrets.clone(), "onedrive_refresh_token", None)
+            .unwrap();
         let result = client
             .upload("report.pdf", bytes.clone(), "application/pdf", None)
             .await
@@ -1392,6 +1561,11 @@ mod tests {
         assert_eq!(result.path, "/SeraBot/report.pdf");
         assert_eq!(result.size, bytes.len() as u64);
         assert_eq!(result.sha256, sha256);
+        assert_eq!(
+            secrets.get("onedrive_refresh_token").as_deref(),
+            Some("refresh-2")
+        );
+        assert_eq!(secrets.get("other_secret").as_deref(), Some("other-value"));
         server.verify().await;
     }
 
@@ -1759,15 +1933,23 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut client = test_client(&server);
-        client
-            .upload("report.pdf", b"payload".to_vec(), "application/pdf", None)
-            .await
+        let (_dir, _identity, _path, secrets) =
+            age_store(&[("onedrive_refresh_token", "refresh-1")]);
+        let mut client = test_client(&server)
+            .with_refresh_persistence(secrets.clone(), "onedrive_refresh_token", None)
             .unwrap();
         client
             .upload("report.pdf", b"payload".to_vec(), "application/pdf", None)
             .await
             .unwrap();
+        client
+            .upload("report.pdf", b"payload".to_vec(), "application/pdf", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            secrets.get("onedrive_refresh_token").as_deref(),
+            Some("refresh-2")
+        );
         server.verify().await;
     }
 
@@ -1824,11 +2006,26 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut client = test_client(&server);
+        let (_dir, _identity, path, secrets) = age_store(&[
+            ("onedrive_refresh_token", "refresh-1"),
+            ("other_secret", "other-value"),
+        ]);
+        let mut client = test_client(&server)
+            .with_refresh_persistence(secrets.clone(), "onedrive_refresh_token", None)
+            .unwrap();
         client
             .upload("report.pdf", b"payload".to_vec(), "application/pdf", None)
             .await
             .unwrap();
+        assert_eq!(
+            secrets.get("onedrive_refresh_token").as_deref(),
+            Some("refresh-3")
+        );
+        assert_eq!(secrets.get("other_secret").as_deref(), Some("other-value"));
+        let raw = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+        for secret in ["refresh-1", "refresh-2", "refresh-3", "other-value"] {
+            assert!(!raw.contains(secret), "{secret}");
+        }
         server.verify().await;
     }
 
@@ -1861,7 +2058,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let mut client = test_client(&server);
+        let secrets = SharedSecrets::new(SecretStore::from_map(BTreeMap::from([(
+            "onedrive_refresh_token".into(),
+            "refresh-1".into(),
+        )])));
+        let mut client = test_client(&server)
+            .with_refresh_persistence(secrets.clone(), "onedrive_refresh_token", None)
+            .unwrap();
         client
             .upload("report.pdf", b"payload".to_vec(), "application/pdf", None)
             .await
@@ -1870,7 +2073,12 @@ mod tests {
         let state = client.tokens.lock().await;
         assert_eq!(state.refresh_token, "refresh-1");
         assert_eq!(state.access_token.as_deref(), Some("access-1"));
+        assert!(!state.refresh_unpersisted);
         drop(state);
+        assert_eq!(
+            secrets.get("onedrive_refresh_token").as_deref(),
+            Some("refresh-1")
+        );
         server.verify().await;
     }
 
@@ -1901,6 +2109,261 @@ mod tests {
         assert!(!debug.contains("access-secret"));
         assert!(!debug.contains("client-1"));
         assert!(debug.contains("SeraBot"));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn rotated_refresh_and_access_tokens_are_written_to_the_age_store() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(BodyContains("refresh_token=refresh-old-value"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-new-value",
+                "refresh_token": "refresh-new-value",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, _identity, path, secrets) = age_store(&[
+            ("onedrive_refresh_token", "refresh-old-value"),
+            ("onedrive_access_token", "access-old-value"),
+            ("other_secret", "other-value"),
+        ]);
+        let client = client_with_refresh(
+            &server,
+            "refresh-old-value",
+            secrets.clone(),
+            Some("onedrive_access_token"),
+        );
+        assert_eq!(client.access_token().await.unwrap(), "access-new-value");
+        assert_eq!(client.access_token().await.unwrap(), "access-new-value");
+        assert_eq!(
+            secrets.get("onedrive_refresh_token").as_deref(),
+            Some("refresh-new-value")
+        );
+        assert_eq!(
+            secrets.get("onedrive_access_token").as_deref(),
+            Some("access-new-value")
+        );
+        assert_eq!(secrets.get("other_secret").as_deref(), Some("other-value"));
+        let raw = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+        for secret in [
+            "refresh-new-value",
+            "refresh-old-value",
+            "access-new-value",
+            "access-old-value",
+            "other-value",
+            "client-id-value",
+        ] {
+            assert!(!raw.contains(secret), "{secret}");
+        }
+        let rendered = format!("{client:?}");
+        assert!(!rendered.contains("refresh-new-value"));
+        assert!(!rendered.contains("access-new-value"));
+        assert!(!rendered.contains("client-id-value"));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn refresh_only_persistence_does_not_invent_an_access_secret() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(BodyContains("refresh_token=refresh-old-value"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-new-value",
+                "refresh_token": "refresh-new-value",
+                "expires_in": 3600,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, _identity, path, secrets) = age_store(&[
+            ("onedrive_refresh_token", "refresh-old-value"),
+            ("other_secret", "other-value"),
+        ]);
+        let client = client_with_refresh(&server, "refresh-old-value", secrets.clone(), None);
+        assert_eq!(client.access_token().await.unwrap(), "access-new-value");
+        assert_eq!(
+            secrets.get("onedrive_refresh_token").as_deref(),
+            Some("refresh-new-value")
+        );
+        assert_eq!(secrets.get("onedrive_access_token"), None);
+        assert_eq!(secrets.get("other_secret").as_deref(), Some("other-value"));
+        let raw = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+        assert!(!raw.contains("refresh-new-value"));
+        assert!(!raw.contains("access-new-value"));
+        assert!(!raw.contains("other-value"));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn store_write_failure_fails_closed_and_keeps_the_rotated_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(BodyContains("refresh_token=refresh-old-value"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-new-value",
+                "refresh_token": "refresh-new-value",
+                "expires_in": 3600,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, identity, path, secrets) = age_store(&[
+            ("onedrive_refresh_token", "refresh-old-value"),
+            ("onedrive_access_token", "access-old-value"),
+            ("other_secret", "other-value"),
+        ]);
+        let backup = std::fs::read(&identity).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        std::fs::write(&identity, "not-an-identity").unwrap();
+        let client = client_with_refresh(
+            &server,
+            "refresh-old-value",
+            secrets.clone(),
+            Some("onedrive_access_token"),
+        );
+        let error = client.access_token().await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("identity") || message.contains("not persisted"),
+            "{message}"
+        );
+        for secret in [
+            "refresh-old-value",
+            "refresh-new-value",
+            "access-old-value",
+            "access-new-value",
+            "client-id-value",
+            "other-value",
+        ] {
+            assert!(!message.contains(secret), "{message}");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        {
+            let state = client.tokens.lock().await;
+            assert_eq!(state.refresh_token, "refresh-new-value");
+            assert_eq!(state.access_token.as_deref(), Some("access-new-value"));
+            assert!(state.refresh_unpersisted);
+        }
+        assert_eq!(
+            secrets.get("onedrive_refresh_token").as_deref(),
+            Some("refresh-old-value")
+        );
+        assert_eq!(
+            secrets.get("onedrive_access_token").as_deref(),
+            Some("access-old-value")
+        );
+
+        std::fs::write(&identity, backup).unwrap();
+        assert_eq!(client.access_token().await.unwrap(), "access-new-value");
+        assert_eq!(
+            secrets.get("onedrive_refresh_token").as_deref(),
+            Some("refresh-new-value")
+        );
+        assert_eq!(
+            secrets.get("onedrive_access_token").as_deref(),
+            Some("access-new-value")
+        );
+        assert_eq!(secrets.get("other_secret").as_deref(), Some("other-value"));
+        let raw = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+        assert!(!raw.contains("refresh-new-value"));
+        assert!(!raw.contains("access-new-value"));
+        assert!(!raw.contains("other-value"));
+        {
+            let state = client.tokens.lock().await;
+            assert!(!state.refresh_unpersisted);
+        }
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn rotation_without_a_secret_store_fails_closed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(BodyContains("refresh_token=refresh-old-value"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-new-value",
+                "refresh_token": "refresh-new-value",
+                "expires_in": 3600,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut client = OneDriveClient::new(
+            reqwest::Client::new(),
+            format!("{}/v1.0", server.uri()),
+            "contoso.example".into(),
+            "client-id-value".into(),
+            "refresh-old-value".into(),
+            "SeraBot".into(),
+            "rename".into(),
+        )
+        .unwrap();
+        client
+            .set_token_url(format!("{}/token", server.uri()))
+            .unwrap();
+        let error = client.access_token().await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("not persisted"), "{message}");
+        for secret in [
+            "refresh-old-value",
+            "refresh-new-value",
+            "access-new-value",
+            "client-id-value",
+        ] {
+            assert!(!message.contains(secret), "{message}");
+        }
+        {
+            let state = client.tokens.lock().await;
+            assert_eq!(state.refresh_token, "refresh-new-value");
+            assert!(state.refresh_unpersisted);
+        }
+        let again = client.access_token().await.unwrap_err();
+        assert!(!again.to_string().contains("refresh-new-value"));
+        assert!(!again.to_string().contains("access-new-value"));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn repeated_refresh_token_does_not_rewrite_the_store() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(BodyContains("refresh_token=refresh-old-value"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-new-value",
+                "refresh_token": "refresh-old-value",
+                "expires_in": 3600,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let secrets = SharedSecrets::new(SecretStore::from_map(BTreeMap::from([
+            ("onedrive_refresh_token".into(), "refresh-old-value".into()),
+            ("onedrive_access_token".into(), "access-old-value".into()),
+        ])));
+        let client = client_with_refresh(
+            &server,
+            "refresh-old-value",
+            secrets.clone(),
+            Some("onedrive_access_token"),
+        );
+        assert_eq!(client.access_token().await.unwrap(), "access-new-value");
+        assert_eq!(
+            secrets.get("onedrive_refresh_token").as_deref(),
+            Some("refresh-old-value")
+        );
+        assert_eq!(
+            secrets.get("onedrive_access_token").as_deref(),
+            Some("access-old-value")
+        );
         server.verify().await;
     }
 

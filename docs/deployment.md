@@ -113,7 +113,9 @@ service; native Graph is an additive path through the gateway.
 Keep `[onedrive].enabled = false` until both secrets exist in the SeraBot age
 store. Align `[onedrive].tenant` with the MCP authority (`consumers` for personal
 OneDrive). Secret names default to `onedrive_client_id` and
-`onedrive_refresh_token`.
+`onedrive_refresh_token`. When Microsoft rotates the refresh token, SeraBot
+writes the new value back to `onedrive_refresh_token` and fails the call if
+that write fails. Access tokens stay in memory.
 
 On the VPS (as a user who can read the MCP env, never paste values into chat):
 

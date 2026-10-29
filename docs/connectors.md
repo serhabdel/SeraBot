@@ -14,8 +14,9 @@ records the API origin as the destination.
 
 There is no loopback OAuth callback server. Authorization URL construction and
 token exchange (authorization-code and refresh-token grants) are implemented
-so an owner can finish login later. Rotated refresh tokens stay in process
-memory and are not written back to the secret store.
+so an owner can finish login later. A refresh token from either grant is
+written to that connector's configured age-store key. A failed write fails
+the call. Token values are not logged.
 
 `redirect_uri`, when set, must be `http://127.0.0.1:<port>/<path>` or
 `http://localhost:<port>/<path>` with no query, fragment, or credentials.

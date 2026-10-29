@@ -572,6 +572,11 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             refresh_token.to_owned(),
             config.onedrive.folder.clone(),
             config.onedrive.conflict_behavior.clone(),
+        )?
+        .with_refresh_persistence(
+            secrets.clone(),
+            config.onedrive.refresh_token_secret.clone(),
+            None,
         )?;
         let client = Arc::new(Mutex::new(client));
         registry.register(OneDriveUploadTool::new(

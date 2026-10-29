@@ -8,9 +8,10 @@
 //! - read tools fail closed until a refresh token is stored
 //! - reads are approval-gated once a refresh token is present
 //!
-//! AgentMail is a native HTTPS client. A refresh that returns a new
-//! `refresh_token` is written back to the age store; a failed write fails the
-//! read so the owner sees it. Authorization-code exchange still stays in memory.
+//! AgentMail is a native HTTPS client. A new `refresh_token` from either the
+//! refresh grant or the authorization-code grant is written to the configured
+//! age-store key immediately. A failed write fails the call. Token values are
+//! never logged.
 
 use std::fmt;
 use std::sync::Arc;
@@ -536,7 +537,8 @@ impl OAuthClient {
         Ok(rendered)
     }
 
-    /// Authorization-code grant. The caller keeps the verifier; nothing is written to the secret store.
+    /// Authorization-code grant. The caller keeps the verifier. A refresh token
+    /// in the response is written to the configured secret key before this returns.
     #[cfg_attr(not(test), allow(dead_code))]
     async fn exchange_authorization_code(
         &self,
@@ -572,8 +574,7 @@ impl OAuthClient {
                 verifier,
             })
             .await?;
-        self.store_token(payload).await;
-        Ok(())
+        self.store_token(payload).await
     }
 
     async fn execute_read(&self, args: &Value) -> Result<Value> {
@@ -763,9 +764,19 @@ impl OAuthClient {
             .map_err(|error| redact_persist_error(error, self.kind.section(), refresh))
     }
 
-    async fn store_token(&self, payload: TokenPayload) {
+    async fn store_token(&self, payload: TokenPayload) -> Result<()> {
         let mut memory = self.memory.lock().await;
+        let changed = payload
+            .refresh_token
+            .as_deref()
+            .is_some_and(|value| memory.refresh_token.as_deref() != Some(value));
         store_token_in(&mut memory, payload);
+        if changed {
+            memory.refresh_unpersisted = true;
+            self.persist_rotated_refresh(&memory)?;
+            memory.refresh_unpersisted = false;
+        }
+        Ok(())
     }
 
     async fn request_token(&self, grant: TokenGrant) -> Result<TokenPayload> {
@@ -1864,18 +1875,22 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let client = test_client(
-            ConnectorKind::Notion,
-            None,
-            "http://127.0.0.1:8765/callback",
-            &format!("{}/authorize", server.uri()),
-            &format!("{}/token", server.uri()),
-            &server.uri(),
-        );
+        let (_dir, _identity, path, secrets) = age_store(&[("other_secret", "other-value")]);
+        let client = exchange_client(ConnectorKind::Notion, &server, Some(secrets.clone()));
         client
             .exchange_authorization_code("synthetic-code", None)
             .await
             .unwrap();
+        assert_eq!(
+            secrets.get("notion_refresh_token").as_deref(),
+            Some("rotated-refresh-value")
+        );
+        assert_eq!(secrets.get("other_secret").as_deref(), Some("other-value"));
+        let raw = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+        assert!(!raw.contains("rotated-refresh-value"));
+        assert!(!raw.contains("access-token-value"));
+        assert!(!raw.contains("other-value"));
+        assert!(!raw.contains("client-secret-value"));
         let rendered = format!("{client:?}");
         assert!(!rendered.contains("client-secret-value"));
         assert!(!rendered.contains("rotated-refresh-value"));
@@ -2224,5 +2239,213 @@ mod tests {
             memory,
         );
         assert_eq!(client.access_token().await.unwrap(), "access-new-value");
+    }
+
+    fn exchange_client(
+        kind: ConnectorKind,
+        server: &MockServer,
+        secrets: Option<SharedSecrets>,
+    ) -> OAuthClient {
+        OAuthClient::new(OAuthClientParts {
+            http: http(),
+            kind,
+            client_id: "client-id-value".into(),
+            client_secret: "client-secret-value".into(),
+            refresh_token: None,
+            redirect_uri: "http://127.0.0.1:8765/callback".into(),
+            refresh_secret_name: format!("{}_refresh_token", kind.section()),
+            secrets,
+            allow_loopback: true,
+            authorize_url: format!("{}/authorize", server.uri()),
+            token_url: format!("{}/token", server.uri()),
+            api_base: server.uri(),
+        })
+        .unwrap()
+    }
+
+    fn code_verifier_for(kind: ConnectorKind) -> Option<String> {
+        match kind.provider() {
+            OAuthProvider::Notion => None,
+            OAuthProvider::Google | OAuthProvider::Microsoft => Some(pkce_s256().0),
+        }
+    }
+
+    #[tokio::test]
+    async fn authorization_code_exchange_persists_the_first_refresh_token() {
+        let kinds = [
+            ConnectorKind::GoogleDrive,
+            ConnectorKind::GoogleSheets,
+            ConnectorKind::GoogleCalendar,
+            ConnectorKind::Gmail,
+            ConnectorKind::OutlookMail,
+            ConnectorKind::OutlookCalendar,
+            ConnectorKind::Notion,
+        ];
+        for kind in kinds {
+            let server = MockServer::start().await;
+            let secret_name = format!("{}_refresh_token", kind.section());
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .and(body_string_contains("authorization_code"))
+                .and(body_string_contains("synthetic-code"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "access_token": "access-new-value",
+                    "refresh_token": "refresh-first-value",
+                    "expires_in": 3600,
+                    "token_type": "Bearer"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (_dir, _identity, path, secrets) = age_store(&[("other_secret", "other-value")]);
+            let verifier = code_verifier_for(kind);
+            let client = exchange_client(kind, &server, Some(secrets.clone()));
+            client
+                .exchange_authorization_code("synthetic-code", verifier.as_deref())
+                .await
+                .unwrap();
+            assert_eq!(
+                secrets.get(&secret_name).as_deref(),
+                Some("refresh-first-value"),
+                "{}",
+                kind.section()
+            );
+            assert_eq!(secrets.get("other_secret").as_deref(), Some("other-value"));
+            assert!(secrets.get("access_token").is_none());
+            let raw = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+            for secret in [
+                "refresh-first-value",
+                "access-new-value",
+                "other-value",
+                "client-secret-value",
+                "synthetic-code",
+            ] {
+                assert!(!raw.contains(secret), "{} {secret}", kind.section());
+            }
+            let rendered = format!("{client:?}");
+            assert!(!rendered.contains("refresh-first-value"));
+            assert!(!rendered.contains("access-new-value"));
+        }
+    }
+
+    #[tokio::test]
+    async fn code_exchange_without_a_refresh_token_does_not_touch_the_store() {
+        let server = MockServer::start().await;
+        let (verifier, _) = pkce_s256();
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-new-value",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let secrets = SharedSecrets::new(SecretStore::from_map(BTreeMap::from([(
+            "other_secret".into(),
+            "other-value".into(),
+        )])));
+        let client = exchange_client(
+            ConnectorKind::GoogleCalendar,
+            &server,
+            Some(secrets.clone()),
+        );
+        client
+            .exchange_authorization_code("synthetic-code", Some(&verifier))
+            .await
+            .unwrap();
+        assert_eq!(secrets.get("google_calendar_refresh_token"), None);
+        assert_eq!(secrets.get("other_secret").as_deref(), Some("other-value"));
+    }
+
+    #[tokio::test]
+    async fn first_refresh_without_a_writer_fails_closed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-new-value",
+                "refresh_token": "refresh-first-value",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = exchange_client(ConnectorKind::Gmail, &server, None);
+        let error = client
+            .exchange_authorization_code("synthetic-code", Some(&pkce_s256().0))
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("not persisted"), "{message}");
+        assert!(!message.contains("refresh-first-value"), "{message}");
+        assert!(!message.contains("access-new-value"), "{message}");
+        assert!(!message.contains("client-secret-value"), "{message}");
+        assert!(!message.contains("synthetic-code"), "{message}");
+        assert_eq!(
+            client.memory.lock().await.refresh_token.as_deref(),
+            Some("refresh-first-value")
+        );
+        assert!(client.memory.lock().await.refresh_unpersisted);
+    }
+
+    #[tokio::test]
+    async fn first_refresh_store_failure_keeps_the_token_for_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-new-value",
+                "refresh_token": "refresh-first-value",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, identity, path, secrets) = age_store(&[("other_secret", "other-value")]);
+        let backup = std::fs::read(&identity).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        std::fs::write(&identity, "not-an-identity").unwrap();
+        let client = exchange_client(ConnectorKind::OutlookMail, &server, Some(secrets.clone()));
+        let verifier = pkce_s256().0;
+        let error = client
+            .exchange_authorization_code("synthetic-code", Some(&verifier))
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("identity") || message.contains("not persisted"),
+            "{message}"
+        );
+        for secret in [
+            "refresh-first-value",
+            "access-new-value",
+            "client-secret-value",
+            "synthetic-code",
+            "other-value",
+        ] {
+            assert!(!message.contains(secret), "{message}");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(secrets.get("outlook_refresh_token"), None);
+        assert_eq!(
+            client.memory.lock().await.refresh_token.as_deref(),
+            Some("refresh-first-value")
+        );
+        assert!(client.memory.lock().await.refresh_unpersisted);
+
+        std::fs::write(&identity, backup).unwrap();
+        assert_eq!(client.access_token().await.unwrap(), "access-new-value");
+        assert_eq!(
+            secrets.get("outlook_refresh_token").as_deref(),
+            Some("refresh-first-value")
+        );
+        assert_eq!(secrets.get("other_secret").as_deref(), Some("other-value"));
+        let raw = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+        assert!(!raw.contains("refresh-first-value"));
+        assert!(!raw.contains("access-new-value"));
+        assert!(!raw.contains("other-value"));
+        assert!(!client.memory.lock().await.refresh_unpersisted);
+        server.verify().await;
     }
 }
