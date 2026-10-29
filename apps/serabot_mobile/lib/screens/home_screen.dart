@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 
 import '../session.dart';
+import '../validation.dart';
 import 'approvals_tab.dart';
 import 'chat_tab.dart';
+import 'fleet_tab.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key, required this.session, required this.onDisconnect});
@@ -44,6 +46,16 @@ class _HomeScreenState extends State<HomeScreen> {
         children: [
           ChatTab(session: widget.session),
           ApprovalsTab(session: widget.session),
+          FleetTab(
+            session: widget.session,
+            onUseInChat: (id) {
+              if (!validId(id)) {
+                return;
+              }
+              widget.session.setConversationId(id);
+              setState(() => _index = 0);
+            },
+          ),
         ],
       ),
       bottomNavigationBar: NavigationBar(
@@ -52,6 +64,7 @@ class _HomeScreenState extends State<HomeScreen> {
         destinations: const [
           NavigationDestination(icon: Icon(Icons.chat), label: 'Chat'),
           NavigationDestination(icon: Icon(Icons.gavel), label: 'Approvals'),
+          NavigationDestination(icon: Icon(Icons.account_tree), label: 'Fleet'),
         ],
       ),
     );

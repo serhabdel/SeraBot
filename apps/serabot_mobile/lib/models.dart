@@ -263,6 +263,137 @@ class HealthInfo {
 
 enum ApprovalDecision { once, always, deny }
 
+enum ConversationKind { section, group, direct, room }
+
+extension ConversationKindX on ConversationKind {
+  String get apiValue {
+    switch (this) {
+      case ConversationKind.section:
+        return 'section';
+      case ConversationKind.group:
+        return 'group';
+      case ConversationKind.direct:
+        return 'direct';
+      case ConversationKind.room:
+        return 'room';
+    }
+  }
+
+  String get label {
+    switch (this) {
+      case ConversationKind.section:
+        return 'Section';
+      case ConversationKind.group:
+        return 'Group';
+      case ConversationKind.direct:
+        return 'Direct';
+      case ConversationKind.room:
+        return 'Room';
+    }
+  }
+
+  String get idPrefix {
+    switch (this) {
+      case ConversationKind.section:
+        return 'sec';
+      case ConversationKind.group:
+        return 'grp';
+      case ConversationKind.direct:
+        return 'dir';
+      case ConversationKind.room:
+        return 'room';
+    }
+  }
+
+  bool get acceptsTurns =>
+      this == ConversationKind.direct || this == ConversationKind.room;
+
+  String get parentHint {
+    switch (this) {
+      case ConversationKind.section:
+        return 'No parent. Sections are the top of the tree.';
+      case ConversationKind.group:
+        return 'Requires an existing section, for example sec:finance.';
+      case ConversationKind.direct:
+      case ConversationKind.room:
+        return 'Optional parent: a section (sec:) or group (grp:).';
+    }
+  }
+}
+
+class CreatedBot {
+  CreatedBot({
+    required this.id,
+    required this.enabled,
+    required this.role,
+    required this.live,
+    required this.tools,
+    required this.skills,
+    required this.requireApproval,
+    required this.botFile,
+    required this.promptFile,
+  });
+
+  factory CreatedBot.fromJson(Map<String, dynamic> json) {
+    return CreatedBot(
+      id: json['id'] as String,
+      enabled: json['enabled'] as bool,
+      role: json['role'] as String,
+      live: json['live'] as bool,
+      tools: _stringList(json['tools']),
+      skills: _stringList(json['skills']),
+      requireApproval: _stringList(json['require_approval']),
+      botFile: json['bot_file'] as String,
+      promptFile: json['prompt_file'] as String,
+    );
+  }
+
+  final String id;
+  final bool enabled;
+  final String role;
+  final bool live;
+  final List<String> tools;
+  final List<String> skills;
+  final List<String> requireApproval;
+  final String botFile;
+  final String promptFile;
+}
+
+class CreatedConversation {
+  CreatedConversation({
+    required this.id,
+    required this.kind,
+    required this.parentId,
+    required this.acceptsTurns,
+  });
+
+  factory CreatedConversation.fromJson(Map<String, dynamic> json) {
+    return CreatedConversation(
+      id: json['id'] as String,
+      kind: json['kind'] as String,
+      parentId: json['parent_id'] as String?,
+      acceptsTurns: json['accepts_turns'] as bool,
+    );
+  }
+
+  final String id;
+  final String kind;
+  final String? parentId;
+  final bool acceptsTurns;
+}
+
+List<String> _stringList(dynamic raw) {
+  if (raw is! List) {
+    throw const FormatException('expected list');
+  }
+  return raw.map((entry) {
+    if (entry is! String) {
+      throw const FormatException('expected string');
+    }
+    return entry;
+  }).toList();
+}
+
 extension ApprovalDecisionX on ApprovalDecision {
   String get apiValue {
     switch (this) {

@@ -27,10 +27,13 @@ class _ChatTabState extends State<ChatTab> {
   Timer? _pollTimer;
   DateTime _lastRequest = DateTime.fromMillisecondsSinceEpoch(0);
   int _pollTick = 0;
+  late String _loadedConversation;
 
   @override
   void initState() {
     super.initState();
+    _loadedConversation = widget.session.conversationId;
+    widget.session.addListener(_onSessionChanged);
     _pollTimer = Timer.periodic(const Duration(seconds: 3), (_) => _poll());
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _refreshAll();
@@ -39,10 +42,30 @@ class _ChatTabState extends State<ChatTab> {
 
   @override
   void dispose() {
+    widget.session.removeListener(_onSessionChanged);
     _pollTimer?.cancel();
     _composer.dispose();
     _scroll.dispose();
     super.dispose();
+  }
+
+  void _onSessionChanged() {
+    if (!mounted) {
+      return;
+    }
+    final id = widget.session.conversationId;
+    if (id == _loadedConversation) {
+      return;
+    }
+    _loadedConversation = id;
+    setState(() {
+      _messages = [];
+      _banner = null;
+      _trackedTaskId = null;
+      _trackedStatus = null;
+      _pendingSelection = null;
+    });
+    _refreshAll();
   }
 
   Future<void> _throttle() async {
@@ -253,7 +276,7 @@ class _ChatTabState extends State<ChatTab> {
             ),
             if (!pending.isAuto) ...[
               DropdownButtonFormField<String>(
-                value: providerId != null && providers.any((p) => p.id == providerId)
+                initialValue: providerId != null && providers.any((p) => p.id == providerId)
                     ? providerId
                     : null,
                 decoration: const InputDecoration(labelText: 'Provider'),
@@ -282,7 +305,7 @@ class _ChatTabState extends State<ChatTab> {
               ),
               if (selectedProvider != null)
                 DropdownButtonFormField<String>(
-                  value: modelId != null && selectedProvider.models.contains(modelId)
+                  initialValue: modelId != null && selectedProvider.models.contains(modelId)
                       ? modelId
                       : null,
                   decoration: const InputDecoration(labelText: 'Model'),
@@ -323,6 +346,16 @@ class _ChatTabState extends State<ChatTab> {
               TextButton(onPressed: () => setState(() => _banner = null), child: const Text('Dismiss')),
             ],
           ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 4, 12, 0),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              widget.session.conversationId,
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ),
+        ),
         if (_trackedTaskId != null && _trackedStatus != null)
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),

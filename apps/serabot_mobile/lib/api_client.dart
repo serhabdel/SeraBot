@@ -296,4 +296,196 @@ class ApiClient {
       body: {'decision': decision.apiValue},
     );
   }
+
+  /// Scaffolds a disabled specialist. An empty [tools] list is sent as-is;
+  /// the server then writes an empty tool set rather than its default.
+  Future<CreatedBot> createBot(
+    String id,
+    String description,
+    List<String> tools,
+    List<String> skills,
+  ) async {
+    if (!validBotId(id)) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail:
+            'Bot id must be a lowercase slug of at most 32 characters, and cannot be main or a Windows device name.',
+      );
+    }
+    if (!validBotDescription(description)) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail:
+            'Description must be at most 2,000 characters, without control characters.',
+      );
+    }
+    try {
+      validateToolList(tools);
+    } on ValidationException catch (e) {
+      throw ApiException(ApiErrorKind.validation, detail: e.message);
+    }
+    if (skills.length > 16) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Enter at most 16 skill ids.',
+      );
+    }
+    final seenSkills = <String>{};
+    for (final skill in skills) {
+      if (!validSkillId(skill)) {
+        throw ApiException(
+          ApiErrorKind.validation,
+          detail: 'Skill ids are lowercase slugs such as ask.',
+        );
+      }
+      if (!seenSkills.add(skill)) {
+        throw ApiException(
+          ApiErrorKind.validation,
+          detail: 'Each skill id can be listed once.',
+        );
+      }
+    }
+    final json = await _request(
+      'POST',
+      ['v1', 'bots'],
+      body: {
+        'id': id,
+        'description': description,
+        'tools': tools,
+        'skills': skills,
+      },
+    );
+    return _checkCreatedBot(json, id);
+  }
+
+  Future<CreatedConversation> createConversation(
+    ConversationKind kind,
+    String slug,
+    String? parentId,
+  ) async {
+    if (!validSlug(slug)) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Slug must be a lowercase slug of at most 32 characters.',
+      );
+    }
+    final parent = (parentId == null || parentId.isEmpty) ? null : parentId;
+    try {
+      validateConversationParent(kind, parent);
+    } on ValidationException catch (e) {
+      throw ApiException(ApiErrorKind.validation, detail: e.message);
+    }
+    final json = await _request(
+      'POST',
+      ['v1', 'conversations'],
+      body: {
+        'kind': kind.apiValue,
+        'slug': slug,
+        'parent_id': ?parent,
+      },
+    );
+    return _checkCreatedConversation(json, kind, slug, parent);
+  }
+}
+
+CreatedBot _checkCreatedBot(Map<String, dynamic> json, String id) {
+  try {
+    final raw = json['bot'];
+    if (raw is! Map<String, dynamic>) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+    final bot = CreatedBot.fromJson(raw);
+    if (bot.id != id ||
+        bot.enabled ||
+        bot.live ||
+        bot.role != 'specialist' ||
+        bot.tools.length > 32 ||
+        bot.skills.length > 16 ||
+        bot.requireApproval.length > 32 ||
+        !_safeFleetFile(bot.botFile, id, 'toml') ||
+        !_safeFleetFile(bot.promptFile, id, 'txt') ||
+        bot.tools.any((tool) => tool == 'delegate' || !_boundedName(tool)) ||
+        bot.skills.any((skill) => !validSkillId(skill)) ||
+        bot.requireApproval.any(
+          (tool) => !_boundedName(tool) || !bot.tools.contains(tool),
+        )) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+    return bot;
+  } on ApiException {
+    rethrow;
+  } catch (_) {
+    throw ApiException(ApiErrorKind.invalidResponse);
+  }
+}
+
+CreatedConversation _checkCreatedConversation(
+  Map<String, dynamic> json,
+  ConversationKind kind,
+  String slug,
+  String? parentId,
+) {
+  try {
+    final raw = json['conversation'];
+    if (raw is! Map<String, dynamic>) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+    final node = CreatedConversation.fromJson(raw);
+    final expectedId = conversationNodeId(kind, slug);
+    if (expectedId == null ||
+        node.id != expectedId ||
+        node.kind != kind.apiValue ||
+        node.acceptsTurns != kind.acceptsTurns ||
+        node.parentId != parentId) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+    return node;
+  } on ApiException {
+    rethrow;
+  } catch (_) {
+    throw ApiException(ApiErrorKind.invalidResponse);
+  }
+}
+
+bool _boundedName(String value) {
+  if (value.isEmpty || value.length > 64) {
+    return false;
+  }
+  return value.codeUnits.every((b) {
+    return (b >= 0x30 && b <= 0x39) ||
+        (b >= 0x41 && b <= 0x5a) ||
+        (b >= 0x61 && b <= 0x7a) ||
+        b == 0x5f ||
+        b == 0x2d;
+  });
+}
+
+bool _safeFleetFile(String path, String id, String ext) {
+  if (path.length > 256 ||
+      path.contains('\\') ||
+      path.contains(':') ||
+      path.contains('..') ||
+      path.startsWith('/') ||
+      path.contains('//')) {
+    return false;
+  }
+  for (final b in path.codeUnits) {
+    final ok = (b >= 0x30 && b <= 0x39) ||
+        (b >= 0x41 && b <= 0x5a) ||
+        (b >= 0x61 && b <= 0x7a) ||
+        b == 0x2f ||
+        b == 0x2e ||
+        b == 0x5f ||
+        b == 0x2d;
+    if (!ok) {
+      return false;
+    }
+  }
+  final slash = path.lastIndexOf('/');
+  if (slash <= 0) {
+    return false;
+  }
+  final dir = path.substring(0, slash);
+  final file = path.substring(slash + 1);
+  return dir.isNotEmpty && file == '$id.$ext';
 }

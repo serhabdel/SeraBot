@@ -89,7 +89,7 @@ as other requests and is not retried if the outcome is unknown.
   id into the conversation field; **Open** loads it. Sections and groups do not
   accept turns.
 
-The mobile client does not call these endpoints yet. See
+The mobile Fleet tab calls the same two endpoints. See
 [Mobile client](mobile-client.md).
 
 ## Known limitations
