@@ -1040,7 +1040,7 @@ body {
   background: var(--surface);
   border: 1px solid var(--hairline);
   border-radius: var(--r-xl);
-  box-shadow: var(--shadow-2), inset 0 0 0 1px var(--clear);
+  box-shadow: var(--shadow-2), inset 0 0 0 1px var(--hairline);
   padding: 12px 12px 10px 16px;
   display: flex;
   flex-direction: column;

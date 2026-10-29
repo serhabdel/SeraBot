@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 use crate::ask::{ABSTENTION, validate_citations};
 use crate::config::{Config, LoadedBot};
 use crate::delegate::{DELEGATE_TOOL, HANDOFF_QUEUED_KEY};
-use crate::domain::{Action, Approval, LlmMessage, Role, Task, ToolCall, Turn};
+use crate::domain::{Action, Approval, LlmMessage, Role, Task, ToolCall, Turn, new_id};
 use crate::error::{Result, SeraError};
 use crate::gateway::{
     Decision, DecisionResult, Gateway, Tool, ToolContext, ToolOutcome, ToolOutput, ToolSpec,
@@ -28,7 +28,7 @@ use crate::skills::on_demand_skill_clause;
 use crate::store::Store;
 use crate::teams::{
     AUDIT_ASKED, AUDIT_ROUND_COMPLETED, AUDIT_TURN_COMPLETED, TEAM_ASK_QUEUED_KEY, TEAM_ASK_TOOL,
-    TEAM_REPLY_TOOL, TeamContext, TeamMode,
+    TEAM_REPLY_TOOL, TeamContext, TeamMode, enqueue_turn_task_with_id,
 };
 use crate::util::truncate_chars;
 
@@ -657,22 +657,22 @@ impl Runtime {
                     team: Some(frame.clone()),
                 })?)
             })();
-            let child = match payload.and_then(|payload| {
-                self.store
-                    .enqueue_task("turn", member, &payload, 0, Utc::now())
-            }) {
-                Ok(child) => child,
+            let payload = match payload {
+                Ok(payload) => payload,
                 Err(error) => {
                     warn!(bot = %member, %error, "room team member turn was not queued");
                     continue;
                 }
             };
+            // The team ask is audited before the member turn is queued: a failed
+            // audit must never leave an untracked team message behind.
+            let child = new_id();
             let details = json!({
                 "root_task_id": root_task_id,
                 "conversation_id": conversation_id,
                 "from_bot": ORCHESTRATOR_BOT,
                 "to_bot": member,
-                "child_task_id": child.id,
+                "child_task_id": child,
                 "round": 0,
                 "mode": TeamMode::All.as_str(),
             });
@@ -690,7 +690,11 @@ impl Runtime {
                 )
                 .and_then(|_| self.store.append_event(AUDIT_ASKED, &details))
             {
-                warn!(bot = %member, %error, "room team ask was not audited");
+                warn!(bot = %member, %error, "room team ask was not audited; member turn was not queued");
+                continue;
+            }
+            if let Err(error) = enqueue_turn_task_with_id(&self.store, &child, member, &payload) {
+                warn!(bot = %member, %error, "audited room team ask was not queued");
             }
         }
     }

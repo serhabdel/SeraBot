@@ -61,6 +61,38 @@ impl Theme {
     }
 }
 
+/// What the console refreshes after an event arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventRefresh {
+    /// Reload the approvals list.
+    Approvals,
+    /// Reload the conversation list.
+    Conversations,
+    /// Reload the transcript of the open conversation.
+    History,
+    /// Reload the transcript of the open room and its team.
+    RoomTeam,
+}
+
+/// The refresh an event kind asks for.
+///
+/// A team event belongs to a room. When the open conversation is a room, its
+/// team is read again as well, so an open team sheet shows what the server
+/// saved. Anywhere else there is no team to read and the transcript refresh
+/// is the only thing that happens.
+fn event_refresh(kind: &str, conversation: &str) -> EventRefresh {
+    if kind.starts_with("team.") && teams::is_room(conversation) {
+        return EventRefresh::RoomTeam;
+    }
+    if kind.contains("approval") {
+        EventRefresh::Approvals
+    } else if kind.contains("conversation") {
+        EventRefresh::Conversations
+    } else {
+        EventRefresh::History
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Chat,
@@ -987,16 +1019,19 @@ impl Session {
         }
         self.events_dirty = false;
         let kind = self.last_event_kind.clone();
-        let operation = if kind.contains("approval") {
-            Operation::Approvals
-        } else if kind.contains("conversation") {
-            Operation::ListConversations {
+        match event_refresh(&kind, &self.conversation) {
+            EventRefresh::Approvals => self.start_request(Operation::Approvals),
+            EventRefresh::Conversations => self.start_request(Operation::ListConversations {
                 include_archived: false,
+            }),
+            EventRefresh::History => self.start_request(Operation::History),
+            EventRefresh::RoomTeam => {
+                self.start_request(Operation::History);
+                self.state.team_loading = true;
+                self.state.team_error = None;
+                self.schedule(Operation::GetTeam, Duration::ZERO);
             }
-        } else {
-            Operation::History
-        };
-        self.start_request(operation);
+        }
     }
 
     fn start_request(&mut self, operation: Operation) {
@@ -2089,4 +2124,41 @@ fn model_csv(raw: &str) -> Vec<String> {
         .filter(|model| !model.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EventRefresh, event_refresh};
+
+    #[test]
+    fn a_team_event_refreshes_the_team_only_in_a_room() {
+        assert_eq!(
+            event_refresh("team.member_set", "room:review"),
+            EventRefresh::RoomTeam
+        );
+        assert_eq!(
+            event_refresh("team.member_set", "dir:analyst"),
+            EventRefresh::History
+        );
+        assert_ne!(
+            event_refresh("team.member_set", "dir:analyst"),
+            EventRefresh::RoomTeam
+        );
+    }
+
+    #[test]
+    fn other_events_keep_their_own_refresh() {
+        assert_eq!(
+            event_refresh("approval.requested", "room:review"),
+            EventRefresh::Approvals
+        );
+        assert_eq!(
+            event_refresh("conversation.created", "room:review"),
+            EventRefresh::Conversations
+        );
+        assert_eq!(
+            event_refresh("message", "room:review"),
+            EventRefresh::History
+        );
+    }
 }

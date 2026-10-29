@@ -11,12 +11,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{SecondsFormat, Utc};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tracing::warn;
 
 use crate::config::LoadedBot;
-use crate::domain::Role;
+use crate::domain::{Role, new_id};
 use crate::error::{Result, SeraError};
 use crate::gateway::{Tool, ToolContext, ToolOutput, ToolSpec};
 use crate::model_router::ModelRouter;
@@ -236,16 +238,15 @@ fn refuse_bound(
     ))
 }
 
-/// Queue one member turn on the same conversation and return the child task id.
-fn enqueue_member_turn(
-    store: &Store,
+/// Build the payload of one member turn on the same conversation.
+fn member_turn_payload(
     bots: &HashMap<String, LoadedBot>,
     router: &ModelRouter,
     conversation_id: &str,
     to_bot: &str,
     text: &str,
     team: TeamContext,
-) -> Result<String> {
+) -> Result<Value> {
     let bot = bots
         .get(to_bot)
         .ok_or_else(|| SeraError::NotFound(format!("bot {to_bot}")))?;
@@ -261,7 +262,7 @@ fn enqueue_member_turn(
         &Default::default(),
     )?;
     let route = router.pin(&selection)?;
-    let payload = json!({
+    Ok(json!({
         "conversation_id": conversation_id,
         "text": text,
         "bot": to_bot,
@@ -269,9 +270,36 @@ fn enqueue_member_turn(
         "ask_mode": false,
         "route": route,
         "team": team,
-    });
-    let child = store.enqueue_task("turn", to_bot, &payload, 0, Utc::now())?;
-    Ok(child.id)
+    }))
+}
+
+/// Queue one member turn under a caller-allocated task id.
+///
+/// Team turns are audited before they are queued, so a failed audit never
+/// leaves an untracked member turn behind. The audit row needs the child task
+/// id first and `Store::enqueue_task` allocates that id itself, so the same
+/// insert is repeated here with the id supplied by the caller.
+pub(crate) fn enqueue_turn_task_with_id(
+    store: &Store,
+    id: &str,
+    bot: &str,
+    payload: &Value,
+) -> Result<()> {
+    let stamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let connection = store.connection()?;
+    connection.execute(
+        "INSERT INTO tasks(id, kind, bot, payload_json, status, priority, attempts, max_attempts,
+                run_after, lease_until, worker_id, fencing_token, uncertain, last_error, created_at, updated_at)
+         VALUES (?1, 'turn', ?2, ?3, 'queued', 0, 0, 5, ?4, NULL, NULL, 0, 0, NULL, ?5, ?5)",
+        params![
+            id,
+            bot,
+            serde_json::to_string(payload)?,
+            stamp,
+            stamp
+        ],
+    )?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -448,8 +476,11 @@ impl Tool for TeamAskTool {
                 from_bot: ORCHESTRATOR_BOT.to_owned(),
                 round: 0,
             };
-            let child = enqueue_member_turn(
-                &self.store,
+            // The member turn is audited before it is queued: a failed audit must
+            // never leave an untracked team message behind. The count above is
+            // read before these rows exist, so the bound still covers this turn.
+            let child = new_id();
+            let payload = member_turn_payload(
                 &self.bots,
                 &self.router,
                 conversation_id,
@@ -479,6 +510,10 @@ impl Tool for TeamAskTool {
                 Some(&details),
             )?;
             self.store.append_event(AUDIT_ASKED, &details)?;
+            if let Err(error) = enqueue_turn_task_with_id(&self.store, &child, to_bot, &payload) {
+                warn!(bot = %to_bot, %error, "audited team ask was not queued");
+                return Err(error);
+            }
             queued.push(json!({"to_bot": to_bot, "child_task_id": child}));
         }
 
@@ -642,23 +677,17 @@ impl Tool for TeamReplyTool {
             from_bot: context.bot.clone(),
             round,
         };
-        let child = enqueue_member_turn(
-            &self.store,
+        // The peer message is audited before it is queued: a failed audit must
+        // never leave an untracked team message behind. The count above is read
+        // before these rows exist, so the bound still covers this turn.
+        let child = new_id();
+        let payload = member_turn_payload(
             &self.bots,
             &self.router,
             conversation_id,
             &to_bot,
             &message,
             child_frame,
-        )?;
-        // The peer message belongs to the room transcript: the target bot and
-        // the owner both read it as a labelled assistant message.
-        self.store.append_message_named(
-            conversation_id,
-            Some(turn_id),
-            Role::Assistant,
-            &format!("(to {to_bot}) {message}"),
-            Some(&context.bot),
         )?;
         let details = json!({
             "root_task_id": frame.root_task_id,
@@ -680,6 +709,19 @@ impl Tool for TeamReplyTool {
             Some(&details),
         )?;
         self.store.append_event(AUDIT_REPLIED, &details)?;
+        if let Err(error) = enqueue_turn_task_with_id(&self.store, &child, &to_bot, &payload) {
+            warn!(bot = %to_bot, %error, "audited peer reply was not queued");
+            return Err(error);
+        }
+        // The peer message belongs to the room transcript: the target bot and
+        // the owner both read it as a labelled assistant message.
+        self.store.append_message_named(
+            conversation_id,
+            Some(turn_id),
+            Role::Assistant,
+            &format!("(to {to_bot}) {message}"),
+            Some(&context.bot),
+        )?;
 
         Ok(ToolOutput {
             content: format!("Asked {to_bot} one peer question. Write your own answer now."),
@@ -820,6 +862,89 @@ mod tests {
         assert_eq!(TeamMode::from_name("all").unwrap(), TeamMode::All);
         assert_eq!(TeamMode::from_name("selected").unwrap(), TeamMode::Selected);
         assert!(TeamMode::from_name("everyone").is_err());
+    }
+
+    #[tokio::test]
+    async fn team_ask_audits_the_member_turn_it_queues() {
+        let (store, root) = store();
+        let tool = TeamAskTool::new(store.clone(), bots(), router());
+        let turn = store
+            .create_turn(&root, ORCHESTRATOR_BOT, ROOM, &json!({}))
+            .unwrap();
+        let context = context(ORCHESTRATOR_BOT, &root, &turn.id);
+        let output = tool
+            .execute(
+                json!({
+                    "to_bots": ["analyst"],
+                    "objective": "synthetic room question",
+                    "model_class": "routine",
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+        let child = output
+            .data
+            .as_ref()
+            .and_then(|data| data.get("queued"))
+            .and_then(Value::as_array)
+            .and_then(|queued| queued.first())
+            .and_then(|entry| entry.get("child_task_id"))
+            .and_then(Value::as_str)
+            .expect("child task id")
+            .to_owned();
+        // The audit row names the member turn that was queued.
+        let entry = store
+            .list_audit(20)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.event == AUDIT_ASKED)
+            .expect("team.asked audit row");
+        let details = entry.details.expect("audit details");
+        assert_eq!(
+            details.get("child_task_id").and_then(Value::as_str),
+            Some(child.as_str())
+        );
+        assert_eq!(
+            details.get("to_bot").and_then(Value::as_str),
+            Some("analyst")
+        );
+        // The member turn is queued and counted against the room turn.
+        assert_eq!(store.count_team_events(&root).unwrap(), 1);
+        assert_eq!(store.count_pending_team_tasks(&root).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn team_ask_queues_no_member_turn_when_the_audit_fails() {
+        let (store, root) = store();
+        let tool = TeamAskTool::new(store.clone(), bots(), router());
+        let turn = store
+            .create_turn(&root, ORCHESTRATOR_BOT, ROOM, &json!({}))
+            .unwrap();
+        let context = context(ORCHESTRATOR_BOT, &root, &turn.id);
+        // The event stream write fails, so the team ask is not audited.
+        {
+            let connection = store.connection().unwrap();
+            connection.execute_batch("DROP TABLE events").unwrap();
+        }
+        let error = tool
+            .execute(
+                json!({
+                    "to_bots": ["analyst"],
+                    "objective": "synthetic room question",
+                    "model_class": "routine",
+                }),
+                &context,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no such table: events"),
+            "{error}"
+        );
+        // No member turn was queued: the audit came first and failed.
+        assert_eq!(store.count_pending_team_tasks(&root).unwrap(), 0);
+        assert_eq!(store.pending_task_count().unwrap(), 1);
     }
 
     #[tokio::test]

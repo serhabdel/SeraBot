@@ -3,7 +3,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -160,9 +160,14 @@ pub fn router(state: ApiState) -> Router {
         ));
     // Voice capture posts raw bytes up to the Telegram voice ceiling; the JSON
     // endpoints keep the smaller server body limit.
+    //
+    // The route layer alone is not enough: axum's own `DefaultBodyLimit`
+    // (2 MiB) is what a `Bytes` extraction actually enforces, so the audio
+    // route raises that limit too and the handler reads the body through
+    // `to_bytes` with an explicit ceiling of its own.
     let audio = Router::new()
         .route("/v1/audio/transcribe", post(transcribe_audio))
-        .layer(RequestBodyLimitLayer::new(
+        .layer(axum::extract::DefaultBodyLimit::max(
             crate::audio::DEFAULT_TELEGRAM_AUDIO_MAX_BYTES as usize,
         ));
     let protected = protected
@@ -519,8 +524,9 @@ async fn set_conversation_team(
 async fn transcribe_audio(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
+    let limit = crate::audio::DEFAULT_TELEGRAM_AUDIO_MAX_BYTES;
     let filename = headers
         .get("x-audio-filename")
         .and_then(|value| value.to_str().ok())
@@ -548,18 +554,16 @@ async fn transcribe_audio(
         )
             .into_response();
     }
-    if body.len() as u64 > crate::audio::DEFAULT_TELEGRAM_AUDIO_MAX_BYTES {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(json!({
-                "error": format!(
-                    "audio payload exceeds the {} byte limit",
-                    crate::audio::DEFAULT_TELEGRAM_AUDIO_MAX_BYTES
-                ),
-                "code": "validation",
-            })),
-        )
-            .into_response();
+    // Read the raw payload under the Telegram audio ceiling. The `Bytes`
+    // extractor would apply axum's server-wide 2 MiB default limit instead,
+    // so the body is read explicitly and an oversized payload is reported
+    // with a message that names the limit.
+    let body = match axum::body::to_bytes(body, limit as usize).await {
+        Ok(body) => body,
+        Err(_) => return audio_payload_too_large(limit),
+    };
+    if body.len() as u64 > limit {
+        return audio_payload_too_large(limit);
     }
     if let crate::audio::AudioProviderState::Unavailable(message) =
         crate::audio::audio_provider_state(&state.config)
@@ -601,6 +605,19 @@ async fn transcribe_audio(
                 .into_response()
         }
     }
+}
+
+/// Clear, safe rejection for an audio payload above the documented ceiling.
+/// The message names the limit and never echoes the payload.
+fn audio_payload_too_large(limit: u64) -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(json!({
+            "error": format!("audio payload exceeds the {limit} byte limit"),
+            "code": "validation",
+        })),
+    )
+        .into_response()
 }
 
 fn task_view(task: &Task) -> Value {
@@ -3757,5 +3774,80 @@ mod tests {
         let message = body["error"].as_str().unwrap().to_owned();
         assert!(message.contains("audio.enabled"), "{message}");
         assert!(!message.contains("synthetic-test-key"), "{message}");
+    }
+
+    /// The audio route documents a 20 MiB payload ceiling. The JSON body
+    /// limit (2 MiB by default) must not apply to it: a 3 MiB body has to
+    /// reach the handler, which then refuses for an unrelated reason.
+    #[tokio::test]
+    async fn audio_transcribe_accepts_payloads_above_the_json_body_limit() {
+        let (app, _, _) = app();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/audio/transcribe")
+                    .header("authorization", "Bearer test-token-that-is-long-enough-123")
+                    .header("x-audio-filename", "note.webm")
+                    .body(Body::from(vec![0u8; 3 * 1024 * 1024]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        // No audio provider is configured in the test fixture, so the handler
+        // gets as far as the provider check: the payload was not truncated or
+        // rejected by a body limit.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = read_json(response).await;
+        let message = body["error"].as_str().unwrap().to_owned();
+        assert!(message.contains("audio.enabled"), "{message}");
+    }
+
+    /// A payload above the documented 20 MiB ceiling is rejected with a
+    /// message that names the limit, never with the raw body.
+    #[tokio::test]
+    async fn audio_transcribe_rejects_payloads_above_the_telegram_audio_limit() {
+        let (app, _, _) = app();
+        let limit = crate::audio::DEFAULT_TELEGRAM_AUDIO_MAX_BYTES as usize;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/audio/transcribe")
+                    .header("authorization", "Bearer test-token-that-is-long-enough-123")
+                    .header("x-audio-filename", "note.webm")
+                    .body(Body::from(vec![0u8; limit + 1024]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = read_json(response).await;
+        let message = body["error"].as_str().unwrap().to_owned();
+        assert!(message.contains("20971520"), "{message}");
+        assert!(message.contains("byte limit"), "{message}");
+    }
+
+    /// The JSON endpoints keep the smaller server body limit.
+    #[tokio::test]
+    async fn json_routes_keep_the_server_body_limit() {
+        let (app, _, _) = app();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/conversations")
+                    .header("authorization", "Bearer test-token-that-is-long-enough-123")
+                    .header("content-type", "application/json")
+                    .body(Body::from(vec![b'a'; 3 * 1024 * 1024]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
 use serde_json::{Value, json};
+use tracing::warn;
 
 use crate::config::LoadedBot;
 use crate::domain::new_id;
@@ -14,6 +14,7 @@ use crate::model_router::ModelRouter;
 use crate::orchestration::HandoffContext;
 use crate::orchestration::{BotRole, Handoff, ModelClass, ORCHESTRATOR_BOT, validate_handoff};
 use crate::store::Store;
+use crate::teams::enqueue_turn_task_with_id;
 
 pub const DELEGATE_TOOL: &str = "delegate";
 pub const HANDOFF_QUEUED_KEY: &str = "handoff_queued";
@@ -197,9 +198,11 @@ impl Tool for DelegateTool {
                 skill: handoff.skill.clone(),
             },
         });
-        let child = self
-            .store
-            .enqueue_task("turn", &to_bot, &payload, 0, Utc::now())?;
+        // The handoff is audited before the specialist turn is queued: a failed
+        // audit must never leave an untracked queued turn behind. The audit row
+        // needs the child task id first and `Store::enqueue_task` allocates that
+        // id itself, so the id is allocated here and the turn is queued under it.
+        let child_task_id = new_id();
         self.store.record_audit(
             &context.actor,
             "handoff.queued",
@@ -210,7 +213,7 @@ impl Tool for DelegateTool {
             None,
             Some(&json!({
                 "handoff_id": handoff.id,
-                "child_task_id": child.id,
+                "child_task_id": child_task_id,
                 "conversation_id": conversation_id,
                 "from_bot": ORCHESTRATOR_BOT,
                 "to_bot": to_bot,
@@ -224,20 +227,214 @@ impl Tool for DelegateTool {
             &json!({
                 "handoff_id": handoff.id,
                 "parent_task_id": task_id,
-                "child_task_id": child.id,
+                "child_task_id": child_task_id,
                 "to_bot": to_bot,
             }),
         )?;
+        if let Err(error) =
+            enqueue_turn_task_with_id(&self.store, &child_task_id, &to_bot, &payload)
+        {
+            warn!(bot = %to_bot, %error, "audited handoff was not queued");
+            return Err(error);
+        }
 
         Ok(ToolOutput {
             content: format!("Queued handoff {id} to {to_bot}.", id = handoff.id),
             data: Some(json!({
                 HANDOFF_QUEUED_KEY: true,
                 "handoff_id": handoff.id,
-                "child_task_id": child.id,
+                "child_task_id": child_task_id,
                 "to_bot": to_bot,
             })),
             ..ToolOutput::default()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{BotConfig, Config, LoadedBot};
+    use crate::llm::LlmClient;
+    use rusqlite::params;
+    use std::collections::{BTreeMap, HashSet};
+
+    const ROOM: &str = "room:review";
+
+    /// A room conversation with the orchestrator task that asked for a handoff.
+    fn store() -> (Store, String) {
+        let store = Store::open_in_memory(384).unwrap();
+        store.create_conversation(ROOM, "room", None).unwrap();
+        let parent = store
+            .enqueue_task(
+                "turn",
+                ORCHESTRATOR_BOT,
+                &json!({"conversation_id": ROOM, "text": "synthetic", "bot": ORCHESTRATOR_BOT}),
+                0,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        (store, parent.id)
+    }
+
+    fn bot(name: &str, role: BotRole, delegates: Vec<String>) -> LoadedBot {
+        LoadedBot {
+            config: BotConfig {
+                name: name.into(),
+                trigger: "command".into(),
+                model: None,
+                system_prompt: format!("prompts/{name}.txt"),
+                skills: vec![],
+                tools: vec![],
+                require_approval: vec![],
+                enabled: true,
+                temperature: None,
+                role,
+                delegates,
+            },
+            prompt: name.into(),
+        }
+    }
+
+    fn bots() -> Arc<HashMap<String, LoadedBot>> {
+        Arc::new(
+            [
+                bot(
+                    ORCHESTRATOR_BOT,
+                    BotRole::Orchestrator,
+                    vec!["analyst".to_string()],
+                ),
+                bot("analyst", BotRole::Specialist, vec![]),
+            ]
+            .into_iter()
+            .map(|bot| (bot.config.name.clone(), bot))
+            .collect(),
+        )
+    }
+
+    fn router() -> ModelRouter {
+        let mut config = Config::default();
+        config.llm.data_egress_approved = true;
+        config.llm.model = "test".into();
+        config.llm.base_url = "https://example.com/v1".into();
+        config.llm.models = vec!["test-alternative".into()];
+        ModelRouter::new(
+            &config.llm,
+            BTreeMap::from([(
+                "default".into(),
+                LlmClient::new("https://example.com/v1", "test", 5, 50)
+                    .unwrap()
+                    .with_model("test"),
+            )]),
+        )
+        .unwrap()
+    }
+
+    fn context(task_id: &str, turn_id: &str) -> ToolContext {
+        ToolContext {
+            actor: "owner".into(),
+            bot: ORCHESTRATOR_BOT.into(),
+            task_id: Some(task_id.into()),
+            turn_id: Some(turn_id.into()),
+            conversation_id: Some(ROOM.into()),
+            allowed_tools: HashSet::from([DELEGATE_TOOL.to_string()]),
+            require_approval: HashSet::new(),
+        }
+    }
+
+    fn args() -> Value {
+        json!({
+            "to_bot": "analyst",
+            "objective": "Summarize the synthetic cash position.",
+            "model_class": "routine",
+        })
+    }
+
+    /// Specialist turns that are queued or running.
+    fn queued_specialist_tasks(store: &Store) -> i64 {
+        let connection = store.connection().unwrap();
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks
+                 WHERE bot='analyst' AND status IN ('queued','running','awaiting_approval')",
+                params![],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn delegate_audits_the_child_task_it_queues() {
+        let (store, parent) = store();
+        let tool = DelegateTool::new(store.clone(), bots(), router());
+        let turn = store
+            .create_turn(&parent, ORCHESTRATOR_BOT, ROOM, &json!({}))
+            .unwrap();
+        let context = context(&parent, &turn.id);
+        let output = tool.execute(args(), &context).await.unwrap();
+        let child = output
+            .data
+            .as_ref()
+            .and_then(|data| data.get("child_task_id"))
+            .and_then(Value::as_str)
+            .expect("child task id")
+            .to_owned();
+        // The audit row names the specialist turn that was queued.
+        let entry = store
+            .list_audit(20)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.event == "handoff.queued")
+            .expect("handoff.queued audit row");
+        let details = entry.details.expect("audit details");
+        assert_eq!(
+            details.get("child_task_id").and_then(Value::as_str),
+            Some(child.as_str())
+        );
+        assert_eq!(
+            details.get("to_bot").and_then(Value::as_str),
+            Some("analyst")
+        );
+        assert_eq!(
+            details.get("from_bot").and_then(Value::as_str),
+            Some(ORCHESTRATOR_BOT)
+        );
+        assert_eq!(
+            details.get("conversation_id").and_then(Value::as_str),
+            Some(ROOM)
+        );
+        assert_eq!(
+            details.get("model_class").and_then(Value::as_str),
+            Some("routine")
+        );
+        // The queued task is the task the audit names.
+        let task = store.get_task(&child).unwrap();
+        assert_eq!(task.bot, "analyst");
+        assert_eq!(task.kind, "turn");
+        assert_eq!(task.status, "queued");
+        assert_eq!(queued_specialist_tasks(&store), 1);
+    }
+
+    #[tokio::test]
+    async fn delegate_queues_no_child_task_when_the_audit_fails() {
+        let (store, parent) = store();
+        let tool = DelegateTool::new(store.clone(), bots(), router());
+        let turn = store
+            .create_turn(&parent, ORCHESTRATOR_BOT, ROOM, &json!({}))
+            .unwrap();
+        let context = context(&parent, &turn.id);
+        // The event stream write fails, so the handoff is not audited.
+        {
+            let connection = store.connection().unwrap();
+            connection.execute_batch("DROP TABLE events").unwrap();
+        }
+        let error = tool.execute(args(), &context).await.unwrap_err();
+        assert!(
+            error.to_string().contains("no such table: events"),
+            "{error}"
+        );
+        // No specialist turn was queued: the audit came first and failed.
+        assert_eq!(queued_specialist_tasks(&store), 0);
+        assert_eq!(store.pending_task_count().unwrap(), 1);
     }
 }
