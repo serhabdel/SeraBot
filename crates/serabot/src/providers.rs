@@ -2,7 +2,9 @@
 //!
 //! Chat stays on OpenAI-compatible `/chat/completions`. OAuth credentials stay in
 //! the age secret store. Live catalogs are fetched only after egress consent and
-//! are intersected with the owner allowlist.
+//! are intersected with the owner allowlist. Mistral, DeepSeek, MiniMax (including
+//! M Plan on the same OpenAI-compatible host), MiniMax China, and Muse pin catalog
+//! fetches to their documented hosts.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -25,7 +27,49 @@ const MUSE_API_HOST: &str = "api.meta.ai";
 const MUSE_MINT_PATH: &str = "/muse-code/key";
 const GOOGLE_TOKEN_HOST: &str = "oauth2.googleapis.com";
 const GOOGLE_TOKEN_PATH: &str = "/token";
-const USER_AGENT: &str = "SeraBot/0.1";
+pub(crate) const USER_AGENT: &str = "SeraBot/0.1";
+
+/// Documented model-list endpoints. Chat may use a `/v1` base; DeepSeek's list
+/// is on the host root (`GET /models`), not `GET /v1/models`.
+const OFFICIAL_CATALOGS: &[OfficialCatalog] = &[
+    OfficialCatalog {
+        kind: "mistral",
+        host: "api.mistral.ai",
+        path: "/v1/models",
+    },
+    OfficialCatalog {
+        kind: "deepseek",
+        host: "api.deepseek.com",
+        path: "/models",
+    },
+    OfficialCatalog {
+        kind: "minimax",
+        host: "api.minimax.io",
+        path: "/v1/models",
+    },
+    OfficialCatalog {
+        kind: "minimax-cn",
+        host: "api.minimaxi.com",
+        path: "/v1/models",
+    },
+    OfficialCatalog {
+        kind: "muse-code",
+        host: "api.meta.ai",
+        path: "/v1/models",
+    },
+];
+
+struct OfficialCatalog {
+    kind: &'static str,
+    host: &'static str,
+    path: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCatalog {
+    pub url: String,
+    pub strict: bool,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct BuiltinProvider {
@@ -40,25 +84,25 @@ const BUILTINS: &[BuiltinProvider] = &[
         kind: "mistral",
         base_url: Some("https://api.mistral.ai/v1"),
         auth: "api_key",
-        summary: "Mistral chat; GET /models catalog",
+        summary: "Mistral chat; catalog GET https://api.mistral.ai/v1/models",
     },
     BuiltinProvider {
         kind: "deepseek",
         base_url: Some("https://api.deepseek.com/v1"),
         auth: "api_key",
-        summary: "DeepSeek chat; GET /models catalog",
+        summary: "DeepSeek chat; catalog GET https://api.deepseek.com/models",
     },
     BuiltinProvider {
         kind: "minimax",
         base_url: Some("https://api.minimax.io/v1"),
         auth: "api_key",
-        summary: "MiniMax global OpenAI-compatible chat",
+        summary: "MiniMax global and M Plan; catalog GET https://api.minimax.io/v1/models",
     },
     BuiltinProvider {
         kind: "minimax-cn",
         base_url: Some("https://api.minimaxi.com/v1"),
         auth: "api_key",
-        summary: "MiniMax China OpenAI-compatible chat",
+        summary: "MiniMax China chat; catalog GET https://api.minimaxi.com/v1/models",
     },
     BuiltinProvider {
         kind: "openai",
@@ -112,7 +156,7 @@ const BUILTINS: &[BuiltinProvider] = &[
         kind: "muse-code",
         base_url: Some("https://api.meta.ai/v1"),
         auth: "oauth",
-        summary: "Muse Code device login, minted key, GET /models",
+        summary: "Muse Code device login, minted key, catalog GET https://api.meta.ai/v1/models",
     },
     BuiltinProvider {
         kind: "google-antigravity",
@@ -231,9 +275,7 @@ pub fn auth_plan(kind: &str, auth: &str) -> Result<AuthPlan> {
                 "oauth auth is only supported for muse-code and google-antigravity".into(),
             )),
         },
-        _ => Err(SeraError::Config(
-            "auth must be api_key or oauth".into(),
-        )),
+        _ => Err(SeraError::Config("auth must be api_key or oauth".into())),
     }
 }
 
@@ -246,7 +288,7 @@ pub fn check_profile(
     catalog_fetch: bool,
     catalog_ttl_secs: u64,
 ) -> Result<()> {
-    let _ = resolve_base_url(kind, base_url)?;
+    let endpoint = resolve_base_url(kind, base_url)?;
     match auth_plan(kind, auth)? {
         AuthPlan::ApiKey => {
             if !refresh_token_secret.trim().is_empty() {
@@ -271,7 +313,47 @@ pub fn check_profile(
             "catalog_ttl_secs must be between 1 and 86400 when catalog_fetch is true".into(),
         ));
     }
+    if catalog_fetch {
+        resolve_catalog(kind, &endpoint)?;
+    }
     Ok(())
+}
+
+pub fn resolve_catalog(kind: &str, base_url: &str) -> Result<ResolvedCatalog> {
+    let kind = canonical_kind(kind)?;
+    let base = validate_base_url(base_url)?;
+    let parsed =
+        url::Url::parse(&base).map_err(|_| SeraError::Config("invalid catalog base url".into()))?;
+    if let Some(spec) = OFFICIAL_CATALOGS.iter().find(|item| item.kind == kind) {
+        if is_exact_loopback(&parsed) {
+            return Ok(ResolvedCatalog {
+                url: validate_base_url(&format!("{base}/models"))?,
+                strict: true,
+            });
+        }
+        let host = parsed.host_str().unwrap_or("");
+        if !host.eq_ignore_ascii_case(spec.host) {
+            return Err(SeraError::Config(
+                "catalog fetch for this provider only contacts its documented host".into(),
+            ));
+        }
+        return Ok(ResolvedCatalog {
+            url: validate_base_url(&format!("https://{}{}", spec.host, spec.path))?,
+            strict: true,
+        });
+    }
+    Ok(ResolvedCatalog {
+        url: validate_base_url(&format!("{base}/models"))?,
+        strict: false,
+    })
+}
+
+fn is_exact_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip == std::net::Ipv4Addr::LOCALHOST,
+        Some(url::Host::Ipv6(ip)) => ip == std::net::Ipv6Addr::LOCALHOST,
+        _ => false,
+    }
 }
 
 pub fn enforce_oauth_target(style: OAuthStyle, token_url: &str) -> Result<String> {
@@ -332,6 +414,62 @@ pub fn parse_model_ids(bytes: &[u8]) -> Result<BTreeSet<String>> {
         ));
     }
     Ok(ids)
+}
+
+/// Official Mistral, DeepSeek, and MiniMax lists are `{object:list, data:[{id, object:model}]}`.
+/// Unexpected shapes fail closed. Ids and response bodies are never copied into errors.
+pub fn parse_official_catalog(bytes: &[u8]) -> Result<BTreeSet<String>> {
+    if bytes.len() > 1_048_576 {
+        return Err(SeraError::External("model catalog is too large".into()));
+    }
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|_| SeraError::External("malformed model catalog".into()))?;
+    if value.get("object").and_then(Value::as_str) != Some("list") {
+        return Err(SeraError::External("model catalog was not a list".into()));
+    }
+    let entries = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| SeraError::External("model catalog has no model list".into()))?;
+    if entries.len() > 4_000 {
+        return Err(SeraError::External("model catalog is too large".into()));
+    }
+    let mut ids = BTreeSet::new();
+    for entry in entries {
+        if entry
+            .get("object")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind != "model")
+        {
+            continue;
+        }
+        if entry
+            .pointer("/capabilities/completion_chat")
+            .and_then(Value::as_bool)
+            == Some(false)
+        {
+            continue;
+        }
+        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if official_model_id(id) {
+            ids.insert(id.to_owned());
+        }
+    }
+    if ids.is_empty() {
+        return Err(SeraError::External(
+            "model catalog contained no usable model ids".into(),
+        ));
+    }
+    Ok(ids)
+}
+
+fn official_model_id(model: &str) -> bool {
+    valid_model_id(model)
+        && model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '+'))
 }
 
 pub async fn muse_mint_api_key(
@@ -481,10 +619,7 @@ where
             http,
             &endpoints.token,
             &[
-                (
-                    "grant_type",
-                    "urn:ietf:params:oauth:grant-type:device_code",
-                ),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("device_code", device_code.as_str()),
                 ("client_id", MUSE_CLIENT_ID),
             ],
@@ -562,7 +697,9 @@ async fn post_form(
         .await
         .map_err(|_| SeraError::External("Muse login request failed".into()))?;
     if bytes.len() > 65_536 {
-        return Err(SeraError::External("Muse login response is too large".into()));
+        return Err(SeraError::External(
+            "Muse login response is too large".into(),
+        ));
     }
     let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     Ok((status, value))
@@ -649,11 +786,7 @@ mod tests {
             "https://api.minimax.io/v1"
         );
         assert!(
-            resolve_base_url(
-                "google-antigravity",
-                "https://cloudcode-pa.googleapis.com"
-            )
-            .is_err()
+            resolve_base_url("google-antigravity", "https://cloudcode-pa.googleapis.com").is_err()
         );
         assert!(
             resolve_base_url(
@@ -788,5 +921,116 @@ mod tests {
         assert!(message.contains("rejected"));
         assert!(!message.contains("device-secret"));
         assert!(!message.contains("evil.example"));
+    }
+
+    #[test]
+    fn official_catalogs_pin_documented_hosts_and_deepseek_root_path() {
+        assert_eq!(
+            resolve_catalog("mistral", "https://api.mistral.ai/v1")
+                .unwrap()
+                .url,
+            "https://api.mistral.ai/v1/models"
+        );
+        assert_eq!(
+            resolve_catalog("deepseek", "https://api.deepseek.com/v1")
+                .unwrap()
+                .url,
+            "https://api.deepseek.com/models"
+        );
+        assert_eq!(
+            resolve_catalog("minimax", "https://api.minimax.io/v1")
+                .unwrap()
+                .url,
+            "https://api.minimax.io/v1/models"
+        );
+        assert_eq!(
+            resolve_catalog("minimax-cn", "https://api.minimaxi.com/v1")
+                .unwrap()
+                .url,
+            "https://api.minimaxi.com/v1/models"
+        );
+        assert_eq!(
+            resolve_catalog("muse-code", "https://api.meta.ai/v1")
+                .unwrap()
+                .url,
+            "https://api.meta.ai/v1/models"
+        );
+        let loopback = resolve_catalog("mistral", "http://127.0.0.1:9/v1").unwrap();
+        assert!(loopback.strict);
+        assert_eq!(loopback.url, "http://127.0.0.1:9/v1/models");
+        let generic = resolve_catalog("openai-compatible", "https://api.example.com/v1").unwrap();
+        assert!(!generic.strict);
+        assert_eq!(generic.url, "https://api.example.com/v1/models");
+        let mismatch = resolve_catalog("minimax", "https://evil.example/v1").unwrap_err();
+        let message = mismatch.to_string();
+        assert!(message.contains("documented host"));
+        assert!(!message.contains("evil.example"));
+        assert!(
+            check_profile(
+                "deepseek",
+                "https://proxy.example/v1",
+                "",
+                "",
+                "",
+                false,
+                1800
+            )
+            .is_ok()
+        );
+        assert!(
+            check_profile(
+                "deepseek",
+                "https://proxy.example/v1",
+                "",
+                "",
+                "",
+                true,
+                1800
+            )
+            .is_err()
+        );
+        assert!(check_profile("deepseek", "", "", "", "", true, 1800).is_ok());
+    }
+
+    #[test]
+    fn official_catalog_parser_keeps_chat_ids_and_drops_secrets() {
+        let secret = "synthetic-catalog-secret";
+        let ids = parse_official_catalog(
+            serde_json::to_vec(&json!({
+                "object": "list",
+                "data": [
+                    {"id": "mistral-large-latest", "object": "model", "capabilities": {"completion_chat": true}},
+                    {"id": "mistral-embed", "object": "model", "capabilities": {"completion_chat": false}, "description": secret},
+                    {"id": "bad/id", "object": "model", "owned_by": secret},
+                    {"id": "ft:open-mistral-7b:abc", "object": "model"},
+                    {"id": "MiniMax-M3.1-Flash", "object": "model"},
+                    {"id": "deepseek-flash", "object": "model", "name": "DeepSeek-V4.1-Flash"}
+                ]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            ids.into_iter().collect::<Vec<_>>(),
+            vec![
+                "MiniMax-M3.1-Flash".to_string(),
+                "deepseek-flash".to_string(),
+                "ft:open-mistral-7b:abc".to_string(),
+                "mistral-large-latest".to_string(),
+            ]
+        );
+        let rejected = parse_official_catalog(
+            serde_json::to_vec(&json!({
+                "object": "model",
+                "id": secret,
+                "data": [{"id": "kept"}]
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap_err();
+        assert!(!rejected.to_string().contains(secret));
+        assert!(parse_official_catalog(br#"{"models":[{"id":"kept"}]}"#).is_err());
     }
 }

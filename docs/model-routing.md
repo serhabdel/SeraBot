@@ -1,7 +1,10 @@
 # Model routing
 
 SeraBot talks to OpenAI-compatible chat-completion endpoints. Routing is
-configuration-driven. Builtin kinds supply an OpenAI-compatible base. A live `GET /models` catalog is optional, cached, and intersected with the allowlist. There is no automatic cross-provider fallback and no client-supplied endpoint.
+configuration-driven. Builtin kinds supply an OpenAI-compatible base. A live
+model catalog is optional, cached in process memory, and intersected with the
+allowlist. There is no automatic cross-provider fallback and no client-supplied
+endpoint.
 
 ## Providers and allowed models
 
@@ -13,7 +16,7 @@ base_url = "https://api.mistral.ai/v1"
 model = "mistral-large-latest"
 api_key_secret = "llm_api_key"        # name in the encrypted secret store
 kind = "mistral"                      # or deepseek, minimax, openai, groq, ...
-catalog_fetch = false                 # true fetches GET {base}/models
+catalog_fetch = false                 # true fetches the documented model list
 data_egress_approved = false
 models = [
   "mistral-medium-latest",
@@ -134,11 +137,22 @@ Model content is not written to the audit log.
 ## Operational notes
 
 - With `catalog_fetch = false`, advertised models are exactly the configured allowlist.
-- With `catalog_fetch = true` and `data_egress_approved = true`, SeraBot caches `GET {base}/models` for `catalog_ttl_secs` (1..=86400, default 1800) and advertises only the allowlist intersection. A failed or stale refresh closes the cache: no models are advertised and chat is refused. Unapproved providers are not contacted.
-- Builtin kinds: mistral, deepseek, minimax, minimax-cn, openai, groq, together, fireworks, openrouter, xai, cerebras, moonshot, muse-code, google-antigravity. Empty kind or `openai-compatible` requires `base_url`. Cloud Code Assist hosts are rejected.
-- `serabot providers kinds` lists kinds without a network call. `serabot providers login muse-code` stores the minted key and identity token in the age secret store and prints only the verification URL and user code.
+- With `catalog_fetch = true` and `data_egress_approved = true`, SeraBot caches the provider's model list for `catalog_ttl_secs` (1..=86400, default 1800) and advertises only the allowlist intersection. A failed, malformed, or stale refresh closes the cache: no models are advertised and chat is refused. Unapproved providers are not contacted. The previous list is not kept across a failed refresh.
+- Catalog responses and errors never include endpoints, response bodies, or credentials. Audit event `model.catalog_refreshed` records provider, verified, and model_count only.
+- Official catalogs are host-pinned and parsed strictly (`object` must be `list`, ids come from `data[].id`). A non-chat Mistral card (`capabilities.completion_chat = false`) is ignored. Loopback bases are the fixture exception and append `/models` to that base.
+
+  | Kind | Chat base | Catalog |
+  | --- | --- | --- |
+  | `mistral` | `https://api.mistral.ai/v1` | `GET https://api.mistral.ai/v1/models` |
+  | `deepseek` | `https://api.deepseek.com/v1` | `GET https://api.deepseek.com/models` |
+  | `minimax` | `https://api.minimax.io/v1` | `GET https://api.minimax.io/v1/models` |
+  | `minimax-cn` | `https://api.minimaxi.com/v1` | `GET https://api.minimaxi.com/v1/models` |
+  | `muse-code` | `https://api.meta.ai/v1` | `GET https://api.meta.ai/v1/models` |
+
+  MiniMax M Plan uses the same `minimax` kind and catalog. The subscription key and a pay-as-you-go key are different secrets; store one name in `api_key_secret` (for example `minimax_m_plan_key`). Example allowlist ids from the public docs are `MiniMax-M3.1-Flash` and `MiniMax-M3`. DeepSeek's public list uses ids such as `deepseek-flash` and `deepseek-v4-pro`. The live response is authoritative; new ids are not written back into config.
+- Other builtin kinds (openai, groq, together, fireworks, openrouter, xai, cerebras, moonshot) and `openai-compatible` use `GET {base}/models` with the looser parser. Empty kind or `openai-compatible` requires `base_url`. Cloud Code Assist hosts are rejected.
+- `serabot providers kinds` lists kinds without a network call. `serabot providers login muse-code` stores the minted key and identity token in the age secret store and prints only the verification URL and user code. A later 401 mints a replacement key from that identity token.
 - `google-antigravity` refreshes an OAuth token when a refresh secret and client secret are stored. It has no default chat base and does not speak the Cloud Code Assist protocol.
-- Audit event `model.catalog_refreshed` records provider, verified, and model_count only.
 - Per-call auditing occurs after each model response, so usage totals are
   approximate if a call fails mid-stream.
 - `max_output_tokens`, timeouts, retries, tool-round limits, and SSRF/fetch policy
@@ -147,3 +161,11 @@ Model content is not written to the audit log.
   SeraBot does not truncate prompts to a local input cap. Tune
   `max_output_tokens`, `[runtime].history_limit`, and tool limits for ~4 GB RAM
   hosts so concurrent turns stay within memory budget.
+
+## Not in this build
+
+- No browser PKCE login for `google-antigravity`, and no Cloud Code Assist model list or chat.
+- No MiniMax Anthropic-compatible protocol (`/anthropic`). M Plan text chat stays on the OpenAI-compatible base above.
+- Muse has device login and key mint. It has no separate catalog protocol beyond the pinned `GET /v1/models`.
+- openai, groq, together, fireworks, openrouter, xai, cerebras, and moonshot are not host-pinned.
+- The catalog cache is process memory. A restart fetches again when egress is approved.

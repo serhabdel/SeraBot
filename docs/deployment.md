@@ -79,7 +79,7 @@ models = []                 # extra allowed models for the "default" provider
 # [llm.providers.<id>]      # optional additional profiles
 ```
 
-`data_egress_approved` remains `false` unless explicitly approved by the owner. `catalog_fetch` fails closed: an unapproved provider is not contacted, and a failed catalog refresh advertises no models.
+`data_egress_approved` remains `false` unless explicitly approved by the owner. `catalog_fetch` fails closed: an unapproved provider is not contacted, and a failed catalog refresh advertises no models. Mistral, DeepSeek, and MiniMax (M Plan uses the `minimax` kind) only fetch catalogs from their documented hosts. See [Model routing](model-routing.md).
 If no extra profiles are configured, the catalog contains only `default` and
 per-bot model overrides.
 

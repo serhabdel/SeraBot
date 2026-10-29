@@ -10,7 +10,8 @@ use crate::error::{Result, SeraError};
 use crate::gateway::ToolSpec;
 use crate::llm::{LlmClient, LlmResponse};
 use crate::providers::{
-    AuthPlan, auth_plan, canonical_kind, check_profile, resolve_base_url, valid_model_id,
+    AuthPlan, auth_plan, canonical_kind, check_profile, resolve_base_url, resolve_catalog,
+    valid_model_id,
 };
 use crate::util::sha256_hex;
 
@@ -65,7 +66,10 @@ pub struct CatalogRefresh {
 #[derive(Clone)]
 enum CatalogSnapshot {
     Closed,
-    Verified { at: Instant, models: BTreeSet<String> },
+    Verified {
+        at: Instant,
+        models: BTreeSet<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,6 +87,8 @@ struct Provider {
     kind: String,
     catalog_fetch: bool,
     catalog_ttl: Duration,
+    catalog_url: String,
+    catalog_strict: bool,
     catalog: Arc<Mutex<CatalogSnapshot>>,
 }
 
@@ -147,12 +153,20 @@ impl ModelRouter {
                 AuthPlan::ApiKey => "api_key",
                 AuthPlan::OAuth { .. } => "oauth",
             };
+            let resolved_catalog = if profile.catalog_fetch {
+                Some(resolve_catalog(&kind, &endpoint)?)
+            } else {
+                None
+            };
+            let catalog_strict = resolved_catalog.as_ref().is_some_and(|item| item.strict);
+            let catalog_url = resolved_catalog.map(|item| item.url).unwrap_or_default();
             let fingerprint = sha256_hex(serde_json::to_vec(&(
                 &endpoint,
                 &profile.api_key_secret,
                 profile.data_egress_approved,
                 &kind,
                 profile.catalog_fetch,
+                &catalog_url,
                 auth_label,
             ))?);
             providers.insert(
@@ -165,6 +179,8 @@ impl ModelRouter {
                     kind,
                     catalog_fetch: profile.catalog_fetch,
                     catalog_ttl: Duration::from_secs(profile.catalog_ttl_secs.max(1)),
+                    catalog_url,
+                    catalog_strict,
                     catalog: Arc::new(Mutex::new(CatalogSnapshot::Closed)),
                 },
             );
@@ -228,12 +244,15 @@ impl ModelRouter {
             .iter()
             .flat_map(|(id, provider)| {
                 let verified = provider.catalog_verified();
-                provider.advertised().into_iter().map(move |model| CatalogEntry {
-                    provider: id.clone(),
-                    model,
-                    data_egress_approved: provider.data_egress_approved,
-                    catalog_verified: verified,
-                })
+                provider
+                    .advertised()
+                    .into_iter()
+                    .map(move |model| CatalogEntry {
+                        provider: id.clone(),
+                        model,
+                        data_egress_approved: provider.data_egress_approved,
+                        catalog_verified: verified,
+                    })
             })
             .collect()
     }
@@ -283,12 +302,25 @@ impl ModelRouter {
                 model_count: provider.advertised().len(),
             });
         }
-        match provider.client.list_models().await {
+        if provider.catalog_url.is_empty() {
+            *provider
+                .catalog
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = CatalogSnapshot::Closed;
+            return Ok(CatalogRefresh {
+                provider: id.to_owned(),
+                fetched: true,
+                verified: false,
+                model_count: 0,
+            });
+        }
+        match provider
+            .client
+            .fetch_model_catalog(&provider.catalog_url, provider.catalog_strict)
+            .await
+        {
             Ok(models) => {
-                let model_count = provider
-                    .models
-                    .intersection(&models)
-                    .count();
+                let model_count = provider.models.intersection(&models).count();
                 *provider
                     .catalog
                     .lock()
@@ -517,7 +549,9 @@ impl ModelRouter {
 
 impl Provider {
     fn lock_catalog(&self) -> std::sync::MutexGuard<'_, CatalogSnapshot> {
-        self.catalog.lock().unwrap_or_else(|error| error.into_inner())
+        self.catalog
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     fn is_fresh(&self) -> bool {
@@ -960,7 +994,11 @@ mod tests {
                 .is_err()
         );
         let requests = server.received_requests().await.unwrap();
-        assert!(requests.iter().all(|request| request.url.path() != "/chat/completions"));
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() != "/chat/completions")
+        );
     }
 
     #[tokio::test]
@@ -1006,8 +1044,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/models"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"data": [{"id": "kept"}]})),
+                ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "kept"}]})),
             )
             .with_priority(1)
             .up_to_n_times(1)
@@ -1032,5 +1069,150 @@ mod tests {
         router.refresh_catalogs().await.unwrap();
         assert!(router.catalog()[0].models.is_empty());
         assert!(!router.catalog()[0].catalog_verified);
+    }
+
+    #[tokio::test]
+    async fn minimax_m_plan_catalog_intersects_allowlist_and_rejects_loose_shapes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(header("authorization", "Bearer synthetic-m-plan"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [
+                    {"id": "MiniMax-M3.1-Flash", "object": "model", "owned_by": "minimax"},
+                    {"id": "MiniMax-M3", "object": "model", "owned_by": "minimax"},
+                    {"id": "not/an id", "object": "model", "owned_by": "synthetic-catalog-secret"}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let base = format!("{}/v1", server.uri());
+        let config = LlmConfig {
+            base_url: base.clone(),
+            model: "MiniMax-M3.1-Flash".into(),
+            data_egress_approved: true,
+            kind: "minimax".into(),
+            catalog_fetch: true,
+            catalog_ttl_secs: 60,
+            models: vec!["MiniMax-M3".into(), "MiniMax-M2".into()],
+            ..LlmConfig::default()
+        };
+        let clients = BTreeMap::from([(
+            "default".into(),
+            LlmClient::new(&base, "synthetic-m-plan", 1, 100).unwrap(),
+        )]);
+        let router = ModelRouter::new(&config, clients).unwrap();
+        let reports = router.refresh_catalogs().await.unwrap();
+        assert!(reports[0].fetched && reports[0].verified);
+        assert_eq!(reports[0].model_count, 2);
+        assert_eq!(
+            router.catalog()[0].models,
+            vec!["MiniMax-M3".to_string(), "MiniMax-M3.1-Flash".to_string()]
+        );
+        assert!(
+            router
+                .catalog_gate(&ModelSelection {
+                    provider: "default".into(),
+                    model: "MiniMax-M2".into(),
+                })
+                .is_err()
+        );
+
+        let loose = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"id": "MiniMax-M3.1-Flash"}]
+            })))
+            .mount(&loose)
+            .await;
+        let loose_base = format!("{}/v1", loose.uri());
+        let loose_config = LlmConfig {
+            base_url: loose_base.clone(),
+            model: "MiniMax-M3.1-Flash".into(),
+            data_egress_approved: true,
+            kind: "mistral".into(),
+            catalog_fetch: true,
+            catalog_ttl_secs: 60,
+            ..LlmConfig::default()
+        };
+        let loose_router = ModelRouter::new(
+            &loose_config,
+            BTreeMap::from([(
+                "default".into(),
+                LlmClient::new(&loose_base, "synthetic-key", 1, 100).unwrap(),
+            )]),
+        )
+        .unwrap();
+        let loose_reports = loose_router.refresh_catalogs().await.unwrap();
+        assert!(loose_reports[0].fetched && !loose_reports[0].verified);
+        assert!(loose_router.catalog()[0].models.is_empty());
+        let route = loose_router
+            .pin(&ModelSelection {
+                provider: "default".into(),
+                model: "MiniMax-M3.1-Flash".into(),
+            })
+            .unwrap();
+        assert!(
+            loose_router
+                .complete(&route, &[LlmMessage::user("synthetic")], &[], None)
+                .await
+                .is_err()
+        );
+        assert!(
+            loose
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.url.path() != "/v1/chat/completions")
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_catalog_uses_host_root_on_loopback_fixtures() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [
+                    {"id": "deepseek-flash", "object": "model", "owned_by": "deepseek"},
+                    {"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek"}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config = LlmConfig {
+            base_url: server.uri(),
+            model: "deepseek-flash".into(),
+            data_egress_approved: true,
+            kind: "deepseek".into(),
+            catalog_fetch: true,
+            catalog_ttl_secs: 60,
+            models: vec!["deepseek-chat".into()],
+            ..LlmConfig::default()
+        };
+        let clients = BTreeMap::from([(
+            "default".into(),
+            LlmClient::new(server.uri(), "synthetic-key", 1, 100).unwrap(),
+        )]);
+        let router = ModelRouter::new(&config, clients).unwrap();
+        router.refresh_catalogs().await.unwrap();
+        assert_eq!(
+            router.catalog()[0].models,
+            vec!["deepseek-flash".to_string()]
+        );
+        let paths: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|request| request.url.path().to_owned())
+            .collect();
+        assert_eq!(paths, vec!["/models".to_string()]);
     }
 }

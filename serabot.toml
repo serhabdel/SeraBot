@@ -67,16 +67,19 @@ models = [
 # [llm.providers.deepseek]
 # kind = "deepseek"
 # api_key_secret = "deepseek_api_key"
-# models = ["deepseek-chat", "deepseek-reasoner"]
+# models = ["deepseek-flash", "deepseek-v4-pro"]
 # catalog_fetch = true
 # data_egress_approved = false
+# Chat base is https://api.deepseek.com/v1. The catalog is GET https://api.deepseek.com/models.
 #
 # [llm.providers.minimax]
 # kind = "minimax"
-# api_key_secret = "minimax_api_key"
-# models = ["MiniMax-M2"]
+# api_key_secret = "minimax_m_plan_key"
+# models = ["MiniMax-M3.1-Flash", "MiniMax-M3"]
 # catalog_fetch = true
 # data_egress_approved = false
+# M Plan subscription keys and pay-as-you-go keys are different secrets. Same catalog:
+# GET https://api.minimax.io/v1/models. Store the secret name only.
 #
 # [llm.providers.openai]
 # kind = "openai"

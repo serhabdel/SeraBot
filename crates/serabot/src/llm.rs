@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 use zeroize::Zeroize;
 
 use crate::providers::{
-    OAuthMaterial, OAuthStyle, enforce_oauth_target, muse_mint_api_key, parse_model_ids,
-    refresh_token_grant,
+    OAuthMaterial, OAuthStyle, USER_AGENT, enforce_oauth_target, muse_mint_api_key,
+    parse_model_ids, parse_official_catalog, refresh_token_grant,
 };
 
 use crate::domain::{LlmMessage, Role, ToolCall};
@@ -222,7 +222,16 @@ impl LlmClient {
     }
 
     pub async fn list_models(&self) -> Result<std::collections::BTreeSet<String>> {
-        let url = format!("{}/models", self.base_url);
+        self.fetch_model_catalog(&format!("{}/models", self.base_url), false)
+            .await
+    }
+
+    pub(crate) async fn fetch_model_catalog(
+        &self,
+        catalog_url: &str,
+        strict: bool,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let url = validate_base_url(catalog_url)?;
         let mut refreshed = false;
         let mut last_error = None;
         for attempt in 0..=self.max_retries + 1 {
@@ -231,6 +240,7 @@ impl LlmClient {
                 .http
                 .get(&url)
                 .bearer_auth(&key)
+                .header("user-agent", USER_AGENT)
                 .header("accept", "application/json")
                 .send()
                 .await;
@@ -243,12 +253,23 @@ impl LlmClient {
                         self.refresh_oauth().await?;
                         continue;
                     }
-                    if status.is_success() {
-                        let bytes = response.bytes().await.map_err(|_| {
-                            SeraError::External("model catalog read failed".into())
-                        })?;
-                        return parse_model_ids(&bytes);
+                    if catalog_body_too_large(&response) {
+                        last_error = Some(SeraError::External("model catalog is too large".into()));
+                        break;
                     }
+                    if status.is_success() {
+                        let bytes = response
+                            .bytes()
+                            .await
+                            .map_err(|_| SeraError::External("model catalog read failed".into()))?;
+                        return if strict {
+                            parse_official_catalog(&bytes)
+                        } else {
+                            parse_model_ids(&bytes)
+                        };
+                    }
+                    // Drop the body. Provider errors can echo credentials; the status is enough.
+                    let _ = response.bytes().await;
                     let retryable = status.as_u16() == 429 || status.is_server_error();
                     last_error = Some(SeraError::External(format!(
                         "model catalog failed with status {}",
@@ -268,13 +289,15 @@ impl LlmClient {
                 }
             }
         }
-        Err(last_error.unwrap_or_else(|| SeraError::External("model catalog request failed".into())))
+        Err(last_error
+            .unwrap_or_else(|| SeraError::External("model catalog request failed".into())))
     }
 
     async fn refresh_oauth(&self) -> Result<()> {
-        let oauth = self.oauth.as_ref().ok_or_else(|| {
-            SeraError::External("oauth refresh is not configured".into())
-        })?;
+        let oauth = self
+            .oauth
+            .as_ref()
+            .ok_or_else(|| SeraError::External("oauth refresh is not configured".into()))?;
         let token = match oauth.style {
             OAuthStyle::MuseMint => {
                 muse_mint_api_key(
@@ -301,6 +324,10 @@ impl LlmClient {
             .unwrap_or_else(|error| error.into_inner()) = SecretString::new(token);
         Ok(())
     }
+}
+
+fn catalog_body_too_large(response: &reqwest::Response) -> bool {
+    response.content_length().is_some_and(|len| len > 1_048_576)
 }
 
 pub(crate) fn validate_base_url(value: &str) -> Result<String> {
@@ -575,5 +602,67 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn catalog_errors_omit_response_bodies() {
+        let server = MockServer::start().await;
+        let secret = "synthetic-catalog-secret";
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(secret))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), "synthetic-key", 10, 100).unwrap();
+        let error = client.list_models().await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("500"));
+        assert!(!message.contains(secret));
+        assert!(!message.contains("synthetic-key"));
+    }
+
+    #[tokio::test]
+    async fn catalog_401_mints_a_muse_key_without_echoing_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer minted-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "muse-spark"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer old-key"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("old-key identity-token"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/muse-code/key"))
+            .and(header("authorization", "Bearer identity-token"))
+            .and(header("user-agent", USER_AGENT))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "api_key": "minted-key"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), "old-key", 10, 100)
+            .unwrap()
+            .with_oauth_unpinned(OAuthMaterial {
+                style: OAuthStyle::MuseMint,
+                refresh_token: "identity-token".into(),
+                token_url: format!("{}/muse-code/key", server.uri()),
+                client_id: String::new(),
+                client_secret: String::new(),
+            })
+            .unwrap();
+        let ids = client.list_models().await.unwrap();
+        assert!(ids.contains("muse-spark"));
+        assert!(!format!("{ids:?}").contains("identity-token"));
+        assert!(!format!("{ids:?}").contains("old-key"));
     }
 }
