@@ -956,7 +956,13 @@ impl Runtime {
         let temperature = bot.config.temperature;
         self.checked_route(&state.route)?;
 
-        for _ in 0..self.config.runtime.max_tool_iterations.max(1) {
+        let tool_round_cap = self
+            .config
+            .runtime
+            .max_tool_iterations
+            .max(self.config.llm.max_tool_rounds)
+            .max(1);
+        for _ in 0..tool_round_cap {
             if self.shutdown.is_cancelled() {
                 return Err(SeraError::Internal("shutting down".into()));
             }

@@ -639,8 +639,8 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             max_concurrent_turns: 2,
-            max_tool_calls_per_turn: 8,
-            max_tool_iterations: 6,
+            max_tool_calls_per_turn: default_max_tool_calls(),
+            max_tool_iterations: default_tool_iterations(),
             task_lease_secs: default_lease(),
             worker_poll_ms: default_poll(),
             history_limit: default_history_limit(),
@@ -928,10 +928,10 @@ fn default_llm_timeout() -> u64 {
     120
 }
 fn default_max_tool_rounds() -> usize {
-    6
+    10
 }
 fn default_max_output_tokens() -> u32 {
-    4096
+    32768
 }
 fn default_data_egress_approved() -> bool {
     false
@@ -1036,10 +1036,10 @@ fn default_max_turns() -> usize {
     2
 }
 fn default_max_tool_calls() -> usize {
-    8
+    12
 }
 fn default_tool_iterations() -> usize {
-    6
+    10
 }
 fn default_lease() -> u64 {
     300
@@ -1048,7 +1048,7 @@ fn default_poll() -> u64 {
     500
 }
 fn default_history_limit() -> usize {
-    30
+    50
 }
 fn default_tick() -> u64 {
     30

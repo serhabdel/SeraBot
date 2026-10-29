@@ -37,8 +37,8 @@ base_url = "https://api.mistral.ai/v1"
 model = "mistral-large-latest"
 api_key_secret = "llm_api_key"
 timeout_secs = 120
-max_tool_rounds = 6
-max_output_tokens = 4096
+max_tool_rounds = 10
+max_output_tokens = 32768
 data_egress_approved = false
 # Extra allowed models for the reserved "default" provider (no network discovery).
 models = []
@@ -96,11 +96,11 @@ max_pages = 30
 
 [runtime]
 max_concurrent_turns = 2
-max_tool_calls_per_turn = 8
-max_tool_iterations = 6
+max_tool_calls_per_turn = 12
+max_tool_iterations = 10
 task_lease_secs = 300
 worker_poll_ms = 500
-history_limit = 30
+history_limit = 50
 owner_standing_consent = false
 
 [schedule]
@@ -118,10 +118,10 @@ chunk_overlap = 150
 retrieval_k = 8
 
 [audio]
-enabled = false
+enabled = true
 provider = "default"
 transcription_model = "voxtral-mini-latest"
 understanding_model = "voxtral-small-latest"
 max_bytes = 52428800
-telegram_intake = false
+telegram_intake = true
 telegram_max_bytes = 20971520

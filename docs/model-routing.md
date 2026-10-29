@@ -124,3 +124,7 @@ Model content is not written to the audit log.
   approximate if a call fails mid-stream.
 - `max_output_tokens`, timeouts, retries, tool-round limits, and SSRF/fetch policy
   remain global under `[llm]` and gateway configuration.
+- Large provider context windows (for example 1M tokens) are enforced by the API;
+  SeraBot does not truncate prompts to a local input cap. Tune
+  `max_output_tokens`, `[runtime].history_limit`, and tool limits for ~4 GB RAM
+  hosts so concurrent turns stay within memory budget.

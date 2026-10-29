@@ -36,8 +36,10 @@ base_url = "https://api.mistral.ai/v1"
 model = "mistral-large-latest"
 api_key_secret = "llm_api_key"
 timeout_secs = 120
-max_tool_rounds = 6
-max_output_tokens = 4096
+# Tool rounds: runtime.max_tool_iterations and llm.max_tool_rounds; loop uses the higher value.
+max_tool_rounds = 10
+# Provider may advertise 1M+ context; SeraBot forwards max_tokens only (no local input cap).
+max_output_tokens = 32768
 # Set true only after you accept that selected prompt/document passages leave this host.
 data_egress_approved = false
 # [llm] is the reserved "default" provider. Its model and bot overrides are allowed too.
@@ -113,11 +115,11 @@ max_pages = 30
 
 [runtime]
 max_concurrent_turns = 2
-max_tool_calls_per_turn = 8
-max_tool_iterations = 6
+max_tool_calls_per_turn = 12
+max_tool_iterations = 10
 task_lease_secs = 300
 worker_poll_ms = 500
-history_limit = 30
+history_limit = 50
 owner_standing_consent = false
 
 [schedule]
@@ -138,6 +140,7 @@ retrieval_k = 8
 [audio]
 enabled = false
 provider = "default"
+# Set enabled + telegram_intake true for owner voice notes in inbox (tools still need approval).
 # base_url = "https://api.mistral.ai/v1"
 # api_key_secret = "llm_api_key"
 transcription_model = "voxtral-mini-latest"
