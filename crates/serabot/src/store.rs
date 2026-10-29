@@ -1292,7 +1292,9 @@ fn conversation_from_row(row: &Row<'_>) -> rusqlite::Result<StoredConversation> 
     })
 }
 
-fn parse_stored_conversation_kind(kind: &str) -> Result<crate::orchestration::ConversationKind> {
+pub(crate) fn parse_stored_conversation_kind(
+    kind: &str,
+) -> Result<crate::orchestration::ConversationKind> {
     use crate::orchestration::ConversationKind;
     match kind {
         "section" => Ok(ConversationKind::Section),

@@ -106,16 +106,20 @@ conversation column in **Chat**, and a content pane. It is responsive down to
 - **Rail** — Chat, Conversations, Memory, Providers, Connectors, Approvals,
   Fleet, and Settings. Icons are painted with the GPU painter; the build ships
   no image assets.
+- **Appearance** — **Settings → Appearance** switches the whole console between
+  a deep teal-black dark palette and a warm paper light palette. The choice is
+  saved locally in `settings.json`. Both use gradient backdrops, elevated cards,
+  painted avatars, and soft status chips.
 - **Top bar** — the active conversation title and kind, connection state, the
   per-conversation model chip, an update badge, and the command palette
   (`Ctrl+K`).
 - **Chat** — the conversation column lists server metadata (title, kind,
   last-message time) and supports search, open, and new direct threads. Messages
-  are bubbles by bot with timestamps; clicking a bubble copies its text. The
-  message list is virtualized: only visible rows are drawn, and wrapped galleys
-  are cached by message id and width, so scrolling and resizing do not re-wrap
-  the whole history. `stick_to_bottom` keeps the newest message in view unless
-  you scroll away; **Latest** returns to it.
+  are bubbles by bot with avatars, tails, and timestamps; clicking a bubble
+  copies its text. The message list is virtualized: only visible rows are drawn,
+  and wrapped galleys are cached by message id and width, so scrolling and
+  resizing do not re-wrap the whole history. `stick_to_bottom` keeps the newest
+  message in view unless you scroll away; **Latest** returns to it.
 - **Composer** — `Ctrl+Enter` sends; **Send** is enabled only when the catalog
   selection is saved and approved, no unknown outcome is pending, and the
   conversation accepts turns. Sections and groups are read-only structure.
@@ -123,6 +127,7 @@ conversation column in **Chat**, and a content pane. It is responsive down to
   a thread, and archive it (soft; messages stay on the server). Rooms are
   conversations with the orchestrator and the specialists it delegates to, not
   multi-person chats. The server assigns ids (`sec:`, `grp:`, `dir:`, `room:`).
+  Pre-kind legacy rows are shown as turn-capable direct threads.
 - **Memory** — list, search, add, and delete owner-scoped facts. Each write goes
   through `POST /v1/memories` and is audited. The screen states that the
   orchestrator receives the 20 most recently updated memories; specialists never
@@ -141,6 +146,8 @@ conversation column in **Chat**, and a content pane. It is responsive down to
   refreshed read per request gap; task polling remains as a stuck-stream guard
   and is the only path when the stream is unavailable. All network work stays
   off the UI thread.
+- **Fleet** — opening the screen loads the bot roster and skill packs
+  automatically (one read each, then on demand with **Refresh**).
 - Approvals load from `GET /v1/approvals`. Once / Always / Deny call
   `POST /v1/approvals/{id}/decide` with the same semantics as Telegram. Decisions
   still bind canonical arguments, destination, artifact hash, policy version,

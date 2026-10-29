@@ -69,14 +69,15 @@ Still on `main` from the earlier wake note (code through `795b139`):
 
 ## OVH
 
-Running **SeraBot 0.2.0**. Binary SHA-256
-`8ac709fecc9b4fe4609048a62eea6ec2e2aea354b6f2eceb8bc53b38b62d925a`, built
-locally in WSL Ubuntu 24.04 from `d810b9c+worktree` (reported as the
-`/healthz` build). Staged at `/var/lib/serabot/releases/serabot-8ac709fe`; the
-previous binary is `/var/lib/serabot/releases/serabot-pre-8ac709fe` (SHA-256
-`48519539099b5235471f96295911de063de46f2ab2fff50addae1832b8c93d1d`). Only
-`serabot.service` was restarted; `database user_version` is 4 and the queue was
-empty before the swap.
+Running **SeraBot 0.2.1**. Binary SHA-256
+`c6d47a83f1d95c4ce858bd3195f8ba2fb144536959f2eb4d6d5d1ddb4f00a3df`, built
+locally in WSL from the 0.2.2 worktree. Staged at
+`/var/lib/serabot/releases/serabot-c6d47a83`; the previous binary is
+`/var/lib/serabot/releases/serabot-pre-c6d47a83` (SHA-256
+`8ac709fecc9b4fe4609048a62eea6ec2e2aea354b6f2eceb8bc53b38b62d925a`). Legacy
+conversations now list as turn-capable direct threads, all six models and auto
+mode select successfully, and the queue was empty before the swap. Only
+`serabot.service` was restarted; `database user_version` is 4.
 
 `bot.seradyx.tech` is served by the dedicated `cloudflared-bot.service` to
 `127.0.0.1:8787`. The pre-existing dashboard-managed `cloudflared.service`, the
@@ -89,11 +90,10 @@ If historical journals ever contained `getUpdates` URLs (a build before
 with `serabot secrets set`. Do not paste the token, the journal line, or the
 URL into chat, tickets, or git.
 
-Roll back by restoring `serabot-pre-8ac709fe` onto `/opt/serabot/serabot` and
+Roll back by restoring `serabot-pre-c6d47a83` onto `/opt/serabot/serabot` and
 restarting **only** `serabot.service`. Leave Docker, OpenBot,
 `onedrive-mcp.service`, and both Cloudflare tunnels alone. Before replacing a
-busy binary, read the queue; it was empty of non-terminal tasks at this deploy
-(17 done and 2 failed rows).
+busy binary, read the queue; it was empty of non-terminal tasks at this deploy.
 
 New bots and skills are **not** hot-reloaded. `POST /v1/bots` and
 `POST /v1/skills` report `live: false`. `GET /v1/bots` lists the files anyway,

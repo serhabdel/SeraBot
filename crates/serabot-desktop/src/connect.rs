@@ -4,20 +4,11 @@
 //! [`crate::state::State::connected`] true. The token field is masked and the
 //! token is only persisted after that first successful reply.
 
-use crate::{ApiError, creds, valid_token, validate_endpoint};
-use eframe::egui::{self, Color32, Frame, Margin, RichText, Stroke};
+use crate::{ApiError, creds, design, valid_token, validate_endpoint};
+use eframe::egui::{self, Frame, Margin, RichText, Stroke};
 use secrecy::ExposeSecret;
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
-
-// Mirrors the palette in app.rs so both surfaces read as one product.
-const BG: Color32 = Color32::from_rgb(14, 17, 22);
-const PANEL: Color32 = Color32::from_rgb(22, 27, 34);
-const STROKE: Color32 = Color32::from_rgb(42, 50, 60);
-const TEAL: Color32 = Color32::from_rgb(88, 196, 178);
-const TEXT: Color32 = Color32::from_rgb(230, 236, 242);
-const MUTED: Color32 = Color32::from_rgb(140, 152, 168);
-const DANGER: Color32 = Color32::from_rgb(220, 110, 110);
 
 /// Connect-card state. `persisted` flips after the first authenticated Health
 /// reply has been written to settings + the credential store.
@@ -78,21 +69,22 @@ impl Drop for ConnectState {
 pub fn connect_screen(ctx: &egui::Context, state: &mut ConnectState, footer: &str) -> bool {
     let mut submitted = false;
     egui::CentralPanel::default()
-        .frame(Frame::new().fill(BG).inner_margin(Margin::symmetric(24, 24)))
+        .frame(Frame::new().fill(design::bg()).inner_margin(Margin::symmetric(24, 24)))
         .show(ctx, |ui| {
+            design::paint_backdrop(ui);
             let top = ((ui.available_height() - 470.0) * 0.5).max(16.0);
             ui.add_space(top);
             let card_width = (ui.available_width() - 80.0).clamp(280.0, 392.0);
             ui.vertical_centered(|ui| {
                 Frame::new()
-                    .fill(PANEL)
-                    .stroke(Stroke::new(1.0_f32, STROKE))
+                    .fill(design::card_color())
+                    .stroke(Stroke::new(1.0_f32, design::stroke_color()))
                     .corner_radius(14.0)
                     .inner_margin(Margin::symmetric(28, 24))
                     .show(ui, |ui| {
                         ui.set_width(card_width);
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("SeraBot").size(22.0).strong().color(TEXT));
+                            ui.label(RichText::new("SeraBot").size(22.0).strong().color(design::text()));
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -105,12 +97,12 @@ pub fn connect_screen(ctx: &egui::Context, state: &mut ConnectState, footer: &st
                         ui.label(
                             RichText::new("Owner console · connect to your host")
                                 .size(12.0)
-                                .color(MUTED),
+                                .color(design::muted()),
                         );
                         ui.add_space(16.0);
 
                         ui.add_enabled_ui(!state.connecting, |ui| {
-                            ui.label(RichText::new("Server").size(11.0).color(MUTED));
+                            ui.label(RichText::new("Server").size(11.0).color(design::muted()));
                             ui.add(
                                 egui::TextEdit::singleline(&mut state.server)
                                     .desired_width(f32::INFINITY)
@@ -122,10 +114,10 @@ pub fn connect_screen(ctx: &egui::Context, state: &mut ConnectState, footer: &st
                                     "HTTPS origin, or exact loopback HTTP for an SSH tunnel.",
                                 )
                                 .size(11.0)
-                                .color(MUTED),
+                                .color(design::muted()),
                             );
                             ui.add_space(8.0);
-                            ui.label(RichText::new("Token").size(11.0).color(MUTED));
+                            ui.label(RichText::new("Token").size(11.0).color(design::muted()));
                             ui.add(
                                 egui::TextEdit::singleline(&mut *state.token)
                                     .password(true)
@@ -138,12 +130,12 @@ pub fn connect_screen(ctx: &egui::Context, state: &mut ConnectState, footer: &st
                         if let Some(error) = &state.error {
                             ui.add_space(8.0);
                             Frame::new()
-                                .fill(Color32::from_rgb(48, 32, 28))
-                                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(88, 58, 48)))
+                                .fill(design::danger_bg())
+                                .stroke(Stroke::new(1.0_f32, design::danger()))
                                 .corner_radius(10.0)
                                 .inner_margin(Margin::symmetric(10, 8))
                                 .show(ui, |ui| {
-                                    ui.label(RichText::new(error).size(12.0).color(DANGER));
+                                    ui.label(RichText::new(error).size(12.0).color(design::danger()));
                                 });
                         }
 
@@ -157,7 +149,7 @@ pub fn connect_screen(ctx: &egui::Context, state: &mut ConnectState, footer: &st
                             .add_enabled(
                                 !state.connecting,
                                 egui::Button::new(
-                                    RichText::new(label).size(14.0).strong().color(TEAL),
+                                    RichText::new(label).size(14.0).strong().color(design::accent()),
                                 ),
                             )
                             .clicked()
@@ -178,13 +170,13 @@ pub fn connect_screen(ctx: &egui::Context, state: &mut ConnectState, footer: &st
                             RichText::new("Mint a token on the server")
                                 .size(11.0)
                                 .strong()
-                                .color(TEXT),
+                                .color(design::text()),
                         );
                         ui.label(
                             RichText::new("serabot token mint --label desktop-win")
                                 .size(11.0)
                                 .monospace()
-                                .color(TEAL),
+                                .color(design::accent()),
                         );
                         ui.add_space(4.0);
                         ui.label(
@@ -192,11 +184,11 @@ pub fn connect_screen(ctx: &egui::Context, state: &mut ConnectState, footer: &st
                                 "The token is kept in Windows Credential Manager; only the server URL is written to settings.json. No token is embedded in this build.",
                             )
                             .size(11.0)
-                            .color(MUTED),
+                            .color(design::muted()),
                         );
                     });
                 ui.add_space(16.0);
-                ui.label(RichText::new(footer).size(11.0).color(MUTED));
+                ui.label(RichText::new(footer).size(11.0).color(design::muted()));
                 ui.add_space(8.0);
             });
         });

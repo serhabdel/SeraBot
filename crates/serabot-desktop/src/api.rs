@@ -491,6 +491,15 @@ impl ConversationSummary {
     pub fn display_title(&self) -> &str {
         self.title.as_deref().unwrap_or(&self.id)
     }
+
+    /// Legacy rows are turn-capable direct threads.
+    pub fn normalized_kind(&self) -> &str {
+        if self.kind == "legacy" {
+            "direct"
+        } else {
+            &self.kind
+        }
+    }
 }
 
 /// One page of conversations. The cursor is opaque to the UI.
@@ -1160,7 +1169,8 @@ impl ApiClient {
             if !valid_speaker(&bot.id) || !seen.insert(bot.id.as_str()) {
                 return Err(ApiError::InvalidResponse);
             }
-            if bot.role != "specialist" && bot.role != "orchestrator" {
+            // Accept future roles; the surface only displays the label.
+            if !valid_speaker(&bot.role) {
                 return Err(ApiError::InvalidResponse);
             }
             if bot.tools.len() > MAX_BOT_SUMMARY_ITEMS || bot.skills.len() > MAX_BOT_SUMMARY_ITEMS {
@@ -1429,16 +1439,7 @@ pub fn valid_conversation_title(title: &str) -> bool {
 }
 
 fn check_conversation_summary(conversation: &ConversationSummary) -> Result<(), ApiError> {
-    let kind = match conversation.kind.as_str() {
-        "section" => ConversationKind::Section,
-        "group" => ConversationKind::Group,
-        "direct" => ConversationKind::Direct,
-        "room" => ConversationKind::Room,
-        _ => return Err(ApiError::InvalidResponse),
-    };
     if !valid_id(&conversation.id)
-        || conversation.accepts_turns != kind.accepts_turns()
-        || valid_conversation_parent(kind, conversation.parent_id.as_deref()).is_err()
         || conversation
             .title
             .as_deref()
@@ -1456,7 +1457,35 @@ fn check_conversation_summary(conversation: &ConversationSummary) -> Result<(), 
     {
         return Err(ApiError::InvalidResponse);
     }
-    Ok(())
+    let parent = conversation.parent_id.as_deref();
+    let valid = match conversation.kind.as_str() {
+        "section" => {
+            valid_conversation_parent(ConversationKind::Section, parent).is_ok()
+                && !conversation.accepts_turns
+        }
+        "group" => {
+            valid_conversation_parent(ConversationKind::Group, parent).is_ok()
+                && !conversation.accepts_turns
+        }
+        "direct" => {
+            valid_conversation_parent(ConversationKind::Direct, parent).is_ok()
+                && conversation.accepts_turns
+        }
+        "room" => {
+            valid_conversation_parent(ConversationKind::Room, parent).is_ok()
+                && conversation.accepts_turns
+        }
+        // Legacy rows predate kinds and are direct chats.
+        "legacy" => parent.is_none() && conversation.accepts_turns,
+        // A newer server may add kinds. Accept them as opaque threads instead
+        // of failing the whole directory.
+        _ => parent.is_none_or(valid_id),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(ApiError::InvalidResponse)
+    }
 }
 
 pub fn valid_memory_kind(kind: &str) -> bool {
@@ -1627,4 +1656,32 @@ fn check_created_skill(skill: CreatedSkill, id: &str) -> Result<CreatedSkill, Ap
         return Err(ApiError::InvalidResponse);
     }
     Ok(skill)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(kind: &str, accepts_turns: bool) -> ConversationSummary {
+        ConversationSummary {
+            id: "windows-owner".into(),
+            kind: kind.into(),
+            parent_id: None,
+            title: Some("Owner".into()),
+            created_at: "2026-10-29T10:00:00.000Z".into(),
+            updated_at: "2026-10-29T10:00:00.000Z".into(),
+            last_message_at: None,
+            archived_at: None,
+            accepts_turns,
+        }
+    }
+
+    #[test]
+    fn legacy_and_future_kinds_never_break_the_directory() {
+        assert!(check_conversation_summary(&summary("legacy", true)).is_ok());
+        assert!(check_conversation_summary(&summary("future-kind", true)).is_ok());
+        assert!(check_conversation_summary(&summary("section", true)).is_err());
+        assert!(check_conversation_summary(&summary("direct", false)).is_err());
+        assert_eq!(summary("legacy", true).normalized_kind(), "direct");
+    }
 }

@@ -30,14 +30,14 @@ impl Desktop {
                         RichText::new("Directory")
                             .size(14.0)
                             .strong()
-                            .color(design::TEXT),
+                            .color(design::text()),
                     );
                     if !self.state.conversations.is_empty() {
                         design::chip(
                             ui,
                             &format!("{} threads", self.state.conversations.len()),
-                            design::MUTED,
-                            design::PANEL_ALT,
+                            design::muted(),
+                            design::panel_alt(),
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -109,7 +109,7 @@ impl Desktop {
                             "section" | "group" => design::NavIcon::Conversations,
                             _ => design::NavIcon::Chat,
                         },
-                        design::ACCENT,
+                        design::accent(),
                     );
                     if renaming {
                         if let Some(draft) = rename.as_mut() {
@@ -131,16 +131,16 @@ impl Desktop {
                             RichText::new(conversation.display_title())
                                 .size(14.0)
                                 .strong()
-                                .color(design::TEXT),
+                                .color(design::text()),
                         );
                         design::chip(
                             ui,
                             &kind_title(&conversation.kind),
-                            design::MUTED,
-                            design::PANEL_ALT,
+                            design::muted(),
+                            design::panel_alt(),
                         );
                         if conversation.archived_at.is_some() {
-                            design::chip(ui, "archived", design::WARNING, design::WARNING_BG);
+                            design::chip(ui, "archived", design::warning(), design::warning_bg());
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -159,7 +159,7 @@ impl Desktop {
                             "Archive"
                         };
                         let archive = if confirming {
-                            design::danger(archive_label).small()
+                            design::danger_button(archive_label).small()
                         } else {
                             egui::Button::new(RichText::new(archive_label).size(11.0)).small()
                         };
@@ -183,7 +183,7 @@ impl Desktop {
                         RichText::new(&conversation.id)
                             .size(10.0)
                             .monospace()
-                            .color(design::MUTED_DIM),
+                            .color(design::muted_dim()),
                     );
                     if let Some(parent) = &conversation.parent_id {
                         ui.label(design::meta(format!("· under {parent}")));
@@ -206,7 +206,7 @@ impl Desktop {
                     ui.label(
                         RichText::new("Titles are stored on the server and shown in every client.")
                             .size(10.0)
-                            .color(design::MUTED),
+                            .color(design::muted()),
                     );
                 }
             });
@@ -255,14 +255,14 @@ impl Desktop {
                 RichText::new("New conversation")
                     .size(15.0)
                     .strong()
-                    .color(design::TEXT),
+                    .color(design::text()),
             );
             ui.label(
                 RichText::new(
                     "Sections and groups organize the tree. Direct threads and rooms accept turns. A room talks to the orchestrator and the specialists it delegates to; it is not a multi-person chat.",
                 )
                 .size(11.0)
-                .color(design::MUTED),
+                .color(design::muted()),
             );
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
@@ -319,7 +319,7 @@ impl Desktop {
                 ui.label(
                     RichText::new("Parent must be an existing sec: or grp: id.")
                         .size(10.0)
-                        .color(design::WARNING),
+                        .color(design::warning()),
                 );
             }
             ui.add_space(6.0);
@@ -351,7 +351,7 @@ impl Desktop {
                         }
                     ))
                     .size(11.0)
-                    .color(design::ACCENT),
+                    .color(design::accent()),
                 );
                 if node.accepts_turns && ui.small_button("Open conversation").clicked() {
                     self.open_conversation(node.id.clone());
@@ -362,6 +362,7 @@ impl Desktop {
 }
 
 fn kind_title(kind: &str) -> String {
+    let kind = if kind == "legacy" { "direct" } else { kind };
     let mut chars = kind.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),

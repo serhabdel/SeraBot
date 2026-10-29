@@ -6,14 +6,14 @@ impl Desktop {
     pub(crate) fn status_banner(&mut self, ui: &mut egui::Ui) {
         if let Some(error) = self.state.error.clone() {
             Frame::new()
-                .fill(design::WARNING_BG)
+                .fill(design::warning_bg())
                 .stroke(Stroke::new(1.0_f32, Color32::from_rgb(88, 70, 40)))
                 .corner_radius(10.0)
                 .inner_margin(Margin::symmetric(12, 9))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        design::chip(ui, "Notice", design::WARNING, design::WARNING_BG);
-                        ui.label(RichText::new(error).size(12.0).color(design::TEXT));
+                        design::chip(ui, "Notice", design::warning(), design::warning_bg());
+                        ui.label(RichText::new(error).size(12.0).color(design::text()));
                     });
                 });
             ui.add_space(8.0);
@@ -28,7 +28,7 @@ impl Desktop {
                     ui.label(
                         RichText::new("Reads refreshed. A missing reply does not prove failure.")
                             .size(12.0)
-                            .color(design::TEXT),
+                            .color(design::text()),
                     );
                     if ui
                         .button("I reviewed server state — allow new actions")
@@ -45,18 +45,18 @@ impl Desktop {
             return;
         };
         let (fg, bg) = match task.status {
-            TaskStatus::Failed => (design::DANGER, design::DANGER_BG),
-            TaskStatus::AwaitingApproval => (design::WARNING, design::WARNING_BG),
-            TaskStatus::Done => (design::ACCENT, design::OK_BG),
-            _ => (design::MUTED, design::PANEL_ALT),
+            TaskStatus::Failed => (design::danger(), design::danger_bg()),
+            TaskStatus::AwaitingApproval => (design::warning(), design::warning_bg()),
+            TaskStatus::Done => (design::accent(), design::ok_bg()),
+            _ => (design::muted(), design::panel_alt()),
         };
         let awaiting = task.status == TaskStatus::AwaitingApproval;
         let task_id = task.id.clone();
         let bot = task.bot.clone();
         let label = task.status.label();
         Frame::new()
-            .fill(design::PANEL_ALT)
-            .stroke(Stroke::new(1.0_f32, design::STROKE_SOFT))
+            .fill(design::panel_alt())
+            .stroke(Stroke::new(1.0_f32, design::stroke_soft()))
             .corner_radius(10.0)
             .inner_margin(Margin::symmetric(12, 7))
             .show(ui, |ui| {
@@ -89,7 +89,7 @@ impl Desktop {
                     "Decisions bind the exact payload, destination, artifact hash, policy version and expiry.",
                 )
                 .size(11.0)
-                .color(design::MUTED),
+                .color(design::muted()),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -128,7 +128,7 @@ impl Desktop {
                 for approval in &self.state.approvals {
                     design::card(ui, |ui| {
                         ui.horizontal(|ui| {
-                            design::chip(ui, &approval.tool, design::ACCENT, design::OK_BG);
+                            design::chip(ui, &approval.tool, design::accent(), design::ok_bg());
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -143,14 +143,14 @@ impl Desktop {
                         ui.label(
                             RichText::new(&approval.summary)
                                 .size(13.0)
-                                .color(design::TEXT),
+                                .color(design::text()),
                         );
                         ui.add_space(2.0);
                         ui.label(
                             RichText::new(format!("Approval id · {}", approval.id))
                                 .size(10.0)
                                 .monospace()
-                                .color(design::MUTED_DIM),
+                                .color(design::muted_dim()),
                         );
                         ui.add_space(8.0);
                         design::divider(ui);
@@ -162,7 +162,7 @@ impl Desktop {
                                 ApprovalDecision::Deny,
                             ] {
                                 let button = match decision {
-                                    ApprovalDecision::Deny => design::danger(decision.label()),
+                                    ApprovalDecision::Deny => design::danger_button(decision.label()),
                                     ApprovalDecision::Once => design::primary(decision.label()),
                                     ApprovalDecision::Always => {
                                         egui::Button::new(RichText::new(decision.label()).size(13.0))
@@ -179,7 +179,7 @@ impl Desktop {
                                 "Once = this exact payload. Always = revocable grant for this exact payload.",
                             )
                             .size(10.0)
-                            .color(design::MUTED_DIM),
+                            .color(design::muted_dim()),
                         );
                     });
                     ui.add_space(8.0);
@@ -207,7 +207,7 @@ impl Desktop {
                         RichText::new("Conversation nodes")
                             .size(13.0)
                             .strong()
-                            .color(design::TEXT),
+                            .color(design::text()),
                     );
                     if ui
                         .small_button(RichText::new("Manage conversations").size(11.0))
@@ -233,14 +233,14 @@ impl Desktop {
                 RichText::new("New specialist")
                     .size(15.0)
                     .strong()
-                    .color(design::TEXT),
+                    .color(design::text()),
             );
             ui.label(
                 RichText::new(
                     "The id is the bot name. The bot stays disabled until the server restarts, and it is not added to main.delegates.",
                 )
                 .size(11.0)
-                .color(design::MUTED),
+                .color(design::muted()),
             );
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
@@ -297,7 +297,7 @@ impl Desktop {
                 ui.label(
                     RichText::new("No tools selected. The bot file will list an empty tool set.")
                         .size(10.0)
-                        .color(design::MUTED),
+                        .color(design::muted()),
                 );
             }
             if let Some(bot) = &created {
@@ -305,7 +305,7 @@ impl Desktop {
                 ui.label(
                     RichText::new(format!("Created {} · disabled · not live", bot.id))
                         .size(11.0)
-                        .color(design::ACCENT),
+                        .color(design::accent()),
                 );
                 ui.label(design::meta(format!(
                     "{} · {}",
@@ -314,7 +314,7 @@ impl Desktop {
                 ui.label(
                     RichText::new("Restart the server before this bot can run.")
                         .size(10.0)
-                        .color(design::WARNING),
+                        .color(design::warning()),
                 );
             }
             ui.add_space(6.0);
@@ -348,7 +348,7 @@ impl Desktop {
                         "Use a lowercase slug (max 32). main and Windows device names are reserved.",
                     )
                     .size(10.0)
-                    .color(design::WARNING),
+                    .color(design::warning()),
                 );
             }
             ui.add_space(8.0);
@@ -369,9 +369,14 @@ impl Desktop {
             ui.label(
                 RichText::new("Summaries only. GET /v1/bots does not return prompts or secrets.")
                     .size(10.0)
-                    .color(design::MUTED_DIM),
+                    .color(design::muted_dim()),
             );
-            if self.state.bots_loaded && self.state.listed_bots.is_empty() {
+            if !self.state.bots_loaded {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(design::meta("Loading bots…"));
+                });
+            } else if self.state.listed_bots.is_empty() {
                 ui.label(design::meta("No bot files on disk."));
             }
             let listed = &self.state.listed_bots;
@@ -386,24 +391,24 @@ impl Desktop {
                                 ui.label(
                                     RichText::new(format!("{} · {}", bot.id, bot.role))
                                         .size(12.0)
-                                        .color(design::TEXT),
+                                        .color(design::text()),
                                 );
                                 design::chip(
                                     ui,
                                     if bot.enabled { "enabled" } else { "disabled" },
                                     if bot.enabled {
-                                        design::ACCENT
+                                        design::accent()
                                     } else {
-                                        design::MUTED
+                                        design::muted()
                                     },
-                                    design::PANEL_ALT,
+                                    design::panel_alt(),
                                 );
                                 if !bot.live {
                                     design::chip(
                                         ui,
                                         "restart required",
-                                        design::WARNING,
-                                        design::WARNING_BG,
+                                        design::warning(),
+                                        design::warning_bg(),
                                     );
                                 }
                             });
@@ -430,14 +435,14 @@ impl Desktop {
                 RichText::new("New skill pack")
                     .size(15.0)
                     .strong()
-                    .color(design::TEXT),
+                    .color(design::text()),
             );
             ui.label(
                 RichText::new(
                     "The id is the pack name. The body is optional markdown. The pack stays off the running catalog until a restart, and a bot cannot load it until you add the id to that bot.",
                 )
                 .size(11.0)
-                .color(design::MUTED),
+                .color(design::muted()),
             );
             ui.add_space(6.0);
             ui.add(
@@ -452,7 +457,7 @@ impl Desktop {
                         "Use a lowercase slug (max 64). Windows device names are reserved.",
                     )
                     .size(10.0)
-                    .color(design::WARNING),
+                    .color(design::warning()),
                 );
             }
             ui.add(
@@ -465,7 +470,7 @@ impl Desktop {
                 ui.label(
                     RichText::new("One line, at most 500 characters, no quotes or backslashes.")
                         .size(10.0)
-                        .color(design::WARNING),
+                        .color(design::warning()),
                 );
             }
             ui.add(
@@ -481,7 +486,7 @@ impl Desktop {
                         "Markdown only, at most 96,000 bytes, without control characters.",
                     )
                     .size(10.0)
-                    .color(design::WARNING),
+                    .color(design::warning()),
                 );
             }
             if let Some(skill) = &created {
@@ -489,7 +494,7 @@ impl Desktop {
                 ui.label(
                     RichText::new(format!("Created {} · not live", skill.id))
                         .size(11.0)
-                        .color(design::ACCENT),
+                        .color(design::accent()),
                 );
                 ui.label(design::meta(&skill.file));
                 ui.label(
@@ -497,7 +502,7 @@ impl Desktop {
                         "Restart the server, then add this id to a bot before it can load the pack.",
                     )
                     .size(10.0)
-                    .color(design::WARNING),
+                    .color(design::warning()),
                 );
             }
             ui.add_space(6.0);
@@ -535,9 +540,14 @@ impl Desktop {
             ui.label(
                 RichText::new("Summaries only. GET /v1/skills does not return bodies.")
                     .size(10.0)
-                    .color(design::MUTED_DIM),
+                    .color(design::muted_dim()),
             );
-            if self.state.skills_loaded && self.state.listed_skills.is_empty() {
+            if !self.state.skills_loaded {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(design::meta("Loading skills…"));
+                });
+            } else if self.state.listed_skills.is_empty() {
                 ui.label(design::meta("No skill packs on disk."));
             }
             let listed = &self.state.listed_skills;
@@ -554,7 +564,7 @@ impl Desktop {
                                     None => skill.id.clone(),
                                 })
                                 .size(12.0)
-                                .color(design::TEXT),
+                                .color(design::text()),
                             );
                             if !skill.description.is_empty() {
                                 ui.label(design::meta(skill_blurb(&skill.description)));

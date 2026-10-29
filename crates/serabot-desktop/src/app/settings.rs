@@ -20,8 +20,8 @@ impl Desktop {
             return;
         };
         Frame::new()
-            .fill(design::OK_BG)
-            .stroke(Stroke::new(1.0_f32, design::ACCENT_DIM))
+            .fill(design::ok_bg())
+            .stroke(Stroke::new(1.0_f32, design::accent_dim()))
             .corner_radius(12.0)
             .inner_margin(Margin::symmetric(14, 10))
             .show(ui, |ui| {
@@ -31,7 +31,7 @@ impl Desktop {
                         RichText::new(format!("Update v{} available", info.version))
                             .size(13.0)
                             .strong()
-                            .color(design::ACCENT),
+                            .color(design::accent()),
                     );
                     ui.label(design::meta(format_size(info.size)));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -62,11 +62,11 @@ impl Desktop {
                 egui::CollapsingHeader::new(
                     RichText::new("Release notes")
                         .size(10.0)
-                        .color(design::MUTED),
+                        .color(design::muted()),
                 )
                 .id_salt("update-notes")
                 .show(ui, |ui| {
-                    ui.label(RichText::new(&info.notes).size(12.0).color(design::TEXT));
+                    ui.label(RichText::new(&info.notes).size(12.0).color(design::text()));
                 });
             });
         ui.add_space(8.0);
@@ -79,6 +79,8 @@ impl Desktop {
             .id_salt("settings-screen")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                self.appearance_card(ui, ctx);
+                ui.add_space(10.0);
                 self.connection_card(ui, ctx);
                 ui.add_space(10.0);
                 self.updates_card(ui, ctx);
@@ -87,6 +89,47 @@ impl Desktop {
                 ui.add_space(10.0);
                 self.shortcuts_card(ui);
             });
+    }
+
+    fn appearance_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let current = self.theme;
+        let mut chosen = None;
+        design::card(ui, |ui| {
+            ui.label(
+                RichText::new("Appearance")
+                    .size(15.0)
+                    .strong()
+                    .color(design::text()),
+            );
+            ui.label(design::meta(
+                "Switch the whole console. The choice is saved locally.",
+            ));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                for mode in [design::ThemeMode::Dark, design::ThemeMode::Light] {
+                    if ui.selectable_label(current == mode, mode.label()).clicked() {
+                        chosen = Some(mode);
+                    }
+                }
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                for (label, color) in [
+                    ("Background", design::bg()),
+                    ("Surface", design::card_color()),
+                    ("Accent", design::accent()),
+                    ("Accent 2", design::accent_amber()),
+                ] {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(18.0, 18.0), Sense::hover());
+                    ui.painter()
+                        .rect_filled(rect, egui::CornerRadius::same(5), color);
+                    ui.label(design::meta(label));
+                }
+            });
+        });
+        if let Some(mode) = chosen {
+            self.set_theme(ctx, mode);
+        }
     }
 
     fn connection_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -101,7 +144,7 @@ impl Desktop {
                 RichText::new("Connection")
                     .size(15.0)
                     .strong()
-                    .color(design::TEXT),
+                    .color(design::text()),
             );
             ui.add_space(2.0);
             ui.horizontal(|ui| {
@@ -110,7 +153,7 @@ impl Desktop {
                     RichText::new(&origin)
                         .size(12.0)
                         .monospace()
-                        .color(design::TEXT),
+                        .color(design::text()),
                 );
                 design::copy_button(ui, &origin, "Copy");
             });
@@ -128,7 +171,7 @@ impl Desktop {
                     "This build keeps the token in memory. The server origin is written to the settings file."
                 })
                 .size(11.0)
-                .color(design::MUTED),
+                .color(design::muted()),
             );
             if !persisted {
                 ui.label(
@@ -136,7 +179,7 @@ impl Desktop {
                         "This session is not persisted yet (waiting for a saved credential).",
                     )
                     .size(10.0)
-                    .color(design::WARNING),
+                    .color(design::warning()),
                 );
             }
             ui.add_space(6.0);
@@ -144,13 +187,13 @@ impl Desktop {
                 if ui.button("Forget token").clicked() {
                     self.forget_token(ctx);
                 }
-                if ui.add(design::danger("Disconnect")).clicked() {
+                if ui.add(design::danger_button("Disconnect")).clicked() {
                     self.disconnect(ctx);
                 }
                 ui.label(
                     RichText::new("Revoking a device token on the server returns this app to the connect screen.")
                         .size(10.0)
-                        .color(design::MUTED_DIM),
+                        .color(design::muted_dim()),
                 );
             });
         });
@@ -167,7 +210,7 @@ impl Desktop {
                 RichText::new("Updates")
                     .size(15.0)
                     .strong()
-                    .color(design::TEXT),
+                    .color(design::text()),
             );
             ui.label(design::meta(format!("Desktop v{version}")));
             if let Some(sha) = sha {
@@ -202,7 +245,7 @@ impl Desktop {
                                     format_size(info.size)
                                 ))
                                 .size(11.0)
-                                .color(design::ACCENT),
+                                .color(design::accent()),
                             );
                             if ui.add(design::primary("Install and restart")).clicked() {
                                 match updater::spawn_apply(info) {
@@ -218,11 +261,11 @@ impl Desktop {
                         egui::CollapsingHeader::new(
                             RichText::new("Release notes")
                                 .size(10.0)
-                                .color(design::MUTED),
+                                .color(design::muted()),
                         )
                         .id_salt("settings-update-notes")
                         .show(ui, |ui| {
-                            ui.label(RichText::new(&info.notes).size(12.0).color(design::TEXT));
+                            ui.label(RichText::new(&info.notes).size(12.0).color(design::text()));
                         });
                     }
                 }
@@ -232,19 +275,19 @@ impl Desktop {
                             "Developer build · updates are disabled. Release builds set SERABOT_RELEASES_REPO.",
                         )
                         .size(11.0)
-                        .color(design::MUTED),
+                        .color(design::muted()),
                     );
                 }
             }
             if let Some(error) = &error {
-                ui.label(RichText::new(error).size(11.0).color(design::DANGER));
+                ui.label(RichText::new(error).size(11.0).color(design::danger()));
             }
             ui.label(
                 RichText::new(
                     "Downloads are SHA-256 verified before installation. No silent installs.",
                 )
                 .size(10.0)
-                .color(design::MUTED_DIM),
+                .color(design::muted_dim()),
             );
         });
     }
@@ -255,15 +298,15 @@ impl Desktop {
                 RichText::new("Live updates")
                     .size(15.0)
                     .strong()
-                    .color(design::TEXT),
+                    .color(design::text()),
             );
             ui.horizontal(|ui| {
                 design::status_dot(
                     ui,
                     if self.events_active {
-                        design::ACCENT
+                        design::accent()
                     } else {
-                        design::WARNING
+                        design::warning()
                     },
                 );
                 ui.label(design::meta(if self.events_active {
@@ -283,7 +326,7 @@ impl Desktop {
                     "The stream reconnects with backoff and Last-Event-ID. Task polling still runs as a stuck-stream guard.",
                 )
                 .size(10.0)
-                .color(design::MUTED_DIM),
+                .color(design::muted_dim()),
             );
         });
     }
@@ -294,7 +337,7 @@ impl Desktop {
                 RichText::new("Keyboard")
                     .size(15.0)
                     .strong()
-                    .color(design::TEXT),
+                    .color(design::text()),
             );
             for (keys, action) in [
                 ("Ctrl+K", "Command palette"),
@@ -308,7 +351,7 @@ impl Desktop {
                         RichText::new(keys)
                             .size(11.0)
                             .monospace()
-                            .color(design::ACCENT),
+                            .color(design::accent()),
                     );
                     ui.label(design::meta(action));
                 });
@@ -319,7 +362,7 @@ impl Desktop {
                     "Tokens are per device. Mint with `serabot token mint --label desktop-win` and revoke with `serabot token revoke <id>` on the server.",
                 )
                 .size(10.0)
-                .color(design::MUTED_DIM),
+                .color(design::muted_dim()),
             );
         });
     }

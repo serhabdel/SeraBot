@@ -195,6 +195,7 @@ pub struct Desktop {
     pub(crate) state: State,
     worker: Option<Worker>,
     credentials: Option<Arc<Credentials>>,
+    pub(crate) theme: design::ThemeMode,
     events: Option<EventStream>,
     pub(crate) events_active: bool,
     events_dirty: bool,
@@ -236,7 +237,9 @@ fn default_tool_flags() -> Vec<bool> {
 
 impl Desktop {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        design::apply_theme(&cc.egui_ctx);
+        let stored = creds::load_settings();
+        let theme = design::ThemeMode::from_stored(stored.theme.as_deref());
+        design::apply_theme(&cc.egui_ctx, theme);
         let worker = Worker::start().ok();
         let mut state = State::default();
         if worker.is_none() {
@@ -246,6 +249,7 @@ impl Desktop {
         let mut desktop = Self {
             state,
             worker,
+            theme,
             credentials: None,
             events: None,
             events_active: false,
@@ -552,6 +556,7 @@ impl Desktop {
         let origin = credentials.endpoint.origin().ascii_serialization();
         let settings = creds::save_settings(&creds::Settings {
             server: origin.clone(),
+            theme: Some(self.theme.as_str().into()),
         });
         let token = creds::save_token(credentials.token.expose_secret());
         self.connect.server = origin;
@@ -703,6 +708,11 @@ impl Desktop {
                         OperationKind::CreateBot => {
                             self.schedule(Operation::ListBots, Duration::ZERO);
                         }
+                        OperationKind::ListBots => {
+                            if self.section == Section::Fleet && !self.state.skills_loaded {
+                                self.schedule(Operation::ListSkills, Duration::ZERO);
+                            }
+                        }
                         OperationKind::CreateConversation => {
                             self.fleet.conv_slug.clear();
                             self.fleet.conv_parent.clear();
@@ -827,7 +837,16 @@ impl Desktop {
             Section::Providers => (!self.state.providers_loaded).then_some(Operation::Providers),
             Section::Connectors => (!self.state.connectors_loaded).then_some(Operation::Connectors),
             Section::Approvals => (!self.state.approvals_loaded).then_some(Operation::Approvals),
-            Section::Fleet | Section::Settings => None,
+            Section::Fleet => {
+                if !self.state.bots_loaded {
+                    Some(Operation::ListBots)
+                } else if !self.state.skills_loaded {
+                    Some(Operation::ListSkills)
+                } else {
+                    None
+                }
+            }
+            Section::Settings => None,
         }
     }
 
@@ -880,7 +899,7 @@ impl Desktop {
             .conversations
             .iter()
             .find(|conversation| conversation.id == self.conversation)
-            .map(|conversation| conversation.kind.as_str())
+            .map(|conversation| conversation.normalized_kind())
     }
 
     pub(crate) fn conversation_accepts_turns(&self) -> bool {
@@ -954,26 +973,27 @@ impl Desktop {
             .resizable(false)
             .frame(
                 Frame::new()
-                    .fill(design::RAIL)
-                    .stroke(Stroke::new(1.0_f32, design::STROKE_SOFT))
+                    .fill(design::rail_color())
+                    .stroke(Stroke::new(1.0_f32, design::stroke_soft()))
                     .inner_margin(Margin::symmetric(0, 8)),
             )
             .show(ctx, |ui| {
+                design::paint_rail_backdrop(ui);
                 ui.vertical_centered(|ui| {
                     let (rect, _) = ui.allocate_exact_size(Vec2::new(36.0, 36.0), Sense::hover());
                     ui.painter()
-                        .circle_filled(rect.center(), 15.0, design::ACCENT_DIM);
+                        .circle_filled(rect.center(), 15.0, design::accent_dim());
                     ui.painter().circle_stroke(
                         rect.center(),
                         15.0,
-                        Stroke::new(1.0_f32, design::ACCENT),
+                        Stroke::new(1.0_f32, design::accent()),
                     );
                     ui.painter().text(
                         rect.center(),
                         Align2::CENTER_CENTER,
                         "S",
                         FontId::proportional(15.0),
-                        design::ACCENT,
+                        design::accent(),
                     );
                 });
                 ui.add_space(6.0);
@@ -995,7 +1015,7 @@ impl Desktop {
                     ui.label(
                         RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
                             .size(9.5)
-                            .color(design::MUTED_DIM),
+                            .color(design::muted_dim()),
                     );
                     if design::rail_item(
                         ui,
@@ -1008,11 +1028,11 @@ impl Desktop {
                         self.open_section(Section::Settings);
                     }
                     let color = if self.pending.is_some() {
-                        design::WARNING
+                        design::warning()
                     } else if self.state.connected {
-                        design::ACCENT
+                        design::accent()
                     } else {
-                        design::MUTED
+                        design::muted()
                     };
                     let (rect, response) =
                         ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
@@ -1040,27 +1060,27 @@ impl Desktop {
                 RichText::new(heading)
                     .size(15.0)
                     .strong()
-                    .color(design::TEXT),
+                    .color(design::text()),
             );
             if self.section == Section::Chat {
                 if let Some(kind) = self.conversation_kind() {
-                    design::chip(ui, kind, design::MUTED, design::PANEL_ALT);
+                    design::chip(ui, kind, design::muted(), design::panel_alt());
                 }
                 if !self.active_conversation() {
-                    design::chip(ui, "opening…", design::WARNING, design::WARNING_BG);
+                    design::chip(ui, "opening…", design::warning(), design::warning_bg());
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (label, color) = if self.pending.is_some() {
-                    ("Syncing", design::WARNING)
+                    ("Syncing", design::warning())
                 } else if self.state.connected {
-                    ("Online", design::ACCENT)
+                    ("Online", design::accent())
                 } else {
-                    ("Offline", design::MUTED)
+                    ("Offline", design::muted())
                 };
                 Frame::new()
-                    .fill(design::PANEL_ALT)
-                    .stroke(Stroke::new(1.0_f32, design::STROKE_SOFT))
+                    .fill(design::panel_alt())
+                    .stroke(Stroke::new(1.0_f32, design::stroke_soft()))
                     .corner_radius(10.0)
                     .inner_margin(Margin::symmetric(9, 4))
                     .show(ui, |ui| {
@@ -1073,7 +1093,7 @@ impl Desktop {
                         });
                     });
                 if ui
-                    .small_button(RichText::new("Ctrl K").size(10.0).color(design::MUTED))
+                    .small_button(RichText::new("Ctrl K").size(10.0).color(design::muted()))
                     .on_hover_text("Command palette")
                     .clicked()
                 {
@@ -1081,7 +1101,7 @@ impl Desktop {
                 }
                 if self.update.info.is_some()
                     && ui
-                        .small_button(RichText::new("Update").size(10.0).color(design::ACCENT))
+                        .small_button(RichText::new("Update").size(10.0).color(design::accent()))
                         .on_hover_text("Open Settings to install")
                         .clicked()
                 {
@@ -1092,7 +1112,7 @@ impl Desktop {
                         .small_button(
                             RichText::new(self.model_label())
                                 .size(10.0)
-                                .color(design::MUTED),
+                                .color(design::muted()),
                         )
                         .on_hover_text("Model routing for this conversation")
                         .clicked()
@@ -1171,8 +1191,8 @@ impl Desktop {
             .resizable(false)
             .frame(
                 Frame::new()
-                    .fill(design::PANEL)
-                    .stroke(Stroke::new(1.0_f32, design::STROKE))
+                    .fill(design::panel())
+                    .stroke(Stroke::new(1.0_f32, design::stroke_color()))
                     .corner_radius(14.0)
                     .inner_margin(Margin::symmetric(14, 12))
                     .shadow(egui::epaint::Shadow {
@@ -1205,15 +1225,17 @@ impl Desktop {
                     ui.label(
                         RichText::new("No matching command.")
                             .size(12.0)
-                            .color(design::MUTED),
+                            .color(design::muted()),
                     );
                 }
                 for (label, item) in commands {
                     if ui
                         .add(
-                            egui::Button::new(RichText::new(&label).size(13.0).color(design::TEXT))
-                                .frame(false)
-                                .min_size(Vec2::new(ui.available_width(), 28.0)),
+                            egui::Button::new(
+                                RichText::new(&label).size(13.0).color(design::text()),
+                            )
+                            .frame(false)
+                            .min_size(Vec2::new(ui.available_width(), 28.0)),
                         )
                         .clicked()
                     {
@@ -1300,6 +1322,26 @@ impl Desktop {
         self.toast = Some((message.into(), Instant::now()));
     }
 
+    pub(crate) fn set_theme(&mut self, ctx: &egui::Context, mode: design::ThemeMode) {
+        if self.theme == mode {
+            return;
+        }
+        self.theme = mode;
+        design::apply_theme(ctx, mode);
+        let origin = self
+            .credentials
+            .as_ref()
+            .map(|credentials| credentials.endpoint.origin().ascii_serialization())
+            .unwrap_or_else(|| self.connect.server.clone());
+        if !origin.is_empty() {
+            let _ = creds::save_settings(&creds::Settings {
+                server: origin,
+                theme: Some(mode.as_str().into()),
+            });
+        }
+        ctx.request_repaint();
+    }
+
     pub(crate) fn toast_message(&self) -> Option<&str> {
         self.toast.as_ref().and_then(|(message, at)| {
             (Instant::now().duration_since(*at) < TOAST_GAP).then_some(message.as_str())
@@ -1319,18 +1361,19 @@ impl eframe::App for Desktop {
                 .exact_height(50.0)
                 .frame(
                     Frame::new()
-                        .fill(design::BG)
-                        .stroke(Stroke::new(1.0_f32, design::STROKE_SOFT))
+                        .fill(design::bg())
+                        .stroke(Stroke::new(1.0_f32, design::stroke_soft()))
                         .inner_margin(Margin::symmetric(14, 9)),
                 )
                 .show(ctx, |ui| self.top_bar(ui, ctx));
             egui::CentralPanel::default()
                 .frame(
                     Frame::new()
-                        .fill(design::BG)
+                        .fill(design::bg())
                         .inner_margin(Margin::symmetric(18, 14)),
                 )
                 .show(ctx, |ui| {
+                    design::paint_backdrop(ui);
                     self.update_banner(ui, ctx);
                     match self.section {
                         Section::Chat => self.chat_screen(ui),
@@ -1423,6 +1466,7 @@ mod tests {
             state: State::default(),
             worker: Some(Worker::start().unwrap()),
             credentials: None,
+            theme: design::ThemeMode::Dark,
             events: None,
             events_active: false,
             events_dirty: false,
@@ -1747,7 +1791,7 @@ mod tests {
             ] {
                 app.section = section;
                 let ctx = egui::Context::default();
-                design::apply_theme(&ctx);
+                design::apply_theme(&ctx, design::ThemeMode::Dark);
                 let input = egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,

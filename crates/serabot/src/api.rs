@@ -750,7 +750,8 @@ async fn list_conversations(
 }
 
 fn conversation_view(record: &StoredConversation) -> Result<Value> {
-    let kind = ConversationKind::from_name(&record.kind)?;
+    // Legacy rows predate the kind column; they are turn-capable direct chats.
+    let kind = crate::store::parse_stored_conversation_kind(&record.kind)?;
     Ok(json!({
         "id": record.id,
         "kind": record.kind,
@@ -2727,6 +2728,29 @@ mod tests {
         );
         assert_eq!(gmail["secrets"]["client_id"]["configured"], false);
         assert!(!connectors.to_string().contains("synthetic-test-key"));
+    }
+
+    #[tokio::test]
+    async fn legacy_conversations_list_as_turn_capable_threads() {
+        let (app, _, store) = app();
+        store
+            .ensure_conversation_accepts_turns("windows-owner")
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/conversations", true, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        let legacy = body["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|conversation| conversation["id"] == "windows-owner")
+            .expect("legacy conversation");
+        assert_eq!(legacy["kind"], "legacy");
+        assert_eq!(legacy["accepts_turns"], true);
     }
 
     #[test]

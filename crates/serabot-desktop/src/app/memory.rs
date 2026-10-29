@@ -29,14 +29,14 @@ impl Desktop {
                 RichText::new("Add a memory")
                     .size(15.0)
                     .strong()
-                    .color(design::TEXT),
+                    .color(design::text()),
             );
             ui.label(
                 RichText::new(
                     "Memories are owner-scoped and reviewable. The orchestrator receives the 20 most recently updated entries as facts; specialists never list them on their own.",
                 )
                 .size(11.0)
-                .color(design::MUTED),
+                .color(design::muted()),
             );
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
@@ -88,7 +88,7 @@ impl Desktop {
                     ui.label(
                         RichText::new(format!("{} / 4,000", self.memory.content.chars().count()))
                             .size(10.0)
-                            .color(design::MUTED_DIM),
+                            .color(design::muted_dim()),
                     );
                 });
             });
@@ -101,14 +101,14 @@ impl Desktop {
                 RichText::new("Saved memories")
                     .size(14.0)
                     .strong()
-                    .color(design::TEXT),
+                    .color(design::text()),
             );
             if self.state.memories_loaded {
                 design::chip(
                     ui,
                     &format!("{}", self.state.memories.len()),
-                    design::MUTED,
-                    design::PANEL_ALT,
+                    design::muted(),
+                    design::panel_alt(),
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -170,7 +170,7 @@ impl Desktop {
             let confirming = draft.delete_confirm.as_deref() == Some(memory.id.as_str());
             design::card(ui, |ui| {
                 ui.horizontal(|ui| {
-                    design::chip(ui, &memory.kind, design::ACCENT, design::OK_BG);
+                    design::chip(ui, &memory.kind, design::accent(), design::ok_bg());
                     ui.label(design::meta(format!(
                         "{} · {}",
                         design::format_stamp(&memory.created_at),
@@ -178,7 +178,10 @@ impl Desktop {
                     )));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if confirming {
-                            if ui.add(design::danger("Confirm delete").small()).clicked() {
+                            if ui
+                                .add(design::danger_button("Confirm delete").small())
+                                .clicked()
+                            {
                                 delete = Some(memory.id.clone());
                             }
                             if ui.small_button("Cancel").clicked() {
@@ -193,14 +196,14 @@ impl Desktop {
                 ui.label(
                     RichText::new(&memory.content)
                         .size(13.0)
-                        .color(design::TEXT),
+                        .color(design::text()),
                 );
                 ui.add_space(2.0);
                 ui.label(
                     RichText::new(&memory.id)
                         .size(9.5)
                         .monospace()
-                        .color(design::MUTED_DIM),
+                        .color(design::muted_dim()),
                 );
             });
             ui.add_space(6.0);

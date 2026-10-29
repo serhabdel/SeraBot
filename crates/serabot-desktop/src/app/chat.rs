@@ -71,7 +71,7 @@ impl MessageLayout {
             return;
         }
         self.rows.clear();
-        let bubble_max = (width * 0.78).clamp(220.0, 760.0);
+        let bubble_max = ((width - 44.0) * 0.82).clamp(200.0, 720.0);
         let wrap = (bubble_max - BUBBLE_PAD_X * 2.0).max(80.0);
         let font = FontId::proportional(13.5);
         for message in messages {
@@ -87,7 +87,7 @@ impl MessageLayout {
             }
             .to_owned();
             let galley = ui.fonts(|fonts| {
-                fonts.layout(message.content.clone(), font.clone(), design::TEXT, wrap)
+                fonts.layout(message.content.clone(), font.clone(), design::text(), wrap)
             });
             let bubble_w = (galley.size().x + BUBBLE_PAD_X * 2.0)
                 .min(bubble_max)
@@ -119,6 +119,7 @@ fn kind_icon(kind: &str) -> design::NavIcon {
 }
 
 fn kind_label(kind: &str) -> String {
+    let kind = if kind == "legacy" { "direct" } else { kind };
     let mut chars = kind.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
@@ -133,8 +134,8 @@ impl Desktop {
             .resizable(false)
             .frame(
                 Frame::new()
-                    .fill(design::PANEL)
-                    .stroke(Stroke::new(1.0_f32, design::STROKE_SOFT))
+                    .fill(design::panel())
+                    .stroke(Stroke::new(1.0_f32, design::stroke_soft()))
                     .inner_margin(Margin::symmetric(12, 12)),
             )
             .show(ctx, |ui| {
@@ -143,11 +144,11 @@ impl Desktop {
                         RichText::new("Conversations")
                             .size(14.0)
                             .strong()
-                            .color(design::TEXT),
+                            .color(design::text()),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .small_button(RichText::new("New").size(11.0).color(design::ACCENT))
+                            .small_button(RichText::new("New").size(11.0).color(design::accent()))
                             .on_hover_text("Open a fresh direct conversation")
                             .clicked()
                         {
@@ -199,7 +200,7 @@ impl Desktop {
                             let icon = kind_icon(&conversation.kind);
                             let response = Frame::new()
                                 .fill(if selected {
-                                    design::PANEL_ALT
+                                    design::panel_alt()
                                 } else {
                                     Color32::TRANSPARENT
                                 })
@@ -217,9 +218,9 @@ impl Desktop {
                                             rect,
                                             icon,
                                             if selected {
-                                                design::ACCENT
+                                                design::accent()
                                             } else {
-                                                design::ICON
+                                                design::icon()
                                             },
                                         );
                                         ui.vertical(|ui| {
@@ -228,7 +229,7 @@ impl Desktop {
                                                 RichText::new(conversation.display_title())
                                                     .size(12.5)
                                                     .strong()
-                                                    .color(design::TEXT),
+                                                    .color(design::text()),
                                             );
                                             let stamp = conversation
                                                 .last_message_at
@@ -241,7 +242,7 @@ impl Desktop {
                                                     design::format_stamp(stamp)
                                                 ))
                                                 .size(10.0)
-                                                .color(design::MUTED_DIM),
+                                                .color(design::muted_dim()),
                                             );
                                         });
                                     });
@@ -260,7 +261,7 @@ impl Desktop {
                         .add(egui::Button::new(
                             RichText::new("Manage conversations")
                                 .size(11.0)
-                                .color(design::MUTED),
+                                .color(design::muted()),
                         ))
                         .clicked()
                     {
@@ -280,12 +281,17 @@ impl Desktop {
                 RichText::new(&self.conversation)
                     .size(11.0)
                     .monospace()
-                    .color(design::MUTED_DIM),
+                    .color(design::muted_dim()),
             );
             if self.conversation_accepts_turns() {
-                design::chip(ui, "accepts turns", design::MUTED, design::PANEL_ALT);
+                design::chip(ui, "accepts turns", design::muted(), design::panel_alt());
             } else {
-                design::chip(ui, "read-only node", design::WARNING, design::WARNING_BG);
+                design::chip(
+                    ui,
+                    "read-only node",
+                    design::warning(),
+                    design::warning_bg(),
+                );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -400,8 +406,8 @@ impl Desktop {
             && accepts
             && !self.state.unknown_outcome;
         Frame::new()
-            .fill(design::PANEL_ALT)
-            .stroke(Stroke::new(1.0_f32, design::STROKE_SOFT))
+            .fill(design::panel_alt())
+            .stroke(Stroke::new(1.0_f32, design::stroke_soft()))
             .corner_radius(12.0)
             .inner_margin(Margin::symmetric(12, 10))
             .show(ui, |ui| {
@@ -430,7 +436,7 @@ impl Desktop {
                         .add_enabled(
                             enabled,
                             egui::Button::new(
-                                RichText::new("Send").strong().color(design::ACCENT),
+                                RichText::new("Send").strong().color(design::accent()),
                             ),
                         )
                         .clicked()
@@ -447,7 +453,7 @@ impl Desktop {
                                 self.composer.chars().count()
                             ))
                             .size(10.0)
-                            .color(design::MUTED_DIM),
+                            .color(design::muted_dim()),
                         );
                     });
                 });
@@ -457,7 +463,7 @@ impl Desktop {
                             "Sections and groups organize the tree. Open a direct thread or a room to talk.",
                         )
                         .size(10.0)
-                        .color(design::WARNING),
+                        .color(design::warning()),
                     );
                 }
             });
@@ -466,36 +472,78 @@ impl Desktop {
 
 fn paint_row(ui: &egui::Ui, rect: Rect, row: &RowLayout, epoch: u64) -> bool {
     let x = if row.user {
-        rect.right() - row.bubble_w
+        rect.right() - 40.0 - row.bubble_w
     } else {
-        rect.left()
+        rect.left() + 40.0
     };
     let bubble = Rect::from_min_size(pos2(x, rect.top()), vec2(row.bubble_w, row.height));
     let painter = ui.painter();
-    painter.rect_filled(
-        bubble,
-        CornerRadius::same(12),
+    let avatar_center = pos2(
         if row.user {
-            design::USER_BUBBLE
+            rect.right() - 16.0
         } else {
-            design::BOT_BUBBLE
+            rect.left() + 16.0
         },
+        rect.top() + 16.0,
     );
+    if row.user {
+        design::paint_avatar(
+            painter,
+            avatar_center,
+            13.0,
+            "You",
+            design::accent(),
+            design::avatar_text(),
+        );
+    } else {
+        design::paint_avatar(
+            painter,
+            avatar_center,
+            13.0,
+            &row.speaker,
+            design::accent_dim(),
+            design::accent(),
+        );
+    }
+    let bubble_color = if row.user {
+        design::user_bubble()
+    } else {
+        design::bot_bubble()
+    };
+    painter.rect_filled(bubble, CornerRadius::same(14), bubble_color);
     painter.rect_stroke(
         bubble,
-        CornerRadius::same(12),
-        Stroke::new(1.0_f32, design::BUBBLE_STROKE),
+        CornerRadius::same(14),
+        Stroke::new(1.0_f32, design::bubble_stroke()),
         StrokeKind::Inside,
     );
+    let tail = if row.user {
+        vec![
+            pos2(bubble.right(), bubble.top() + 12.0),
+            pos2(bubble.right() + 8.0, bubble.top() + 18.0),
+            pos2(bubble.right(), bubble.top() + 26.0),
+        ]
+    } else {
+        vec![
+            pos2(bubble.left(), bubble.top() + 12.0),
+            pos2(bubble.left() - 8.0, bubble.top() + 18.0),
+            pos2(bubble.left(), bubble.top() + 26.0),
+        ]
+    };
+    painter.add(egui::Shape::convex_polygon(
+        tail,
+        bubble_color,
+        Stroke::NONE,
+    ));
     painter.text(
         pos2(bubble.left() + BUBBLE_PAD_X, bubble.top() + 9.0),
         Align2::LEFT_TOP,
         &row.speaker,
         FontId::proportional(11.0),
         if row.user {
-            design::ACCENT
+            design::accent()
         } else {
-            design::MUTED
+            design::muted()
         },
     );
     painter.text(
@@ -503,12 +551,12 @@ fn paint_row(ui: &egui::Ui, rect: Rect, row: &RowLayout, epoch: u64) -> bool {
         Align2::RIGHT_TOP,
         &row.stamp,
         FontId::proportional(10.0),
-        design::MUTED_DIM,
+        design::muted_dim(),
     );
     painter.galley(
         pos2(bubble.left() + BUBBLE_PAD_X, bubble.top() + 31.0),
         Arc::clone(&row.galley),
-        design::TEXT,
+        design::text(),
     );
     ui.interact(
         bubble,
@@ -537,7 +585,7 @@ mod tests {
 
     fn layout_for(messages: &[Message], width: f32) -> (egui::Context, MessageLayout) {
         let ctx = egui::Context::default();
-        design::apply_theme(&ctx);
+        design::apply_theme(&ctx, design::ThemeMode::Dark);
         let mut layout = MessageLayout::default();
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(900.0, 600.0))),
@@ -575,7 +623,7 @@ mod tests {
             ..Default::default()
         };
         let ctx = egui::Context::default();
-        design::apply_theme(&ctx);
+        design::apply_theme(&ctx, design::ThemeMode::Dark);
         let _ = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 reused.ensure(ui, &messages, 420.0, 7);

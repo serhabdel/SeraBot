@@ -25,11 +25,13 @@ pub const TOKEN_ENV_FALLBACK: &str = "SERABOT_OWNER_TOKEN";
 const SETTINGS_FILE: &str = "settings.json";
 const TEMP_SETTINGS_FILE: &str = "settings.json.tmp";
 
-/// Non-secret persisted settings. Only the server origin is stored.
+/// Non-secret persisted settings. Only the server origin and UI theme are stored.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Settings {
     #[serde(default)]
     pub server: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
 }
 
 /// `%APPDATA%\SeraBot` on Windows, `$HOME/.config/SeraBot` elsewhere.
@@ -74,11 +76,19 @@ pub fn load_settings_from(dir: &Path) -> Settings {
     let Ok(settings) = serde_json::from_str::<Settings>(&text) else {
         return Settings::default();
     };
+    let theme = settings.theme.and_then(|theme| match theme.as_str() {
+        "dark" | "light" => Some(theme),
+        _ => None,
+    });
     match validate_endpoint(settings.server.trim()) {
         Ok(url) => Settings {
             server: url.origin().ascii_serialization(),
+            theme,
         },
-        Err(_) => Settings::default(),
+        Err(_) => Settings {
+            server: String::new(),
+            theme,
+        },
     }
 }
 
@@ -93,8 +103,11 @@ pub fn save_settings_to(dir: &Path, settings: &Settings) -> Result<(), String> {
             .origin()
             .ascii_serialization()
     };
-    let text = serde_json::to_string_pretty(&Settings { server })
-        .map_err(|_| "Could not encode settings.".to_owned())?;
+    let text = serde_json::to_string_pretty(&Settings {
+        server,
+        theme: settings.theme.clone(),
+    })
+    .map_err(|_| "Could not encode settings.".to_owned())?;
     fs::create_dir_all(dir).map_err(|_| "Could not create the settings directory.".to_owned())?;
     let temp = dir.join(TEMP_SETTINGS_FILE);
     fs::write(&temp, text).map_err(|_| "Could not write settings.".to_owned())?;
@@ -264,13 +277,15 @@ mod tests {
             &dir,
             &Settings {
                 server: "https://bot.example/".into(),
+                theme: Some("light".into()),
             },
         )
         .unwrap();
         assert_eq!(
             load_settings_from(&dir),
             Settings {
-                server: "https://bot.example".into()
+                server: "https://bot.example".into(),
+                theme: Some("light".into())
             }
         );
         let text = fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
@@ -281,6 +296,7 @@ mod tests {
             &dir,
             &Settings {
                 server: "http://127.0.0.1:8787".into(),
+                theme: None,
             },
         )
         .unwrap();
@@ -315,7 +331,8 @@ mod tests {
             save_settings_to(
                 &dir,
                 &Settings {
-                    server: "http://bot.example".into()
+                    server: "http://bot.example".into(),
+                    ..Default::default()
                 }
             )
             .is_err()
@@ -324,7 +341,8 @@ mod tests {
             save_settings_to(
                 &dir,
                 &Settings {
-                    server: "https://user:secret@bot.example".into()
+                    server: "https://user:secret@bot.example".into(),
+                    ..Default::default()
                 }
             )
             .is_err()
@@ -339,12 +357,14 @@ mod tests {
     fn prefill_prefers_a_saved_origin_over_the_built_in_hint() {
         assert_eq!(
             prefill_server(&Settings {
-                server: "https://owner.example".into()
+                server: "https://owner.example".into(),
+                ..Default::default()
             }),
             "https://owner.example"
         );
         let settings = Settings {
             server: "http://owner.example".into(),
+            theme: None,
         };
         // Invalid saved origins fall back to the optional compiled hint.
         assert_eq!(prefill_server(&settings), default_server_url());

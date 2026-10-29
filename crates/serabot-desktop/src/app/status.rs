@@ -20,14 +20,14 @@ impl Desktop {
                         RichText::new("Model routing")
                             .size(15.0)
                             .strong()
-                            .color(design::TEXT),
+                            .color(design::text()),
                     );
                     ui.label(
                         RichText::new(
                             "The selection is stored per conversation. Applying a different provider requires explicit egress consent.",
                         )
                         .size(11.0)
-                        .color(design::MUTED),
+                        .color(design::muted()),
                     );
                     ui.add_space(6.0);
                     self.model_block(ui);
@@ -38,7 +38,7 @@ impl Desktop {
                         RichText::new("Configured providers")
                             .size(14.0)
                             .strong()
-                            .color(design::TEXT),
+                            .color(design::text()),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
@@ -75,7 +75,7 @@ impl Desktop {
                         "Visibility only. Provider settings, keys and egress approval stay in the server config and the age-encrypted secret store.",
                     )
                     .size(10.0)
-                    .color(design::MUTED_DIM),
+                    .color(design::muted_dim()),
                 );
             });
     }
@@ -96,7 +96,7 @@ impl Desktop {
                         RichText::new("Connectors")
                             .size(14.0)
                             .strong()
-                            .color(design::TEXT),
+                            .color(design::text()),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
@@ -133,7 +133,7 @@ impl Desktop {
                         "Secret presence only; values never leave the age store. OAuth login and writes stay on the server CLI, for example `serabot secrets set NAME`.",
                     )
                     .size(10.0)
-                    .color(design::MUTED_DIM),
+                    .color(design::muted_dim()),
                 );
             });
     }
@@ -214,7 +214,7 @@ impl Desktop {
                             ui.label(
                                 RichText::new("Autoselect uses bot defaults and approved models.")
                                     .size(11.0)
-                                    .color(design::MUTED),
+                                    .color(design::muted()),
                             );
                             return;
                         }
@@ -270,7 +270,7 @@ impl Desktop {
             ui.label(
                 RichText::new("Saved profile unavailable or egress not approved.")
                     .size(11.0)
-                    .color(design::WARNING),
+                    .color(design::warning()),
             );
         }
         if self.state.draft == catalog.selection {
@@ -326,31 +326,36 @@ fn provider_card(ui: &mut egui::Ui, provider: &ProviderStatus) {
                 RichText::new(&provider.id)
                     .size(14.0)
                     .strong()
-                    .color(design::TEXT),
+                    .color(design::text()),
             );
-            design::chip(ui, &provider.kind, design::MUTED, design::PANEL_ALT);
+            design::chip(ui, &provider.kind, design::muted(), design::panel_alt());
             if provider.data_egress_approved {
-                design::chip(ui, "egress approved", design::ACCENT, design::OK_BG);
+                design::chip(ui, "egress approved", design::accent(), design::ok_bg());
             } else {
-                design::chip(ui, "egress blocked", design::WARNING, design::WARNING_BG);
+                design::chip(
+                    ui,
+                    "egress blocked",
+                    design::warning(),
+                    design::warning_bg(),
+                );
             }
             if provider.catalog_verified {
-                design::chip(ui, "catalog verified", design::ACCENT, design::OK_BG);
+                design::chip(ui, "catalog verified", design::accent(), design::ok_bg());
             } else if provider.catalog_fetch {
-                design::chip(ui, "catalog fetched", design::MUTED, design::PANEL_ALT);
+                design::chip(ui, "catalog fetched", design::muted(), design::panel_alt());
             }
         });
         ui.add_space(4.0);
         ui.label(
             RichText::new(format!("Models · {}", join_models(&provider.models)))
                 .size(11.0)
-                .color(design::MUTED),
+                .color(design::muted()),
         );
         if !provider.routing_classes.is_empty() {
             ui.horizontal_wrapped(|ui| {
                 ui.label(design::meta("Routing classes"));
                 for class in &provider.routing_classes {
-                    design::chip(ui, class, design::MUTED, design::PANEL_ALT);
+                    design::chip(ui, class, design::muted(), design::panel_alt());
                 }
             });
         }
@@ -366,13 +371,13 @@ fn connector_card(ui: &mut egui::Ui, connector: &ConnectorStatus) {
                 RichText::new(&connector.id)
                     .size(14.0)
                     .strong()
-                    .color(design::TEXT),
+                    .color(design::text()),
             );
-            design::chip(ui, &connector.kind, design::MUTED, design::PANEL_ALT);
+            design::chip(ui, &connector.kind, design::muted(), design::panel_alt());
             if connector.enabled {
-                design::chip(ui, "enabled", design::ACCENT, design::OK_BG);
+                design::chip(ui, "enabled", design::accent(), design::ok_bg());
             } else {
-                design::chip(ui, "disabled", design::MUTED, design::PANEL_ALT);
+                design::chip(ui, "disabled", design::muted(), design::panel_alt());
             }
         });
         if let Some(uri) = &connector.redirect_uri {
@@ -382,7 +387,7 @@ fn connector_card(ui: &mut egui::Ui, connector: &ConnectorStatus) {
                     RichText::new(uri)
                         .size(10.5)
                         .monospace()
-                        .color(design::TEXT),
+                        .color(design::text()),
                 );
                 design::copy_button(ui, uri, "Copy");
             });
@@ -410,17 +415,17 @@ fn secret_rows(ui: &mut egui::Ui, secrets: &std::collections::BTreeMap<String, S
                 rect.center(),
                 3.5,
                 if secret.configured {
-                    design::ACCENT
+                    design::accent()
                 } else {
-                    design::WARNING
+                    design::warning()
                 },
             );
             let name = secret.name.as_deref().unwrap_or("not configured");
             ui.label(RichText::new(format!("{role} · {name}")).size(10.5).color(
                 if secret.configured {
-                    design::TEXT
+                    design::text()
                 } else {
-                    design::MUTED
+                    design::muted()
                 },
             ));
             if let Some(name) = secret.name.as_deref() {

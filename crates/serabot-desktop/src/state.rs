@@ -269,6 +269,11 @@ impl State {
             self.error = Some(format!(
                 "Unknown {operation} outcome. It may have reached the server. Do not resend. Use Refresh / retry reads to inspect history and the saved selection. {error}"
             ));
+        } else if kind == OperationKind::Apply && error == ApiError::Http(422) {
+            self.error = Some(
+                "The server rejected that model selection. Refresh, reopen Model routing, and pick a listed provider and model."
+                    .into(),
+            );
         } else {
             self.error = Some(error.to_string());
         }
