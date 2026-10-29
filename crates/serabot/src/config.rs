@@ -48,6 +48,9 @@ pub struct Config {
     pub browser: BrowserConfig,
     #[serde(default)]
     pub connectors: ConnectorsConfig,
+    /// Fleet file locations. Relative to `base_dir`; the owner API never accepts paths.
+    #[serde(default)]
+    pub fleet: FleetConfig,
     #[serde(skip)]
     pub base_dir: PathBuf,
 }
@@ -75,6 +78,7 @@ impl Default for Config {
             skills: SkillsConfig::default(),
             browser: BrowserConfig::default(),
             connectors: ConnectorsConfig::default(),
+            fleet: FleetConfig::default(),
             base_dir: PathBuf::from("."),
         }
     }
@@ -250,6 +254,8 @@ impl Config {
         }
         self.browser.validate()?;
         self.connectors.validate()?;
+        validate_relative_dir("fleet.bots_dir", &self.fleet.bots_dir)?;
+        validate_relative_dir("fleet.prompts_dir", &self.fleet.prompts_dir)?;
         Ok(())
     }
 
@@ -485,6 +491,23 @@ impl Default for SkillsConfig {
     fn default() -> Self {
         Self {
             dir: default_skills_dir(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetConfig {
+    #[serde(default = "default_bots_dir")]
+    pub bots_dir: String,
+    #[serde(default = "default_prompts_dir")]
+    pub prompts_dir: String,
+}
+
+impl Default for FleetConfig {
+    fn default() -> Self {
+        Self {
+            bots_dir: default_bots_dir(),
+            prompts_dir: default_prompts_dir(),
         }
     }
 }
@@ -983,6 +1006,331 @@ pub fn load_bots(config: &Config, dir: impl AsRef<Path>) -> Result<Vec<LoadedBot
     Ok(bots)
 }
 
+/// Specialist tools the owner API may write into a scaffolded bot file.
+/// `delegate` is orchestrator-only and is intentionally absent.
+const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
+    "skill_list",
+    "skill_search",
+    "skill_load",
+    "rag_search",
+    "xlsx_analyze",
+    "timesheet_analyze",
+    "document_index",
+    "fetch_url",
+    "watch_now",
+    "audio_transcribe",
+    "audio_understand",
+    "firecrawl_scrape",
+    "firecrawl_map",
+    "firecrawl_search",
+    "firecrawl_crawl",
+    "elevenlabs_list_voices",
+    "elevenlabs_text_to_speech",
+    "elevenlabs_sound_effect",
+    "elevenlabs_transcribe",
+    "elevenlabs_generate_image",
+    "elevenlabs_generate_video",
+    "deck_build",
+    "telegram_send_document",
+    "onedrive_upload",
+    "onedrive_list",
+    "browser_session_start",
+    "browser_session_stop",
+    "browser_navigate",
+    "browser_snapshot",
+    "google_drive_list",
+    "google_sheets_read",
+    "google_calendar_list_events",
+    "gmail_list_messages",
+    "outlook_list_messages",
+    "outlook_calendar_list_events",
+    "notion_query_database",
+    "agentmail_inboxes_list",
+    "agentmail_send",
+];
+
+const DEFAULT_SPECIALIST_TOOLS: &[&str] = &["skill_list", "skill_search", "skill_load"];
+
+/// Tools with an external effect. A scaffold lists these in `require_approval`.
+const EXTERNAL_EFFECT_TOOLS: &[&str] = &[
+    "audio_transcribe",
+    "audio_understand",
+    "firecrawl_scrape",
+    "firecrawl_map",
+    "firecrawl_search",
+    "firecrawl_crawl",
+    "elevenlabs_text_to_speech",
+    "elevenlabs_sound_effect",
+    "elevenlabs_transcribe",
+    "elevenlabs_generate_image",
+    "elevenlabs_generate_video",
+    "telegram_send_document",
+    "onedrive_upload",
+    "browser_session_start",
+    "browser_session_stop",
+    "browser_navigate",
+    "agentmail_inboxes_list",
+    "agentmail_send",
+];
+
+const MAX_BOT_DESCRIPTION_CHARS: usize = 2000;
+const MAX_SCAFFOLD_TOOLS: usize = 32;
+const MAX_SCAFFOLD_SKILLS: usize = 16;
+
+#[derive(Debug, Clone)]
+pub struct ScaffoldedBot {
+    pub id: String,
+    pub bot_file: String,
+    pub prompt_file: String,
+    pub bot_path: PathBuf,
+    pub prompt_path: PathBuf,
+    pub tools: Vec<String>,
+    pub skills: Vec<String>,
+    pub require_approval: Vec<String>,
+}
+
+/// Write `bots/<id>.toml` and `prompts/<id>.txt` from the fixed specialist template.
+/// Paths come from `[fleet]`, never from the caller. The bot stays disabled.
+pub fn scaffold_specialist_bot(
+    config: &Config,
+    id: &str,
+    description: &str,
+    tools: Option<&[String]>,
+    skills: Option<&[String]>,
+    policy: &crate::policy::Policy,
+) -> Result<ScaffoldedBot> {
+    validate_bot_id(id)?;
+    if description.chars().count() > MAX_BOT_DESCRIPTION_CHARS {
+        return Err(SeraError::Validation("description is too long".into()));
+    }
+    if description
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return Err(SeraError::Validation(
+            "description contains unsupported control characters".into(),
+        ));
+    }
+    let description = description.trim();
+    let tools = match tools {
+        Some(tools) => normalize_tool_list(tools)?,
+        None => DEFAULT_SPECIALIST_TOOLS
+            .iter()
+            .map(|tool| (*tool).to_owned())
+            .collect(),
+    };
+    let skills = normalize_skill_list(config, skills.unwrap_or(&[]))?;
+    let prompt = specialist_prompt(description);
+    if !policy.is_allowed(description) || !policy.is_allowed(&prompt) {
+        return Err(SeraError::PolicyViolation);
+    }
+    let require_approval: Vec<String> = tools
+        .iter()
+        .filter(|tool| EXTERNAL_EFFECT_TOOLS.contains(&tool.as_str()))
+        .cloned()
+        .collect();
+
+    let bots_dir = fleet_dir(config, &config.fleet.bots_dir)?;
+    let prompts_dir = fleet_dir(config, &config.fleet.prompts_dir)?;
+    let bot_path = bots_dir.join(format!("{id}.toml"));
+    let prompt_path = prompts_dir.join(format!("{id}.txt"));
+    if bot_path.exists() || prompt_path.exists() {
+        return Err(SeraError::InvalidState("bot already exists".into()));
+    }
+    let bot_file = relative_fleet_file(&config.fleet.bots_dir, &format!("{id}.toml"));
+    let prompt_file = relative_fleet_file(&config.fleet.prompts_dir, &format!("{id}.txt"));
+    let toml_body = render_bot_toml(id, &prompt_file, &skills, &tools, &require_approval);
+    write_new_file(&prompt_path, &prompt)?;
+    if let Err(error) = write_new_file(&bot_path, &toml_body) {
+        let _ = std::fs::remove_file(&prompt_path);
+        return Err(error);
+    }
+    Ok(ScaffoldedBot {
+        id: id.to_owned(),
+        bot_file,
+        prompt_file,
+        bot_path,
+        prompt_path,
+        tools,
+        skills,
+        require_approval,
+    })
+}
+
+fn validate_bot_id(id: &str) -> Result<()> {
+    crate::orchestration::validate_slug(id)?;
+    if id == crate::orchestration::ORCHESTRATOR_BOT || is_windows_device_name(id) {
+        return Err(SeraError::Validation("bot id is reserved".into()));
+    }
+    Ok(())
+}
+
+fn is_windows_device_name(id: &str) -> bool {
+    matches!(id, "con" | "prn" | "aux" | "nul")
+        || (id.len() == 4
+            && (id.starts_with("com") || id.starts_with("lpt"))
+            && id.as_bytes()[3].is_ascii_digit())
+}
+
+fn normalize_tool_list(tools: &[String]) -> Result<Vec<String>> {
+    if tools.len() > MAX_SCAFFOLD_TOOLS {
+        return Err(SeraError::Validation("too many tools".into()));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(tools.len());
+    for tool in tools {
+        if tool == "delegate" {
+            return Err(SeraError::Validation(
+                "specialists cannot be granted delegate".into(),
+            ));
+        }
+        if !SPECIALIST_TOOL_ALLOWLIST.contains(&tool.as_str()) {
+            return Err(SeraError::Validation(format!(
+                "tool '{tool}' is not on the specialist allowlist"
+            )));
+        }
+        if !seen.insert(tool.clone()) {
+            return Err(SeraError::Validation(format!("duplicate tool '{tool}'")));
+        }
+        out.push(tool.clone());
+    }
+    Ok(out)
+}
+
+fn normalize_skill_list(config: &Config, skills: &[String]) -> Result<Vec<String>> {
+    if skills.len() > MAX_SCAFFOLD_SKILLS {
+        return Err(SeraError::Validation("too many skills".into()));
+    }
+    if skills.is_empty() {
+        return Ok(Vec::new());
+    }
+    let catalog = crate::skills::SkillCatalog::load(config)?;
+    let known = catalog.skill_ids();
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(skills.len());
+    for skill in skills {
+        crate::skills::validate_skill_id(skill)?;
+        if !known.iter().any(|id| id == skill) {
+            return Err(SeraError::Validation(format!("unknown skill '{skill}'")));
+        }
+        if !seen.insert(skill.clone()) {
+            return Err(SeraError::Validation(format!("duplicate skill '{skill}'")));
+        }
+        out.push(skill.clone());
+    }
+    Ok(out)
+}
+
+fn specialist_prompt(description: &str) -> String {
+    let mut body = String::from(
+        "You are a specialist bot. Follow the owner request, use only allowlisted tools, and do not delegate.\n",
+    );
+    if !description.is_empty() {
+        body.push('\n');
+        body.push_str(description);
+        body.push('\n');
+    }
+    body
+}
+
+fn render_bot_toml(
+    id: &str,
+    prompt_file: &str,
+    skills: &[String],
+    tools: &[String],
+    require_approval: &[String],
+) -> String {
+    format!(
+        "name = {id}\nrole = \"specialist\"\ndelegates = []\ntrigger = \"command\"\nsystem_prompt = {prompt}\nskills = {skills}\ntools = {tools}\nrequire_approval = {approvals}\nenabled = false\n",
+        id = toml_basic_string(id),
+        prompt = toml_basic_string(prompt_file),
+        skills = toml_string_array(skills),
+        tools = toml_string_array(tools),
+        approvals = toml_string_array(require_approval),
+    )
+}
+
+fn toml_basic_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn toml_string_array(values: &[String]) -> String {
+    if values.is_empty() {
+        return "[]".into();
+    }
+    let items = values
+        .iter()
+        .map(|value| toml_basic_string(value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{items}]")
+}
+
+fn fleet_dir(config: &Config, relative: &str) -> Result<PathBuf> {
+    validate_relative_dir("fleet directory", relative)?;
+    let dir = config.base_dir.join(relative);
+    std::fs::create_dir_all(&dir)?;
+    let base = config.base_dir.canonicalize().map_err(|error| {
+        SeraError::Config(format!(
+            "configuration directory cannot be resolved: {error}"
+        ))
+    })?;
+    let dir = dir.canonicalize().map_err(|error| {
+        SeraError::Config(format!("fleet directory cannot be resolved: {error}"))
+    })?;
+    if !dir.starts_with(&base) {
+        return Err(SeraError::Config(
+            "fleet directory escapes the configuration directory".into(),
+        ));
+    }
+    Ok(dir)
+}
+
+fn relative_fleet_file(dir: &str, file_name: &str) -> String {
+    let mut parts = Vec::new();
+    for component in Path::new(dir).components() {
+        if let std::path::Component::Normal(part) = component {
+            parts.push(part.to_string_lossy().into_owned());
+        }
+    }
+    parts.push(file_name.to_owned());
+    parts.join("/")
+}
+
+fn write_new_file(path: &Path, contents: &str) -> Result<()> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(SeraError::InvalidState("bot already exists".into()))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_relative_dir(label: &str, value: &str) -> Result<()> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || path.is_absolute()
+        || !path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(SeraError::Config(format!(
+            "{label} must be a relative directory inside the configuration directory"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
     pub name: String,
@@ -1077,6 +1425,12 @@ fn default_catalog_ttl_secs() -> u64 {
 }
 fn default_skills_dir() -> String {
     "skills".into()
+}
+fn default_bots_dir() -> String {
+    "bots".into()
+}
+fn default_prompts_dir() -> String {
+    "prompts".into()
 }
 fn default_max_tool_rounds() -> usize {
     10
@@ -1337,5 +1691,113 @@ enabled = false
         let config: Config = toml::from_str(raw).unwrap();
         assert_eq!(config.llm.model, "test-model");
         assert!(!config.api.enabled);
+        assert_eq!(config.fleet.bots_dir, "bots");
+        assert_eq!(config.fleet.prompts_dir, "prompts");
+    }
+
+    #[test]
+    fn rejects_fleet_dir_that_escapes_the_configuration_directory() {
+        let mut config = Config::default();
+        config.fleet.bots_dir = "../bots".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn scaffolds_disabled_specialist_under_configured_dirs() {
+        let root = std::env::temp_dir().join(format!("serabot-scaffold-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let skill_dir = root.join("skills").join("ask");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: \"Ask\"\ndescription: \"Synthetic ask skill\"\n---\n\n# Ask\n",
+        )
+        .unwrap();
+        let config = Config {
+            base_dir: root.clone(),
+            skills: SkillsConfig {
+                dir: "skills".into(),
+            },
+            ..Config::default()
+        };
+        let policy = crate::policy::Policy::empty();
+        let scaffolded = scaffold_specialist_bot(
+            &config,
+            "notes",
+            "Synthetic notes specialist.",
+            Some(&["rag_search".into(), "firecrawl_search".into()]),
+            Some(&["ask".into()]),
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(scaffolded.bot_file, "bots/notes.toml");
+        assert_eq!(scaffolded.prompt_file, "prompts/notes.txt");
+        assert!(scaffolded.bot_path.starts_with(&root));
+        assert!(scaffolded.prompt_path.starts_with(&root));
+        let raw = std::fs::read_to_string(&scaffolded.bot_path).unwrap();
+        let bot: BotConfig = toml::from_str(&raw).unwrap();
+        assert_eq!(bot.name, "notes");
+        assert!(!bot.enabled);
+        assert_eq!(bot.role, BotRole::Specialist);
+        assert!(bot.delegates.is_empty());
+        assert_eq!(bot.system_prompt, "prompts/notes.txt");
+        assert_eq!(bot.tools, vec!["rag_search", "firecrawl_search"]);
+        assert_eq!(bot.skills, vec!["ask"]);
+        assert_eq!(bot.require_approval, vec!["firecrawl_search"]);
+        assert!(!bot.tools.iter().any(|tool| tool == "delegate"));
+        let prompt = std::fs::read_to_string(&scaffolded.prompt_path).unwrap();
+        assert!(prompt.contains("do not delegate"));
+        assert!(prompt.contains("Synthetic notes specialist."));
+        assert!(scaffold_specialist_bot(&config, "notes", "", None, None, &policy).is_err());
+        assert!(scaffold_specialist_bot(&config, "../outside", "", None, None, &policy).is_err());
+        assert!(scaffold_specialist_bot(&config, "main", "", None, None, &policy).is_err());
+        assert!(
+            scaffold_specialist_bot(
+                &config,
+                "other",
+                "",
+                Some(&["delegate".into()]),
+                None,
+                &policy
+            )
+            .is_err()
+        );
+        assert!(
+            scaffold_specialist_bot(
+                &config,
+                "other",
+                "",
+                Some(&["not_a_tool".into()]),
+                None,
+                &policy
+            )
+            .is_err()
+        );
+        assert!(
+            scaffold_specialist_bot(
+                &config,
+                "other",
+                "",
+                None,
+                Some(&["missing-skill".into()]),
+                &policy
+            )
+            .is_err()
+        );
+        let blocked = crate::policy::Policy::from_text("synthetic blocked phrase");
+        assert!(
+            scaffold_specialist_bot(
+                &config,
+                "other",
+                "notes about synthetic blocked phrase",
+                None,
+                None,
+                &blocked
+            )
+            .is_err()
+        );
+        assert!(!root.join("bots").join("other.toml").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

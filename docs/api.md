@@ -73,6 +73,41 @@ Returns `{"selection": {...}}`. Unknown providers/models and unapproved
 profiles are rejected; client-supplied endpoints are not accepted. The
 selection applies to future turns only. See [model routing](model-routing.md).
 
+## Fleet scaffold
+
+`POST /v1/bots`
+
+```json
+{
+  "id": "notes",
+  "description": "Synthetic notes specialist.",
+  "tools": ["skill_list", "rag_search"],
+  "skills": ["ask"]
+}
+```
+
+Creates a disabled specialist from a fixed template under the configured `bots`
+and `prompts` directories. `id` is a slug. There is no path field. `tools` and
+`skills` are optional; omitted tools default to `skill_list`, `skill_search`,
+and `skill_load`. Unknown tools, `delegate`, and unknown skills are rejected.
+The description is checked against the content policy. The response reports
+`enabled: false` and `live: false` — restart before the bot can run, and add it
+to `main.delegates` yourself if `main` should hand work to it.
+
+See [Orchestration](orchestration.md).
+
+## Conversation tree
+
+`POST /v1/conversations`
+
+```json
+{"kind": "group", "slug": "ops", "parent_id": "sec:finance"}
+```
+
+`kind` is `section`, `group`, `direct`, or `room`. The server assigns the id.
+Sections and groups do not accept turns; `POST /v1/messages` to those ids is
+rejected. Direct and room conversations do. Duplicate ids conflict.
+
 ## Conversation history
 
 `GET /v1/conversations/{id}/messages?limit=100`

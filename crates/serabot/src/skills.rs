@@ -550,10 +550,13 @@ mod tests {
     }
 
     fn test_config(base: &Path) -> Config {
-        let mut config = Config::default();
-        config.base_dir = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
-        config.skills.dir = "skills".into();
-        config
+        Config {
+            base_dir: base.canonicalize().unwrap_or_else(|_| base.to_path_buf()),
+            skills: crate::config::SkillsConfig {
+                dir: "skills".into(),
+            },
+            ..Config::default()
+        }
     }
 
     #[test]

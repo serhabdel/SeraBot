@@ -286,6 +286,18 @@ impl Runtime {
         &self.config
     }
 
+    pub fn bot_loaded(&self, name: &str) -> bool {
+        self.bots.contains_key(name)
+    }
+
+    pub fn policy_version(&self) -> &str {
+        self.gateway.policy().version()
+    }
+
+    pub fn policy(&self) -> &crate::policy::Policy {
+        self.gateway.policy()
+    }
+
     pub fn scan_owner_output(&self, text: &str) -> Result<()> {
         self.gateway.scan_egress(text)
     }

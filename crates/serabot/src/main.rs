@@ -281,7 +281,7 @@ fn load(
     config_path: &std::path::Path,
 ) -> anyhow::Result<(Arc<Config>, Vec<serabot::config::LoadedBot>)> {
     let config = Arc::new(Config::load(config_path)?);
-    let bots = load_bots(&config, "bots")?;
+    let bots = load_bots(&config, &config.fleet.bots_dir)?;
     if !bots
         .iter()
         .any(|bot| bot.config.name == "main" && bot.config.enabled)
@@ -535,7 +535,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         register_connector_tools(
             &mut registry,
             &config.connectors,
-            agentmail_key.as_deref(),
+            agentmail_key,
             connector_http,
         )?;
     }

@@ -19,12 +19,13 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 
-use crate::config::Config;
+use crate::config::{Config, scaffold_specialist_bot};
 use crate::domain::Task;
 use crate::error::{Result, SeraError};
 use crate::gateway::Decision;
 use crate::maker::ArtifactStore;
 use crate::model_router::ModelSelection;
+use crate::orchestration::{ConversationKind, scoped_conversation_id};
 use crate::runtime::{ApprovalNotice, Notifier, Runtime};
 use crate::store::Store;
 use crate::util::{constant_time_eq, sha256_hex, truncate_chars};
@@ -107,6 +108,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
         .route("/v1/messages", post(send_message))
+        .route("/v1/bots", post(create_bot))
+        .route("/v1/conversations", post(create_conversation))
         .route("/v1/models", get(models))
         .route("/v1/conversations/{id}/model", put(select_model))
         .route(
@@ -462,6 +465,137 @@ async fn approve_artifact(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateBotRequest {
+    id: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    tools: Option<Vec<String>>,
+    #[serde(default)]
+    skills: Option<Vec<String>>,
+}
+
+async fn create_bot(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<CreateBotRequest>,
+) -> Result<Json<Value>> {
+    if state.runtime.bot_loaded(&request.id) {
+        return Err(SeraError::InvalidState("bot already exists".into()));
+    }
+    state.runtime.scan_owner_output(&request.description)?;
+    let scaffolded = scaffold_specialist_bot(
+        &state.config,
+        &request.id,
+        &request.description,
+        request.tools.as_deref(),
+        request.skills.as_deref(),
+        state.runtime.policy(),
+    )?;
+    if let Err(error) = state.store.record_audit(
+        "owner",
+        "bot.scaffolded",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({
+            "id": scaffolded.id,
+            "bot_file": scaffolded.bot_file,
+            "prompt_file": scaffolded.prompt_file,
+            "enabled": false,
+            "role": "specialist",
+            "tools": scaffolded.tools,
+            "skills": scaffolded.skills,
+        })),
+    ) {
+        let _ = std::fs::remove_file(&scaffolded.bot_path);
+        let _ = std::fs::remove_file(&scaffolded.prompt_path);
+        return Err(error);
+    }
+    Ok(Json(json!({
+        "bot": {
+            "id": scaffolded.id,
+            "enabled": false,
+            "role": "specialist",
+            "live": false,
+            "tools": scaffolded.tools,
+            "skills": scaffolded.skills,
+            "require_approval": scaffolded.require_approval,
+            "bot_file": scaffolded.bot_file,
+            "prompt_file": scaffolded.prompt_file,
+        }
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateConversationRequest {
+    kind: String,
+    slug: String,
+    #[serde(default)]
+    parent_id: Option<String>,
+}
+
+async fn create_conversation(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<CreateConversationRequest>,
+) -> Result<Json<Value>> {
+    let kind = ConversationKind::from_name(&request.kind)?;
+    let id = scoped_conversation_id(kind, &request.slug)?;
+    let parent_id = match request.parent_id.as_deref() {
+        None => None,
+        Some("") => {
+            return Err(SeraError::Validation(
+                "conversation parent id is empty".into(),
+            ));
+        }
+        Some(parent) => Some(parent),
+    };
+    if matches!(kind, ConversationKind::Section) && parent_id.is_some() {
+        return Err(SeraError::Validation(
+            "section conversations cannot have a parent".into(),
+        ));
+    }
+    if matches!(kind, ConversationKind::Group) && parent_id.is_none() {
+        return Err(SeraError::Validation(
+            "group conversations require a section parent".into(),
+        ));
+    }
+    state
+        .store
+        .create_conversation(&id, kind.as_str(), parent_id)?;
+    let record = state
+        .store
+        .get_conversation(&id)?
+        .ok_or_else(|| SeraError::Internal("conversation missing after insert".into()))?;
+    state.store.record_audit(
+        "owner",
+        "conversation.created",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({
+            "id": record.id,
+            "kind": record.kind,
+            "parent_id": record.parent_id,
+            "accepts_turns": kind.accepts_turns(),
+        })),
+    )?;
+    Ok(Json(json!({
+        "conversation": {
+            "id": record.id,
+            "kind": record.kind,
+            "parent_id": record.parent_id,
+            "accepts_turns": kind.accepts_turns(),
+        }
+    })))
+}
+
 async fn authorize(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
@@ -592,6 +726,14 @@ mod tests {
     }
 
     fn app_with_policy(egress_approved: bool, policy: Policy) -> (Router, Arc<Config>, Store) {
+        app_with_root(egress_approved, policy, std::env::current_dir().unwrap())
+    }
+
+    fn app_with_root(
+        egress_approved: bool,
+        policy: Policy,
+        base_dir: std::path::PathBuf,
+    ) -> (Router, Arc<Config>, Store) {
         let mut config = Config::default();
         config.api.enabled = true;
         config.api.token_hash = sha256_hex("test-token-that-is-long-enough-123");
@@ -599,7 +741,7 @@ mod tests {
         config.llm.model = "test".into();
         config.llm.base_url = "https://example.com/v1".into();
         config.llm.models = vec!["test-alternative".into()];
-        config.base_dir = std::env::current_dir().unwrap();
+        config.base_dir = base_dir;
         let config = Arc::new(config);
         let store = Store::open(
             std::env::temp_dir().join(format!("serabot-api-{}.db", uuid::Uuid::new_v4())),
@@ -1067,5 +1209,334 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
+    }
+
+    async fn read_json(response: Response) -> Value {
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn temp_base() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("serabot-api-fleet-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("skills").join("ask")).unwrap();
+        std::fs::write(
+            root.join("skills").join("ask").join("SKILL.md"),
+            "---\nname: \"Ask\"\ndescription: \"Synthetic ask skill\"\n---\n\n# Ask\n",
+        )
+        .unwrap();
+        root.canonicalize().unwrap()
+    }
+
+    #[tokio::test]
+    async fn scaffolds_bot_from_template_without_owner_paths() {
+        let root = temp_base();
+        let (app, _, store) = app_with_root(true, Policy::empty(), root.clone());
+        let denied = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/bots",
+                false,
+                Some(json!({"id": "notes"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/bots",
+                true,
+                Some(json!({
+                    "id": "notes",
+                    "description": "Synthetic notes specialist.",
+                    "tools": ["rag_search", "skill_list"],
+                    "skills": ["ask"]
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = read_json(response).await;
+        assert_eq!(value["bot"]["id"], "notes");
+        assert_eq!(value["bot"]["enabled"], false);
+        assert_eq!(value["bot"]["role"], "specialist");
+        assert_eq!(value["bot"]["live"], false);
+        assert_eq!(value["bot"]["bot_file"], "bots/notes.toml");
+        assert_eq!(value["bot"]["prompt_file"], "prompts/notes.txt");
+        assert!(!value.to_string().contains("delegate"));
+        let toml = std::fs::read_to_string(root.join("bots").join("notes.toml")).unwrap();
+        assert!(toml.contains("enabled = false"));
+        assert!(toml.contains("role = \"specialist\""));
+        assert!(!toml.contains("delegates = [\""));
+        assert!(root.join("prompts").join("notes.txt").is_file());
+        assert!(
+            store
+                .list_audit(10)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.event == "bot.scaffolded")
+        );
+
+        let again = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/bots",
+                true,
+                Some(json!({"id": "notes"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::CONFLICT);
+
+        let escaped = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/bots",
+                true,
+                Some(json!({"id": "../outside", "path": "C:/secret"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(escaped.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!root.join("outside.toml").exists());
+
+        let delegate = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/bots",
+                true,
+                Some(json!({"id": "other", "tools": ["delegate"]})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(delegate.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!root.join("bots").join("other.toml").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn bot_scaffold_rejects_policy_violations() {
+        let root = temp_base();
+        let (app, _, _) = app_with_root(
+            true,
+            Policy::from_text("synthetic blocked phrase"),
+            root.clone(),
+        );
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/bots",
+                true,
+                Some(json!({
+                    "id": "notes",
+                    "description": "mentions synthetic blocked phrase"
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!root.join("bots").join("notes.toml").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn creates_conversation_tree_and_keeps_containers_turnless() {
+        let (app, _, store) = app();
+        let denied = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/conversations",
+                false,
+                Some(json!({"kind": "section", "slug": "finance"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let section = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/conversations",
+                true,
+                Some(json!({"kind": "section", "slug": "finance"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(section.status(), StatusCode::OK);
+        let section = read_json(section).await;
+        assert_eq!(section["conversation"]["id"], "sec:finance");
+        assert_eq!(section["conversation"]["accepts_turns"], false);
+        assert!(section["conversation"]["parent_id"].is_null());
+
+        let group = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/conversations",
+                true,
+                Some(json!({
+                    "kind": "group",
+                    "slug": "ops",
+                    "parent_id": "sec:finance"
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(group.status(), StatusCode::OK);
+        let group = read_json(group).await;
+        assert_eq!(group["conversation"]["id"], "grp:ops");
+        assert_eq!(group["conversation"]["parent_id"], "sec:finance");
+        assert_eq!(group["conversation"]["accepts_turns"], false);
+
+        let direct = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/conversations",
+                true,
+                Some(json!({
+                    "kind": "direct",
+                    "slug": "analyst",
+                    "parent_id": "grp:ops"
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(direct.status(), StatusCode::OK);
+        let direct = read_json(direct).await;
+        assert_eq!(direct["conversation"]["id"], "dir:analyst");
+        assert_eq!(direct["conversation"]["accepts_turns"], true);
+
+        let room = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/conversations",
+                true,
+                Some(json!({
+                    "kind": "room",
+                    "slug": "review",
+                    "parent_id": "sec:finance"
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(room.status(), StatusCode::OK);
+        assert_eq!(read_json(room).await["conversation"]["id"], "room:review");
+
+        let orphan_group = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/conversations",
+                true,
+                Some(json!({"kind": "group", "slug": "loose"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(orphan_group.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let bad_parent = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/conversations",
+                true,
+                Some(json!({
+                    "kind": "direct",
+                    "slug": "bad",
+                    "parent_id": "dir:analyst"
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bad_parent.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let duplicate = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/conversations",
+                true,
+                Some(json!({"kind": "section", "slug": "finance"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+
+        let section_turn = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/messages",
+                true,
+                Some(json!({"conversation_id": "sec:finance", "text": "hello"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(section_turn.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let group_turn = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/messages",
+                true,
+                Some(json!({"conversation_id": "grp:ops", "text": "hello"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(group_turn.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let direct_turn = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/messages",
+                true,
+                Some(json!({"conversation_id": "dir:analyst", "text": "hello"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(direct_turn.status(), StatusCode::OK);
+        assert_eq!(store.pending_task_count().unwrap(), 1);
+        assert_eq!(
+            store
+                .get_conversation("dir:analyst")
+                .unwrap()
+                .unwrap()
+                .parent_id
+                .as_deref(),
+            Some("grp:ops")
+        );
     }
 }

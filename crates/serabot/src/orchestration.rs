@@ -30,6 +30,46 @@ impl ConversationKind {
             Self::Direct | Self::Room | Self::Legacy
         )
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Section => "section",
+            Self::Group => "group",
+            Self::Direct => "direct",
+            Self::Room => "room",
+            Self::Legacy => "legacy",
+        }
+    }
+
+    /// Kinds the owner API may create. Legacy ids stay implicit.
+    pub fn from_name(name: &str) -> Result<Self> {
+        match name {
+            "section" => Ok(Self::Section),
+            "group" => Ok(Self::Group),
+            "direct" => Ok(Self::Direct),
+            "room" => Ok(Self::Room),
+            _ => Err(SeraError::Validation(
+                "conversation kind must be section, group, direct, or room".into(),
+            )),
+        }
+    }
+
+    pub fn id_prefix(self) -> Result<&'static str> {
+        match self {
+            Self::Section => Ok("sec"),
+            Self::Group => Ok("grp"),
+            Self::Direct => Ok("dir"),
+            Self::Room => Ok("room"),
+            Self::Legacy => Err(SeraError::Validation(
+                "legacy conversations are not created explicitly".into(),
+            )),
+        }
+    }
+}
+
+pub fn scoped_conversation_id(kind: ConversationKind, slug: &str) -> Result<String> {
+    validate_slug(slug)?;
+    Ok(format!("{}:{slug}", kind.id_prefix()?))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,11 +146,8 @@ pub fn validate_conversation_id(id: &str) -> Result<()> {
     {
         return Err(SeraError::Validation("invalid conversation id".into()));
     }
-    if let Some((prefix, slug)) = id.split_once(':') {
-        match prefix {
-            "sec" | "grp" | "dir" | "room" => validate_slug(slug)?,
-            _ => {}
-        }
+    if let Some(("sec" | "grp" | "dir" | "room", slug)) = id.split_once(':') {
+        validate_slug(slug)?;
     }
     Ok(())
 }

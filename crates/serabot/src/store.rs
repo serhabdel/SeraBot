@@ -281,10 +281,12 @@ impl Store {
             ));
         }
         let connection = self.connection()?;
-        connection.execute(
-            "INSERT INTO conversations(id, kind, parent_id, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![id, kind, parent_id, now_string()],
-        )?;
+        connection
+            .execute(
+                "INSERT INTO conversations(id, kind, parent_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![id, kind, parent_id, now_string()],
+            )
+            .map_err(map_conversation_write)?;
         Ok(())
     }
 
@@ -1092,6 +1094,20 @@ pub struct StoredConversation {
     pub created_at: DateTime<Utc>,
 }
 
+fn map_conversation_write(error: rusqlite::Error) -> SeraError {
+    if let rusqlite::Error::SqliteFailure(err, _) = &error {
+        if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+            || err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+        {
+            return SeraError::InvalidState("conversation already exists".into());
+        }
+        if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY {
+            return SeraError::Validation("invalid conversation parent".into());
+        }
+    }
+    SeraError::Database(error)
+}
+
 fn conversation_kind_str(kind: crate::orchestration::ConversationKind) -> &'static str {
     use crate::orchestration::ConversationKind;
     match kind {
@@ -1435,5 +1451,65 @@ mod tests {
             "direct"
         );
         store.ensure_conversation_accepts_turns("owner").unwrap();
+    }
+
+    #[test]
+    fn conversation_tree_links_parents_and_rejects_bad_edges() {
+        let store = store();
+        store
+            .create_conversation("sec:finance", "section", None)
+            .unwrap();
+        store
+            .create_conversation("grp:ops", "group", Some("sec:finance"))
+            .unwrap();
+        store
+            .create_conversation("dir:analyst", "direct", Some("grp:ops"))
+            .unwrap();
+        store
+            .create_conversation("room:review", "room", Some("sec:finance"))
+            .unwrap();
+        assert_eq!(
+            store
+                .get_conversation("dir:analyst")
+                .unwrap()
+                .unwrap()
+                .parent_id
+                .as_deref(),
+            Some("grp:ops")
+        );
+        assert!(
+            store
+                .ensure_conversation_accepts_turns("sec:finance")
+                .is_err()
+        );
+        assert!(store.ensure_conversation_accepts_turns("grp:ops").is_err());
+        store
+            .ensure_conversation_accepts_turns("dir:analyst")
+            .unwrap();
+        store
+            .ensure_conversation_accepts_turns("room:review")
+            .unwrap();
+        assert!(
+            store
+                .create_conversation("grp:other", "group", None)
+                .is_err()
+        );
+        assert!(
+            store
+                .create_conversation("sec:nested", "section", Some("sec:finance"))
+                .is_err()
+        );
+        assert!(
+            store
+                .create_conversation("dir:bad", "direct", Some("dir:analyst"))
+                .is_err()
+        );
+        assert!(
+            store
+                .create_conversation("sec:finance", "section", None)
+                .unwrap_err()
+                .to_string()
+                .contains("already exists")
+        );
     }
 }

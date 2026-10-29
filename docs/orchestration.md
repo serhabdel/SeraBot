@@ -91,13 +91,35 @@ Startup validation (`load_bots`):
 
 Bots load at process start; changing fleet files requires restart.
 
-## Bot creation (planned)
+## Bot creation
 
-Owner API will write `bots/<name>.toml` and `prompts/<name>.txt` from a fixed
-template: `enabled = false`, `role = "specialist"`, tools and skills drawn only
-from existing allowlists, policy scan on description. New bots are not added to
-`main.delegates` automatically and are not live until restart. No model-chosen
-paths.
+`POST /v1/bots` (owner token) writes `bots/<id>.toml` and `prompts/<id>.txt`
+from a fixed template: `enabled = false`, `role = "specialist"`, `delegates = []`,
+`trigger = "command"`. The id is a slug (`^[a-z][a-z0-9-]{0,31}$`). `main` and
+Windows device names are reserved. Tools must be on the specialist allowlist
+(`delegate` is rejected). Skills must already exist under `skills.dir`. The
+description is policy-scanned and stored only in the prompt stub.
+
+Directories come from `[fleet]` (`bots_dir` / `prompts_dir`, default `bots` and
+`prompts`) and must stay inside the configuration directory. The request has no
+path field. New bots are not added to `main.delegates` and are not live until
+restart. External-effect tools listed on the bot are also listed in
+`require_approval`.
+
+## Conversation tree
+
+`POST /v1/conversations` creates one node:
+
+```json
+{"kind": "section", "slug": "finance"}
+{"kind": "group", "slug": "ops", "parent_id": "sec:finance"}
+{"kind": "direct", "slug": "analyst", "parent_id": "grp:ops"}
+{"kind": "room", "slug": "review", "parent_id": "sec:finance"}
+```
+
+The server builds the id (`sec:`, `grp:`, `dir:`, `room:` plus the slug). Sections
+have no parent. Groups require a section parent. Direct and room nodes may sit
+under a section or a group. Sections and groups still cannot accept turns.
 
 ## Runtime concurrency
 
