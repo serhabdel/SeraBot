@@ -575,6 +575,18 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         &mut registry,
         SkillRuntime::new(catalog, &bots),
     )?;
+    let bot_map: Arc<std::collections::HashMap<String, serabot::config::LoadedBot>> =
+        Arc::new(
+            bots.iter()
+                .cloned()
+                .map(|bot| (bot.config.name.clone(), bot))
+                .collect(),
+        );
+    registry.register(serabot::delegate::DelegateTool::new(
+        store.clone(),
+        bot_map,
+        router.clone(),
+    ))?;
     let notifier = Arc::new(CompositeNotifier::new(notifiers));
 
     let gateway = Gateway::new(

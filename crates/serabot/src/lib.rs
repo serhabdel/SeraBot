@@ -7,6 +7,7 @@ pub mod browser;
 pub mod config;
 pub mod connectors;
 pub mod deck;
+pub mod delegate;
 pub mod documents;
 pub mod domain;
 pub mod elevenlabs;

@@ -47,6 +47,17 @@ pub enum ModelClass {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HandoffContext {
+    pub handoff_id: String,
+    pub parent_task_id: String,
+    pub parent_turn_id: String,
+    #[serde(default)]
+    pub memory_ids: Vec<String>,
+    #[serde(default)]
+    pub skill: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Handoff {
     pub id: String,
     pub parent_task_id: String,

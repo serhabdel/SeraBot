@@ -15,6 +15,7 @@ use crate::domain::{
 use crate::error::{Result, SeraError};
 
 const MIGRATION_1: &str = include_str!("../migrations/0001_core.sql");
+const MIGRATION_2: &str = include_str!("../migrations/0002_conversations.sql");
 
 pub type StoreConnection = PooledConnection<SqliteConnectionManager>;
 
@@ -123,6 +124,11 @@ impl Store {
             connection.execute_batch(MIGRATION_1)?;
             connection.pragma_update(None, "user_version", 1)?;
         }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 2 {
+            connection.execute_batch(MIGRATION_2)?;
+            connection.pragma_update(None, "user_version", 2)?;
+        }
         let stored_dimension: Option<String> = connection
             .query_row(
                 "SELECT value FROM kv WHERE key = 'embedding_dimension'",
@@ -208,18 +214,125 @@ impl Store {
         role: Role,
         content: &str,
     ) -> Result<StoredMessage> {
+        self.append_message_named(conversation_id, turn_id, role, content, None)
+    }
+
+    pub fn append_message_named(
+        &self,
+        conversation_id: &str,
+        turn_id: Option<&str>,
+        role: Role,
+        content: &str,
+        name: Option<&str>,
+    ) -> Result<StoredMessage> {
         let message = StoredMessage {
             id: new_id(),
             conversation_id: conversation_id.to_owned(),
             turn_id: turn_id.map(str::to_owned),
             role,
             content: content.to_owned(),
-            name: None,
+            name: name.map(str::to_owned),
             tool_call_id: None,
             created_at: utc_now(),
         };
         self.insert_message(&message)?;
         Ok(message)
+    }
+
+    pub fn create_conversation(
+        &self,
+        id: &str,
+        kind: &str,
+        parent_id: Option<&str>,
+    ) -> Result<()> {
+        use crate::orchestration::{
+            ConversationKind, parse_conversation_scope, validate_conversation_id,
+        };
+        validate_conversation_id(id)?;
+        let scope = parse_conversation_scope(id)?;
+        let expected = conversation_kind_str(scope.kind);
+        if kind != expected {
+            return Err(SeraError::Validation(
+                "conversation kind does not match id".into(),
+            ));
+        }
+        if let Some(parent) = parent_id {
+            validate_conversation_id(parent)?;
+            let parent_row = self.get_conversation(parent)?;
+            let Some(parent_row) = parent_row else {
+                return Err(SeraError::NotFound(format!("conversation {parent}")));
+            };
+            let parent_kind = parse_stored_conversation_kind(&parent_row.kind)?;
+            if !matches!(
+                (parent_kind, scope.kind),
+                (ConversationKind::Section, ConversationKind::Group)
+                    | (ConversationKind::Section, ConversationKind::Direct)
+                    | (ConversationKind::Section, ConversationKind::Room)
+                    | (ConversationKind::Group, ConversationKind::Direct)
+                    | (ConversationKind::Group, ConversationKind::Room)
+            ) {
+                return Err(SeraError::Validation(
+                    "invalid conversation parent for kind".into(),
+                ));
+            }
+        } else if matches!(scope.kind, ConversationKind::Group) {
+            return Err(SeraError::Validation(
+                "group conversations require a section parent".into(),
+            ));
+        }
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO conversations(id, kind, parent_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![id, kind, parent_id, now_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_conversation(&self, id: &str) -> Result<Option<StoredConversation>> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT id, kind, parent_id, created_at FROM conversations WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(StoredConversation {
+                        id: row.get(0)?,
+                        kind: row.get(1)?,
+                        parent_id: row.get(2)?,
+                        created_at: parse_datetime(&row.get::<_, String>(3)?),
+                    })
+                },
+            )
+            .optional()
+            .map_err(SeraError::from)
+    }
+
+    /// Reject container conversations; lazily record turn-capable scopes on first use.
+    pub fn ensure_conversation_accepts_turns(&self, id: &str) -> Result<()> {
+        use crate::orchestration::{parse_conversation_scope, validate_conversation_id};
+        validate_conversation_id(id)?;
+        let scope = parse_conversation_scope(id)?;
+        if let Some(record) = self.get_conversation(id)? {
+            let kind = parse_stored_conversation_kind(&record.kind)?;
+            if !kind.accepts_turns() {
+                return Err(SeraError::Validation(
+                    "conversation cannot accept turns".into(),
+                ));
+            }
+            return Ok(());
+        }
+        if !scope.kind.accepts_turns() {
+            return Err(SeraError::Validation(
+                "conversation cannot accept turns".into(),
+            ));
+        }
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO conversations(id, kind, parent_id, created_at) VALUES (?1, ?2, NULL, ?3)
+             ON CONFLICT(id) DO NOTHING",
+            params![id, conversation_kind_str(scope.kind), now_string()],
+        )?;
+        Ok(())
     }
 
     pub fn list_messages(&self, conversation_id: &str, limit: usize) -> Result<Vec<StoredMessage>> {
@@ -971,6 +1084,37 @@ impl Store {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredConversation {
+    pub id: String,
+    pub kind: String,
+    pub parent_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+fn conversation_kind_str(kind: crate::orchestration::ConversationKind) -> &'static str {
+    use crate::orchestration::ConversationKind;
+    match kind {
+        ConversationKind::Section => "section",
+        ConversationKind::Group => "group",
+        ConversationKind::Direct => "direct",
+        ConversationKind::Room => "room",
+        ConversationKind::Legacy => "legacy",
+    }
+}
+
+fn parse_stored_conversation_kind(kind: &str) -> Result<crate::orchestration::ConversationKind> {
+    use crate::orchestration::ConversationKind;
+    match kind {
+        "section" => Ok(ConversationKind::Section),
+        "group" => Ok(ConversationKind::Group),
+        "direct" => Ok(ConversationKind::Direct),
+        "room" => Ok(ConversationKind::Room),
+        "legacy" => Ok(ConversationKind::Legacy),
+        _ => Err(SeraError::Internal("invalid stored conversation kind".into())),
+    }
+}
+
 fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
     Ok(Task {
         id: row.get(0)?,
@@ -1110,7 +1254,14 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
+        connection
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
         connection
             .execute(
                 "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES ('x', ?1)",
@@ -1262,5 +1413,27 @@ mod tests {
         let recovered = store.get_task(&task.id).unwrap();
         assert_eq!(recovered.status, "failed");
         assert_eq!(recovered.fencing_token, claimed.fencing_token);
+    }
+
+    #[test]
+    fn conversation_metadata_rejects_container_turns() {
+        let store = store();
+        store
+            .create_conversation("sec:finance", "section", None)
+            .unwrap();
+        assert!(store.ensure_conversation_accepts_turns("sec:finance").is_err());
+        assert!(store.ensure_conversation_accepts_turns("grp:ops").is_err());
+        assert!(store.get_conversation("grp:ops").unwrap().is_none());
+        store.ensure_conversation_accepts_turns("owner").unwrap();
+        store.ensure_conversation_accepts_turns("dir:main").unwrap();
+        assert_eq!(
+            store.get_conversation("owner").unwrap().unwrap().kind,
+            "legacy"
+        );
+        assert_eq!(
+            store.get_conversation("dir:main").unwrap().unwrap().kind,
+            "direct"
+        );
+        store.ensure_conversation_accepts_turns("owner").unwrap();
     }
 }

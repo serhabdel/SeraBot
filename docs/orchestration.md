@@ -58,11 +58,12 @@ A handoff is validated before enqueue. Fields:
 | `memory_ids` | At most five existing memory ids (orchestrator attaches; no invented ids) |
 | `model_class` | `routine` or `synthesis`; resolved via `[llm.classes]` when configured |
 
-Audit event (future slice): `handoff.queued` with canonical arguments.
+Audit event: `handoff.queued` with canonical handoff arguments; `handoff.completed`
+when the specialist turn finishes.
 
-Child context (future slice): specialist system prompt, objective, and attached
-memories only — not the parent tool trace. Completion posts one assistant
-message on the parent `conversation_id` with `name` set to the specialist.
+Child context: specialist system prompt, objective, and attached memories only —
+not the parent tool trace. Completion posts one assistant message on the parent
+`conversation_id` with `name` set to the specialist.
 
 ## Bot fleet configuration
 
@@ -103,7 +104,7 @@ paths.
 `runtime` holds a concurrency permit for the whole `process_task` turn. The
 parent must **not** await the child inside `process_task` while holding that
 permit — that would deadlock when `max_concurrent_turns` is saturated. The
-delegate tool slice will enqueue the child and end the parent turn first.
+delegate tool enqueues the child and ends the parent turn before the child runs.
 
 ## Non-goals
 
