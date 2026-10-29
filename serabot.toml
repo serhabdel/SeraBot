@@ -42,8 +42,17 @@ max_tool_rounds = 10
 max_output_tokens = 32768
 # Set true only after you accept that selected prompt/document passages leave this host.
 data_egress_approved = false
+# Builtin kind. Empty means a generic OpenAI-compatible base.
+kind = "mistral"
+# Fetch GET {base}/models, cache it, and intersect with the allowlist. Fail closed.
+catalog_fetch = true
+catalog_ttl_secs = 1800
 # [llm] is the reserved "default" provider. Its model and bot overrides are allowed too.
-# Flat list only — no live provider catalog. /models and /providers show these entries plus [llm].model.
+# /models and /providers show the allowlist, narrowed by the cached catalog when fetch is on.
+# Optional logical classes for orchestration handoffs (models must appear above or in [llm].model).
+# [llm.classes]
+# routine = ["mistral-small-latest", "ministral-8b-latest"]
+# synthesis = ["mistral-large-latest", "mistral-medium-latest"]
 models = [
   "mistral-medium-latest",
   "mistral-small-latest",
@@ -51,11 +60,50 @@ models = [
   "ministral-8b-latest",
   "open-mistral-nemo",
 ]
-# Optional synthetic profile; selection never grants consent or triggers fallback.
-# Store this key in the encrypted secret store before enabling the profile.
-# [llm.providers.secondary]
+# Optional profiles. Store each api_key_secret with `serabot secrets set` before enabling.
+# Selection never grants consent. catalog_fetch narrows `models` and hides them if refresh fails.
+# kind fills base_url when it is omitted. Cloud Code Assist hosts are rejected.
+#
+# [llm.providers.deepseek]
+# kind = "deepseek"
+# api_key_secret = "deepseek_api_key"
+# models = ["deepseek-chat", "deepseek-reasoner"]
+# catalog_fetch = true
+# data_egress_approved = false
+#
+# [llm.providers.minimax]
+# kind = "minimax"
+# api_key_secret = "minimax_api_key"
+# models = ["MiniMax-M2"]
+# catalog_fetch = true
+# data_egress_approved = false
+#
+# [llm.providers.openai]
+# kind = "openai"
+# api_key_secret = "openai_api_key"
+# models = ["gpt-4.1"]
+# catalog_fetch = true
+# data_egress_approved = false
+#
+# Other OpenAI-compatible kinds: groq, together, fireworks, openrouter, xai, cerebras, moonshot, minimax-cn.
+#
+# [llm.providers.muse]
+# kind = "muse-code"
+# auth = "oauth"
+# api_key_secret = "muse_code_api_key"
+# refresh_token_secret = "muse_code_identity"
+# models = ["muse-spark-1.3"]
+# catalog_fetch = true
+# data_egress_approved = false
+# Sign in with: serabot providers login muse-code
+#
+# [llm.providers.antigravity]
+# kind = "google-antigravity"
+# auth = "oauth"
 # base_url = "https://api.example.com/v1"
-# api_key_secret = "secondary_llm_key"
+# api_key_secret = "antigravity_access_token"
+# refresh_token_secret = "antigravity_refresh_token"
+# oauth_client_secret_secret = "antigravity_oauth_client_secret"
 # models = ["example-model"]
 # data_egress_approved = false
 

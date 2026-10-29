@@ -8,6 +8,7 @@ artifacts.
 | Document | Purpose |
 | --- | --- |
 | [Model routing](model-routing.md) | Configure providers/models, consent, selection, and pinned turns. |
+| [Orchestration](orchestration.md) | Orchestrator bot, scope ids, bounded handoffs, fleet rules. |
 | [Audio](audio.md) | Mistral Voxtral transcription/understanding, inbox tools, Telegram intake. |
 | [Owner API](api.md) | Authenticated HTTP/SSE contract used by the owner and clients. |
 | [Desktop client](desktop-client.md) | Native Windows client build, launch, and current limitations. |

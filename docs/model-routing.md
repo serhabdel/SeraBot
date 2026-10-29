@@ -91,6 +91,16 @@ deterministically:
 Auto mode re-resolves when bot defaults change; a fixed provider/model selection
 does not.
 
+### Model classes (orchestration handoffs)
+
+Optional `[llm.classes]` maps logical names (`routine`, `synthesis`) to model ids
+that must already appear in the configured allowlist. `ModelRouter::select_class`
+picks the first egress-approved model in that class (preferring provider
+`default`), then falls back to the autoselect order above when the class is
+missing, empty, or has no approved models. Classes do not scrape provider
+catalogs, bypass consent, or replace owner `/model` selections. See
+[Orchestration](orchestration.md).
+
 ## Pinned turns
 
 A route is pinned at enqueue time: provider, model, and a configuration
