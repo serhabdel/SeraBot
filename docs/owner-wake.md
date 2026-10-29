@@ -10,12 +10,12 @@ chat, tickets, or git.
 | --- | --- |
 | **Code tip for the binary** | `795b139` — *Persist OneDrive refresh rotation and the first connector refresh token.* |
 | **Routing decision** | `bd871f9` — *Record why routing stays on the in-process allowlist.* Docs only (`docs/model-routing.md`). |
-| **This checklist** | Documentation on top of `bd871f9`. It does not move the binary. |
+| **This checklist** | Documentation on top of `bd871f9` and `cd62044`. It does not move the binary. |
 | **Previous wake note** | `6d718fe` (ElevenLabs allowlist). Superseded by this page. |
 
-Commits after `795b139`, including `bd871f9` and this page, do not change the
-server binary. A host already running `795b139` does not need another deploy
-for them.
+Commits after `795b139`, including docs-only `bd871f9` and `cd62044`, plus this
+page, do not change the server binary. A host already running `795b139` does
+not need another deploy for them.
 
 Landed on `main` since `6d718fe` (code through `795b139`):
 
@@ -32,44 +32,33 @@ Landed on `main` since `6d718fe` (code through `795b139`):
 - Public CI rules: workflows do not read owner tokens ([ci-and-secrets.md](ci-and-secrets.md)).
 - Routing decision in `bd871f9`: keep the in-process allowlist `ModelRouter`. LiteLLM, RouteLLM, and OpenRouter auto-routing stay out.
 
-## What OVH needs after wake
+## OVH
 
-A redeploy **to `795b139`** was in progress. Confirm it; do not assume the
-binary on disk is that commit. `/v1/health` reports crate version `0.1.0`, not
-a git SHA.
+Confirmed on code tip **`795b139`**
+(`795b13937206fca7e379b3024008e1a1df182c52`). `serabot` is active. Binary
+SHA-256 `795becec49bf5c178bc2c68f209b85471142516f2c78d0b9c8b2c6800f29f1e7`.
+`onedrive-mcp` was left untouched. Unauthenticated `GET /v1/health` returns
+401. `/v1/health` reports crate version `0.1.0`, not a git SHA.
 
-```mermaid
-flowchart TD
-  wake[After wake] --> hash{SHA-256 matches the Ubuntu 24.04 build of 795b139?}
-  hash -->|yes| smoke[Read-only Owner API smoke]
-  hash -->|no| stage[Stage serabot-795b139 and back up the current binary]
-  stage --> swap["Replace /opt/serabot/serabot"]
-  swap --> restart[Restart serabot.service only]
-  restart --> smoke
-  smoke --> later[Leave connectors, AgentMail, and Antigravity for later]
-```
+Docs-only `bd871f9` and `cd62044` do not change that binary and do not need a
+redeploy. The earlier read-only check (mtime `2026-10-29 01:39:08` UTC,
+SHA-256 prefix `dfbc71dd89536f4e…`) predates this binary.
 
-Confirm the binary before the API smoke. `bd871f9` is documentation and does not change this decision.
+If a later `sha256sum /opt/serabot/serabot` disagrees, finish the additive
+upgrade in [deployment.md](deployment.md): stage
+`/var/lib/serabot/releases/serabot-795b139`, back up the current binary,
+replace `/opt/serabot/serabot` only after the staged SHA-256 matches, and
+restart **only** `serabot.service`. Leave Docker, OpenBot,
+`onedrive-mcp.service`, and the Cloudflare tunnel alone. Roll back by
+restoring the backup and restarting only `serabot.service`. Before replacing
+a busy binary, tunnel in and read `GET /v1/status`. Queued turns without a
+pinned route fail closed.
 
-1. Read-only preflight. Do not restart other units.
-
-   ```bash
-   ssh ovh-vps 'systemctl is-active serabot; systemctl is-enabled serabot; ls -l /opt/serabot/serabot; sha256sum /opt/serabot/serabot'
-   ```
-
-2. Compare that SHA-256 with `sha256sum target/release/serabot` from an **Ubuntu 24.04** `cargo build --release --locked -p serabot` of **`795b139`**. The earlier read-only check (mtime `2026-10-29 01:39:08` UTC, SHA-256 prefix `dfbc71dd89536f4e…`) predates this redeploy. Treat it as stale until the new hash matches. Full hash: `sha256sum /opt/serabot/serabot` on the host.
-
-3. If the hash does not match, finish the additive upgrade in [deployment.md](deployment.md):
-   - Stage `/var/lib/serabot/releases/serabot-795b139`.
-   - Back up the current binary under `/var/lib/serabot/releases/`.
-   - Replace `/opt/serabot/serabot` only after the staged SHA-256 matches.
-   - Restart **only** `serabot.service`.
-   - Leave Docker, OpenBot, `onedrive-mcp.service`, and the Cloudflare tunnel alone.
-   - Roll back by restoring the backup and restarting only `serabot.service`.
-
-4. Before replacing a busy binary, tunnel in and read `GET /v1/status`. Queued turns without a pinned route fail closed. With live chat idle and an empty queue there is nothing to drain.
-
-5. New bots and skills are **not** hot-reloaded. `POST /v1/bots` and `POST /v1/skills` report `live: false`. Restart **only** `serabot.service` after those files exist, then add the skill id to a bot allowlist. A scaffolded bot stays `enabled = false` and is not added to `main.delegates` until you edit that and restart again.
+New bots and skills are **not** hot-reloaded. `POST /v1/bots` and
+`POST /v1/skills` report `live: false`. Restart **only** `serabot.service`
+after those files exist, then add the skill id to a bot allowlist. A
+scaffolded bot stays `enabled = false` and is not added to `main.delegates`
+until you edit that and restart again.
 
 ```bash
 systemctl status serabot --no-pager
@@ -93,7 +82,7 @@ Commands below use secret **names** only.
 | **Enable a connector** | One section at a time, after its keys exist. Add the tool to a bot allowlist. Reads and AgentMail sends stay approval-gated. Restart **only** `serabot.service`. |
 | **Antigravity** | `secrets set antigravity_oauth_client_secret`, point `[llm.providers.*]` at `kind = "google-antigravity"`, then `serabot providers login google-antigravity`. Run that on the machine whose browser can open `127.0.0.1:51121`. Set `data_egress_approved = true` only when you intend Cloud Code to receive prompts. See [antigravity.md](antigravity.md). |
 | **GitHub Actions client builds** | `.github/workflows/clients.yml` runs desktop check/test and Flutter analyze/test and reads **no** Actions secrets. Add repository secrets only when you publish signed desktop or mobile artifacts. Never put the owner API token in a workflow, APK, or release binary ([ci-and-secrets.md](ci-and-secrets.md)). |
-| **Hot reload** | Not implemented. Restart `serabot.service` for new bots and skills (step 5 above). |
+| **Hot reload** | Not implemented. Restart `serabot.service` for new bots and skills (OVH section above). |
 
 Still owner-gated from the previous checklist. Same stdin rule.
 
@@ -129,7 +118,7 @@ is pending tasks, pending approvals, and the loopback API. Models lists
 allowlisted pairs and must not include endpoints or credentials. Skills
 returns on-disk summaries, not bodies.
 
-Telegram, about five minutes, after the service is on `795b139`:
+Telegram, about five minutes. The service is on `795b139`:
 
 1. Owner chat — command menu populated (`setMyCommands` on poll startup).
 2. **`/providers`** — models grouped by provider. Catalogs fail closed when refresh fails.
@@ -174,4 +163,6 @@ OneDrive after the maker bot is up: **`onedrive_list`** (read), then
 Unit tests use synthetic fixtures. Treat Telegram, Firecrawl, ElevenLabs,
 voice intake, OneDrive uploads, Antigravity, connector OAuth, AgentMail, and
 browser CDP as owner-verified only after you exercise them on the real
-account. This page does not record a completed `795b139` deploy.
+account. OVH is confirmed on code tip `795b139`; that confirmation is the
+binary and the unauthenticated health check, not a live exercise of those
+tools.
