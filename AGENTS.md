@@ -41,6 +41,7 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot/src/gateway.rs` — tool allowlist, approvals, policy, audit.
 - `crates/serabot/src/runtime.rs` — bot routing, durable turn loop, schedules.
 - `crates/serabot/src/telegram.rs`, `api.rs` — owner transports.
+- `crates/serabot-desktop` — Windows owner console (`eframe`/`egui`); talks to Owner API only.
 - `crates/serabot/src/documents.rs`, `retrieval.rs`, `embeddings.rs` — cited RAG.
 - `crates/serabot/src/watcher.rs`, `scheduler.rs`, `brief.rs` — monitoring and deadlines.
 - `crates/serabot/src/analyst.rs`, `spreadsheets.rs` — document and finance analysis.

@@ -502,6 +502,18 @@ impl Desktop {
                             {
                                 self.connect(ctx);
                             }
+                            let enter = ui.ctx().input(|input| {
+                                input.key_pressed(egui::Key::Enter)
+                                    && !input.modifiers.any()
+                            });
+                            if enter
+                                && self.ready()
+                                && validate_endpoint(&self.server).is_ok()
+                                && valid_token(&self.token)
+                                && valid_id(&self.conversation)
+                            {
+                                self.connect(ctx);
+                            }
                         });
                         ui.label(
                             RichText::new("HTTPS, or exact loopback HTTP for tunnels. Token never leaves memory.")

@@ -7,6 +7,7 @@ fn main() -> eframe::Result<()> {
         "SeraBot",
         eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
+                .with_title("SeraBot Owner")
                 .with_inner_size([1120.0, 720.0])
                 .with_min_inner_size([860.0, 560.0]),
             renderer: eframe::Renderer::Glow,

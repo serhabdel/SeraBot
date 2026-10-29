@@ -1,15 +1,35 @@
 # Desktop client (Windows)
 
-`crates/serabot-desktop` is a native Rust owner console built with `eframe`/`egui`
-(OpenGL). It adds no Node runtime, web server, or web admin UI. The server
-binary is unchanged and remains the default workspace member, so server release
-builds and Linux deployments do not include the desktop GUI.
+**Primary owner desktop:** `crates/serabot-desktop` — native Rust with
+`eframe`/`egui` (OpenGL). There is no second desktop shell (no Tauri app in this
+repo). Mobile work lives under `apps/` separately; it does not replace this
+console.
+
+### Why egui instead of Tauri
+
+The owner API client, endpoint/token validation, approval semantics, and
+no-blind-resubmit rules are implemented once in Rust with integration tests.
+Shipping a Tauri webview tonight would duplicate that surface, add a Node
+frontend toolchain, and split documentation without improving security or
+features beyond what the current UI already covers (chat, model routing,
+approvals, connection).
+
+The stack adds no Node runtime, web server, or web admin UI on the server. The
+server binary remains the default workspace member, so Linux release builds and
+OVH deployments do not include the desktop GUI.
 
 ## Build and launch (Windows, MSVC)
 
 ```bat
 scripts\cargo-win.bat test -p serabot-desktop --locked
 scripts\cargo-win.bat run -p serabot-desktop --locked
+```
+
+Release binary (optional):
+
+```bat
+scripts\cargo-win.bat build --release -p serabot-desktop --locked
+target\release\serabot-desktop.exe
 ```
 
 Build the server only with:
@@ -27,6 +47,8 @@ scripts\cargo-win.bat build --release -p serabot --locked
 - **API token** — the owner token whose SHA-256 hash is in `[api].token_hash`.
   It is held only in memory for the session (masked input); it is not written to
   disk. Disconnecting clears the token, chat text, history, and pending actions.
+- **Connect** — **Connect** or **Enter** (with valid server URL, token, and
+  conversation id) starts the session read.
 
 ## Behaviour
 
