@@ -23,7 +23,6 @@ pub mod onedrive;
 pub mod orchestration;
 pub mod policy;
 pub mod providers;
-pub mod skills;
 pub mod render;
 pub mod retrieval;
 pub mod runtime;

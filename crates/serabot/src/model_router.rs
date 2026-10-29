@@ -1000,6 +1000,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/models"))
             .respond_with(ResponseTemplate::new(503))
+            .with_priority(2)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -1008,6 +1009,7 @@ mod tests {
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"data": [{"id": "kept"}]})),
             )
+            .with_priority(1)
             .up_to_n_times(1)
             .mount(&server)
             .await;
