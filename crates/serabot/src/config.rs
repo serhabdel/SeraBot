@@ -98,10 +98,32 @@ impl Config {
             .canonicalize()
             .unwrap_or_else(|_| parent.to_path_buf());
         config.validate()?;
-        let overlay =
-            crate::admin::AdminOverlay::load(&crate::admin::AdminOverlay::path_for(&config))?;
-        overlay.apply(&mut config)?;
-        config.validate()?;
+        let overlay_path = crate::admin::AdminOverlay::path_for(&config);
+        match crate::admin::AdminOverlay::load(&overlay_path) {
+            Ok(overlay) => {
+                let mut merged = config.clone();
+                match overlay.apply(&mut merged).and_then(|()| merged.validate()) {
+                    Ok(()) => config = merged,
+                    Err(error) => {
+                        // Never crash-loop the service on a bad overlay. The
+                        // console can rewrite it and restart once the cause
+                        // (for example a missing secret) is fixed.
+                        tracing::error!(
+                            %error,
+                            path = %overlay_path.display(),
+                            "admin overrides were not applied"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    path = %overlay_path.display(),
+                    "admin overrides could not be read"
+                );
+            }
+        }
         Ok(config)
     }
 
