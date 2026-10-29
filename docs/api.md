@@ -96,6 +96,28 @@ to `main.delegates` yourself if `main` should hand work to it.
 
 See [Orchestration](orchestration.md).
 
+## Skill packs
+
+`GET /v1/skills` returns on-disk summaries (`id`, `name`, `description`,
+optional `pack`). Bodies are omitted.
+
+`POST /v1/skills`
+
+```json
+{
+  "id": "notes-pack",
+  "description": "Synthetic notes workflow.",
+  "body": "# Notes\n\nUse allowlisted tools.\n"
+}
+```
+
+Creates `<skills.dir>/<id>/SKILL.md`. `id` is a slug. There is no path field.
+`description` and `body` are optional; the body is scanned with the content
+policy before the directory is created. The response reports `live: false` —
+restart and add the id to a bot allowlist before a bot can load it. Duplicate
+ids conflict. Audit records the id and relative file, not the body. See
+[skills](skills.md).
+
 ## Conversation tree
 
 `POST /v1/conversations`

@@ -10,14 +10,17 @@ Layout:
 - `skills/packs/<pack>/<id>/SKILL.md` — shared packs (for example `office/`)
 - `skills/skill-creator/SKILL.md` — how to add a new skill
 
-Scaffold a new skill:
+Register a new skill (the owner writes the file; bots load it later with
+`skill_load`):
 
 ```bat
 scripts\cargo-win.bat run -- skill init my-skill --description "Short summary"
+scripts\cargo-win.bat run -- skill create my-skill --description "Short summary" --body-file workflow.md
 ```
 
-Then add the id to the relevant bot's `skills = [...]` array and include
-`skill_list`, `skill_search`, and `skill_load` in that bot's `tools` list.
+Or `POST /v1/skills` (see `docs/skills.md`). Then add the id to the relevant
+bot's `skills = [...]` array, restart, and include `skill_list`, `skill_search`,
+and `skill_load` in that bot's `tools` list. Bodies stay out of the base prompt.
 
 Skill ids must match `^[a-z][a-z0-9-]{0,63}$`. Content is synthetic in the
 public repository; never commit private dossier material into skills.

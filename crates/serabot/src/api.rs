@@ -27,6 +27,7 @@ use crate::maker::ArtifactStore;
 use crate::model_router::ModelSelection;
 use crate::orchestration::{ConversationKind, scoped_conversation_id};
 use crate::runtime::{ApprovalNotice, Notifier, Runtime};
+use crate::skills::{SkillCatalog, create_skill, discard_created_skill};
 use crate::store::Store;
 use crate::util::{constant_time_eq, sha256_hex, truncate_chars};
 
@@ -109,6 +110,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/messages", post(send_message))
         .route("/v1/bots", post(create_bot))
+        .route("/v1/skills", get(list_skills).post(create_skill_pack))
         .route("/v1/conversations", post(create_conversation))
         .route("/v1/models", get(models))
         .route("/v1/conversations/{id}/model", put(select_model))
@@ -526,6 +528,66 @@ async fn create_bot(
             "require_approval": scaffolded.require_approval,
             "bot_file": scaffolded.bot_file,
             "prompt_file": scaffolded.prompt_file,
+        }
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateSkillRequest {
+    id: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+async fn list_skills(State(state): State<Arc<ApiState>>) -> Result<Json<Value>> {
+    let catalog = SkillCatalog::load(&state.config)?;
+    let skills = catalog.summaries();
+    Ok(Json(json!({ "skills": skills })))
+}
+
+async fn create_skill_pack(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<CreateSkillRequest>,
+) -> Result<Json<Value>> {
+    state.runtime.scan_owner_output(&request.id)?;
+    state.runtime.scan_owner_output(&request.description)?;
+    if let Some(body) = &request.body {
+        state.runtime.scan_owner_output(body)?;
+    }
+    let created = create_skill(
+        &state.config,
+        &request.id,
+        &request.description,
+        request.body.as_deref(),
+        state.runtime.policy(),
+    )?;
+    if let Err(error) = state.store.record_audit(
+        "owner",
+        "skill.created",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({
+            "id": created.id,
+            "file": created.file,
+            "live": false,
+        })),
+    ) {
+        let _ = discard_created_skill(&state.config, &created);
+        return Err(error);
+    }
+    Ok(Json(json!({
+        "skill": {
+            "id": created.id,
+            "name": created.name,
+            "description": created.description,
+            "file": created.file,
+            "live": false,
         }
     })))
 }
@@ -1352,6 +1414,133 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(!root.join("bots").join("notes.toml").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn registers_skill_pack_without_returning_or_logging_the_body() {
+        let root = temp_base();
+        let (app, _, store) = app_with_root(true, Policy::empty(), root.clone());
+        let denied = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/skills",
+                false,
+                Some(json!({"id": "notes-pack"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let marker = "Unique workflow sentence alpha-bridge-7.";
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/skills",
+                true,
+                Some(json!({
+                    "id": "notes-pack",
+                    "description": "Public summary",
+                    "body": marker
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = read_json(response).await;
+        assert_eq!(value["skill"]["id"], "notes-pack");
+        assert_eq!(value["skill"]["file"], "skills/notes-pack/SKILL.md");
+        assert_eq!(value["skill"]["live"], false);
+        assert!(!value.to_string().contains(marker));
+        let raw = std::fs::read_to_string(root.join("skills").join("notes-pack").join("SKILL.md"))
+            .unwrap();
+        assert!(raw.contains(marker));
+        assert!(
+            store
+                .list_audit(10)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.event == "skill.created")
+        );
+        let audit = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/audit?limit=20", true, None))
+            .await
+            .unwrap();
+        let audit = read_json(audit).await;
+        assert!(!audit.to_string().contains(marker));
+
+        let listed = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/skills", true, None))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = read_json(listed).await;
+        let skills = listed["skills"].as_array().unwrap();
+        assert!(skills.iter().any(|skill| skill["id"] == "notes-pack"));
+        assert!(skills.iter().any(|skill| skill["id"] == "ask"));
+        assert!(!listed.to_string().contains(marker));
+
+        let again = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/skills",
+                true,
+                Some(json!({"id": "notes-pack"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::CONFLICT);
+
+        let escaped = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/skills",
+                true,
+                Some(json!({"id": "../outside", "path": "C:/secret"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(escaped.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!root.join("outside").exists());
+        assert!(!root.join("skills").join("outside").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn skill_registration_rejects_policy_violations() {
+        let root = temp_base();
+        let (app, _, _) = app_with_root(
+            true,
+            Policy::from_text("synthetic blocked phrase"),
+            root.clone(),
+        );
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/skills",
+                true,
+                Some(json!({
+                    "id": "notes-pack",
+                    "description": "Public summary",
+                    "body": "mentions synthetic blocked phrase"
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!root.join("skills").join("notes-pack").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -35,7 +35,9 @@ use serabot::retrieval::{Retriever, SqliteRetriever};
 use serabot::runtime::{CompositeNotifier, Notifier, RagSearchTool, Runtime, ScheduledPayload};
 use serabot::scheduler::{due_routines, ensure_daily_routine};
 use serabot::secrets::{SecretStore, ensure_identity};
-use serabot::skills::{SkillCatalog, SkillRuntime, init_skill, register_skill_tools};
+use serabot::skills::{
+    SkillCatalog, SkillRuntime, create_skill, read_skill_body_file, register_skill_tools,
+};
 use serabot::store::Store;
 use serabot::telegram::TelegramClient;
 use serabot::tools::{
@@ -92,6 +94,15 @@ enum SkillCommand {
         name: String,
         #[arg(long, default_value = "Operator-defined skill")]
         description: String,
+    },
+    /// Register a skill pack. Reads markdown instructions from --body-file when set.
+    Create {
+        name: String,
+        #[arg(long, default_value = "Operator-defined skill")]
+        description: String,
+        /// UTF-8 markdown instructions. Omit to write the standard stub.
+        #[arg(long)]
+        body_file: Option<PathBuf>,
     },
     /// List skill ids discovered under skills.dir.
     List,
@@ -185,9 +196,14 @@ async fn main() -> anyhow::Result<()> {
         },
         Command::Skill { command } => match command {
             SkillCommand::Init { name, description } => {
-                let config = Config::load(&cli.config)?;
-                let path = init_skill(&config.base_dir, &config.skills.dir, &name, &description)?;
-                println!("skill scaffold written to {}", path.display());
+                register_skill_pack(&cli.config, &name, &description, None)?;
+            }
+            SkillCommand::Create {
+                name,
+                description,
+                body_file,
+            } => {
+                register_skill_pack(&cli.config, &name, &description, body_file.as_deref())?;
             }
             SkillCommand::List => {
                 let config = Config::load(&cli.config)?;
@@ -291,6 +307,23 @@ fn load(
     }
     SkillCatalog::load(&config)?.validate_bot_skills(&bots)?;
     Ok((config, bots))
+}
+
+fn register_skill_pack(
+    config_path: &std::path::Path,
+    name: &str,
+    description: &str,
+    body_file: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let config = Config::load(config_path)?;
+    let policy = Policy::load(&config.path(&config.policy.blocklist_file))?;
+    let body = match body_file {
+        Some(path) => Some(read_skill_body_file(path)?),
+        None => None,
+    };
+    let created = create_skill(&config, name, description, body.as_deref(), &policy)?;
+    println!("skill pack written to {}", created.file);
+    Ok(())
 }
 
 fn check(config_path: &std::path::Path) -> anyhow::Result<()> {
