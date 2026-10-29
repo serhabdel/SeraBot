@@ -69,15 +69,17 @@ Still on `main` from the earlier wake note (code through `795b139`):
 
 ## OVH
 
-Running **SeraBot 0.2.2**. Binary SHA-256
-`b403cab608ff0613e072c579545e8d8025b5e2ac676f34d54831ff2974c46037`, built
-locally in WSL from commit `b0a134e`. Staged at
-`/var/lib/serabot/releases/serabot-b403cab6`; the previous binary is
-`/var/lib/serabot/releases/serabot-pre-b403cab6` (SHA-256
-`c6d47a83f1d95c4ce858bd3195f8ba2fb144536959f2eb4d6d5d1ddb4f00a3df`). Legacy
-conversations now list as turn-capable direct threads, all six models and auto
-mode select successfully, and the queue was empty before the swap. Only
-`serabot.service` was restarted; `database user_version` is 4.
+Running **SeraBot 0.2.3**. Binary SHA-256
+`1f7be61ec445bf4e9cea440f385fad90a5a7b1eab564c2526383ff33764ef497`, built
+locally in WSL from commit `64f5d45`. Staged at
+`/var/lib/serabot/releases/serabot-1f7be61e`; the previous binary is
+`/var/lib/serabot/releases/serabot-pre-1f7be61e` (SHA-256
+`b403cab608ff0613e072c579545e8d8025b5e2ac676f34d54831ff2974c46037`). Legacy
+conversations list as turn-capable direct threads, all six models and auto mode
+select successfully, and `GET /v1/bots` now reports approval-gated tools
+(Firecrawl search/crawl are highlighted in the desktop). Only
+`serabot.service` was restarted; `database user_version` is 4. Old release
+binaries were pruned to the current and previous build (2.6 GB free).
 
 `bot.seradyx.tech` is served by the dedicated `cloudflared-bot.service` to
 `127.0.0.1:8787`. The pre-existing dashboard-managed `cloudflared.service`, the
@@ -90,7 +92,7 @@ If historical journals ever contained `getUpdates` URLs (a build before
 with `serabot secrets set`. Do not paste the token, the journal line, or the
 URL into chat, tickets, or git.
 
-Roll back by restoring `serabot-pre-b403cab6` onto `/opt/serabot/serabot` and
+Roll back by restoring `serabot-pre-1f7be61e` onto `/opt/serabot/serabot` and
 restarting **only** `serabot.service`. Leave Docker, OpenBot,
 `onedrive-mcp.service`, and both Cloudflare tunnels alone. Before replacing a
 busy binary, read the queue; it was empty of non-terminal tasks at this deploy.
