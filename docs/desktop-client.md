@@ -189,6 +189,9 @@ after **Restart server and apply** in the status banner.
   secret that another provider still uses.
 - `serabot.toml` remains the source for server bind, tunnels, OAuth client IDs,
   and the base provider set; the app never edits it.
+- If an overlay cannot be applied at startup (for example a secret was removed
+  out of band), the server logs it, keeps the base configuration, and stays
+  reachable so the console can repair it.
 
 ## Fleet
 
