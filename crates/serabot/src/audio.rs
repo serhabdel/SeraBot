@@ -36,7 +36,10 @@ pub struct AudioProviderSettings {
     pub data_egress_approved: bool,
 }
 
-pub fn resolve_audio_provider(llm: &LlmConfig, audio: &AudioConfig) -> Result<AudioProviderSettings> {
+pub fn resolve_audio_provider(
+    llm: &LlmConfig,
+    audio: &AudioConfig,
+) -> Result<AudioProviderSettings> {
     if audio.provider.trim() != "default" {
         let profile = llm.providers.get(&audio.provider).ok_or_else(|| {
             SeraError::Config(format!(
@@ -102,7 +105,9 @@ impl MistralAudioClient {
         let base_url = validate_base_url(&base_url.into())?;
         let api_key = api_key.into();
         if api_key.trim().is_empty() {
-            return Err(SeraError::Config("audio provider credential is missing".into()));
+            return Err(SeraError::Config(
+                "audio provider credential is missing".into(),
+            ));
         }
         validate_model_id(&audio.transcription_model)?;
         validate_model_id(&audio.understanding_model)?;
@@ -181,12 +186,13 @@ impl MistralAudioClient {
             .multipart(form)
             .send()
             .await
-            .map_err(|error| SeraError::External(format!("audio transcription request failed: {error}")))?;
+            .map_err(|error| {
+                SeraError::External(format!("audio transcription request failed: {error}"))
+            })?;
         let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| SeraError::External(format!("audio transcription read failed: {error}")))?;
+        let body = response.bytes().await.map_err(|error| {
+            SeraError::External(format!("audio transcription read failed: {error}"))
+        })?;
         if !status.is_success() {
             return Err(SeraError::External(format!(
                 "audio transcription failed with status {}: {}",
@@ -197,11 +203,7 @@ impl MistralAudioClient {
         parse_transcription_response(&body)
     }
 
-    pub async fn understand_file(
-        &self,
-        path: &Path,
-        instruction: &str,
-    ) -> Result<String> {
+    pub async fn understand_file(&self, path: &Path, instruction: &str) -> Result<String> {
         self.ensure_egress()?;
         if instruction.trim().is_empty() || instruction.len() > 8_192 {
             return Err(SeraError::Validation(
@@ -234,12 +236,13 @@ impl MistralAudioClient {
             .json(&body)
             .send()
             .await
-            .map_err(|error| SeraError::External(format!("audio understanding request failed: {error}")))?;
+            .map_err(|error| {
+                SeraError::External(format!("audio understanding request failed: {error}"))
+            })?;
         let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| SeraError::External(format!("audio understanding read failed: {error}")))?;
+        let body = response.bytes().await.map_err(|error| {
+            SeraError::External(format!("audio understanding read failed: {error}"))
+        })?;
         if !status.is_success() {
             return Err(SeraError::External(format!(
                 "audio understanding failed with status {}: {}",
@@ -264,7 +267,9 @@ pub fn resolve_inbox_audio(config: &Config, relative: &str) -> Result<PathBuf> {
     if raw.components().any(|component| {
         matches!(
             component,
-            std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_)
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
         )
     }) {
         return Err(SeraError::Forbidden(
@@ -332,8 +337,9 @@ fn validate_model_id(model: &str) -> Result<()> {
 }
 
 fn parse_transcription_response(bytes: &[u8]) -> Result<String> {
-    let value: Value = serde_json::from_slice(bytes)
-        .map_err(|error| SeraError::External(format!("malformed transcription response: {error}")))?;
+    let value: Value = serde_json::from_slice(bytes).map_err(|error| {
+        SeraError::External(format!("malformed transcription response: {error}"))
+    })?;
     if let Some(text) = value.get("text").and_then(Value::as_str) {
         return Ok(text.to_owned());
     }
@@ -379,7 +385,12 @@ fn sanitize_provider_error(body: &[u8]) -> String {
         .as_ref()
         .and_then(|value| value.pointer("/error/message"))
         .and_then(Value::as_str)
-        .or_else(|| parsed.as_ref().and_then(|value| value.get("message")).and_then(Value::as_str))
+        .or_else(|| {
+            parsed
+                .as_ref()
+                .and_then(|value| value.get("message"))
+                .and_then(Value::as_str)
+        })
         .unwrap_or(&text);
     message.chars().take(500).collect()
 }
@@ -455,10 +466,7 @@ impl Tool for AudioTranscribeTool {
             .ok_or_else(|| SeraError::Validation("path is required".into()))?;
         let language = args.get("language").and_then(Value::as_str);
         let resolved = self.resolve(path)?;
-        let text = self
-            .client
-            .transcribe_file(&resolved, language)
-            .await?;
+        let text = self.client.transcribe_file(&resolved, language).await?;
         Ok(ToolOutput {
             content: text.clone(),
             data: Some(json!({
@@ -551,10 +559,7 @@ impl Tool for AudioUnderstandTool {
             .and_then(Value::as_str)
             .ok_or_else(|| SeraError::Validation("instruction is required".into()))?;
         let resolved = self.resolve(path)?;
-        let text = self
-            .client
-            .understand_file(&resolved, instruction)
-            .await?;
+        let text = self.client.understand_file(&resolved, instruction).await?;
         Ok(ToolOutput {
             content: text.clone(),
             data: Some(json!({
@@ -644,14 +649,9 @@ mod tests {
     #[tokio::test]
     async fn transcribe_requires_egress_consent() {
         let server = MockServer::start().await;
-        let client = MistralAudioClient::new(
-            server.uri(),
-            "secret",
-            10,
-            &AudioConfig::default(),
-            false,
-        )
-        .unwrap();
+        let client =
+            MistralAudioClient::new(server.uri(), "secret", 10, &AudioConfig::default(), false)
+                .unwrap();
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("note.wav");
         std::fs::write(&file, b"RIFF").unwrap();
@@ -668,14 +668,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"text": "hello world"})))
             .mount(&server)
             .await;
-        let client = MistralAudioClient::new(
-            server.uri(),
-            "secret",
-            10,
-            &AudioConfig::default(),
-            true,
-        )
-        .unwrap();
+        let client =
+            MistralAudioClient::new(server.uri(), "secret", 10, &AudioConfig::default(), true)
+                .unwrap();
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("note.wav");
         std::fs::write(&file, b"RIFFfake").unwrap();
@@ -694,14 +689,9 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let client = MistralAudioClient::new(
-            server.uri(),
-            "secret",
-            10,
-            &AudioConfig::default(),
-            true,
-        )
-        .unwrap();
+        let client =
+            MistralAudioClient::new(server.uri(), "secret", 10, &AudioConfig::default(), true)
+                .unwrap();
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("call.wav");
         std::fs::write(&file, b"RIFFfake").unwrap();

@@ -200,10 +200,7 @@ impl FirecrawlClient {
                     }
                 }
             }
-            if matches!(
-                status_label.as_str(),
-                "completed" | "failed" | "cancelled"
-            ) {
+            if matches!(status_label.as_str(), "completed" | "failed" | "cancelled") {
                 if let Some(next) = value.get("next").and_then(Value::as_str) {
                     next_path = Some(self.relative_api_path(next)?);
                     continue;
@@ -282,11 +279,7 @@ impl FirecrawlClient {
         self.decode_response(response, path).await
     }
 
-    async fn decode_response(
-        &self,
-        response: reqwest::Response,
-        label: &str,
-    ) -> Result<Value> {
+    async fn decode_response(&self, response: reqwest::Response, label: &str) -> Result<Value> {
         let status = response.status();
         let body = read_limited(response, MAX_API_RESPONSE_BYTES).await?;
         let value: Value = serde_json::from_slice(&body).unwrap_or_else(|_| {
@@ -296,8 +289,8 @@ impl FirecrawlClient {
             })
         });
         if !status.is_success() {
-            let message = api_error_message(&value)
-                .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
+            let message =
+                api_error_message(&value).unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
             return Err(SeraError::External(format!(
                 "Firecrawl {label} failed: {message}"
             )));
@@ -358,9 +351,9 @@ pub struct CrawlResult {
 }
 
 fn parse_scrape_response(value: &Value, url: &str) -> Result<ScrapeResult> {
-    let data = value.get("data").ok_or_else(|| {
-        SeraError::External("Firecrawl scrape returned no data".into())
-    })?;
+    let data = value
+        .get("data")
+        .ok_or_else(|| SeraError::External("Firecrawl scrape returned no data".into()))?;
     let markdown = data
         .get("markdown")
         .and_then(Value::as_str)
@@ -412,10 +405,7 @@ fn parse_search_response(value: &Value, query: &str) -> Result<SearchResult> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let hits = web
-        .iter()
-        .filter_map(parse_search_hit)
-        .collect::<Vec<_>>();
+    let hits = web.iter().filter_map(parse_search_hit).collect::<Vec<_>>();
     Ok(SearchResult {
         query: query.to_owned(),
         hits,
@@ -438,7 +428,10 @@ fn parse_search_hit(item: &Value) -> Option<SearchHit> {
         .or_else(|| item.pointer("/metadata/description"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let markdown = item.get("markdown").and_then(Value::as_str).map(str::to_owned);
+    let markdown = item
+        .get("markdown")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     Some(SearchHit {
         url,
         title,
@@ -477,30 +470,29 @@ fn parse_crawl_page(item: &Value) -> Result<CrawlPage> {
 fn api_error_message(value: &Value) -> Option<String> {
     value
         .get("error")
-        .and_then(|e| e.as_str().map(str::to_owned).or_else(|| {
-            e.get("message")
-                .and_then(Value::as_str)
+        .and_then(|e| {
+            e.as_str()
                 .map(str::to_owned)
-        }))
+                .or_else(|| e.get("message").and_then(Value::as_str).map(str::to_owned))
+        })
         .filter(|s| !s.is_empty())
 }
 
 fn validate_api_base(value: &str, allow_insecure_loopback: bool) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err(SeraError::Config("firecrawl.api_base must not be empty".into()));
+        return Err(SeraError::Config(
+            "firecrawl.api_base must not be empty".into(),
+        ));
     }
-    let parsed = Url::parse(trimmed).map_err(|error| {
-        SeraError::Config(format!("firecrawl.api_base is invalid: {error}"))
-    })?;
+    let parsed = Url::parse(trimmed)
+        .map_err(|error| SeraError::Config(format!("firecrawl.api_base is invalid: {error}")))?;
     let host = parsed
         .host_str()
         .ok_or_else(|| SeraError::Config("firecrawl.api_base has no host".into()))?
         .to_ascii_lowercase();
-    let is_loopback = host == "localhost"
-        || host.ends_with(".localhost")
-        || host == "127.0.0.1"
-        || host == "::1";
+    let is_loopback =
+        host == "localhost" || host.ends_with(".localhost") || host == "127.0.0.1" || host == "::1";
     match parsed.scheme() {
         "https" => {}
         "http" if allow_insecure_loopback && is_loopback => {}
@@ -522,9 +514,8 @@ fn validate_target_url(raw: &str, allow_insecure_loopback: bool) -> Result<Strin
     if raw.len() > MAX_TARGET_URL_LEN {
         return Err(SeraError::Validation("target URL is too long".into()));
     }
-    let mut url = Url::parse(raw.trim()).map_err(|error| {
-        SeraError::Validation(format!("invalid target URL: {error}"))
-    })?;
+    let mut url = Url::parse(raw.trim())
+        .map_err(|error| SeraError::Validation(format!("invalid target URL: {error}")))?;
     url.set_fragment(None);
     if !url.username().is_empty() || url.password().is_some() {
         return Err(SeraError::Forbidden(
@@ -545,9 +536,7 @@ fn validate_target_url(raw: &str, allow_insecure_loopback: bool) -> Result<Strin
         "https" => {}
         "http" if allow_insecure_loopback && is_loopback => {}
         "http" => {
-            return Err(SeraError::Forbidden(
-                "target URLs must use HTTPS".into(),
-            ));
+            return Err(SeraError::Forbidden("target URLs must use HTTPS".into()));
         }
         other => {
             return Err(SeraError::Forbidden(format!(
@@ -566,9 +555,11 @@ async fn read_limited(mut response: reqwest::Response, limit: usize) -> Result<V
         ));
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| {
-        SeraError::External(format!("read Firecrawl response: {error}"))
-    })? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| SeraError::External(format!("read Firecrawl response: {error}")))?
+    {
         if body.len().saturating_add(chunk.len()) > limit {
             return Err(SeraError::External(format!(
                 "Firecrawl response exceeds {limit} bytes"
@@ -669,10 +660,7 @@ impl Tool for FirecrawlScrapeTool {
     }
 
     fn approval_details(&self, args: &Value) -> Result<ApprovalDetails> {
-        let url = args
-            .get("url")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let url = args.get("url").and_then(Value::as_str).unwrap_or_default();
         Ok(ApprovalDetails {
             summary: format!("Firecrawl scrape {url}"),
             destination: Some(format!("firecrawl:scrape:{url}")),
@@ -738,10 +726,7 @@ impl Tool for FirecrawlMapTool {
     }
 
     fn approval_details(&self, args: &Value) -> Result<ApprovalDetails> {
-        let url = args
-            .get("url")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let url = args.get("url").and_then(Value::as_str).unwrap_or_default();
         Ok(ApprovalDetails {
             summary: format!("Firecrawl map {url}"),
             destination: Some(format!("firecrawl:map:{url}")),
@@ -889,10 +874,7 @@ impl Tool for FirecrawlCrawlTool {
     }
 
     fn approval_details(&self, args: &Value) -> Result<ApprovalDetails> {
-        let url = args
-            .get("url")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let url = args.get("url").and_then(Value::as_str).unwrap_or_default();
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10);
         Ok(ApprovalDetails {
             summary: format!("Firecrawl crawl {url} (limit {limit})"),
@@ -915,12 +897,8 @@ impl Tool for FirecrawlCrawlTool {
             .get("only_main_content")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        let result = self
-            .client
-            .crawl_and_wait(url, limit, only_main)
-            .await?;
-        let per_page =
-            (self.limits.max_markdown_chars / result.pages.len().max(1)).max(400);
+        let result = self.client.crawl_and_wait(url, limit, only_main).await?;
+        let per_page = (self.limits.max_markdown_chars / result.pages.len().max(1)).max(400);
         let mut sections = Vec::new();
         for (index, page) in result.pages.iter().enumerate() {
             let md = truncate_chars(&page.markdown, per_page);
@@ -982,14 +960,9 @@ mod tests {
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap();
-        FirecrawlClient::new(
-            http,
-            server.uri(),
-            "fc-synthetic-test-key",
-            &test_config(),
-        )
-        .unwrap()
-        .allow_insecure_api_http()
+        FirecrawlClient::new(http, server.uri(), "fc-synthetic-test-key", &test_config())
+            .unwrap()
+            .allow_insecure_api_http()
     }
 
     #[tokio::test]
@@ -1009,10 +982,7 @@ mod tests {
             .await;
 
         let client = test_client(&server).await;
-        let result = client
-            .scrape("https://example.com/", true)
-            .await
-            .unwrap();
+        let result = client.scrape("https://example.com/", true).await.unwrap();
         assert_eq!(result.markdown, "# Hello");
         assert_eq!(result.title.as_deref(), Some("Hello"));
     }
@@ -1098,7 +1068,10 @@ mod tests {
     async fn rejects_plain_http_targets() {
         let server = MockServer::start().await;
         let client = test_client(&server).await;
-        let error = client.scrape("http://example.com/", true).await.unwrap_err();
+        let error = client
+            .scrape("http://example.com/", true)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("HTTPS"), "{error}");
     }
 
@@ -1117,15 +1090,18 @@ mod tests {
         let client = Arc::new(test_client(&server).await);
         let tool = FirecrawlScrapeTool::new(client, FirecrawlLimits::from_config(&test_config()));
         let output = tool
-            .execute(json!({"url": "https://example.com/"}), &crate::gateway::ToolContext {
-                actor: "owner".into(),
-                bot: "test".into(),
-                task_id: None,
-                turn_id: None,
-                conversation_id: None,
-                allowed_tools: std::collections::HashSet::new(),
-                require_approval: std::collections::HashSet::new(),
-            })
+            .execute(
+                json!({"url": "https://example.com/"}),
+                &crate::gateway::ToolContext {
+                    actor: "owner".into(),
+                    bot: "test".into(),
+                    task_id: None,
+                    turn_id: None,
+                    conversation_id: None,
+                    allowed_tools: std::collections::HashSet::new(),
+                    require_approval: std::collections::HashSet::new(),
+                },
+            )
             .await
             .unwrap();
         assert!(output.content.contains("UNTRUSTED PAGE CONTENT"));
@@ -1145,7 +1121,13 @@ mod tests {
             .await;
 
         let client = test_client(&server).await;
-        let error = client.scrape("https://example.com/", true).await.unwrap_err();
-        assert!(error.to_string().contains("insufficient credits"), "{error}");
+        let error = client
+            .scrape("https://example.com/", true)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("insufficient credits"),
+            "{error}"
+        );
     }
 }

@@ -239,12 +239,7 @@ impl Store {
         Ok(message)
     }
 
-    pub fn create_conversation(
-        &self,
-        id: &str,
-        kind: &str,
-        parent_id: Option<&str>,
-    ) -> Result<()> {
+    pub fn create_conversation(&self, id: &str, kind: &str, parent_id: Option<&str>) -> Result<()> {
         use crate::orchestration::{
             ConversationKind, parse_conversation_scope, validate_conversation_id,
         };
@@ -1127,7 +1122,9 @@ fn parse_stored_conversation_kind(kind: &str) -> Result<crate::orchestration::Co
         "direct" => Ok(ConversationKind::Direct),
         "room" => Ok(ConversationKind::Room),
         "legacy" => Ok(ConversationKind::Legacy),
-        _ => Err(SeraError::Internal("invalid stored conversation kind".into())),
+        _ => Err(SeraError::Internal(
+            "invalid stored conversation kind".into(),
+        )),
     }
 }
 
@@ -1437,7 +1434,11 @@ mod tests {
         store
             .create_conversation("sec:finance", "section", None)
             .unwrap();
-        assert!(store.ensure_conversation_accepts_turns("sec:finance").is_err());
+        assert!(
+            store
+                .ensure_conversation_accepts_turns("sec:finance")
+                .is_err()
+        );
         assert!(store.ensure_conversation_accepts_turns("grp:ops").is_err());
         assert!(store.get_conversation("grp:ops").unwrap().is_none());
         store.ensure_conversation_accepts_turns("owner").unwrap();

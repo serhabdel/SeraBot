@@ -55,6 +55,39 @@ mod tests {
     }
 
     #[test]
+    fn server_hint_keeps_a_valid_origin_and_drops_invalid_values() {
+        assert_eq!(
+            resolve_server_hint(Some("https://owner.example"), None),
+            "https://owner.example"
+        );
+        assert_eq!(
+            resolve_server_hint(
+                Some("  https://owner.example  "),
+                Some("http://evil.example")
+            ),
+            "https://owner.example"
+        );
+        assert_eq!(
+            resolve_server_hint(None, Some("https://compiled.example")),
+            "https://compiled.example"
+        );
+        assert_eq!(
+            resolve_server_hint(
+                Some("http://owner.example"),
+                Some("https://compiled.example")
+            ),
+            "https://compiled.example"
+        );
+        assert_eq!(resolve_server_hint(Some(""), Some("")), "");
+        assert_eq!(
+            resolve_server_hint(Some("https://user:secret@owner.example"), Some("not a url")),
+            ""
+        );
+        assert_eq!(OWNER_TOKEN_SECRET_NAME, "SERABOT_OWNER_TOKEN");
+        assert!(!valid_token(OWNER_TOKEN_SECRET_NAME));
+    }
+
+    #[test]
     fn a_server_timeout_does_not_prove_a_mutation_was_rejected() {
         assert!(ApiError::Http(408).unknown_outcome());
         assert!(ApiError::Http(504).unknown_outcome());

@@ -7,8 +7,10 @@ Bots declare an allowlist in `bots/*.toml`; at runtime they call `skill_list`,
 Layout:
 
 - `skills/<id>/SKILL.md` — bot workflow skills (triage, deck, legal-rag, …)
-- `skills/packs/<pack>/<id>/SKILL.md` — shared packs (for example `office/`)
+- `skills/packs/<pack>/<id>/SKILL.md` — shared packs (for example `office/`: `docx`, `xlsx`, `pptx`, `design`)
 - `skills/skill-creator/SKILL.md` — how to add a new skill
+
+Each `SKILL.md` is an instruction body with a heading and a workflow. `skill_load` returns that body. A file that is only a placeholder is not a pack.
 
 Register a new skill (the owner writes the file; bots load it later with
 `skill_load`):

@@ -2,8 +2,8 @@ use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, RichText, Stroke,
 use secrecy::SecretString;
 use serabot_desktop::{
     ApiError, ApprovalDecision, ConversationKind, DEFAULT_SPECIALIST_TOOLS, MAX_SKILL_BODY_BYTES,
-    MAX_SKILL_DESCRIPTION_CHARS, Role, SPECIALIST_TOOLS, Selection, TaskStatus,
-    conversation_node_id, parse_skill_list,
+    MAX_SKILL_DESCRIPTION_CHARS, OWNER_TOKEN_SECRET_NAME, Role, SPECIALIST_TOOLS, Selection,
+    TaskStatus, conversation_node_id, default_server_url, parse_skill_list,
     state::State,
     valid_bot_description, valid_bot_id, valid_conversation_parent, valid_id, valid_new_skill_id,
     valid_skill_body, valid_skill_description, valid_slug, valid_text, valid_token,
@@ -141,7 +141,7 @@ impl Desktop {
             state,
             worker,
             credentials: None,
-            server: String::new(),
+            server: default_server_url(),
             token: String::new(),
             conversation: "windows-owner".into(),
             composer: String::new(),
@@ -641,9 +641,11 @@ impl Desktop {
                             }
                         });
                         ui.label(
-                            RichText::new("HTTPS, or exact loopback HTTP for tunnels. Token never leaves memory.")
-                                .size(11.0)
-                                .color(MUTED),
+                            RichText::new(format!(
+                                "HTTPS, or exact loopback HTTP for tunnels. Token stays in memory. Builds do not embed the {OWNER_TOKEN_SECRET_NAME} secret."
+                            ))
+                            .size(11.0)
+                            .color(MUTED),
                         );
                     }
                 });

@@ -478,8 +478,7 @@ impl Tool for OneDriveListTool {
         ToolSpec {
             name: "onedrive_list".into(),
             description:
-                "List files and folders in the approved OneDrive dossier folder (read-only)."
-                    .into(),
+                "List files and folders in the approved OneDrive dossier folder (read-only).".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {

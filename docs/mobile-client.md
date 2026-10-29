@@ -7,15 +7,17 @@ cd apps/serabot_mobile
 flutter pub get && flutter analyze && flutter test
 ```
 
-Connect with HTTPS to the VPS or loopback over SSH/`adb reverse`. Token is entered at runtime only.
+Connect with HTTPS to the VPS or loopback over SSH/`adb reverse`. The token is entered at runtime only. The connect screen names the GitHub Actions secret `SERABOT_OWNER_TOKEN` and does not embed its value.
 
-Optional build hint (URL only, never token):
+Optional build hint (URL only, never the token value):
 
 ```bash
-flutter build apk --release --dart-define=SERABOT_DEFAULT_SERVER_URL=https://your-vps.example
+flutter build apk --release \
+  --dart-define=SERABOT_DEFAULT_SERVER_URL=https://owner.example \
+  --dart-define=SERABOT_OWNER_TOKEN_SECRET_NAME=SERABOT_OWNER_TOKEN
 ```
 
-See `docs/ci-and-secrets.md`.
+`https://owner.example` is a synthetic origin. CI reads the optional repository secret `SERABOT_OWNER_API_URL` and passes it as `SERABOT_DEFAULT_SERVER_URL`. An invalid origin is ignored and the field stays `https://`. See `docs/ci-and-secrets.md`.
 
 ## Fleet
 

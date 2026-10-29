@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../api_client.dart';
+import '../build_config.dart';
 import '../session.dart';
 import '../validation.dart';
 
@@ -15,7 +16,7 @@ class ConnectScreen extends StatefulWidget {
 }
 
 class _ConnectScreenState extends State<ConnectScreen> {
-  final _urlController = TextEditingController(text: 'https://');
+  final _urlController = TextEditingController(text: BuildConfig.initialServerUrl());
   final _tokenController = TextEditingController();
   final _conversationController = TextEditingController(text: 'android-owner');
   String? _error;
@@ -68,9 +69,10 @@ class _ConnectScreenState extends State<ConnectScreen> {
             style: Theme.of(context).textTheme.headlineSmall,
           ),
           const SizedBox(height: 8),
-          const Text(
+          Text(
             'HTTPS origin, or exact loopback HTTP for an SSH tunnel '
-            '(http://127.0.0.1:8787). Token stays in memory only.',
+            '(http://127.0.0.1:8787). Token stays in memory. '
+            'This build does not embed the ${BuildConfig.ownerTokenSecretName} secret.',
           ),
           const SizedBox(height: 24),
           TextField(

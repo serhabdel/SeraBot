@@ -11,10 +11,8 @@ use crate::error::{Result, SeraError};
 use crate::gateway::{Tool, ToolContext, ToolOutput, ToolSpec};
 use crate::memory;
 use crate::model_router::ModelRouter;
-use crate::orchestration::{
-    BotRole, Handoff, ModelClass, ORCHESTRATOR_BOT, validate_handoff,
-};
 use crate::orchestration::HandoffContext;
+use crate::orchestration::{BotRole, Handoff, ModelClass, ORCHESTRATOR_BOT, validate_handoff};
 use crate::store::Store;
 
 pub const DELEGATE_TOOL: &str = "delegate";
@@ -28,11 +26,7 @@ pub struct DelegateTool {
 }
 
 impl DelegateTool {
-    pub fn new(
-        store: Store,
-        bots: Arc<HashMap<String, LoadedBot>>,
-        router: ModelRouter,
-    ) -> Self {
+    pub fn new(store: Store, bots: Arc<HashMap<String, LoadedBot>>, router: ModelRouter) -> Self {
         Self {
             store,
             bots,
@@ -97,10 +91,9 @@ impl Tool for DelegateTool {
         let conversation_id = context
             .conversation_id
             .as_deref()
-            .ok_or_else(|| {
-                SeraError::InvalidState("delegate requires a conversation id".into())
-            })?;
-        self.store.ensure_conversation_accepts_turns(conversation_id)?;
+            .ok_or_else(|| SeraError::InvalidState("delegate requires a conversation id".into()))?;
+        self.store
+            .ensure_conversation_accepts_turns(conversation_id)?;
 
         let to_bot = args
             .get("to_bot")
@@ -204,7 +197,9 @@ impl Tool for DelegateTool {
                 skill: handoff.skill.clone(),
             },
         });
-        let child = self.store.enqueue_task("turn", &to_bot, &payload, 0, Utc::now())?;
+        let child = self
+            .store
+            .enqueue_task("turn", &to_bot, &payload, 0, Utc::now())?;
         self.store.record_audit(
             &context.actor,
             "handoff.queued",

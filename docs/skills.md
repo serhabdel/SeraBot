@@ -75,8 +75,10 @@ Duplicate ids conflict. The file lands at `<skills.dir>/<id>/SKILL.md`.
 
 ## Packs
 
-Shared deliverable skills live under `skills/packs/<pack>/<id>/SKILL.md` (for
-example the `office` pack: `docx`, `xlsx`, `pptx`, `design`). Pack membership is
+Shared deliverable skills live under `skills/packs/<pack>/<id>/SKILL.md` (the
+`office` pack: `docx`, `xlsx`, `pptx`, `design`). Each office file is a
+workflow: when to use it, the gateway tool and its arguments, a synthetic
+example, and what the renderer or analyzer will reject. Pack membership is
 metadata only; bots still opt in by skill id. The owner API writes flat packs,
 not `packs/` entries.
 

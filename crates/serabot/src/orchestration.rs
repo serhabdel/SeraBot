@@ -25,10 +25,7 @@ pub enum ConversationKind {
 
 impl ConversationKind {
     pub fn accepts_turns(self) -> bool {
-        matches!(
-            self,
-            Self::Direct | Self::Room | Self::Legacy
-        )
+        matches!(self, Self::Direct | Self::Room | Self::Legacy)
     }
 
     pub fn as_str(self) -> &'static str {

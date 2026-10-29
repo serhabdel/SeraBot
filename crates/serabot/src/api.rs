@@ -239,10 +239,9 @@ async fn models(
     state.runtime.refresh_model_catalogs().await?;
     let bot = query.bot.as_deref().unwrap_or("main");
     let selection = state.runtime.model_selection(&query.conversation_id, bot)?;
-    let effective_selection =
-        state
-            .runtime
-            .effective_model_selection(&query.conversation_id, bot)?;
+    let effective_selection = state
+        .runtime
+        .effective_model_selection(&query.conversation_id, bot)?;
     Ok(Json(json!({
         "providers": state.runtime.model_catalog()?,
         "entries": state.runtime.model_catalog_entries()?,

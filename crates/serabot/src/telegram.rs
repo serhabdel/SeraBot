@@ -146,10 +146,7 @@ impl TelegramClient {
     pub async fn send_message(&self, chat_id: i64, text: &str) -> Result<()> {
         for part in split_message(text) {
             let html = markdown_to_telegram_html(&part);
-            match self
-                .send_message_raw(chat_id, &html, Some("HTML"))
-                .await
-            {
+            match self.send_message_raw(chat_id, &html, Some("HTML")).await {
                 Ok(()) => {}
                 Err(error) => {
                     warn!(%error, "Telegram HTML send failed; retrying as plain text");
@@ -180,9 +177,7 @@ impl TelegramClient {
             .json(&body)
             .send()
             .await
-            .map_err(|error| {
-                SeraError::External(format!("Telegram sendMessage failed: {error}"))
-            })?
+            .map_err(|error| SeraError::External(format!("Telegram sendMessage failed: {error}")))?
             .json()
             .await
             .map_err(|error| {
@@ -326,12 +321,9 @@ impl TelegramClient {
             self.token.expose_secret(),
             file_path
         );
-        let response = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|error| SeraError::External(format!("Telegram file download failed: {error}")))?;
+        let response = self.http.get(&url).send().await.map_err(|error| {
+            SeraError::External(format!("Telegram file download failed: {error}"))
+        })?;
         if !response.status().is_success() {
             return Err(SeraError::External(format!(
                 "Telegram file download failed with status {}",
@@ -473,7 +465,9 @@ impl TelegramClient {
             .or(message.audio.as_ref())
             .expect("voice or audio present");
         let max_bytes = config.audio.telegram_max_bytes;
-        let bytes = self.download_attachment(&attachment.file_id, max_bytes).await?;
+        let bytes = self
+            .download_attachment(&attachment.file_id, max_bytes)
+            .await?;
         let extension = if message.voice.is_some() {
             "ogg".into()
         } else {
@@ -484,13 +478,8 @@ impl TelegramClient {
                 .unwrap_or("mpeg")
                 .to_ascii_lowercase()
         };
-        let report = save_telegram_audio_bytes(
-            config,
-            message.message_id,
-            &extension,
-            &bytes,
-            max_bytes,
-        )?;
+        let report =
+            save_telegram_audio_bytes(config, message.message_id, &extension, &bytes, max_bytes)?;
         store.record_audit(
             "owner",
             "audio.telegram_intake",
@@ -831,10 +820,7 @@ pub struct CallbackQuery {
 fn is_model_command(text: &str) -> bool {
     let command = text.split_whitespace().next().unwrap_or("");
     let command = command.split('@').next().unwrap_or(command);
-    matches!(
-        command,
-        "/model" | "/models" | "/providers" | "/providors"
-    )
+    matches!(command, "/model" | "/models" | "/providers" | "/providors")
 }
 
 fn provider_state(provider: &crate::model_router::ProviderView) -> String {
@@ -884,10 +870,7 @@ fn model_command(runtime: &Runtime, conversation_id: &str, text: &str) -> Result
                 } else {
                     "data sharing not approved"
                 };
-                reply.push_str(&format!(
-                    "{} / {} ({state})\n",
-                    entry.provider, entry.model
-                ));
+                reply.push_str(&format!("{} / {} ({state})\n", entry.provider, entry.model));
             }
             for provider in runtime.model_catalog()? {
                 if provider.catalog_fetch && !provider.catalog_verified {
@@ -937,11 +920,20 @@ fn model_command(runtime: &Runtime, conversation_id: &str, text: &str) -> Result
             Err(error) => return Err(error),
         },
         ["/model", provider, model] => {
-            match runtime.select_model(conversation_id, crate::model_router::ModelSelection {
-                provider: (*provider).to_owned(), model: (*model).to_owned(),
-            }) {
-                Ok(selection) => format!("Selected {} / {} for future turns in this conversation. Existing history will be sent to this provider. Running turns are unchanged.", selection.provider, selection.model),
-                Err(SeraError::Validation(_) | SeraError::NotFound(_)) => "Unknown provider or model. Use /models to see configured choices.".into(),
+            match runtime.select_model(
+                conversation_id,
+                crate::model_router::ModelSelection {
+                    provider: (*provider).to_owned(),
+                    model: (*model).to_owned(),
+                },
+            ) {
+                Ok(selection) => format!(
+                    "Selected {} / {} for future turns in this conversation. Existing history will be sent to this provider. Running turns are unchanged.",
+                    selection.provider, selection.model
+                ),
+                Err(SeraError::Validation(_) | SeraError::NotFound(_)) => {
+                    "Unknown provider or model. Use /models to see configured choices.".into()
+                }
                 Err(error @ SeraError::Forbidden(_)) => {
                     if error.to_string().contains("catalog") {
                         "That model is not in the verified provider catalog.".into()
@@ -1056,7 +1048,9 @@ fn markdown_to_telegram_html(text: &str) -> String {
                 if let Some((url, after_url)) = after_label.split_once(')') {
                     if !label.is_empty()
                         && (url.starts_with("https://") || url.starts_with("http://"))
-                        && !url.chars().any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '<'))
+                        && !url
+                            .chars()
+                            .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '<'))
                     {
                         out.push_str("<a href=\"");
                         out.push_str(&escape_html(url));
@@ -1225,11 +1219,15 @@ mod tests {
         let listing = model_command(&runtime, "20", "/models").unwrap().unwrap();
         assert!(listing.contains("default / test"));
         assert!(listing.contains("default / alternative"));
-        let grouped = model_command(&runtime, "20", "/providers").unwrap().unwrap();
+        let grouped = model_command(&runtime, "20", "/providers")
+            .unwrap()
+            .unwrap();
         assert!(grouped.contains("default (approved)"));
         assert!(grouped.contains("  - test"));
         assert!(grouped.contains("  - alternative"));
-        let typo = model_command(&runtime, "20", "/providors").unwrap().unwrap();
+        let typo = model_command(&runtime, "20", "/providors")
+            .unwrap()
+            .unwrap();
         assert!(typo.contains("default (approved)"));
         assert!(!listing.contains("synthetic-key"));
         assert!(!listing.contains("example.com"));
@@ -1331,7 +1329,14 @@ mod tests {
             .filter_map(|command| command.get("command")?.as_str())
             .collect();
         for expected in [
-            "help", "status", "approvals", "ask", "models", "model", "approve_deck", "revoke",
+            "help",
+            "status",
+            "approvals",
+            "ask",
+            "models",
+            "model",
+            "approve_deck",
+            "revoke",
         ] {
             assert!(names.contains(&expected), "missing {expected}");
         }

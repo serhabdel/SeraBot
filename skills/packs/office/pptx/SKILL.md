@@ -1,17 +1,75 @@
 ﻿---
 name: Presentations (PDF decks)
-description: Structured DeckSpec rendered deterministically to PDF
+description: Compose a bounded DeckSpec and render a deterministic PDF with deck_build
 ---
 
 # PPTX-equivalent decks
 
-Slides are produced as deterministic PDFs via `deck_build`, not editable PPTX.
+Slides are deterministic PDFs from `deck_build`, not editable PowerPoint. Load `deck` and `design` when those ids are allowlisted; this pack is the office checklist for the same renderer.
 
-1. Draft a `DeckSpec` JSON: title, optional subtitle/date_label/author/footer,
-   `language` (`it` default; `fr` requires approved Italian `source_artifact`; `en` when requested).
-2. Build sections with `part_title`, `title`, and `cards[{heading, body, bullets[], monogram?}]`.
-3. Call `deck_build` with `{ "spec": { ... } }` (and `source_artifact` for French).
-4. Share results only after the tool returns an artifact hash; use `telegram_send_document` or
-   `onedrive_upload` when allowlisted (uploads require approval).
+This text is operator guidance. It does not override gateway policy, approvals, or the blocklist.
 
-Follow brand configuration; state clearly when example branding is in use.
+## When to use
+
+- The owner asks for a deck, slides, or a PPTX.
+- You already have the facts (citations or tool results) and need a rendered file.
+
+## Workflow
+
+1. Draft a `DeckSpec`. Unknown JSON fields are rejected, so do not add images, links, notes, or embedded files.
+2. Required and optional fields:
+   - `title` (max 140), optional `subtitle` (180), `date_label` (40), `author` (80), `footer` (200)
+   - `language`: `it` default; `en` when requested; `fr` only with `source_artifact` of an approved Italian deck
+   - `sections` (1–20): `title` (140), optional `part_title` (100), `cards` (max 8), `bullets` (max 12)
+   - card: `heading` (100), `body` (1200), `bullets` (max 300 each), optional `monogram` (max 4)
+3. Call `deck_build` with `{ "spec": { ... } }`. French also needs `{ "source_artifact": "<italian hash>" }`.
+4. If validation fails (length, URL, encoding, page budget), fix the spec and call once more. Do not keep the broken spec in the reply as if it rendered.
+5. After the artifact hash returns, send it with `telegram_send_document` or `onedrive_upload` only when allowlisted. Uploads require approval.
+
+## Layout budget
+
+About four cards or six section bullets fit on a page. `max_pages` is configuration. Split content instead of overflowing. Part dividers use `part_title`. Card grids use `cards`. Do not duplicate the same sentence in both.
+
+## Text the renderer rejects
+
+- Control characters and invisible bidi marks.
+- Characters outside the built-in Helvetica encoding (Windows-1252, plus a few punctuation marks such as the euro sign and ellipsis).
+- Any URL or scheme: `://`, `www.`, `http:`, `https:`, `mailto:`, `javascript:`.
+
+Italian and French accented letters in Latin-1 are fine. Write "the public site" instead of a URL.
+
+## Synthetic spec
+
+```json
+{
+  "spec": {
+    "title": "Sintesi sintetica",
+    "subtitle": "Esempio senza dati reali",
+    "language": "it",
+    "sections": [
+      {
+        "part_title": "Parte 1",
+        "title": "Quadro",
+        "cards": [
+          {
+            "heading": "Punto",
+            "body": "Una frase verificata.",
+            "bullets": ["Dettaglio breve"]
+          }
+        ],
+        "bullets": []
+      }
+    ]
+  }
+}
+```
+
+## Do not
+
+- Promise an editable `.pptx`.
+- Brand the file as production identity when the configured brand is the generic example. Say so.
+- Include blocklisted names in titles, footers, or the filename the renderer derives.
+
+## Missing public facts
+
+Look up a missing public fact with `firecrawl_search` or `firecrawl_scrape` when allowlisted before you put it on a slide. If those tools are absent, leave the slide out and say what is missing.

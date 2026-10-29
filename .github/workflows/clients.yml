@@ -8,6 +8,13 @@ on:
 permissions:
   contents: read
 
+# Optional repository secrets. Unset secrets expand to empty and CI still passes.
+#   SERABOT_OWNER_API_URL — HTTPS origin (synthetic example: https://owner.example).
+#     Desktop compiles and reads this name. Mobile receives it as
+#     --dart-define=SERABOT_DEFAULT_SERVER_URL.
+#   SERABOT_OWNER_TOKEN — owner API token. This workflow does not read it.
+#     Clients compile only the placeholder name SERABOT_OWNER_TOKEN.
+
 jobs:
   desktop:
     strategy:
@@ -15,26 +22,39 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      SERABOT_TEST_MODE: "1"
+      SERABOT_OWNER_API_URL: ${{ secrets.SERABOT_OWNER_API_URL }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p serabot-desktop --locked
-      - run: cargo test -p serabot-desktop --locked
-        env:
-          SERABOT_TEST_MODE: "1"
+      - name: Check
+        run: cargo check -p serabot-desktop --locked
+      - name: Test
+        run: cargo test -p serabot-desktop --locked
+      - name: Release build
+        run: cargo build --release -p serabot-desktop --locked
 
   mobile:
     runs-on: ubuntu-latest
+    env:
+      SERABOT_OWNER_API_URL: ${{ secrets.SERABOT_OWNER_API_URL }}
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
-      - run: flutter pub get
+      - name: Dependencies
         working-directory: apps/serabot_mobile
-      - run: flutter analyze
+        run: flutter pub get
+      - name: Analyze
         working-directory: apps/serabot_mobile
-      - run: flutter test
+        run: flutter analyze
+      - name: Test with optional server URL
         working-directory: apps/serabot_mobile
+        run: |
+          flutter test \
+            --dart-define=SERABOT_DEFAULT_SERVER_URL="${SERABOT_OWNER_API_URL}" \
+            --dart-define=SERABOT_OWNER_TOKEN_SECRET_NAME=SERABOT_OWNER_TOKEN

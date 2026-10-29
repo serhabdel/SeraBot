@@ -1083,4 +1083,47 @@ mod tests {
                 .contains("Short public")
         );
     }
+
+    #[test]
+    fn repository_skill_files_are_instructions_not_a_sentinel() {
+        let skills = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("skills");
+        let mut found = 0usize;
+        fn visit(dir: &Path, found: &mut usize) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path, found);
+                    continue;
+                }
+                if path.file_name().and_then(|name| name.to_str()) != Some(SKILL_FILE) {
+                    continue;
+                }
+                let raw = fs::read_to_string(&path).unwrap();
+                let body = raw.trim_start_matches('\u{feff}').trim();
+                assert!(
+                    !body.contains("System.Object[]"),
+                    "{} contains the PowerShell sentinel",
+                    path.display()
+                );
+                assert!(
+                    body.contains("# "),
+                    "{} has no markdown heading",
+                    path.display()
+                );
+                assert!(
+                    body.len() > 400,
+                    "{} is too short to be an instruction pack",
+                    path.display()
+                );
+                *found += 1;
+            }
+        }
+        visit(&skills, &mut found);
+        assert!(
+            found >= 23,
+            "expected the shipped skill packs, found {found}"
+        );
+    }
 }

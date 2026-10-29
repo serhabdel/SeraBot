@@ -81,7 +81,7 @@ Commands below use secret **names** only.
 | **AgentMail** | `secrets set agentmail_api_key`. Set `default_inbox_id` or pass `inbox_id` (letters, digits, `_`, `-`). Enable `[connectors.agentmail]` only after the key is stored. |
 | **Enable a connector** | One section at a time, after its keys exist. Add the tool to a bot allowlist. Reads and AgentMail sends stay approval-gated. Restart **only** `serabot.service`. |
 | **Antigravity** | `secrets set antigravity_oauth_client_secret`, point `[llm.providers.*]` at `kind = "google-antigravity"`, then `serabot providers login google-antigravity`. Run that on the machine whose browser can open `127.0.0.1:51121`. Set `data_egress_approved = true` only when you intend Cloud Code to receive prompts. See [antigravity.md](antigravity.md). |
-| **GitHub Actions client builds** | `.github/workflows/clients.yml` runs desktop check/test and Flutter analyze/test and reads **no** Actions secrets. Add repository secrets only when you publish signed desktop or mobile artifacts. Never put the owner API token in a workflow, APK, or release binary ([ci-and-secrets.md](ci-and-secrets.md)). |
+| **GitHub Actions client builds** | `.github/workflows/clients.yml` accepts optional secrets `SERABOT_OWNER_API_URL` (synthetic shape `https://owner.example`, baked as the client default) and documents `SERABOT_OWNER_TOKEN`. The workflow does **not** read the token secret and does not compile a token. Unset secrets leave CI green. Never commit secret values ([ci-and-secrets.md](ci-and-secrets.md)). |
 | **Hot reload** | Not implemented. Restart `serabot.service` for new bots and skills (OVH section above). |
 
 Still owner-gated from the previous checklist. Same stdin rule.

@@ -106,6 +106,32 @@ pub fn validate_endpoint(raw: &str) -> Result<Url, ApiError> {
     Ok(url)
 }
 
+/// GitHub Actions secret *name* for the owner API token.
+/// Workflows document this name and do not compile the secret value.
+pub const OWNER_TOKEN_SECRET_NAME: &str = "SERABOT_OWNER_TOKEN";
+
+/// First valid server origin among a runtime value and a compile-time value.
+/// Empty and invalid strings are skipped. Tokens are never accepted here.
+pub fn resolve_server_hint(runtime: Option<&str>, compiled: Option<&str>) -> String {
+    for candidate in [runtime, compiled].into_iter().flatten() {
+        let trimmed = candidate.trim();
+        if !trimmed.is_empty() && validate_endpoint(trimmed).is_ok() {
+            return trimmed.to_owned();
+        }
+    }
+    String::new()
+}
+
+/// Prefill for the desktop server field.
+/// `SERABOT_OWNER_API_URL` in the process environment wins; otherwise the
+/// value present when this binary was compiled (CI secret of the same name).
+pub fn default_server_url() -> String {
+    resolve_server_hint(
+        std::env::var("SERABOT_OWNER_API_URL").ok().as_deref(),
+        option_env!("SERABOT_OWNER_API_URL"),
+    )
+}
+
 pub fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128

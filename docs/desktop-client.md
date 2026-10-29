@@ -43,10 +43,14 @@ scripts\cargo-win.bat build --release -p serabot --locked
 - **Server URL** — HTTPS origin, or exact loopback HTTP for an SSH tunnel
   (`http://127.0.0.1:8787`, `http://[::1]:8787`, `http://localhost:8787`).
   Credentials, paths, queries, fragments, redirects, and lookalike loopback
-  hosts are rejected.
+  hosts are rejected. A valid `SERABOT_OWNER_API_URL` prefills the field:
+  the process environment wins, then the value compiled from the GitHub Actions
+  secret of the same name. Invalid values are ignored. See
+  [CI and secrets](ci-and-secrets.md).
 - **API token** — the owner token whose SHA-256 hash is in `[api].token_hash`.
   It is held only in memory for the session (masked input); it is not written to
-  disk. Disconnecting clears the token, chat text, history, and pending actions.
+  disk and it is not compiled from the `SERABOT_OWNER_TOKEN` secret. Disconnecting
+  clears the token, chat text, history, and pending actions.
 - **Connect** — **Connect** or **Enter** (with valid server URL, token, and
   conversation id) starts the session read.
 

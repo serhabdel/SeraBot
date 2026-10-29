@@ -19,9 +19,7 @@ use crate::audio::resolve_inbox_audio;
 use crate::config::{Config, ElevenLabsConfig};
 use crate::domain::Language;
 use crate::error::{Result, SeraError};
-use crate::gateway::{
-    ApprovalDetails, Tool, ToolContext, ToolOutput, ToolRegistry, ToolSpec,
-};
+use crate::gateway::{ApprovalDetails, Tool, ToolContext, ToolOutput, ToolRegistry, ToolSpec};
 use crate::llm::validate_base_url;
 use crate::maker::{ArtifactMeta, ArtifactStore};
 use crate::policy::Policy;
@@ -48,7 +46,11 @@ impl std::fmt::Debug for ElevenLabsClient {
 }
 
 impl ElevenLabsClient {
-    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>, timeout_secs: u64) -> Result<Self> {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        timeout_secs: u64,
+    ) -> Result<Self> {
         let base_url = validate_base_url(&base_url.into())?;
         let api_key = api_key.into();
         if api_key.trim().is_empty() {
@@ -89,7 +91,9 @@ impl ElevenLabsClient {
             .headers(self.auth_headers()?)
             .send()
             .await
-            .map_err(|error| SeraError::External(format!("ElevenLabs voices request failed: {error}")))?;
+            .map_err(|error| {
+                SeraError::External(format!("ElevenLabs voices request failed: {error}"))
+            })?;
         read_json_response(response, "voices").await
     }
 
@@ -115,7 +119,9 @@ impl ElevenLabsClient {
             .json(&body)
             .send()
             .await
-            .map_err(|error| SeraError::External(format!("ElevenLabs TTS request failed: {error}")))?;
+            .map_err(|error| {
+                SeraError::External(format!("ElevenLabs TTS request failed: {error}"))
+            })?;
         read_bytes_response(response, "text-to-speech").await
     }
 
@@ -138,7 +144,9 @@ impl ElevenLabsClient {
             .json(&body)
             .send()
             .await
-            .map_err(|error| SeraError::External(format!("ElevenLabs sound effect request failed: {error}")))?;
+            .map_err(|error| {
+                SeraError::External(format!("ElevenLabs sound effect request failed: {error}"))
+            })?;
         read_bytes_response(response, "sound-generation").await
     }
 
@@ -151,13 +159,17 @@ impl ElevenLabsClient {
     ) -> Result<Value> {
         validate_model_id(model_id)?;
         if bytes.is_empty() || bytes.len() > 100 * 1024 * 1024 {
-            return Err(SeraError::Validation("invalid transcription input size".into()));
+            return Err(SeraError::Validation(
+                "invalid transcription input size".into(),
+            ));
         }
         let part = Part::bytes(bytes.to_vec())
             .file_name(filename.to_owned())
             .mime_str(mime_for_filename(filename))
             .map_err(|error| SeraError::External(error.to_string()))?;
-        let mut form = Form::new().part("file", part).text("model_id", model_id.to_owned());
+        let mut form = Form::new()
+            .part("file", part)
+            .text("model_id", model_id.to_owned());
         if let Some(code) = language_code.filter(|value| !value.is_empty()) {
             form = form.text("language_code", code.to_owned());
         }
@@ -168,11 +180,18 @@ impl ElevenLabsClient {
             .multipart(form)
             .send()
             .await
-            .map_err(|error| SeraError::External(format!("ElevenLabs STT request failed: {error}")))?;
+            .map_err(|error| {
+                SeraError::External(format!("ElevenLabs STT request failed: {error}"))
+            })?;
         read_json_response(response, "speech-to-text").await
     }
 
-    pub async fn create_image(&self, model_id: &str, prompt: &str, aspect_ratio: &str) -> Result<FlowCreateResponse> {
+    pub async fn create_image(
+        &self,
+        model_id: &str,
+        prompt: &str,
+        aspect_ratio: &str,
+    ) -> Result<FlowCreateResponse> {
         validate_model_id(model_id)?;
         let body = json!({
             "model_id": model_id,
@@ -200,11 +219,13 @@ impl ElevenLabsClient {
     }
 
     pub async fn get_image_generation(&self, generation_id: &str) -> Result<Value> {
-        self.get_flow(&format!("/v1/flows/image/{generation_id}")).await
+        self.get_flow(&format!("/v1/flows/image/{generation_id}"))
+            .await
     }
 
     pub async fn get_video_generation(&self, generation_id: &str) -> Result<Value> {
-        self.get_flow(&format!("/v1/flows/video/{generation_id}")).await
+        self.get_flow(&format!("/v1/flows/video/{generation_id}"))
+            .await
     }
 
     async fn post_flow(&self, path: &str, body: &Value) -> Result<FlowCreateResponse> {
@@ -215,7 +236,9 @@ impl ElevenLabsClient {
             .json(body)
             .send()
             .await
-            .map_err(|error| SeraError::External(format!("ElevenLabs flow create failed: {error}")))?;
+            .map_err(|error| {
+                SeraError::External(format!("ElevenLabs flow create failed: {error}"))
+            })?;
         let value = read_json_response(response, "flow create").await?;
         let id = value
             .get("id")
@@ -237,7 +260,9 @@ impl ElevenLabsClient {
             .headers(self.auth_headers()?)
             .send()
             .await
-            .map_err(|error| SeraError::External(format!("ElevenLabs flow status failed: {error}")))?;
+            .map_err(|error| {
+                SeraError::External(format!("ElevenLabs flow status failed: {error}"))
+            })?;
         read_json_response(response, "flow status").await
     }
 
@@ -324,9 +349,13 @@ impl ElevenLabsClient {
         let mut stream = response.bytes_stream();
         use futures::StreamExt;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| SeraError::External(format!("media download read failed: {error}")))?;
+            let chunk = chunk.map_err(|error| {
+                SeraError::External(format!("media download read failed: {error}"))
+            })?;
             if body.len() + chunk.len() > MAX_FLOW_DOWNLOAD_BYTES {
-                return Err(SeraError::Validation("generated media exceeds size limit".into()));
+                return Err(SeraError::Validation(
+                    "generated media exceeds size limit".into(),
+                ));
             }
             body.extend_from_slice(&chunk);
         }
@@ -366,7 +395,9 @@ fn check_outbound_text(policy: &Policy, text: &str) -> Result<()> {
 fn validate_voice_id(voice_id: &str) -> Result<()> {
     if voice_id.is_empty()
         || voice_id.len() > 64
-        || voice_id.chars().any(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        || voice_id
+            .chars()
+            .any(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
     {
         return Err(SeraError::Validation("invalid voice_id".into()));
     }
@@ -474,7 +505,12 @@ fn sanitize_provider_error(body: &[u8]) -> String {
         .as_ref()
         .and_then(|value| value.pointer("/detail/0/msg"))
         .and_then(Value::as_str)
-        .or_else(|| parsed.as_ref().and_then(|value| value.get("message")).and_then(Value::as_str))
+        .or_else(|| {
+            parsed
+                .as_ref()
+                .and_then(|value| value.get("message"))
+                .and_then(Value::as_str)
+        })
         .unwrap_or(&text)
         .chars()
         .take(500)
@@ -710,7 +746,9 @@ impl Tool for ElevenLabsSoundEffectTool {
             .and_then(Value::as_str)
             .ok_or_else(|| SeraError::Validation("text is required".into()))?;
         if text.len() > MAX_SOUND_PROMPT_CHARS {
-            return Err(SeraError::Validation("sound effect prompt is too long".into()));
+            return Err(SeraError::Validation(
+                "sound effect prompt is too long".into(),
+            ));
         }
         check_outbound_text(&self.deps.policy, text)?;
         let duration = args.get("duration_seconds").and_then(Value::as_f64);
@@ -792,23 +830,24 @@ impl Tool for ElevenLabsTranscribeTool {
     }
 
     async fn execute(&self, args: Value, _context: &ToolContext) -> Result<ToolOutput> {
-        let (bytes, filename) = if let Some(hash) = args.get("artifact_hash").and_then(Value::as_str) {
-            let artifact = self.deps.artifacts.load(hash)?;
-            (artifact.bytes, artifact.filename)
-        } else if let Some(path) = args.get("path").and_then(Value::as_str) {
-            let resolved = resolve_inbox_audio(self.deps.app_config.as_ref(), path)?;
-            let bytes = std::fs::read(&resolved)?;
-            let filename = resolved
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("audio.wav")
-                .to_owned();
-            (bytes, filename)
-        } else {
-            return Err(SeraError::Validation(
-                "artifact_hash or path is required".into(),
-            ));
-        };
+        let (bytes, filename) =
+            if let Some(hash) = args.get("artifact_hash").and_then(Value::as_str) {
+                let artifact = self.deps.artifacts.load(hash)?;
+                (artifact.bytes, artifact.filename)
+            } else if let Some(path) = args.get("path").and_then(Value::as_str) {
+                let resolved = resolve_inbox_audio(self.deps.app_config.as_ref(), path)?;
+                let bytes = std::fs::read(&resolved)?;
+                let filename = resolved
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("audio.wav")
+                    .to_owned();
+                (bytes, filename)
+            } else {
+                return Err(SeraError::Validation(
+                    "artifact_hash or path is required".into(),
+                ));
+            };
         let model_id = args
             .get("model_id")
             .and_then(Value::as_str)
@@ -1003,7 +1042,10 @@ impl Tool for ElevenLabsGenerateVideoTool {
             .get("aspect_ratio")
             .and_then(Value::as_str)
             .unwrap_or("16:9");
-        let duration_secs = args.get("duration_secs").and_then(Value::as_u64).unwrap_or(5) as u32;
+        let duration_secs = args
+            .get("duration_secs")
+            .and_then(Value::as_u64)
+            .unwrap_or(5) as u32;
         let created = self
             .deps
             .client
@@ -1078,7 +1120,12 @@ mod tests {
             .await;
         let client = mock_client(&server);
         let bytes = client
-            .text_to_speech("voice123", "Hello", "eleven_multilingual_v2", "mp3_44100_128")
+            .text_to_speech(
+                "voice123",
+                "Hello",
+                "eleven_multilingual_v2",
+                "mp3_44100_128",
+            )
             .await
             .unwrap();
         assert_eq!(bytes, b"FAKEAUDIO");

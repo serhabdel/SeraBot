@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:serabot_mobile/build_config.dart';
 import 'package:serabot_mobile/models.dart';
 import 'package:serabot_mobile/validation.dart';
 
@@ -34,6 +35,25 @@ void main() {
         () => validateEndpoint('http://example.com'),
         throwsA(isA<ValidationException>()),
       );
+    });
+  });
+
+  group('build config', () {
+    test('prefill keeps a valid origin and drops an invalid one', () {
+      expect(BuildConfig.initialServerUrlFrom(''), 'https://');
+      expect(
+        BuildConfig.initialServerUrlFrom('https://owner.example'),
+        'https://owner.example',
+      );
+      expect(
+        BuildConfig.initialServerUrlFrom('http://owner.example'),
+        'https://',
+      );
+    });
+
+    test('token secret name is a placeholder, not a token', () {
+      expect(BuildConfig.ownerTokenSecretName, 'SERABOT_OWNER_TOKEN');
+      expect(validToken(BuildConfig.ownerTokenSecretName), isFalse);
     });
   });
 

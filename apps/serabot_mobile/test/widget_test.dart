@@ -8,6 +8,7 @@ void main() {
   testWidgets('shows connect screen', (tester) async {
     await tester.pumpWidget(const SeraBotMobileApp());
     expect(find.text('Connect'), findsOneWidget);
+    expect(find.textContaining('SERABOT_OWNER_TOKEN'), findsOneWidget);
   });
 
   testWidgets('fleet tab shows specialist, skill, and conversation forms', (

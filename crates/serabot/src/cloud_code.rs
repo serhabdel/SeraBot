@@ -765,24 +765,22 @@ fn sanitize_schema_in(value: &mut Value, depth: u8) {
             }
         }
     }
-    if let Some(picked) = obj.remove("anyOf").or_else(|| obj.remove("oneOf")) {
-        if let Value::Array(branches) = picked {
-            for branch in branches {
-                let Value::Object(map) = branch else {
-                    continue;
-                };
-                let is_null = map
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|kind| kind.eq_ignore_ascii_case("null"));
-                if is_null {
-                    continue;
-                }
-                for (key, child) in map {
-                    obj.entry(key).or_insert(child);
-                }
-                break;
+    if let Some(Value::Array(branches)) = obj.remove("anyOf").or_else(|| obj.remove("oneOf")) {
+        for branch in branches {
+            let Value::Object(map) = branch else {
+                continue;
+            };
+            let is_null = map
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("null"));
+            if is_null {
+                continue;
             }
+            for (key, child) in map {
+                obj.entry(key).or_insert(child);
+            }
+            break;
         }
     }
     if let Some(Value::Array(types)) = obj.get("type").cloned() {

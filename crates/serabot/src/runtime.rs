@@ -12,14 +12,14 @@ use tracing::{error, info, warn};
 use crate::ask::{ABSTENTION, validate_citations};
 use crate::config::{Config, LoadedBot};
 use crate::delegate::{DELEGATE_TOOL, HANDOFF_QUEUED_KEY};
-use crate::memory;
-use crate::orchestration::{BotRole, HandoffContext, ORCHESTRATOR_BOT, validate_conversation_id};
 use crate::domain::{Action, Approval, LlmMessage, Role, Task, ToolCall, Turn};
 use crate::error::{Result, SeraError};
 use crate::gateway::{
     Decision, DecisionResult, Gateway, Tool, ToolContext, ToolOutcome, ToolOutput, ToolSpec,
 };
+use crate::memory;
 use crate::model_router::{ModelRouter, ModelSelection, PinnedRoute, ProviderView};
+use crate::orchestration::{BotRole, HandoffContext, ORCHESTRATOR_BOT, validate_conversation_id};
 use crate::retrieval::{RetrievedChunk, Retriever, evidence_block};
 use crate::skills::on_demand_skill_clause;
 use crate::store::Store;
@@ -345,10 +345,9 @@ impl Runtime {
             .store
             .kv_get(&format!("model_selection:{conversation_id}"))?
         {
-            Some(value) => Ok(Some(
-                serde_json::from_str(&value)
-                    .map_err(|_| SeraError::InvalidState("stored model selection is invalid".into()))?,
-            )),
+            Some(value) => Ok(Some(serde_json::from_str(&value).map_err(|_| {
+                SeraError::InvalidState("stored model selection is invalid".into())
+            })?)),
             None => Ok(None),
         }
     }
@@ -888,10 +887,8 @@ impl Runtime {
         let history = if payload.handoff.is_some() {
             Vec::new()
         } else {
-            self.store.history_for_llm(
-                &payload.conversation_id,
-                self.config.runtime.history_limit,
-            )?
+            self.store
+                .history_for_llm(&payload.conversation_id, self.config.runtime.history_limit)?
         };
         let turn =
             self.store
@@ -1161,10 +1158,7 @@ impl Runtime {
                 return self.suspend_for_approval(task, turn, state, pending).await;
             }
             if state.handoff_queued {
-                let label = state
-                    .handoff_to_bot
-                    .as_deref()
-                    .unwrap_or("specialist");
+                let label = state.handoff_to_bot.as_deref().unwrap_or("specialist");
                 let text = format!("Queued handoff to {label}.");
                 self.notifier.send_text(conversation_id, &text).await?;
                 self.store.append_message(
@@ -2000,10 +1994,7 @@ mod tests {
         ]
     }
 
-    fn setup_orchestration(
-        server_uri: &str,
-        notifier: Arc<Capture>,
-    ) -> (Runtime, Store) {
+    fn setup_orchestration(server_uri: &str, notifier: Arc<Capture>) -> (Runtime, Store) {
         let mut config = Config::default();
         config.llm.data_egress_approved = true;
         config.llm.base_url = server_uri.into();
@@ -2088,9 +2079,7 @@ mod tests {
             .await;
         let notifier = Arc::new(Capture::default());
         let (runtime, store) = setup_orchestration(&server.uri(), notifier.clone());
-        runtime
-            .submit_text("owner", "review cash", None)
-            .unwrap();
+        runtime.submit_text("owner", "review cash", None).unwrap();
         let parent = store.claim_task("worker", 30).unwrap().unwrap();
         runtime.process_task(parent.clone()).await.unwrap();
         assert_eq!(store.pending_task_count().unwrap(), 1);
