@@ -45,7 +45,14 @@ body {
     radial-gradient(900px 500px at 100% 0%, color-mix(in srgb, var(--accent-2) 7%, transparent), transparent),
     var(--bg);
 }
-.root { height: 100vh; color: var(--text); }
+.root {
+  height: 100vh;
+  color: var(--text);
+  background:
+    radial-gradient(1100px 520px at 15% -10%, color-mix(in srgb, var(--accent) 10%, transparent), transparent),
+    radial-gradient(900px 500px at 100% 0%, color-mix(in srgb, var(--accent-2) 7%, transparent), transparent),
+    var(--bg);
+}
 button, input, select, textarea { font: inherit; color: inherit; }
 h1, h2, h3, p { margin: 0; }
 h1 { font-size: 26px; letter-spacing: -.02em; }

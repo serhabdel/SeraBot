@@ -25,7 +25,7 @@ use std::{
 };
 use zeroize::Zeroize;
 
-pub const REQUEST_GAP: Duration = Duration::from_secs(3);
+pub const REQUEST_GAP: Duration = Duration::from_secs(2);
 pub const POLL_GAP: Duration = Duration::from_secs(5);
 pub const POLL_SAFETY: Duration = Duration::from_secs(20);
 

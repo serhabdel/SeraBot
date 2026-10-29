@@ -10,6 +10,10 @@ use serabot_desktop::{
 
 const CSS: &str = include_str!("../assets/app.css");
 
+fn stamp(raw: &str) -> String {
+    raw.chars().take(16).collect::<String>().replace('T', " ")
+}
+
 const NAV: [(Section, &str, &str); 7] = [
     (Section::Chat, "Chat", "chat"),
     (Section::Conversations, "Threads", "threads"),
@@ -33,12 +37,14 @@ type BotRow = (
 pub fn run() {
     #[cfg(windows)]
     {
-        let config = dioxus::desktop::Config::new().with_window(
-            dioxus::desktop::WindowBuilder::new()
-                .with_title("SeraBot Owner")
-                .with_inner_size(dioxus::desktop::LogicalSize::new(1280.0, 820.0))
-                .with_min_inner_size(dioxus::desktop::LogicalSize::new(920.0, 620.0)),
-        );
+        let config = dioxus::desktop::Config::new()
+            .with_menu(Option::<dioxus::desktop::muda::Menu>::None)
+            .with_window(
+                dioxus::desktop::WindowBuilder::new()
+                    .with_title("SeraBot Owner")
+                    .with_inner_size(dioxus::desktop::LogicalSize::new(1280.0, 820.0))
+                    .with_min_inner_size(dioxus::desktop::LogicalSize::new(920.0, 620.0)),
+            );
         dioxus::LaunchBuilder::desktop()
             .with_cfg(config)
             .launch(App);
@@ -86,6 +92,9 @@ fn Icon(name: String) -> Element {
         "fleet" => "M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z",
         "settings" => {
             "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zM12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"
+        }
+        "theme" => {
+            "M12 4v2M12 18v2M4 12h2M18 12h2M6.3 6.3l1.4 1.4M16.3 16.3l1.4 1.4M17.7 6.3l-1.4 1.4M7.7 16.3l-1.4 1.4M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0z"
         }
         "send" => "M4 12l16-8-6 16-2-6-8-2z",
         "refresh" => {
@@ -190,8 +199,8 @@ fn Shell(session: Signal<Session>) -> Element {
                             let next = session.read().theme.toggled();
                             session.write().set_theme(next);
                         },
-                        Icon { name: "settings".to_string() }
-                        span { if theme == Theme::Dark { "Light" } else { "Dark" } }
+                        Icon { name: "theme".to_string() }
+                        span { if theme == Theme::Dark { "Dark" } else { "Light" } }
                     }
                     button {
                         class: if section == Section::Settings { "nav-btn active" } else { "nav-btn" },
@@ -235,6 +244,12 @@ fn Header(session: Signal<Session>) -> Element {
     let kind = session.read().conversation_kind().map(str::to_owned);
     let connected = session.read().state.connected;
     let bots = session.read().state.listed_bots.len();
+    let bots_loaded = session.read().state.bots_loaded;
+    let bots_label = if bots_loaded {
+        format!("Bots {bots}")
+    } else {
+        "Bots".to_owned()
+    };
     let theme = session.read().theme;
     rsx! {
         header { class: "header",
@@ -249,7 +264,7 @@ fn Header(session: Signal<Session>) -> Element {
                     button {
                         class: "btn ghost small",
                         onclick: move |_| session.write().open_section(Section::Fleet),
-                        "Bots {bots}"
+                        "Bots {bots_label}"
                     }
                 }
                 button {
@@ -279,6 +294,7 @@ fn ConversationsPane(session: Signal<Session>) -> Element {
     let mut search = use_signal(String::new);
     let needle = search().to_lowercase();
     let current = session.read().conversation.clone();
+    let loaded = session.read().state.conversations_loaded;
     let items: Vec<(String, String, String)> = session
         .read()
         .state
@@ -320,6 +336,9 @@ fn ConversationsPane(session: Signal<Session>) -> Element {
                 oninput: move |event| search.set(event.value()),
             }
             div { class: "thread-list",
+                if !loaded {
+                    div { class: "muted small", "Loading threads…" }
+                }
                 for (id, title, kind) in items {
                     button {
                         class: if id == current { "thread active" } else { "thread" },
@@ -359,7 +378,7 @@ fn ChatView(session: Signal<Session>) -> Element {
                 message.id.clone(),
                 user,
                 speaker,
-                message.created_at.clone(),
+                stamp(&message.created_at),
                 message.content.clone(),
             )
         })
@@ -908,7 +927,7 @@ fn ConversationsView(session: Signal<Session>) -> Element {
                 conversation.id.clone(),
                 conversation.display_title().to_owned(),
                 conversation.normalized_kind().to_owned(),
-                conversation.updated_at.clone(),
+                stamp(&conversation.updated_at),
             )
         })
         .collect();
