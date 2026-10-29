@@ -41,7 +41,13 @@ max_tool_rounds = 10
 max_output_tokens = 32768
 data_egress_approved = false
 # Extra allowed models for the reserved "default" provider (no network discovery).
-models = []
+models = [
+  "mistral-medium-latest",
+  "mistral-small-latest",
+  "codestral-latest",
+  "ministral-8b-latest",
+  "open-mistral-nemo",
+]
 # Optional synthetic profile: requires its encrypted key at startup.
 # Consent must be explicitly approved independently of conversation selection.
 # [llm.providers.secondary]
@@ -70,14 +76,15 @@ morning_brief_enabled = true
 [onedrive]
 enabled = false
 graph_base = "https://graph.microsoft.com/v1.0"
-tenant = "common"
+tenant = "consumers"
 client_id_secret = "onedrive_client_id"
 refresh_token_secret = "onedrive_refresh_token"
 folder = "SeraBot"
 conflict_behavior = "rename"
 
+# Enable only after: serabot secrets set firecrawl_api_key
 [firecrawl]
-enabled = false
+enabled = true
 api_base = "https://api.firecrawl.dev"
 api_key_secret = "firecrawl_api_key"
 timeout_secs = 120

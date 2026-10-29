@@ -619,8 +619,10 @@ impl TelegramClient {
                          /brief — morning brief\n\
                          /status — queue and approvals\n\
                          /models — configured providers and models\n\
+                         /providers — same allowlist grouped by provider\n\
                          /model auto — automatic approved model per bot\n\
                          /model <provider> <model> — select for this conversation\n\
+                         /brief and /watch — on-demand brief or watch (also see [schedule])\n\
                          /approvals — resend pending approvals\n\
                          /approve_deck <sha256> — approve Italian deck content for French\n\
                          /revoke — revoke all standing grants",
@@ -823,9 +825,33 @@ pub struct CallbackQuery {
     pub message: Option<TelegramMessage>,
 }
 
+fn provider_catalog_reply(runtime: &Runtime) -> Result<String> {
+    let mut reply = String::from("Configured providers:\n");
+    for provider in runtime.model_catalog()? {
+        let state = if provider.data_egress_approved {
+            "approved"
+        } else {
+            "data sharing not approved"
+        };
+        reply.push_str(&format!("\n{} ({state})\n", provider.id));
+        for model in &provider.models {
+            reply.push_str(&format!("  - {model}\n"));
+        }
+    }
+    reply.push_str(
+        "\n/model auto picks an approved model using bot defaults.\n\
+         /model <provider> <model> selects for this conversation. \
+         Future turns include this conversation's history; running turns keep their original selection.\n\
+         /models lists the same allowlist as flat provider / model lines.",
+    );
+    runtime.scan_owner_output(&reply)?;
+    Ok(reply)
+}
+
 fn model_command(runtime: &Runtime, conversation_id: &str, text: &str) -> Result<Option<String>> {
     let parts: Vec<_> = text.split_whitespace().collect();
     let reply = match parts.as_slice() {
+        ["/providers"] | ["/providors"] => provider_catalog_reply(runtime)?,
         ["/models"] => {
             let mut reply = String::from("Configured providers and models:\n");
             for entry in runtime.model_catalog_entries()? {
@@ -839,7 +865,12 @@ fn model_command(runtime: &Runtime, conversation_id: &str, text: &str) -> Result
                     entry.provider, entry.model
                 ));
             }
-            reply.push_str("\n/model auto picks an approved model using bot defaults.\n/model <provider> <model> selects for this conversation. Future turns include this conversation's history; running turns keep their original selection.");
+            reply.push_str(
+                "\n/model auto picks an approved model using bot defaults.\n\
+                 /model <provider> <model> selects for this conversation. \
+                 Future turns include this conversation's history; running turns keep their original selection.\n\
+                 /providers groups the same list by provider.",
+            );
             reply
         }
         ["/model"] => {
@@ -884,11 +915,17 @@ fn model_command(runtime: &Runtime, conversation_id: &str, text: &str) -> Result
                 Err(error) => return Err(error),
             }
         }
-        ["/model", ..] | ["/models", ..] => {
-            "Usage: /models, /model, /model auto, or /model <provider> <model>".into()
+        ["/model", ..] | ["/models", ..] | ["/providers", ..] | ["/providors", ..] => {
+            "Usage: /models, /providers, /model, /model auto, or /model <provider> <model>".into()
         }
-        [command, ..] if command.starts_with("/model@") || command.starts_with("/models@") => {
-            "Use /model or /models without an @username in the configured owner chat.".into()
+        [command, ..]
+            if command.starts_with("/model@")
+                || command.starts_with("/models@")
+                || command.starts_with("/providers@")
+                || command.starts_with("/providors@") =>
+        {
+            "Use /model, /models, or /providers without an @username in the configured owner chat."
+                .into()
         }
         _ => return Ok(None),
     };
@@ -909,6 +946,7 @@ fn bot_commands() -> Vec<Value> {
         ("timesheets", "Timesheet analysis — /timesheets <request>"),
         ("brief", "Generate the morning brief"),
         ("models", "List configured providers and models"),
+        ("providers", "List models grouped by provider"),
         ("model", "Show or set provider/model for this chat"),
         ("remember", "Store a fact — /remember <fact>"),
         ("memories", "List stored facts"),
@@ -1147,6 +1185,12 @@ mod tests {
         let listing = model_command(&runtime, "20", "/models").unwrap().unwrap();
         assert!(listing.contains("default / test"));
         assert!(listing.contains("default / alternative"));
+        let grouped = model_command(&runtime, "20", "/providers").unwrap().unwrap();
+        assert!(grouped.contains("default (approved)"));
+        assert!(grouped.contains("  - test"));
+        assert!(grouped.contains("  - alternative"));
+        let typo = model_command(&runtime, "20", "/providors").unwrap().unwrap();
+        assert!(typo.contains("default (approved)"));
         assert!(!listing.contains("synthetic-key"));
         assert!(!listing.contains("example.com"));
         let reply = model_command(&runtime, "20", "/model default alternative")

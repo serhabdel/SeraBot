@@ -14,7 +14,11 @@ base_url = "https://api.mistral.ai/v1"
 model = "mistral-large-latest"
 api_key_secret = "llm_api_key"        # name in the encrypted secret store
 data_egress_approved = false
-models = ["mistral-medium-latest"]    # optional extra allowed models
+models = [
+  "mistral-medium-latest",
+  "mistral-small-latest",
+  "codestral-latest",
+]    # optional extra allowed models (no live catalog scrape)
 ```
 
 Per-bot overrides (`model` in `bots/*.toml` or `llm.bot_models`) are also
@@ -54,7 +58,7 @@ will be sent to that provider on future turns.
 
 The owner selects a provider/model per conversation:
 
-- Telegram: `/models`, `/model`, `/model auto`, `/model <provider> <model>`
+- Telegram: `/models`, `/providers` (same allowlist grouped by provider; `/providors` is accepted), `/model`, `/model auto`, `/model <provider> <model>`
 - API: `GET /v1/models` and `PUT /v1/conversations/{id}/model`
 
 Catalog responses list every configured pair as `provider / model` (API field

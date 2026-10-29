@@ -2,6 +2,15 @@ name = "main"
 trigger = "command"
 system_prompt = "prompts/main.txt"
 skills = ["triage", "ask"]
-tools = ["rag_search"]
-require_approval = []
+tools = [
+  "rag_search",
+  "fetch_url",
+  "audio_transcribe",
+  "audio_understand",
+  "firecrawl_scrape",
+  "firecrawl_map",
+  "firecrawl_search",
+  "firecrawl_crawl",
+]
+require_approval = ["firecrawl_crawl", "firecrawl_search"]
 enabled = true

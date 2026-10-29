@@ -43,7 +43,14 @@ max_output_tokens = 32768
 # Set true only after you accept that selected prompt/document passages leave this host.
 data_egress_approved = false
 # [llm] is the reserved "default" provider. Its model and bot overrides are allowed too.
-models = []
+# Flat list only — no live provider catalog. /models and /providers show these entries plus [llm].model.
+models = [
+  "mistral-medium-latest",
+  "mistral-small-latest",
+  "codestral-latest",
+  "ministral-8b-latest",
+  "open-mistral-nemo",
+]
 # Optional synthetic profile; selection never grants consent or triggers fallback.
 # Store this key in the encrypted secret store before enabling the profile.
 # [llm.providers.secondary]
@@ -87,7 +94,7 @@ poll_max_attempts = 60
 [onedrive]
 enabled = false
 graph_base = "https://graph.microsoft.com/v1.0"
-tenant = "common"
+tenant = "consumers"
 client_id_secret = "onedrive_client_id"
 refresh_token_secret = "onedrive_refresh_token"
 folder = "SeraBot"
