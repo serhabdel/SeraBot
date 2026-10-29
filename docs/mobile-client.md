@@ -2,26 +2,49 @@
 
 Flutter owner console: `apps/serabot_mobile`.
 
+Android builds are **CI-only**. Do not install an Android SDK or run `flutter
+build` locally; the GitHub Actions runner is the only Android compile
+verification path.
+
+| Trigger | Workflow | Output |
+| --- | --- | --- |
+| Push to `main`, pull request, manual dispatch | `clients.yml` | `flutter analyze`, `flutter test`, then a debug APK uploaded as the artifact `serabot-mobile-debug-<sha>` (14 days) |
+| Tag push (`v*`) or `release.yml` dispatch with a `tag` input | `release.yml` | Versioned and `latest` APK/AAB release assets |
+
+Local Dart checks are optional and need no Android SDK:
+
 ```bash
 cd apps/serabot_mobile
 flutter pub get && flutter analyze && flutter test
 ```
 
-Connect with HTTPS to the VPS or loopback over SSH/`adb reverse`. The token is entered at runtime only. The connect screen names the GitHub Actions secret `SERABOT_OWNER_TOKEN` and does not embed its value.
+The app connects to the owner API at the build-time
+`SERABOT_DEFAULT_SERVER_URL`. The owner release build pre-fills
+`https://bot.seradyx.tech` from the `SERABOT_OWNER_API_URL` repository secret;
+forks build a generic client with an empty default. The token is entered at
+runtime only and is never embedded. The connect screen names the GitHub
+Actions secret `SERABOT_OWNER_TOKEN`; its value is not compiled in.
 
-Optional build hint (URL only, never the token value):
+Release builds take their version from the release tag:
+`--build-name="${TAG#v}"` and `--build-number="${{ github.run_number }}"`, so
+`versionCode` increases on every CI run. The workspace `pubspec.yaml` version
+is not changed by this workflow.
 
-```bash
-flutter build apk --release \
-  --dart-define=SERABOT_DEFAULT_SERVER_URL=https://owner.example \
-  --dart-define=SERABOT_OWNER_TOKEN_SECRET_NAME=SERABOT_OWNER_TOKEN
-```
+Signing: a stable release keystore is optional. When
+`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`,
+and `ANDROID_KEY_PASSWORD` are configured, CI decodes the keystore to a
+temporary path and Gradle signs the release build with it. Secret values are
+never printed. Without those secrets, Gradle falls back to the Android debug
+key; such APKs install but cannot replace a differently signed install, and
+the debug key may change between CI runs. Use a stable keystore before relying
+on in-place upgrades.
 
-`https://owner.example` is a synthetic origin. CI reads the optional repository secret `SERABOT_OWNER_API_URL` and passes it as `SERABOT_DEFAULT_SERVER_URL`. An invalid origin is ignored and the field stays `https://`. See `docs/ci-and-secrets.md`.
-
-Prebuilt APKs (and AABs) are attached to GitHub Releases on tag pushes (`v*`);
-see [CI and secrets](ci-and-secrets.md#releases). The release APK is signed
-with the Android debug key, so sideload it rather than uploading to Play.
+Prebuilt downloads are attached to GitHub Releases on tag pushes or manual
+dispatch; see [CI and secrets](ci-and-secrets.md#releases). The server also
+redirects `https://bot.seradyx.tech/app/latest.apk` and
+`https://bot.seradyx.tech/app/SHA256SUMS` to the latest release, and the
+landing page at `https://bot.seradyx.tech/` links both clients. Allow "install
+unknown apps" and sideload the APK; this is not a Play Store upload.
 
 ## Fleet
 

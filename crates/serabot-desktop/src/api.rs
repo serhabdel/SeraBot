@@ -1,7 +1,13 @@
 use reqwest::{Method, blocking::Client, redirect::Policy};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{collections::HashSet, fmt, io::Read, net::SocketAddr, time::Duration};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+    io::Read,
+    net::SocketAddr,
+    time::Duration,
+};
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -463,6 +469,99 @@ pub struct BotSummary {
     pub skills: Vec<String>,
 }
 
+/// One conversation row from `GET /v1/conversations`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ConversationSummary {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub last_message_at: Option<String>,
+    #[serde(default)]
+    pub archived_at: Option<String>,
+    pub accepts_turns: bool,
+}
+
+impl ConversationSummary {
+    pub fn display_title(&self) -> &str {
+        self.title.as_deref().unwrap_or(&self.id)
+    }
+}
+
+/// One page of conversations. The cursor is opaque to the UI.
+#[derive(Debug, Deserialize)]
+pub struct ConversationPage {
+    pub conversations: Vec<ConversationSummary>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+/// Operator-reviewable fact with mandatory provenance.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct MemoryEntry {
+    pub id: String,
+    pub kind: String,
+    pub content: String,
+    pub source: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Presence-only secret status. Values never appear in API responses.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SecretStatus {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub configured: bool,
+}
+
+/// Read-only provider view from `GET /v1/providers`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ProviderStatus {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub routing_classes: Vec<String>,
+    #[serde(default)]
+    pub data_egress_approved: bool,
+    #[serde(default)]
+    pub catalog_fetch: bool,
+    #[serde(default)]
+    pub catalog_verified: bool,
+    #[serde(default)]
+    pub secrets: BTreeMap<String, SecretStatus>,
+}
+
+/// Read-only connector view from `GET /v1/connectors`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ConnectorStatus {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
+    #[serde(default)]
+    pub api_base: Option<String>,
+    #[serde(default)]
+    pub default_inbox_id: Option<String>,
+    #[serde(default)]
+    pub secrets: BTreeMap<String, SecretStatus>,
+}
+
+pub const MEMORY_KINDS: &[&str] = &["preference", "fact", "decision", "context", "note"];
+pub const MAX_MEMORY_CONTENT_CHARS: usize = 4_000;
+pub const MAX_MEMORY_SOURCE_CHARS: usize = 512;
+pub const MAX_CONVERSATION_TITLE_CHARS: usize = 120;
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Selection {
     pub provider: String,
@@ -664,6 +763,26 @@ struct SkillEnvelope {
 #[derive(Deserialize)]
 struct SkillsEnvelope {
     skills: Vec<SkillSummary>,
+}
+#[derive(Deserialize)]
+struct ConversationSummaryEnvelope {
+    conversation: ConversationSummary,
+}
+#[derive(Deserialize)]
+struct MemoriesEnvelope {
+    memories: Vec<MemoryEntry>,
+}
+#[derive(Deserialize)]
+struct MemoryEnvelope {
+    memory: MemoryEntry,
+}
+#[derive(Deserialize)]
+struct ProvidersEnvelope {
+    providers: Vec<ProviderStatus>,
+}
+#[derive(Deserialize)]
+struct ConnectorsEnvelope {
+    connectors: Vec<ConnectorStatus>,
 }
 
 /// Construct and use only on a worker thread. No retries, cookies, redirects,
@@ -1055,6 +1174,233 @@ impl ApiClient {
         }
         Ok(response.bots)
     }
+
+    /// One page of conversation metadata. `cursor` is opaque and must come
+    /// from a previous `next_cursor`; it is never guessed from UI state.
+    pub fn list_conversations(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+        include_archived: bool,
+    ) -> Result<ConversationPage, ApiError> {
+        if !(1..=200).contains(&limit) {
+            return Err(ApiError::Validation(
+                "Conversation page size must be 1–200.",
+            ));
+        }
+        let limit_value = limit.to_string();
+        let include_archived = if include_archived { "true" } else { "false" };
+        let mut query = vec![
+            ("limit", limit_value.as_str()),
+            ("include_archived", include_archived),
+        ];
+        if let Some(cursor) = cursor {
+            if !valid_cursor(cursor) {
+                return Err(ApiError::Validation("Invalid conversation cursor."));
+            }
+            query.push(("cursor", cursor));
+        }
+        let page: ConversationPage = self.get(&["v1", "conversations"], &query)?;
+        if page.conversations.len() > limit {
+            return Err(ApiError::InvalidResponse);
+        }
+        for conversation in &page.conversations {
+            check_conversation_summary(conversation)?;
+        }
+        if let Some(next) = &page.next_cursor {
+            if !valid_cursor(next) {
+                return Err(ApiError::InvalidResponse);
+            }
+        }
+        Ok(page)
+    }
+
+    pub fn rename_conversation(
+        &self,
+        id: &str,
+        title: &str,
+    ) -> Result<ConversationSummary, ApiError> {
+        check_id(id)?;
+        let title = title.trim();
+        if !valid_conversation_title(title) {
+            return Err(ApiError::Validation(
+                "Title must be 1–120 characters, without control characters.",
+            ));
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            title: &'a str,
+        }
+        let response: ConversationSummaryEnvelope = self.request(
+            Method::PATCH,
+            &["v1", "conversations", id],
+            &[],
+            Some(&Body { title }),
+        )?;
+        check_conversation_summary(&response.conversation)?;
+        if response.conversation.id != id {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(response.conversation)
+    }
+
+    /// Soft archive. Messages stay on the server.
+    pub fn archive_conversation(&self, id: &str) -> Result<(), ApiError> {
+        check_id(id)?;
+        #[derive(Deserialize)]
+        struct Body {
+            archived: bool,
+        }
+        let body: Body =
+            self.request::<Body, ()>(Method::DELETE, &["v1", "conversations", id], &[], None)?;
+        if !body.archived {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(())
+    }
+
+    pub fn list_memories(&self, query: Option<&str>) -> Result<Vec<MemoryEntry>, ApiError> {
+        let mut params = vec![("limit", "200")];
+        if let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) {
+            if query.chars().count() > 200 || query.chars().any(|c| c.is_control()) {
+                return Err(ApiError::Validation(
+                    "Search text must be at most 200 characters.",
+                ));
+            }
+            params.push(("query", query));
+        }
+        let response: MemoriesEnvelope = self.get(&["v1", "memories"], &params)?;
+        if response.memories.len() > 200 {
+            return Err(ApiError::InvalidResponse);
+        }
+        let mut seen = HashSet::with_capacity(response.memories.len());
+        for memory in &response.memories {
+            check_memory(memory)?;
+            if !seen.insert(memory.id.as_str()) {
+                return Err(ApiError::InvalidResponse);
+            }
+        }
+        Ok(response.memories)
+    }
+
+    pub fn add_memory(
+        &self,
+        kind: &str,
+        content: &str,
+        source: &str,
+    ) -> Result<MemoryEntry, ApiError> {
+        if !valid_memory_kind(kind) {
+            return Err(ApiError::Validation(
+                "Choose a memory kind: preference, fact, decision, context or note.",
+            ));
+        }
+        if !valid_memory_content(content) {
+            return Err(ApiError::Validation(
+                "Memory must be 1–4,000 characters, without control characters.",
+            ));
+        }
+        let source = source.trim();
+        if !valid_memory_source(source) {
+            return Err(ApiError::Validation(
+                "Source must be at most 512 characters, without control characters.",
+            ));
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            kind: &'a str,
+            content: &'a str,
+            source: &'a str,
+        }
+        let response: MemoryEnvelope = self.request(
+            Method::POST,
+            &["v1", "memories"],
+            &[],
+            Some(&Body {
+                kind,
+                content,
+                source,
+            }),
+        )?;
+        check_memory(&response.memory)?;
+        if response.memory.kind != kind {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(response.memory)
+    }
+
+    pub fn delete_memory(&self, id: &str) -> Result<(), ApiError> {
+        if !valid_memory_id(id) {
+            return Err(ApiError::Validation("Invalid memory id."));
+        }
+        #[derive(Deserialize)]
+        struct Body {
+            deleted: String,
+        }
+        let body: Body =
+            self.request::<Body, ()>(Method::DELETE, &["v1", "memories", id], &[], None)?;
+        if body.deleted != id {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(())
+    }
+
+    pub fn providers(&self) -> Result<Vec<ProviderStatus>, ApiError> {
+        let response: ProvidersEnvelope = self.get(&["v1", "providers"], &[])?;
+        if response.providers.len() > 64 {
+            return Err(ApiError::InvalidResponse);
+        }
+        let mut seen = HashSet::with_capacity(response.providers.len());
+        for provider in &response.providers {
+            if !bounded_text(&provider.id, 128)
+                || !bounded_text(&provider.kind, 64)
+                || !seen.insert(provider.id.as_str())
+                || provider.models.len() > 256
+                || provider
+                    .models
+                    .iter()
+                    .any(|model| !bounded_text(model, 256))
+                || provider.routing_classes.len() > 32
+                || provider
+                    .routing_classes
+                    .iter()
+                    .any(|class| !bounded_text(class, 64))
+                || !valid_secret_map(&provider.secrets)
+            {
+                return Err(ApiError::InvalidResponse);
+            }
+        }
+        Ok(response.providers)
+    }
+
+    pub fn connectors(&self) -> Result<Vec<ConnectorStatus>, ApiError> {
+        let response: ConnectorsEnvelope = self.get(&["v1", "connectors"], &[])?;
+        if response.connectors.len() > 64 {
+            return Err(ApiError::InvalidResponse);
+        }
+        let mut seen = HashSet::with_capacity(response.connectors.len());
+        for connector in &response.connectors {
+            if !bounded_text(&connector.id, 128)
+                || !bounded_text(&connector.kind, 32)
+                || !seen.insert(connector.id.as_str())
+                || connector
+                    .redirect_uri
+                    .as_deref()
+                    .is_some_and(|uri| !bounded_text(uri, 2_048))
+                || connector
+                    .api_base
+                    .as_deref()
+                    .is_some_and(|base| !bounded_text(base, 2_048))
+                || connector
+                    .default_inbox_id
+                    .as_deref()
+                    .is_some_and(|inbox| !bounded_text(inbox, 256))
+                || !valid_secret_map(&connector.secrets)
+            {
+                return Err(ApiError::InvalidResponse);
+            }
+        }
+        Ok(response.connectors)
+    }
 }
 
 fn check_id(id: &str) -> Result<(), ApiError> {
@@ -1065,6 +1411,107 @@ fn check_id(id: &str) -> Result<(), ApiError> {
             "IDs must be 1–128 ASCII letters, digits, underscores, colons or hyphens.",
         ))
     }
+}
+
+fn bounded_text(value: &str, max_chars: usize) -> bool {
+    !value.is_empty() && value.chars().count() <= max_chars && !value.chars().any(char::is_control)
+}
+
+fn valid_cursor(cursor: &str) -> bool {
+    !cursor.is_empty() && cursor.len() <= 256 && cursor.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+pub fn valid_conversation_title(title: &str) -> bool {
+    let title = title.trim();
+    !title.is_empty()
+        && title.chars().count() <= MAX_CONVERSATION_TITLE_CHARS
+        && !title.chars().any(char::is_control)
+}
+
+fn check_conversation_summary(conversation: &ConversationSummary) -> Result<(), ApiError> {
+    let kind = match conversation.kind.as_str() {
+        "section" => ConversationKind::Section,
+        "group" => ConversationKind::Group,
+        "direct" => ConversationKind::Direct,
+        "room" => ConversationKind::Room,
+        _ => return Err(ApiError::InvalidResponse),
+    };
+    if !valid_id(&conversation.id)
+        || conversation.accepts_turns != kind.accepts_turns()
+        || valid_conversation_parent(kind, conversation.parent_id.as_deref()).is_err()
+        || conversation
+            .title
+            .as_deref()
+            .is_some_and(|title| !valid_conversation_title(title))
+        || !bounded_text(&conversation.created_at, 64)
+        || !bounded_text(&conversation.updated_at, 64)
+        || conversation
+            .last_message_at
+            .as_deref()
+            .is_some_and(|stamp| !bounded_text(stamp, 64))
+        || conversation
+            .archived_at
+            .as_deref()
+            .is_some_and(|stamp| !bounded_text(stamp, 64))
+    {
+        return Err(ApiError::InvalidResponse);
+    }
+    Ok(())
+}
+
+pub fn valid_memory_kind(kind: &str) -> bool {
+    MEMORY_KINDS.contains(&kind)
+}
+
+pub fn valid_memory_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+pub fn valid_memory_content(content: &str) -> bool {
+    let content = content.trim();
+    !content.is_empty()
+        && content.chars().count() <= MAX_MEMORY_CONTENT_CHARS
+        && !content
+            .chars()
+            .any(|c| c != '\n' && c != '\r' && c != '\t' && c.is_control())
+}
+
+pub fn valid_memory_source(source: &str) -> bool {
+    let source = source.trim();
+    !source.is_empty()
+        && source.chars().count() <= MAX_MEMORY_SOURCE_CHARS
+        && !source.chars().any(char::is_control)
+}
+
+fn check_memory(memory: &MemoryEntry) -> Result<(), ApiError> {
+    if !valid_memory_id(&memory.id)
+        || !valid_memory_kind(&memory.kind)
+        || !valid_memory_content(&memory.content)
+        || !valid_memory_source(&memory.source)
+        || !bounded_text(&memory.created_at, 64)
+        || !bounded_text(&memory.updated_at, 64)
+    {
+        return Err(ApiError::InvalidResponse);
+    }
+    Ok(())
+}
+
+fn valid_secret_map(secrets: &BTreeMap<String, SecretStatus>) -> bool {
+    secrets.len() <= 8
+        && secrets.iter().all(|(key, secret)| {
+            bounded_text(key, 64)
+                && secret.name.as_deref().is_none_or(|name| {
+                    name.len() <= 128
+                        && !name.is_empty()
+                        && name.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+                        })
+                })
+        })
 }
 
 fn check_task(task: Task) -> Result<Task, ApiError> {

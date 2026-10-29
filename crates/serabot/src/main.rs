@@ -69,6 +69,11 @@ enum Command {
     },
     /// Print the SHA-256 hash of an owner API token read from stdin.
     HashToken,
+    /// Mint, list, or revoke owner API device tokens.
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
+    },
     /// Create a consistent SQLite backup; refuses to overwrite.
     Backup { destination: PathBuf },
     /// Load the local multilingual embedding model and verify it produces vectors.
@@ -126,6 +131,22 @@ enum SecretsCommand {
     List,
 }
 
+#[derive(Debug, Subcommand)]
+enum TokenCommand {
+    /// Mint a device token. Prints it once; only its hash is stored.
+    Mint {
+        #[arg(long)]
+        label: String,
+        /// Days until expiry. Omit for no expiry; revocation is the control.
+        #[arg(long)]
+        days: Option<u32>,
+    },
+    /// List device tokens. Token hashes are never shown.
+    List,
+    /// Revoke a device token by id.
+    Revoke { id: String },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -174,6 +195,32 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("token must be at least 32 characters");
             }
             println!("{}", sha256_hex(token));
+        }
+        Command::Token { command } => {
+            let config = Config::load(&cli.config)?;
+            let store = Store::open(
+                config.database_path(),
+                config.embeddings.dimension,
+                config.database.busy_timeout_ms,
+            )?;
+            match command {
+                TokenCommand::Mint { label, days } => {
+                    let token = serabot::token_cli::mint(&store, &label, days)?;
+                    eprintln!("store this token now; the server keeps only its hash");
+                    println!("{token}");
+                }
+                TokenCommand::List => {
+                    for token in serabot::token_cli::list(&store)? {
+                        println!("{}", serabot::token_cli::format_line(&token));
+                    }
+                }
+                TokenCommand::Revoke { id } => {
+                    if !serabot::token_cli::revoke(&store, &id)? {
+                        anyhow::bail!("no device token with id {id}");
+                    }
+                    println!("revoked {id}");
+                }
+            }
         }
         Command::Providers { command } => match command {
             ProvidersCommand::Kinds => {
@@ -634,6 +681,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             store.clone(),
             config.clone(),
             artifacts.clone(),
+            secrets.clone(),
         );
         let app = serabot::api::router(state);
         let listener = tokio::net::TcpListener::bind(&config.server.bind)

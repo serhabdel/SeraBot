@@ -1,6 +1,7 @@
 use crate::{
-    ApiClient, ApiError, Approval, ApprovalDecision, BotSummary, Catalog, ConversationKind,
-    CreatedBot, CreatedConversation, CreatedSkill, Health, History, Scope, Selection, SkillSummary,
+    ApiClient, ApiError, Approval, ApprovalDecision, BotSummary, Catalog, ConnectorStatus,
+    ConversationKind, ConversationPage, ConversationSummary, CreatedBot, CreatedConversation,
+    CreatedSkill, Health, History, MemoryEntry, ProviderStatus, Scope, Selection, SkillSummary,
     Task,
 };
 use secrecy::SecretString;
@@ -32,6 +33,14 @@ pub enum OperationKind {
     CreateSkill,
     ListSkills,
     ListBots,
+    ListConversations,
+    RenameConversation,
+    ArchiveConversation,
+    ListMemories,
+    AddMemory,
+    DeleteMemory,
+    Providers,
+    Connectors,
 }
 
 pub enum Operation {
@@ -64,6 +73,29 @@ pub enum Operation {
     },
     ListSkills,
     ListBots,
+    ListConversations {
+        include_archived: bool,
+    },
+    RenameConversation {
+        id: String,
+        title: Zeroizing<String>,
+    },
+    ArchiveConversation {
+        id: String,
+    },
+    ListMemories {
+        query: Option<String>,
+    },
+    AddMemory {
+        kind: String,
+        content: Zeroizing<String>,
+        source: String,
+    },
+    DeleteMemory {
+        id: String,
+    },
+    Providers,
+    Connectors,
 }
 
 impl Operation {
@@ -82,6 +114,14 @@ impl Operation {
             Self::CreateSkill { .. } => OperationKind::CreateSkill,
             Self::ListSkills => OperationKind::ListSkills,
             Self::ListBots => OperationKind::ListBots,
+            Self::ListConversations { .. } => OperationKind::ListConversations,
+            Self::RenameConversation { .. } => OperationKind::RenameConversation,
+            Self::ArchiveConversation { .. } => OperationKind::ArchiveConversation,
+            Self::ListMemories { .. } => OperationKind::ListMemories,
+            Self::AddMemory { .. } => OperationKind::AddMemory,
+            Self::DeleteMemory { .. } => OperationKind::DeleteMemory,
+            Self::Providers => OperationKind::Providers,
+            Self::Connectors => OperationKind::Connectors,
         }
     }
 }
@@ -99,6 +139,14 @@ pub enum Reply {
     CreatedSkill(CreatedSkill),
     Skills(Vec<SkillSummary>),
     Bots(Vec<BotSummary>),
+    Conversations(ConversationPage),
+    RenamedConversation(ConversationSummary),
+    ArchivedConversation(String),
+    Memories(Vec<MemoryEntry>),
+    AddedMemory(MemoryEntry),
+    DeletedMemory(String),
+    Providers(Vec<ProviderStatus>),
+    Connectors(Vec<ConnectorStatus>),
 }
 
 pub struct Job {
@@ -229,6 +277,30 @@ fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
         }
         Operation::ListSkills => client.list_skills().map(Reply::Skills),
         Operation::ListBots => client.list_bots().map(Reply::Bots),
+        Operation::ListConversations { include_archived } => client
+            .list_conversations(100, None, *include_archived)
+            .map(Reply::Conversations),
+        Operation::RenameConversation { id, title } => client
+            .rename_conversation(id, title)
+            .map(Reply::RenamedConversation),
+        Operation::ArchiveConversation { id } => client
+            .archive_conversation(id)
+            .map(|_| Reply::ArchivedConversation(id.clone())),
+        Operation::ListMemories { query } => {
+            client.list_memories(query.as_deref()).map(Reply::Memories)
+        }
+        Operation::AddMemory {
+            kind,
+            content,
+            source,
+        } => client
+            .add_memory(kind, content, source)
+            .map(Reply::AddedMemory),
+        Operation::DeleteMemory { id } => client
+            .delete_memory(id)
+            .map(|_| Reply::DeletedMemory(id.clone())),
+        Operation::Providers => client.providers().map(Reply::Providers),
+        Operation::Connectors => client.connectors().map(Reply::Connectors),
     }
 }
 

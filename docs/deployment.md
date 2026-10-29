@@ -16,7 +16,7 @@ reconfigured.
 - Configuration: `/etc/serabot/serabot.toml`; secrets in `/etc/serabot/private`.
 - Data, models, artifacts: `/var/lib/serabot`.
 - Owner API: loopback `127.0.0.1:8787`; reach it through an SSH tunnel or the
-  approved TLS proxy. Never expose it publicly.
+  dedicated `bot.seradyx.tech` tunnel below (the listener itself stays loopback).
 - Disk headroom is limited; keep old binary backups only as long as needed.
 
 ## Build the release on Ubuntu 24.04
@@ -33,7 +33,10 @@ cargo build --release --locked -p serabot
 ```
 
 The server binary is `target/release/serabot`. The desktop crate is a workspace
-member but is not deployed; `-p serabot` keeps the release server-only.
+member but is not deployed; `-p serabot` keeps the release server-only. For the
+public `bot.seradyx.tech` deployment, set `SERABOT_RELEASES_REPO` and
+`SERABOT_BUILD_SHA` as shown in the public hostname section below; without them
+the download routes return `503`.
 
 Verify the artifact before upload:
 
@@ -67,7 +70,81 @@ ldd target/release/serabot | head
 
 7. Roll back by restoring the previous binary and restarting only this service.
 
-Do not touch Docker, OpenBot, the OneDrive MCP service, or the Cloudflare tunnel.
+Do not touch Docker, OpenBot, the OneDrive MCP service, or the existing
+Cloudflare tunnel. The separate additive `cloudflared-bot` unit below is a new
+service, not a change to that tunnel.
+
+## Public hostname `bot.seradyx.tech` (additive)
+
+The Owner API stays bound to `127.0.0.1:8787`. A **second, dedicated**
+Cloudflare tunnel publishes it at `https://bot.seradyx.tech` together with the
+public client downloads. The existing dashboard-managed `cloudflared.service`
+and `/etc/cloudflared/token` are not read, edited, restarted, or removed.
+
+Exact remote manifest (present it before any change):
+
+```text
+NEW  /etc/cloudflared-bot/                         0755 root:root
+NEW  /etc/cloudflared-bot/token                    0600 root:root  (dashboard tunnel token)
+NEW  /etc/systemd/system/cloudflared-bot.service   0644 root:root  (deploy/cloudflared-bot.service)
+RUN  systemctl daemon-reload && systemctl enable --now cloudflared-bot
+DASH Zero Trust > Networks > Tunnels: create "serabot-bot"; public hostname
+     bot.seradyx.tech -> http://127.0.0.1:8787
+DASH Cache bypass for /v1/* and /healthz; WAF rate limit 120/min/IP on /v1/*;
+     no Managed Challenge/Bot Fight on /v1/*; no Cloudflare Access (native app)
+UNTOUCHED cloudflared.service, /etc/cloudflared/token, docker, onedrive-mcp,
+     /opt/serabot, /etc/serabot, /var/lib/serabot
+```
+
+The new unit is in this repository as `deploy/cloudflared-bot.service`. Install
+the token from the tunnel dashboard directly on the host (never paste it into
+chat, git, or logs):
+
+```bash
+sudo install -d -o root -g root -m 0755 /etc/cloudflared-bot
+sudo bash -c 'read -rsp "tunnel token: " TOKEN && printf "%s" "$TOKEN" > /etc/cloudflared-bot/token && unset TOKEN'
+sudo chown root:root /etc/cloudflared-bot/token
+sudo chmod 0600 /etc/cloudflared-bot/token
+sudo install -o root -g root -m 0644 deploy/cloudflared-bot.service /etc/systemd/system/cloudflared-bot.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now cloudflared-bot
+```
+
+`read -s` keeps the token out of terminal echo and shell history. Do not pass
+it as a command-line argument or paste it into chat, tickets, or git.
+
+The dashboard public-hostname step creates the DNS record for
+`bot.seradyx.tech`; confirm it resolves to Cloudflare and that no A record was
+added manually. The tunnel points at loopback, so no new port is opened and no
+APK is stored on the host: `/app/latest.apk` and `/app/SHA256SUMS` are `302`
+redirects to the GitHub release assets.
+
+Build the deployed server with the public metadata compiled in:
+
+```bash
+SERABOT_RELEASES_REPO=serhabdel/SeraBot \
+SERABOT_BUILD_SHA="$(git rev-parse --short HEAD)" \
+cargo build --release --locked -p serabot
+```
+
+`SERABOT_RELEASES_REPO` must be an `owner/repo` value. If it is absent or
+malformed, `/` and `/app` hide the download links and the download routes
+return `503`; `/healthz` and `/v1/health` still work. `SERABOT_BUILD_SHA` is
+reported as `build` (`dev` when unset).
+
+Verification after the manifest is applied:
+
+```bash
+curl -fsS -o /dev/null -w '%{http_code}\n' https://bot.seradyx.tech/                # 200
+curl -fsS -o /dev/null -w '%{http_code}\n' https://bot.seradyx.tech/app/latest.apk  # 302
+curl -sS -o /dev/null -w '%{http_code}\n' https://bot.seradyx.tech/v1/health        # 401
+curl -fsS https://bot.seradyx.tech/healthz                                          # 200, build only
+systemctl status cloudflared-bot --no-pager
+```
+
+Check `systemctl status cloudflared --no-pager` and the existing tunnel again
+afterwards: its active state and start time must be unchanged. `serabot.service`
+is restarted only for a server binary upgrade, never for the tunnel.
 
 ## Configuration compatibility
 

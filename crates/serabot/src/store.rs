@@ -16,6 +16,24 @@ use crate::error::{Result, SeraError};
 
 const MIGRATION_1: &str = include_str!("../migrations/0001_core.sql");
 const MIGRATION_2: &str = include_str!("../migrations/0002_conversations.sql");
+const MIGRATION_3: &str = include_str!("../migrations/0003_device_tokens.sql");
+const MIGRATION_4: &str = include_str!("../migrations/0004_conversation_meta.sql");
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceToken {
+    pub id: String,
+    pub label: String,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+impl DeviceToken {
+    pub fn active_at(&self, now: DateTime<Utc>) -> bool {
+        self.revoked_at.is_none() && self.expires_at.is_none_or(|expires| expires > now)
+    }
+}
 
 pub type StoreConnection = PooledConnection<SqliteConnectionManager>;
 
@@ -129,6 +147,16 @@ impl Store {
             connection.execute_batch(MIGRATION_2)?;
             connection.pragma_update(None, "user_version", 2)?;
         }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 3 {
+            connection.execute_batch(MIGRATION_3)?;
+            connection.pragma_update(None, "user_version", 3)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 4 {
+            connection.execute_batch(MIGRATION_4)?;
+            connection.pragma_update(None, "user_version", 4)?;
+        }
         let stored_dimension: Option<String> = connection
             .query_row(
                 "SELECT value FROM kv WHERE key = 'embedding_dimension'",
@@ -188,6 +216,79 @@ impl Store {
         Ok(())
     }
 
+    pub fn insert_device_token(
+        &self,
+        id: &str,
+        label: &str,
+        token_hash: &str,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO device_tokens(id, label, token_hash, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id,
+                label,
+                token_hash,
+                now_string(),
+                expires_at.map(to_string)
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn device_token_by_hash(&self, token_hash: &str) -> Result<Option<DeviceToken>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT id, label, created_at, last_used_at, expires_at, revoked_at
+                 FROM device_tokens WHERE token_hash = ?1",
+                params![token_hash],
+                device_token_from_row,
+            )
+            .optional()?)
+    }
+
+    pub fn list_device_tokens(&self) -> Result<Vec<DeviceToken>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, label, created_at, last_used_at, expires_at, revoked_at
+             FROM device_tokens ORDER BY created_at DESC, id",
+        )?;
+        let rows = statement.query_map([], device_token_from_row)?;
+        let mut tokens = Vec::new();
+        for row in rows {
+            tokens.push(row?);
+        }
+        Ok(tokens)
+    }
+
+    /// Marks a token revoked. Returns false only when the id does not exist.
+    pub fn revoke_device_token(&self, id: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE device_tokens SET revoked_at = COALESCE(revoked_at, ?2) WHERE id = ?1",
+            params![id, now_string()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Records use at most once per hour to keep token checks read-mostly.
+    pub fn touch_device_token(&self, id: &str, at: DateTime<Utc>) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE device_tokens SET last_used_at = ?2
+             WHERE id = ?1 AND (last_used_at IS NULL OR last_used_at < ?3)",
+            params![
+                id,
+                to_string(at),
+                to_string(at - chrono::Duration::hours(1))
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn insert_message(&self, message: &StoredMessage) -> Result<()> {
         let connection = self.connection()?;
         connection.execute(
@@ -203,6 +304,10 @@ impl Store {
                 message.tool_call_id,
                 to_string(message.created_at),
             ],
+        )?;
+        connection.execute(
+            "UPDATE conversations SET updated_at = ?2 WHERE id = ?1",
+            params![message.conversation_id, to_string(message.created_at)],
         )?;
         Ok(())
     }
@@ -278,7 +383,8 @@ impl Store {
         let connection = self.connection()?;
         connection
             .execute(
-                "INSERT INTO conversations(id, kind, parent_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO conversations(id, kind, parent_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
                 params![id, kind, parent_id, now_string()],
             )
             .map_err(map_conversation_write)?;
@@ -289,19 +395,67 @@ impl Store {
         let connection = self.connection()?;
         connection
             .query_row(
-                "SELECT id, kind, parent_id, created_at FROM conversations WHERE id = ?1",
+                "SELECT c.id, c.kind, c.parent_id, c.title, c.created_at, c.updated_at,
+                        c.archived_at,
+                        (SELECT MAX(m.created_at) FROM messages m WHERE m.conversation_id = c.id)
+                 FROM conversations c WHERE c.id = ?1",
                 params![id],
-                |row| {
-                    Ok(StoredConversation {
-                        id: row.get(0)?,
-                        kind: row.get(1)?,
-                        parent_id: row.get(2)?,
-                        created_at: parse_datetime(&row.get::<_, String>(3)?),
-                    })
-                },
+                conversation_from_row,
             )
             .optional()
             .map_err(SeraError::from)
+    }
+
+    pub fn list_conversations(
+        &self,
+        limit: usize,
+        before: Option<(DateTime<Utc>, &str)>,
+        include_archived: bool,
+    ) -> Result<Vec<StoredConversation>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT c.id, c.kind, c.parent_id, c.title, c.created_at, c.updated_at,
+                    c.archived_at,
+                    (SELECT MAX(m.created_at) FROM messages m WHERE m.conversation_id = c.id)
+             FROM conversations c
+             WHERE (?2 = 1 OR c.archived_at IS NULL)
+               AND (?3 IS NULL OR c.updated_at < ?3 OR (c.updated_at = ?3 AND c.id < ?4))
+             ORDER BY c.updated_at DESC, c.id DESC
+             LIMIT ?1",
+        )?;
+        let cursor = before.as_ref().map(|(at, _)| to_string(*at));
+        let cursor_id = before.as_ref().map(|(_, id)| *id);
+        let rows = statement.query_map(
+            params![
+                limit.clamp(1, 200) as i64,
+                include_archived as i64,
+                cursor,
+                cursor_id
+            ],
+            conversation_from_row,
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Returns false when the conversation does not exist.
+    pub fn rename_conversation(&self, id: &str, title: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE conversations SET title = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, title, now_string()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Soft archive: messages are kept. Returns false when the id is unknown.
+    pub fn archive_conversation(&self, id: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE conversations SET archived_at = COALESCE(archived_at, ?2), updated_at = ?2
+             WHERE id = ?1",
+            params![id, now_string()],
+        )?;
+        Ok(changed == 1)
     }
 
     /// Reject container conversations; lazily record turn-capable scopes on first use.
@@ -325,7 +479,8 @@ impl Store {
         }
         let connection = self.connection()?;
         connection.execute(
-            "INSERT INTO conversations(id, kind, parent_id, created_at) VALUES (?1, ?2, NULL, ?3)
+            "INSERT INTO conversations(id, kind, parent_id, created_at, updated_at)
+             VALUES (?1, ?2, NULL, ?3, ?3)
              ON CONFLICT(id) DO NOTHING",
             params![id, conversation_kind_str(scope.kind), now_string()],
         )?;
@@ -1086,7 +1241,11 @@ pub struct StoredConversation {
     pub id: String,
     pub kind: String,
     pub parent_id: Option<String>,
+    pub title: Option<String>,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub archived_at: Option<DateTime<Utc>>,
+    pub last_message_at: Option<DateTime<Utc>>,
 }
 
 fn map_conversation_write(error: rusqlite::Error) -> SeraError {
@@ -1112,6 +1271,25 @@ fn conversation_kind_str(kind: crate::orchestration::ConversationKind) -> &'stat
         ConversationKind::Room => "room",
         ConversationKind::Legacy => "legacy",
     }
+}
+
+fn conversation_from_row(row: &Row<'_>) -> rusqlite::Result<StoredConversation> {
+    Ok(StoredConversation {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        parent_id: row.get(2)?,
+        title: row.get(3)?,
+        created_at: parse_datetime(&row.get::<_, String>(4)?),
+        updated_at: parse_datetime(&row.get::<_, String>(5)?),
+        archived_at: row
+            .get::<_, Option<String>>(6)?
+            .as_deref()
+            .map(parse_datetime),
+        last_message_at: row
+            .get::<_, Option<String>>(7)?
+            .as_deref()
+            .map(parse_datetime),
+    })
 }
 
 fn parse_stored_conversation_kind(kind: &str) -> Result<crate::orchestration::ConversationKind> {
@@ -1184,6 +1362,26 @@ fn parse_datetime(value: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
         .unwrap_or_else(|_| utc_now())
+}
+
+fn device_token_from_row(row: &Row<'_>) -> rusqlite::Result<DeviceToken> {
+    Ok(DeviceToken {
+        id: row.get(0)?,
+        label: row.get(1)?,
+        created_at: parse_datetime(&row.get::<_, String>(2)?),
+        last_used_at: row
+            .get::<_, Option<String>>(3)?
+            .as_deref()
+            .map(parse_datetime),
+        expires_at: row
+            .get::<_, Option<String>>(4)?
+            .as_deref()
+            .map(parse_datetime),
+        revoked_at: row
+            .get::<_, Option<String>>(5)?
+            .as_deref()
+            .map(parse_datetime),
+    })
 }
 
 fn truncate(value: &str, max: usize) -> String {
@@ -1288,10 +1486,17 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 4);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        connection
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='device_tokens'",
                 [],
                 |row| row.get::<_, String>(0),
             )
@@ -1307,6 +1512,122 @@ mod tests {
                 ],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn upgrades_a_version_two_database_in_place() {
+        let path = std::env::temp_dir().join(format!("serabot-store-v2-{}.db", new_id()));
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection.execute_batch(MIGRATION_1).unwrap();
+            connection.execute_batch(MIGRATION_2).unwrap();
+            connection.pragma_update(None, "user_version", 2).unwrap();
+        }
+        let store = Store::open(&path, 384, 5000).unwrap();
+        store.health().unwrap();
+        let version: i64 = store
+            .connection()
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        assert!(store.list_device_tokens().unwrap().is_empty());
+    }
+
+    #[test]
+    fn device_tokens_round_trip_without_storing_plaintext() {
+        let store = store();
+        let expires = utc_now() + chrono::Duration::days(30);
+        store
+            .insert_device_token("tok-1", "desktop-win", "hash-only", Some(expires))
+            .unwrap();
+        let found = store.device_token_by_hash("hash-only").unwrap().unwrap();
+        assert_eq!(found.id, "tok-1");
+        assert_eq!(found.label, "desktop-win");
+        assert!(found.expires_at.is_some());
+        assert!(found.last_used_at.is_none());
+        assert!(found.active_at(utc_now()));
+        assert!(store.device_token_by_hash("absent").unwrap().is_none());
+
+        store.touch_device_token("tok-1", utc_now()).unwrap();
+        assert!(
+            store.list_device_tokens().unwrap()[0]
+                .last_used_at
+                .is_some()
+        );
+
+        assert!(store.revoke_device_token("tok-1").unwrap());
+        let revoked = store.device_token_by_hash("hash-only").unwrap().unwrap();
+        assert!(revoked.revoked_at.is_some());
+        assert!(!revoked.active_at(utc_now()));
+        assert!(!store.revoke_device_token("absent").unwrap());
+    }
+
+    #[test]
+    fn expired_tokens_are_inactive() {
+        let store = store();
+        store
+            .insert_device_token(
+                "tok-2",
+                "old-laptop",
+                "expired-hash",
+                Some(utc_now() - chrono::Duration::seconds(1)),
+            )
+            .unwrap();
+        let token = store.device_token_by_hash("expired-hash").unwrap().unwrap();
+        assert!(!token.active_at(utc_now()));
+    }
+
+    #[test]
+    fn conversations_keep_metadata_and_paginate() {
+        let store = store();
+        store
+            .create_conversation("sec:finance", "section", None)
+            .unwrap();
+        store
+            .create_conversation("grp:ops", "group", Some("sec:finance"))
+            .unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE conversations SET updated_at = '2026-01-01T00:00:00.000Z'",
+                [],
+            )
+            .unwrap();
+        store
+            .append_message("grp:ops", None, Role::User, "hello")
+            .unwrap();
+
+        let all = store.list_conversations(10, None, false).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id, "grp:ops", "message activity sorts first");
+        assert!(all[0].last_message_at.is_some());
+        assert!(all[1].title.is_none());
+
+        assert!(store.rename_conversation("grp:ops", "Operations").unwrap());
+        assert!(!store.rename_conversation("missing", "x").unwrap());
+        let renamed = store.get_conversation("grp:ops").unwrap().unwrap();
+        assert_eq!(renamed.title.as_deref(), Some("Operations"));
+
+        let page = store.list_conversations(1, None, false).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "grp:ops");
+        let rest = store
+            .list_conversations(10, Some((page[0].updated_at, &page[0].id)), false)
+            .unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].id, "sec:finance");
+
+        assert!(store.archive_conversation("grp:ops").unwrap());
+        let visible = store.list_conversations(10, None, false).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, "sec:finance");
+        let with_archived = store.list_conversations(10, None, true).unwrap();
+        assert_eq!(with_archived.len(), 2);
+        let archived = store.get_conversation("grp:ops").unwrap().unwrap();
+        assert!(archived.archived_at.is_some());
+        assert_eq!(store.list_visible_messages("grp:ops", 10).unwrap().len(), 1);
     }
 
     #[test]

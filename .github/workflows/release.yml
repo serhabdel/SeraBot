@@ -1,15 +1,22 @@
 name: release
 
 # Client downloads. Push a tag to publish:
-#   git tag v0.1.0 && git push origin v0.1.0
+#   git tag v0.2.0 && git push origin v0.2.0
+# Or dispatch this workflow with an existing tag, for example v0.2.0.
 # The workflow builds the Windows desktop client and the Android app, then
-# posts both to the GitHub Releases page for that tag. No secrets are required
-# for the artifacts themselves; only the optional SERABOT_OWNER_API_URL prefill
-# secret is read (see docs/ci-and-secrets.md). The owner token is never read,
-# compiled, or embedded.
+# posts both to the GitHub Release for that tag. No secrets are required for
+# the artifacts themselves; the optional SERABOT_OWNER_API_URL prefill and the
+# Android signing secrets are read when configured (see docs/ci-and-secrets.md).
+# The owner token is never read, compiled, or embedded.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build, for example v0.2.0"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -18,35 +25,70 @@ jobs:
   desktop:
     runs-on: windows-latest
     env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
       # Optional repository secret (synthetic example: https://owner.example).
       # Unset expands to empty; the binary then compiles with an empty prefill
       # and the server field stays generic.
       SERABOT_OWNER_API_URL: ${{ secrets.SERABOT_OWNER_API_URL }}
+      SERABOT_RELEASES_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - name: Record checked-out commit
+        shell: bash
+        run: echo "SERABOT_BUILD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Validate tag
+        shell: bash
+        run: |
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "dispatch tag must look like v0.2.0" >&2
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Release build
         run: cargo build --release --locked -p serabot-desktop
-      - name: Zip the client
+      - name: Package the client
+        shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
-          Compress-Archive -Path target\release\serabot-desktop.exe -DestinationPath "serabot-desktop-$tag-windows-x64.zip"
+          Compress-Archive -Path target\release\serabot-desktop.exe -DestinationPath "serabot-desktop-$env:TAG-windows-x64.zip"
+          Copy-Item target\release\serabot-desktop.exe "serabot-desktop-$env:TAG-windows-x64.exe"
+          Copy-Item target\release\serabot-desktop.exe "serabot-desktop-latest-windows-x64.exe"
+          Copy-Item "serabot-desktop-$env:TAG-windows-x64.zip" "serabot-desktop-latest-windows-x64.zip"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: desktop-assets
           path: |
-            serabot-desktop-${{ github.ref_name }}-windows-x64.zip
-            target/release/serabot-desktop.exe
+            serabot-desktop-${{ github.event.inputs.tag || github.ref_name }}-windows-x64.exe
+            serabot-desktop-${{ github.event.inputs.tag || github.ref_name }}-windows-x64.zip
+            serabot-desktop-latest-windows-x64.exe
+            serabot-desktop-latest-windows-x64.zip
 
   mobile:
     runs-on: ubuntu-latest
     env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
       # Optional repository secret, origin only. Never the token.
       SERABOT_OWNER_API_URL: ${{ secrets.SERABOT_OWNER_API_URL }}
+      # Optional Android release keystore. Unset variables fall back to the
+      # Android debug key. Values are never echoed.
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - name: Validate tag
+        shell: bash
+        run: |
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "dispatch tag must look like v0.2.0" >&2
+            exit 1
+          fi
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -58,40 +100,65 @@ jobs:
       - name: Dependencies
         working-directory: apps/serabot_mobile
         run: flutter pub get
+      - name: Configure release signing
+        working-directory: apps/serabot_mobile
+        run: |
+          if [ -n "${ANDROID_KEYSTORE_BASE64}" ]; then
+            printf '%s' "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > "$RUNNER_TEMP/release.keystore"
+            chmod 600 "$RUNNER_TEMP/release.keystore"
+            echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+          fi
       - name: Build release APK
         working-directory: apps/serabot_mobile
         run: |
           flutter build apk --release \
+            --build-name="${TAG#v}" \
+            --build-number="${{ github.run_number }}" \
             --dart-define=SERABOT_DEFAULT_SERVER_URL="${SERABOT_OWNER_API_URL}" \
             --dart-define=SERABOT_OWNER_TOKEN_SECRET_NAME=SERABOT_OWNER_TOKEN
-          cp build/app/outputs/flutter-apk/app-release.apk "serabot-mobile-${{ github.ref_name }}.apk"
+          cp build/app/outputs/flutter-apk/app-release.apk "serabot-mobile-${TAG}.apk"
+          cp build/app/outputs/flutter-apk/app-release.apk "serabot-mobile-latest.apk"
       - name: Build release app bundle
         working-directory: apps/serabot_mobile
         run: |
           flutter build appbundle --release \
+            --build-name="${TAG#v}" \
+            --build-number="${{ github.run_number }}" \
             --dart-define=SERABOT_DEFAULT_SERVER_URL="${SERABOT_OWNER_API_URL}" \
             --dart-define=SERABOT_OWNER_TOKEN_SECRET_NAME=SERABOT_OWNER_TOKEN
-          cp build/app/outputs/bundle/release/app-release.aab "serabot-mobile-${{ github.ref_name }}.aab"
+          cp build/app/outputs/bundle/release/app-release.aab "serabot-mobile-${TAG}.aab"
+          cp build/app/outputs/bundle/release/app-release.aab "serabot-mobile-latest.aab"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: mobile-assets
           path: |
-            apps/serabot_mobile/serabot-mobile-${{ github.ref_name }}.apk
-            apps/serabot_mobile/serabot-mobile-${{ github.ref_name }}.aab
+            apps/serabot_mobile/serabot-mobile-${{ github.event.inputs.tag || github.ref_name }}.apk
+            apps/serabot_mobile/serabot-mobile-${{ github.event.inputs.tag || github.ref_name }}.aab
+            apps/serabot_mobile/serabot-mobile-latest.apk
+            apps/serabot_mobile/serabot-mobile-latest.aab
 
   publish:
     needs: [desktop, mobile]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | LC_ALL=C sort | xargs -r sha256sum > SHA256SUMS
+          cat SHA256SUMS
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: dist/*
           generate_release_notes: true
           fail_on_unmatched_files: true

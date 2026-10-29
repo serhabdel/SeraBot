@@ -1,9 +1,10 @@
 //! Reviewable agent memory.
 //!
 //! Memories are operator-reviewable facts with mandatory provenance. This
-//! module only provides CRUD: nothing here is automatically injected into
-//! prompts, policies or planning. Callers must explicitly select and review
-//! memories before using them.
+//! module provides CRUD only. The runtime separately injects the 20 most
+//! recently updated memories into the orchestrator system prompt as
+//! owner-approved facts, and `delegate` handoffs attach explicitly selected
+//! ids. Specialists never list memory on their own.
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{OptionalExtension, params};

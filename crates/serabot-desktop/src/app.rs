@@ -1,13 +1,16 @@
-use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, RichText, Stroke, Vec2};
-use secrecy::SecretString;
+use eframe::egui::{self, Align2, Color32, FontId, Frame, Margin, RichText, Sense, Stroke, Vec2};
+use secrecy::{ExposeSecret, SecretString};
 use serabot_desktop::{
     ApiError, ApprovalDecision, ConversationKind, DEFAULT_SPECIALIST_TOOLS, MAX_SKILL_BODY_BYTES,
-    MAX_SKILL_DESCRIPTION_CHARS, OWNER_TOKEN_SECRET_NAME, Role, SPECIALIST_TOOLS, Selection,
-    TaskStatus, conversation_node_id, default_server_url, parse_skill_list,
+    MAX_SKILL_DESCRIPTION_CHARS, Role, SPECIALIST_TOOLS, TaskStatus,
+    connect::{ConnectState, connect_screen},
+    conversation_node_id, creds, design,
+    events::{EventStream, EventUpdate},
+    parse_skill_list,
     state::State,
-    valid_bot_description, valid_bot_id, valid_conversation_parent, valid_id, valid_new_skill_id,
-    valid_skill_body, valid_skill_description, valid_slug, valid_speaker, valid_text, valid_token,
-    validate_endpoint, validate_tool_list,
+    updater, valid_bot_description, valid_bot_id, valid_conversation_parent, valid_id,
+    valid_new_skill_id, valid_skill_body, valid_skill_description, valid_slug, valid_speaker,
+    valid_text, valid_token, validate_tool_list,
     worker::{Credentials, Job, Operation, OperationKind, Worker},
 };
 use std::{
@@ -16,135 +19,99 @@ use std::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-const BG: Color32 = Color32::from_rgb(14, 17, 22);
-const PANEL: Color32 = Color32::from_rgb(22, 27, 34);
-const PANEL_ALT: Color32 = Color32::from_rgb(28, 34, 42);
-const STROKE: Color32 = Color32::from_rgb(42, 50, 60);
-const TEAL: Color32 = Color32::from_rgb(88, 196, 178);
-const TEAL_DIM: Color32 = Color32::from_rgb(42, 92, 84);
-const TEXT: Color32 = Color32::from_rgb(230, 236, 242);
-const MUTED: Color32 = Color32::from_rgb(140, 152, 168);
-const WARNING: Color32 = Color32::from_rgb(232, 176, 98);
-const DANGER: Color32 = Color32::from_rgb(220, 110, 110);
-const USER_BUBBLE: Color32 = Color32::from_rgb(28, 48, 52);
-const BOT_BUBBLE: Color32 = Color32::from_rgb(30, 35, 43);
+mod chat;
+mod conversations;
+mod fleet;
+mod memory;
+mod settings;
+mod status;
+
+pub(crate) use chat::ChatView;
+
 const REQUEST_GAP: Duration = Duration::from_secs(3);
 const POLL_GAP: Duration = Duration::from_secs(5);
-const SIDEBAR_W: f32 = 268.0;
-fn status_chip(ui: &mut egui::Ui, label: &str, fg: Color32, bg: Color32) {
-    Frame::new()
-        .fill(bg)
-        .corner_radius(12.0)
-        .inner_margin(Margin::symmetric(10, 5))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(RichText::new("●").size(9.0).color(fg));
-                ui.label(RichText::new(label).size(11.0).strong().color(fg));
-            });
-        });
-}
+const POLL_SAFETY: Duration = Duration::from_secs(20);
+const TOAST_GAP: Duration = Duration::from_secs(4);
 
-fn empty_state(ui: &mut egui::Ui, title: &str, body: &str) {
-    ui.add_space(32.0);
-    ui.vertical_centered(|ui| {
-        Frame::new()
-            .fill(PANEL_ALT)
-            .stroke(Stroke::new(1.0_f32, STROKE))
-            .corner_radius(14.0)
-            .inner_margin(Margin::symmetric(28, 22))
-            .show(ui, |ui| {
-                ui.set_max_width(420.0);
-                ui.label(RichText::new(title).size(20.0).strong().color(TEXT));
-                ui.add_space(8.0);
-                ui.label(RichText::new(body).color(MUTED));
-            });
-    });
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Section {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Section {
     Chat,
+    Conversations,
+    Memory,
+    Providers,
+    Connectors,
     Approvals,
     Fleet,
+    Settings,
 }
 
-fn default_tool_flags() -> Vec<bool> {
-    SPECIALIST_TOOLS
-        .iter()
-        .map(|tool| DEFAULT_SPECIALIST_TOOLS.contains(tool))
-        .collect()
-}
+impl Section {
+    pub const NAV: [Self; 7] = [
+        Self::Chat,
+        Self::Conversations,
+        Self::Memory,
+        Self::Providers,
+        Self::Connectors,
+        Self::Approvals,
+        Self::Fleet,
+    ];
 
-pub struct Desktop {
-    state: State,
-    worker: Option<Worker>,
-    credentials: Option<Arc<Credentials>>,
-    server: String,
-    token: String,
-    conversation: String,
-    composer: String,
-    bot_id: String,
-    bot_description: String,
-    bot_tools: Vec<bool>,
-    bot_skills: String,
-    skill_id: String,
-    skill_description: String,
-    skill_body: String,
-    conv_kind: ConversationKind,
-    conv_slug: String,
-    conv_parent: String,
-    connection_open: bool,
-    section: Section,
-    pending: Option<OperationKind>,
-    scheduled: Option<(Instant, Operation)>,
-    next_request: Instant,
-    refreshing: bool,
-    reviewed_unknown: bool,
-    confirmed_egress: bool,
-    poll_history: bool,
-    poll_paused: bool,
-    poll_approvals: bool,
-}
-
-impl Desktop {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = PANEL;
-        visuals.window_fill = PANEL;
-        visuals.extreme_bg_color = BG;
-        visuals.override_text_color = Some(TEXT);
-        visuals.widgets.noninteractive.bg_fill = PANEL_ALT;
-        visuals.widgets.inactive.bg_fill = PANEL_ALT;
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(36, 44, 54);
-        visuals.widgets.active.bg_fill = TEAL_DIM;
-        visuals.selection.bg_fill = TEAL_DIM;
-        visuals.selection.stroke = Stroke::new(1.0_f32, TEAL);
-        visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
-        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
-        visuals.window_stroke = Stroke::new(1.0_f32, STROKE);
-        cc.egui_ctx.set_visuals(visuals);
-        cc.egui_ctx.style_mut(|style| {
-            style.spacing.item_spacing = Vec2::new(10.0, 8.0);
-            style.spacing.button_padding = Vec2::new(14.0, 7.0);
-            style.spacing.interact_size.y = 32.0;
-            style.spacing.window_margin = Margin::same(0);
-            style.visuals.window_corner_radius = CornerRadius::same(0);
-        });
-        let worker = Worker::start().ok();
-        let mut state = State::default();
-        if worker.is_none() {
-            state.error =
-                Some("Could not start the network worker. Close and reopen SeraBot.".into());
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Chat => "Chat",
+            Self::Conversations => "Conversations",
+            Self::Memory => "Memory",
+            Self::Providers => "Providers",
+            Self::Connectors => "Connectors",
+            Self::Approvals => "Approvals",
+            Self::Fleet => "Fleet",
+            Self::Settings => "Settings",
         }
+    }
+
+    pub fn icon(self) -> design::NavIcon {
+        match self {
+            Self::Chat => design::NavIcon::Chat,
+            Self::Conversations => design::NavIcon::Conversations,
+            Self::Memory => design::NavIcon::Memory,
+            Self::Providers => design::NavIcon::Providers,
+            Self::Connectors => design::NavIcon::Connectors,
+            Self::Approvals => design::NavIcon::Approvals,
+            Self::Fleet => design::NavIcon::Fleet,
+            Self::Settings => design::NavIcon::Settings,
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Chat => "Talk to the orchestrator",
+            Self::Conversations => "Sections, groups, direct threads and rooms",
+            Self::Memory => "Owner-approved facts",
+            Self::Providers => "Models, routing and egress consent",
+            Self::Connectors => "Google, Microsoft, Notion, AgentMail",
+            Self::Approvals => "Gateway consent for outbound effects",
+            Self::Fleet => "Bots, skills and conversation nodes",
+            Self::Settings => "Connection, updates and shortcuts",
+        }
+    }
+}
+
+pub(crate) struct FleetDraft {
+    pub bot_id: String,
+    pub bot_description: String,
+    pub bot_tools: Vec<bool>,
+    pub bot_skills: String,
+    pub skill_id: String,
+    pub skill_description: String,
+    pub skill_body: String,
+    pub conv_kind: ConversationKind,
+    pub conv_slug: String,
+    pub conv_parent: String,
+}
+
+impl Default for FleetDraft {
+    fn default() -> Self {
         Self {
-            state,
-            worker,
-            credentials: None,
-            server: default_server_url(),
-            token: String::new(),
-            conversation: "windows-owner".into(),
-            composer: String::new(),
             bot_id: String::new(),
             bot_description: String::new(),
             bot_tools: default_tool_flags(),
@@ -155,8 +122,146 @@ impl Desktop {
             conv_kind: ConversationKind::Section,
             conv_slug: String::new(),
             conv_parent: String::new(),
-            connection_open: true,
+        }
+    }
+}
+
+impl Drop for FleetDraft {
+    fn drop(&mut self) {
+        self.bot_description.zeroize();
+        self.skill_description.zeroize();
+        self.skill_body.zeroize();
+    }
+}
+
+pub(crate) struct MemoryDraft {
+    pub kind: String,
+    pub content: String,
+    pub source: String,
+    pub query: String,
+    pub delete_confirm: Option<String>,
+}
+
+impl Default for MemoryDraft {
+    fn default() -> Self {
+        Self {
+            kind: "note".into(),
+            content: String::new(),
+            source: "operator:desktop".into(),
+            query: String::new(),
+            delete_confirm: None,
+        }
+    }
+}
+
+impl MemoryDraft {
+    pub fn query_opt(&self) -> Option<String> {
+        let query = self.query.trim();
+        (!query.is_empty()).then(|| query.to_owned())
+    }
+}
+
+impl Drop for MemoryDraft {
+    fn drop(&mut self) {
+        self.content.zeroize();
+    }
+}
+
+pub(crate) struct RenameDraft {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaletteAction {
+    Go(Section),
+    NewConversation,
+    Refresh,
+    CheckUpdates,
+    Disconnect,
+    ForgetToken,
+}
+
+#[derive(Default)]
+pub(crate) struct UpdateUi {
+    pub info: Option<updater::UpdateInfo>,
+    pub error: Option<String>,
+    pub checking: bool,
+    pub dismissed: bool,
+    pub rx: Option<std::sync::mpsc::Receiver<Result<Option<updater::UpdateInfo>, String>>>,
+}
+
+pub struct Desktop {
+    pub(crate) state: State,
+    worker: Option<Worker>,
+    credentials: Option<Arc<Credentials>>,
+    events: Option<EventStream>,
+    pub(crate) events_active: bool,
+    events_dirty: bool,
+    pub(crate) last_event_id: i64,
+    last_event_kind: String,
+    connect: ConnectState,
+    pub(crate) conversation: String,
+    pub(crate) section: Section,
+    pub(crate) composer: String,
+    pub(crate) conv_search: String,
+    pub(crate) fleet: FleetDraft,
+    pub(crate) memory: MemoryDraft,
+    pub(crate) rename: Option<RenameDraft>,
+    pub(crate) archive_confirm: Option<String>,
+    pub(crate) chat: ChatView,
+    pending: Option<OperationKind>,
+    scheduled: Option<(Instant, Operation)>,
+    next_request: Instant,
+    refreshing: bool,
+    reviewed_unknown: bool,
+    confirmed_egress: bool,
+    poll_history: bool,
+    poll_paused: bool,
+    poll_approvals: bool,
+    model_open: bool,
+    palette_open: bool,
+    palette_focus: bool,
+    palette_query: String,
+    pub(crate) toast: Option<(String, Instant)>,
+    pub(crate) update: UpdateUi,
+}
+
+fn default_tool_flags() -> Vec<bool> {
+    SPECIALIST_TOOLS
+        .iter()
+        .map(|tool| DEFAULT_SPECIALIST_TOOLS.contains(tool))
+        .collect()
+}
+
+impl Desktop {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        design::apply_theme(&cc.egui_ctx);
+        let worker = Worker::start().ok();
+        let mut state = State::default();
+        if worker.is_none() {
+            state.error =
+                Some("Could not start the network worker. Close and reopen SeraBot.".into());
+        }
+        let mut desktop = Self {
+            state,
+            worker,
+            credentials: None,
+            events: None,
+            events_active: false,
+            events_dirty: false,
+            last_event_id: 0,
+            last_event_kind: String::new(),
+            connect: ConnectState::load(),
+            conversation: "windows-owner".into(),
             section: Section::Chat,
+            composer: String::new(),
+            conv_search: String::new(),
+            fleet: FleetDraft::default(),
+            memory: MemoryDraft::default(),
+            rename: None,
+            archive_confirm: None,
+            chat: ChatView::default(),
             pending: None,
             scheduled: None,
             next_request: Instant::now(),
@@ -166,7 +271,23 @@ impl Desktop {
             poll_history: false,
             poll_paused: false,
             poll_approvals: false,
+            model_open: false,
+            palette_open: false,
+            palette_focus: false,
+            palette_query: String::new(),
+            toast: None,
+            update: UpdateUi::default(),
+        };
+        // Auto-connect only with a saved credential and a valid server origin.
+        if desktop.worker.is_some()
+            && desktop.connect.ready()
+            && valid_id(&desktop.conversation)
+            && desktop.connect_now()
+        {
+            cc.egui_ctx.request_repaint();
         }
+        desktop.check_updates();
+        desktop
     }
 
     fn ready(&self) -> bool {
@@ -175,7 +296,8 @@ impl Desktop {
             && self.worker.is_some()
             && Instant::now() >= self.next_request
     }
-    fn active_conversation(&self) -> bool {
+
+    pub(crate) fn active_conversation(&self) -> bool {
         self.conversation == self.state.scope.conversation
     }
 
@@ -185,16 +307,7 @@ impl Desktop {
             worker.set_epoch(self.state.scope.epoch);
         }
         self.composer.zeroize();
-        if !connected {
-            self.state.created_bot = None;
-            self.state.created_conversation = None;
-            self.state.created_skill = None;
-            self.state.listed_skills.clear();
-            self.state.skills_loaded = false;
-            self.state.listed_bots.clear();
-            self.state.bots_loaded = false;
-            self.clear_fleet_drafts();
-        }
+        self.chat.reset();
         self.pending = None;
         self.scheduled = None;
         self.refreshing = false;
@@ -203,27 +316,42 @@ impl Desktop {
         self.poll_history = false;
         self.poll_paused = false;
         self.poll_approvals = false;
+        self.events_dirty = false;
+        self.rename = None;
+        self.archive_confirm = None;
+        if !connected {
+            self.state.created_bot = None;
+            self.state.created_conversation = None;
+            self.state.created_skill = None;
+            self.state.listed_skills.clear();
+            self.state.skills_loaded = false;
+            self.state.listed_bots.clear();
+            self.state.bots_loaded = false;
+            self.state.conversations.clear();
+            self.state.conversations_loaded = false;
+            self.state.memories.clear();
+            self.state.memories_loaded = false;
+            self.state.providers.clear();
+            self.state.providers_loaded = false;
+            self.state.connectors.clear();
+            self.state.connectors_loaded = false;
+            self.clear_fleet_drafts();
+            self.memory.content.zeroize();
+            self.memory.delete_confirm = None;
+        }
     }
 
     fn clear_fleet_drafts(&mut self) {
-        self.bot_id.clear();
-        self.bot_description.zeroize();
-        self.bot_tools = default_tool_flags();
-        self.bot_skills.clear();
-        self.skill_id.clear();
-        self.skill_description.zeroize();
-        self.skill_body.zeroize();
-        self.conv_kind = ConversationKind::Section;
-        self.conv_slug.clear();
-        self.conv_parent.clear();
+        self.fleet = FleetDraft::default();
     }
 
-    fn selected_tools(&self) -> Vec<String> {
+    pub(crate) fn selected_tools(&self) -> Vec<String> {
         SPECIALIST_TOOLS
             .iter()
             .enumerate()
             .filter_map(|(index, name)| {
-                self.bot_tools
+                self.fleet
+                    .bot_tools
                     .get(index)
                     .copied()
                     .unwrap_or(false)
@@ -232,34 +360,211 @@ impl Desktop {
             .collect()
     }
 
-    fn connect(&mut self, ctx: &egui::Context) {
-        let endpoint = match validate_endpoint(&self.server) {
-            Ok(endpoint) => endpoint,
-            Err(error) => {
-                self.state.error = Some(error.to_string());
-                return;
-            }
+    fn start_events(&mut self, ctx: &egui::Context) {
+        self.stop_events();
+        let Some(credentials) = self.credentials.clone() else {
+            return;
         };
-        if !valid_token(&self.token) || !valid_id(&self.conversation) {
-            self.state.error = Some("Enter a 32–512 character API token and a valid conversation ID (letters, digits, _ : -; max 128).".into());
+        let wake: Box<dyn Fn() + Send> = {
+            let ctx = ctx.clone();
+            Box::new(move || ctx.request_repaint())
+        };
+        self.events = Some(EventStream::start(credentials, self.last_event_id, wake));
+    }
+
+    fn stop_events(&mut self) {
+        if let Some(events) = self.events.take() {
+            events.stop();
+        }
+        self.events_active = false;
+    }
+
+    fn poll_events(&mut self, ctx: &egui::Context) {
+        let mut unauthorized = false;
+        if let Some(stream) = &self.events {
+            while let Some(update) = stream.try_recv() {
+                match update {
+                    EventUpdate::Connected => self.events_active = true,
+                    EventUpdate::Disconnected => self.events_active = false,
+                    EventUpdate::Unauthorized => unauthorized = true,
+                    EventUpdate::Event { id, kind, .. } => {
+                        self.last_event_id = self.last_event_id.max(id);
+                        self.last_event_kind = kind;
+                        self.events_dirty = true;
+                    }
+                }
+            }
+        }
+        if unauthorized {
+            self.stop_events();
+            self.reject_token(ctx);
+        }
+    }
+
+    /// Coalesce server events into at most one refresh per request gap.
+    fn flush_events(&mut self) {
+        if !self.events_dirty
+            || !self.state.connected
+            || self.state.unknown_outcome
+            || !self.state.history_loaded
+            || self.refreshing
+            || self.pending.is_some()
+            || self.scheduled.is_some()
+            || Instant::now() < self.next_request
+        {
             return;
         }
+        self.events_dirty = false;
+        let kind = self.last_event_kind.clone();
+        let operation = if kind.contains("approval") {
+            Operation::Approvals
+        } else if kind.contains("conversation") {
+            Operation::ListConversations {
+                include_archived: false,
+            }
+        } else {
+            Operation::History
+        };
+        self.start_request(operation);
+    }
+
+    /// Validate the connect card and start the authenticated health read.
+    fn connect_now(&mut self) -> bool {
+        let endpoint = match self.connect.endpoint() {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                self.connect.error = Some(error.to_string());
+                self.connect.connecting = false;
+                return false;
+            }
+        };
+        if !valid_token(&self.connect.token) {
+            self.connect.error =
+                Some("Paste the token minted on the server (32–512 characters, no spaces).".into());
+            self.connect.connecting = false;
+            return false;
+        }
+        if !valid_id(&self.conversation) {
+            self.connect.error = Some(
+                "Conversation IDs use letters, digits, _ : - and are at most 128 characters."
+                    .into(),
+            );
+            self.connect.connecting = false;
+            return false;
+        }
+        self.stop_events();
         self.reset_scope(false);
+        self.state.error = None;
+        self.connect.error = None;
+        self.connect.connecting = true;
         self.credentials = Some(Arc::new(Credentials {
             endpoint,
-            token: SecretString::new(std::mem::take(&mut self.token)),
+            token: SecretString::new(self.connect.token.to_string()),
         }));
-        ctx.memory_mut(|memory| *memory = Default::default());
         self.refreshing = true;
         self.start_request(Operation::Health);
+        true
     }
 
     fn disconnect(&mut self, ctx: &egui::Context) {
+        self.stop_events();
         self.reset_scope(false);
         self.credentials = None;
-        self.token.zeroize();
-        self.connection_open = true;
-        ctx.memory_mut(|memory| *memory = Default::default());
+        self.connect.clear_token();
+        self.connect.connecting = false;
+        self.connect.persisted = false;
+        self.connect.error = None;
+        self.state.error = None;
+        self.close_overlays();
+        ctx.request_repaint();
+    }
+
+    /// Delete the stored credential, clear the field, and keep the server URL.
+    fn forget_token(&mut self, ctx: &egui::Context) {
+        let origin = self
+            .credentials
+            .as_ref()
+            .map(|credentials| credentials.endpoint.origin().ascii_serialization())
+            .or_else(|| {
+                self.connect
+                    .endpoint()
+                    .ok()
+                    .map(|endpoint| endpoint.origin().ascii_serialization())
+            });
+        let result = creds::forget_token();
+        self.stop_events();
+        self.reset_scope(false);
+        self.credentials = None;
+        self.connect.clear_token();
+        self.connect.connecting = false;
+        self.connect.persisted = false;
+        if let Some(origin) = origin {
+            self.connect.server = origin;
+        }
+        self.connect.error = result.err();
+        self.state.error = None;
+        self.close_overlays();
+        ctx.request_repaint();
+    }
+
+    /// A revoked or rejected token never stays in memory or the credential
+    /// store. The server URL is kept so only a new token is required.
+    fn reject_token(&mut self, ctx: &egui::Context) {
+        let origin = self
+            .credentials
+            .as_ref()
+            .map(|credentials| credentials.endpoint.origin().ascii_serialization())
+            .or_else(|| {
+                self.connect
+                    .endpoint()
+                    .ok()
+                    .map(|url| url.origin().ascii_serialization())
+            });
+        let _ = creds::forget_token();
+        self.stop_events();
+        self.reset_scope(false);
+        self.credentials = None;
+        self.connect.clear_token();
+        self.connect.connecting = false;
+        self.connect.persisted = false;
+        if let Some(origin) = origin {
+            self.connect.server = origin;
+        }
+        self.connect.error =
+            Some("Token rejected or revoked. Mint a new token on the server.".into());
+        self.state.error = None;
+        self.close_overlays();
+        ctx.request_repaint();
+    }
+
+    fn close_overlays(&mut self) {
+        self.model_open = false;
+        self.palette_open = false;
+        self.palette_focus = false;
+        self.palette_query.clear();
+    }
+
+    /// Persist only after the first authenticated Health reply.
+    fn persist_credentials(&mut self) {
+        let Some(credentials) = self.credentials.clone() else {
+            return;
+        };
+        let origin = credentials.endpoint.origin().ascii_serialization();
+        let settings = creds::save_settings(&creds::Settings {
+            server: origin.clone(),
+        });
+        let token = creds::save_token(credentials.token.expose_secret());
+        self.connect.server = origin;
+        self.connect.persisted = settings.is_ok() && token.is_ok();
+        if let Err(error) = settings {
+            self.state.error = Some(format!(
+                "Connected, but the server URL could not be saved: {error}"
+            ));
+        } else if let Err(error) = token {
+            self.state.error = Some(format!(
+                "Connected, but the token could not be saved: {error}"
+            ));
+        }
     }
 
     fn start_request(&mut self, operation: Operation) {
@@ -280,6 +585,11 @@ impl Desktop {
             self.state.error = Some("Network worker unavailable. This request was not sent. Disconnect, then reconnect.".into());
             self.refreshing = false;
             self.poll_paused = true;
+            self.connect.connecting = false;
+            if !self.state.connected {
+                self.connect.error =
+                    Some("Network worker unavailable. Close and reopen SeraBot.".into());
+            }
             return;
         }
         self.pending = Some(kind);
@@ -295,6 +605,7 @@ impl Desktop {
         self.refreshing = true;
         self.reviewed_unknown = false;
         self.poll_paused = false;
+        self.ensure_fresh_section();
         self.start_request(if self.state.connected {
             Operation::Catalog
         } else {
@@ -302,32 +613,65 @@ impl Desktop {
         });
     }
 
-    fn receive(&mut self) {
+    /// Drop the cached list for the open section so refresh reloads it.
+    fn ensure_fresh_section(&mut self) {
+        match self.section {
+            Section::Memory => self.state.memories_loaded = false,
+            Section::Providers => self.state.providers_loaded = false,
+            Section::Connectors => self.state.connectors_loaded = false,
+            Section::Approvals => self.state.approvals_loaded = false,
+            _ => {}
+        }
+    }
+
+    fn receive(&mut self, ctx: &egui::Context) {
         while let Some(completion) = self.worker.as_ref().and_then(Worker::completion) {
             if !self.state.scope.accepts(&completion.scope) {
                 continue;
             }
             self.pending = None;
+            if completion.kind == OperationKind::Health {
+                self.connect.connecting = false;
+            }
             match completion.result {
+                Err(ApiError::Http(401)) => {
+                    self.refreshing = false;
+                    self.scheduled = None;
+                    self.poll_paused = true;
+                    self.reject_token(ctx);
+                }
                 Err(error) => {
                     self.state.fail(&completion.scope, completion.kind, error);
                     self.refreshing = false;
                     self.scheduled = None;
                     self.poll_paused = true;
+                    if !self.state.connected {
+                        self.connect.error = Some(error.to_string());
+                    }
                     if error == ApiError::Http(429) {
                         self.next_request = Instant::now() + Duration::from_secs(60);
                     }
                 }
                 Ok(reply) => {
-                    self.state.receive(&completion.scope, reply);
+                    if !self.state.receive(&completion.scope, reply) {
+                        continue;
+                    }
                     match completion.kind {
                         OperationKind::Health if self.state.connected => {
-                            self.connection_open = false;
+                            self.connect.error = None;
+                            self.persist_credentials();
+                            self.start_events(ctx);
                             self.schedule(Operation::Catalog, Duration::ZERO);
                         }
                         OperationKind::Health => {
                             self.refreshing = false;
                             self.poll_paused = true;
+                            self.connect.error = Some(
+                                self.state
+                                    .error
+                                    .clone()
+                                    .unwrap_or_else(|| "Server is not ready. Retry.".into()),
+                            );
                         }
                         OperationKind::Catalog if self.refreshing => {
                             self.schedule(Operation::History, Duration::ZERO)
@@ -335,9 +679,16 @@ impl Desktop {
                         OperationKind::History if self.refreshing => {
                             self.schedule(Operation::Approvals, Duration::ZERO)
                         }
-                        OperationKind::Approvals if self.refreshing => {
+                        OperationKind::Approvals if self.refreshing => self.schedule(
+                            Operation::ListConversations {
+                                include_archived: false,
+                            },
+                            Duration::ZERO,
+                        ),
+                        OperationKind::ListConversations if self.refreshing => {
                             self.refreshing = false;
                             self.reviewed_unknown = self.state.unknown_outcome;
+                            self.ensure_section_data();
                         }
                         OperationKind::Submit => {
                             self.poll_history = false;
@@ -351,6 +702,46 @@ impl Desktop {
                         }
                         OperationKind::CreateBot => {
                             self.schedule(Operation::ListBots, Duration::ZERO);
+                        }
+                        OperationKind::CreateConversation => {
+                            self.fleet.conv_slug.clear();
+                            self.fleet.conv_parent.clear();
+                            self.schedule(
+                                Operation::ListConversations {
+                                    include_archived: false,
+                                },
+                                Duration::ZERO,
+                            );
+                        }
+                        OperationKind::RenameConversation | OperationKind::ArchiveConversation => {
+                            let archived_current = completion.kind
+                                == OperationKind::ArchiveConversation
+                                && self.archive_confirm.as_deref()
+                                    == Some(self.conversation.as_str());
+                            self.rename = None;
+                            self.archive_confirm = None;
+                            if archived_current {
+                                self.open_conversation("windows-owner".into());
+                            } else {
+                                self.schedule(
+                                    Operation::ListConversations {
+                                        include_archived: false,
+                                    },
+                                    Duration::ZERO,
+                                );
+                            }
+                        }
+                        OperationKind::AddMemory | OperationKind::DeleteMemory => {
+                            if completion.kind == OperationKind::AddMemory {
+                                self.memory.content.zeroize();
+                            }
+                            self.memory.delete_confirm = None;
+                            self.schedule(
+                                Operation::ListMemories {
+                                    query: self.memory.query_opt(),
+                                },
+                                Duration::ZERO,
+                            );
                         }
                         OperationKind::Task
                             if self
@@ -394,23 +785,28 @@ impl Desktop {
         {
             if let Some(task) = &self.state.task {
                 if !task.status.terminal() {
-                    let operation =
-                        if self.poll_approvals && task.status == TaskStatus::AwaitingApproval {
-                            Operation::Approvals
-                        } else if self.poll_history {
-                            Operation::History
+                    if self.events_active {
+                        // The stream drives updates; this is a stuck-stream guard.
+                        self.schedule(Operation::Task(task.id.clone()), POLL_SAFETY);
+                    } else {
+                        let operation =
+                            if self.poll_approvals && task.status == TaskStatus::AwaitingApproval {
+                                Operation::Approvals
+                            } else if self.poll_history {
+                                Operation::History
+                            } else {
+                                Operation::Task(task.id.clone())
+                            };
+                        if task.status == TaskStatus::AwaitingApproval {
+                            self.poll_approvals = !self.poll_approvals;
+                            if !self.poll_approvals {
+                                self.poll_history = !self.poll_history;
+                            }
                         } else {
-                            Operation::Task(task.id.clone())
-                        };
-                    if task.status == TaskStatus::AwaitingApproval {
-                        self.poll_approvals = !self.poll_approvals;
-                        if !self.poll_approvals {
                             self.poll_history = !self.poll_history;
                         }
-                    } else {
-                        self.poll_history = !self.poll_history;
+                        self.schedule(operation, POLL_GAP);
                     }
-                    self.schedule(operation, POLL_GAP);
                 }
             } else if self.section == Section::Approvals {
                 self.schedule(Operation::Approvals, POLL_GAP * 2);
@@ -418,1417 +814,549 @@ impl Desktop {
         }
     }
 
-    fn sidebar(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("sidebar")
-            .exact_width(SIDEBAR_W)
+    fn missing_section_op(&self) -> Option<Operation> {
+        match self.section {
+            Section::Chat | Section::Conversations => {
+                (!self.state.conversations_loaded).then(|| Operation::ListConversations {
+                    include_archived: false,
+                })
+            }
+            Section::Memory => (!self.state.memories_loaded).then(|| Operation::ListMemories {
+                query: self.memory.query_opt(),
+            }),
+            Section::Providers => (!self.state.providers_loaded).then_some(Operation::Providers),
+            Section::Connectors => (!self.state.connectors_loaded).then_some(Operation::Connectors),
+            Section::Approvals => (!self.state.approvals_loaded).then_some(Operation::Approvals),
+            Section::Fleet | Section::Settings => None,
+        }
+    }
+
+    fn ensure_section_data(&mut self) {
+        if !self.state.connected || self.state.unknown_outcome || self.refreshing {
+            return;
+        }
+        let Some(operation) = self.missing_section_op() else {
+            return;
+        };
+        if self.pending.is_some() {
+            return;
+        }
+        if self.ready() {
+            self.start_request(operation);
+        } else {
+            self.schedule(operation, Duration::ZERO);
+        }
+    }
+
+    fn open_section(&mut self, section: Section) {
+        if self.section != section {
+            self.section = section;
+            self.model_open = false;
+        }
+        self.ensure_section_data();
+    }
+
+    pub(crate) fn open_conversation(&mut self, id: String) {
+        if !valid_id(&id) {
+            return;
+        }
+        self.conversation = id;
+        self.section = Section::Chat;
+        self.reset_scope(true);
+        self.refresh();
+    }
+
+    pub(crate) fn conversation_title(&self) -> String {
+        self.state
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == self.conversation)
+            .map(|conversation| conversation.display_title().to_owned())
+            .unwrap_or_else(|| self.conversation.clone())
+    }
+
+    pub(crate) fn conversation_kind(&self) -> Option<&str> {
+        self.state
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == self.conversation)
+            .map(|conversation| conversation.kind.as_str())
+    }
+
+    pub(crate) fn conversation_accepts_turns(&self) -> bool {
+        self.state
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == self.conversation)
+            .is_none_or(|conversation| conversation.accepts_turns)
+    }
+
+    fn check_updates(&mut self) {
+        if self.update.checking || updater::configured_repo().is_none() {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.update.rx = Some(receiver);
+        self.update.checking = true;
+        self.update.error = None;
+        let spawned = std::thread::Builder::new()
+            .name("serabot-update".into())
+            .spawn(move || {
+                let result = match updater::Updater::from_build_env() {
+                    Some(updater) => updater.check().map_err(|error| error.to_string()),
+                    None => Ok(None),
+                };
+                let _ = sender.send(result);
+            });
+        if spawned.is_err() {
+            self.update.rx = None;
+            self.update.checking = false;
+            self.update.error = Some("Could not start the update check.".into());
+        }
+    }
+
+    fn poll_updates(&mut self) {
+        let received = self
+            .update
+            .rx
+            .as_ref()
+            .map(std::sync::mpsc::Receiver::try_recv);
+        match received {
+            Some(Ok(Ok(Some(info)))) => {
+                self.update.rx = None;
+                self.update.checking = false;
+                self.update.info = Some(info);
+                self.update.dismissed = false;
+                self.update.error = None;
+            }
+            Some(Ok(Ok(None))) => {
+                self.update.rx = None;
+                self.update.checking = false;
+                self.update.info = None;
+            }
+            Some(Ok(Err(error))) => {
+                self.update.rx = None;
+                self.update.checking = false;
+                self.update.error = Some(error);
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.update.rx = None;
+                self.update.checking = false;
+                self.update.error = Some("The update check stopped unexpectedly.".into());
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    fn rail(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("rail")
+            .exact_width(design::RAIL_W)
             .resizable(false)
             .frame(
                 Frame::new()
-                    .fill(PANEL)
-                    .stroke(Stroke::new(1.0_f32, STROKE))
-                    .inner_margin(Margin::symmetric(16, 16)),
+                    .fill(design::RAIL)
+                    .stroke(Stroke::new(1.0_f32, design::STROKE_SOFT))
+                    .inner_margin(Margin::symmetric(0, 8)),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("SeraBot").size(22.0).strong().color(TEXT));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if self.pending.is_some() {
-                            ui.spinner();
-                        }
-                        let (label, fg, bg) = if self.pending.is_some() {
-                            ("Syncing", WARNING, Color32::from_rgb(52, 42, 28))
-                        } else if self.state.connected {
-                            ("Connected", TEAL, Color32::from_rgb(24, 44, 40))
-                        } else {
-                            ("Offline", MUTED, Color32::from_rgb(32, 36, 42))
-                        };
-                        status_chip(ui, label, fg, bg);
-                    });
-                });
-                ui.label(
-                    RichText::new("Owner console · session only")
-                        .size(11.0)
-                        .color(MUTED),
-                );
-                if !self.state.version.is_empty() {
-                    ui.label(
-                        RichText::new(format!("server {}", self.state.version))
-                            .size(11.0)
-                            .color(MUTED),
+                ui.vertical_centered(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(36.0, 36.0), Sense::hover());
+                    ui.painter()
+                        .circle_filled(rect.center(), 15.0, design::ACCENT_DIM);
+                    ui.painter().circle_stroke(
+                        rect.center(),
+                        15.0,
+                        Stroke::new(1.0_f32, design::ACCENT),
                     );
-                }
-                ui.add_space(14.0);
-                ui.separator();
-                ui.add_space(10.0);
-
-                for (section, label, hint) in [
-                    (Section::Chat, "Chat", "Conversation and model routing"),
-                    (
-                        Section::Approvals,
-                        "Approvals",
-                        if self.state.approvals.is_empty() {
-                            "No pending actions"
-                        } else {
-                            "Pending gateway decisions"
-                        },
-                    ),
-                    (Section::Fleet, "Fleet", "Bots and conversation nodes"),
-                ] {
-                    let selected = self.section == section;
-                    let fill = if selected {
-                        Color32::from_rgb(32, 40, 46)
-                    } else {
-                        Color32::TRANSPARENT
-                    };
-                    let response = ui
-                        .horizontal(|ui| {
-                            Frame::new()
-                                .fill(if selected { TEAL } else { Color32::TRANSPARENT })
-                                .show(ui, |ui| {
-                                    ui.set_min_size(Vec2::new(3.0, 44.0));
-                                });
-                            Frame::new()
-                                .fill(fill)
-                                .corner_radius(8.0)
-                                .inner_margin(Margin::symmetric(10, 8))
-                                .show(ui, |ui| {
-                                    ui.set_width((ui.available_width() - 6.0).max(0.0));
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            RichText::new(label)
-                                                .strong()
-                                                .size(14.0)
-                                                .color(if selected { TEAL } else { TEXT }),
-                                        );
-                                        if section == Section::Approvals
-                                            && !self.state.approvals.is_empty()
-                                        {
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    status_chip(
-                                                        ui,
-                                                        &format!("{}", self.state.approvals.len()),
-                                                        WARNING,
-                                                        Color32::from_rgb(52, 42, 28),
-                                                    );
-                                                },
-                                            );
-                                        }
-                                    });
-                                    ui.label(RichText::new(hint).size(11.0).color(MUTED));
-                                })
-                                .response
-                                .interact(egui::Sense::click())
-                        })
-                        .inner;
-                    if response.clicked() {
-                        self.section = section;
-                        if section == Section::Approvals
-                            && self.ready()
-                            && self.state.connected
-                            && !self.state.unknown_outcome
-                        {
-                            self.start_request(Operation::Approvals);
-                        }
-                    }
-                    ui.add_space(4.0);
-                }
-
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(10.0);
-                ui.label(RichText::new("Conversation").small().color(MUTED));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.conversation)
-                        .desired_width(f32::INFINITY)
-                        .char_limit(128)
-                        .hint_text("conversation id"),
-                );
-                ui.horizontal(|ui| {
-                    let can_open =
-                        self.ready() && self.state.connected && valid_id(&self.conversation);
-                    if ui
-                        .add_enabled(
-                            can_open && !self.active_conversation(),
-                            egui::Button::new("Open"),
-                        )
-                        .clicked()
-                    {
-                        self.reset_scope(true);
-                        ctx.memory_mut(|memory| *memory = Default::default());
-                        self.refresh();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.ready() && self.state.connected,
-                            egui::Button::new("New"),
-                        )
-                        .clicked()
-                    {
-                        self.conversation = format!("windows-{}", uuid::Uuid::new_v4());
-                        self.reset_scope(true);
-                        ctx.memory_mut(|memory| *memory = Default::default());
-                        self.refresh();
-                    }
-                });
-                if !self.active_conversation() && self.state.connected {
-                    ui.colored_label(WARNING, "Open to load this conversation id.");
-                }
-
-                ui.add_space(10.0);
-                self.model_block(ui);
-
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if self.credentials.is_some() {
-                            if ui.button("Disconnect").clicked() {
-                                self.disconnect(ctx);
-                            }
-                            if ui
-                                .add_enabled(
-                                    self.ready()
-                                        && self.state.connected
-                                        && self.active_conversation(),
-                                    egui::Button::new("Refresh"),
-                                )
-                                .clicked()
-                            {
-                                self.refresh();
-                            }
-                        }
-                    });
-                    ui.add_space(8.0);
-                    if ui
-                        .selectable_label(self.connection_open, "Connection")
-                        .clicked()
-                    {
-                        self.connection_open = !self.connection_open;
-                    }
-                    if self.connection_open {
-                        ui.add_space(6.0);
-                        ui.add_enabled_ui(self.credentials.is_none(), |ui| {
-                            ui.label(RichText::new("Server").small().color(MUTED));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.server)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text("https://… or http://127.0.0.1:8787")
-                                    .char_limit(2048),
-                            );
-                            ui.add_space(4.0);
-                            ui.label(RichText::new("API token").small().color(MUTED));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.token)
-                                    .password(true)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text("owner token")
-                                    .char_limit(512),
-                            );
-                            ui.add_space(6.0);
-                            if ui
-                                .add_enabled(self.ready(), egui::Button::new("Connect"))
-                                .clicked()
-                            {
-                                self.connect(ctx);
-                            }
-                            let enter = ui.ctx().input(|input| {
-                                input.key_pressed(egui::Key::Enter)
-                                    && !input.modifiers.any()
-                            });
-                            if enter
-                                && self.ready()
-                                && validate_endpoint(&self.server).is_ok()
-                                && valid_token(&self.token)
-                                && valid_id(&self.conversation)
-                            {
-                                self.connect(ctx);
-                            }
-                        });
-                        ui.label(
-                            RichText::new(format!(
-                                "HTTPS, or exact loopback HTTP for tunnels. Token stays in memory. Builds do not embed the {OWNER_TOKEN_SECRET_NAME} secret."
-                            ))
-                            .size(11.0)
-                            .color(MUTED),
-                        );
-                    }
-                });
-            });
-    }
-
-    fn model_block(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Model routing").small().color(MUTED));
-        let ready = self.ready()
-            && self.active_conversation()
-            && !self.state.unknown_outcome
-            && self.state.task.as_ref().is_none_or(|t| t.status.terminal());
-        let Some(catalog) = &self.state.catalog else {
-            ui.label(
-                RichText::new("Connect to load providers.")
-                    .size(12.0)
-                    .color(MUTED),
-            );
-            return;
-        };
-        let before = self.state.draft.clone();
-        ui.add_enabled_ui(ready, |ui| {
-            let provider_label = if self.state.draft.is_auto() {
-                "auto".to_string()
-            } else {
-                self.state.draft.provider.clone()
-            };
-            egui::ComboBox::from_id_salt("provider")
-                .width(ui.available_width() - 8.0)
-                .selected_text(provider_label)
-                .show_ui(ui, |ui| {
-                    if ui
-                        .selectable_label(self.state.draft.is_auto(), "auto")
-                        .clicked()
-                    {
-                        self.state.draft = Selection::auto();
-                    }
-                    for provider in &catalog.providers {
-                        let label = if provider.data_egress_approved {
-                            provider.id.clone()
-                        } else {
-                            format!("{} · blocked", provider.id)
-                        };
-                        if ui
-                            .add_enabled(
-                                provider.data_egress_approved,
-                                egui::SelectableLabel::new(
-                                    !self.state.draft.is_auto()
-                                        && self.state.draft.provider == provider.id,
-                                    label,
-                                ),
-                            )
-                            .clicked()
-                        {
-                            self.state.draft.provider = provider.id.clone();
-                            self.state.draft.model =
-                                provider.models.first().cloned().unwrap_or_default();
-                        }
-                    }
-                });
-            let model_label = if self.state.draft.is_auto() {
-                catalog
-                    .effective_selection
-                    .as_ref()
-                    .map(|s| format!("{} / {}", s.provider, s.model))
-                    .unwrap_or_else(|| "automatic".into())
-            } else {
-                format!("{} / {}", self.state.draft.provider, self.state.draft.model)
-            };
-            egui::ComboBox::from_id_salt("model")
-                .width(ui.available_width() - 8.0)
-                .selected_text(model_label)
-                .show_ui(ui, |ui| {
-                    if self.state.draft.is_auto() {
-                        ui.label(
-                            RichText::new("Autoselect uses bot defaults and approved models.")
-                                .size(11.0)
-                                .color(MUTED),
-                        );
-                        return;
-                    }
-                    let entries = if catalog.entries.is_empty() {
-                        catalog
-                            .providers
-                            .iter()
-                            .flat_map(|provider| {
-                                provider.models.iter().map(|model| {
-                                    (
-                                        provider.id.clone(),
-                                        model.clone(),
-                                        provider.data_egress_approved,
-                                    )
-                                })
-                            })
-                            .collect::<Vec<_>>()
-                    } else {
-                        catalog
-                            .entries
-                            .iter()
-                            .map(|entry| {
-                                (
-                                    entry.provider.clone(),
-                                    entry.model.clone(),
-                                    entry.data_egress_approved,
-                                )
-                            })
-                            .collect()
-                    };
-                    for (provider, model, approved) in entries {
-                        let label = format!("{provider} / {model}");
-                        ui.add_enabled_ui(approved, |ui| {
-                            if ui
-                                .selectable_label(
-                                    self.state.draft.provider == provider
-                                        && self.state.draft.model == model,
-                                    label,
-                                )
-                                .clicked()
-                            {
-                                self.state.draft.provider = provider;
-                                self.state.draft.model = model;
-                            }
-                        });
-                    }
-                });
-        });
-        if before != self.state.draft {
-            self.confirmed_egress = false;
-        }
-        if !catalog.allows(&catalog.selection) {
-            ui.colored_label(WARNING, "Saved profile unavailable or egress not approved.");
-        }
-        if self.state.draft != catalog.selection {
-            let saved = if catalog.selection.is_auto() {
-                catalog
-                    .effective_selection
-                    .as_ref()
-                    .map(|s| format!("auto → {} / {}", s.provider, s.model))
-                    .unwrap_or_else(|| "auto".into())
-            } else {
-                format!(
-                    "{} / {}",
-                    catalog.selection.provider, catalog.selection.model
-                )
-            };
-            ui.label(
-                RichText::new(format!("Saved {saved}"))
-                    .size(11.0)
-                    .color(MUTED),
-            );
-            ui.checkbox(
-                &mut self.confirmed_egress,
-                "Provider will receive this conversation history",
-            );
-            let can_apply = ready && self.confirmed_egress && catalog.allows(&self.state.draft);
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(can_apply, egui::Button::new("Apply"))
-                    .clicked()
-                {
-                    self.state.error = None;
-                    self.confirmed_egress = false;
-                    self.start_request(Operation::Apply(self.state.draft.clone()));
-                }
-                if ui
-                    .add_enabled(ready, egui::Button::new("Discard"))
-                    .clicked()
-                {
-                    if let Some(catalog) = &self.state.catalog {
-                        self.state.draft = catalog.selection.clone();
-                    }
-                    self.confirmed_egress = false;
-                }
-            });
-        }
-    }
-
-    fn section_header(&self, ui: &mut egui::Ui, title: &str, subtitle: &str) {
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(RichText::new(title).size(22.0).strong().color(TEXT));
-                ui.label(RichText::new(subtitle).size(12.0).color(MUTED));
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.section == Section::Chat
-                    && self.state.connected
-                    && self.active_conversation()
-                {
-                    let draft = if self.state.draft.is_auto() {
-                        "auto".into()
-                    } else {
-                        format!("{} / {}", self.state.draft.provider, self.state.draft.model)
-                    };
-                    status_chip(ui, &draft, TEAL, Color32::from_rgb(24, 44, 40));
-                }
-            });
-        });
-        ui.add_space(10.0);
-    }
-
-    fn status_banner(&mut self, ui: &mut egui::Ui) {
-        if let Some(error) = &self.state.error {
-            Frame::new()
-                .fill(Color32::from_rgb(48, 32, 28))
-                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(88, 58, 48)))
-                .corner_radius(10.0)
-                .inner_margin(Margin::symmetric(12, 10))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        status_chip(ui, "Notice", WARNING, Color32::from_rgb(62, 44, 28));
-                        ui.label(RichText::new(error).color(TEXT));
-                    });
-                });
-            ui.add_space(8.0);
-        }
-        if self.state.unknown_outcome && self.reviewed_unknown {
-            Frame::new()
-                .fill(Color32::from_rgb(48, 40, 24))
-                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(88, 72, 40)))
-                .corner_radius(10.0)
-                .inner_margin(Margin::symmetric(12, 10))
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new("Reads refreshed. A missing reply does not prove failure.")
-                            .color(TEXT),
+                    ui.painter().text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        "S",
+                        FontId::proportional(15.0),
+                        design::ACCENT,
                     );
-                    if ui
-                        .button("I reviewed server state — allow new actions")
-                        .clicked()
-                    {
-                        self.state.unknown_outcome = false;
-                        self.state.error = None;
-                        self.reviewed_unknown = false;
-                    }
                 });
-            ui.add_space(8.0);
-        }
-        if let Some(task) = &self.state.task {
-            let (fg, bg) = match task.status {
-                TaskStatus::Failed => (DANGER, Color32::from_rgb(52, 32, 32)),
-                TaskStatus::AwaitingApproval => (WARNING, Color32::from_rgb(52, 42, 28)),
-                TaskStatus::Done => (TEAL, Color32::from_rgb(24, 44, 40)),
-                _ => (MUTED, Color32::from_rgb(32, 36, 42)),
-            };
-            Frame::new()
-                .fill(PANEL_ALT)
-                .stroke(Stroke::new(1.0_f32, STROKE))
-                .corner_radius(10.0)
-                .inner_margin(Margin::symmetric(12, 8))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        status_chip(ui, task.status.label(), fg, bg);
-                        ui.label(
-                            RichText::new(format!("{} · {}", task.bot, task.id))
-                                .size(12.0)
-                                .color(MUTED),
-                        );
-                        if task.status == TaskStatus::AwaitingApproval {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.button("Open approvals →").clicked() {
-                                        self.section = Section::Approvals;
-                                    }
-                                },
-                            );
-                        }
-                    });
-                });
-            ui.add_space(8.0);
-        }
-    }
-
-    fn composer_block(&mut self, ui: &mut egui::Ui, rows: usize) {
-        Frame::new()
-            .fill(PANEL_ALT)
-            .stroke(Stroke::new(1.0_f32, STROKE))
-            .corner_radius(12.0)
-            .inner_margin(Margin::symmetric(12, 10))
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                let edit = ui.add_enabled(
-                    self.state.connected && self.active_conversation(),
-                    egui::TextEdit::multiline(&mut self.composer)
-                        .desired_rows(rows)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("Message SeraBot…")
-                        .char_limit(8000),
-                );
-                let shortcut = ui
-                    .ctx()
-                    .input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::Enter));
-                ui.horizontal(|ui| {
-                    let enabled = self.ready()
-                        && self.active_conversation()
-                        && self.state.can_send()
-                        && valid_text(&self.composer);
-                    if ui
-                        .add_enabled(
-                            enabled,
-                            egui::Button::new(RichText::new("Send").strong().color(TEAL)),
-                        )
-                        .clicked()
-                        || (enabled && shortcut)
-                    {
-                        self.state.error = None;
-                        let text = Zeroizing::new(std::mem::take(&mut self.composer));
-                        self.start_request(Operation::Submit(text));
-                        ui.ctx().memory_mut(|memory| *memory = Default::default());
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(format!(
-                                "Ctrl+Enter · {} / 8,000",
-                                self.composer.chars().count()
-                            ))
-                            .small()
-                            .color(MUTED),
-                        );
-                    });
-                    let _ = edit;
-                });
-            });
-    }
-
-    fn chat_panel(&mut self, ui: &mut egui::Ui) {
-        self.section_header(
-            ui,
-            "Chat",
-            if self.active_conversation() {
-                &self.conversation
-            } else {
-                "Open a conversation id from the sidebar"
-            },
-        );
-        self.status_banner(ui);
-        let composer_rows = if ui.available_height() < 420.0 {
-            2_usize
-        } else {
-            3_usize
-        };
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            ui.set_width(ui.available_width());
-            self.composer_block(ui, composer_rows);
-            ui.add_space(8.0);
-            let scroll_h = ui.available_height().max(96.0);
-            egui::ScrollArea::vertical()
-                .id_salt(("history", self.state.scope.epoch))
-                .auto_shrink([false, false])
-                .stick_to_bottom(true)
-                .max_height(scroll_h)
-                .show(ui, |ui| {
-                    ui.set_min_height(scroll_h - 4.0);
-                    ui.set_width(ui.available_width());
-                    if self.state.messages.is_empty() {
-                        empty_state(
-                            ui,
-                            if !self.state.connected {
-                                "Connect to your host"
-                            } else if !self.state.history_loaded {
-                                "Loading conversation"
-                            } else {
-                                "No messages yet"
-                            },
-                            if !self.state.connected {
-                                "Use an HTTPS origin or a loopback SSH tunnel, then paste the owner API token."
-                            } else {
-                                "Only visible user and assistant messages from the server appear here."
-                            },
-                        );
-                        return;
-                    }
-                    for message in &self.state.messages {
-                        ui.add_space(10.0);
-                        let user = message.role == Role::User;
-                        let max_w = (ui.available_width() * 0.88).max(200.0);
-                        ui.horizontal(|ui| {
-                            if user {
-                                ui.add_space((ui.available_width() - max_w).max(0.0));
-                            }
-                            Frame::new()
-                                .fill(if user { USER_BUBBLE } else { BOT_BUBBLE })
-                                .stroke(Stroke::new(
-                                    1.0_f32,
-                                    if user {
-                                        Color32::from_rgb(48, 72, 68)
-                                    } else {
-                                        STROKE
-                                    },
-                                ))
-                                .corner_radius(14.0)
-                                .inner_margin(Margin::symmetric(14, 12))
-                                .show(ui, |ui| {
-                                    ui.set_max_width(max_w);
-                                    let speaker = if user {
-                                        "You".to_owned()
-                                    } else if let Some(name) =
-                                        message.name.clone().filter(|name| valid_speaker(name))
-                                    {
-                                        name
-                                    } else {
-                                        "SeraBot".into()
-                                    };
-                                    ui.horizontal(|ui| {
-                                        ui.label(
-                                            RichText::new(speaker)
-                                                .size(12.0)
-                                                .strong()
-                                                .color(if user { TEAL } else { MUTED }),
-                                        );
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                ui.label(
-                                                    RichText::new(&message.created_at)
-                                                        .size(11.0)
-                                                        .color(MUTED),
-                                                );
-                                            },
-                                        );
-                                    });
-                                    ui.add_space(6.0);
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&message.content)
-                                                .size(14.0)
-                                                .color(TEXT),
-                                        )
-                                        .wrap()
-                                        .selectable(true),
-                                    );
-                                });
-                        });
-                    }
-                    ui.add_space(12.0);
-                });
-        });
-    }
-
-    fn approvals_panel(&mut self, ui: &mut egui::Ui) {
-        self.section_header(
-            ui,
-            "Approvals",
-            "Gateway consent for outbound tools and effects",
-        );
-        self.status_banner(ui);
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(
-                    "Decisions bind the exact payload, destination, artifact hash, policy version, and expiry.",
-                )
-                .size(12.0)
-                .color(MUTED),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(
-                        self.ready() && self.state.connected && !self.state.unknown_outcome,
-                        egui::Button::new("Refresh list"),
-                    )
-                    .clicked()
-                {
-                    self.start_request(Operation::Approvals);
-                }
-            });
-        });
-        ui.add_space(12.0);
-        if !self.state.connected {
-            empty_state(
-                ui,
-                "Connect to review approvals",
-                "Pending gateway actions appear here once you are connected to the owner API.",
-            );
-            return;
-        }
-        if !self.state.approvals_loaded {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new("Loading approvals…").color(MUTED));
-            });
-            return;
-        }
-        if self.state.approvals.is_empty() {
-            empty_state(
-                ui,
-                "Nothing pending",
-                "When the gateway needs consent, actions appear here and in Telegram.",
-            );
-            return;
-        }
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for approval in self.state.approvals.clone() {
-                    ui.add_space(10.0);
-                    Frame::new()
-                        .fill(PANEL_ALT)
-                        .stroke(Stroke::new(1.0_f32, STROKE))
-                        .corner_radius(14.0)
-                        .inner_margin(Margin::symmetric(16, 14))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                status_chip(
-                                    ui,
-                                    &approval.tool,
-                                    TEAL,
-                                    Color32::from_rgb(24, 44, 40),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "expires {}",
-                                                approval.expires_at
-                                            ))
-                                            .size(11.0)
-                                            .color(MUTED),
-                                        );
-                                    },
-                                );
-                            });
-                            ui.add_space(10.0);
-                            ui.label(
-                                RichText::new(&approval.summary)
-                                    .size(14.0)
-                                    .color(TEXT),
-                            );
-                            ui.add_space(6.0);
-                            ui.label(
-                                RichText::new(format!("Approval id · {}", approval.id))
-                                    .size(11.0)
-                                    .color(MUTED),
-                            );
-                            ui.add_space(12.0);
-                            ui.separator();
-                            ui.add_space(10.0);
-                            ui.horizontal(|ui| {
-                                let can = self.ready() && !self.state.unknown_outcome;
-                                for decision in [
-                                    ApprovalDecision::Once,
-                                    ApprovalDecision::Always,
-                                    ApprovalDecision::Deny,
-                                ] {
-                                    let button = match decision {
-                                        ApprovalDecision::Deny => egui::Button::new(
-                                            RichText::new(decision.label()).color(DANGER),
-                                        ),
-                                        ApprovalDecision::Once => egui::Button::new(
-                                            RichText::new(decision.label())
-                                                .strong()
-                                                .color(TEAL),
-                                        ),
-                                        ApprovalDecision::Always => {
-                                            egui::Button::new(decision.label())
-                                        }
-                                    };
-                                    if ui.add_enabled(can, button).clicked() {
-                                        self.state.error = None;
-                                        self.start_request(Operation::Decide {
-                                            id: approval.id.clone(),
-                                            decision,
-                                        });
-                                    }
-                                }
-                            });
-                            ui.add_space(6.0);
-                            ui.label(
-                                RichText::new(
-                                    "Once = this exact payload. Always = revocable grant for this exact payload.",
-                                )
-                                .size(11.0)
-                                .color(MUTED),
-                            );
-                        });
-                }
-            });
-    }
-
-    fn fleet_panel(&mut self, ui: &mut egui::Ui) {
-        self.section_header(
-            ui,
-            "Fleet",
-            "Disabled specialists, skill packs, and conversation nodes",
-        );
-        self.status_banner(ui);
-        if !self.state.connected {
-            empty_state(
-                ui,
-                "Connect to change the fleet",
-                "Create a disabled specialist, a skill pack, or a section, group, direct, or room node. Nothing is written until you submit.",
-            );
-            return;
-        }
-        egui::ScrollArea::vertical()
-            .id_salt(("fleet", self.state.scope.epoch))
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                self.bot_card(ui);
-                ui.add_space(16.0);
-                self.skill_card(ui);
-                ui.add_space(16.0);
-                self.conversation_card(ui);
-                ui.add_space(8.0);
-            });
-    }
-
-    fn bot_card(&mut self, ui: &mut egui::Ui) {
-        Frame::new()
-            .fill(PANEL_ALT)
-            .stroke(Stroke::new(1.0_f32, STROKE))
-            .corner_radius(14.0)
-            .inner_margin(Margin::symmetric(16, 14))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new("New specialist")
-                        .size(16.0)
-                        .strong()
-                        .color(TEXT),
-                );
-                ui.label(
-                    RichText::new(
-                        "The id is the bot name. The description is stored in the prompt stub. The bot stays disabled until you restart, and it is not added to main.delegates.",
-                    )
-                    .size(12.0)
-                    .color(MUTED),
-                );
-                ui.add_space(8.0);
-                ui.label(RichText::new("Bot id").small().color(MUTED));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.bot_id)
-                        .desired_width(f32::INFINITY)
-                        .char_limit(32)
-                        .hint_text("notes"),
-                );
-                ui.add_space(4.0);
-                ui.label(RichText::new("Description").small().color(MUTED));
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.bot_description)
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY)
-                        .char_limit(2000)
-                        .hint_text("Synthetic notes specialist."),
-                );
                 ui.add_space(6.0);
-                ui.label(RichText::new("Tools").small().color(MUTED));
-                ui.label(
-                    RichText::new("Specialist allowlist only. delegate is not offered.")
-                        .size(11.0)
-                        .color(MUTED),
-                );
-                let columns = if ui.available_width() < 520.0 { 1 } else { 2 };
-                egui::ScrollArea::vertical()
-                    .id_salt("specialist-tools")
-                    .max_height(168.0)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        egui::Grid::new("specialist-tool-grid")
-                            .num_columns(columns)
-                            .spacing([12.0, 4.0])
-                            .show(ui, |ui| {
-                                for (index, name) in SPECIALIST_TOOLS.iter().enumerate() {
-                                    if let Some(flag) = self.bot_tools.get_mut(index) {
-                                        ui.checkbox(flag, *name);
-                                    }
-                                    if (index + 1) % columns == 0 {
-                                        ui.end_row();
-                                    }
-                                }
-                                if !SPECIALIST_TOOLS.is_empty()
-                                    && SPECIALIST_TOOLS.len() % columns != 0
-                                {
-                                    ui.end_row();
-                                }
-                            });
-                    });
-                let selected = self.bot_tools.iter().filter(|on| **on).count();
-                if selected > 32 {
-                    ui.colored_label(WARNING, "Select at most 32 tools.");
-                } else if selected == 0 {
-                    ui.label(
-                        RichText::new(
-                            "No tools selected. The bot file will list an empty tool set.",
-                        )
-                        .size(11.0)
-                        .color(MUTED),
-                    );
-                }
-                ui.add_space(6.0);
-                ui.label(RichText::new("Skills").small().color(MUTED));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.bot_skills)
-                        .desired_width(f32::INFINITY)
-                        .char_limit(512)
-                        .hint_text("ask, notes"),
-                );
-                ui.label(
-                    RichText::new(
-                        "Optional skill ids, separated by commas. The server rejects unknown skills.",
+                for section in Section::NAV {
+                    if design::rail_item(
+                        ui,
+                        section.icon(),
+                        section.label(),
+                        self.section == section,
                     )
-                    .size(11.0)
-                    .color(MUTED),
-                );
-                if let Some(bot) = self.state.created_bot.clone() {
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(format!("Created {} · disabled · not live", bot.id))
-                            .color(TEAL),
-                    );
-                    ui.label(
-                        RichText::new(format!("{} · {}", bot.bot_file, bot.prompt_file))
-                            .size(11.0)
-                            .color(MUTED),
-                    );
-                    if !bot.require_approval.is_empty() {
-                        ui.label(
-                            RichText::new(format!(
-                                "Approval required · {}",
-                                bot.require_approval.join(", ")
-                            ))
-                            .size(11.0)
-                            .color(MUTED),
-                        );
-                    }
-                    ui.label(
-                        RichText::new("Restart the server before this bot can run.")
-                            .size(11.0)
-                            .color(WARNING),
-                    );
-                }
-                ui.add_space(8.0);
-                let tools = self.selected_tools();
-                let can_create = self.ready()
-                    && !self.state.unknown_outcome
-                    && valid_bot_id(&self.bot_id)
-                    && valid_bot_description(&self.bot_description)
-                    && validate_tool_list(&tools).is_ok()
-                    && parse_skill_list(&self.bot_skills).is_ok();
-                if ui
-                    .add_enabled(
-                        can_create,
-                        egui::Button::new(RichText::new("Create disabled bot").strong().color(TEAL)),
-                    )
+                    .on_hover_text(section.hint())
                     .clicked()
-                {
-                    match parse_skill_list(&self.bot_skills) {
-                        Ok(skills) => {
-                            self.state.error = None;
-                            self.start_request(Operation::CreateBot {
-                                id: self.bot_id.clone(),
-                                description: Zeroizing::new(self.bot_description.clone()),
-                                tools,
-                                skills,
-                            });
-                        }
-                        Err(error) => self.state.error = Some(error.to_string()),
+                    {
+                        self.open_section(section);
                     }
                 }
-                if !self.bot_id.is_empty() && !valid_bot_id(&self.bot_id) {
-                    ui.label(
-                        RichText::new(
-                            "Use a lowercase slug (max 32). main and Windows device names are reserved.",
-                        )
-                        .size(11.0)
-                        .color(WARNING),
-                    );
-                }
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.label(RichText::new("On disk").small().color(MUTED));
-                let can_list = self.ready() && !self.state.unknown_outcome;
-                if ui
-                    .add_enabled(can_list, egui::Button::new("Refresh bots"))
-                    .clicked()
-                {
-                    self.state.error = None;
-                    self.start_request(Operation::ListBots);
-                }
-                ui.label(
-                    RichText::new(
-                        "Summaries only. GET /v1/bots does not return prompts or secrets.",
-                    )
-                    .size(11.0)
-                    .color(MUTED),
-                );
-                if self.state.bots_loaded && self.state.listed_bots.is_empty() {
-                    ui.label(
-                        RichText::new("No bot files on disk.")
-                            .size(11.0)
-                            .color(MUTED),
-                    );
-                }
-                let listed = self.state.listed_bots.clone();
-                if !listed.is_empty() {
-                    egui::ScrollArea::vertical()
-                        .id_salt("fleet-bots")
-                        .max_height(180.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for bot in listed {
-                                let status = format!(
-                                    "{} · {}",
-                                    if bot.enabled { "enabled" } else { "disabled" },
-                                    if bot.live { "live" } else { "not live" }
-                                );
-                                ui.label(
-                                    RichText::new(format!("{} · {} · {status}", bot.id, bot.role))
-                                        .color(TEXT),
-                                );
-                                ui.label(
-                                    RichText::new(format!("tools · {}", fleet_names(&bot.tools)))
-                                        .size(11.0)
-                                        .color(MUTED),
-                                );
-                                ui.label(
-                                    RichText::new(format!("skills · {}", fleet_names(&bot.skills)))
-                                        .size(11.0)
-                                        .color(MUTED),
-                                );
-                                ui.add_space(4.0);
-                            }
-                        });
-                }
-            });
-    }
-
-    fn skill_card(&mut self, ui: &mut egui::Ui) {
-        Frame::new()
-            .fill(PANEL_ALT)
-            .stroke(Stroke::new(1.0_f32, STROKE))
-            .corner_radius(14.0)
-            .inner_margin(Margin::symmetric(16, 14))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new("New skill")
-                        .size(16.0)
-                        .strong()
-                        .color(TEXT),
-                );
-                ui.label(
-                    RichText::new(
-                        "The id is the pack name. There is no path field. Description is one line, and the body is optional markdown. The pack stays off the running catalog until you restart, and a bot cannot load it until you add the id to that bot.",
-                    )
-                    .size(12.0)
-                    .color(MUTED),
-                );
-                ui.add_space(8.0);
-                ui.label(RichText::new("Skill id").small().color(MUTED));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.skill_id)
-                        .desired_width(f32::INFINITY)
-                        .char_limit(64)
-                        .hint_text("notes-pack"),
-                );
-                if !self.skill_id.is_empty() && !valid_new_skill_id(&self.skill_id) {
-                    ui.label(
-                        RichText::new(
-                            "Use a lowercase slug (max 64). Windows device names are reserved.",
-                        )
-                        .size(11.0)
-                        .color(WARNING),
-                    );
-                }
-                ui.add_space(4.0);
-                ui.label(RichText::new("Description").small().color(MUTED));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.skill_description)
-                        .desired_width(f32::INFINITY)
-                        .char_limit(MAX_SKILL_DESCRIPTION_CHARS)
-                        .hint_text("Short summary"),
-                );
-                if !valid_skill_description(&self.skill_description) {
-                    ui.label(
-                        RichText::new(
-                            "One line, at most 500 characters, without quotes or backslashes.",
-                        )
-                        .size(11.0)
-                        .color(WARNING),
-                    );
-                }
-                ui.add_space(4.0);
-                ui.label(RichText::new("Body").small().color(MUTED));
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.skill_body)
-                        .desired_rows(5)
-                        .desired_width(f32::INFINITY)
-                        .char_limit(MAX_SKILL_BODY_BYTES)
-                        .hint_text("Optional markdown. Leave empty for a short stub."),
-                );
-                ui.label(
-                    RichText::new("Optional. The server does not echo the body back.")
-                        .size(11.0)
-                        .color(MUTED),
-                );
-                if !valid_skill_body(self.skill_body.trim()) {
-                    ui.label(
-                        RichText::new(
-                            "Markdown only, at most 96,000 bytes, without control characters.",
-                        )
-                        .size(11.0)
-                        .color(WARNING),
-                    );
-                }
-                if let Some(skill) = self.state.created_skill.clone() {
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(format!("Created {} · not live", skill.id)).color(TEAL),
-                    );
-                    ui.label(RichText::new(skill.file).size(11.0).color(MUTED));
-                    ui.label(
-                        RichText::new(
-                            "Restart the server, then add this id to a bot before it can load the pack.",
-                        )
-                        .size(11.0)
-                        .color(WARNING),
-                    );
-                }
-                ui.add_space(8.0);
-                let can_create = self.ready()
-                    && !self.state.unknown_outcome
-                    && valid_new_skill_id(&self.skill_id)
-                    && valid_skill_description(&self.skill_description)
-                    && valid_skill_body(self.skill_body.trim());
-                if ui
-                    .add_enabled(
-                        can_create,
-                        egui::Button::new(RichText::new("Create skill").strong().color(TEAL)),
-                    )
-                    .clicked()
-                {
-                    let description = self.skill_description.trim().to_owned();
-                    let body = self.skill_body.trim().to_owned();
-                    self.state.error = None;
-                    self.start_request(Operation::CreateSkill {
-                        id: self.skill_id.clone(),
-                        description: Zeroizing::new(description),
-                        body: Zeroizing::new(body),
-                    });
-                }
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.label(RichText::new("On disk").small().color(MUTED));
-                let can_list = self.ready() && !self.state.unknown_outcome;
-                if ui
-                    .add_enabled(can_list, egui::Button::new("Refresh skills"))
-                    .clicked()
-                {
-                    self.state.error = None;
-                    self.start_request(Operation::ListSkills);
-                }
-                ui.label(
-                    RichText::new("Summaries only. GET /v1/skills does not return bodies.")
-                        .size(11.0)
-                        .color(MUTED),
-                );
-                if self.state.skills_loaded && self.state.listed_skills.is_empty() {
-                    ui.label(
-                        RichText::new("No skill packs on disk.").size(11.0).color(MUTED),
-                    );
-                }
-                let listed = self.state.listed_skills.clone();
-                if !listed.is_empty() {
-                    egui::ScrollArea::vertical()
-                        .id_salt("fleet-skills")
-                        .max_height(160.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for skill in listed {
-                                let title = match &skill.pack {
-                                    Some(pack) => format!("{} · {pack}", skill.id),
-                                    None => skill.id.clone(),
-                                };
-                                ui.label(RichText::new(title).color(TEXT));
-                                if !skill.description.is_empty() {
-                                    ui.label(
-                                        RichText::new(skill_blurb(&skill.description))
-                                            .size(11.0)
-                                            .color(MUTED),
-                                    );
-                                }
-                                ui.add_space(4.0);
-                            }
-                        });
-                }
-            });
-    }
-
-    fn conversation_card(&mut self, ui: &mut egui::Ui) {
-        Frame::new()
-            .fill(PANEL_ALT)
-            .stroke(Stroke::new(1.0_f32, STROKE))
-            .corner_radius(14.0)
-            .inner_margin(Margin::symmetric(16, 14))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new("New conversation")
-                        .size(16.0)
-                        .strong()
-                        .color(TEXT),
-                );
-                ui.label(
-                    RichText::new(
-                        "The server assigns the id. Sections and groups do not accept turns. Direct and room nodes do.",
-                    )
-                    .size(12.0)
-                    .color(MUTED),
-                );
-                ui.add_space(8.0);
-                ui.label(RichText::new("Kind").small().color(MUTED));
-                egui::ComboBox::from_id_salt("conversation-kind")
-                    .width((ui.available_width() - 8.0).max(0.0))
-                    .selected_text(self.conv_kind.label())
-                    .show_ui(ui, |ui| {
-                        for kind in ConversationKind::ALL {
-                            if ui
-                                .selectable_label(self.conv_kind == kind, kind.label())
-                                .clicked()
-                            {
-                                self.conv_kind = kind;
-                                if kind == ConversationKind::Section {
-                                    self.conv_parent.clear();
-                                }
-                            }
-                        }
-                    });
-                ui.add_space(4.0);
-                ui.label(RichText::new("Slug").small().color(MUTED));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.conv_slug)
-                        .desired_width(f32::INFINITY)
-                        .char_limit(32)
-                        .hint_text("finance"),
-                );
-                if let Some(id) = conversation_node_id(self.conv_kind, &self.conv_slug) {
-                    ui.label(
-                        RichText::new(format!("Server id {id}"))
-                            .size(11.0)
-                            .color(MUTED),
-                    );
-                } else if !self.conv_slug.is_empty() {
-                    ui.label(
-                        RichText::new("Slug must be a lowercase slug of at most 32 characters.")
-                            .size(11.0)
-                            .color(WARNING),
-                    );
-                }
-                let parent_hint = match self.conv_kind {
-                    ConversationKind::Section => {
-                        "No parent. Sections are the top of the tree."
-                    }
-                    ConversationKind::Group => {
-                        "Requires an existing section, for example sec:finance."
-                    }
-                    ConversationKind::Direct => {
-                        "Optional parent: a section (sec:) or group (grp:)."
-                    }
-                    ConversationKind::Room => {
-                        "Optional parent: a section (sec:) or group (grp:)."
-                    }
-                };
-                ui.label(RichText::new(parent_hint).size(11.0).color(MUTED));
-                if self.conv_kind != ConversationKind::Section {
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                     ui.add_space(4.0);
                     ui.label(
-                        RichText::new(if self.conv_kind == ConversationKind::Group {
-                            "Parent section"
-                        } else {
-                            "Parent"
-                        })
-                        .small()
-                        .color(MUTED),
+                        RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                            .size(9.5)
+                            .color(design::MUTED_DIM),
                     );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.conv_parent)
-                            .desired_width(f32::INFINITY)
-                            .char_limit(128)
-                            .hint_text(if self.conv_kind == ConversationKind::Group {
-                                "sec:finance"
-                            } else {
-                                "sec:finance or grp:ops"
-                            }),
-                    );
-                }
-                if let Some(node) = self.state.created_conversation.clone() {
-                    ui.add_space(8.0);
-                    let turns = if node.accepts_turns {
-                        "accepts turns"
-                    } else {
-                        "does not accept turns"
-                    };
-                    ui.label(RichText::new(format!("Created {} · {turns}", node.id)).color(TEAL));
-                    if ui.button("Use in sidebar").clicked() {
-                        self.conversation = node.id.clone();
+                    if design::rail_item(
+                        ui,
+                        design::NavIcon::Settings,
+                        "Settings",
+                        self.section == Section::Settings,
+                    )
+                    .clicked()
+                    {
+                        self.open_section(Section::Settings);
                     }
-                    ui.label(
-                        RichText::new(
-                            "Open that id from the sidebar to load it. Sections and groups still reject turns.",
-                        )
-                        .size(11.0)
-                        .color(MUTED),
-                    );
+                    let color = if self.pending.is_some() {
+                        design::WARNING
+                    } else if self.state.connected {
+                        design::ACCENT
+                    } else {
+                        design::MUTED
+                    };
+                    let (rect, response) =
+                        ui.allocate_exact_size(Vec2::new(14.0, 14.0), Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 4.0, color);
+                    let host = self
+                        .credentials
+                        .as_ref()
+                        .and_then(|credentials| credentials.endpoint.host_str())
+                        .unwrap_or("not connected");
+                    response.on_hover_text(host);
+                    ui.add_space(4.0);
+                });
+            });
+    }
+
+    fn top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            let heading = if self.section == Section::Chat {
+                self.conversation_title()
+            } else {
+                self.section.label().to_owned()
+            };
+            ui.label(
+                RichText::new(heading)
+                    .size(15.0)
+                    .strong()
+                    .color(design::TEXT),
+            );
+            if self.section == Section::Chat {
+                if let Some(kind) = self.conversation_kind() {
+                    design::chip(ui, kind, design::MUTED, design::PANEL_ALT);
                 }
-                ui.add_space(8.0);
-                let parent_owned = if self.conv_kind == ConversationKind::Section {
-                    None
+                if !self.active_conversation() {
+                    design::chip(ui, "opening…", design::WARNING, design::WARNING_BG);
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (label, color) = if self.pending.is_some() {
+                    ("Syncing", design::WARNING)
+                } else if self.state.connected {
+                    ("Online", design::ACCENT)
                 } else {
-                    let trimmed = self.conv_parent.trim();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed.to_owned())
-                    }
+                    ("Offline", design::MUTED)
                 };
-                let can_create = self.ready()
-                    && !self.state.unknown_outcome
-                    && valid_slug(&self.conv_slug)
-                    && valid_conversation_parent(self.conv_kind, parent_owned.as_deref()).is_ok();
+                Frame::new()
+                    .fill(design::PANEL_ALT)
+                    .stroke(Stroke::new(1.0_f32, design::STROKE_SOFT))
+                    .corner_radius(10.0)
+                    .inner_margin(Margin::symmetric(9, 4))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            let (rect, _) =
+                                ui.allocate_exact_size(Vec2::new(6.0, 6.0), Sense::hover());
+                            ui.painter().circle_filled(rect.center(), 3.0, color);
+                            ui.label(RichText::new(label).size(11.0).color(color));
+                        });
+                    });
                 if ui
-                    .add_enabled(
-                        can_create,
-                        egui::Button::new(
-                            RichText::new("Create conversation").strong().color(TEAL),
-                        ),
-                    )
+                    .small_button(RichText::new("Ctrl K").size(10.0).color(design::MUTED))
+                    .on_hover_text("Command palette")
                     .clicked()
                 {
-                    self.state.error = None;
-                    self.start_request(Operation::CreateConversation {
-                        kind: self.conv_kind,
-                        slug: self.conv_slug.clone(),
-                        parent_id: parent_owned,
-                    });
+                    self.open_palette();
+                }
+                if self.update.info.is_some()
+                    && ui
+                        .small_button(RichText::new("Update").size(10.0).color(design::ACCENT))
+                        .on_hover_text("Open Settings to install")
+                        .clicked()
+                {
+                    self.open_section(Section::Settings);
+                }
+                if self.section == Section::Chat
+                    && ui
+                        .small_button(
+                            RichText::new(self.model_label())
+                                .size(10.0)
+                                .color(design::MUTED),
+                        )
+                        .on_hover_text("Model routing for this conversation")
+                        .clicked()
+                {
+                    self.model_open = true;
+                }
+                let _ = ctx;
+            });
+        });
+    }
+
+    fn model_label(&self) -> String {
+        match &self.state.catalog {
+            Some(catalog) if catalog.selection.is_auto() => "auto".into(),
+            Some(catalog) => catalog.selection.model.clone(),
+            None => "model".into(),
+        }
+    }
+
+    fn open_palette(&mut self) {
+        self.palette_open = true;
+        self.palette_focus = true;
+        self.palette_query.clear();
+    }
+
+    fn palette_commands(&self) -> Vec<(String, PaletteAction)> {
+        let mut commands = Section::NAV
+            .into_iter()
+            .map(|section| {
+                (
+                    format!("Go to {}", section.label()),
+                    PaletteAction::Go(section),
+                )
+            })
+            .collect::<Vec<_>>();
+        commands.push((
+            "Go to Settings".into(),
+            PaletteAction::Go(Section::Settings),
+        ));
+        commands.push(("New conversation".into(), PaletteAction::NewConversation));
+        commands.push(("Refresh".into(), PaletteAction::Refresh));
+        if updater::configured_repo().is_some() {
+            commands.push(("Check for updates".into(), PaletteAction::CheckUpdates));
+        }
+        commands.push(("Disconnect".into(), PaletteAction::Disconnect));
+        commands.push(("Forget token".into(), PaletteAction::ForgetToken));
+        commands
+    }
+
+    fn run_palette(&mut self, action: PaletteAction, ctx: &egui::Context) {
+        match action {
+            PaletteAction::Go(section) => self.open_section(section),
+            PaletteAction::NewConversation => {
+                self.open_conversation(format!("windows-{}", uuid::Uuid::new_v4()));
+            }
+            PaletteAction::Refresh => self.refresh(),
+            PaletteAction::CheckUpdates => self.check_updates(),
+            PaletteAction::Disconnect => self.disconnect(ctx),
+            PaletteAction::ForgetToken => self.forget_token(ctx),
+        }
+    }
+
+    fn palette_window(&mut self, ctx: &egui::Context) {
+        if !self.palette_open {
+            return;
+        }
+        let mut action = None;
+        let mut close = false;
+        egui::Window::new("Command palette")
+            .id(egui::Id::new("serabot-palette"))
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .anchor(Align2::CENTER_TOP, [0.0, 84.0])
+            .default_width(440.0)
+            .resizable(false)
+            .frame(
+                Frame::new()
+                    .fill(design::PANEL)
+                    .stroke(Stroke::new(1.0_f32, design::STROKE))
+                    .corner_radius(14.0)
+                    .inner_margin(Margin::symmetric(14, 12))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 10],
+                        blur: 30,
+                        spread: 0,
+                        color: Color32::from_black_alpha(120),
+                    }),
+            )
+            .show(ctx, |ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.palette_query)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Type a command…"),
+                );
+                if self.palette_focus {
+                    response.request_focus();
+                    self.palette_focus = false;
+                }
+                ui.add_space(6.0);
+                let needle = self.palette_query.trim().to_lowercase();
+                let commands = self
+                    .palette_commands()
+                    .into_iter()
+                    .filter(|(label, _)| {
+                        needle.is_empty() || label.to_lowercase().contains(&needle)
+                    })
+                    .collect::<Vec<_>>();
+                if commands.is_empty() {
+                    ui.label(
+                        RichText::new("No matching command.")
+                            .size(12.0)
+                            .color(design::MUTED),
+                    );
+                }
+                for (label, item) in commands {
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(&label).size(13.0).color(design::TEXT))
+                                .frame(false)
+                                .min_size(Vec2::new(ui.available_width(), 28.0)),
+                        )
+                        .clicked()
+                    {
+                        action = Some(item);
+                    }
+                }
+                let enter = ui
+                    .ctx()
+                    .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+                if enter && action.is_none() {
+                    action = self
+                        .palette_commands()
+                        .into_iter()
+                        .find(|(label, _)| {
+                            needle.is_empty() || label.to_lowercase().contains(&needle)
+                        })
+                        .map(|(_, item)| item);
+                }
+                if ui.ctx().input(|input| input.key_pressed(egui::Key::Escape)) {
+                    close = true;
                 }
             });
+        if close {
+            self.palette_open = false;
+        }
+        if let Some(action) = action {
+            self.palette_open = false;
+            self.run_palette(action, ctx);
+        }
     }
-}
 
-fn fleet_names(items: &[String]) -> String {
-    if items.is_empty() {
-        return "none".into();
+    fn model_window(&mut self, ctx: &egui::Context) {
+        if !self.model_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Model routing")
+            .id(egui::Id::new("serabot-model"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(360.0)
+            .show(ctx, |ui| self.model_block(ui));
+        if !open {
+            self.model_open = false;
+        }
     }
-    skill_blurb(&items.join(", "))
-}
 
-fn skill_blurb(text: &str) -> String {
-    let mut chars = text.chars();
-    let blurb: String = chars.by_ref().take(160).collect();
-    if chars.next().is_some() {
-        format!("{blurb}…")
-    } else {
-        blurb
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let palette = ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::K));
+        if palette {
+            self.open_palette();
+        }
+        if self.palette_open {
+            return;
+        }
+        let mut jump = None;
+        for (index, section) in Section::NAV.into_iter().enumerate() {
+            let key = match index {
+                0 => egui::Key::Num1,
+                1 => egui::Key::Num2,
+                2 => egui::Key::Num3,
+                3 => egui::Key::Num4,
+                4 => egui::Key::Num5,
+                5 => egui::Key::Num6,
+                _ => egui::Key::Num7,
+            };
+            if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, key)) {
+                jump = Some(section);
+            }
+        }
+        if let Some(section) = jump {
+            self.open_section(section);
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::R)) {
+            self.refresh();
+        }
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.model_open = false;
+        }
+    }
+
+    pub(crate) fn show_toast(&mut self, message: impl Into<String>) {
+        self.toast = Some((message.into(), Instant::now()));
+    }
+
+    pub(crate) fn toast_message(&self) -> Option<&str> {
+        self.toast.as_ref().and_then(|(message, at)| {
+            (Instant::now().duration_since(*at) < TOAST_GAP).then_some(message.as_str())
+        })
     }
 }
 
 impl eframe::App for Desktop {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.receive();
-        egui::CentralPanel::default()
-            .frame(Frame::new().fill(BG).inner_margin(0.0))
-            .show(ctx, |_| {});
-        self.sidebar(ctx);
-        egui::CentralPanel::default()
-            .frame(
-                Frame::new()
-                    .fill(BG)
-                    .inner_margin(Margin::symmetric(20, 16)),
-            )
-            .show(ctx, |ui| match self.section {
-                Section::Chat => self.chat_panel(ui),
-                Section::Approvals => self.approvals_panel(ui),
-                Section::Fleet => self.fleet_panel(ui),
-            });
+        if self.state.connected {
+            self.handle_shortcuts(ctx);
+            self.rail(ctx);
+            if self.section == Section::Chat {
+                self.conversation_column(ctx);
+            }
+            egui::TopBottomPanel::top("topbar")
+                .exact_height(50.0)
+                .frame(
+                    Frame::new()
+                        .fill(design::BG)
+                        .stroke(Stroke::new(1.0_f32, design::STROKE_SOFT))
+                        .inner_margin(Margin::symmetric(14, 9)),
+                )
+                .show(ctx, |ui| self.top_bar(ui, ctx));
+            egui::CentralPanel::default()
+                .frame(
+                    Frame::new()
+                        .fill(design::BG)
+                        .inner_margin(Margin::symmetric(18, 14)),
+                )
+                .show(ctx, |ui| {
+                    self.update_banner(ui, ctx);
+                    match self.section {
+                        Section::Chat => self.chat_screen(ui),
+                        Section::Conversations => self.conversations_screen(ui),
+                        Section::Memory => self.memory_screen(ui),
+                        Section::Providers => self.providers_screen(ui),
+                        Section::Connectors => self.connectors_screen(ui),
+                        Section::Approvals => self.approvals_screen(ui, ctx),
+                        Section::Fleet => self.fleet_screen(ui),
+                        Section::Settings => self.settings_screen(ui, ctx),
+                    }
+                });
+            self.model_window(ctx);
+            self.palette_window(ctx);
+        } else {
+            let footer = build_footer();
+            if connect_screen(ctx, &mut self.connect, &footer) {
+                self.connect_now();
+            }
+        }
+
+        self.poll_events(ctx);
+        self.receive(ctx);
+        self.flush_events();
+        self.poll_updates();
+
         if self.pending.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         } else if let Some((when, _)) = &self.scheduled {
@@ -1842,6 +1370,19 @@ impl eframe::App for Desktop {
         } else if Instant::now() < self.next_request {
             ctx.request_repaint_after(self.next_request.saturating_duration_since(Instant::now()));
         }
+        if self.update.checking {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() >= TOAST_GAP)
+        {
+            self.toast = None;
+        }
+        if self.toast.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
     }
 
     fn persist_egui_memory(&self) -> bool {
@@ -1851,40 +1392,52 @@ impl eframe::App for Desktop {
 
 impl Drop for Desktop {
     fn drop(&mut self) {
-        self.token.zeroize();
         self.composer.zeroize();
-        self.bot_description.zeroize();
-        self.skill_description.zeroize();
-        self.skill_body.zeroize();
+        self.memory.content.zeroize();
         self.credentials = None;
+        self.stop_events();
+    }
+}
+
+fn build_footer() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    if updater::configured_repo().is_none() {
+        return format!("v{version} · developer build");
+    }
+    match updater::build_sha().and_then(|sha| sha.get(..8)) {
+        Some(sha) => format!("v{version} · {sha}"),
+        None => format!("v{version}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serabot_desktop::{
+        ConnectorStatus, ConversationSummary, MemoryEntry, Message, ProviderStatus, SecretStatus,
+        validate_endpoint,
+    };
 
     fn app() -> Desktop {
         Desktop {
             state: State::default(),
             worker: Some(Worker::start().unwrap()),
             credentials: None,
-            server: String::new(),
-            token: String::new(),
+            events: None,
+            events_active: false,
+            events_dirty: false,
+            last_event_id: 0,
+            last_event_kind: String::new(),
+            connect: ConnectState::new(String::new()),
             conversation: "windows-owner".into(),
-            composer: String::new(),
-            bot_id: String::new(),
-            bot_description: String::new(),
-            bot_tools: default_tool_flags(),
-            bot_skills: String::new(),
-            skill_id: String::new(),
-            skill_description: String::new(),
-            skill_body: String::new(),
-            conv_kind: ConversationKind::Section,
-            conv_slug: String::new(),
-            conv_parent: String::new(),
-            connection_open: true,
             section: Section::Chat,
+            composer: String::new(),
+            conv_search: String::new(),
+            fleet: FleetDraft::default(),
+            memory: MemoryDraft::default(),
+            rename: None,
+            archive_confirm: None,
+            chat: ChatView::default(),
             pending: None,
             scheduled: None,
             next_request: Instant::now(),
@@ -1894,7 +1447,109 @@ mod tests {
             poll_history: false,
             poll_paused: false,
             poll_approvals: false,
+            model_open: false,
+            palette_open: false,
+            palette_focus: false,
+            palette_query: String::new(),
+            toast: None,
+            update: UpdateUi::default(),
         }
+    }
+
+    fn summary(id: &str, kind: &str, title: &str) -> ConversationSummary {
+        ConversationSummary {
+            id: id.into(),
+            kind: kind.into(),
+            parent_id: (kind == "group").then(|| "sec:finance".into()),
+            title: Some(title.into()),
+            created_at: "2026-10-29T10:00:00.000Z".into(),
+            updated_at: "2026-10-29T10:05:00.000Z".into(),
+            last_message_at: Some("2026-10-29T10:05:00.000Z".into()),
+            archived_at: None,
+            accepts_turns: matches!(kind, "direct" | "room"),
+        }
+    }
+
+    fn connected_app() -> Desktop {
+        let mut app = app();
+        app.state.connected = true;
+        app.credentials = Some(Arc::new(Credentials {
+            endpoint: validate_endpoint("http://127.0.0.1:1").unwrap(),
+            token: SecretString::new("x".repeat(32)),
+        }));
+        app.state.history_loaded = true;
+        app.state.catalog = Some(
+            serde_json::from_str(r#"{"providers":[{"id":"approved","models":["small","large"],"data_egress_approved":true}],"selection":{"provider":"approved","model":"small"}}"#).unwrap(),
+        );
+        app.state.messages = vec![
+            Message {
+                id: "m1".into(),
+                role: Role::User,
+                content: "Synthetic question about a spreadsheet.".into(),
+                created_at: "2026-10-29T10:00:00.000Z".into(),
+                name: None,
+            },
+            Message {
+                id: "m2".into(),
+                role: Role::Assistant,
+                content: "Synthetic answer with a longer body so the bubble wraps across the available width and the virtualized layout has to measure a multi-line galley.".into(),
+                created_at: "2026-10-29T10:01:00.000Z".into(),
+                name: Some("analyst".into()),
+            },
+        ];
+        app.state.conversations = vec![
+            summary("windows-owner", "direct", "Owner"),
+            summary("room:review", "room", "Review room"),
+            summary("grp:ops", "group", "Operations"),
+        ];
+        app.state.conversations_loaded = true;
+        app.state.memories_loaded = true;
+        app.state.memories = vec![MemoryEntry {
+            id: "mem_1".into(),
+            kind: "fact".into(),
+            content: "Synthetic memory fixture.".into(),
+            source: "operator:desktop".into(),
+            created_at: "2026-10-29T10:00:00.000Z".into(),
+            updated_at: "2026-10-29T10:00:00.000Z".into(),
+        }];
+        app.state.providers = vec![ProviderStatus {
+            id: "approved".into(),
+            kind: "openai".into(),
+            models: vec!["small".into(), "large".into()],
+            routing_classes: vec!["default".into()],
+            data_egress_approved: true,
+            catalog_fetch: true,
+            catalog_verified: true,
+            secrets: [(
+                "api_key".into(),
+                SecretStatus {
+                    name: Some("OPENAI_API_KEY".into()),
+                    configured: true,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        }];
+        app.state.providers_loaded = true;
+        app.state.connectors = vec![ConnectorStatus {
+            id: "notion".into(),
+            kind: "oauth".into(),
+            enabled: false,
+            redirect_uri: Some("https://bot.example/v1/oauth/notion/callback".into()),
+            api_base: None,
+            default_inbox_id: None,
+            secrets: [(
+                "client_id".into(),
+                SecretStatus {
+                    name: Some("NOTION_CLIENT_ID".into()),
+                    configured: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        }];
+        app.state.connectors_loaded = true;
+        app
     }
 
     #[test]
@@ -1923,13 +1578,14 @@ mod tests {
     #[test]
     fn disconnect_wipes_inputs_credentials_and_pending_actions() {
         let mut app = app();
-        app.token = "synthetic-token".into();
+        app.connect.token = Zeroizing::new("synthetic-token".into());
         app.composer = "sensitive synthetic text".into();
-        app.bot_id = "notes".into();
-        app.bot_description = "synthetic description".into();
-        app.skill_id = "notes-pack".into();
-        app.skill_description = "synthetic summary".into();
-        app.skill_body = "synthetic skill body".into();
+        app.fleet.bot_id = "notes".into();
+        app.fleet.bot_description = "synthetic description".into();
+        app.fleet.skill_id = "notes-pack".into();
+        app.fleet.skill_description = "synthetic summary".into();
+        app.fleet.skill_body = "synthetic skill body".into();
+        app.memory.content = "synthetic memory".into();
         app.credentials = Some(Arc::new(Credentials {
             endpoint: validate_endpoint("http://127.0.0.1:1").unwrap(),
             token: SecretString::new("x".repeat(32)),
@@ -1937,64 +1593,194 @@ mod tests {
         app.schedule(Operation::History, POLL_GAP);
         let old = app.state.scope.clone();
         app.disconnect(&egui::Context::default());
-        assert!(app.token.is_empty());
+        assert!(app.connect.token.is_empty());
         assert!(app.composer.is_empty());
-        assert!(app.bot_id.is_empty());
-        assert!(app.bot_description.is_empty());
-        assert!(app.skill_id.is_empty());
-        assert!(app.skill_description.is_empty());
-        assert!(app.skill_body.is_empty());
+        assert!(app.fleet.bot_id.is_empty());
+        assert!(app.fleet.bot_description.is_empty());
+        assert!(app.fleet.skill_id.is_empty());
+        assert!(app.fleet.skill_description.is_empty());
+        assert!(app.fleet.skill_body.is_empty());
+        assert!(app.memory.content.is_empty());
         assert!(app.credentials.is_none());
         assert!(app.scheduled.is_none());
         assert!(!app.state.scope.accepts(&old));
     }
 
+    #[cfg(not(windows))]
     #[test]
-    fn opening_a_conversation_keeps_fleet_drafts() {
+    fn forgetting_the_token_returns_to_the_connect_screen_and_keeps_the_server() {
         let mut app = app();
-        app.bot_id = "notes".into();
-        app.bot_description = "synthetic description".into();
-        app.skill_id = "notes-pack".into();
-        app.skill_body = "synthetic skill body".into();
-        app.conv_slug = "finance".into();
         app.state.connected = true;
-        app.conversation = "dir:analyst".into();
-        app.reset_scope(true);
-        assert_eq!(app.bot_id, "notes");
-        assert_eq!(app.bot_description, "synthetic description");
-        assert_eq!(app.skill_id, "notes-pack");
-        assert_eq!(app.skill_body, "synthetic skill body");
-        assert_eq!(app.conv_slug, "finance");
-        app.reset_scope(false);
-        assert!(app.bot_id.is_empty());
-        assert!(app.bot_description.is_empty());
-        assert!(app.skill_id.is_empty());
-        assert!(app.skill_body.is_empty());
-        assert!(app.conv_slug.is_empty());
+        app.connect.server = "https://owner.example".into();
+        app.connect.token = Zeroizing::new("synthetic-forget-token-000000000000".into());
+        app.connect.persisted = true;
+        app.credentials = Some(Arc::new(Credentials {
+            endpoint: validate_endpoint("https://owner.example").unwrap(),
+            token: SecretString::new("synthetic-forget-token-000000000000".into()),
+        }));
+        app.forget_token(&egui::Context::default());
+        assert!(app.credentials.is_none());
+        assert!(!app.state.connected);
+        assert!(app.connect.token.is_empty());
+        assert!(!app.connect.persisted);
+        assert_eq!(app.connect.server, "https://owner.example");
+        assert!(app.connect.error.is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_rejected_token_is_dropped_and_explained() {
+        let mut app = app();
+        app.state.connected = true;
+        app.connect.token = Zeroizing::new("synthetic-revoked-token-00000000000".into());
+        app.connect.persisted = true;
+        app.credentials = Some(Arc::new(Credentials {
+            endpoint: validate_endpoint("https://owner.example").unwrap(),
+            token: SecretString::new("synthetic-revoked-token-00000000000".into()),
+        }));
+        app.reject_token(&egui::Context::default());
+        assert!(app.credentials.is_none());
+        assert!(!app.state.connected);
+        assert!(app.connect.token.is_empty());
+        assert!(!app.connect.persisted);
+        assert_eq!(app.connect.server, "https://owner.example");
+        assert!(
+            app.connect
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Token rejected or revoked")
+        );
     }
 
     #[test]
-    fn native_panels_render_at_minimum_and_default_window_sizes() {
-        for size in [[860.0, 560.0], [720.0, 520.0], [1100.0, 740.0]] {
-            let mut app = app();
-            let ctx = egui::Context::default();
-            let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(size[0], size[1]),
-                )),
-                ..Default::default()
-            };
-            let output = ctx.run(input, |ctx| {
-                app.sidebar(ctx);
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    app.chat_panel(ui);
-                    app.approvals_panel(ui);
-                    app.state.connected = true;
-                    app.fleet_panel(ui);
+    fn opening_a_conversation_keeps_fleet_drafts_and_directory_data() {
+        let mut app = connected_app();
+        app.fleet.bot_id = "notes".into();
+        app.fleet.bot_description = "synthetic description".into();
+        app.fleet.skill_id = "notes-pack".into();
+        app.fleet.skill_body = "synthetic skill body".into();
+        app.fleet.conv_slug = "finance".into();
+        app.open_conversation("dir:analyst".into());
+        assert_eq!(app.fleet.bot_id, "notes");
+        assert_eq!(app.fleet.bot_description, "synthetic description");
+        assert_eq!(app.fleet.skill_id, "notes-pack");
+        assert_eq!(app.fleet.skill_body, "synthetic skill body");
+        assert_eq!(app.fleet.conv_slug, "finance");
+        assert_eq!(app.state.conversations.len(), 3);
+        assert_eq!(app.state.memories.len(), 1);
+        assert_eq!(app.state.providers.len(), 1);
+        assert_eq!(app.section, Section::Chat);
+        app.reset_scope(false);
+        assert!(app.fleet.bot_id.is_empty());
+        assert!(app.fleet.bot_description.is_empty());
+        assert!(app.fleet.skill_id.is_empty());
+        assert!(app.fleet.skill_body.is_empty());
+        assert!(app.fleet.conv_slug.is_empty());
+        assert!(app.state.conversations.is_empty());
+    }
+
+    #[test]
+    fn conversation_titles_and_kinds_come_from_the_directory() {
+        let mut app = connected_app();
+        app.conversation = "room:review".into();
+        assert_eq!(app.conversation_title(), "Review room");
+        assert_eq!(app.conversation_kind(), Some("room"));
+        app.conversation = "windows-missing".into();
+        assert_eq!(app.conversation_title(), "windows-missing");
+        assert_eq!(app.conversation_kind(), None);
+        assert!(app.conversation_accepts_turns());
+    }
+
+    #[test]
+    fn palette_filters_commands_and_runs_section_jumps() {
+        let mut app = connected_app();
+        app.open_palette();
+        app.palette_query = "memory".into();
+        let matches = app
+            .palette_commands()
+            .into_iter()
+            .filter(|(label, _)| label.to_lowercase().contains("memory"))
+            .collect::<Vec<_>>();
+        assert_eq!(matches.len(), 1);
+        assert!(matches!(matches[0].1, PaletteAction::Go(Section::Memory)));
+        app.run_palette(
+            PaletteAction::Go(Section::Memory),
+            &egui::Context::default(),
+        );
+        assert_eq!(app.section, Section::Memory);
+        assert!(app.state.memories_loaded, "cached data stays");
+    }
+
+    #[test]
+    fn events_coalesce_into_a_single_refresh_and_ignore_reads_while_disconnected() {
+        let mut app = connected_app();
+        app.events_dirty = true;
+        app.last_event_kind = "approval.requested".into();
+        app.flush_events();
+        assert!(!app.events_dirty);
+        assert!(matches!(app.pending, Some(OperationKind::Approvals)));
+        let mut offline = self::app();
+        offline.events_active = true;
+        offline.events_dirty = true;
+        offline.flush_events();
+        assert!(offline.pending.is_none());
+        assert!(
+            offline.scheduled.is_none(),
+            "offline events never schedule reads"
+        );
+    }
+
+    #[test]
+    fn native_screens_render_at_minimum_and_default_window_sizes() {
+        for size in [[860.0, 560.0], [1280.0, 800.0]] {
+            let mut app = connected_app();
+            for section in [
+                Section::Chat,
+                Section::Conversations,
+                Section::Memory,
+                Section::Providers,
+                Section::Connectors,
+                Section::Approvals,
+                Section::Fleet,
+                Section::Settings,
+            ] {
+                app.section = section;
+                let ctx = egui::Context::default();
+                design::apply_theme(&ctx);
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(size[0], size[1]),
+                    )),
+                    ..Default::default()
+                };
+                let output = ctx.run(input, |ctx| {
+                    app.rail(ctx);
+                    if app.section == Section::Chat {
+                        app.conversation_column(ctx);
+                    }
+                    egui::TopBottomPanel::top("topbar").show(ctx, |ui| app.top_bar(ui, ctx));
+                    egui::CentralPanel::default().show(ctx, |ui| match app.section {
+                        Section::Chat => app.chat_screen(ui),
+                        Section::Conversations => app.conversations_screen(ui),
+                        Section::Memory => app.memory_screen(ui),
+                        Section::Providers => app.providers_screen(ui),
+                        Section::Connectors => app.connectors_screen(ui),
+                        Section::Approvals => app.approvals_screen(ui, ctx),
+                        Section::Fleet => app.fleet_screen(ui),
+                        Section::Settings => app.settings_screen(ui, ctx),
+                    });
                 });
-            });
-            assert!(!output.shapes.is_empty());
+                assert!(!output.shapes.is_empty(), "{section:?} at {size:?}");
+            }
         }
+    }
+
+    #[test]
+    fn the_footer_always_carries_the_active_build() {
+        let footer = build_footer();
+        assert!(footer.contains(env!("CARGO_PKG_VERSION")));
+        assert!(footer.contains("developer build") || footer.contains(" · "));
     }
 }

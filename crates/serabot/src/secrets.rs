@@ -140,6 +140,11 @@ impl SharedSecrets {
         self.lock().get(name).map(str::to_owned)
     }
 
+    /// Presence check for status surfaces. Values never leave this module.
+    pub fn has(&self, name: &str) -> bool {
+        self.lock().get(name).is_some()
+    }
+
     pub fn require(&self, name: &str) -> Result<String> {
         self.lock().require(name).map(str::to_owned)
     }

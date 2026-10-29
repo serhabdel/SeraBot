@@ -1,5 +1,10 @@
 mod api;
+pub mod connect;
+pub mod creds;
+pub mod design;
+pub mod events;
 pub mod state;
+pub mod updater;
 pub mod worker;
 pub use api::*;
 
@@ -208,6 +213,28 @@ mod tests {
             provider: "invented".into(),
             model: "small".into()
         }));
+    }
+
+    #[test]
+    fn conversation_memory_and_secret_inputs_stay_bounded() {
+        assert!(valid_conversation_title("Operations review"));
+        assert!(!valid_conversation_title("   "));
+        assert!(!valid_conversation_title("line\nbreak"));
+        assert!(!valid_conversation_title(&"a".repeat(121)));
+        assert!(valid_memory_kind("fact"));
+        assert!(valid_memory_kind("preference"));
+        assert!(!valid_memory_kind("secret"));
+        assert!(!valid_memory_kind("Fact"));
+        assert!(valid_memory_content("line one\nline two\t"));
+        assert!(!valid_memory_content(" \n "));
+        assert!(!valid_memory_content("a\u{0}b"));
+        assert!(!valid_memory_content(&"é".repeat(4_001)));
+        assert!(valid_memory_source("operator:desktop"));
+        assert!(!valid_memory_source(""));
+        assert!(!valid_memory_source(&"a".repeat(513)));
+        assert!(valid_memory_id("mem_1-2"));
+        assert!(!valid_memory_id(""));
+        assert!(!valid_memory_id("a/b"));
     }
 
     #[test]

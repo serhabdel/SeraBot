@@ -10,10 +10,22 @@ Linux and Windows: `cargo fmt`, `clippy -D warnings`, `cargo check --all-targets
 
 ## Clients (`.github/workflows/clients.yml`)
 
-- `serabot-desktop`: check, test, and release build on Ubuntu and Windows
-- `serabot_mobile`: `flutter analyze` and `flutter test` on Ubuntu
+Runs on push to `main`, pull requests, and manual dispatch. No Android SDK is
+needed locally: this workflow is the Android compile verification.
 
-The workflow accepts two optional repository secrets. When they are unset (public CI, forks), the values are empty and the jobs still pass.
+- `serabot-desktop`: check, test, and release build on Ubuntu and Windows. On
+  Windows only, the release exe is zipped as
+  `serabot-desktop-<sha>-windows-x64.zip` and uploaded as the artifact
+  `serabot-desktop-<sha>-windows-x64` with 14-day retention. The Windows binary
+  is verified through this artifact, not by a local Windows build.
+- `serabot_mobile`: Java 17 (temurin), `flutter pub get`, `flutter analyze`,
+  `flutter test`, then `flutter build apk --debug` and an upload of
+  `apps/serabot_mobile/build/app/outputs/flutter-apk/app-debug.apk` as
+  `serabot-mobile-debug-<sha>` (14 days). This checks that Android compiles; it
+  is not a distribution build.
+
+The workflow accepts two optional repository secrets. When they are unset
+(public CI, forks), the values are empty and the jobs still pass.
 
 | Secret name | Synthetic example | What the workflow does |
 | --- | --- | --- |
@@ -24,54 +36,74 @@ Create the secrets in the GitHub repository settings. Do not put the values in a
 
 Desktop prefill order: process environment `SERABOT_OWNER_API_URL`, then the value compiled in, then an empty field. Invalid origins (plain HTTP to a public host, credentials, paths) are ignored.
 
-Mobile release build, when you choose to publish an APK locally or in a later job:
+## Releases
 
-```bash
-flutter build apk --release \
-  --dart-define=SERABOT_DEFAULT_SERVER_URL="$SERABOT_OWNER_API_URL" \
-  --dart-define=SERABOT_OWNER_TOKEN_SECRET_NAME=SERABOT_OWNER_TOKEN
-```
+`release.yml` runs on a tag push matching `v*`, or manually via
+**Run workflow** with a required **tag** input naming an existing tag (for
+example `v0.2.0`). Every job checks out that tag and publishes the GitHub
+Release with `tag_name` set to it. Asset names use the same tag value.
 
-`$SERABOT_OWNER_API_URL` is the origin only. Do not pass `SERABOT_OWNER_TOKEN` into `--dart-define`.
+| Asset | Built on | Notes |
+| --- | --- | --- |
+| `serabot-desktop-<tag>-windows-x64.exe` | `windows-latest` | Release binary |
+| `serabot-desktop-<tag>-windows-x64.zip` | `windows-latest` | Zipped release binary |
+| `serabot-desktop-latest-windows-x64.exe` | `windows-latest` | Stable alias of the same binary |
+| `serabot-desktop-latest-windows-x64.zip` | `windows-latest` | Stable alias of the same zip |
+| `serabot-mobile-<tag>.apk` | `ubuntu-latest` | `flutter build apk --release` |
+| `serabot-mobile-<tag>.aab` | `ubuntu-latest` | `flutter build appbundle --release` (Play bundle) |
+| `serabot-mobile-latest.apk` | `ubuntu-latest` | Stable alias |
+| `serabot-mobile-latest.aab` | `ubuntu-latest` | Stable alias |
+| `SHA256SUMS` | publish job | SHA-256 of every other file in `dist/`, generated after download |
+
+The publish job downloads all artifacts, writes `SHA256SUMS` over the files
+except itself, and uploads `dist/*` with `fail_on_unmatched_files: true`.
+Android versions come from the workflow: `--build-name` strips the leading `v`
+from the tag, and `--build-number` is `${{ github.run_number }}`, so
+`versionCode` increases on every release run.
+
+### Android release signing
+
+These optional repository secrets are exposed to the mobile job environment.
+Values must never be echoed, committed, or pasted into an issue.
+
+| Secret name | Effect |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | Base64 of the release keystore. When set, CI decodes it to `$RUNNER_TEMP/release.keystore` and exports `ANDROID_KEYSTORE_PATH` through `$GITHUB_ENV`; the secret value is never printed. |
+| `ANDROID_KEYSTORE_PASSWORD` | Keystore password read by Gradle. |
+| `ANDROID_KEY_ALIAS` | Key alias read by Gradle. |
+| `ANDROID_KEY_PASSWORD` | Key password read by Gradle. |
+
+`apps/serabot_mobile/android/app/build.gradle.kts` creates a `release` signing
+config only when `ANDROID_KEYSTORE_PATH` is present. Otherwise the release
+build falls back to the Android **debug** key, which installs but may not
+upgrade in place because CI debug keys can change per run. Configure a stable
+keystore before relying on APK updates.
+
+### Build-time environment
+
+| Variable | Value in CI | Effect |
+| --- | --- | --- |
+| `SERABOT_RELEASES_REPO` | `${{ github.repository }}` on desktop builds | Compile-time `owner/repo` used by the server for public download links. Client release builds receive the same value as build metadata. Local server builds for deployment must set `SERABOT_RELEASES_REPO=serhabdel/SeraBot`. |
+| `SERABOT_BUILD_SHA` | The checked-out commit (`git rev-parse HEAD`) on desktop release builds | Reported by `/healthz` and `/v1/health` as `build`. Shows `dev` when unset. |
+
+The server's public download routes redirect to
+`https://github.com/<SERABOT_RELEASES_REPO>/releases/latest/download/<asset>`.
+A malformed or absent value disables the links and makes the download routes
+return `503`; it never accepts request input in a URL. See
+[deployment](deployment.md) and [API](api.md).
+
+## Tokens
 
 | Client | Server URL | Token |
 | --- | --- | --- |
-| Desktop | `SERABOT_OWNER_API_URL` (env, or compiled from the Actions secret) | Typed in the UI. Held in memory. Placeholder name `SERABOT_OWNER_TOKEN`. |
+| Desktop | Typed on first run; prefilled from `SERABOT_OWNER_API_URL` when CI compiled it | Minted per device with `serabot token mint --label desktop-win`. Stored in Windows Credential Manager via the `keyring` crate; only the server origin goes to `%APPDATA%\SeraBot\settings.json`. Debug builds may read `SERABOT_OWNER_TOKEN`; release builds contain no code that reads it. |
 | Mobile | `--dart-define=SERABOT_DEFAULT_SERVER_URL` | Typed at runtime. Placeholder name `SERABOT_OWNER_TOKEN`. |
-| Server | `[api].token_hash` locally | `serabot hash-token` |
+| Server | `[api].token_hash` remains as a static fallback | `serabot token mint/list/revoke` manages per-device hashes; `serabot hash-token` prints the static hash. |
 
-Never bake owner token values into APKs or release binaries.
+The desktop token is not held in memory only: it persists in the OS credential
+store so auto-connect works after restart. “Forget token” removes it. Treat a
+minted token as a credential and hand it over through a secure channel.
 
-## Releases (`.github/workflows/release.yml`)
-
-Any tag push matching `v*` builds the clients and posts a GitHub Release with
-generated notes:
-
-```bash
-git tag v0.1.0 && git push origin v0.1.0
-```
-
-| Asset | Built on | Command |
-| --- | --- | --- |
-| `serabot-desktop-<tag>-windows-x64.zip` | `windows-latest` | `cargo build --release --locked -p serabot-desktop`, zipped |
-| `serabot-desktop.exe` | `windows-latest` | Same build, bare binary |
-| `serabot-mobile-<tag>.apk` | `ubuntu-latest` | `flutter build apk --release` in `apps/serabot_mobile` |
-| `serabot-mobile-<tag>.aab` | `ubuntu-latest` | `flutter build appbundle --release` (Play bundle) |
-
-Download from the repository **Releases** page (latest tag on top). Windows:
-unzip and run `serabot-desktop.exe`. Android: allow "install unknown apps" and
-sideload the APK. The APK and AAB are signed with the Android **debug** key
-(the TODO in `apps/serabot_mobile/android/app/build.gradle.kts`), so they
-sideload fine but are not Play Store uploads. A real signing config would add
-keystore secrets; that is a follow-up and is not wired here.
-
-Release secrets — the same optional names as the client CI, nothing else:
-
-| Secret name | Read by the release workflow | Effect |
-| --- | --- | --- |
-| `SERABOT_OWNER_API_URL` | Yes | Compiled into the desktop binary and passed to Flutter as `--dart-define=SERABOT_DEFAULT_SERVER_URL`. Origin only. Empty or invalid values are ignored at runtime, so unset secrets still produce working clients with a generic server field. |
-| `SERABOT_OWNER_TOKEN` | **No** | Never read, compiled, or embedded. The clients name it so the owner knows which secret to type at runtime. |
-
-`GITHUB_TOKEN` needs no setup: the workflow declares `permissions: contents:
-write` and creates the release from the tag. No other secrets are required for
-public artifacts.
+Never bake owner token values into APKs or release binaries. `GITHUB_TOKEN`
+needs no setup: the workflow declares `permissions: contents: write` and
+creates the release from the tag.

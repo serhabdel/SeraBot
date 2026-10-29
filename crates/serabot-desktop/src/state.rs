@@ -1,6 +1,7 @@
 use crate::{
-    ApiError, Approval, BotSummary, Catalog, CreatedBot, CreatedConversation, CreatedSkill,
-    Message, Scope, Selection, SkillSummary, Task,
+    ApiError, Approval, BotSummary, Catalog, ConnectorStatus, ConversationSummary, CreatedBot,
+    CreatedConversation, CreatedSkill, MemoryEntry, Message, ProviderStatus, Scope, Selection,
+    SkillSummary, Task,
     worker::{OperationKind, Reply},
 };
 
@@ -15,6 +16,14 @@ pub struct State {
     pub task: Option<Task>,
     pub approvals: Vec<Approval>,
     pub approvals_loaded: bool,
+    pub conversations: Vec<ConversationSummary>,
+    pub conversations_loaded: bool,
+    pub memories: Vec<MemoryEntry>,
+    pub memories_loaded: bool,
+    pub providers: Vec<ProviderStatus>,
+    pub providers_loaded: bool,
+    pub connectors: Vec<ConnectorStatus>,
+    pub connectors_loaded: bool,
     pub created_bot: Option<CreatedBot>,
     pub created_conversation: Option<CreatedConversation>,
     pub created_skill: Option<CreatedSkill>,
@@ -42,6 +51,14 @@ impl Default for State {
             task: None,
             approvals: Vec::new(),
             approvals_loaded: false,
+            conversations: Vec::new(),
+            conversations_loaded: false,
+            memories: Vec::new(),
+            memories_loaded: false,
+            providers: Vec::new(),
+            providers_loaded: false,
+            connectors: Vec::new(),
+            connectors_loaded: false,
             created_bot: None,
             created_conversation: None,
             created_skill: None,
@@ -65,6 +82,15 @@ impl State {
         let skills_loaded = self.skills_loaded;
         let listed_bots = self.listed_bots.clone();
         let bots_loaded = self.bots_loaded;
+        // Directory data is owner-scoped but not conversation-scoped.
+        let conversations = self.conversations.clone();
+        let conversations_loaded = self.conversations_loaded;
+        let memories = self.memories.clone();
+        let memories_loaded = self.memories_loaded;
+        let providers = self.providers.clone();
+        let providers_loaded = self.providers_loaded;
+        let connectors = self.connectors.clone();
+        let connectors_loaded = self.connectors_loaded;
         *self = Self {
             scope: Scope {
                 epoch,
@@ -78,6 +104,14 @@ impl State {
             skills_loaded,
             listed_bots,
             bots_loaded,
+            conversations,
+            conversations_loaded,
+            memories,
+            memories_loaded,
+            providers,
+            providers_loaded,
+            connectors,
+            connectors_loaded,
             ..Self::default()
         };
     }
@@ -91,6 +125,14 @@ impl State {
         self.skills_loaded = false;
         self.listed_bots.clear();
         self.bots_loaded = false;
+        self.conversations.clear();
+        self.conversations_loaded = false;
+        self.memories.clear();
+        self.memories_loaded = false;
+        self.providers.clear();
+        self.providers_loaded = false;
+        self.connectors.clear();
+        self.connectors_loaded = false;
     }
 
     pub fn can_send(&self) -> bool {
@@ -146,6 +188,51 @@ impl State {
                 self.listed_bots = bots;
                 self.bots_loaded = true;
             }
+            Reply::Conversations(page) => {
+                self.conversations = page.conversations;
+                self.conversations_loaded = true;
+            }
+            Reply::RenamedConversation(conversation) => {
+                match self
+                    .conversations
+                    .iter_mut()
+                    .find(|existing| existing.id == conversation.id)
+                {
+                    Some(existing) => *existing = conversation,
+                    None => self.conversations.push(conversation),
+                }
+            }
+            Reply::ArchivedConversation(id) => {
+                self.conversations
+                    .retain(|conversation| conversation.id != id);
+            }
+            Reply::Memories(memories) => {
+                self.memories = memories;
+                self.memories_loaded = true;
+            }
+            Reply::AddedMemory(memory) => {
+                if let Some(existing) = self
+                    .memories
+                    .iter_mut()
+                    .find(|existing| existing.id == memory.id)
+                {
+                    *existing = memory;
+                } else {
+                    self.memories.insert(0, memory);
+                }
+                self.memories_loaded = true;
+            }
+            Reply::DeletedMemory(id) => {
+                self.memories.retain(|memory| memory.id != id);
+            }
+            Reply::Providers(providers) => {
+                self.providers = providers;
+                self.providers_loaded = true;
+            }
+            Reply::Connectors(connectors) => {
+                self.connectors = connectors;
+                self.connectors_loaded = true;
+            }
         }
         true
     }
@@ -162,6 +249,9 @@ impl State {
                 | OperationKind::CreateBot
                 | OperationKind::CreateConversation
                 | OperationKind::CreateSkill
+                | OperationKind::RenameConversation
+                | OperationKind::ArchiveConversation
+                | OperationKind::AddMemory
         );
         if mutation && error.unknown_outcome() {
             self.unknown_outcome = true;
@@ -171,6 +261,9 @@ impl State {
                 OperationKind::CreateBot => "bot scaffold",
                 OperationKind::CreateConversation => "conversation create",
                 OperationKind::CreateSkill => "skill create",
+                OperationKind::RenameConversation => "rename",
+                OperationKind::ArchiveConversation => "archive",
+                OperationKind::AddMemory => "memory write",
                 _ => "model change",
             };
             self.error = Some(format!(
@@ -187,8 +280,9 @@ impl State {
 mod tests {
     use super::*;
     use crate::{
-        BotSummary, Catalog, CreatedBot, CreatedConversation, CreatedSkill, Health, Message, Role,
-        Selection, SkillSummary, Task, TaskStatus,
+        BotSummary, Catalog, ConnectorStatus, ConversationPage, ConversationSummary, CreatedBot,
+        CreatedConversation, CreatedSkill, Health, MemoryEntry, Message, ProviderStatus, Role,
+        SecretStatus, Selection, SkillSummary, Task, TaskStatus,
     };
 
     fn catalog() -> Catalog {
@@ -392,5 +486,104 @@ mod tests {
         assert!(!state.skills_loaded);
         assert!(state.listed_bots.is_empty());
         assert!(!state.bots_loaded);
+    }
+
+    fn summary(id: &str, kind: &str, title: &str) -> ConversationSummary {
+        ConversationSummary {
+            id: id.into(),
+            kind: kind.into(),
+            parent_id: None,
+            title: Some(title.into()),
+            created_at: "2026-10-29T10:00:00.000Z".into(),
+            updated_at: "2026-10-29T10:05:00.000Z".into(),
+            last_message_at: None,
+            archived_at: None,
+            accepts_turns: matches!(kind, "direct" | "room"),
+        }
+    }
+
+    #[test]
+    fn directory_and_memory_replies_update_and_survive_conversation_switches() {
+        let mut state = State::default();
+        let scope = state.scope.clone();
+        state.receive(
+            &scope,
+            Reply::Conversations(ConversationPage {
+                conversations: vec![
+                    summary("room:review", "room", "Review room"),
+                    summary("sec:finance", "section", "Finance"),
+                ],
+                next_cursor: Some("2026-10-29T10:05:00.000Z|sec:finance".into()),
+            }),
+        );
+        assert!(state.conversations_loaded);
+        let mut renamed = summary("room:review", "room", "Operations review");
+        renamed.title = Some("Operations review".into());
+        state.receive(&scope, Reply::RenamedConversation(renamed));
+        assert_eq!(
+            state.conversations[0].title.as_deref(),
+            Some("Operations review")
+        );
+        state.receive(&scope, Reply::ArchivedConversation("sec:finance".into()));
+        assert_eq!(state.conversations.len(), 1);
+
+        let memory = MemoryEntry {
+            id: "mem_1".into(),
+            kind: "fact".into(),
+            content: "Synthetic fact.".into(),
+            source: "operator:desktop".into(),
+            created_at: "2026-10-29T10:00:00.000Z".into(),
+            updated_at: "2026-10-29T10:00:00.000Z".into(),
+        };
+        state.receive(&scope, Reply::AddedMemory(memory.clone()));
+        state.receive(&scope, Reply::AddedMemory(memory.clone()));
+        assert_eq!(state.memories.len(), 1);
+        assert!(state.memories_loaded);
+        state.receive(&scope, Reply::DeletedMemory(memory.id));
+        assert!(state.memories.is_empty());
+
+        state.receive(
+            &scope,
+            Reply::Providers(vec![ProviderStatus {
+                id: "approved".into(),
+                kind: "openai".into(),
+                models: vec!["small".into()],
+                routing_classes: Vec::new(),
+                data_egress_approved: true,
+                catalog_fetch: false,
+                catalog_verified: false,
+                secrets: std::collections::BTreeMap::from([(
+                    "api_key".into(),
+                    SecretStatus {
+                        name: Some("OPENAI_API_KEY".into()),
+                        configured: true,
+                    },
+                )]),
+            }]),
+        );
+        state.receive(
+            &scope,
+            Reply::Connectors(vec![ConnectorStatus {
+                id: "notion".into(),
+                kind: "oauth".into(),
+                enabled: false,
+                redirect_uri: None,
+                api_base: None,
+                default_inbox_id: None,
+                secrets: std::collections::BTreeMap::new(),
+            }]),
+        );
+        assert!(state.providers_loaded);
+        assert!(state.connectors_loaded);
+
+        state.new_scope("dir:analyst".into(), true);
+        assert_eq!(state.conversations.len(), 1, "directory survives a switch");
+        assert!(state.providers_loaded);
+        state.disconnect();
+        assert!(state.conversations.is_empty());
+        assert!(state.memories.is_empty());
+        assert!(state.providers.is_empty());
+        assert!(!state.providers_loaded);
+        assert!(state.connectors.is_empty());
     }
 }

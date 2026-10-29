@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,8 +9,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
+use chrono::{DateTime, SecondsFormat, Utc};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,16 +20,18 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 
-use crate::config::{Config, scaffold_specialist_bot};
+use crate::config::{Config, OAuthConnectorSettings, ProviderConfig, scaffold_specialist_bot};
 use crate::domain::Task;
 use crate::error::{Result, SeraError};
 use crate::gateway::Decision;
 use crate::maker::ArtifactStore;
+use crate::memory;
 use crate::model_router::ModelSelection;
-use crate::orchestration::{ConversationKind, scoped_conversation_id};
+use crate::orchestration::{ConversationKind, scoped_conversation_id, validate_conversation_id};
 use crate::runtime::{ApprovalNotice, Notifier, Runtime};
+use crate::secrets::SharedSecrets;
 use crate::skills::{SkillCatalog, create_skill, discard_created_skill};
-use crate::store::Store;
+use crate::store::{Store, StoredConversation};
 use crate::util::{constant_time_eq, sha256_hex, truncate_chars};
 
 #[derive(Clone)]
@@ -79,6 +82,7 @@ pub struct ApiState {
     store: Store,
     config: Arc<Config>,
     artifacts: Arc<ArtifactStore>,
+    secrets: SharedSecrets,
     token_hash: String,
     rate: Arc<Mutex<VecDeque<Instant>>>,
     rate_limit: usize,
@@ -90,11 +94,13 @@ impl ApiState {
         store: Store,
         config: Arc<Config>,
         artifacts: Arc<ArtifactStore>,
+        secrets: SharedSecrets,
     ) -> Self {
         Self {
             runtime,
             store,
             artifacts,
+            secrets,
             token_hash: config.api.token_hash.to_ascii_lowercase(),
             rate: Arc::new(Mutex::new(VecDeque::new())),
             rate_limit: config.server.rate_limit_per_minute.max(1) as usize,
@@ -105,13 +111,24 @@ impl ApiState {
 
 pub fn router(state: ApiState) -> Router {
     let shared = Arc::new(state);
-    Router::new()
+    let protected = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
         .route("/v1/messages", post(send_message))
         .route("/v1/bots", get(list_bots).post(create_bot))
         .route("/v1/skills", get(list_skills).post(create_skill_pack))
-        .route("/v1/conversations", post(create_conversation))
+        .route(
+            "/v1/conversations",
+            get(list_conversations).post(create_conversation),
+        )
+        .route(
+            "/v1/conversations/{id}",
+            patch(rename_conversation).delete(archive_conversation),
+        )
+        .route("/v1/memories", get(list_memories).post(add_memory))
+        .route("/v1/memories/{id}", delete(delete_memory))
+        .route("/v1/providers", get(list_providers))
+        .route("/v1/connectors", get(list_connectors))
         .route("/v1/models", get(models))
         .route("/v1/conversations/{id}/model", put(select_model))
         .route(
@@ -129,7 +146,9 @@ pub fn router(state: ApiState) -> Router {
         .layer(middleware::from_fn_with_state(shared.clone(), rate_limit))
         .layer(RequestBodyLimitLayer::new(
             shared.config.server.body_limit_bytes,
-        ))
+        ));
+    crate::web::router()
+        .merge(protected)
         .layer(TraceLayer::new_for_http())
         .with_state(shared)
 }
@@ -139,7 +158,7 @@ async fn health(State(state): State<Arc<ApiState>>) -> Response {
         Ok(()) => Json(json!({
             "ok": true,
             "version": env!("CARGO_PKG_VERSION"),
-            "database": state.store.path().display().to_string(),
+            "build": crate::web::build_sha(),
         }))
         .into_response(),
         Err(error) => (
@@ -210,18 +229,6 @@ async fn send_message(
         request.bot.as_deref(),
     )?;
     Ok(Json(json!({"task": task_view(&task)})))
-}
-
-fn validate_conversation_id(id: &str) -> Result<()> {
-    if id.is_empty()
-        || id.len() > 128
-        || !id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'))
-    {
-        return Err(SeraError::Validation("invalid conversation_id".into()));
-    }
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -404,9 +411,10 @@ struct EventQuery {
 
 async fn events(
     State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
     Query(query): Query<EventQuery>,
 ) -> Sse<impl futures::Stream<Item = std::result::Result<SseEvent, Infallible>>> {
-    let last = query.after.unwrap_or(0).max(0);
+    let last = resume_cursor(&headers, query.after);
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let store = state.store.clone();
     let stream = futures::stream::unfold((last, store), move |(last, store)| async move {
@@ -436,6 +444,19 @@ async fn events(
     })
     .flatten();
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+}
+
+/// `?after=` wins; otherwise honor the standard SSE reconnect header.
+fn resume_cursor(headers: &HeaderMap, after: Option<i64>) -> i64 {
+    after
+        .or_else(|| {
+            headers
+                .get("last-event-id")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<i64>().ok())
+        })
+        .unwrap_or(0)
+        .max(0)
 }
 
 #[derive(Debug, Deserialize)]
@@ -685,14 +706,354 @@ async fn create_conversation(
             "accepts_turns": kind.accepts_turns(),
         })),
     )?;
+    Ok(Json(json!({"conversation": conversation_view(&record)?})))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConversationListQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    include_archived: Option<bool>,
+}
+
+async fn list_conversations(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<ConversationListQuery>,
+) -> Result<Json<Value>> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let cursor = match query.cursor.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(value) => Some(parse_conversation_cursor(value)?),
+    };
+    let records = state.store.list_conversations(
+        limit,
+        cursor.as_ref().map(|(at, id)| (*at, id.as_str())),
+        query.include_archived.unwrap_or(false),
+    )?;
+    let next_cursor = if records.len() == limit {
+        records.last().map(conversation_cursor)
+    } else {
+        None
+    };
+    let conversations = records
+        .iter()
+        .map(conversation_view)
+        .collect::<Result<Vec<_>>>()?;
     Ok(Json(json!({
-        "conversation": {
-            "id": record.id,
-            "kind": record.kind,
-            "parent_id": record.parent_id,
-            "accepts_turns": kind.accepts_turns(),
-        }
+        "conversations": conversations,
+        "next_cursor": next_cursor,
     })))
+}
+
+fn conversation_view(record: &StoredConversation) -> Result<Value> {
+    let kind = ConversationKind::from_name(&record.kind)?;
+    Ok(json!({
+        "id": record.id,
+        "kind": record.kind,
+        "parent_id": record.parent_id,
+        "title": record.title,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+        "last_message_at": record.last_message_at,
+        "archived_at": record.archived_at,
+        "accepts_turns": kind.accepts_turns(),
+    }))
+}
+
+fn conversation_cursor(record: &StoredConversation) -> String {
+    format!(
+        "{}|{}",
+        record
+            .updated_at
+            .to_rfc3339_opts(SecondsFormat::Millis, true),
+        record.id
+    )
+}
+
+fn parse_conversation_cursor(cursor: &str) -> Result<(DateTime<Utc>, String)> {
+    let invalid = || SeraError::Validation("invalid conversation cursor".into());
+    let (at, id) = cursor.rsplit_once('|').ok_or_else(invalid)?;
+    let at = DateTime::parse_from_rfc3339(at)
+        .map_err(|_| invalid())?
+        .with_timezone(&Utc);
+    validate_conversation_id(id)?;
+    Ok((at, id.to_owned()))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameConversationRequest {
+    title: String,
+}
+
+async fn rename_conversation(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(request): Json<RenameConversationRequest>,
+) -> Result<Json<Value>> {
+    validate_conversation_id(&id)?;
+    let title = request
+        .title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() {
+        return Err(SeraError::Validation(
+            "conversation title must not be empty".into(),
+        ));
+    }
+    let length = title.chars().count();
+    if length > 120 {
+        return Err(SeraError::Validation(format!(
+            "conversation title has {length} characters; maximum is 120"
+        )));
+    }
+    state.runtime.scan_owner_output(&title)?;
+    if !state.store.rename_conversation(&id, &title)? {
+        return Err(SeraError::NotFound(format!("conversation {id}")));
+    }
+    state.store.record_audit(
+        "owner",
+        "conversation.renamed",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({"id": id, "title": title})),
+    )?;
+    let record = state
+        .store
+        .get_conversation(&id)?
+        .ok_or_else(|| SeraError::NotFound(format!("conversation {id}")))?;
+    Ok(Json(json!({"conversation": conversation_view(&record)?})))
+}
+
+async fn archive_conversation(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    validate_conversation_id(&id)?;
+    if !state.store.archive_conversation(&id)? {
+        return Err(SeraError::NotFound(format!("conversation {id}")));
+    }
+    state.store.record_audit(
+        "owner",
+        "conversation.archived",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({"id": id})),
+    )?;
+    Ok(Json(json!({"id": id, "archived": true})))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryListQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    query: Option<String>,
+}
+
+async fn list_memories(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<MemoryListQuery>,
+) -> Result<Json<Value>> {
+    let limit = query.limit.unwrap_or(100).clamp(1, memory::MAX_LIST_LIMIT);
+    let memories = match query
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|needle| !needle.is_empty())
+    {
+        Some(needle) => {
+            let needle = needle.to_lowercase();
+            let mut matches = memory::list(&state.store, memory::MAX_LIST_LIMIT)?
+                .into_iter()
+                .filter(|memory| {
+                    memory.content.to_lowercase().contains(&needle)
+                        || memory.kind.to_lowercase().contains(&needle)
+                        || memory.source.to_lowercase().contains(&needle)
+                })
+                .collect::<Vec<_>>();
+            matches.truncate(limit);
+            matches
+        }
+        None => memory::list(&state.store, limit)?,
+    };
+    let body = json!({"memories": memories});
+    state.runtime.scan_owner_output(&body.to_string())?;
+    Ok(Json(body))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddMemoryRequest {
+    kind: String,
+    content: String,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+async fn add_memory(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<AddMemoryRequest>,
+) -> Result<Json<Value>> {
+    state.runtime.scan_owner_output(&request.content)?;
+    let source = request
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+        .unwrap_or("operator:desktop");
+    let memory = memory::add(&state.store, &request.kind, &request.content, source)?;
+    state.store.record_audit(
+        "owner",
+        "memory.created",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({
+            "id": memory.id,
+            "kind": memory.kind,
+            "source": memory.source,
+        })),
+    )?;
+    Ok(Json(json!({"memory": memory})))
+}
+
+async fn delete_memory(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(SeraError::Validation("invalid memory id".into()));
+    }
+    if !memory::delete(&state.store, &id)? {
+        return Err(SeraError::NotFound(format!("memory {id}")));
+    }
+    state.store.record_audit(
+        "owner",
+        "memory.deleted",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({"id": id})),
+    )?;
+    Ok(Json(json!({"deleted": id})))
+}
+
+async fn list_providers(State(state): State<Arc<ApiState>>) -> Result<Json<Value>> {
+    let catalog = state.runtime.model_catalog()?;
+    let llm = &state.config.llm;
+    let mut settings: BTreeMap<String, ProviderConfig> = llm.providers.clone();
+    settings.insert("default".to_owned(), llm.default_provider());
+    let providers = catalog
+        .into_iter()
+        .map(|provider| {
+            let config = settings.get(&provider.id);
+            let routing_classes = llm
+                .classes
+                .iter()
+                .filter(|(_, models)| {
+                    models
+                        .iter()
+                        .any(|model| provider.models.iter().any(|advertised| advertised == model))
+                })
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            json!({
+                "id": provider.id,
+                "kind": provider.kind,
+                "models": provider.models,
+                "routing_classes": routing_classes,
+                "data_egress_approved": provider.data_egress_approved,
+                "catalog_fetch": provider.catalog_fetch,
+                "catalog_verified": provider.catalog_verified,
+                "secrets": {
+                    "api_key": secret_status(&state.secrets, config.map(|c| c.api_key_secret.as_str())),
+                    "refresh_token": secret_status(&state.secrets, config.map(|c| c.refresh_token_secret.as_str())),
+                    "oauth_client_id": secret_status(&state.secrets, config.map(|c| c.oauth_client_id_secret.as_str())),
+                    "oauth_client_secret": secret_status(&state.secrets, config.map(|c| c.oauth_client_secret_secret.as_str())),
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({"providers": providers})))
+}
+
+async fn list_connectors(State(state): State<Arc<ApiState>>) -> Result<Json<Value>> {
+    let connectors = &state.config.connectors;
+    let oauth: [(&str, &dyn OAuthConnectorSettings); 7] = [
+        ("google_drive", &connectors.google_drive),
+        ("google_sheets", &connectors.google_sheets),
+        ("google_calendar", &connectors.google_calendar),
+        ("gmail", &connectors.gmail),
+        ("outlook", &connectors.outlook),
+        ("outlook_calendar", &connectors.outlook_calendar),
+        ("notion", &connectors.notion),
+    ];
+    let mut views = oauth
+        .into_iter()
+        .map(|(id, connector)| oauth_connector_view(&state, id, connector))
+        .collect::<Vec<_>>();
+    let agentmail = &connectors.agentmail;
+    views.push(json!({
+        "id": "agentmail",
+        "kind": "api_key",
+        "enabled": agentmail.enabled,
+        "redirect_uri": Value::Null,
+        "api_base": agentmail.api_base,
+        "default_inbox_id": agentmail.default_inbox_id,
+        "secrets": {
+            "api_key": secret_status(&state.secrets, Some(agentmail.api_key_secret.as_str())),
+        },
+    }));
+    Ok(Json(json!({"connectors": views})))
+}
+
+fn oauth_connector_view(
+    state: &ApiState,
+    id: &str,
+    connector: &dyn OAuthConnectorSettings,
+) -> Value {
+    let redirect = connector.redirect_uri().trim();
+    json!({
+        "id": id,
+        "kind": "oauth",
+        "enabled": connector.oauth_enabled(),
+        "redirect_uri": if redirect.is_empty() { Value::Null } else { json!(redirect) },
+        "secrets": {
+            "client_id": secret_status(&state.secrets, Some(connector.client_id_secret_name())),
+            "client_secret": secret_status(&state.secrets, Some(connector.client_secret_secret_name())),
+            "refresh_token": secret_status(&state.secrets, Some(connector.refresh_token_secret_name())),
+        },
+    })
+}
+
+/// Names only. Secret values never leave the age store.
+fn secret_status(secrets: &SharedSecrets, name: Option<&str>) -> Value {
+    match name.filter(|name| !name.is_empty()) {
+        Some(name) => json!({"name": name, "configured": secrets.has(name)}),
+        None => json!({"name": Value::Null, "configured": false}),
+    }
 }
 
 async fn authorize(
@@ -721,10 +1082,23 @@ async fn authorize(
         return unauthorized();
     }
     let candidate = sha256_hex(token);
-    if !constant_time_eq(&candidate, &state.token_hash) {
-        return unauthorized();
+    if constant_time_eq(&candidate, &state.token_hash) {
+        return next.run(request).await;
     }
-    next.run(request).await
+    let now = chrono::Utc::now();
+    match state.store.device_token_by_hash(&candidate) {
+        Ok(Some(record)) if record.active_at(now) => {
+            if let Err(error) = state.store.touch_device_token(&record.id, now) {
+                warn!(%error, "device token last-used update failed");
+            }
+            next.run(request).await
+        }
+        Ok(_) => unauthorized(),
+        Err(error) => {
+            warn!(%error, "device token lookup failed");
+            unauthorized()
+        }
+    }
 }
 
 fn unauthorized() -> Response {
@@ -894,7 +1268,18 @@ mod tests {
             )
             .unwrap(),
         );
-        let state = ApiState::new(runtime, store.clone(), config.clone(), artifacts);
+        let state = ApiState::new(
+            runtime,
+            store.clone(),
+            config.clone(),
+            artifacts,
+            SharedSecrets::new(crate::secrets::SecretStore::from_map(
+                std::collections::BTreeMap::from([(
+                    config.llm.api_key_secret.clone(),
+                    "synthetic-test-key".to_string(),
+                )]),
+            )),
+        );
         (router(state), config, store)
     }
 
@@ -921,6 +1306,24 @@ mod tests {
             .unwrap()
     }
 
+    fn request_with_token(
+        method: &str,
+        uri: &str,
+        token: &str,
+        body: Option<Value>,
+    ) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(
+                body.map(|value| Body::from(value.to_string()))
+                    .unwrap_or_else(Body::empty),
+            )
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn requires_owner_token() {
         let (app, _, _) = app();
@@ -934,7 +1337,7 @@ mod tests {
 
     #[tokio::test]
     async fn accepts_owner_token_and_reports_health() {
-        let (app, _, _) = app();
+        let (app, _, store) = app();
         let response = app
             .clone()
             .oneshot(request(&app, "GET", "/v1/health", true, None))
@@ -945,8 +1348,155 @@ mod tests {
             .await
             .unwrap()
             .to_bytes();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("database"));
+        assert!(!text.contains(&store.path().display().to_string()));
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["ok"], true);
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["build"], crate::web::build_sha());
+    }
+
+    #[tokio::test]
+    async fn accepts_minted_device_tokens_and_records_use() {
+        let (app, _, store) = app();
+        let token = crate::token_cli::mint(&store, "api-test", None).unwrap();
+        let response = app
+            .clone()
+            .oneshot(request_with_token("GET", "/v1/health", &token, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed = store.list_device_tokens().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].label, "api-test");
+        assert!(listed[0].last_used_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn rejects_revoked_expired_and_unknown_device_tokens() {
+        let (app, _, store) = app();
+        let revoked = crate::token_cli::mint(&store, "revoked", None).unwrap();
+        let record = store
+            .device_token_by_hash(&sha256_hex(&revoked))
+            .unwrap()
+            .unwrap();
+        assert!(store.revoke_device_token(&record.id).unwrap());
+        let expired = crate::token_cli::mint(&store, "expired", Some(0)).unwrap();
+        for token in [
+            revoked,
+            expired,
+            "unknown-token-that-is-long-enough".to_string(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request_with_token("GET", "/v1/health", &token, None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{token}");
+        }
+    }
+
+    #[tokio::test]
+    async fn serves_public_landing_page_without_authentication() {
+        let (app, _, _) = app();
+        for path in ["/", "/app"] {
+            let response = app
+                .clone()
+                .oneshot(request(&app, "GET", path, false, None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-security-policy")
+                    .and_then(|value| value.to_str().ok()),
+                Some(crate::web::CSP)
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/html; charset=utf-8")
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-content-type-options")
+                    .and_then(|value| value.to_str().ok()),
+                Some("nosniff")
+            );
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            let body = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(!body.contains("<script"));
+            assert!(body.contains("SeraBot"));
+            assert!(body.contains("private single-operator deployment"));
+        }
+    }
+
+    #[tokio::test]
+    async fn public_downloads_redirect_or_report_unconfigured() {
+        let (app, _, _) = app();
+        for (path, asset) in [
+            ("/app/latest.apk", crate::web::APK_ASSET),
+            ("/app/SHA256SUMS", crate::web::SHA256SUMS_ASSET),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(&app, "GET", path, false, None))
+                .await
+                .unwrap();
+            match crate::web::releases_repo() {
+                Some(repo) => {
+                    assert_eq!(response.status(), StatusCode::FOUND);
+                    let expected =
+                        format!("https://github.com/{repo}/releases/latest/download/{asset}");
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get("location")
+                            .and_then(|value| value.to_str().ok()),
+                        Some(expected.as_str())
+                    );
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get("cache-control")
+                            .and_then(|value| value.to_str().ok()),
+                        Some("no-store")
+                    );
+                }
+                None => assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn public_health_reports_build_without_database_details() {
+        let (app, _, store) = app();
+        let response = app
+            .clone()
+            .oneshot(request(&app, "GET", "/healthz", false, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("database"));
+        assert!(!text.contains(&store.path().display().to_string()));
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["build"], crate::web::build_sha());
+        assert!(value.get("database").is_none());
     }
 
     #[tokio::test]
@@ -1858,5 +2408,336 @@ mod tests {
                 .as_deref(),
             Some("grp:ops")
         );
+    }
+
+    #[tokio::test]
+    async fn lists_renames_archives_and_paginates_conversations() {
+        let (app, _, _) = app();
+        for (kind, slug, parent) in [
+            ("section", "alpha", None),
+            ("section", "beta", None),
+            ("direct", "analyst", Some("sec:beta")),
+        ] {
+            let mut body = json!({"kind": kind, "slug": slug});
+            if let Some(parent) = parent {
+                body["parent_id"] = json!(parent);
+            }
+            let response = app
+                .clone()
+                .oneshot(request(&app, "POST", "/v1/conversations", true, Some(body)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{kind} {slug}");
+        }
+
+        let first = read_json(
+            app.clone()
+                .oneshot(request(
+                    &app,
+                    "GET",
+                    "/v1/conversations?limit=2",
+                    true,
+                    None,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(first["conversations"].as_array().unwrap().len(), 2);
+        let cursor = first["next_cursor"]
+            .as_str()
+            .expect("next cursor")
+            .to_owned();
+        let encoded = url::form_urlencoded::byte_serialize(cursor.as_bytes()).collect::<String>();
+        let second = read_json(
+            app.clone()
+                .oneshot(request(
+                    &app,
+                    "GET",
+                    &format!("/v1/conversations?limit=2&cursor={encoded}"),
+                    true,
+                    None,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let mut ids = first["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(second["conversations"].as_array().unwrap().iter())
+            .map(|conversation| conversation["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, ["dir:analyst", "sec:alpha", "sec:beta"]);
+
+        let renamed = read_json(
+            app.clone()
+                .oneshot(request(
+                    &app,
+                    "PATCH",
+                    "/v1/conversations/sec:beta",
+                    true,
+                    Some(json!({"title": "  Finance   reviews  "})),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(renamed["conversation"]["title"], "Finance reviews");
+
+        let empty_title = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PATCH",
+                "/v1/conversations/sec:beta",
+                true,
+                Some(json!({"title": "   "})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(empty_title.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let missing = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PATCH",
+                "/v1/conversations/sec:missing",
+                true,
+                Some(json!({"title": "Nope"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let archived = read_json(
+            app.clone()
+                .oneshot(request(
+                    &app,
+                    "DELETE",
+                    "/v1/conversations/dir:analyst",
+                    true,
+                    None,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(archived["archived"], true);
+
+        let visible = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/conversations", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(!visible.to_string().contains("dir:analyst"));
+
+        let with_archived = read_json(
+            app.clone()
+                .oneshot(request(
+                    &app,
+                    "GET",
+                    "/v1/conversations?include_archived=true",
+                    true,
+                    None,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(with_archived.to_string().contains("dir:analyst"));
+    }
+
+    #[tokio::test]
+    async fn memory_crud_over_http() {
+        let (app, _, _) = app();
+        let denied = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/memories", false, None))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let created = read_json(
+            app.clone()
+                .oneshot(request(
+                    &app,
+                    "POST",
+                    "/v1/memories",
+                    true,
+                    Some(json!({
+                        "kind": "preference",
+                        "content": "Prefers concise summaries"
+                    })),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(created["memory"]["kind"], "preference");
+        assert_eq!(created["memory"]["source"], "operator:desktop");
+        let id = created["memory"]["id"].as_str().unwrap().to_owned();
+
+        let matched = read_json(
+            app.clone()
+                .oneshot(request(
+                    &app,
+                    "GET",
+                    "/v1/memories?query=concise",
+                    true,
+                    None,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(matched["memories"].as_array().unwrap().len(), 1);
+
+        let unmatched = read_json(
+            app.clone()
+                .oneshot(request(
+                    &app,
+                    "GET",
+                    "/v1/memories?query=absent-term",
+                    true,
+                    None,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(unmatched["memories"].as_array().unwrap().is_empty());
+
+        let bad_kind = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/memories",
+                true,
+                Some(json!({"kind": "guess", "content": "x"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bad_kind.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let deleted = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "DELETE",
+                &format!("/v1/memories/{id}"),
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let missing = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "DELETE",
+                &format!("/v1/memories/{id}"),
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn memory_writes_respect_the_content_policy() {
+        let (app, _, _) = app_with_policy(true, Policy::from_text("synthetic blocked phrase"));
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/memories",
+                true,
+                Some(json!({
+                    "kind": "fact",
+                    "content": "mentions synthetic blocked phrase"
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let listed = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/memories", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(listed["memories"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn providers_and_connectors_report_status_without_secret_values() {
+        let (app, _, _) = app();
+        let providers = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/providers", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let list = providers["providers"].as_array().unwrap();
+        let default = list
+            .iter()
+            .find(|provider| provider["id"] == "default")
+            .expect("default provider");
+        assert_eq!(default["secrets"]["api_key"]["name"], "llm_api_key");
+        assert_eq!(default["secrets"]["api_key"]["configured"], true);
+        assert!(
+            default["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|model| model == "test")
+        );
+        assert!(!providers.to_string().contains("synthetic-test-key"));
+
+        let connectors = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/connectors", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let list = connectors["connectors"].as_array().unwrap();
+        assert_eq!(list.len(), 8);
+        let gmail = list
+            .iter()
+            .find(|connector| connector["id"] == "gmail")
+            .expect("gmail connector");
+        assert_eq!(gmail["enabled"], false);
+        assert_eq!(gmail["redirect_uri"], Value::Null);
+        assert_eq!(
+            gmail["secrets"]["client_id"]["name"],
+            "google_oauth_client_id"
+        );
+        assert_eq!(gmail["secrets"]["client_id"]["configured"], false);
+        assert!(!connectors.to_string().contains("synthetic-test-key"));
+    }
+
+    #[test]
+    fn event_resume_prefers_query_and_accepts_last_event_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert("last-event-id", "7".parse().unwrap());
+        assert_eq!(resume_cursor(&headers, None), 7);
+        assert_eq!(resume_cursor(&headers, Some(12)), 12);
+        assert_eq!(resume_cursor(&HeaderMap::new(), None), 0);
+        assert_eq!(resume_cursor(&HeaderMap::new(), Some(-3)), 0);
+        headers.insert("last-event-id", "not-a-number".parse().unwrap());
+        assert_eq!(resume_cursor(&headers, None), 0);
     }
 }
