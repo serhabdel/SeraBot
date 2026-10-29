@@ -134,6 +134,31 @@ mod tests {
     }
 
     #[test]
+    fn skill_inputs_stay_on_the_safe_subset() {
+        assert!(valid_new_skill_id("notes-pack"));
+        assert!(valid_new_skill_id("main"));
+        assert!(valid_new_skill_id("a"));
+        assert!(!valid_new_skill_id(""));
+        assert!(!valid_new_skill_id("Notes"));
+        assert!(!valid_new_skill_id("../notes"));
+        assert!(!valid_new_skill_id("con"));
+        assert!(!valid_new_skill_id("aux"));
+        assert!(!valid_new_skill_id("com1"));
+        assert!(!valid_new_skill_id("lpt9"));
+        assert!(!valid_new_skill_id(&"a".repeat(65)));
+        assert!(valid_skill_description(""));
+        assert!(valid_skill_description(" Short summary "));
+        assert!(!valid_skill_description("say \"hi\""));
+        assert!(!valid_skill_description("a\\b"));
+        assert!(!valid_skill_description("line\nbreak"));
+        assert!(!valid_skill_description(&"a".repeat(501)));
+        assert!(valid_skill_body(""));
+        assert!(valid_skill_body("# Notes\n\nSteps.\t"));
+        assert!(!valid_skill_body("a\u{0}b"));
+        assert!(!valid_skill_body(&"a".repeat(96_001)));
+    }
+
+    #[test]
     fn selection_requires_catalog_membership_and_egress_approval() {
         let catalog: Catalog = serde_json::from_str(r#"{"providers":[{"id":"blocked","models":["private"],"data_egress_approved":false},{"id":"allowed","models":["small","large"],"data_egress_approved":true}],"selection":{"provider":"blocked","model":"private"}}"#).unwrap();
         assert_eq!(catalog.providers.len(), 2, "blocked profiles stay visible");

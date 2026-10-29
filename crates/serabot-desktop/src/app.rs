@@ -1,11 +1,13 @@
 use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, RichText, Stroke, Vec2};
 use secrecy::SecretString;
 use serabot_desktop::{
-    ApiError, ApprovalDecision, ConversationKind, DEFAULT_SPECIALIST_TOOLS, Role, SPECIALIST_TOOLS,
-    Selection, TaskStatus, conversation_node_id, parse_skill_list,
+    ApiError, ApprovalDecision, ConversationKind, DEFAULT_SPECIALIST_TOOLS, MAX_SKILL_BODY_BYTES,
+    MAX_SKILL_DESCRIPTION_CHARS, Role, SPECIALIST_TOOLS, Selection, TaskStatus,
+    conversation_node_id, parse_skill_list,
     state::State,
-    valid_bot_description, valid_bot_id, valid_conversation_parent, valid_id, valid_slug,
-    valid_text, valid_token, validate_endpoint, validate_tool_list,
+    valid_bot_description, valid_bot_id, valid_conversation_parent, valid_id, valid_new_skill_id,
+    valid_skill_body, valid_skill_description, valid_slug, valid_text, valid_token,
+    validate_endpoint, validate_tool_list,
     worker::{Credentials, Job, Operation, OperationKind, Worker},
 };
 use std::{
@@ -86,6 +88,9 @@ pub struct Desktop {
     bot_description: String,
     bot_tools: Vec<bool>,
     bot_skills: String,
+    skill_id: String,
+    skill_description: String,
+    skill_body: String,
     conv_kind: ConversationKind,
     conv_slug: String,
     conv_parent: String,
@@ -144,6 +149,9 @@ impl Desktop {
             bot_description: String::new(),
             bot_tools: default_tool_flags(),
             bot_skills: String::new(),
+            skill_id: String::new(),
+            skill_description: String::new(),
+            skill_body: String::new(),
             conv_kind: ConversationKind::Section,
             conv_slug: String::new(),
             conv_parent: String::new(),
@@ -180,6 +188,9 @@ impl Desktop {
         if !connected {
             self.state.created_bot = None;
             self.state.created_conversation = None;
+            self.state.created_skill = None;
+            self.state.listed_skills.clear();
+            self.state.skills_loaded = false;
             self.clear_fleet_drafts();
         }
         self.pending = None;
@@ -197,6 +208,9 @@ impl Desktop {
         self.bot_description.zeroize();
         self.bot_tools = default_tool_flags();
         self.bot_skills.clear();
+        self.skill_id.clear();
+        self.skill_description.zeroize();
+        self.skill_body.zeroize();
         self.conv_kind = ConversationKind::Section;
         self.conv_slug.clear();
         self.conv_parent.clear();
@@ -329,6 +343,9 @@ impl Desktop {
                         }
                         OperationKind::Decide => {
                             self.schedule(Operation::Approvals, Duration::ZERO);
+                        }
+                        OperationKind::CreateSkill => {
+                            self.schedule(Operation::ListSkills, Duration::ZERO);
                         }
                         OperationKind::Task
                             if self
@@ -1199,13 +1216,17 @@ impl Desktop {
     }
 
     fn fleet_panel(&mut self, ui: &mut egui::Ui) {
-        self.section_header(ui, "Fleet", "Disabled specialists and conversation nodes");
+        self.section_header(
+            ui,
+            "Fleet",
+            "Disabled specialists, skill packs, and conversation nodes",
+        );
         self.status_banner(ui);
         if !self.state.connected {
             empty_state(
                 ui,
                 "Connect to change the fleet",
-                "Create a disabled specialist or a section, group, direct, or room node. Nothing is written until you submit.",
+                "Create a disabled specialist, a skill pack, or a section, group, direct, or room node. Nothing is written until you submit.",
             );
             return;
         }
@@ -1214,6 +1235,8 @@ impl Desktop {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 self.bot_card(ui);
+                ui.add_space(16.0);
+                self.skill_card(ui);
                 ui.add_space(16.0);
                 self.conversation_card(ui);
                 ui.add_space(8.0);
@@ -1384,6 +1407,169 @@ impl Desktop {
             });
     }
 
+    fn skill_card(&mut self, ui: &mut egui::Ui) {
+        Frame::new()
+            .fill(PANEL_ALT)
+            .stroke(Stroke::new(1.0_f32, STROKE))
+            .corner_radius(14.0)
+            .inner_margin(Margin::symmetric(16, 14))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new("New skill")
+                        .size(16.0)
+                        .strong()
+                        .color(TEXT),
+                );
+                ui.label(
+                    RichText::new(
+                        "The id is the pack name. There is no path field. Description is one line, and the body is optional markdown. The pack stays off the running catalog until you restart, and a bot cannot load it until you add the id to that bot.",
+                    )
+                    .size(12.0)
+                    .color(MUTED),
+                );
+                ui.add_space(8.0);
+                ui.label(RichText::new("Skill id").small().color(MUTED));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.skill_id)
+                        .desired_width(f32::INFINITY)
+                        .char_limit(64)
+                        .hint_text("notes-pack"),
+                );
+                if !self.skill_id.is_empty() && !valid_new_skill_id(&self.skill_id) {
+                    ui.label(
+                        RichText::new(
+                            "Use a lowercase slug (max 64). Windows device names are reserved.",
+                        )
+                        .size(11.0)
+                        .color(WARNING),
+                    );
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new("Description").small().color(MUTED));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.skill_description)
+                        .desired_width(f32::INFINITY)
+                        .char_limit(MAX_SKILL_DESCRIPTION_CHARS)
+                        .hint_text("Short summary"),
+                );
+                if !valid_skill_description(&self.skill_description) {
+                    ui.label(
+                        RichText::new(
+                            "One line, at most 500 characters, without quotes or backslashes.",
+                        )
+                        .size(11.0)
+                        .color(WARNING),
+                    );
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new("Body").small().color(MUTED));
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.skill_body)
+                        .desired_rows(5)
+                        .desired_width(f32::INFINITY)
+                        .char_limit(MAX_SKILL_BODY_BYTES)
+                        .hint_text("Optional markdown. Leave empty for a short stub."),
+                );
+                ui.label(
+                    RichText::new("Optional. The server does not echo the body back.")
+                        .size(11.0)
+                        .color(MUTED),
+                );
+                if !valid_skill_body(self.skill_body.trim()) {
+                    ui.label(
+                        RichText::new(
+                            "Markdown only, at most 96,000 bytes, without control characters.",
+                        )
+                        .size(11.0)
+                        .color(WARNING),
+                    );
+                }
+                if let Some(skill) = self.state.created_skill.clone() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!("Created {} · not live", skill.id)).color(TEAL),
+                    );
+                    ui.label(RichText::new(skill.file).size(11.0).color(MUTED));
+                    ui.label(
+                        RichText::new(
+                            "Restart the server, then add this id to a bot before it can load the pack.",
+                        )
+                        .size(11.0)
+                        .color(WARNING),
+                    );
+                }
+                ui.add_space(8.0);
+                let can_create = self.ready()
+                    && !self.state.unknown_outcome
+                    && valid_new_skill_id(&self.skill_id)
+                    && valid_skill_description(&self.skill_description)
+                    && valid_skill_body(self.skill_body.trim());
+                if ui
+                    .add_enabled(
+                        can_create,
+                        egui::Button::new(RichText::new("Create skill").strong().color(TEAL)),
+                    )
+                    .clicked()
+                {
+                    let description = self.skill_description.trim().to_owned();
+                    let body = self.skill_body.trim().to_owned();
+                    self.state.error = None;
+                    self.start_request(Operation::CreateSkill {
+                        id: self.skill_id.clone(),
+                        description: Zeroizing::new(description),
+                        body: Zeroizing::new(body),
+                    });
+                }
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(RichText::new("On disk").small().color(MUTED));
+                let can_list = self.ready() && !self.state.unknown_outcome;
+                if ui
+                    .add_enabled(can_list, egui::Button::new("Refresh skills"))
+                    .clicked()
+                {
+                    self.state.error = None;
+                    self.start_request(Operation::ListSkills);
+                }
+                ui.label(
+                    RichText::new("Summaries only. GET /v1/skills does not return bodies.")
+                        .size(11.0)
+                        .color(MUTED),
+                );
+                if self.state.skills_loaded && self.state.listed_skills.is_empty() {
+                    ui.label(
+                        RichText::new("No skill packs on disk.").size(11.0).color(MUTED),
+                    );
+                }
+                let listed = self.state.listed_skills.clone();
+                if !listed.is_empty() {
+                    egui::ScrollArea::vertical()
+                        .id_salt("fleet-skills")
+                        .max_height(160.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for skill in listed {
+                                let title = match &skill.pack {
+                                    Some(pack) => format!("{} · {pack}", skill.id),
+                                    None => skill.id.clone(),
+                                };
+                                ui.label(RichText::new(title).color(TEXT));
+                                if !skill.description.is_empty() {
+                                    ui.label(
+                                        RichText::new(skill_blurb(&skill.description))
+                                            .size(11.0)
+                                            .color(MUTED),
+                                    );
+                                }
+                                ui.add_space(4.0);
+                            }
+                        });
+                }
+            });
+    }
+
     fn conversation_card(&mut self, ui: &mut egui::Ui) {
         Frame::new()
             .fill(PANEL_ALT)
@@ -1535,6 +1721,16 @@ impl Desktop {
     }
 }
 
+fn skill_blurb(text: &str) -> String {
+    let mut chars = text.chars();
+    let blurb: String = chars.by_ref().take(160).collect();
+    if chars.next().is_some() {
+        format!("{blurb}…")
+    } else {
+        blurb
+    }
+}
+
 impl eframe::App for Desktop {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive();
@@ -1578,6 +1774,8 @@ impl Drop for Desktop {
         self.token.zeroize();
         self.composer.zeroize();
         self.bot_description.zeroize();
+        self.skill_description.zeroize();
+        self.skill_body.zeroize();
         self.credentials = None;
     }
 }
@@ -1599,6 +1797,9 @@ mod tests {
             bot_description: String::new(),
             bot_tools: default_tool_flags(),
             bot_skills: String::new(),
+            skill_id: String::new(),
+            skill_description: String::new(),
+            skill_body: String::new(),
             conv_kind: ConversationKind::Section,
             conv_slug: String::new(),
             conv_parent: String::new(),
@@ -1646,6 +1847,9 @@ mod tests {
         app.composer = "sensitive synthetic text".into();
         app.bot_id = "notes".into();
         app.bot_description = "synthetic description".into();
+        app.skill_id = "notes-pack".into();
+        app.skill_description = "synthetic summary".into();
+        app.skill_body = "synthetic skill body".into();
         app.credentials = Some(Arc::new(Credentials {
             endpoint: validate_endpoint("http://127.0.0.1:1").unwrap(),
             token: SecretString::new("x".repeat(32)),
@@ -1657,6 +1861,9 @@ mod tests {
         assert!(app.composer.is_empty());
         assert!(app.bot_id.is_empty());
         assert!(app.bot_description.is_empty());
+        assert!(app.skill_id.is_empty());
+        assert!(app.skill_description.is_empty());
+        assert!(app.skill_body.is_empty());
         assert!(app.credentials.is_none());
         assert!(app.scheduled.is_none());
         assert!(!app.state.scope.accepts(&old));
@@ -1667,16 +1874,22 @@ mod tests {
         let mut app = app();
         app.bot_id = "notes".into();
         app.bot_description = "synthetic description".into();
+        app.skill_id = "notes-pack".into();
+        app.skill_body = "synthetic skill body".into();
         app.conv_slug = "finance".into();
         app.state.connected = true;
         app.conversation = "dir:analyst".into();
         app.reset_scope(true);
         assert_eq!(app.bot_id, "notes");
         assert_eq!(app.bot_description, "synthetic description");
+        assert_eq!(app.skill_id, "notes-pack");
+        assert_eq!(app.skill_body, "synthetic skill body");
         assert_eq!(app.conv_slug, "finance");
         app.reset_scope(false);
         assert!(app.bot_id.is_empty());
         assert!(app.bot_description.is_empty());
+        assert!(app.skill_id.is_empty());
+        assert!(app.skill_body.is_empty());
         assert!(app.conv_slug.is_empty());
     }
 

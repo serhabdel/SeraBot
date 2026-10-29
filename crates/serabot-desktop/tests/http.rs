@@ -296,6 +296,30 @@ fn scaffold_requests_reject_unsafe_inputs_before_the_network() {
         ),
         Err(ApiError::Validation(_))
     ));
+    assert!(matches!(
+        client.create_skill("../notes", "Short summary", None),
+        Err(ApiError::Validation(_))
+    ));
+    assert!(matches!(
+        client.create_skill("con", "Short summary", None),
+        Err(ApiError::Validation(_))
+    ));
+    assert!(matches!(
+        client.create_skill("com1", "Short summary", None),
+        Err(ApiError::Validation(_))
+    ));
+    assert!(matches!(
+        client.create_skill("notes-pack", "say \"hi\"", None),
+        Err(ApiError::Validation(_))
+    ));
+    assert!(matches!(
+        client.create_skill("notes-pack", "Short summary", Some("a\u{0}b")),
+        Err(ApiError::Validation(_))
+    ));
+    assert!(matches!(
+        client.create_skill("notes-pack", &"a".repeat(501), None),
+        Err(ApiError::Validation(_))
+    ));
 }
 
 #[test]
@@ -337,6 +361,90 @@ fn scaffold_responses_must_stay_disabled_and_relative() {
             .unwrap_err(),
         ApiError::InvalidResponse
     );
+    handle.join().unwrap();
+}
+
+#[test]
+fn creates_and_lists_skills_without_a_path_or_echoed_body() {
+    let created = r#"{"skill":{"id":"notes-pack","name":"Notes Pack","description":"Short summary","file":"skills/notes-pack/SKILL.md","live":false}}"#;
+    let listed = r#"{"skills":[{"id":"ask","name":"Ask","description":"Synthetic summary"},{"id":"notes-pack","name":"Notes Pack","description":"Short summary","pack":"office"}]}"#;
+    let (client, handle) = server(vec![
+        (200, created.into()),
+        (200, created.into()),
+        (200, listed.into()),
+    ]);
+    let skill = client
+        .create_skill(
+            "notes-pack",
+            "  Short summary  ",
+            Some("  # Notes\n\nUse allowlisted tools.\n  "),
+        )
+        .unwrap();
+    assert_eq!(skill.id, "notes-pack");
+    assert!(!skill.live);
+    assert_eq!(skill.file, "skills/notes-pack/SKILL.md");
+    let stub = client
+        .create_skill("notes-pack", "Short summary", Some("   "))
+        .unwrap();
+    assert!(!stub.live);
+    let skills = client.list_skills().unwrap();
+    assert_eq!(skills.len(), 2);
+    assert_eq!(skills[1].pack.as_deref(), Some("office"));
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("POST /v1/skills "));
+    assert!(requests[1].starts_with("POST /v1/skills "));
+    assert!(requests[2].starts_with("GET /v1/skills "));
+    for request in &requests {
+        assert!(
+            request
+                .to_lowercase()
+                .contains(&format!("authorization: bearer {TOKEN}\r\n"))
+        );
+    }
+    let body = |index: usize| -> serde_json::Value {
+        serde_json::from_str(requests[index].split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    };
+    assert_eq!(
+        body(0),
+        serde_json::json!({
+            "id": "notes-pack",
+            "description": "Short summary",
+            "body": "# Notes\n\nUse allowlisted tools."
+        })
+    );
+    assert!(body(0).get("path").is_none());
+    assert_eq!(
+        body(1),
+        serde_json::json!({"id": "notes-pack", "description": "Short summary"})
+    );
+    assert!(body(1).get("body").is_none());
+    assert!(body(1).get("path").is_none());
+}
+
+#[test]
+fn skill_responses_must_stay_offline_and_relative() {
+    let bodies = [
+        r#"{"skill":{"id":"notes-pack","name":"Notes Pack","description":"Short summary","file":"skills/notes-pack/SKILL.md","live":true}}"#,
+        r#"{"skill":{"id":"other","name":"Other","description":"Short summary","file":"skills/other/SKILL.md","live":false}}"#,
+        r#"{"skill":{"id":"notes-pack","name":"Notes Pack","description":"Short summary","file":"../notes-pack/SKILL.md","live":false}}"#,
+        r#"{"skill":{"id":"notes-pack","name":"Notes Pack","description":"Short summary","file":"C:/skills/notes-pack/SKILL.md","live":false}}"#,
+        r#"{"skill":{"id":"notes-pack","name":"../Notes","description":"Short summary","file":"skills/notes-pack/SKILL.md","live":false}}"#,
+    ];
+    for body in bodies {
+        let (client, handle) = server(vec![(200, body.into())]);
+        assert_eq!(
+            client
+                .create_skill("notes-pack", "Short summary", None)
+                .unwrap_err(),
+            ApiError::InvalidResponse
+        );
+        handle.join().unwrap();
+    }
+    let (client, handle) = server(vec![(
+        200,
+        r#"{"skills":[{"id":"../ask","name":"Ask","description":"Synthetic summary"}]}"#.into(),
+    )]);
+    assert_eq!(client.list_skills().unwrap_err(), ApiError::InvalidResponse);
     handle.join().unwrap();
 }
 

@@ -170,6 +170,9 @@ pub const DEFAULT_SPECIALIST_TOOLS: &[&str] = &["skill_list", "skill_search", "s
 const MAX_BOT_DESCRIPTION_CHARS: usize = 2000;
 const MAX_SCAFFOLD_TOOLS: usize = 32;
 const MAX_SCAFFOLD_SKILLS: usize = 16;
+pub const MAX_SKILL_DESCRIPTION_CHARS: usize = 500;
+pub const MAX_SKILL_BODY_BYTES: usize = 96_000;
+const MAX_SKILL_LIST: usize = 256;
 
 /// Lowercase slug shared by bot ids and conversation slugs (`^[a-z][a-z0-9-]{0,31}$`).
 pub fn valid_slug(slug: &str) -> bool {
@@ -201,6 +204,33 @@ pub fn valid_skill_id(id: &str) -> bool {
     id.len() <= 64
         && first.is_ascii_lowercase()
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn reserved_skill_id(id: &str) -> bool {
+    matches!(id, "con" | "prn" | "aux" | "nul")
+        || (id.len() == 4
+            && (id.starts_with("com") || id.starts_with("lpt"))
+            && id.as_bytes()[3].is_ascii_digit())
+}
+
+/// Skill ids the owner may register. `main` is allowed; Windows device names are not.
+pub fn valid_new_skill_id(id: &str) -> bool {
+    valid_skill_id(id) && !reserved_skill_id(id)
+}
+
+pub fn valid_skill_description(text: &str) -> bool {
+    let text = text.trim();
+    text.chars().count() <= MAX_SKILL_DESCRIPTION_CHARS
+        && !text
+            .chars()
+            .any(|c| c.is_control() || c == '"' || c == '\\')
+}
+
+pub fn valid_skill_body(text: &str) -> bool {
+    text.len() <= MAX_SKILL_BODY_BYTES
+        && !text
+            .chars()
+            .any(|c| c != '\n' && c != '\r' && c != '\t' && c.is_control())
 }
 
 pub fn valid_bot_description(text: &str) -> bool {
@@ -364,6 +394,24 @@ pub struct CreatedConversation {
     #[serde(default)]
     pub parent_id: Option<String>,
     pub accepts_turns: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct CreatedSkill {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub file: String,
+    pub live: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SkillSummary {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub pack: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -553,6 +601,14 @@ struct BotEnvelope {
 #[derive(Deserialize)]
 struct ConversationEnvelope {
     conversation: CreatedConversation,
+}
+#[derive(Deserialize)]
+struct SkillEnvelope {
+    skill: CreatedSkill,
+}
+#[derive(Deserialize)]
+struct SkillsEnvelope {
+    skills: Vec<SkillSummary>,
 }
 
 /// Construct and use only on a worker thread. No retries, cookies, redirects,
@@ -835,6 +891,78 @@ impl ApiClient {
         )?;
         check_created_conversation(response.conversation, kind, slug, parent_id)
     }
+
+    pub fn create_skill(
+        &self,
+        id: &str,
+        description: &str,
+        body: Option<&str>,
+    ) -> Result<CreatedSkill, ApiError> {
+        if !valid_new_skill_id(id) {
+            return Err(ApiError::Validation(
+                "Skill id must be a lowercase slug of at most 64 characters, and cannot be a Windows device name.",
+            ));
+        }
+        let description = description.trim();
+        if !valid_skill_description(description) {
+            return Err(ApiError::Validation(
+                "Description must be one line of at most 500 characters, without quotes or backslashes.",
+            ));
+        }
+        let body = body.map(str::trim).filter(|text| !text.is_empty());
+        if let Some(body) = body {
+            if !valid_skill_body(body) {
+                return Err(ApiError::Validation(
+                    "Body must be markdown of at most 96,000 bytes, without control characters.",
+                ));
+            }
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            id: &'a str,
+            description: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            body: Option<&'a str>,
+        }
+        let response: SkillEnvelope = self.request(
+            Method::POST,
+            &["v1", "skills"],
+            &[],
+            Some(&Body {
+                id,
+                description,
+                body,
+            }),
+        )?;
+        check_created_skill(response.skill, id)
+    }
+
+    pub fn list_skills(&self) -> Result<Vec<SkillSummary>, ApiError> {
+        let response: SkillsEnvelope = self.get(&["v1", "skills"], &[])?;
+        if response.skills.len() > MAX_SKILL_LIST {
+            return Err(ApiError::InvalidResponse);
+        }
+        let mut seen = HashSet::with_capacity(response.skills.len());
+        for skill in &response.skills {
+            if !valid_skill_id(&skill.id) || !seen.insert(skill.id.as_str()) {
+                return Err(ApiError::InvalidResponse);
+            }
+            if !bounded_skill_label(&skill.name)
+                || skill.description.chars().count() > 2_000
+                || skill.description.chars().any(|c| c.is_control())
+            {
+                return Err(ApiError::InvalidResponse);
+            }
+            if skill
+                .pack
+                .as_ref()
+                .is_some_and(|pack| !valid_skill_id(pack))
+            {
+                return Err(ApiError::InvalidResponse);
+            }
+        }
+        Ok(response.skills)
+    }
 }
 
 fn check_id(id: &str) -> Result<(), ApiError> {
@@ -924,4 +1052,40 @@ fn check_created_conversation(
         return Err(ApiError::InvalidResponse);
     }
     Ok(node)
+}
+
+fn bounded_skill_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= 128
+        && !value
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
+}
+
+fn safe_skill_file(path: &str, id: &str) -> bool {
+    let nested = format!("/{id}/SKILL.md");
+    let flat = format!("{id}/SKILL.md");
+    (path.ends_with(&nested) || path == flat)
+        && path.len() <= 256
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.contains(':')
+        && !path.contains("..")
+        && !path.contains("//")
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+}
+
+fn check_created_skill(skill: CreatedSkill, id: &str) -> Result<CreatedSkill, ApiError> {
+    if skill.id != id
+        || skill.live
+        || !bounded_skill_label(&skill.name)
+        || skill.description.chars().count() > MAX_SKILL_DESCRIPTION_CHARS
+        || skill.description.chars().any(|c| c.is_control())
+        || !safe_skill_file(&skill.file, id)
+    {
+        return Err(ApiError::InvalidResponse);
+    }
+    Ok(skill)
 }

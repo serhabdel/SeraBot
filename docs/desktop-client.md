@@ -82,6 +82,12 @@ as other requests and is not retried if the outcome is unknown.
   chosen from the specialist allowlist, and optional skill ids. `delegate` is
   not offered. The server writes a disabled specialist. Restart before it can
   run, and add it to `main.delegates` yourself if `main` should hand it work.
+- **New skill** — `POST /v1/skills` with a lowercase skill id, a one-line
+  description, and an optional markdown body. There is no path field. The
+  server writes the pack under the configured skills directory and reports
+  `live: false`. Restart, then add the id to a bot's skills list before that
+  bot can load it. **Refresh skills** calls `GET /v1/skills` for on-disk
+  summaries. Bodies are not returned.
 - **New conversation** — `POST /v1/conversations` with kind (`section`, `group`,
   `direct`, or `room`), a slug, and an optional parent. Sections have no parent.
   Groups require a section id (`sec:…`). Direct and room nodes may sit under a
@@ -89,7 +95,7 @@ as other requests and is not retried if the outcome is unknown.
   id into the conversation field; **Open** loads it. Sections and groups do not
   accept turns.
 
-The mobile Fleet tab calls the same two endpoints. See
+The mobile Fleet tab calls the specialist and conversation endpoints. See
 [Mobile client](mobile-client.md).
 
 ## Known limitations

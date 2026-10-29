@@ -19,7 +19,9 @@ See `docs/ci-and-secrets.md`.
 
 ## Fleet
 
-The **Fleet** tab calls the same owner endpoints as the desktop Fleet panel.
+The **Fleet** tab calls `POST /v1/bots` and `POST /v1/conversations`, matching
+the desktop specialist and conversation forms. Desktop also registers skill
+packs; this tab does not.
 Each submit waits at least three seconds after the previous Fleet request and
 is not retried when the outcome is unknown.
 

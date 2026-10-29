@@ -1,6 +1,6 @@
 use crate::{
     ApiClient, ApiError, Approval, ApprovalDecision, Catalog, ConversationKind, CreatedBot,
-    CreatedConversation, Health, History, Scope, Selection, Task,
+    CreatedConversation, CreatedSkill, Health, History, Scope, Selection, SkillSummary, Task,
 };
 use secrecy::SecretString;
 use std::sync::{
@@ -28,6 +28,8 @@ pub enum OperationKind {
     Decide,
     CreateBot,
     CreateConversation,
+    CreateSkill,
+    ListSkills,
 }
 
 pub enum Operation {
@@ -53,6 +55,12 @@ pub enum Operation {
         slug: String,
         parent_id: Option<String>,
     },
+    CreateSkill {
+        id: String,
+        description: Zeroizing<String>,
+        body: Zeroizing<String>,
+    },
+    ListSkills,
 }
 
 impl Operation {
@@ -68,6 +76,8 @@ impl Operation {
             Self::Decide { .. } => OperationKind::Decide,
             Self::CreateBot { .. } => OperationKind::CreateBot,
             Self::CreateConversation { .. } => OperationKind::CreateConversation,
+            Self::CreateSkill { .. } => OperationKind::CreateSkill,
+            Self::ListSkills => OperationKind::ListSkills,
         }
     }
 }
@@ -82,6 +92,8 @@ pub enum Reply {
     Decided,
     CreatedBot(CreatedBot),
     CreatedConversation(CreatedConversation),
+    CreatedSkill(CreatedSkill),
+    Skills(Vec<SkillSummary>),
 }
 
 pub struct Job {
@@ -196,6 +208,21 @@ fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
         } => client
             .create_conversation(*kind, slug, parent_id.as_deref())
             .map(Reply::CreatedConversation),
+        Operation::CreateSkill {
+            id,
+            description,
+            body,
+        } => {
+            let body = if body.is_empty() {
+                None
+            } else {
+                Some(body.as_str())
+            };
+            client
+                .create_skill(id, description, body)
+                .map(Reply::CreatedSkill)
+        }
+        Operation::ListSkills => client.list_skills().map(Reply::Skills),
     }
 }
 

@@ -1,5 +1,6 @@
 use crate::{
-    ApiError, Approval, Catalog, CreatedBot, CreatedConversation, Message, Scope, Selection, Task,
+    ApiError, Approval, Catalog, CreatedBot, CreatedConversation, CreatedSkill, Message, Scope,
+    Selection, SkillSummary, Task,
     worker::{OperationKind, Reply},
 };
 
@@ -16,6 +17,9 @@ pub struct State {
     pub approvals_loaded: bool,
     pub created_bot: Option<CreatedBot>,
     pub created_conversation: Option<CreatedConversation>,
+    pub created_skill: Option<CreatedSkill>,
+    pub listed_skills: Vec<SkillSummary>,
+    pub skills_loaded: bool,
     pub error: Option<String>,
     pub unknown_outcome: bool,
 }
@@ -38,6 +42,9 @@ impl Default for State {
             approvals_loaded: false,
             created_bot: None,
             created_conversation: None,
+            created_skill: None,
+            listed_skills: Vec::new(),
+            skills_loaded: false,
             error: None,
             unknown_outcome: false,
         }
@@ -49,6 +56,9 @@ impl State {
         let epoch = self.scope.epoch.wrapping_add(1);
         let created_bot = self.created_bot.clone();
         let created_conversation = self.created_conversation.clone();
+        let created_skill = self.created_skill.clone();
+        let listed_skills = self.listed_skills.clone();
+        let skills_loaded = self.skills_loaded;
         *self = Self {
             scope: Scope {
                 epoch,
@@ -57,6 +67,9 @@ impl State {
             connected,
             created_bot,
             created_conversation,
+            created_skill,
+            listed_skills,
+            skills_loaded,
             ..Self::default()
         };
     }
@@ -65,6 +78,9 @@ impl State {
         self.new_scope(self.scope.conversation.clone(), false);
         self.created_bot = None;
         self.created_conversation = None;
+        self.created_skill = None;
+        self.listed_skills.clear();
+        self.skills_loaded = false;
     }
 
     pub fn can_send(&self) -> bool {
@@ -111,6 +127,11 @@ impl State {
             Reply::Decided => {}
             Reply::CreatedBot(bot) => self.created_bot = Some(bot),
             Reply::CreatedConversation(node) => self.created_conversation = Some(node),
+            Reply::CreatedSkill(skill) => self.created_skill = Some(skill),
+            Reply::Skills(skills) => {
+                self.listed_skills = skills;
+                self.skills_loaded = true;
+            }
         }
         true
     }
@@ -126,6 +147,7 @@ impl State {
                 | OperationKind::Decide
                 | OperationKind::CreateBot
                 | OperationKind::CreateConversation
+                | OperationKind::CreateSkill
         );
         if mutation && error.unknown_outcome() {
             self.unknown_outcome = true;
@@ -134,6 +156,7 @@ impl State {
                 OperationKind::Decide => "approval decision",
                 OperationKind::CreateBot => "bot scaffold",
                 OperationKind::CreateConversation => "conversation create",
+                OperationKind::CreateSkill => "skill create",
                 _ => "model change",
             };
             self.error = Some(format!(
@@ -150,8 +173,8 @@ impl State {
 mod tests {
     use super::*;
     use crate::{
-        Catalog, CreatedBot, CreatedConversation, Health, Message, Role, Selection, Task,
-        TaskStatus,
+        Catalog, CreatedBot, CreatedConversation, CreatedSkill, Health, Message, Role, Selection,
+        SkillSummary, Task, TaskStatus,
     };
 
     fn catalog() -> Catalog {
@@ -282,6 +305,23 @@ mod tests {
             ApiError::Http(422),
         );
         assert!(!clean.unknown_outcome);
+        clean.fail(
+            &clean_scope,
+            OperationKind::CreateSkill,
+            ApiError::Http(409),
+        );
+        assert!(!clean.unknown_outcome);
+        clean.fail(&clean_scope, OperationKind::ListSkills, ApiError::Transport);
+        assert!(!clean.unknown_outcome);
+
+        state.fail(&scope, OperationKind::CreateSkill, ApiError::Transport);
+        assert!(
+            state
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Unknown skill create outcome")
+        );
 
         state.created_bot = Some(CreatedBot {
             id: "notes".into(),
@@ -300,11 +340,30 @@ mod tests {
             parent_id: None,
             accepts_turns: false,
         });
+        state.created_skill = Some(CreatedSkill {
+            id: "notes-pack".into(),
+            name: "Notes Pack".into(),
+            description: "Short summary".into(),
+            file: "skills/notes-pack/SKILL.md".into(),
+            live: false,
+        });
+        state.listed_skills.push(SkillSummary {
+            id: "ask".into(),
+            name: "Ask".into(),
+            description: "Synthetic summary".into(),
+            pack: None,
+        });
+        state.skills_loaded = true;
         state.new_scope("dir:analyst".into(), true);
         assert!(state.created_bot.is_some());
         assert!(state.created_conversation.is_some());
+        assert!(state.created_skill.is_some());
+        assert!(state.skills_loaded);
         state.disconnect();
         assert!(state.created_bot.is_none());
         assert!(state.created_conversation.is_none());
+        assert!(state.created_skill.is_none());
+        assert!(state.listed_skills.is_empty());
+        assert!(!state.skills_loaded);
     }
 }
