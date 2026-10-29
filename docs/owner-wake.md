@@ -69,35 +69,31 @@ Still on `main` from the earlier wake note (code through `795b139`):
 
 ## OVH
 
-Confirmed on code tip **`27b1018`**
-(`27b101819acad0502cc0b596e6e48b255175e618`). `serabot` is active. Binary
-SHA-256 `48519539099b5235471f96295911de063de46f2ab2fff50addae1832b8c93d1d`.
-Staged at `/var/lib/serabot/releases/serabot-27b1018`. The previous binary is
-`/var/lib/serabot/releases/serabot-pre-27b1018` (code tip `23fcb7d`, SHA-256
-`b0cc4ca9a8dddd0f79aba44fba4c8a7740d35cb293c79b7a3239a3f354620738`).
-Built locally in WSL Ubuntu 24.04.5 (glibc 2.39, matching the host) with
-`cargo build --release --locked -p serabot`, uploaded, and swapped in by atomic
-rename; the running process was verified against the same SHA-256 through
-`/proc/<pid>/exe`. Only `serabot.service` was restarted. `onedrive-mcp` was
-left untouched and is still active. Unauthenticated `GET /v1/health` and
-`GET /v1/bots` return 401. `/v1/health` reports crate version `0.1.0`, not a
-git SHA.
+Running **SeraBot 0.2.0**. Binary SHA-256
+`8ac709fecc9b4fe4609048a62eea6ec2e2aea354b6f2eceb8bc53b38b62d925a`, built
+locally in WSL Ubuntu 24.04 from `d810b9c+worktree` (reported as the
+`/healthz` build). Staged at `/var/lib/serabot/releases/serabot-8ac709fe`; the
+previous binary is `/var/lib/serabot/releases/serabot-pre-8ac709fe` (SHA-256
+`48519539099b5235471f96295911de063de46f2ab2fff50addae1832b8c93d1d`). Only
+`serabot.service` was restarted; `database user_version` is 4 and the queue was
+empty before the swap.
+
+`bot.seradyx.tech` is served by the dedicated `cloudflared-bot.service` to
+`127.0.0.1:8787`. The pre-existing dashboard-managed `cloudflared.service`, the
+Docker cloudflared processes, and `onedrive-mcp` are untouched. Public checks:
+`/` 200, `/healthz` 200, `/v1/health` 401, `/app/latest.apk` 302 to the GitHub
+release asset.
 
 If historical journals ever contained `getUpdates` URLs (a build before
 `4464558`), rotate `telegram_bot_token` in BotFather and store the new value
 with `serabot secrets set`. Do not paste the token, the journal line, or the
 URL into chat, tickets, or git.
 
-This page does not change the binary. Roll back by restoring
-`serabot-pre-27b1018` onto `/opt/serabot/serabot` and restarting **only**
-`serabot.service`. Leave Docker, OpenBot, `onedrive-mcp.service`, and the
-Cloudflare tunnel alone. Before replacing a busy binary, tunnel in and read
-`GET /v1/status`. Queued turns without a pinned route fail closed. The queue
-was empty of non-terminal tasks at this deploy (15 done and 2 failed rows,
-nothing pending).
-
-The earlier read-only check (mtime `2026-10-29 01:39:08` UTC, SHA-256 prefix
-`dfbc71dd89536f4e…`) and the `795b139` binary both predate `4464558`.
+Roll back by restoring `serabot-pre-8ac709fe` onto `/opt/serabot/serabot` and
+restarting **only** `serabot.service`. Leave Docker, OpenBot,
+`onedrive-mcp.service`, and both Cloudflare tunnels alone. Before replacing a
+busy binary, read the queue; it was empty of non-terminal tasks at this deploy
+(17 done and 2 failed rows).
 
 New bots and skills are **not** hot-reloaded. `POST /v1/bots` and
 `POST /v1/skills` report `live: false`. `GET /v1/bots` lists the files anyway,
@@ -128,7 +124,7 @@ Commands below use secret **names** only.
 | **Enable a connector** | One section at a time, after its keys exist. Add the tool to a bot allowlist. Reads and AgentMail sends stay approval-gated. Restart **only** `serabot.service`. |
 | **Antigravity** | `secrets set antigravity_oauth_client_secret`, point `[llm.providers.*]` at `kind = "google-antigravity"`, then `serabot providers login google-antigravity`. Run that on the machine whose browser can open `127.0.0.1:51121`. Set `data_egress_approved = true` only when you intend Cloud Code to receive prompts. See [antigravity.md](antigravity.md). |
 | **GitHub Actions client builds** | `.github/workflows/clients.yml` accepts optional secrets `SERABOT_OWNER_API_URL` (synthetic shape `https://owner.example`, baked as the client default) and documents `SERABOT_OWNER_TOKEN`. The workflow does **not** read the token secret and does not compile a token. Unset secrets leave CI green. Never commit secret values ([ci-and-secrets.md](ci-and-secrets.md)). |
-| **GitHub Releases (client downloads)** | `git tag v0.2.0 && git push origin v0.2.0` runs `.github/workflows/release.yml`: builds `serabot-desktop` (Windows exe + zip) and `apps/serabot_mobile` (APK + AAB) and posts them to the Releases page. Reads only the optional `SERABOT_OWNER_API_URL` secret; the token is never read or compiled. APK/AAB are debug-signed (sideload only) until a keystore secret exists. See [ci-and-secrets.md](ci-and-secrets.md#releases). |
+| **GitHub Releases (client downloads)** | Bump `[workspace.package].version` on `main`: after tests pass, `.github/workflows/ci.yml` creates `v<version>` and dispatches `.github/workflows/release.yml`. That builds `serabot-desktop` (Windows exe + zip) and `apps/serabot_mobile` (APK + AAB) and posts them to the Releases page. A manual `git tag vX.Y.Z && git push origin vX.Y.Z` still works. Reads only the optional `SERABOT_OWNER_API_URL` secret; the token is never read or compiled. APK/AAB are debug-signed (sideload only) until a keystore secret exists. See [ci-and-secrets.md](ci-and-secrets.md#releases). |
 | **Hot reload** | Not implemented. Restart `serabot.service` for new bots and skills (OVH section above). |
 
 Still owner-gated from the previous checklist. Same stdin rule.

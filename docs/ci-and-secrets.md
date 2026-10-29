@@ -38,10 +38,14 @@ Desktop prefill order: process environment `SERABOT_OWNER_API_URL`, then the val
 
 ## Releases
 
-`release.yml` runs on a tag push matching `v*`, or manually via
-**Run workflow** with a required **tag** input naming an existing tag (for
-example `v0.2.0`). Every job checks out that tag and publishes the GitHub
-Release with `tag_name` set to it. Asset names use the same tag value.
+`release.yml` builds and publishes the client downloads. It is normally
+triggered by `ci.yml` after both test jobs pass on `main`: if the workspace
+version in `Cargo.toml` has no matching `v<version>` tag, CI creates the tag on
+that commit and dispatches `release.yml` with it. A version bump is therefore
+the release switch. A manual tag push (`git tag vX.Y.Z && git push origin
+vX.Y.Z`) or **Run workflow** with an existing tag (for example `v0.2.1`) still
+works. Every job checks out that tag and publishes the GitHub Release with
+`tag_name` set to it. Asset names use the same tag value.
 
 | Asset | Built on | Notes |
 | --- | --- | --- |

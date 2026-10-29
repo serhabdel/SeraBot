@@ -34,3 +34,40 @@ jobs:
       - name: Release build
         if: matrix.os == 'ubuntu-latest'
         run: cargo build --release -p serabot --locked
+
+  # A version bump on main is the release switch. After both test jobs pass,
+  # create v<workspace version> if it is new and dispatch the client release.
+  # The tag is created with GITHUB_TOKEN, which does not trigger `push` workflows,
+  # so release.yml is dispatched explicitly.
+  release:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-tag
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag and dispatch client release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "workspace version is not semver: '${version}'" >&2
+            exit 1
+          fi
+          tag="v${version}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "${tag} already exists; nothing to release."
+            exit 0
+          fi
+          git tag "${tag}"
+          git push origin "refs/tags/${tag}"
+          gh workflow run release.yml --ref main -f tag="${tag}"
+          echo "Created ${tag} and dispatched release.yml."
