@@ -501,6 +501,11 @@ impl Session {
         if self.pending.is_some() {
             return;
         }
+        // Load the open section even while a task is running or a poll is queued.
+        self.ensure_section_data();
+        if self.pending.is_some() {
+            return;
+        }
         if let Some((when, _)) = &self.scheduled {
             if Instant::now() >= *when {
                 if let Some((_, operation)) = self.scheduled.take() {
@@ -944,6 +949,16 @@ impl Session {
 
     pub fn refresh_providers(&mut self) {
         self.start_request(Operation::Providers);
+    }
+
+    /// Refresh the live provider catalogs (GET /v1/models) and then reload
+    /// provider status. Requires catalog_fetch on the server provider.
+    pub fn fetch_models(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
+        self.state.providers_loaded = false;
+        self.start_request(Operation::Catalog);
     }
 
     pub fn refresh_connectors(&mut self) {

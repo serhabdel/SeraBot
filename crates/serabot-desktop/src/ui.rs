@@ -578,7 +578,6 @@ fn ChatView(session: Signal<Session>) -> Element {
 
 #[component]
 fn ModelBar(session: Signal<Session>) -> Element {
-    let mut confirmed = use_signal(|| false);
     let (options, current, allowed, saved) = {
         let session = session.read();
         let catalog = session.state.catalog.as_ref();
@@ -650,19 +649,13 @@ fn ModelBar(session: Signal<Session>) -> Element {
                 }
             }
             if changed {
-                input {
-                    "type": "checkbox",
-                    checked: confirmed(),
-                    onchange: move |event| confirmed.set(event.checked()),
-                }
-                span { class: "muted small", "Provider receives this history" }
+                span { class: "muted small", "Egress-approved providers only" }
                 button {
                     class: "btn primary small",
-                    disabled: !allowed || !confirmed(),
+                    disabled: !allowed,
                     onclick: move |_| {
                         let draft = session.read().state.draft.clone();
                         session.write().apply_model(draft);
-                        confirmed.set(false);
                     },
                     "Apply"
                 }
@@ -693,6 +686,7 @@ fn FleetView(session: Signal<Session>) -> Element {
         })
         .collect();
     let bots_empty = bots.is_empty();
+    let bots_loaded = session.read().state.bots_loaded;
     let mut bot_id = use_signal(String::new);
     let mut bot_desc = use_signal(String::new);
     let mut bot_skills = use_signal(String::new);
@@ -806,6 +800,9 @@ fn FleetView(session: Signal<Session>) -> Element {
                 }
             }
             div { class: "cards",
+                if !bots_loaded {
+                    div { class: "card empty", h3 { "Loading bots…" } }
+                }
                 for (id, role, enabled, live, tools, skills, approvals) in bots {
                     div { class: "card bot-card", key: "{id}",
                         div { class: "bot-head",
@@ -831,7 +828,7 @@ fn FleetView(session: Signal<Session>) -> Element {
                         }
                     }
                 }
-                if bots_empty {
+                if bots_loaded && bots_empty {
                     div { class: "card empty",
                         h3 { "No bots loaded yet" }
                         p { class: "muted", "Refresh, or create a specialist on the server." }
@@ -844,6 +841,7 @@ fn FleetView(session: Signal<Session>) -> Element {
 
 #[component]
 fn ApprovalsView(session: Signal<Session>) -> Element {
+    let approvals_loaded = session.read().state.approvals_loaded;
     let approvals: Vec<(String, String, String, String)> = session
         .read()
         .state
@@ -873,6 +871,9 @@ fn ApprovalsView(session: Signal<Session>) -> Element {
                 }
             }
             div { class: "cards",
+                if !approvals_loaded {
+                    div { class: "card empty", h3 { "Loading approvals…" } }
+                }
                 for (id, tool, summary, expires) in approvals {
                     div { class: "card", key: "{id}",
                         div { class: "row between",
@@ -908,7 +909,7 @@ fn ApprovalsView(session: Signal<Session>) -> Element {
                         }
                     }
                 }
-                if approvals_empty {
+                if approvals_loaded && approvals_empty {
                     div { class: "card empty",
                         h3 { "Nothing pending" }
                         p { class: "muted", "Gateway requests appear here." }
@@ -922,22 +923,51 @@ fn ApprovalsView(session: Signal<Session>) -> Element {
 #[component]
 fn ProvidersView(session: Signal<Session>) -> Element {
     let providers = session.read().state.providers.clone();
+    let loaded = session.read().state.providers_loaded;
+    let mut prov_id = use_signal(|| "custom".to_owned());
+    let mut prov_base = use_signal(|| "https://api.example.com/v1".to_owned());
+    let mut prov_models = use_signal(|| "model-1, model-2".to_owned());
+    let mut prov_secret = use_signal(|| "custom_api_key".to_owned());
+    let models = prov_models()
+        .split(',')
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(|model| format!("\"{model}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let snippet = format!(
+        "[llm.providers.{}]\nkind = \"openai-compatible\"\nbase_url = \"{}\"\nmodels = [{}]\napi_key_secret = \"{}\"\ndata_egress_approved = true\ncatalog_fetch = true",
+        prov_id(),
+        prov_base(),
+        models,
+        prov_secret()
+    );
     rsx! {
         div { class: "page",
             div { class: "page-head",
                 div {
                     h1 { "Providers" }
-                    p { class: "muted", "Select an approved model for this conversation." }
+                    p { class: "muted", "Select an approved model and manage provider catalogs." }
                 }
-                button {
-                    class: "btn ghost",
-                    onclick: move |_| session.write().refresh_providers(),
-                    "Refresh"
+                div { class: "row",
+                    button {
+                        class: "btn ghost",
+                        onclick: move |_| session.write().fetch_models(),
+                        "Fetch models"
+                    }
+                    button {
+                        class: "btn ghost",
+                        onclick: move |_| session.write().refresh_providers(),
+                        "Refresh"
+                    }
                 }
             }
             div { class: "card",
                 ModelBar { session }
                 p { class: "muted small", "Applies to the next turn; a running turn keeps its pinned route." }
+            }
+            if !loaded {
+                div { class: "card empty", h3 { "Loading providers…" } }
             }
             div { class: "cards",
                 for provider in providers {
@@ -945,6 +975,20 @@ fn ProvidersView(session: Signal<Session>) -> Element {
                         div { class: "row between",
                             h3 { "{provider.id}" }
                             span { class: "pill", "{provider.kind}" }
+                        }
+                        div { class: "chips",
+                            if provider.catalog_verified {
+                                span { class: "pill ok", "catalog verified" }
+                            } else if provider.catalog_fetch {
+                                span { class: "pill warn", "catalog fetch on" }
+                            } else {
+                                span { class: "pill", "static models" }
+                            }
+                            if provider.data_egress_approved {
+                                span { class: "pill ok", "egress approved" }
+                            } else {
+                                span { class: "pill warn", "egress blocked" }
+                            }
                         }
                         div { class: "chips",
                             for model in provider.models {
@@ -962,11 +1006,43 @@ fn ProvidersView(session: Signal<Session>) -> Element {
                     }
                 }
             }
-            div { class: "card",
-                h3 { "Add or change a provider" }
-                p { class: "muted small", "Provider blocks, keys and egress approval stay in /etc/serabot/serabot.toml and the age store." }
-                code { "serabot secrets set <api_key_secret>" }
+            details { class: "card form-card",
+                summary { "Add a provider (server config)" }
+                p { class: "muted small",
+                    "The app never writes config or secrets. Generate the block, save it on the server, store the key, then restart serabot."
+                }
+                div { class: "form-grid",
+                    input {
+                        class: "input",
+                        value: "{prov_id}",
+                        placeholder: "provider id",
+                        oninput: move |event| prov_id.set(event.value()),
+                    }
+                    input {
+                        class: "input",
+                        value: "{prov_base}",
+                        placeholder: "https://api.example.com/v1",
+                        oninput: move |event| prov_base.set(event.value()),
+                    }
+                    input {
+                        class: "input",
+                        value: "{prov_models}",
+                        placeholder: "model ids, comma separated",
+                        oninput: move |event| prov_models.set(event.value()),
+                    }
+                    input {
+                        class: "input",
+                        value: "{prov_secret}",
+                        placeholder: "api key secret name",
+                        oninput: move |event| prov_secret.set(event.value()),
+                    }
+                }
+                code { "{snippet}" }
+                code { "serabot secrets set {prov_secret()}" }
                 code { "sudo systemctl restart serabot" }
+                p { class: "muted small",
+                    "Supported now: openai-compatible and the built-in kinds. Anthropic-compatible chat is the next provider protocol."
+                }
             }
         }
     }
@@ -975,6 +1051,7 @@ fn ProvidersView(session: Signal<Session>) -> Element {
 #[component]
 fn ConnectorsView(session: Signal<Session>) -> Element {
     let connectors = session.read().state.connectors.clone();
+    let loaded = session.read().state.connectors_loaded;
     rsx! {
         div { class: "page",
             div { class: "page-head",
@@ -987,6 +1064,9 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
                     onclick: move |_| session.write().refresh_connectors(),
                     "Refresh"
                 }
+            }
+            if !loaded {
+                div { class: "card empty", h3 { "Loading connectors…" } }
             }
             div { class: "cards",
                 for connector in connectors {
@@ -1001,11 +1081,20 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
                             code { "{uri}" }
                         }
                         div { class: "chips",
-                            for (role, secret) in connector.secrets {
+                            for (role, secret) in &connector.secrets {
                                 span { class: if secret.configured { "chip accent" } else { "chip warn" },
                                     "{role}: {secret.name.clone().unwrap_or_default()}"
                                 }
                             }
+                        }
+                        details {
+                            summary { class: "muted small", "Setup commands" }
+                            for (_, secret) in &connector.secrets {
+                                if !secret.configured {
+                                    code { "serabot secrets set {secret.name.clone().unwrap_or_default()}" }
+                                }
+                            }
+                            code { "sudo systemctl restart serabot" }
                         }
                     }
                 }
@@ -1017,6 +1106,7 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
 #[component]
 fn MemoryView(session: Signal<Session>) -> Element {
     let memories = session.read().state.memories.clone();
+    let memories_loaded = session.read().state.memories_loaded;
     let kind = session.read().memory.kind.clone();
     let content = session.read().memory.content.clone();
     let source = session.read().memory.source.clone();
@@ -1078,6 +1168,9 @@ fn MemoryView(session: Signal<Session>) -> Element {
                 }
             }
             div { class: "cards",
+                if !memories_loaded {
+                    div { class: "card empty", h3 { "Loading memories…" } }
+                }
                 for memory in memories {
                     div { class: "card", key: "{memory.id}",
                         div { class: "row between",

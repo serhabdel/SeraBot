@@ -131,14 +131,18 @@ network work stays on the Rust worker/SSE threads, never on the UI thread.
   through `POST /v1/memories` and is audited. The screen states that the
   orchestrator receives the 20 most recently updated memories; specialists never
   list them on their own.
-- **Providers** — read-only cards for each configured provider: kind, models,
-  routing classes, and secret **names** with presence. Values never appear.
-  Model selection is saved per conversation and applies to the next turn; a
-  running turn keeps its pinned route. The screen explains that provider blocks
-  and keys stay in `/etc/serabot/serabot.toml` and the age store.
-- **Connectors** — enabled/disabled state, redirect URI, and secret names for
-  Google, Microsoft, Notion, and AgentMail. Secret writes and OAuth login stay on
-  the server CLI.
+- **Providers** — provider cards show kind, models, catalog state, routing
+  classes, and secret **names** with presence. **Fetch models** re-reads the
+  provider catalog (requires `catalog_fetch = true` on the server). Model
+  selection is saved per conversation and applies to the next turn; a running
+  turn keeps its pinned route. Only egress-approved providers are selectable;
+  the separate confirmation checkbox was removed. An "Add a provider" generator
+  produces the TOML block and secret command for an OpenAI-compatible provider;
+  the app never writes server config or secrets.
+- **Connectors** — all configured connectors are listed with enabled state,
+  redirect URI, and secret names. Each card has copyable `serabot secrets set`
+  commands for missing keys. Secret writes and OAuth login stay on the server
+  CLI.
 - **Live updates** — the Rust core opens `GET /v1/events` on a dedicated thread
   with its own HTTP client, reconnects with backoff, and resumes from the last
   event id (`after=` / `Last-Event-ID`). Events coalesce into at most one

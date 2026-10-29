@@ -78,7 +78,11 @@ locally in WSL from commit `5ad1c65`. Staged at
 prompt now lists the callable tools explicitly, so the model should request
 approval for Firecrawl search/crawl instead of calling them unavailable. Legacy
 conversations and all six models remain verified. Only `serabot.service` was
-restarted; `database user_version` is 4.
+restarted; `database user_version` is 4. Model catalog fetching is enabled in
+`/etc/serabot/serabot.toml` (`catalog_fetch = true`, backup
+`serabot.toml.bak-20261029T154436Z`); `/v1/models` verifies 5 Mistral models.
+Audio is enabled (`voxtral-mini-latest` transcription, `voxtral-small-latest`
+understanding, Telegram intake); the desktop does not yet upload audio files.
 
 `bot.seradyx.tech` is served by the dedicated `cloudflared-bot.service` to
 `127.0.0.1:8787`. The pre-existing dashboard-managed `cloudflared.service`, the

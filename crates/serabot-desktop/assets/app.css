@@ -169,6 +169,7 @@ code {
   display: block; font-family: "Cascadia Code", Consolas, monospace; font-size: 12px;
   background: var(--bg-2); border: 1px solid var(--line-soft); border-radius: 8px;
   padding: 7px 9px; margin: 4px 0; color: var(--accent); overflow-x: auto;
+  white-space: pre-wrap; overflow-wrap: anywhere;
 }
 
 .connect { height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 24px; }
