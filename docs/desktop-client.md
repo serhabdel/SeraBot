@@ -114,16 +114,30 @@ network work stays on the Rust worker/SSE threads, never on the UI thread.
   soft status chips.
 - **Header** — the active conversation title and kind, connection state, a
   **Bots** count, the appearance switch, and refresh.
-- **Chat** — the conversation column lists server metadata (title, kind, and
-  id) and supports search, open, and new direct threads. Messages render as
-  bubbles with avatars, speaker, timestamp, and text. An empty conversation
-  shows the specialist roster. Chat history is capped at the server's recent
-  window (100 messages).
+- **Chat rail** — grouped into **Bots**, sections, rooms, and direct chats.
+  Every bot has a one-to-one row with its avatar and display name; sections and
+  groups are collapsible and show their children indented. Search filters labels
+  and assistant names. Raw ids are never the primary label: titles win, then the
+  bot profile, then a humanized slug, and numeric Telegram chats become
+  `Chat <last four>`.
+- **Chat** — messages render as bubbles with the producing bot's avatar, display
+  name, timestamp, and text. Assistant messages carry the bot that ran the turn;
+  legacy messages fall back to the orchestrator profile. An empty conversation
+  shows the bot roster. Chat history is capped at the server's recent window
+  (100 messages).
+- **Bot profiles** — open a profile from a Fleet card or from a bot chat header.
+  The page shows the avatar, display name, description, role, live state,
+  configured model, attached skills, and a "Can produce" summary. Display name,
+  avatar (emoji or initials), and description are editable and saved in the
+  admin overlay; tools, prompts, and model stay in the bot file. **Open 1:1
+  chat** opens `dir:<bot>`, which the server routes to that bot rather than the
+  orchestrator.
 - **Composer** — **Send** is enabled only when the catalog selection is saved and
   approved, no unknown outcome is pending, and the conversation accepts turns.
   Sections and groups are read-only structure.
-- **Conversations** — create sections, groups, direct threads, and rooms, rename
-  a thread, and archive it (soft; messages stay on the server). Rooms are
+- **Conversations** — create sections, groups, direct threads, and rooms with a
+  display name (stored as the conversation title) and an optional parent,
+  rename a thread, and archive it (soft; messages stay on the server). Rooms are
   conversations with the orchestrator and the specialists it delegates to, not
   multi-person chats. The server assigns ids (`sec:`, `grp:`, `dir:`, `room:`).
   Pre-kind legacy rows are shown as turn-capable direct threads.
@@ -170,12 +184,13 @@ network work stays on the Rust worker/SSE threads, never on the UI thread.
 
 ## Administration
 
-Provider, connector, and audio writes use the owner token and land in
-`admin-overrides.json` beside the SQLite database (on the standard host,
+Provider, connector, audio, and bot-profile writes use the owner token and land
+in `admin-overrides.json` beside the SQLite database (on the standard host,
 `/var/lib/serabot/admin-overrides.json`). That file holds non-secret settings
 only; credentials go to the age store and are never returned by the API. The
-overlay is merged over `serabot.toml` at startup, so saved changes take effect
-after **Restart server and apply** in the status banner.
+overlay is merged over `serabot.toml` at startup, so provider, connector, and
+audio changes take effect after **Restart server and apply** in the status
+banner. Bot display profiles are read at request time and apply immediately.
 
 - The restart endpoint refuses while a task is queued, running, or awaiting
   approval, and requires an explicit `confirm` in the request.
@@ -255,5 +270,13 @@ collapsible release notes, **Install and restart**, **Later**, and
 - OAuth consent for Google, Microsoft, and Notion still happens outside the app;
   paste the resulting refresh token in **Connectors**.
 - Admin saves require a service restart. If the unit is not managed by systemd
-  with `Restart=on-failure`, restart it yourself.
+  with `Restart=on-failure`, restart it yourself. Bot display profiles are the
+  exception: they apply immediately.
+- Per-bot fallback models are not implemented. A bot's 1:1 conversation keeps
+  its own pinned model through the Model bar.
+- Routines are global and run as the Watcher; per-bot routines have no schema or
+  UI yet.
+- Bot avatars are emoji or initials. Image upload/storage is not implemented.
+- Generated decks and media are downloadable from approvals and artifact links,
+  but there is no per-bot generation history index yet.
 - No live provider or Telegram verification is implied by the synthetic tests.
