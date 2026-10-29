@@ -1,8 +1,8 @@
 use crate::{
-    ApiClient, ApiError, Approval, ApprovalDecision, AudioUpdate, BotSummary, Catalog,
-    ConnectorStatus, ConnectorUpdate, ConversationKind, ConversationPage, ConversationSummary,
-    CreatedBot, CreatedConversation, CreatedSkill, Health, History, MemoryEntry, NewProvider,
-    ProviderStatus, Scope, Selection, SkillSummary, Task,
+    ApiClient, ApiError, Approval, ApprovalDecision, AudioUpdate, BotProfileUpdate, BotSummary,
+    Catalog, ConnectorStatus, ConnectorUpdate, ConversationKind, ConversationPage,
+    ConversationSummary, CreatedBot, CreatedConversation, CreatedSkill, Health, History,
+    MemoryEntry, NewProvider, ProviderStatus, Scope, Selection, SkillSummary, Task,
 };
 use secrecy::SecretString;
 use std::sync::{
@@ -42,6 +42,7 @@ pub enum OperationKind {
     Providers,
     Connectors,
     AdminWrite,
+    AdminProfile,
     AdminRestart,
 }
 
@@ -67,6 +68,7 @@ pub enum Operation {
         kind: ConversationKind,
         slug: String,
         parent_id: Option<String>,
+        title: Option<String>,
     },
     CreateSkill {
         id: String,
@@ -105,6 +107,10 @@ pub enum Operation {
         update: ConnectorUpdate,
     },
     AdminSetAudio(AudioUpdate),
+    AdminSetBotProfile {
+        id: String,
+        update: BotProfileUpdate,
+    },
     AdminRestart,
 }
 
@@ -136,6 +142,7 @@ impl Operation {
             | Self::AdminRemoveProvider(_)
             | Self::AdminSetConnector { .. }
             | Self::AdminSetAudio(_) => OperationKind::AdminWrite,
+            Self::AdminSetBotProfile { .. } => OperationKind::AdminProfile,
             Self::AdminRestart => OperationKind::AdminRestart,
         }
     }
@@ -163,6 +170,7 @@ pub enum Reply {
     Providers(Vec<ProviderStatus>),
     Connectors(Vec<ConnectorStatus>),
     AdminSaved,
+    BotProfileSaved,
     AdminRestarted,
 }
 
@@ -275,8 +283,9 @@ fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
             kind,
             slug,
             parent_id,
+            title,
         } => client
-            .create_conversation(*kind, slug, parent_id.as_deref())
+            .create_conversation(*kind, slug, parent_id.as_deref(), title.as_deref())
             .map(Reply::CreatedConversation),
         Operation::CreateSkill {
             id,
@@ -330,6 +339,9 @@ fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
         Operation::AdminSetAudio(update) => {
             client.admin_set_audio(update).map(|_| Reply::AdminSaved)
         }
+        Operation::AdminSetBotProfile { id, update } => client
+            .admin_set_bot_profile(id, update)
+            .map(|_| Reply::BotProfileSaved),
         Operation::AdminRestart => client.admin_restart().map(|ack| {
             if ack.restarting {
                 Reply::AdminRestarted

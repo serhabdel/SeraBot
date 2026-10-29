@@ -8,6 +8,7 @@ use serabot_desktop::{
     parse_skill_list,
     session::{Section, Session, Theme},
 };
+use std::collections::HashSet;
 
 const CSS: &str = include_str!("../assets/app.css");
 
@@ -25,15 +26,80 @@ const NAV: [(Section, &str, &str); 7] = [
     (Section::Fleet, "Fleet", "fleet"),
 ];
 
-type BotRow = (
-    String,
-    String,
-    bool,
-    bool,
-    Vec<String>,
-    Vec<String>,
-    Vec<String>,
-);
+#[derive(Clone)]
+struct BotCard {
+    id: String,
+    role: String,
+    enabled: bool,
+    live: bool,
+    display_name: String,
+    description: String,
+    avatar: String,
+    model: Option<String>,
+    tools: Vec<String>,
+    skills: Vec<String>,
+    require_approval: Vec<String>,
+}
+
+fn avatar_hue(id: &str) -> u16 {
+    let mut hash: u32 = 0;
+    for byte in id.bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(u32::from(byte));
+    }
+    (hash % 360) as u16
+}
+
+fn avatar_style(id: &str) -> String {
+    format!(
+        "--avatar-hue: {}; --avatar-a: hsl({} 58% 52%); --avatar-b: hsl({} 62% 38%);",
+        avatar_hue(id),
+        avatar_hue(id),
+        (avatar_hue(id) + 28) % 360
+    )
+}
+
+fn human_model(model: &str) -> String {
+    let base = model.strip_suffix("-latest").unwrap_or(model);
+    base.split(['-', '_'])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn human_provider(provider: &str) -> String {
+    if provider == "default" {
+        "Default provider".into()
+    } else {
+        human_model(provider)
+    }
+}
+
+fn capability_label(tool: &str) -> Option<&'static str> {
+    match tool {
+        "deck_build" => Some("Slide decks"),
+        "xlsx_analyze" | "timesheet_analyze" => Some("Spreadsheet analysis"),
+        "rag_search" | "document_index" => Some("Document search"),
+        "fetch_url" | "watch_now" | "firecrawl_scrape" | "firecrawl_map" | "firecrawl_search"
+        | "firecrawl_crawl" => Some("Web research"),
+        "audio_transcribe" | "audio_understand" => Some("Audio notes"),
+        "elevenlabs_text_to_speech"
+        | "elevenlabs_sound_effect"
+        | "elevenlabs_transcribe"
+        | "elevenlabs_generate_image"
+        | "elevenlabs_generate_video" => Some("Voice and media"),
+        "onedrive_upload" | "onedrive_list" => Some("OneDrive files"),
+        "skill_list" | "skill_search" | "skill_load" => Some("Skills"),
+        "delegate" => Some("Team handoffs"),
+        _ => None,
+    }
+}
 
 pub fn run() {
     #[cfg(windows)]
@@ -228,7 +294,13 @@ fn Shell(session: Signal<Session>) -> Element {
                         Section::Providers => rsx! { ProvidersView { session } },
                         Section::Connectors => rsx! { ConnectorsView { session } },
                         Section::Approvals => rsx! { ApprovalsView { session } },
-                        Section::Fleet => rsx! { FleetView { session } },
+                        Section::Fleet => {
+                            if session.read().selected_bot.is_some() {
+                                rsx! { BotProfileView { session } }
+                            } else {
+                                rsx! { FleetView { session } }
+                            }
+                        }
                         Section::Settings => rsx! { SettingsView { session } },
                     }}
                 }
@@ -246,6 +318,15 @@ fn Header(session: Signal<Session>) -> Element {
         section.label().to_owned()
     };
     let kind = session.read().conversation_kind().map(str::to_owned);
+    let active_bot = session
+        .read()
+        .conversation
+        .strip_prefix("dir:")
+        .map(str::to_owned);
+    let active_bot_avatar = active_bot
+        .as_deref()
+        .map(|bot| session.read().bot_avatar(bot))
+        .unwrap_or_default();
     let connected = session.read().state.connected;
     let bots = session.read().state.listed_bots.len();
     let bots_loaded = session.read().state.bots_loaded;
@@ -261,6 +342,15 @@ fn Header(session: Signal<Session>) -> Element {
                 strong { "{title}" }
                 if let Some(kind) = kind {
                     span { class: "pill", "{kind}" }
+                }
+                if let Some(bot) = active_bot.clone() {
+                    span { class: "pill accent", "bot chat" }
+                    button {
+                        class: "btn ghost small",
+                        onclick: move |_| session.write().open_bot(bot.clone()),
+                        span { class: "avatar avatar-xs", "{active_bot_avatar}" }
+                        "Profile"
+                    }
                 }
             }
             div { class: "header-actions",
@@ -431,72 +521,276 @@ fn UpdateBanner(session: Signal<Session>) -> Element {
     }
 }
 
+enum RailItem {
+    Header {
+        key: String,
+        title: String,
+        count: usize,
+        collapsed: bool,
+    },
+    Bot {
+        id: String,
+        label: String,
+        role: String,
+        avatar: String,
+        active: bool,
+        enabled: bool,
+    },
+    Thread {
+        id: String,
+        label: String,
+        subtitle: String,
+        depth: u8,
+        active: bool,
+    },
+}
+
 #[component]
 fn ConversationsPane(session: Signal<Session>) -> Element {
     let mut search = use_signal(String::new);
-    let needle = search().to_lowercase();
+    let mut collapsed = use_signal(HashSet::<String>::new);
+    let needle = search().trim().to_lowercase();
     let current = session.read().conversation.clone();
     let loaded = session.read().state.conversations_loaded;
-    let items: Vec<(String, String, String)> = session
-        .read()
-        .state
-        .conversations
-        .iter()
-        .filter(|conversation| {
+    let items = {
+        let state = session.read();
+        let bots = &state.state.listed_bots;
+        let conversations = &state.state.conversations;
+        let matches = |label: &str, subtitle: &str| {
             needle.is_empty()
-                || conversation.id.to_lowercase().contains(&needle)
-                || conversation
-                    .display_title()
-                    .to_lowercase()
-                    .contains(&needle)
-        })
-        .map(|conversation| {
-            (
-                conversation.id.clone(),
-                conversation.display_title().to_owned(),
-                conversation.normalized_kind().to_owned(),
-            )
-        })
-        .collect();
+                || label.to_lowercase().contains(&needle)
+                || subtitle.to_lowercase().contains(&needle)
+        };
+        let bot_chats: HashSet<String> = bots.iter().map(|bot| format!("dir:{}", bot.id)).collect();
+        let mut items = Vec::new();
+
+        let bot_rows = bots
+            .iter()
+            .filter(|bot| {
+                matches(
+                    &state.bot_display_name(&bot.id),
+                    &format!("bot {}", bot.role),
+                )
+            })
+            .collect::<Vec<_>>();
+        if needle.is_empty() || !bot_rows.is_empty() {
+            let key = "group:bots".to_owned();
+            let is_collapsed = collapsed().contains(&key);
+            items.push(RailItem::Header {
+                key: key.clone(),
+                title: "Bots".into(),
+                count: bots.len(),
+                collapsed: is_collapsed,
+            });
+            if !is_collapsed {
+                for bot in bot_rows {
+                    let id = format!("dir:{}", bot.id);
+                    items.push(RailItem::Bot {
+                        active: id == current,
+                        id,
+                        label: state.bot_display_name(&bot.id),
+                        role: bot.role.clone(),
+                        avatar: state.bot_avatar(&bot.id),
+                        enabled: bot.enabled,
+                    });
+                }
+            }
+        }
+
+        for section in conversations
+            .iter()
+            .filter(|conversation| conversation.normalized_kind() == "section")
+        {
+            let children = conversations
+                .iter()
+                .filter(|conversation| {
+                    conversation.parent_id.as_deref() == Some(&section.id)
+                        && !bot_chats.contains(&conversation.id)
+                })
+                .collect::<Vec<_>>();
+            let mut rows = Vec::new();
+            for child in &children {
+                let label = state.conversation_label(child);
+                let subtitle = state.conversation_subtitle(child);
+                if matches(&label, &subtitle) {
+                    rows.push(RailItem::Thread {
+                        id: child.id.clone(),
+                        label,
+                        subtitle,
+                        depth: 1,
+                        active: child.id == current,
+                    });
+                }
+                if child.normalized_kind() == "group" {
+                    for grand in conversations.iter().filter(|conversation| {
+                        conversation.parent_id.as_deref() == Some(&child.id)
+                            && !bot_chats.contains(&conversation.id)
+                    }) {
+                        let label = state.conversation_label(grand);
+                        let subtitle = state.conversation_subtitle(grand);
+                        if matches(&label, &subtitle) {
+                            rows.push(RailItem::Thread {
+                                id: grand.id.clone(),
+                                label,
+                                subtitle,
+                                depth: 2,
+                                active: grand.id == current,
+                            });
+                        }
+                    }
+                }
+            }
+            if needle.is_empty() || !rows.is_empty() {
+                let is_collapsed = collapsed().contains(&section.id);
+                items.push(RailItem::Header {
+                    key: section.id.clone(),
+                    title: state.conversation_label(section),
+                    count: rows.len(),
+                    collapsed: is_collapsed,
+                });
+                if !is_collapsed {
+                    items.extend(rows);
+                }
+            }
+        }
+
+        let mut roots = conversations
+            .iter()
+            .filter(|conversation| {
+                conversation.parent_id.is_none()
+                    && conversation.normalized_kind() != "section"
+                    && !bot_chats.contains(&conversation.id)
+            })
+            .collect::<Vec<_>>();
+        roots.sort_by(|left, right| {
+            let left_room = left.normalized_kind() == "room";
+            let right_room = right.normalized_kind() == "room";
+            right_room
+                .cmp(&left_room)
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+        });
+        let room_total = roots
+            .iter()
+            .filter(|conversation| conversation.normalized_kind() == "room")
+            .count();
+        let direct_total = roots.len().saturating_sub(room_total);
+        let mut rooms_added = false;
+        let mut directs_added = false;
+        for conversation in roots {
+            let is_room = conversation.normalized_kind() == "room";
+            let label = state.conversation_label(conversation);
+            let subtitle = state.conversation_subtitle(conversation);
+            if !matches(&label, &subtitle) {
+                continue;
+            }
+            let (key, title, added) = if is_room {
+                ("group:rooms", "Rooms", &mut rooms_added)
+            } else {
+                ("group:directs", "Direct chats", &mut directs_added)
+            };
+            if !*added {
+                *added = true;
+                let is_collapsed = collapsed().contains(key);
+                items.push(RailItem::Header {
+                    key: key.to_owned(),
+                    title: title.to_owned(),
+                    count: if is_room { room_total } else { direct_total },
+                    collapsed: is_collapsed,
+                });
+            }
+            let is_collapsed = collapsed().contains(key);
+            if !is_collapsed {
+                items.push(RailItem::Thread {
+                    id: conversation.id.clone(),
+                    label,
+                    subtitle,
+                    depth: 0,
+                    active: conversation.id == current,
+                });
+            }
+        }
+        items
+    };
     rsx! {
         aside { class: "sidebar",
             div { class: "sidebar-head",
-                h2 { "Conversations" }
+                h2 { "Chats" }
                 button {
                     class: "btn primary small",
-                    onclick: move |_| {
-                        let id = format!("windows-{}", uuid::Uuid::new_v4());
-                        session.write().open_conversation(id);
-                    },
+                    onclick: move |_| session.write().open_section(Section::Conversations),
                     "New"
                 }
             }
             input {
                 class: "input",
                 value: "{search}",
-                placeholder: "Search threads",
+                placeholder: "Search chats and bots",
                 oninput: move |event| search.set(event.value()),
             }
             div { class: "thread-list",
                 if !loaded {
-                    div { class: "muted small", "Loading threads…" }
+                    div { class: "muted small", "Loading chats…" }
                 }
-                for (id, title, kind) in items {
-                    button {
-                        class: if id == current { "thread active" } else { "thread" },
-                        onclick: {
-                            let id = id.clone();
-                            move |_| session.write().open_conversation(id.clone())
+                for item in items {
+                    {match item {
+                        RailItem::Header { key, title, count, collapsed: closed } => {
+                            let toggle = key.clone();
+                            rsx! {
+                                button {
+                                    key: "{key}",
+                                    class: "rail-header",
+                                    onclick: move |_| {
+                                        let mut set = collapsed.write();
+                                        if set.contains(&toggle) {
+                                            set.remove(&toggle);
+                                        } else {
+                                            set.insert(toggle.clone());
+                                        }
+                                    },
+                                    span { class: "rail-chevron", if closed { "▸" } else { "▾" } }
+                                    span { class: "rail-title", "{title}" }
+                                    span { class: "rail-count", "{count}" }
+                                }
+                            }
                         },
-                        span { class: "thread-title", "{title}" }
-                        span { class: "thread-meta", "{kind} · {id}" }
-                    }
+                        RailItem::Bot { id, label, role, avatar, active, enabled } => rsx! {
+                            button {
+                                key: "{id}",
+                                class: if active { "thread bot-thread active" } else { "thread bot-thread" },
+                                onclick: {
+                                    let id = id.clone();
+                                    move |_| {
+                                        let bot = id.strip_prefix("dir:").unwrap_or(&id).to_owned();
+                                        session.write().open_bot_chat(bot);
+                                    }
+                                },
+                                span { class: "avatar bot-avatar", style: avatar_style(&id), "{avatar}" }
+                                span { class: "thread-copy",
+                                    span { class: "thread-title", "{label}" }
+                                    span { class: "thread-meta", if enabled { "{role}" } else { "{role} · disabled" } }
+                                }
+                            }
+                        },
+                        RailItem::Thread { id, label, subtitle, depth, active } => rsx! {
+                            button {
+                                key: "{id}",
+                                class: if active { "thread indent active" } else { "thread indent" },
+                                style: format!("--depth: {depth};"),
+                                onclick: {
+                                    let id = id.clone();
+                                    move |_| session.write().open_conversation(id.clone())
+                                },
+                                span { class: "thread-title", "{label}" }
+                                span { class: "thread-meta", "{subtitle}" }
+                            }
+                        },
+                    }}
                 }
             }
             button {
                 class: "btn ghost small",
                 onclick: move |_| session.write().open_section(Section::Conversations),
-                "Manage conversations"
+                "Manage sections and groups"
             }
         }
     }
@@ -504,27 +798,27 @@ fn ConversationsPane(session: Signal<Session>) -> Element {
 
 #[component]
 fn ChatView(session: Signal<Session>) -> Element {
-    let messages: Vec<(String, bool, String, String, String)> = session
-        .read()
-        .state
-        .messages
-        .iter()
-        .map(|message| {
-            let user = message.role == Role::User;
-            let speaker = if user {
-                "You".to_owned()
-            } else {
-                message.name.clone().unwrap_or_else(|| "SeraBot".into())
-            };
-            (
-                message.id.clone(),
-                user,
-                speaker,
-                stamp(&message.created_at),
-                message.content.clone(),
-            )
-        })
-        .collect();
+    let messages: Vec<(String, bool, String, String, Option<String>, String, String)> = {
+        let state = session.read();
+        state
+            .state
+            .messages
+            .iter()
+            .map(|message| {
+                let user = message.role == Role::User;
+                let (speaker, avatar, bot) = state.message_speaker(message);
+                (
+                    message.id.clone(),
+                    user,
+                    speaker,
+                    avatar,
+                    bot,
+                    stamp(&message.created_at),
+                    message.content.clone(),
+                )
+            })
+            .collect()
+    };
     let task = session
         .read()
         .state
@@ -534,13 +828,42 @@ fn ChatView(session: Signal<Session>) -> Element {
     let composer = session.read().composer.clone();
     let can_send = session.read().state.can_send();
     let accepts = session.read().conversation_accepts_turns();
-    let bots: Vec<String> = session
-        .read()
-        .state
-        .listed_bots
-        .iter()
-        .map(|bot| bot.id.clone())
-        .collect();
+    let (active_bot, active_name, active_avatar, roster) = {
+        let state = session.read();
+        let active = state
+            .conversation
+            .strip_prefix("dir:")
+            .map(str::to_owned)
+            .or_else(|| {
+                state
+                    .state
+                    .listed_bots
+                    .iter()
+                    .find(|bot| bot.role == "orchestrator")
+                    .map(|bot| bot.id.clone())
+            });
+        let name = active
+            .as_deref()
+            .map(|id| state.bot_display_name(id))
+            .unwrap_or_else(|| "Assistant".into());
+        let avatar = active
+            .as_deref()
+            .map(|id| state.bot_avatar(id))
+            .unwrap_or_else(|| "A".into());
+        let roster = state
+            .state
+            .listed_bots
+            .iter()
+            .map(|bot| {
+                (
+                    bot.id.clone(),
+                    state.bot_display_name(&bot.id),
+                    state.bot_avatar(&bot.id),
+                )
+            })
+            .collect::<Vec<_>>();
+        (active, name, avatar, roster)
+    };
     use_effect(move || {
         let _ = session.read().state.messages.len();
         let _ = dioxus::document::eval(
@@ -548,6 +871,7 @@ fn ChatView(session: Signal<Session>) -> Element {
         );
     });
     let empty = messages.is_empty();
+    let is_one_to_one = session.read().conversation.starts_with("dir:");
     rsx! {
         div { class: "chat",
             ModelBar { session }
@@ -566,26 +890,47 @@ fn ChatView(session: Signal<Session>) -> Element {
             div { class: "messages", id: "messages",
                 if empty {
                     div { class: "hero",
-                        div { class: "hero-mark", "S" }
-                        h2 { if accepts { "Start a quiet, focused turn." } else { "This node is read-only." } }
-                        p { class: "muted",
-                            if accepts {
-                                "Ask the orchestrator, or open a room with your specialists."
+                        div { class: "hero-mark", style: active_bot.as_deref().map(avatar_style).unwrap_or_default(), "{active_avatar}" }
+                        h2 {
+                            if !accepts {
+                                "This node is read-only."
+                            } else if is_one_to_one {
+                                "Chat with {active_name}"
                             } else {
+                                "Start a focused turn."
+                            }
+                        }
+                        p { class: "muted",
+                            if !accepts {
                                 "Sections and groups organize the tree. Open a direct thread or a room to talk."
+                            } else if is_one_to_one {
+                                "A one-to-one conversation. Replies come from {active_name}, not the orchestrator."
+                            } else {
+                                "Ask the orchestrator, or open a room with your specialists."
                             }
                         }
                         div { class: "roster",
-                            for bot in bots {
-                                span { class: "avatar", "{bot.chars().next().unwrap_or('?').to_ascii_uppercase()}" }
-                                span { class: "muted small", "{bot}" }
+                            for (bot_id, bot_name, bot_avatar) in roster {
+                                button {
+                                    class: "roster-item",
+                                    onclick: {
+                                        let bot_id = bot_id.clone();
+                                        move |_| session.write().open_bot_chat(bot_id.clone())
+                                    },
+                                    span { class: "avatar", style: avatar_style(&bot_id), "{bot_avatar}" }
+                                    span { class: "muted small", "{bot_name}" }
+                                }
                             }
                         }
                     }
                 }
-                for (id, user, speaker, stamp, content) in messages {
+                for (id, user, speaker, avatar, bot, stamp, content) in messages {
                     div { class: if user { "msg user" } else { "msg" }, key: "{id}",
-                        span { class: "avatar", "{speaker.chars().next().unwrap_or('?').to_ascii_uppercase()}" }
+                        span {
+                            class: "avatar",
+                            style: bot.as_deref().map(avatar_style).unwrap_or_default(),
+                            "{avatar}"
+                        }
                         div { class: "bubble",
                             div { class: "bubble-meta",
                                 strong { "{speaker}" }
@@ -600,7 +945,7 @@ fn ChatView(session: Signal<Session>) -> Element {
                 textarea {
                     class: "input composer-input",
                     value: "{composer}",
-                    placeholder: if accepts { "Message SeraBot…" } else { "This node does not accept turns" },
+                    placeholder: if accepts { format!("Message {active_name}…") } else { "This node does not accept turns".into() },
                     disabled: !accepts,
                     oninput: move |event| session.write().composer = event.value(),
                 }
@@ -644,11 +989,12 @@ fn ModelBar(session: Signal<Session>) -> Element {
             }
             allowed = catalog.allows(&session.state.draft);
             saved = if catalog.selection.is_auto() {
-                "auto".into()
+                "Auto-routing across approved models".into()
             } else {
                 format!(
-                    "{} / {}",
-                    catalog.selection.provider, catalog.selection.model
+                    "Using {} via {}",
+                    human_model(&catalog.selection.model),
+                    human_provider(&catalog.selection.provider)
                 )
             };
         }
@@ -685,9 +1031,9 @@ fn ModelBar(session: Signal<Session>) -> Element {
                 },
                 for (provider, model) in options {
                     if provider == "auto" {
-                        option { value: "auto", "Auto (approved default)" }
+                        option { value: "auto", "Auto · approved route" }
                     } else {
-                        option { value: "{provider}|{model}", "{provider} / {model}" }
+                        option { value: "{provider}|{model}", "{human_model(&model)} · {human_provider(&provider)}" }
                     }
                 }
             }
@@ -711,25 +1057,30 @@ fn ModelBar(session: Signal<Session>) -> Element {
 
 #[component]
 fn FleetView(session: Signal<Session>) -> Element {
-    let bots: Vec<BotRow> = session
-        .read()
-        .state
-        .listed_bots
-        .iter()
-        .map(|bot| {
-            (
-                bot.id.clone(),
-                bot.role.clone(),
-                bot.enabled,
-                bot.live,
-                bot.tools.clone(),
-                bot.skills.clone(),
-                bot.require_approval.clone(),
-            )
-        })
-        .collect();
+    let bots: Vec<BotCard> = {
+        let state = session.read();
+        state
+            .state
+            .listed_bots
+            .iter()
+            .map(|bot| BotCard {
+                id: bot.id.clone(),
+                role: bot.role.clone(),
+                enabled: bot.enabled,
+                live: bot.live,
+                display_name: state.bot_display_name(&bot.id),
+                description: bot.description.clone().unwrap_or_default(),
+                avatar: state.bot_avatar(&bot.id),
+                model: bot.model.clone(),
+                tools: bot.tools.clone(),
+                skills: bot.skills.clone(),
+                require_approval: bot.require_approval.clone(),
+            })
+            .collect()
+    };
     let bots_empty = bots.is_empty();
     let bots_loaded = session.read().state.bots_loaded;
+    let bot_binding = session.read().state.bot_chat_binding == Some(true);
     let mut bot_id = use_signal(String::new);
     let mut bot_desc = use_signal(String::new);
     let mut bot_skills = use_signal(String::new);
@@ -748,6 +1099,11 @@ fn FleetView(session: Signal<Session>) -> Element {
                     onclick: move |_| session.write().refresh_bots(),
                     Icon { name: "refresh".to_string() }
                     "Refresh"
+                }
+            }
+            if !bot_binding {
+                div { class: "banner warn",
+                    span { "This server does not route one-to-one bot chats yet. Update the server to 0.5.0 or later." }
                 }
             }
             details { class: "card form-card",
@@ -846,27 +1202,52 @@ fn FleetView(session: Signal<Session>) -> Element {
                 if !bots_loaded {
                     div { class: "card empty", h3 { "Loading bots…" } }
                 }
-                for (id, role, enabled, live, tools, skills, approvals) in bots {
-                    div { class: "card bot-card", key: "{id}",
+                for bot in bots {
+                    div { class: "card bot-card", key: "{bot.id}",
                         div { class: "bot-head",
-                            span { class: "avatar", "{id.chars().next().unwrap_or('?').to_ascii_uppercase()}" }
+                            span { class: "avatar avatar-lg", style: avatar_style(&bot.id), "{bot.avatar}" }
                             div {
-                                h3 { "{id}" }
-                                span { class: "muted small", "{role}" }
+                                h3 { "{bot.display_name}" }
+                                span { class: "muted small", "{bot.id} · {bot.role}" }
                             }
-                            span { class: if enabled { "pill ok" } else { "pill" }, if enabled { "enabled" } else { "disabled" } }
-                            if !live {
+                            span { class: if bot.enabled { "pill ok" } else { "pill" }, if bot.enabled { "enabled" } else { "disabled" } }
+                            if !bot.live {
                                 span { class: "pill warn", "restart required" }
                             }
                         }
+                        if !bot.description.is_empty() {
+                            p { class: "muted small", "{bot.description}" }
+                        }
                         div { class: "chips",
-                            for tool in tools {
-                                span { class: if approvals.contains(&tool) { "chip warn" } else { "chip" }, "{tool}" }
+                            span { class: "chip", if let Some(model) = bot.model.clone() { "Model: {human_model(&model)}" } else { "Model: conversation route" } }
+                        }
+                        div { class: "chips",
+                            for tool in bot.tools {
+                                span { class: if bot.require_approval.contains(&tool) { "chip warn" } else { "chip" }, "{tool}" }
                             }
                         }
                         div { class: "chips",
-                            for skill in skills {
+                            for skill in bot.skills {
                                 span { class: "chip accent", "{skill}" }
+                            }
+                        }
+                        div { class: "row",
+                            button {
+                                class: "btn primary small",
+                                disabled: !bot.enabled || !bot_binding,
+                                onclick: {
+                                    let id = bot.id.clone();
+                                    move |_| session.write().open_bot_chat(id.clone())
+                                },
+                                "1:1 chat"
+                            }
+                            button {
+                                class: "btn ghost small",
+                                onclick: {
+                                    let id = bot.id.clone();
+                                    move |_| session.write().open_bot(id.clone())
+                                },
+                                "Open profile"
                             }
                         }
                     }
@@ -875,6 +1256,197 @@ fn FleetView(session: Signal<Session>) -> Element {
                     div { class: "card empty",
                         h3 { "No bots loaded yet" }
                         p { class: "muted", "Refresh, or create a specialist on the server." }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn BotProfileView(session: Signal<Session>) -> Element {
+    let Some(id) = session.read().selected_bot.clone() else {
+        return rsx! {};
+    };
+    let bot = session
+        .read()
+        .state
+        .listed_bots
+        .iter()
+        .find(|bot| bot.id == id)
+        .cloned();
+    let Some(bot) = bot else {
+        return rsx! {
+            div { class: "page",
+                div { class: "page-head",
+                    div { h1 { "Bot profile" } p { class: "muted", "Loading {id}…" } }
+                    button {
+                        class: "btn ghost",
+                        onclick: move |_| session.write().close_bot(),
+                        "Back to fleet"
+                    }
+                }
+                div { class: "card empty", h3 { "This bot is not in the roster yet." } }
+            }
+        };
+    };
+    let display_name = session.read().bot_display_name(&bot.id);
+    let avatar = session.read().bot_avatar(&bot.id);
+    let bot_description = bot.description.clone().unwrap_or_default();
+    let bot_model = bot.model.clone();
+    let bot_binding = session.read().state.bot_chat_binding == Some(true);
+    let draft_name = session.read().bot_profile.display_name.clone();
+    let draft_description = session.read().bot_profile.description.clone();
+    let draft_avatar = session.read().bot_profile.avatar.clone();
+    let can_save = session.read().can_admin();
+    let skills = {
+        let state = session.read();
+        bot.skills
+            .iter()
+            .map(|id| {
+                let summary = state
+                    .state
+                    .listed_skills
+                    .iter()
+                    .find(|skill| &skill.id == id);
+                (
+                    summary
+                        .map(|skill| skill.name.clone())
+                        .unwrap_or_else(|| id.clone()),
+                    summary
+                        .map(|skill| skill.description.clone())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let capabilities = {
+        let mut labels = bot
+            .tools
+            .iter()
+            .filter_map(|tool| capability_label(tool))
+            .collect::<Vec<_>>();
+        labels.sort_unstable();
+        labels.dedup();
+        labels
+    };
+    let is_watcher = bot.role == "watcher" || bot.id == "watcher";
+    rsx! {
+        div { class: "page",
+            div { class: "page-head",
+                div {
+                    h1 { "{display_name}" }
+                    p { class: "muted", "{bot.id} · {bot.role}" }
+                }
+                div { class: "row",
+                    button {
+                        class: "btn ghost",
+                        onclick: move |_| session.write().close_bot(),
+                        "Back to fleet"
+                    }
+                    button {
+                        class: "btn primary",
+                        disabled: !bot.enabled || !bot_binding,
+                        onclick: {
+                            let id = bot.id.clone();
+                            move |_| session.write().open_bot_chat(id.clone())
+                        },
+                        "Open 1:1 chat"
+                    }
+                }
+            }
+            div { class: "profile-grid",
+                div { class: "card profile-identity",
+                    span { class: "avatar avatar-xl", style: avatar_style(&bot.id), "{avatar}" }
+                    h2 { "{display_name}" }
+                    div { class: "chips",
+                        span { class: if bot.enabled { "pill ok" } else { "pill" }, if bot.enabled { "enabled" } else { "disabled" } }
+                        span { class: if bot.live { "pill ok" } else { "pill warn" }, if bot.live { "live" } else { "restart required" } }
+                        span { class: "pill accent", "{bot.role}" }
+                    }
+                    if !bot_description.is_empty() {
+                        p { class: "muted", "{bot_description}" }
+                    } else {
+                        p { class: "muted small", "No description yet. Add one below so the roster explains itself." }
+                    }
+                    if !bot.enabled {
+                        p { class: "muted small", "This bot is disabled in its bot file. Enable it there and restart the server before chatting." }
+                    }
+                    if !bot_binding {
+                        p { class: "muted small", "This server does not route one-to-one bot chats yet. Update the server to 0.5.0 or later." }
+                    }
+                    div { class: "chips",
+                        span { class: "chip", if let Some(model) = bot_model.clone() { "Model: {human_model(&model)}" } else { "Model: conversation route" } }
+                    }
+                    p { class: "muted small", "Fallback models are not available yet; each turn uses the conversation route." }
+                }
+                div { class: "card",
+                    h3 { "Profile" }
+                    p { class: "muted small", "Display name, avatar and description belong to the console. Behavior, tools and model stay in the bot file." }
+                    p { class: "muted small", "Use an emoji or initials for the avatar. Image uploads are not supported yet." }
+                    div { class: "form-grid",
+                        input {
+                            class: "input",
+                            value: "{draft_name}",
+                            placeholder: "Display name",
+                            oninput: move |event| session.write().bot_profile.display_name = event.value(),
+                        }
+                        input {
+                            class: "input",
+                            value: "{draft_avatar}",
+                            placeholder: "Avatar emoji or initials",
+                            oninput: move |event| session.write().bot_profile.avatar = event.value(),
+                        }
+                    }
+                    textarea {
+                        class: "input",
+                        value: "{draft_description}",
+                        placeholder: "What this bot is for",
+                        oninput: move |event| session.write().bot_profile.description = event.value(),
+                    }
+                    button {
+                        class: "btn primary",
+                        disabled: !can_save,
+                        onclick: move |_| session.write().save_bot_profile(),
+                        "Save profile"
+                    }
+                }
+                div { class: "card",
+                    h3 { "Skills" }
+                    if skills.is_empty() {
+                        p { class: "muted small", "No skills attached to this bot." }
+                    } else {
+                        div { class: "stack",
+                            for (name, description) in skills {
+                                div { class: "stack-row",
+                                    strong { "{name}" }
+                                    if !description.is_empty() {
+                                        span { class: "muted small", "{description}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                div { class: "card",
+                    h3 { "Can produce" }
+                    if capabilities.is_empty() {
+                        p { class: "muted small", "No output tools are attached to this bot." }
+                    } else {
+                        div { class: "chips",
+                            for label in capabilities {
+                                span { class: "chip accent", "{label}" }
+                            }
+                        }
+                        p { class: "muted small", "Generated decks and media are downloadable from their approvals and artifact links; per-bot generation history is not indexed yet." }
+                    }
+                }
+                div { class: "card",
+                    h3 { "Routines" }
+                    if is_watcher {
+                        p { class: "muted small", "The watcher runs the morning brief and watched-source checks from the server schedule." }
+                    } else {
+                        p { class: "muted small", "No per-bot routine yet. Routines currently run on the Watcher schedule only." }
                     }
                 }
             }
@@ -1373,21 +1945,46 @@ fn MemoryView(session: Signal<Session>) -> Element {
 #[component]
 fn ConversationsView(session: Signal<Session>) -> Element {
     let mut rename = use_signal(|| None::<(String, String)>);
-    let items: Vec<(String, String, String, String)> = session
-        .read()
-        .state
-        .conversations
-        .iter()
-        .map(|conversation| {
-            (
-                conversation.id.clone(),
-                conversation.display_title().to_owned(),
-                conversation.normalized_kind().to_owned(),
-                stamp(&conversation.updated_at),
-            )
-        })
-        .collect();
     let kind = session.read().fleet.conv_kind;
+    let (items, parents) = {
+        let state = session.read();
+        let items = state
+            .state
+            .conversations
+            .iter()
+            .map(|conversation| {
+                (
+                    conversation.id.clone(),
+                    state.conversation_label(conversation),
+                    state.conversation_subtitle(conversation),
+                    stamp(&conversation.updated_at),
+                )
+            })
+            .collect::<Vec<_>>();
+        let parent_kinds: &[&str] = match kind {
+            ConversationKind::Section => &[],
+            ConversationKind::Group => &["section"],
+            ConversationKind::Direct | ConversationKind::Room => &["section", "group"],
+        };
+        let parents = state
+            .state
+            .conversations
+            .iter()
+            .filter(|conversation| {
+                parent_kinds
+                    .iter()
+                    .any(|kind| *kind == conversation.normalized_kind())
+            })
+            .map(|conversation| {
+                (
+                    conversation.id.clone(),
+                    state.conversation_label(conversation),
+                )
+            })
+            .collect::<Vec<_>>();
+        (items, parents)
+    };
+    let title = session.read().fleet.conv_title.clone();
     let slug = session.read().fleet.conv_slug.clone();
     let parent = session.read().fleet.conv_parent.clone();
     let editing = rename();
@@ -1416,6 +2013,7 @@ fn ConversationsView(session: Signal<Session>) -> Element {
                                 .find(|kind| kind.as_str() == event.value())
                                 .unwrap_or(ConversationKind::Section);
                             session.write().fleet.conv_kind = next;
+                            session.write().fleet.conv_parent.clear();
                         },
                         for kind in ConversationKind::ALL {
                             option { value: "{kind.as_str()}", "{kind.label()}" }
@@ -1423,16 +2021,25 @@ fn ConversationsView(session: Signal<Session>) -> Element {
                     }
                     input {
                         class: "input",
+                        value: "{title}",
+                        placeholder: "name (for example Finance)",
+                        oninput: move |event| session.write().fleet.conv_title = event.value(),
+                    }
+                    input {
+                        class: "input",
                         value: "{slug}",
-                        placeholder: "slug",
+                        placeholder: "id (lowercase slug)",
                         oninput: move |event| session.write().fleet.conv_slug = event.value(),
                     }
                     if kind != ConversationKind::Section {
-                        input {
+                        select {
                             class: "input",
                             value: "{parent}",
-                            placeholder: "parent sec:finance",
-                            oninput: move |event| session.write().fleet.conv_parent = event.value(),
+                            onchange: move |event| session.write().fleet.conv_parent = event.value(),
+                            option { value: "", "No parent" }
+                            for (id, label) in parents {
+                                option { value: "{id}", "{label}" }
+                            }
                         }
                     }
                     button {
@@ -1440,20 +2047,26 @@ fn ConversationsView(session: Signal<Session>) -> Element {
                         onclick: move |_| {
                             let kind = session.read().fleet.conv_kind;
                             let slug = session.read().fleet.conv_slug.clone();
+                            let title = session.read().fleet.conv_title.clone();
                             let parent = session.read().fleet.conv_parent.trim().to_owned();
-                            session.write().create_conversation(kind, slug, (!parent.is_empty()).then_some(parent));
+                            session.write().create_conversation(
+                                kind,
+                                slug,
+                                (!parent.is_empty()).then_some(parent),
+                                title,
+                            );
                         },
                         "Create"
                     }
                 }
             }
             div { class: "cards",
-                for (id, title, kind, updated) in items {
+                for (id, title, subtitle, updated) in items {
                     div { class: "card", key: "{id}",
                         div { class: "row between",
                             div {
                                 h3 { "{title}" }
-                                span { class: "muted small", "{id} · {kind} · {updated}" }
+                                span { class: "muted small", "{subtitle} · {updated}" }
                             }
                             div { class: "row",
                                 button {

@@ -114,6 +114,21 @@ h3 { font-size: 16px; }
 .thread.active { background: color-mix(in srgb, var(--accent) 13%, transparent); }
 .thread-title { font-weight: 600; font-size: 13px; }
 .thread-meta { color: var(--muted); font-size: 10.5px; }
+.thread.indent { padding-left: calc(11px + var(--depth, 0) * 14px); }
+.thread.bot-thread { flex-direction: row; align-items: center; gap: 9px; }
+.thread-copy { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.rail-header {
+  border: 0; background: transparent; color: var(--muted); cursor: pointer;
+  display: flex; align-items: center; gap: 6px; padding: 7px 6px 3px;
+  font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+}
+.rail-header:hover { color: var(--text); }
+.rail-chevron { width: 12px; font-size: 10px; }
+.rail-title { flex: 1; text-align: left; }
+.rail-count {
+  min-width: 18px; text-align: center; border-radius: 999px; padding: 1px 6px;
+  background: color-mix(in srgb, var(--text) 7%, transparent); font-size: 9.5px;
+}
 
 .main { display: flex; flex-direction: column; min-width: 0; height: 100vh; }
 .header {
@@ -201,9 +216,13 @@ code {
 .avatar {
   width: 30px; height: 30px; border-radius: 10px; flex: none;
   display: grid; place-items: center; font-weight: 700; font-size: 12px;
-  color: var(--accent); background: color-mix(in srgb, var(--accent) 16%, transparent);
-  border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
+  color: #fff; background: linear-gradient(135deg, var(--avatar-a, var(--accent)), var(--avatar-b, #0f766e));
+  border: 1px solid color-mix(in srgb, #fff 12%, transparent);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 22%, transparent);
 }
+.avatar-xs { width: 20px; height: 20px; border-radius: 7px; font-size: 10px; }
+.avatar-lg { width: 42px; height: 42px; border-radius: 14px; font-size: 17px; }
+.avatar-xl { width: 76px; height: 76px; border-radius: 24px; font-size: 30px; }
 .msg.user .avatar { color: #062a26; background: var(--accent); border-color: transparent; }
 .bubble {
   background: var(--bot); border: 1px solid var(--line-soft); border-radius: 16px;
@@ -218,12 +237,18 @@ code {
 .hero { margin: auto; text-align: center; max-width: 560px; display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 24px; }
 .hero-mark {
   width: 64px; height: 64px; border-radius: 22px; display: grid; place-items: center;
-  font-size: 26px; font-weight: 800; color: #062a26;
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  font-size: 26px; font-weight: 800; color: #fff;
+  background: linear-gradient(135deg, var(--avatar-a, var(--accent)), var(--avatar-b, var(--accent-2)));
   box-shadow: 0 16px 40px color-mix(in srgb, var(--accent) 28%, transparent);
 }
-.roster { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: center; margin-top: 6px; }
+.roster { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: center; margin-top: 6px; }
 .roster .avatar { width: 26px; height: 26px; border-radius: 9px; font-size: 11px; }
+.roster-item {
+  border: 1px solid var(--line-soft); background: color-mix(in srgb, var(--card) 70%, transparent);
+  border-radius: 999px; padding: 4px 10px 4px 5px; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 6px; color: var(--text);
+}
+.roster-item:hover { border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
 
 .composer { border-top: 1px solid var(--line-soft); padding: 12px 18px 14px; background: color-mix(in srgb, var(--panel) 65%, transparent); }
 .composer-input { min-height: 54px; max-height: 160px; resize: none; background: var(--card); }
@@ -256,10 +281,20 @@ details summary { cursor: pointer; }
 }
 .tool-grid label { display: flex; align-items: center; gap: 6px; }
 
+.profile-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.profile-identity { align-items: flex-start; gap: 8px; }
+.stack { display: flex; flex-direction: column; gap: 8px; }
+.stack-row { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border-radius: 12px; background: color-mix(in srgb, var(--text) 4%, transparent); }
+
 @media (max-width: 1080px) {
-  .shell { grid-template-columns: 70px minmax(0, 1fr); }
-  .sidebar { display: none; }
+  .shell { grid-template-columns: 70px 258px minmax(0, 1fr); }
   .cards { grid-template-columns: 1fr; }
+  .profile-grid { grid-template-columns: 1fr; }
   .header { padding: 0 14px; }
   .content { overflow-y: auto; }
+}
+
+@media (max-width: 900px) {
+  .shell { grid-template-columns: 70px minmax(0, 1fr); }
+  .sidebar { display: none; }
 }

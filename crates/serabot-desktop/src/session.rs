@@ -4,9 +4,9 @@
 //! the worker and SSE threads, never on the UI thread.
 
 use crate::{
-    ApiError, ApprovalDecision, AudioUpdate, ConnectorUpdate, ConversationKind,
-    MAX_SKILL_BODY_BYTES, MAX_SKILL_DESCRIPTION_CHARS, NewProvider, SPECIALIST_TOOLS, Selection,
-    TaskStatus,
+    ApiError, ApprovalDecision, AudioUpdate, BotProfileUpdate, ConnectorUpdate, ConversationKind,
+    MAX_SKILL_BODY_BYTES, MAX_SKILL_DESCRIPTION_CHARS, Message, NewProvider, Role,
+    SPECIALIST_TOOLS, Selection, TaskStatus,
     api::{
         MEMORY_KINDS, valid_conversation_title, valid_credential, valid_memory_content,
         valid_memory_kind, valid_memory_source, valid_model_id, valid_provider_id,
@@ -107,6 +107,7 @@ pub struct FleetDraft {
     pub skill_description: String,
     pub skill_body: String,
     pub conv_kind: ConversationKind,
+    pub conv_title: String,
     pub conv_slug: String,
     pub conv_parent: String,
 }
@@ -125,6 +126,7 @@ impl Default for FleetDraft {
             skill_description: String::new(),
             skill_body: String::new(),
             conv_kind: ConversationKind::Section,
+            conv_title: String::new(),
             conv_slug: String::new(),
             conv_parent: String::new(),
         }
@@ -217,6 +219,14 @@ pub struct AudioDraft {
     pub understanding_model: String,
 }
 
+#[derive(Default)]
+pub struct BotProfileDraft {
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    pub avatar: String,
+}
+
 pub struct RenameDraft {
     pub id: String,
     pub title: String,
@@ -252,6 +262,8 @@ pub struct Session {
     pub provider: ProviderDraft,
     pub connector_drafts: BTreeMap<String, ConnectorDraft>,
     pub audio: AudioDraft,
+    pub selected_bot: Option<String>,
+    pub bot_profile: BotProfileDraft,
     pub admin_notice: Option<String>,
     pub admin_error: Option<String>,
     pub restart_pending: bool,
@@ -307,6 +319,8 @@ impl Session {
             provider: ProviderDraft::default(),
             connector_drafts: BTreeMap::new(),
             audio: AudioDraft::default(),
+            selected_bot: None,
+            bot_profile: BotProfileDraft::default(),
             admin_notice: None,
             admin_error: None,
             restart_pending: false,
@@ -462,6 +476,8 @@ impl Session {
             self.state.connectors.clear();
             self.state.connectors_loaded = false;
             self.fleet = FleetDraft::default();
+            self.selected_bot = None;
+            self.bot_profile = BotProfileDraft::default();
             self.memory.content.zeroize();
             self.memory.delete_confirm = None;
         }
@@ -495,6 +511,9 @@ impl Session {
 
     pub fn open_section(&mut self, section: Section) {
         self.section = section;
+        if section != Section::Fleet {
+            self.selected_bot = None;
+        }
         self.ensure_section_data();
     }
 
@@ -504,8 +523,197 @@ impl Session {
         }
         self.conversation = id;
         self.section = Section::Chat;
+        self.selected_bot = None;
         self.reset_scope(true);
         self.refresh();
+    }
+
+    pub fn open_bot(&mut self, id: String) {
+        if !valid_id(&id) {
+            return;
+        }
+        self.selected_bot = Some(id.clone());
+        self.section = Section::Fleet;
+        self.bot_profile = match self.state.listed_bots.iter().find(|bot| bot.id == id) {
+            Some(bot) => BotProfileDraft {
+                id: bot.id.clone(),
+                display_name: self.bot_display_name(&bot.id),
+                description: bot.description.clone().unwrap_or_default(),
+                avatar: bot.avatar.clone().unwrap_or_default(),
+            },
+            None => BotProfileDraft {
+                id,
+                ..BotProfileDraft::default()
+            },
+        };
+        self.ensure_section_data();
+    }
+
+    pub fn close_bot(&mut self) {
+        self.selected_bot = None;
+        self.bot_profile = BotProfileDraft::default();
+    }
+
+    pub fn open_bot_chat(&mut self, id: String) {
+        if self.state.bot_chat_binding != Some(true) {
+            self.state.error = Some(
+                "This server does not route one-to-one bot chats. Update the server to 0.5.0 or later."
+                    .into(),
+            );
+            return;
+        }
+        self.selected_bot = None;
+        self.open_conversation(format!("dir:{id}"));
+    }
+
+    pub fn save_bot_profile(&mut self) {
+        self.admin_error = None;
+        self.admin_notice = None;
+        let name = self.bot_profile.display_name.trim().to_owned();
+        if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+            self.admin_error = Some("Bot display name must be 1–64 visible characters.".into());
+            return;
+        }
+        if self.bot_profile.avatar.chars().count() > 16
+            || self.bot_profile.avatar.chars().any(char::is_control)
+        {
+            self.admin_error = Some("Bot avatar must be a short label or emoji.".into());
+            return;
+        }
+        if self.state.bot_profiles != Some(true) {
+            self.admin_error = Some(
+                "This server does not store bot profiles. Update the server to 0.5.0 or later."
+                    .into(),
+            );
+            return;
+        }
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.start_request(Operation::AdminSetBotProfile {
+            id: self.bot_profile.id.clone(),
+            update: BotProfileUpdate {
+                display_name: name,
+                description: self.bot_profile.description.trim().to_owned(),
+                avatar: self.bot_profile.avatar.trim().to_owned(),
+            },
+        });
+    }
+
+    pub fn bot_display_name(&self, id: &str) -> String {
+        self.state
+            .listed_bots
+            .iter()
+            .find(|bot| bot.id == id)
+            .and_then(|bot| bot.display_name.clone())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| humanize_label(id))
+    }
+
+    pub fn bot_avatar(&self, id: &str) -> String {
+        if let Some(avatar) = self
+            .state
+            .listed_bots
+            .iter()
+            .find(|bot| bot.id == id)
+            .and_then(|bot| bot.avatar.clone())
+            .filter(|avatar| !avatar.trim().is_empty())
+        {
+            return avatar;
+        }
+        self.bot_display_name(id)
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "B".into())
+    }
+
+    pub fn conversation_label(&self, conversation: &crate::ConversationSummary) -> String {
+        if let Some(title) = conversation
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+        {
+            return title.to_owned();
+        }
+        if conversation.id == "windows-owner" {
+            return "Owner".into();
+        }
+        if let Some(bot) = conversation.id.strip_prefix("dir:") {
+            if self.state.listed_bots.iter().any(|item| item.id == bot) {
+                return self.bot_display_name(bot);
+            }
+        }
+        let kind = conversation.normalized_kind();
+        let slug = conversation
+            .id
+            .split_once(':')
+            .map(|(_, slug)| slug)
+            .unwrap_or(&conversation.id);
+        if conversation.id.chars().all(|c| c.is_ascii_digit()) {
+            let tail = &conversation.id[conversation.id.len().saturating_sub(4)..];
+            return format!("Chat {tail}");
+        }
+        match kind {
+            "section" => format!("Section · {}", humanize_label(slug)),
+            "group" => format!("Group · {}", humanize_label(slug)),
+            "room" => format!("Room · {}", humanize_label(slug)),
+            _ => humanize_label(slug),
+        }
+    }
+
+    pub fn conversation_subtitle(&self, conversation: &crate::ConversationSummary) -> String {
+        if conversation.id == "windows-owner" {
+            return "Your direct chat".into();
+        }
+        if let Some(bot) = conversation.id.strip_prefix("dir:") {
+            if let Some(found) = self.state.listed_bots.iter().find(|item| item.id == bot) {
+                return format!("Bot · {}", found.role);
+            }
+        }
+        if conversation.id.chars().all(|c| c.is_ascii_digit()) {
+            return "Direct chat".into();
+        }
+        match conversation.normalized_kind() {
+            "section" => "Section".into(),
+            "group" => "Group".into(),
+            "room" => "Room".into(),
+            _ => "Direct chat".into(),
+        }
+    }
+
+    /// User messages are "You"; assistant messages resolve to the producing bot.
+    pub fn message_speaker(&self, message: &Message) -> (String, String, Option<String>) {
+        if message.role == Role::User {
+            return ("You".into(), "Y".into(), None);
+        }
+        let dir_bot = if self.state.bot_chat_binding == Some(true) {
+            self.conversation.strip_prefix("dir:")
+        } else {
+            None
+        };
+        let bot = message
+            .bot
+            .as_deref()
+            .or(message.name.as_deref())
+            .or(dir_bot)
+            .or_else(|| {
+                self.state
+                    .listed_bots
+                    .iter()
+                    .find(|bot| bot.role == "orchestrator")
+                    .map(|bot| bot.id.as_str())
+            });
+        match bot {
+            Some(id) if !id.is_empty() => (
+                self.bot_display_name(id),
+                self.bot_avatar(id),
+                Some(id.to_owned()),
+            ),
+            _ => ("Assistant".into(), "A".into(), None),
+        }
     }
 
     pub fn submit(&mut self) {
@@ -752,7 +960,9 @@ impl Session {
                 Err(error)
                     if matches!(
                         completion.kind,
-                        OperationKind::AdminWrite | OperationKind::AdminRestart
+                        OperationKind::AdminWrite
+                            | OperationKind::AdminProfile
+                            | OperationKind::AdminRestart
                     ) =>
                 {
                     let message = match &error {
@@ -836,14 +1046,55 @@ impl Session {
                             self.schedule(Operation::ListSkills, Duration::ZERO);
                         }
                         OperationKind::CreateBot => {
+                            if let Some(created) = self.state.created_bot.clone() {
+                                self.selected_bot = Some(created.id.clone());
+                                self.section = Section::Fleet;
+                                self.bot_profile = BotProfileDraft {
+                                    id: created.id.clone(),
+                                    display_name: humanize_label(&created.id),
+                                    description: self.fleet.bot_description.clone(),
+                                    avatar: String::new(),
+                                };
+                            }
                             self.schedule(Operation::ListBots, Duration::ZERO);
                         }
                         OperationKind::ListBots => {
+                            if let Some(id) = self.selected_bot.clone() {
+                                if let Some(bot) =
+                                    self.state.listed_bots.iter().find(|bot| bot.id == id)
+                                {
+                                    if self.bot_profile.display_name.trim().is_empty() {
+                                        self.bot_profile.display_name = self.bot_display_name(&id);
+                                    }
+                                    if self.bot_profile.avatar.trim().is_empty() {
+                                        self.bot_profile.avatar =
+                                            bot.avatar.clone().unwrap_or_default();
+                                    }
+                                }
+                            }
                             if self.section == Section::Fleet && !self.state.skills_loaded {
                                 self.schedule(Operation::ListSkills, Duration::ZERO);
                             }
                         }
+                        OperationKind::AdminProfile => {
+                            if let Some(bot) = self
+                                .state
+                                .listed_bots
+                                .iter_mut()
+                                .find(|bot| bot.id == self.bot_profile.id)
+                            {
+                                let name = self.bot_profile.display_name.trim().to_owned();
+                                let description = self.bot_profile.description.trim().to_owned();
+                                let avatar = self.bot_profile.avatar.trim().to_owned();
+                                bot.display_name = (!name.is_empty()).then_some(name);
+                                bot.description = (!description.is_empty()).then_some(description);
+                                bot.avatar = (!avatar.is_empty()).then_some(avatar);
+                            }
+                            self.admin_error = None;
+                            self.admin_notice = Some("Bot profile saved.".into());
+                        }
                         OperationKind::CreateConversation => {
+                            self.fleet.conv_title.clear();
                             self.fleet.conv_slug.clear();
                             self.fleet.conv_parent.clear();
                             self.schedule(
@@ -1057,12 +1308,21 @@ impl Session {
     }
 
     pub fn conversation_title(&self) -> String {
-        self.state
+        if let Some(conversation) = self
+            .state
             .conversations
             .iter()
             .find(|conversation| conversation.id == self.conversation)
-            .map(|conversation| conversation.display_title().to_owned())
-            .unwrap_or_else(|| self.conversation.clone())
+        {
+            return self.conversation_label(conversation);
+        }
+        if self.conversation == "windows-owner" {
+            return "Owner".into();
+        }
+        if let Some(bot) = self.conversation.strip_prefix("dir:") {
+            return self.bot_display_name(bot);
+        }
+        humanize_label(&self.conversation)
     }
 
     pub fn conversation_kind(&self) -> Option<&str> {
@@ -1334,15 +1594,33 @@ impl Session {
         kind: ConversationKind,
         slug: String,
         parent: Option<String>,
+        title: String,
     ) {
         if !valid_slug(&slug) || valid_conversation_parent(kind, parent.as_deref()).is_err() {
             self.state.error = Some("Check the conversation slug and parent.".into());
             return;
         }
+        let title = title.trim().to_owned();
+        if !title.is_empty() && !valid_conversation_title(&title) {
+            self.state.error = Some("Conversation name must be 1–120 characters.".into());
+            return;
+        }
+        let title = if self.state.conversation_titles == Some(true) {
+            title
+        } else {
+            if !title.is_empty() {
+                self.admin_notice = Some(
+                    "This server does not store conversation names yet; the chat uses its id."
+                        .into(),
+                );
+            }
+            String::new()
+        };
         self.start_request(Operation::CreateConversation {
             kind,
             slug,
             parent_id: parent.filter(|parent| !parent.trim().is_empty()),
+            title: (!title.is_empty()).then_some(title),
         });
     }
 
@@ -1399,6 +1677,25 @@ impl Drop for Session {
         self.memory.content.zeroize();
         self.credentials = None;
         self.stop_events();
+    }
+}
+
+fn humanize_label(raw: &str) -> String {
+    let words = raw
+        .split(['-', '_', ':', '.', ' '])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>();
+    if words.is_empty() {
+        "Conversation".into()
+    } else {
+        words.join(" ")
     }
 }
 

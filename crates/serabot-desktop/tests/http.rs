@@ -193,17 +193,28 @@ fn creates_bot_and_conversation_with_owner_auth() {
             serabot_desktop::ConversationKind::Group,
             "ops",
             Some("sec:finance"),
+            None,
         )
         .unwrap();
     assert_eq!(node.id, "grp:ops");
     assert!(!node.accepts_turns);
     let section = client
-        .create_conversation(serabot_desktop::ConversationKind::Section, "finance", None)
+        .create_conversation(
+            serabot_desktop::ConversationKind::Section,
+            "finance",
+            None,
+            None,
+        )
         .unwrap();
     assert_eq!(section.id, "sec:finance");
     assert!(section.parent_id.is_none());
     let direct = client
-        .create_conversation(serabot_desktop::ConversationKind::Direct, "analyst", None)
+        .create_conversation(
+            serabot_desktop::ConversationKind::Direct,
+            "analyst",
+            None,
+            None,
+        )
         .unwrap();
     assert!(direct.accepts_turns);
     let requests = handle.join().unwrap();
@@ -273,18 +284,24 @@ fn scaffold_requests_reject_unsafe_inputs_before_the_network() {
         Err(ApiError::Validation(_))
     ));
     assert!(matches!(
-        client.create_conversation(serabot_desktop::ConversationKind::Section, "Finance", None),
+        client.create_conversation(
+            serabot_desktop::ConversationKind::Section,
+            "Finance",
+            None,
+            None
+        ),
         Err(ApiError::Validation(_))
     ));
     assert!(matches!(
-        client.create_conversation(serabot_desktop::ConversationKind::Group, "ops", None),
+        client.create_conversation(serabot_desktop::ConversationKind::Group, "ops", None, None),
         Err(ApiError::Validation(_))
     ));
     assert!(matches!(
         client.create_conversation(
             serabot_desktop::ConversationKind::Section,
             "finance",
-            Some("sec:finance")
+            Some("sec:finance"),
+            None
         ),
         Err(ApiError::Validation(_))
     ));
@@ -292,7 +309,8 @@ fn scaffold_requests_reject_unsafe_inputs_before_the_network() {
         client.create_conversation(
             serabot_desktop::ConversationKind::Direct,
             "analyst",
-            Some("dir:other")
+            Some("dir:other"),
+            None
         ),
         Err(ApiError::Validation(_))
     ));
@@ -357,7 +375,12 @@ fn scaffold_responses_must_stay_disabled_and_relative() {
     )]);
     assert_eq!(
         client
-            .create_conversation(serabot_desktop::ConversationKind::Section, "finance", None)
+            .create_conversation(
+                serabot_desktop::ConversationKind::Section,
+                "finance",
+                None,
+                None
+            )
             .unwrap_err(),
         ApiError::InvalidResponse
     );

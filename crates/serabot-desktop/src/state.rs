@@ -15,6 +15,9 @@ pub struct State {
     pub firecrawl_enabled: Option<bool>,
     pub telegram_enabled: Option<bool>,
     pub catalog_fetch: Option<bool>,
+    pub bot_chat_binding: Option<bool>,
+    pub bot_profiles: Option<bool>,
+    pub conversation_titles: Option<bool>,
     pub catalog: Option<Catalog>,
     pub draft: Selection,
     pub messages: Vec<Message>,
@@ -56,6 +59,9 @@ impl Default for State {
             firecrawl_enabled: None,
             telegram_enabled: None,
             catalog_fetch: None,
+            bot_chat_binding: None,
+            bot_profiles: None,
+            conversation_titles: None,
             catalog: None,
             draft: Selection::default(),
             messages: Vec::new(),
@@ -94,6 +100,9 @@ impl State {
         let firecrawl_enabled = self.firecrawl_enabled;
         let telegram_enabled = self.telegram_enabled;
         let catalog_fetch = self.catalog_fetch;
+        let bot_chat_binding = self.bot_chat_binding;
+        let bot_profiles = self.bot_profiles;
+        let conversation_titles = self.conversation_titles;
         let created_bot = self.created_bot.clone();
         let created_conversation = self.created_conversation.clone();
         let created_skill = self.created_skill.clone();
@@ -123,6 +132,9 @@ impl State {
             firecrawl_enabled,
             telegram_enabled,
             catalog_fetch,
+            bot_chat_binding,
+            bot_profiles,
+            conversation_titles,
             created_bot,
             created_conversation,
             created_skill,
@@ -185,6 +197,9 @@ impl State {
                 self.firecrawl_enabled = health.firecrawl_enabled;
                 self.telegram_enabled = health.telegram_enabled;
                 self.catalog_fetch = health.catalog_fetch;
+                self.bot_chat_binding = health.bot_chat_binding;
+                self.bot_profiles = health.bot_profiles;
+                self.conversation_titles = health.conversation_titles;
                 if !health.ok {
                     self.error = Some("Server is not ready. Retry the connection read.".into());
                 }
@@ -265,7 +280,7 @@ impl State {
                 self.connectors = connectors;
                 self.connectors_loaded = true;
             }
-            Reply::AdminSaved | Reply::AdminRestarted => {}
+            Reply::AdminSaved | Reply::BotProfileSaved | Reply::AdminRestarted => {}
         }
         true
     }
@@ -410,6 +425,7 @@ mod tests {
             content: "sensitive fixture".into(),
             created_at: "now".into(),
             name: Some("analyst".into()),
+            bot: Some("analyst".into()),
         });
         state.task = Some(Task {
             id: "t".into(),
@@ -508,6 +524,10 @@ mod tests {
             role: "specialist".into(),
             enabled: true,
             live: true,
+            model: None,
+            display_name: Some("Analyst".into()),
+            description: None,
+            avatar: Some("A".into()),
             tools: vec!["skill_list".into()],
             skills: vec!["ask".into()],
             require_approval: Vec::new(),

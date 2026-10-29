@@ -501,6 +501,14 @@ pub struct BotSummary {
     pub role: String,
     pub enabled: bool,
     pub live: bool,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub avatar: Option<String>,
     pub tools: Vec<String>,
     pub skills: Vec<String>,
     #[serde(default)]
@@ -635,6 +643,15 @@ pub struct AudioUpdate {
     pub understanding_model: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct BotProfileUpdate {
+    pub display_name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub avatar: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct AdminAck {
     #[serde(default)]
@@ -736,6 +753,12 @@ pub struct Health {
     pub telegram_enabled: Option<bool>,
     #[serde(default)]
     pub catalog_fetch: Option<bool>,
+    #[serde(default)]
+    pub bot_chat_binding: Option<bool>,
+    #[serde(default)]
+    pub bot_profiles: Option<bool>,
+    #[serde(default)]
+    pub conversation_titles: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -754,6 +777,9 @@ pub struct Message {
     /// Bot id on a room or handoff reply. Absent on ordinary assistant text.
     #[serde(default)]
     pub name: Option<String>,
+    /// Bot that produced this assistant message, resolved by the server.
+    #[serde(default)]
+    pub bot: Option<String>,
 }
 
 impl Drop for Message {
@@ -763,6 +789,9 @@ impl Drop for Message {
         self.created_at.zeroize();
         if let Some(name) = self.name.as_mut() {
             name.zeroize();
+        }
+        if let Some(bot) = self.bot.as_mut() {
+            bot.zeroize();
         }
     }
 }
@@ -996,6 +1025,7 @@ impl ApiClient {
                 .name
                 .as_ref()
                 .is_some_and(|name| !valid_speaker(name))
+                || message.bot.as_ref().is_some_and(|bot| !valid_speaker(bot))
         }) {
             return Err(ApiError::InvalidResponse);
         }
@@ -1150,6 +1180,7 @@ impl ApiClient {
         kind: ConversationKind,
         slug: &str,
         parent_id: Option<&str>,
+        title: Option<&str>,
     ) -> Result<CreatedConversation, ApiError> {
         if !valid_slug(slug) {
             return Err(ApiError::Validation(
@@ -1158,12 +1189,20 @@ impl ApiClient {
         }
         let parent_id = parent_id.filter(|parent| !parent.is_empty());
         valid_conversation_parent(kind, parent_id)?;
+        let title = title.map(str::trim).filter(|title| !title.is_empty());
+        if title.is_some_and(|title| !valid_conversation_title(title)) {
+            return Err(ApiError::Validation(
+                "Conversation names must be 1–120 visible characters.",
+            ));
+        }
         #[derive(Serialize)]
         struct Body<'a> {
             kind: &'a str,
             slug: &'a str,
             #[serde(skip_serializing_if = "Option::is_none")]
             parent_id: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            title: Option<&'a str>,
         }
         let response: ConversationEnvelope = self.request(
             Method::POST,
@@ -1173,6 +1212,7 @@ impl ApiClient {
                 kind: kind.as_str(),
                 slug,
                 parent_id,
+                title,
             }),
         )?;
         check_created_conversation(response.conversation, kind, slug, parent_id)
@@ -1280,6 +1320,24 @@ impl ApiClient {
             }
             if bot.tools.iter().any(|tool| !valid_speaker(tool))
                 || bot.skills.iter().any(|skill| !valid_speaker(skill))
+            {
+                return Err(ApiError::InvalidResponse);
+            }
+            if bot.display_name.as_deref().is_some_and(|name| {
+                name.trim().is_empty()
+                    || name.chars().count() > 64
+                    || name.chars().any(char::is_control)
+            }) || bot.description.as_deref().is_some_and(|text| {
+                text.chars().count() > 2_000
+                    || text
+                        .chars()
+                        .any(|c| c != '\n' && c != '\r' && c != '\t' && c.is_control())
+            }) || bot.avatar.as_deref().is_some_and(|avatar| {
+                avatar.chars().count() > 16 || avatar.chars().any(char::is_control)
+            }) || bot
+                .model
+                .as_deref()
+                .is_some_and(|model| !valid_model_id(model))
             {
                 return Err(ApiError::InvalidResponse);
             }
@@ -1637,6 +1695,40 @@ impl ApiClient {
             return Err(ApiError::Validation("Check the audio model names."));
         }
         self.admin_request(Method::PUT, &["v1", "admin", "audio"], update)
+    }
+
+    pub fn admin_set_bot_profile(
+        &self,
+        id: &str,
+        update: &BotProfileUpdate,
+    ) -> Result<AdminAck, ApiError> {
+        if !valid_speaker(id) {
+            return Err(ApiError::Validation("Bot id is not valid."));
+        }
+        let name = update.display_name.trim();
+        if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+            return Err(ApiError::Validation(
+                "Bot display name must be 1–64 visible characters.",
+            ));
+        }
+        if update.description.chars().count() > 2_000
+            || update
+                .description
+                .chars()
+                .any(|c| c != '\n' && c != '\r' && c != '\t' && c.is_control())
+        {
+            return Err(ApiError::Validation(
+                "Bot description is too long or contains control characters.",
+            ));
+        }
+        if update.avatar.chars().count() > 16 || update.avatar.chars().any(char::is_control) {
+            return Err(ApiError::Validation(
+                "Bot avatar must be a short label or emoji.",
+            ));
+        }
+        let mut update = update.clone();
+        update.display_name = name.to_owned();
+        self.admin_request(Method::PUT, &["v1", "admin", "bots", id], &update)
     }
 
     pub fn admin_restart(&self) -> Result<AdminRestart, ApiError> {
