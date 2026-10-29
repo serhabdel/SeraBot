@@ -69,12 +69,12 @@ Still on `main` from the earlier wake note (code through `795b139`):
 
 ## OVH
 
-Running **SeraBot 0.2.1**. Binary SHA-256
-`c6d47a83f1d95c4ce858bd3195f8ba2fb144536959f2eb4d6d5d1ddb4f00a3df`, built
-locally in WSL from the 0.2.2 worktree. Staged at
-`/var/lib/serabot/releases/serabot-c6d47a83`; the previous binary is
-`/var/lib/serabot/releases/serabot-pre-c6d47a83` (SHA-256
-`8ac709fecc9b4fe4609048a62eea6ec2e2aea354b6f2eceb8bc53b38b62d925a`). Legacy
+Running **SeraBot 0.2.2**. Binary SHA-256
+`b403cab608ff0613e072c579545e8d8025b5e2ac676f34d54831ff2974c46037`, built
+locally in WSL from commit `b0a134e`. Staged at
+`/var/lib/serabot/releases/serabot-b403cab6`; the previous binary is
+`/var/lib/serabot/releases/serabot-pre-b403cab6` (SHA-256
+`c6d47a83f1d95c4ce858bd3195f8ba2fb144536959f2eb4d6d5d1ddb4f00a3df`). Legacy
 conversations now list as turn-capable direct threads, all six models and auto
 mode select successfully, and the queue was empty before the swap. Only
 `serabot.service` was restarted; `database user_version` is 4.
@@ -90,7 +90,7 @@ If historical journals ever contained `getUpdates` URLs (a build before
 with `serabot secrets set`. Do not paste the token, the journal line, or the
 URL into chat, tickets, or git.
 
-Roll back by restoring `serabot-pre-c6d47a83` onto `/opt/serabot/serabot` and
+Roll back by restoring `serabot-pre-b403cab6` onto `/opt/serabot/serabot` and
 restarting **only** `serabot.service`. Leave Docker, OpenBot,
 `onedrive-mcp.service`, and both Cloudflare tunnels alone. Before replacing a
 busy binary, read the queue; it was empty of non-terminal tasks at this deploy.
