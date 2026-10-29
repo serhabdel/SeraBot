@@ -362,7 +362,7 @@ impl Store {
     ) -> Result<Vec<StoredMessage>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, conversation_id, turn_id, role, content, created_at
+            "SELECT id, conversation_id, turn_id, role, content, name, created_at
              FROM messages WHERE conversation_id = ?1 AND role IN ('user', 'assistant')
              ORDER BY created_at DESC, rowid DESC LIMIT ?2",
         )?;
@@ -375,9 +375,9 @@ impl Store {
                     turn_id: row.get(2)?,
                     role: parse_role(&row.get::<_, String>(3)?),
                     content: row.get(4)?,
-                    name: None,
+                    name: row.get(5)?,
                     tool_call_id: None,
-                    created_at: parse_datetime(&row.get::<_, String>(5)?),
+                    created_at: parse_datetime(&row.get::<_, String>(6)?),
                 })
             },
         )?;
@@ -1257,6 +1257,27 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn visible_history_keeps_specialist_names() {
+        let store = store();
+        store
+            .append_message_named(
+                "room:review",
+                None,
+                Role::Assistant,
+                "from analyst",
+                Some("analyst"),
+            )
+            .unwrap();
+        store
+            .append_message("room:review", None, Role::Tool, "hidden tool")
+            .unwrap();
+        let messages = store.list_visible_messages("room:review", 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].name.as_deref(), Some("analyst"));
+        assert_eq!(messages[0].content, "from analyst");
     }
 
     #[test]

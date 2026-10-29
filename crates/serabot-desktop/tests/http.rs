@@ -457,6 +457,46 @@ fn catalog_without_egress_approval_fails_closed() {
 }
 
 #[test]
+fn history_keeps_a_bot_speaker_and_rejects_an_unsafe_name() {
+    let (client, handle) = server(vec![(
+        200,
+        r#"{"messages":[{"id":"m","role":"assistant","content":"Synthetic analyst summary.","created_at":"now","name":"analyst"}]}"#.into(),
+    )]);
+    let history = client.history("room:review").unwrap();
+    assert_eq!(history.messages[0].name.as_deref(), Some("analyst"));
+    handle.join().unwrap();
+
+    let (client, handle) = server(vec![(
+        200,
+        r#"{"messages":[{"id":"m","role":"assistant","content":"note","created_at":"now","name":"bot999:secretvalue"}]}"#.into(),
+    )]);
+    assert!(matches!(
+        client.history("room:review"),
+        Err(ApiError::InvalidResponse)
+    ));
+    handle.join().unwrap();
+}
+
+#[test]
+fn list_bots_rejects_secret_shaped_ids() {
+    let (client, handle) = server(vec![(
+        200,
+        r#"{"bots":[{"id":"notes","role":"specialist","enabled":false,"live":false,"tools":["skill_list"],"skills":["ask"]}]}"#.into(),
+    )]);
+    let bots = client.list_bots().unwrap();
+    assert_eq!(bots[0].id, "notes");
+    assert!(!bots[0].live);
+    handle.join().unwrap();
+
+    let (client, handle) = server(vec![(
+        200,
+        r#"{"bots":[{"id":"../notes","role":"specialist","enabled":false,"live":false,"tools":[],"skills":[]}]}"#.into(),
+    )]);
+    assert_eq!(client.list_bots().unwrap_err(), ApiError::InvalidResponse);
+    handle.join().unwrap();
+}
+
+#[test]
 fn unexpected_roles_and_overlong_history_are_rejected() {
     for body in [r#"{"messages":[{"id":"m","role":"tool","content":"untrusted internal details","created_at":"now"}]}"#.to_string(),
         serde_json::json!({"messages": (0..101).map(|_| serde_json::json!({"id":"m","role":"user","content":"fixture","created_at":"now"})).collect::<Vec<_>>()}).to_string()] {

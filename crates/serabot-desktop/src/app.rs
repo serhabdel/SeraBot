@@ -6,7 +6,7 @@ use serabot_desktop::{
     TaskStatus, conversation_node_id, default_server_url, parse_skill_list,
     state::State,
     valid_bot_description, valid_bot_id, valid_conversation_parent, valid_id, valid_new_skill_id,
-    valid_skill_body, valid_skill_description, valid_slug, valid_text, valid_token,
+    valid_skill_body, valid_skill_description, valid_slug, valid_speaker, valid_text, valid_token,
     validate_endpoint, validate_tool_list,
     worker::{Credentials, Job, Operation, OperationKind, Worker},
 };
@@ -191,6 +191,8 @@ impl Desktop {
             self.state.created_skill = None;
             self.state.listed_skills.clear();
             self.state.skills_loaded = false;
+            self.state.listed_bots.clear();
+            self.state.bots_loaded = false;
             self.clear_fleet_drafts();
         }
         self.pending = None;
@@ -346,6 +348,9 @@ impl Desktop {
                         }
                         OperationKind::CreateSkill => {
                             self.schedule(Operation::ListSkills, Duration::ZERO);
+                        }
+                        OperationKind::CreateBot => {
+                            self.schedule(Operation::ListBots, Duration::ZERO);
                         }
                         OperationKind::Task
                             if self
@@ -1040,9 +1045,18 @@ impl Desktop {
                                 .inner_margin(Margin::symmetric(14, 12))
                                 .show(ui, |ui| {
                                     ui.set_max_width(max_w);
+                                    let speaker = if user {
+                                        "You".to_owned()
+                                    } else if let Some(name) =
+                                        message.name.clone().filter(|name| valid_speaker(name))
+                                    {
+                                        name
+                                    } else {
+                                        "SeraBot".into()
+                                    };
                                     ui.horizontal(|ui| {
                                         ui.label(
-                                            RichText::new(if user { "You" } else { "SeraBot" })
+                                            RichText::new(speaker)
                                                 .size(12.0)
                                                 .strong()
                                                 .color(if user { TEAL } else { MUTED }),
@@ -1406,6 +1420,63 @@ impl Desktop {
                         .color(WARNING),
                     );
                 }
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(RichText::new("On disk").small().color(MUTED));
+                let can_list = self.ready() && !self.state.unknown_outcome;
+                if ui
+                    .add_enabled(can_list, egui::Button::new("Refresh bots"))
+                    .clicked()
+                {
+                    self.state.error = None;
+                    self.start_request(Operation::ListBots);
+                }
+                ui.label(
+                    RichText::new(
+                        "Summaries only. GET /v1/bots does not return prompts or secrets.",
+                    )
+                    .size(11.0)
+                    .color(MUTED),
+                );
+                if self.state.bots_loaded && self.state.listed_bots.is_empty() {
+                    ui.label(
+                        RichText::new("No bot files on disk.")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                }
+                let listed = self.state.listed_bots.clone();
+                if !listed.is_empty() {
+                    egui::ScrollArea::vertical()
+                        .id_salt("fleet-bots")
+                        .max_height(180.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for bot in listed {
+                                let status = format!(
+                                    "{} · {}",
+                                    if bot.enabled { "enabled" } else { "disabled" },
+                                    if bot.live { "live" } else { "not live" }
+                                );
+                                ui.label(
+                                    RichText::new(format!("{} · {} · {status}", bot.id, bot.role))
+                                        .color(TEXT),
+                                );
+                                ui.label(
+                                    RichText::new(format!("tools · {}", fleet_names(&bot.tools)))
+                                        .size(11.0)
+                                        .color(MUTED),
+                                );
+                                ui.label(
+                                    RichText::new(format!("skills · {}", fleet_names(&bot.skills)))
+                                        .size(11.0)
+                                        .color(MUTED),
+                                );
+                                ui.add_space(4.0);
+                            }
+                        });
+                }
             });
     }
 
@@ -1721,6 +1792,13 @@ impl Desktop {
                 }
             });
     }
+}
+
+fn fleet_names(items: &[String]) -> String {
+    if items.is_empty() {
+        return "none".into();
+    }
+    skill_blurb(&items.join(", "))
 }
 
 fn skill_blurb(text: &str) -> String {

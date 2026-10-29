@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SeraError};
-use crate::orchestration::{BotFleetMember, BotRole, validate_bot_fleet};
+use crate::orchestration::{BotFleetMember, BotRole, safe_bot_label, validate_bot_fleet};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -1016,6 +1016,89 @@ pub fn load_bots(config: &Config, dir: impl AsRef<Path>) -> Result<Vec<LoadedBot
         .collect();
     validate_bot_fleet(&fleet)?;
 
+    Ok(bots)
+}
+
+/// On-disk fleet summary. Prompt files are not read. Secret material is not returned.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfiguredBot {
+    pub id: String,
+    pub role: String,
+    pub enabled: bool,
+    pub tools: Vec<String>,
+    pub skills: Vec<String>,
+}
+
+pub fn list_configured_bots(config: &Config) -> Result<Vec<ConfiguredBot>> {
+    const MAX_BOTS: usize = 64;
+    const MAX_ITEMS: usize = 64;
+    const MAX_FILE_BYTES: usize = 65_536;
+
+    validate_relative_dir("fleet.bots_dir", &config.fleet.bots_dir)?;
+    let base = config.base_dir.canonicalize().map_err(|error| {
+        SeraError::Config(format!(
+            "configuration directory cannot be resolved: {error}"
+        ))
+    })?;
+    let dir = base.join(&config.fleet.bots_dir);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let dir = dir.canonicalize().map_err(|error| {
+        SeraError::Config(format!("fleet directory cannot be resolved: {error}"))
+    })?;
+    if !dir.starts_with(&base) {
+        return Err(SeraError::Config(
+            "fleet directory escapes the configuration directory".into(),
+        ));
+    }
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|error| SeraError::Config(format!("fleet directory cannot be read: {error}")))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .collect();
+    paths.sort();
+    if paths.len() > MAX_BOTS {
+        return Err(SeraError::Config("too many bot files".into()));
+    }
+    let mut names = std::collections::HashSet::new();
+    let mut bots = Vec::with_capacity(paths.len());
+    for path in paths {
+        let canonical = path
+            .canonicalize()
+            .map_err(|_| SeraError::Config("bot file cannot be resolved".into()))?;
+        if !canonical.starts_with(&dir) {
+            return Err(SeraError::Config(
+                "bot file escapes the fleet directory".into(),
+            ));
+        }
+        let raw = std::fs::read_to_string(&canonical)?;
+        if raw.len() > MAX_FILE_BYTES {
+            return Err(SeraError::Config("bot file is too large".into()));
+        }
+        let bot: BotConfig =
+            toml::from_str(&raw).map_err(|_| SeraError::Config("bot file is invalid".into()))?;
+        let id = bot.name;
+        if !safe_bot_label(&id) || !names.insert(id.clone()) {
+            return Err(SeraError::Config("bot file is invalid".into()));
+        }
+        if bot.tools.len() > MAX_ITEMS
+            || bot.skills.len() > MAX_ITEMS
+            || bot.tools.iter().any(|item| !safe_bot_label(item))
+            || bot.skills.iter().any(|item| !safe_bot_label(item))
+        {
+            return Err(SeraError::Config("bot file is invalid".into()));
+        }
+        bots.push(ConfiguredBot {
+            id,
+            role: bot.role.as_str().to_owned(),
+            enabled: bot.enabled,
+            tools: bot.tools,
+            skills: bot.skills,
+        });
+    }
+    bots.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(bots)
 }
 

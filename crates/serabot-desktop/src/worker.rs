@@ -1,6 +1,7 @@
 use crate::{
-    ApiClient, ApiError, Approval, ApprovalDecision, Catalog, ConversationKind, CreatedBot,
-    CreatedConversation, CreatedSkill, Health, History, Scope, Selection, SkillSummary, Task,
+    ApiClient, ApiError, Approval, ApprovalDecision, BotSummary, Catalog, ConversationKind,
+    CreatedBot, CreatedConversation, CreatedSkill, Health, History, Scope, Selection, SkillSummary,
+    Task,
 };
 use secrecy::SecretString;
 use std::sync::{
@@ -30,6 +31,7 @@ pub enum OperationKind {
     CreateConversation,
     CreateSkill,
     ListSkills,
+    ListBots,
 }
 
 pub enum Operation {
@@ -61,6 +63,7 @@ pub enum Operation {
         body: Zeroizing<String>,
     },
     ListSkills,
+    ListBots,
 }
 
 impl Operation {
@@ -78,6 +81,7 @@ impl Operation {
             Self::CreateConversation { .. } => OperationKind::CreateConversation,
             Self::CreateSkill { .. } => OperationKind::CreateSkill,
             Self::ListSkills => OperationKind::ListSkills,
+            Self::ListBots => OperationKind::ListBots,
         }
     }
 }
@@ -94,6 +98,7 @@ pub enum Reply {
     CreatedConversation(CreatedConversation),
     CreatedSkill(CreatedSkill),
     Skills(Vec<SkillSummary>),
+    Bots(Vec<BotSummary>),
 }
 
 pub struct Job {
@@ -223,6 +228,7 @@ fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
                 .map(Reply::CreatedSkill)
         }
         Operation::ListSkills => client.list_skills().map(Reply::Skills),
+        Operation::ListBots => client.list_bots().map(Reply::Bots),
     }
 }
 

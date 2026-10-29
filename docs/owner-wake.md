@@ -8,16 +8,21 @@ chat, tickets, or git.
 
 | Item | Value |
 | --- | --- |
-| **Code tip for the binary** | `795b139` — *Persist OneDrive refresh rotation and the first connector refresh token.* |
+| **OVH code tip** | `4464558` — *Redact Telegram bot tokens before they reach the journal.* |
 | **Routing decision** | `bd871f9` — *Record why routing stays on the in-process allowlist.* Docs only (`docs/model-routing.md`). |
-| **This checklist** | Documentation on top of `bd871f9` and `cd62044`. It does not move the binary. |
-| **Previous wake note** | `6d718fe` (ElevenLabs allowlist). Superseded by this page. |
+| **This checklist** | Records that host tip. The server changes in this commit (`GET /v1/bots`, named room handoff replies) are not on the host until the additive deploy below finishes. |
+| **Previous code tip** | `795b139` (OneDrive refresh rotation). Superseded on the host by `4464558`. |
 
-Commits after `795b139`, including docs-only `bd871f9` and `cd62044`, plus this
-page, do not change the server binary. A host already running `795b139` does
-not need another deploy for them.
+`4464558` (`4464558aa9ab8dd78666430760f3cc6d3c725c5c`) is the binary confirmed
+on OVH at the start of this page. Docs-only commits between `795b139` and
+`4464558` did not need their own deploy.
 
-Landed on `main` since `6d718fe` (code through `795b139`):
+Landed on `main` since `795b139` (code through `4464558`):
+
+- Telegram request URLs are dropped, and `bot<token>` segments are redacted, before an error is logged (`4464558`).
+- `skill_load` returns workflow text, and client builds can take a server origin (`4b1f0a4`).
+
+Still on `main` from the earlier wake note (code through `795b139`):
 
 - On-demand skills and `skill-creator`, including `POST /v1/skills` ([skills.md](skills.md)).
 - Crafting Apps notes: adapt PdfCraft patterns only ([craft-adoption.md](craft-adoption.md)).
@@ -34,19 +39,22 @@ Landed on `main` since `6d718fe` (code through `795b139`):
 
 ## OVH
 
-Confirmed on code tip **`795b139`**
-(`795b13937206fca7e379b3024008e1a1df182c52`). `serabot` is active. Binary
-SHA-256 `795becec49bf5c178bc2c68f209b85471142516f2c78d0b9c8b2c6800f29f1e7`.
-`onedrive-mcp` was left untouched. Unauthenticated `GET /v1/health` returns
-401. `/v1/health` reports crate version `0.1.0`, not a git SHA.
+Confirmed on code tip **`4464558`**
+(`4464558aa9ab8dd78666430760f3cc6d3c725c5c`) before the bot-list and room-name
+changes in this commit. That commit redacts Telegram bot tokens before they
+reach the journal. `serabot` was active on it. `onedrive-mcp` was left
+untouched. Unauthenticated `GET /v1/health` returns 401. `/v1/health` reports
+crate version `0.1.0`, not a git SHA.
 
-Docs-only `bd871f9` and `cd62044` do not change that binary and do not need a
-redeploy. The earlier read-only check (mtime `2026-10-29 01:39:08` UTC,
-SHA-256 prefix `dfbc71dd89536f4e…`) predates this binary.
+If historical journals ever contained `getUpdates` URLs, rotate
+`telegram_bot_token` in BotFather and store the new value with
+`serabot secrets set`. Do not paste the token, the journal line, or the URL
+into chat, tickets, or git.
 
-If a later `sha256sum /opt/serabot/serabot` disagrees, finish the additive
-upgrade in [deployment.md](deployment.md): stage
-`/var/lib/serabot/releases/serabot-795b139`, back up the current binary,
+This commit changes the `serabot` binary (`GET /v1/bots`, named room handoff
+replies). It is not the `4464558` binary. Finish the additive upgrade in
+[deployment.md](deployment.md): build on Ubuntu 24.04, stage
+`/var/lib/serabot/releases/serabot-<this-commit>`, back up the current binary,
 replace `/opt/serabot/serabot` only after the staged SHA-256 matches, and
 restart **only** `serabot.service`. Leave Docker, OpenBot,
 `onedrive-mcp.service`, and the Cloudflare tunnel alone. Roll back by
@@ -54,21 +62,20 @@ restoring the backup and restarting only `serabot.service`. Before replacing
 a busy binary, tunnel in and read `GET /v1/status`. Queued turns without a
 pinned route fail closed.
 
+The earlier read-only check (mtime `2026-10-29 01:39:08` UTC, SHA-256 prefix
+`dfbc71dd89536f4e…`) and the `795b139` binary both predate `4464558`.
+
 New bots and skills are **not** hot-reloaded. `POST /v1/bots` and
-`POST /v1/skills` report `live: false`. Restart **only** `serabot.service`
-after those files exist, then add the skill id to a bot allowlist. A
-scaffolded bot stays `enabled = false` and is not added to `main.delegates`
-until you edit that and restart again.
+`POST /v1/skills` report `live: false`. `GET /v1/bots` lists the files anyway,
+with `live: false` until restart. Restart **only** `serabot.service` after
+those files exist, then add the skill id to a bot allowlist. A scaffolded bot
+stays `enabled = false` and is not added to `main.delegates` until you edit
+that and restart again.
 
 ```bash
 systemctl status serabot --no-pager
 journalctl -u serabot -n 50 --no-pager
 ```
-
-If `journalctl` shows a Telegram `getUpdates` URL from a build before token
-redaction, rotate that bot token in BotFather and `secrets set` it under the
-configured secret name (default `telegram_bot_token`). Do not copy the journal
-line into chat, tickets, or git.
 
 Build the release on Ubuntu 24.04 glibc, not a newer WSL userland ([deployment.md](deployment.md)).
 
@@ -116,14 +123,17 @@ curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/v1/health
 curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/v1/status
 curl -sS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:8787/v1/models?conversation_id=owner"
 curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/v1/skills
+curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8787/v1/bots
 ```
 
 Health should show `ok` true, `version` `0.1.0`, and the database up. Status
 is pending tasks, pending approvals, and the loopback API. Models lists
 allowlisted pairs and must not include endpoints or credentials. Skills
-returns on-disk summaries, not bodies.
+returns on-disk summaries, not bodies. Bots returns `id`, `role`, `enabled`,
+`live`, tools, and skills — not prompts or secrets.
 
-Telegram, about five minutes. The service is on `795b139`:
+Telegram, about five minutes. The service confirmed before this commit is
+`4464558`. After the additive deploy, repeat these on the new binary:
 
 1. Owner chat — command menu populated (`setMyCommands` on poll startup).
 2. **`/providers`** — models grouped by provider. Catalogs fail closed when refresh fails.
@@ -151,8 +161,9 @@ curl -sS -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
 
 Windows desktop and Flutter mobile launch steps are unchanged:
 [desktop-client.md](desktop-client.md), [mobile-client.md](mobile-client.md).
-Fleet on either client calls the same three endpoints. Local check before the
-next OVH build:
+Desktop Fleet refreshes skills with `GET /v1/skills` and bots with
+`GET /v1/bots`. Mobile Fleet still submits the three POST endpoints. Local
+check before the next OVH build:
 
 ```bat
 scripts\cargo-win.bat check --workspace --all-targets
@@ -168,6 +179,8 @@ OneDrive after the maker bot is up: **`onedrive_list`** (read), then
 Unit tests use synthetic fixtures. Treat Telegram, Firecrawl, ElevenLabs,
 voice intake, OneDrive uploads, Antigravity, connector OAuth, AgentMail, and
 browser CDP as owner-verified only after you exercise them on the real
-account. OVH is confirmed on code tip `795b139`; that confirmation is the
-binary and the unauthenticated health check, not a live exercise of those
-tools.
+account. OVH was confirmed on code tip `4464558` before this commit's binary
+changes; that confirmation is the binary and the unauthenticated health check,
+not a live exercise of those tools. If journals from before `4464558` contain
+a `getUpdates` URL, rotate `telegram_bot_token` as described above. Do not
+paste the token.

@@ -59,8 +59,10 @@ scripts\cargo-win.bat build --release -p serabot --locked
 - Sidebar navigation: **Chat**, **Approvals**, and **Fleet**, plus conversation
   id, model routing, and connection controls.
 - Chat history comes only from the server; there are no optimistic or demo
-  messages. The composer stays in a reserved bottom region so it is not clipped
-  at common window sizes.
+  messages. Assistant bubbles use the server `name` when it is a bot id (the
+  room orchestrator, or a specialist after `delegate`). Other assistant
+  messages stay labeled SeraBot. The composer stays in a reserved bottom region
+  so it is not clipped at common window sizes.
 - Provider and model are chosen separately. A change is not applied until
   confirmed, and the confirmation states that the provider will receive this
   conversation's history. Unapproved (`data_egress_approved = false`) profiles
@@ -86,6 +88,9 @@ as other requests and is not retried if the outcome is unknown.
   chosen from the specialist allowlist, and optional skill ids. `delegate` is
   not offered. The server writes a disabled specialist. Restart before it can
   run, and add it to `main.delegates` yourself if `main` should hand it work.
+  **Refresh bots** calls `GET /v1/bots` for on-disk summaries (`id`, `role`,
+  `enabled`, `live`, tools, skills). Prompts and secrets are not returned.
+  `live: false` means the file is not loaded until you restart.
 - **New skill** — `POST /v1/skills` with a lowercase skill id, a one-line
   description, and an optional markdown body. There is no path field. The
   server writes the pack under the configured skills directory and reports

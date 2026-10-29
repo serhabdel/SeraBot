@@ -75,6 +75,13 @@ selection applies to future turns only. See [model routing](model-routing.md).
 
 ## Fleet scaffold
 
+`GET /v1/bots` lists bot files under the configured bots directory. Each entry
+is `id`, `role` (`orchestrator` or `specialist`), `enabled`, `live`, `tools`,
+and `skills`. Prompt text, model endpoints, secret names, and approval lists
+are omitted. `live` is true only when that id is already loaded. A bot created
+with `POST /v1/bots` shows up here with `enabled: false` and `live: false`
+until you restart.
+
 `POST /v1/bots`
 
 ```json
@@ -139,6 +146,10 @@ Returns visible `user` and `assistant` messages in chronological order
 Message content that violates the current content policy is replaced with
 `[Content withheld by policy]`. Messages are fetched only for the requested
 conversation id.
+
+An assistant message may include `name` when it is a bot id: the orchestrator
+on a room turn, or the specialist after `delegate`. Names that are not bot ids
+are omitted. See [Orchestration](orchestration.md).
 
 ## Approvals
 

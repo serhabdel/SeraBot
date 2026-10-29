@@ -199,6 +199,19 @@ const MAX_SCAFFOLD_SKILLS: usize = 16;
 pub const MAX_SKILL_DESCRIPTION_CHARS: usize = 500;
 pub const MAX_SKILL_BODY_BYTES: usize = 96_000;
 const MAX_SKILL_LIST: usize = 256;
+const MAX_BOT_LIST: usize = 64;
+const MAX_BOT_SUMMARY_ITEMS: usize = 64;
+
+/// Bot id safe to show in the fleet list or on a chat bubble.
+pub fn valid_speaker(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    name.len() <= 64
+        && first.is_ascii_lowercase()
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
 
 /// Lowercase slug shared by bot ids and conversation slugs (`^[a-z][a-z0-9-]{0,31}$`).
 pub fn valid_slug(slug: &str) -> bool {
@@ -440,6 +453,16 @@ pub struct SkillSummary {
     pub pack: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct BotSummary {
+    pub id: String,
+    pub role: String,
+    pub enabled: bool,
+    pub live: bool,
+    pub tools: Vec<String>,
+    pub skills: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Selection {
     pub provider: String,
@@ -525,6 +548,9 @@ pub struct Message {
     pub role: Role,
     pub content: String,
     pub created_at: String,
+    /// Bot id on a room or handoff reply. Absent on ordinary assistant text.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 impl Drop for Message {
@@ -532,6 +558,9 @@ impl Drop for Message {
         self.content.zeroize();
         self.id.zeroize();
         self.created_at.zeroize();
+        if let Some(name) = self.name.as_mut() {
+            name.zeroize();
+        }
     }
 }
 
@@ -737,6 +766,14 @@ impl ApiClient {
             &[("limit", "100")],
         )?;
         if history.messages.len() > 100 {
+            return Err(ApiError::InvalidResponse);
+        }
+        if history.messages.iter().any(|message| {
+            message
+                .name
+                .as_ref()
+                .is_some_and(|name| !valid_speaker(name))
+        }) {
             return Err(ApiError::InvalidResponse);
         }
         Ok(history)
@@ -988,6 +1025,35 @@ impl ApiClient {
             }
         }
         Ok(response.skills)
+    }
+
+    pub fn list_bots(&self) -> Result<Vec<BotSummary>, ApiError> {
+        #[derive(Deserialize)]
+        struct BotsEnvelope {
+            bots: Vec<BotSummary>,
+        }
+        let response: BotsEnvelope = self.get(&["v1", "bots"], &[])?;
+        if response.bots.len() > MAX_BOT_LIST {
+            return Err(ApiError::InvalidResponse);
+        }
+        let mut seen = HashSet::with_capacity(response.bots.len());
+        for bot in &response.bots {
+            if !valid_speaker(&bot.id) || !seen.insert(bot.id.as_str()) {
+                return Err(ApiError::InvalidResponse);
+            }
+            if bot.role != "specialist" && bot.role != "orchestrator" {
+                return Err(ApiError::InvalidResponse);
+            }
+            if bot.tools.len() > MAX_BOT_SUMMARY_ITEMS || bot.skills.len() > MAX_BOT_SUMMARY_ITEMS {
+                return Err(ApiError::InvalidResponse);
+            }
+            if bot.tools.iter().any(|tool| !valid_speaker(tool))
+                || bot.skills.iter().any(|skill| !valid_speaker(skill))
+            {
+                return Err(ApiError::InvalidResponse);
+            }
+        }
+        Ok(response.bots)
     }
 }
 

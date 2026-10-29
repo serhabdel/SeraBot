@@ -1,6 +1,6 @@
 use crate::{
-    ApiError, Approval, Catalog, CreatedBot, CreatedConversation, CreatedSkill, Message, Scope,
-    Selection, SkillSummary, Task,
+    ApiError, Approval, BotSummary, Catalog, CreatedBot, CreatedConversation, CreatedSkill,
+    Message, Scope, Selection, SkillSummary, Task,
     worker::{OperationKind, Reply},
 };
 
@@ -20,6 +20,8 @@ pub struct State {
     pub created_skill: Option<CreatedSkill>,
     pub listed_skills: Vec<SkillSummary>,
     pub skills_loaded: bool,
+    pub listed_bots: Vec<BotSummary>,
+    pub bots_loaded: bool,
     pub error: Option<String>,
     pub unknown_outcome: bool,
 }
@@ -45,6 +47,8 @@ impl Default for State {
             created_skill: None,
             listed_skills: Vec::new(),
             skills_loaded: false,
+            listed_bots: Vec::new(),
+            bots_loaded: false,
             error: None,
             unknown_outcome: false,
         }
@@ -59,6 +63,8 @@ impl State {
         let created_skill = self.created_skill.clone();
         let listed_skills = self.listed_skills.clone();
         let skills_loaded = self.skills_loaded;
+        let listed_bots = self.listed_bots.clone();
+        let bots_loaded = self.bots_loaded;
         *self = Self {
             scope: Scope {
                 epoch,
@@ -70,6 +76,8 @@ impl State {
             created_skill,
             listed_skills,
             skills_loaded,
+            listed_bots,
+            bots_loaded,
             ..Self::default()
         };
     }
@@ -81,6 +89,8 @@ impl State {
         self.created_skill = None;
         self.listed_skills.clear();
         self.skills_loaded = false;
+        self.listed_bots.clear();
+        self.bots_loaded = false;
     }
 
     pub fn can_send(&self) -> bool {
@@ -132,6 +142,10 @@ impl State {
                 self.listed_skills = skills;
                 self.skills_loaded = true;
             }
+            Reply::Bots(bots) => {
+                self.listed_bots = bots;
+                self.bots_loaded = true;
+            }
         }
         true
     }
@@ -173,8 +187,8 @@ impl State {
 mod tests {
     use super::*;
     use crate::{
-        Catalog, CreatedBot, CreatedConversation, CreatedSkill, Health, Message, Role, Selection,
-        SkillSummary, Task, TaskStatus,
+        BotSummary, Catalog, CreatedBot, CreatedConversation, CreatedSkill, Health, Message, Role,
+        Selection, SkillSummary, Task, TaskStatus,
     };
 
     fn catalog() -> Catalog {
@@ -261,6 +275,7 @@ mod tests {
             role: Role::Assistant,
             content: "sensitive fixture".into(),
             created_at: "now".into(),
+            name: Some("analyst".into()),
         });
         state.task = Some(Task {
             id: "t".into(),
@@ -354,16 +369,28 @@ mod tests {
             pack: None,
         });
         state.skills_loaded = true;
+        state.listed_bots.push(BotSummary {
+            id: "analyst".into(),
+            role: "specialist".into(),
+            enabled: true,
+            live: true,
+            tools: vec!["skill_list".into()],
+            skills: vec!["ask".into()],
+        });
+        state.bots_loaded = true;
         state.new_scope("dir:analyst".into(), true);
         assert!(state.created_bot.is_some());
         assert!(state.created_conversation.is_some());
         assert!(state.created_skill.is_some());
         assert!(state.skills_loaded);
+        assert!(state.bots_loaded);
         state.disconnect();
         assert!(state.created_bot.is_none());
         assert!(state.created_conversation.is_none());
         assert!(state.created_skill.is_none());
         assert!(state.listed_skills.is_empty());
         assert!(!state.skills_loaded);
+        assert!(state.listed_bots.is_empty());
+        assert!(!state.bots_loaded);
     }
 }

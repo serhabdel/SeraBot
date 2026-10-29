@@ -14,6 +14,15 @@ pub enum BotRole {
     Orchestrator,
 }
 
+impl BotRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Specialist => "specialist",
+            Self::Orchestrator => "orchestrator",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversationKind {
     Section,
@@ -172,6 +181,37 @@ pub fn parse_conversation_scope(id: &str) -> Result<ConversationScope> {
     })
 }
 
+/// Bot id safe to show on a transcript or fleet list. Rejects URLs, tokens, and paths.
+pub fn safe_bot_label(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    name.len() <= 64
+        && first.is_ascii_lowercase()
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// Speaker stored on a visible assistant message.
+/// Handoff replies keep the specialist id in every conversation.
+/// Room turns also label the orchestrator so both bots are visible.
+pub fn assistant_speaker<'a>(
+    conversation_id: &str,
+    bot: &'a str,
+    handoff: bool,
+) -> Option<&'a str> {
+    if !safe_bot_label(bot) {
+        return None;
+    }
+    if handoff {
+        return Some(bot);
+    }
+    match parse_conversation_scope(conversation_id) {
+        Ok(scope) if scope.kind == ConversationKind::Room => Some(bot),
+        _ => None,
+    }
+}
+
 pub fn validate_handoff(h: &Handoff, allowed_skills: &[String]) -> Result<()> {
     if h.from_bot != ORCHESTRATOR_BOT {
         return Err(SeraError::Validation(
@@ -254,6 +294,26 @@ pub fn validate_bot_fleet(members: &[BotFleetMember]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn room_and_handoff_speakers_are_bot_ids_only() {
+        assert_eq!(
+            assistant_speaker("room:review", "main", false),
+            Some("main")
+        );
+        assert_eq!(assistant_speaker("owner", "main", false), None);
+        assert_eq!(assistant_speaker("dir:analyst", "main", false), None);
+        assert_eq!(
+            assistant_speaker("room:review", "analyst", true),
+            Some("analyst")
+        );
+        assert_eq!(assistant_speaker("owner", "analyst", true), Some("analyst"));
+        assert_eq!(
+            assistant_speaker("room:review", "bot999:secret", false),
+            None
+        );
+        assert!(!safe_bot_label("https://token.example/bot"));
+    }
 
     #[test]
     fn rejects_bad_slug() {

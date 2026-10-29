@@ -121,6 +121,28 @@ The server builds the id (`sec:`, `grp:`, `dir:`, `room:` plus the slug). Sectio
 have no parent. Groups require a section parent. Direct and room nodes may sit
 under a section or a group. Sections and groups still cannot accept turns.
 
+## Rooms and delegate
+
+A room is one conversation (`room:<slug>`). It does not start a chat between
+models. Multi-bot presence is the owner, `main`, and at most one named
+specialist reply per orchestrator turn.
+
+1. The owner posts to the room. That turn runs as `main`.
+2. `main` may call `delegate` once. The tool queues one specialist task on the
+   same conversation id and the orchestrator turn ends. In a room, that parent
+   reply is stored with `name` `main` (for example `Queued handoff to analyst.`).
+3. The specialist runs on the handoff objective only and posts one assistant
+   message on that same room. `name` is the specialist id.
+4. `GET /v1/conversations/{id}/messages` returns `name` when it is a bot id.
+   The desktop labels the bubble with that name. Unnamed assistant text stays
+   "SeraBot".
+5. A second specialist speaks only on a later owner turn, when `main` delegates
+   again. Specialists cannot delegate.
+
+Direct and legacy conversations do not label the orchestrator. A handoff reply
+is still named with the specialist id, in the same conversation. There is no
+separate specialist transcript and no free-form agent-to-agent exchange.
+
 ## Runtime concurrency
 
 `runtime` holds a concurrency permit for the whole `process_task` turn. The

@@ -19,7 +19,9 @@ use crate::gateway::{
 };
 use crate::memory;
 use crate::model_router::{ModelRouter, ModelSelection, PinnedRoute, ProviderView};
-use crate::orchestration::{BotRole, HandoffContext, ORCHESTRATOR_BOT, validate_conversation_id};
+use crate::orchestration::{
+    BotRole, HandoffContext, ORCHESTRATOR_BOT, assistant_speaker, validate_conversation_id,
+};
 use crate::retrieval::{RetrievedChunk, Retriever, evidence_block};
 use crate::skills::on_demand_skill_clause;
 use crate::store::Store;
@@ -1000,6 +1002,24 @@ impl Runtime {
             .await
     }
 
+    fn record_assistant(
+        &self,
+        conversation_id: &str,
+        turn: &Turn,
+        text: &str,
+        handoff: bool,
+    ) -> Result<()> {
+        let name = assistant_speaker(conversation_id, &turn.bot, handoff);
+        self.store.append_message_named(
+            conversation_id,
+            Some(&turn.id),
+            Role::Assistant,
+            text,
+            name,
+        )?;
+        Ok(())
+    }
+
     async fn advance(
         &self,
         task: &Task,
@@ -1094,13 +1114,7 @@ impl Runtime {
                 )?;
                 if let Some(handoff) = &state.handoff {
                     self.notifier.send_text(conversation_id, &text).await?;
-                    self.store.append_message_named(
-                        conversation_id,
-                        Some(&turn.id),
-                        Role::Assistant,
-                        &text,
-                        Some(&turn.bot),
-                    )?;
+                    self.record_assistant(conversation_id, turn, &text, true)?;
                     self.store.record_audit(
                         "system",
                         "handoff.completed",
@@ -1117,12 +1131,7 @@ impl Runtime {
                     )?;
                 } else {
                     self.notifier.send_text(conversation_id, &text).await?;
-                    self.store.append_message(
-                        conversation_id,
-                        Some(&turn.id),
-                        Role::Assistant,
-                        &text,
-                    )?;
+                    self.record_assistant(conversation_id, turn, &text, false)?;
                 }
                 self.store
                     .update_turn(&turn.id, "completed", &serde_json::to_value(&state)?)?;
@@ -1138,12 +1147,7 @@ impl Runtime {
             if requested > self.config.runtime.max_tool_calls_per_turn {
                 let text = "I stopped because this turn exceeded the tool-call limit.".to_string();
                 self.notifier.send_text(conversation_id, &text).await?;
-                self.store.append_message(
-                    conversation_id,
-                    Some(&turn.id),
-                    Role::Assistant,
-                    &text,
-                )?;
+                self.record_assistant(conversation_id, turn, &text, false)?;
                 self.store
                     .update_turn(&turn.id, "stopped", &serde_json::to_value(&state)?)?;
                 return Ok(TurnOutcome::Completed);
@@ -1161,12 +1165,7 @@ impl Runtime {
                 let label = state.handoff_to_bot.as_deref().unwrap_or("specialist");
                 let text = format!("Queued handoff to {label}.");
                 self.notifier.send_text(conversation_id, &text).await?;
-                self.store.append_message(
-                    conversation_id,
-                    Some(&turn.id),
-                    Role::Assistant,
-                    &text,
-                )?;
+                self.record_assistant(conversation_id, turn, &text, false)?;
                 self.store
                     .update_turn(&turn.id, "completed", &serde_json::to_value(&state)?)?;
                 self.store.append_event(
@@ -1180,8 +1179,7 @@ impl Runtime {
         }
         let text = "I stopped because the turn reached its tool-iteration limit.".to_string();
         self.notifier.send_text(conversation_id, &text).await?;
-        self.store
-            .append_message(conversation_id, Some(&turn.id), Role::Assistant, &text)?;
+        self.record_assistant(conversation_id, turn, &text, false)?;
         self.store
             .update_turn(&turn.id, "stopped", &serde_json::to_value(&state)?)?;
         Ok(TurnOutcome::Completed)

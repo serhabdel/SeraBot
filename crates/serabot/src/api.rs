@@ -109,7 +109,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
         .route("/v1/messages", post(send_message))
-        .route("/v1/bots", post(create_bot))
+        .route("/v1/bots", get(list_bots).post(create_bot))
         .route("/v1/skills", get(list_skills).post(create_skill_pack))
         .route("/v1/conversations", post(create_conversation))
         .route("/v1/models", get(models))
@@ -289,7 +289,9 @@ async fn conversation_messages(
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
-    let messages = state.store.list_visible_messages(&id, query.limit.unwrap_or(100).clamp(1, 200))?
+    let messages = state
+        .store
+        .list_visible_messages(&id, query.limit.unwrap_or(100).clamp(1, 200))?
         .into_iter()
         .map(|message| {
             let content = if state.runtime.scan_owner_output(&message.content).is_ok() {
@@ -297,8 +299,24 @@ async fn conversation_messages(
             } else {
                 "[Content withheld by policy]".to_owned()
             };
-            json!({"id": message.id, "role": message.role, "content": content, "created_at": message.created_at})
-        }).collect::<Vec<_>>();
+            let mut body = json!({
+                "id": message.id,
+                "role": message.role,
+                "content": content,
+                "created_at": message.created_at,
+            });
+            if let Some(name) = message
+                .name
+                .as_deref()
+                .filter(|name| crate::orchestration::safe_bot_label(name))
+            {
+                if state.runtime.scan_owner_output(name).is_ok() {
+                    body["name"] = json!(name);
+                }
+            }
+            body
+        })
+        .collect::<Vec<_>>();
     Ok(Json(json!({"messages": messages})))
 }
 
@@ -529,6 +547,26 @@ async fn create_bot(
             "prompt_file": scaffolded.prompt_file,
         }
     })))
+}
+
+async fn list_bots(State(state): State<Arc<ApiState>>) -> Result<Json<Value>> {
+    let configured = crate::config::list_configured_bots(&state.config)?;
+    let bots = configured
+        .into_iter()
+        .map(|bot| {
+            json!({
+                "id": bot.id,
+                "role": bot.role,
+                "enabled": bot.enabled,
+                "live": state.runtime.bot_loaded(&bot.id),
+                "tools": bot.tools,
+                "skills": bot.skills,
+            })
+        })
+        .collect::<Vec<_>>();
+    let body = json!({ "bots": bots });
+    state.runtime.scan_owner_output(&body.to_string())?;
+    Ok(Json(body))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1239,6 +1277,100 @@ mod tests {
         let text = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(!text.contains("private system prompt"));
         assert!(!text.contains("other conversation"));
+    }
+
+    #[tokio::test]
+    async fn room_history_returns_handoff_speaker_and_drops_unsafe_names() {
+        let (app, _, store) = app();
+        store
+            .append_message_named(
+                "room:review",
+                None,
+                crate::domain::Role::Assistant,
+                "Synthetic analyst summary.",
+                Some("analyst"),
+            )
+            .unwrap();
+        store
+            .append_message_named(
+                "room:review",
+                None,
+                crate::domain::Role::Assistant,
+                "orchestrator note",
+                Some("bot999:secretvalue"),
+            )
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/conversations/room:review/messages",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = read_json(response).await;
+        let messages = value["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["name"], "analyst");
+        assert!(messages[1].get("name").is_none());
+        let text = value.to_string();
+        assert!(!text.contains("secretvalue"));
+        assert!(!text.contains("bot999"));
+    }
+
+    #[tokio::test]
+    async fn lists_configured_bots_without_prompts_or_secrets() {
+        let root = temp_base();
+        let (app, _, _) = app_with_root(true, Policy::empty(), root.clone());
+        let denied = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/bots", false, None))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let empty = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/bots", true, None))
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::OK);
+        assert_eq!(read_json(empty).await["bots"].as_array().unwrap().len(), 0);
+
+        let secret = "super-secret-prompt-body-should-not-leak";
+        std::fs::create_dir_all(root.join("prompts")).unwrap();
+        std::fs::write(root.join("prompts").join("notes.txt"), secret).unwrap();
+        std::fs::create_dir_all(root.join("bots")).unwrap();
+        std::fs::write(
+            root.join("bots").join("notes.toml"),
+            "name = \"notes\"\nrole = \"specialist\"\ntrigger = \"command\"\nsystem_prompt = \"prompts/notes.txt\"\nskills = [\"ask\"]\ntools = [\"skill_list\"]\nenabled = false\n",
+        )
+        .unwrap();
+
+        let listed = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/bots", true, None))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = read_json(listed).await;
+        let bots = listed["bots"].as_array().unwrap();
+        assert_eq!(bots.len(), 1);
+        assert_eq!(bots[0]["id"], "notes");
+        assert_eq!(bots[0]["role"], "specialist");
+        assert_eq!(bots[0]["enabled"], false);
+        assert_eq!(bots[0]["live"], false);
+        assert_eq!(bots[0]["tools"][0], "skill_list");
+        assert_eq!(bots[0]["skills"][0], "ask");
+        let text = listed.to_string();
+        assert!(!text.contains(secret));
+        assert!(!text.contains("system_prompt"));
+        assert!(!text.contains("prompts/notes.txt"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
