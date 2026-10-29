@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 use age::secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
@@ -97,6 +98,73 @@ impl SecretStore {
         }
         ensure_identity(&self.identity_path)?;
         write_encrypted(&self.path, &self.identity_path, &self.values)
+    }
+}
+
+/// Process-wide handle for the age store. Refresh paths share one store so
+/// rotated credentials are written back without dropping sibling secrets.
+#[derive(Clone)]
+pub struct SharedSecrets {
+    inner: Arc<Mutex<SecretStore>>,
+}
+
+impl std::fmt::Debug for SharedSecrets {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let store = self.lock();
+        let names = store
+            .names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        formatter
+            .debug_struct("SharedSecrets")
+            .field("path", &store.path)
+            .field("identity_path", &store.identity_path)
+            .field("secret_names", &names)
+            .finish()
+    }
+}
+
+impl SharedSecrets {
+    pub fn new(store: SecretStore) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(store)),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SecretStore> {
+        self.inner.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub fn get(&self, name: &str) -> Option<String> {
+        self.lock().get(name).map(str::to_owned)
+    }
+
+    pub fn require(&self, name: &str) -> Result<String> {
+        self.lock().require(name).map(str::to_owned)
+    }
+
+    /// Reload the ciphertext, apply `updates`, and write it back.
+    /// A failed save leaves the previous ciphertext and this handle unchanged.
+    pub fn persist(&self, updates: &[(&str, &str)]) -> Result<()> {
+        if updates.is_empty() {
+            return Err(SeraError::Secrets(
+                "rotated credential was not persisted".into(),
+            ));
+        }
+        let mut guard = self.lock();
+        if guard.path.as_os_str().is_empty() || guard.identity_path.as_os_str().is_empty() {
+            return Err(SeraError::Secrets(
+                "cannot persist an in-memory secret store".into(),
+            ));
+        }
+        let mut updated = SecretStore::open_paths(&guard.path, &guard.identity_path)?;
+        for (name, value) in updates {
+            updated.set(name, value)?;
+        }
+        updated.save()?;
+        *guard = updated;
+        Ok(())
     }
 }
 
@@ -210,5 +278,41 @@ mod tests {
     fn rejects_persisting_memory_store() {
         let store = SecretStore::from_map(BTreeMap::new());
         assert!(store.save().is_err());
+        let shared = SharedSecrets::new(store);
+        let error = shared.persist(&[("refresh", "refresh-new")]).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("in-memory"));
+        assert!(!message.contains("refresh-new"));
+    }
+
+    #[test]
+    fn failed_persist_keeps_the_previous_ciphertext() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = dir.path().join("identity.txt");
+        let store_path = dir.path().join("secrets.age");
+        ensure_identity(&identity).unwrap();
+        let mut store = SecretStore::open_paths(&store_path, &identity).unwrap();
+        store.set("refresh", "refresh-old").unwrap();
+        store.set("other", "other-value").unwrap();
+        store.save().unwrap();
+        let backup = std::fs::read(&identity).unwrap();
+
+        let shared = SharedSecrets::new(SecretStore::open_paths(&store_path, &identity).unwrap());
+        std::fs::write(&identity, "not-an-identity").unwrap();
+        let error = shared.persist(&[("refresh", "refresh-new")]).unwrap_err();
+        let message = error.to_string();
+        assert!(!message.contains("refresh-new"));
+        assert!(!message.contains("refresh-old"));
+        assert!(!message.contains("other-value"));
+        assert_eq!(shared.get("refresh").as_deref(), Some("refresh-old"));
+
+        std::fs::write(&identity, backup).unwrap();
+        let reopened = SecretStore::open_paths(&store_path, &identity).unwrap();
+        assert_eq!(reopened.get("refresh"), Some("refresh-old"));
+        assert_eq!(reopened.get("other"), Some("other-value"));
+        let raw = std::fs::read(&store_path).unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(!text.contains("refresh-old"));
+        assert!(!text.contains("refresh-new"));
     }
 }

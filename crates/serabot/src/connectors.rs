@@ -8,8 +8,9 @@
 //! - read tools fail closed until a refresh token is stored
 //! - reads are approval-gated once a refresh token is present
 //!
-//! AgentMail is a native HTTPS client. Rotated OAuth refresh tokens stay in
-//! memory for the process and are not written back to the secret store.
+//! AgentMail is a native HTTPS client. A refresh that returns a new
+//! `refresh_token` is written back to the age store; a failed write fails the
+//! read so the owner sees it. Authorization-code exchange still stays in memory.
 
 use std::fmt;
 use std::sync::Arc;
@@ -28,7 +29,7 @@ use url::Url;
 use crate::config::{ConnectorsConfig, OAuthConnectorSettings, valid_secret_name};
 use crate::error::{Result, SeraError};
 use crate::gateway::{ApprovalDetails, Tool, ToolContext, ToolOutput, ToolRegistry, ToolSpec};
-use crate::secrets::SecretStore;
+use crate::secrets::SharedSecrets;
 use crate::util::truncate_chars;
 
 const MAX_API_BYTES: usize = 512 * 1024;
@@ -50,7 +51,7 @@ const NOTION_TOKEN: &str = "https://api.notion.com/v1/oauth/token";
 pub fn register_connector_tools(
     registry: &mut ToolRegistry,
     config: &ConnectorsConfig,
-    secrets: &SecretStore,
+    secrets: &SharedSecrets,
     http: Client,
 ) -> Result<()> {
     register_oauth(
@@ -125,7 +126,7 @@ pub fn register_connector_tools(
 
 fn register_oauth(
     registry: &mut ToolRegistry,
-    secrets: &SecretStore,
+    secrets: &SharedSecrets,
     settings: &dyn OAuthConnectorSettings,
     kind: ConnectorKind,
     http: Client,
@@ -154,6 +155,7 @@ fn register_oauth(
     }
     let refresh_token = match secrets
         .get(refresh_name)
+        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
@@ -173,6 +175,7 @@ fn register_oauth(
         refresh_token,
         redirect_uri: settings.redirect_uri().trim().to_owned(),
         refresh_secret_name: refresh_name.to_owned(),
+        secrets: Some(secrets.clone()),
         allow_loopback: false,
         authorize_url: kind.authorize_url().to_owned(),
         token_url: kind.token_url().to_owned(),
@@ -183,7 +186,7 @@ fn register_oauth(
 }
 
 fn require_named_secret(
-    secrets: &SecretStore,
+    secrets: &SharedSecrets,
     section: &str,
     field: &str,
     name: &str,
@@ -196,6 +199,7 @@ fn require_named_secret(
     }
     match secrets
         .get(name)
+        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
@@ -371,6 +375,7 @@ struct OAuthClientParts {
     refresh_token: Option<String>,
     redirect_uri: String,
     refresh_secret_name: String,
+    secrets: Option<SharedSecrets>,
     allow_loopback: bool,
     authorize_url: String,
     token_url: String,
@@ -381,6 +386,8 @@ struct OAuthMemory {
     refresh_token: Option<String>,
     access_token: Option<String>,
     access_expires: Option<Instant>,
+    /// The provider issued a new refresh token that is not in the age store yet.
+    refresh_unpersisted: bool,
 }
 
 struct OAuthClient {
@@ -393,6 +400,7 @@ struct OAuthClient {
     client_secret: String,
     redirect_uri: String,
     refresh_secret_name: String,
+    secrets: Option<SharedSecrets>,
     refresh_configured: bool,
     memory: Mutex<OAuthMemory>,
 }
@@ -453,11 +461,13 @@ impl OAuthClient {
             client_secret: parts.client_secret,
             redirect_uri: parts.redirect_uri,
             refresh_secret_name: parts.refresh_secret_name,
+            secrets: parts.secrets,
             refresh_configured,
             memory: Mutex::new(OAuthMemory {
                 refresh_token: parts.refresh_token,
                 access_token: None,
                 access_expires: None,
+                refresh_unpersisted: false,
             }),
         })
     }
@@ -696,6 +706,10 @@ impl OAuthClient {
 
     async fn access_token(&self) -> Result<String> {
         let mut memory = self.memory.lock().await;
+        if memory.refresh_unpersisted {
+            self.persist_rotated_refresh(&memory)?;
+            memory.refresh_unpersisted = false;
+        }
         if let Some(token) = fresh_access(&memory) {
             return Ok(token);
         }
@@ -712,8 +726,41 @@ impl OAuthClient {
             })?;
         let payload = self.request_token(TokenGrant::Refresh(refresh)).await?;
         let access = payload.access_token.clone();
+        if payload
+            .refresh_token
+            .as_ref()
+            .is_some_and(|value| memory.refresh_token.as_deref() != Some(value.as_str()))
+        {
+            memory.refresh_unpersisted = true;
+        }
         store_token_in(&mut memory, payload);
+        if memory.refresh_unpersisted {
+            self.persist_rotated_refresh(&memory)?;
+            memory.refresh_unpersisted = false;
+        }
         Ok(access)
+    }
+
+    fn persist_rotated_refresh(&self, memory: &OAuthMemory) -> Result<()> {
+        let Some(refresh) = memory
+            .refresh_token
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        else {
+            return Err(SeraError::Secrets(format!(
+                "connectors.{} rotated refresh token was not persisted",
+                self.kind.section()
+            )));
+        };
+        let Some(secrets) = &self.secrets else {
+            return Err(SeraError::Secrets(format!(
+                "connectors.{} rotated refresh token was not persisted",
+                self.kind.section()
+            )));
+        };
+        secrets
+            .persist(&[(&self.refresh_secret_name, refresh)])
+            .map_err(|error| redact_persist_error(error, self.kind.section(), refresh))
     }
 
     async fn store_token(&self, payload: TokenPayload) {
@@ -833,6 +880,17 @@ fn store_token_in(memory: &mut OAuthMemory, payload: TokenPayload) {
         }
     });
     memory.access_token = Some(payload.access_token);
+}
+
+fn redact_persist_error(error: SeraError, section: &str, refresh: &str) -> SeraError {
+    let message = error.to_string();
+    if refresh.len() >= 8 && message.contains(refresh) {
+        SeraError::Secrets(format!(
+            "connectors.{section} rotated refresh token was not persisted"
+        ))
+    } else {
+        error
+    }
 }
 
 fn fresh_access(memory: &OAuthMemory) -> Option<String> {
@@ -1440,6 +1498,7 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
 
     use super::*;
+    use crate::secrets::SecretStore;
     use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1475,6 +1534,7 @@ mod tests {
             refresh_token: refresh.map(str::to_owned),
             redirect_uri: redirect.into(),
             refresh_secret_name: format!("{}_refresh_token", kind.section()),
+            secrets: None,
             allow_loopback: true,
             authorize_url: authorize_url.into(),
             token_url: token_url.into(),
@@ -1534,7 +1594,7 @@ mod tests {
     #[test]
     fn disabled_connectors_register_nothing() {
         let mut registry = ToolRegistry::default();
-        let secrets = SecretStore::from_map(BTreeMap::new());
+        let secrets = SharedSecrets::new(SecretStore::from_map(BTreeMap::new()));
         register_connector_tools(
             &mut registry,
             &ConnectorsConfig::default(),
@@ -1574,7 +1634,7 @@ mod tests {
             let error = register_connector_tools(
                 &mut registry,
                 &config,
-                &SecretStore::from_map(BTreeMap::new()),
+                &SharedSecrets::new(SecretStore::from_map(BTreeMap::new())),
                 http(),
             )
             .unwrap_err();
@@ -1598,7 +1658,7 @@ mod tests {
         register_connector_tools(
             &mut registry,
             &config,
-            &SecretStore::from_map(values),
+            &SharedSecrets::new(SecretStore::from_map(values)),
             http(),
         )
         .unwrap();
@@ -1643,6 +1703,7 @@ mod tests {
             refresh_token: None,
             redirect_uri: redirect.into(),
             refresh_secret_name: "google_drive_refresh_token".into(),
+            secrets: None,
             allow_loopback: false,
             authorize_url: GOOGLE_AUTHORIZE.into(),
             token_url: GOOGLE_TOKEN.into(),
@@ -1666,6 +1727,7 @@ mod tests {
             refresh_token: None,
             redirect_uri: redirect.into(),
             refresh_secret_name: "outlook_refresh_token".into(),
+            secrets: None,
             allow_loopback: false,
             authorize_url: MICROSOFT_AUTHORIZE.into(),
             token_url: MICROSOFT_TOKEN.into(),
@@ -1689,6 +1751,7 @@ mod tests {
             refresh_token: None,
             redirect_uri: redirect.into(),
             refresh_secret_name: "notion_refresh_token".into(),
+            secrets: None,
             allow_loopback: false,
             authorize_url: NOTION_AUTHORIZE.into(),
             token_url: NOTION_TOKEN.into(),
@@ -1893,6 +1956,7 @@ mod tests {
             refresh_token: None,
             redirect_uri: String::new(),
             refresh_secret_name: "outlook_calendar_refresh_token".into(),
+            secrets: None,
             allow_loopback: true,
             authorize_url: "https://evil.example/authorize".into(),
             token_url: MICROSOFT_TOKEN.into(),
@@ -1900,5 +1964,265 @@ mod tests {
         })
         .unwrap_err();
         assert!(!error.to_string().contains("client-secret-value"));
+    }
+
+    fn age_store(
+        pairs: &[(&str, &str)],
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        SharedSecrets,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = dir.path().join("identity.txt");
+        let path = dir.path().join("secrets.age");
+        crate::secrets::ensure_identity(&identity).unwrap();
+        let mut store = SecretStore::open_paths(&path, &identity).unwrap();
+        for (name, value) in pairs {
+            store.set(name, value).unwrap();
+        }
+        store.save().unwrap();
+        let secrets = SharedSecrets::new(SecretStore::open_paths(&path, &identity).unwrap());
+        (dir, identity, path, secrets)
+    }
+
+    fn client_with_store(
+        kind: ConnectorKind,
+        refresh: &str,
+        secret_name: &str,
+        server: &MockServer,
+        secrets: SharedSecrets,
+    ) -> OAuthClient {
+        OAuthClient::new(OAuthClientParts {
+            http: http(),
+            kind,
+            client_id: "client-id-value".into(),
+            client_secret: "client-secret-value".into(),
+            refresh_token: Some(refresh.into()),
+            redirect_uri: String::new(),
+            refresh_secret_name: secret_name.into(),
+            secrets: Some(secrets),
+            allow_loopback: true,
+            authorize_url: format!("{}/authorize", server.uri()),
+            token_url: format!("{}/token", server.uri()),
+            api_base: server.uri(),
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rotated_refresh_tokens_are_written_to_the_age_store() {
+        let kinds = [
+            ConnectorKind::GoogleDrive,
+            ConnectorKind::GoogleSheets,
+            ConnectorKind::GoogleCalendar,
+            ConnectorKind::Gmail,
+            ConnectorKind::OutlookMail,
+            ConnectorKind::OutlookCalendar,
+            ConnectorKind::Notion,
+        ];
+        for kind in kinds {
+            let server = MockServer::start().await;
+            let secret_name = format!("{}_refresh_token", kind.section());
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .and(body_string_contains("refresh_token"))
+                .and(body_string_contains("refresh-old-value"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "access_token": "access-new-value",
+                    "refresh_token": "refresh-new-value",
+                    "expires_in": 3600,
+                    "token_type": "Bearer"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (_dir, _identity, path, secrets) = age_store(&[
+                (&secret_name, "refresh-old-value"),
+                ("other_secret", "other-value"),
+            ]);
+            let client = client_with_store(
+                kind,
+                "refresh-old-value",
+                &secret_name,
+                &server,
+                secrets.clone(),
+            );
+            assert_eq!(client.access_token().await.unwrap(), "access-new-value");
+            assert_eq!(
+                secrets.get(&secret_name).as_deref(),
+                Some("refresh-new-value")
+            );
+            assert_eq!(secrets.get("other_secret").as_deref(), Some("other-value"));
+            let raw = std::fs::read(&path).unwrap();
+            let text = String::from_utf8_lossy(&raw);
+            assert!(!text.contains("refresh-new-value"), "{}", kind.section());
+            assert!(!text.contains("refresh-old-value"), "{}", kind.section());
+            assert!(!text.contains("access-new-value"), "{}", kind.section());
+            assert!(!text.contains("other-value"), "{}", kind.section());
+        }
+    }
+
+    #[tokio::test]
+    async fn store_write_failure_surfaces_and_keeps_the_rotated_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("refresh-old-value"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-new-value",
+                "refresh_token": "refresh-new-value",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/drive/v3/files"))
+            .and(header("authorization", "Bearer access-new-value"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "files": [{"id": "file-1", "name": "Notes"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, identity, path, secrets) = age_store(&[
+            ("google_drive_refresh_token", "refresh-old-value"),
+            ("other_secret", "other-value"),
+        ]);
+        let backup = std::fs::read(&identity).unwrap();
+        std::fs::write(&identity, "not-an-identity").unwrap();
+        let client = Arc::new(client_with_store(
+            ConnectorKind::GoogleDrive,
+            "refresh-old-value",
+            "google_drive_refresh_token",
+            &server,
+            secrets.clone(),
+        ));
+        let tool = OAuthReadTool::new(client.clone());
+        let error = tool.execute(json!({}), &context()).await.unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("secret store") || message.contains("not persisted"),
+            "{message}"
+        );
+        assert!(!message.contains("refresh-new-value"), "{message}");
+        assert!(!message.contains("refresh-old-value"), "{message}");
+        assert!(!message.contains("access-new-value"), "{message}");
+        assert!(!message.contains("client-secret-value"), "{message}");
+        assert_eq!(
+            client.memory.lock().await.refresh_token.as_deref(),
+            Some("refresh-new-value")
+        );
+        assert_eq!(
+            secrets.get("google_drive_refresh_token").as_deref(),
+            Some("refresh-old-value")
+        );
+
+        std::fs::write(&identity, backup).unwrap();
+        let on_disk = SecretStore::open_paths(&path, &identity).unwrap();
+        assert_eq!(
+            on_disk.get("google_drive_refresh_token"),
+            Some("refresh-old-value")
+        );
+        assert_eq!(on_disk.get("other_secret"), Some("other-value"));
+
+        let value = tool.execute(json!({}), &context()).await.unwrap();
+        assert_eq!(value.data.unwrap()["files"][0]["id"], "file-1");
+        assert_eq!(
+            secrets.get("google_drive_refresh_token").as_deref(),
+            Some("refresh-new-value")
+        );
+        assert_eq!(secrets.get("other_secret").as_deref(), Some("other-value"));
+        let raw = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+        assert!(!raw.contains("refresh-new-value"));
+        assert!(!raw.contains("other-value"));
+    }
+
+    #[tokio::test]
+    async fn missing_writer_fails_closed_without_dropping_the_new_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-new-value",
+                "refresh_token": "refresh-new-value",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client(
+            ConnectorKind::OutlookMail,
+            Some("refresh-old-value"),
+            "",
+            &format!("{}/authorize", server.uri()),
+            &format!("{}/token", server.uri()),
+            &server.uri(),
+        );
+        let error = client.access_token().await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("not persisted"), "{message}");
+        assert!(!message.contains("refresh-new-value"), "{message}");
+        assert!(!message.contains("client-secret-value"), "{message}");
+        assert_eq!(
+            client.memory.lock().await.refresh_token.as_deref(),
+            Some("refresh-new-value")
+        );
+        let again = client.access_token().await.unwrap_err();
+        assert!(!again.to_string().contains("refresh-new-value"));
+    }
+
+    #[tokio::test]
+    async fn omitted_or_repeated_refresh_token_does_not_rewrite_the_store() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-new-value",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, _identity, _path, secrets) =
+            age_store(&[("gmail_refresh_token", "refresh-old-value")]);
+        let client = client_with_store(
+            ConnectorKind::Gmail,
+            "refresh-old-value",
+            "gmail_refresh_token",
+            &server,
+            secrets.clone(),
+        );
+        assert_eq!(client.access_token().await.unwrap(), "access-new-value");
+        assert_eq!(
+            secrets.get("gmail_refresh_token").as_deref(),
+            Some("refresh-old-value")
+        );
+
+        let memory = SharedSecrets::new(SecretStore::from_map(BTreeMap::from([(
+            "notion_refresh_token".into(),
+            "refresh-old-value".into(),
+        )])));
+        let echo = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-new-value",
+                "refresh_token": "refresh-old-value",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&echo)
+            .await;
+        let client = client_with_store(
+            ConnectorKind::Notion,
+            "refresh-old-value",
+            "notion_refresh_token",
+            &echo,
+            memory,
+        );
+        assert_eq!(client.access_token().await.unwrap(), "access-new-value");
     }
 }

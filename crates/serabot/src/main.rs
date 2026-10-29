@@ -34,7 +34,7 @@ use serabot::policy::Policy;
 use serabot::retrieval::{Retriever, SqliteRetriever};
 use serabot::runtime::{CompositeNotifier, Notifier, RagSearchTool, Runtime, ScheduledPayload};
 use serabot::scheduler::{due_routines, ensure_daily_routine};
-use serabot::secrets::{SecretStore, ensure_identity};
+use serabot::secrets::{SecretStore, SharedSecrets, ensure_identity};
 use serabot::skills::{
     SkillCatalog, SkillRuntime, create_skill, read_skill_body_file, register_skill_tools,
 };
@@ -359,7 +359,7 @@ fn check(config_path: &std::path::Path) -> anyhow::Result<()> {
 
 async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     let (config, bots) = load(config_path)?;
-    let secrets = SecretStore::open(&config).context("open secret store")?;
+    let secrets = SharedSecrets::new(SecretStore::open(&config).context("open secret store")?);
     let policy = Arc::new(Policy::load(&config.path(&config.policy.blocklist_file))?);
     let store = Store::open(
         config.database_path(),
@@ -761,7 +761,7 @@ fn muse_secret_names(config: &Config) -> (String, String) {
 
 fn open_provider_client(
     profile: &serabot::config::ProviderConfig,
-    secrets: &SecretStore,
+    secrets: &SharedSecrets,
     timeout_secs: u64,
     max_output_tokens: u32,
 ) -> anyhow::Result<LlmClient> {
@@ -800,6 +800,13 @@ fn open_provider_client(
                 client_id,
                 client_secret,
             })?;
+            if style == OAuthStyle::RefreshToken {
+                client = client.with_refresh_persistence(
+                    secrets.clone(),
+                    profile.refresh_token_secret.clone(),
+                    profile.api_key_secret.clone(),
+                )?;
+            }
         }
     }
     if serabot::providers::canonical_kind(&profile.kind)? == "google-antigravity" {

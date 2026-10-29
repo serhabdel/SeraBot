@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use crate::providers::{
 use crate::domain::{LlmMessage, Role, ToolCall};
 use crate::error::{Result, SeraError};
 use crate::gateway::ToolSpec;
+use crate::secrets::SharedSecrets;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Usage {
@@ -33,12 +35,22 @@ pub struct LlmResponse {
     pub finish_reason: Option<String>,
 }
 
+struct RefreshPersistence {
+    secrets: SharedSecrets,
+    refresh_secret_name: String,
+    access_secret_name: String,
+}
+
 struct OAuthState {
     style: OAuthStyle,
     refresh_token: Mutex<SecretString>,
     token_url: String,
     client_id: String,
     client_secret: SecretString,
+    persistence: Mutex<Option<RefreshPersistence>>,
+    /// Set when a provider rotated the refresh token and the age store does not
+    /// yet contain that value. Stays set until `persist` succeeds.
+    refresh_unpersisted: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -123,7 +135,38 @@ impl LlmClient {
             token_url,
             client_id: material.client_id,
             client_secret: SecretString::new(material.client_secret),
+            persistence: Mutex::new(None),
+            refresh_unpersisted: AtomicBool::new(false),
         }));
+        Ok(self)
+    }
+
+    /// Record where a rotated Google refresh token (and its access token) must
+    /// be written. Antigravity login stores both in the age store.
+    pub fn with_refresh_persistence(
+        self,
+        secrets: SharedSecrets,
+        refresh_secret_name: impl Into<String>,
+        access_secret_name: impl Into<String>,
+    ) -> Result<Self> {
+        let refresh_secret_name = refresh_secret_name.into();
+        if refresh_secret_name.trim().is_empty() {
+            return Err(SeraError::Config(
+                "oauth refresh secret name is missing".into(),
+            ));
+        }
+        let oauth = self
+            .oauth
+            .as_ref()
+            .ok_or_else(|| SeraError::Config("oauth refresh persistence requires oauth".into()))?;
+        *oauth
+            .persistence
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(RefreshPersistence {
+            secrets,
+            refresh_secret_name,
+            access_secret_name: access_secret_name.into(),
+        });
         Ok(self)
     }
 
@@ -350,13 +393,34 @@ impl LlmClient {
                 refresh.zeroize();
                 client_secret.zeroize();
                 let grant = grant?;
-                if let Some(rotated) = grant.refresh_token {
-                    *oauth
+                if let Some(mut rotated) = grant.refresh_token {
+                    let mut slot = oauth
                         .refresh_token
                         .lock()
-                        .unwrap_or_else(|error| error.into_inner()) = SecretString::new(rotated);
+                        .unwrap_or_else(|error| error.into_inner());
+                    if slot.expose_secret().as_str() != rotated {
+                        *slot = SecretString::new(rotated.clone());
+                        oauth.refresh_unpersisted.store(true, Ordering::SeqCst);
+                    }
+                    rotated.zeroize();
                 }
-                grant.access_token
+                let mut access = grant.access_token;
+                if oauth.refresh_unpersisted.load(Ordering::SeqCst) {
+                    let mut current = oauth
+                        .refresh_token
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .expose_secret()
+                        .to_owned();
+                    let persisted = self.persist_rotated(&current, &access);
+                    current.zeroize();
+                    if let Err(error) = persisted {
+                        access.zeroize();
+                        return Err(error);
+                    }
+                    oauth.refresh_unpersisted.store(false, Ordering::SeqCst);
+                }
+                access
             }
         };
         *self
@@ -364,6 +428,42 @@ impl LlmClient {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = SecretString::new(token);
         Ok(())
+    }
+
+    fn persist_rotated(&self, refresh: &str, access: &str) -> Result<()> {
+        let oauth = self.oauth.as_ref().ok_or_else(|| {
+            SeraError::Secrets("rotated oauth refresh token was not persisted".into())
+        })?;
+        let (secrets, refresh_name, access_name) = {
+            let persistence = oauth
+                .persistence
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(persistence) = persistence.as_ref() else {
+                return Err(SeraError::Secrets(
+                    "rotated oauth refresh token was not persisted".into(),
+                ));
+            };
+            let refresh_name = persistence.refresh_secret_name.trim().to_owned();
+            if refresh_name.is_empty() {
+                return Err(SeraError::Secrets(
+                    "rotated oauth refresh token was not persisted".into(),
+                ));
+            }
+            (
+                persistence.secrets.clone(),
+                refresh_name,
+                persistence.access_secret_name.trim().to_owned(),
+            )
+        };
+        let mut updates = vec![(refresh_name.as_str(), refresh)];
+        if !access_name.is_empty() && access_name != refresh_name {
+            updates.push((access_name.as_str(), access));
+        }
+        match secrets.persist(&updates) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(redact_secret_error(error, &[refresh, access])),
+        }
     }
 
     async fn complete_cloud_code(
@@ -799,6 +899,18 @@ fn parse_response(bytes: &[u8]) -> Result<LlmResponse> {
     })
 }
 
+fn redact_secret_error(error: SeraError, secrets: &[&str]) -> SeraError {
+    let message = error.to_string();
+    if secrets
+        .iter()
+        .any(|secret| secret.len() >= 8 && message.contains(secret))
+    {
+        SeraError::Secrets("rotated oauth refresh token was not persisted".into())
+    } else {
+        error
+    }
+}
+
 fn sanitize_provider_error(body: &str) -> String {
     let parsed: Option<Value> = serde_json::from_str(body).ok();
     let message = parsed
@@ -818,7 +930,8 @@ fn sanitize_provider_error(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path};
+    use crate::secrets::{SecretStore, SharedSecrets, ensure_identity};
+    use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn tool() -> ToolSpec {
@@ -1061,5 +1174,219 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!evil.to_string().contains("evil.example"));
+    }
+
+    fn age_store(
+        pairs: &[(&str, &str)],
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        SharedSecrets,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = dir.path().join("identity.txt");
+        let path = dir.path().join("secrets.age");
+        ensure_identity(&identity).unwrap();
+        let mut store = SecretStore::open_paths(&path, &identity).unwrap();
+        for (name, value) in pairs {
+            store.set(name, value).unwrap();
+        }
+        store.save().unwrap();
+        let secrets = SharedSecrets::new(SecretStore::open_paths(&path, &identity).unwrap());
+        (dir, identity, path, secrets)
+    }
+
+    fn antigravity_client(server: &MockServer, secrets: Option<SharedSecrets>) -> LlmClient {
+        let client = LlmClient::new(server.uri(), "access-old-value", 10, 128)
+            .unwrap()
+            .with_cloud_code("proj-synthetic")
+            .unwrap()
+            .with_oauth_unpinned(OAuthMaterial {
+                style: OAuthStyle::RefreshToken,
+                refresh_token: "refresh-old-value".into(),
+                token_url: format!("{}/token", server.uri()),
+                client_id: "client-id-value".into(),
+                client_secret: "client-secret-value".into(),
+            })
+            .unwrap()
+            .with_model("gemini-test");
+        match secrets {
+            Some(secrets) => client
+                .with_refresh_persistence(
+                    secrets,
+                    "antigravity_refresh_token",
+                    "antigravity_access_token",
+                )
+                .unwrap(),
+            None => client,
+        }
+    }
+
+    const CLOUD_OK: &str = "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":1}}}\n\n";
+
+    #[tokio::test]
+    async fn antigravity_persists_rotated_refresh_and_access_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1internal:streamGenerateContent"))
+            .and(header("authorization", "Bearer access-old-value"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1internal:streamGenerateContent"))
+            .and(header("authorization", "Bearer access-new-value"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(CLOUD_OK))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("refresh_token=refresh-old-value"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-new-value",
+                "refresh_token": "refresh-new-value",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, _identity, path, secrets) = age_store(&[
+            ("antigravity_refresh_token", "refresh-old-value"),
+            ("antigravity_access_token", "access-old-value"),
+            ("other_secret", "other-value"),
+        ]);
+        let client = antigravity_client(&server, Some(secrets.clone()));
+        let response = client
+            .complete(&[LlmMessage::user("hello")], &[], None, None)
+            .await
+            .unwrap();
+        assert_eq!(response.message.content.as_deref(), Some("hello"));
+        assert_eq!(
+            secrets.get("antigravity_refresh_token").as_deref(),
+            Some("refresh-new-value")
+        );
+        assert_eq!(
+            secrets.get("antigravity_access_token").as_deref(),
+            Some("access-new-value")
+        );
+        assert_eq!(secrets.get("other_secret").as_deref(), Some("other-value"));
+        let raw = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+        for secret in [
+            "refresh-new-value",
+            "refresh-old-value",
+            "access-new-value",
+            "access-old-value",
+            "other-value",
+            "client-secret-value",
+        ] {
+            assert!(!raw.contains(secret), "{secret}");
+        }
+        assert!(!format!("{response:?}").contains("refresh-new-value"));
+        assert!(!format!("{response:?}").contains("access-new-value"));
+    }
+
+    #[tokio::test]
+    async fn antigravity_store_failure_fails_closed_and_keeps_the_refresh_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1internal:streamGenerateContent"))
+            .and(header("authorization", "Bearer access-old-value"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1internal:streamGenerateContent"))
+            .and(header("authorization", "Bearer access-new-value"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(CLOUD_OK))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-new-value",
+                "refresh_token": "refresh-new-value",
+                "expires_in": 3600
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = antigravity_client(&server, None);
+        let first = client
+            .complete(&[LlmMessage::user("hello")], &[], None, None)
+            .await
+            .unwrap_err();
+        let message = first.to_string();
+        assert!(message.contains("not persisted"), "{message}");
+        assert!(!message.contains("refresh-new-value"), "{message}");
+        assert!(!message.contains("refresh-old-value"), "{message}");
+        assert!(!message.contains("access-new-value"), "{message}");
+        assert!(!message.contains("client-secret-value"), "{message}");
+        let second = client
+            .complete(&[LlmMessage::user("hello")], &[], None, None)
+            .await
+            .unwrap_err();
+        assert!(!second.to_string().contains("refresh-new-value"));
+        let requests = server.received_requests().await.unwrap();
+        let token_bodies: Vec<String> = requests
+            .iter()
+            .filter(|request| request.url.path() == "/token")
+            .map(|request| String::from_utf8(request.body.clone()).unwrap_or_default())
+            .collect();
+        assert_eq!(token_bodies.len(), 2);
+        assert!(token_bodies[0].contains("refresh-old-value"));
+        assert!(token_bodies[1].contains("refresh-new-value"));
+        assert!(!token_bodies[1].contains("refresh-old-value"));
+    }
+
+    #[tokio::test]
+    async fn antigravity_without_a_new_refresh_token_does_not_rewrite_the_store() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1internal:streamGenerateContent"))
+            .and(header("authorization", "Bearer access-old-value"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1internal:streamGenerateContent"))
+            .and(header("authorization", "Bearer access-new-value"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(CLOUD_OK))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("refresh_token=refresh-old-value"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-new-value",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_dir, _identity, _path, secrets) = age_store(&[
+            ("antigravity_refresh_token", "refresh-old-value"),
+            ("antigravity_access_token", "access-old-value"),
+        ]);
+        let client = antigravity_client(&server, Some(secrets.clone()));
+        client
+            .complete(&[LlmMessage::user("hello")], &[], None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            secrets.get("antigravity_refresh_token").as_deref(),
+            Some("refresh-old-value")
+        );
+        assert_eq!(
+            secrets.get("antigravity_access_token").as_deref(),
+            Some("access-old-value")
+        );
     }
 }
