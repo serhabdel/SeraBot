@@ -1,9 +1,11 @@
 use eframe::egui::{self, Color32, CornerRadius, Frame, Margin, RichText, Stroke, Vec2};
 use secrecy::SecretString;
 use serabot_desktop::{
-    ApiError, ApprovalDecision, Role, Selection, TaskStatus,
+    ApiError, ApprovalDecision, ConversationKind, DEFAULT_SPECIALIST_TOOLS, Role, SPECIALIST_TOOLS,
+    Selection, TaskStatus, conversation_node_id, parse_skill_list,
     state::State,
-    valid_id, valid_text, valid_token, validate_endpoint,
+    valid_bot_description, valid_bot_id, valid_conversation_parent, valid_id, valid_slug,
+    valid_text, valid_token, validate_endpoint, validate_tool_list,
     worker::{Credentials, Job, Operation, OperationKind, Worker},
 };
 use std::{
@@ -62,6 +64,14 @@ fn empty_state(ui: &mut egui::Ui, title: &str, body: &str) {
 enum Section {
     Chat,
     Approvals,
+    Fleet,
+}
+
+fn default_tool_flags() -> Vec<bool> {
+    SPECIALIST_TOOLS
+        .iter()
+        .map(|tool| DEFAULT_SPECIALIST_TOOLS.contains(tool))
+        .collect()
 }
 
 pub struct Desktop {
@@ -72,6 +82,13 @@ pub struct Desktop {
     token: String,
     conversation: String,
     composer: String,
+    bot_id: String,
+    bot_description: String,
+    bot_tools: Vec<bool>,
+    bot_skills: String,
+    conv_kind: ConversationKind,
+    conv_slug: String,
+    conv_parent: String,
     connection_open: bool,
     section: Section,
     pending: Option<OperationKind>,
@@ -123,6 +140,13 @@ impl Desktop {
             token: String::new(),
             conversation: "windows-owner".into(),
             composer: String::new(),
+            bot_id: String::new(),
+            bot_description: String::new(),
+            bot_tools: default_tool_flags(),
+            bot_skills: String::new(),
+            conv_kind: ConversationKind::Section,
+            conv_slug: String::new(),
+            conv_parent: String::new(),
             connection_open: true,
             section: Section::Chat,
             pending: None,
@@ -153,6 +177,11 @@ impl Desktop {
             worker.set_epoch(self.state.scope.epoch);
         }
         self.composer.zeroize();
+        if !connected {
+            self.state.created_bot = None;
+            self.state.created_conversation = None;
+            self.clear_fleet_drafts();
+        }
         self.pending = None;
         self.scheduled = None;
         self.refreshing = false;
@@ -161,6 +190,30 @@ impl Desktop {
         self.poll_history = false;
         self.poll_paused = false;
         self.poll_approvals = false;
+    }
+
+    fn clear_fleet_drafts(&mut self) {
+        self.bot_id.clear();
+        self.bot_description.zeroize();
+        self.bot_tools = default_tool_flags();
+        self.bot_skills.clear();
+        self.conv_kind = ConversationKind::Section;
+        self.conv_slug.clear();
+        self.conv_parent.clear();
+    }
+
+    fn selected_tools(&self) -> Vec<String> {
+        SPECIALIST_TOOLS
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| {
+                self.bot_tools
+                    .get(index)
+                    .copied()
+                    .unwrap_or(false)
+                    .then_some((*name).to_owned())
+            })
+            .collect()
     }
 
     fn connect(&mut self, ctx: &egui::Context) {
@@ -287,9 +340,11 @@ impl Desktop {
                             self.schedule(Operation::History, Duration::ZERO);
                         }
                         OperationKind::Task
-                            if self.state.task.as_ref().is_some_and(|t| {
-                                t.status == TaskStatus::AwaitingApproval
-                            }) =>
+                            if self
+                                .state
+                                .task
+                                .as_ref()
+                                .is_some_and(|t| t.status == TaskStatus::AwaitingApproval) =>
                         {
                             self.schedule(Operation::Approvals, Duration::ZERO);
                         }
@@ -317,15 +372,14 @@ impl Desktop {
         {
             if let Some(task) = &self.state.task {
                 if !task.status.terminal() {
-                    let operation = if self.poll_approvals
-                        && task.status == TaskStatus::AwaitingApproval
-                    {
-                        Operation::Approvals
-                    } else if self.poll_history {
-                        Operation::History
-                    } else {
-                        Operation::Task(task.id.clone())
-                    };
+                    let operation =
+                        if self.poll_approvals && task.status == TaskStatus::AwaitingApproval {
+                            Operation::Approvals
+                        } else if self.poll_history {
+                            Operation::History
+                        } else {
+                            Operation::Task(task.id.clone())
+                        };
                     if task.status == TaskStatus::AwaitingApproval {
                         self.poll_approvals = !self.poll_approvals;
                         if !self.poll_approvals {
@@ -396,6 +450,7 @@ impl Desktop {
                             "Pending gateway decisions"
                         },
                     ),
+                    (Section::Fleet, "Fleet", "Bots and conversation nodes"),
                 ] {
                     let selected = self.section == section;
                     let fill = if selected {
@@ -639,10 +694,7 @@ impl Desktop {
                     .map(|s| format!("{} / {}", s.provider, s.model))
                     .unwrap_or_else(|| "automatic".into())
             } else {
-                format!(
-                    "{} / {}",
-                    self.state.draft.provider, self.state.draft.model
-                )
+                format!("{} / {}", self.state.draft.provider, self.state.draft.model)
             };
             egui::ComboBox::from_id_salt("model")
                 .width(ui.available_width() - 8.0)
@@ -705,10 +757,7 @@ impl Desktop {
             self.confirmed_egress = false;
         }
         if !catalog.allows(&catalog.selection) {
-            ui.colored_label(
-                WARNING,
-                "Saved profile unavailable or egress not approved.",
-            );
+            ui.colored_label(WARNING, "Saved profile unavailable or egress not approved.");
         }
         if self.state.draft != catalog.selection {
             let saved = if catalog.selection.is_auto() {
@@ -762,22 +811,16 @@ impl Desktop {
                 ui.label(RichText::new(subtitle).size(12.0).color(MUTED));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.section == Section::Chat && self.state.connected && self.active_conversation()
+                if self.section == Section::Chat
+                    && self.state.connected
+                    && self.active_conversation()
                 {
                     let draft = if self.state.draft.is_auto() {
                         "auto".into()
                     } else {
-                        format!(
-                            "{} / {}",
-                            self.state.draft.provider, self.state.draft.model
-                        )
+                        format!("{} / {}", self.state.draft.provider, self.state.draft.model)
                     };
-                    status_chip(
-                        ui,
-                        &draft,
-                        TEAL,
-                        Color32::from_rgb(24, 44, 40),
-                    );
+                    status_chip(ui, &draft, TEAL, Color32::from_rgb(24, 44, 40));
                 }
             });
         });
@@ -807,10 +850,8 @@ impl Desktop {
                 .inner_margin(Margin::symmetric(12, 10))
                 .show(ui, |ui| {
                     ui.label(
-                        RichText::new(
-                            "Reads refreshed. A missing reply does not prove failure.",
-                        )
-                        .color(TEXT),
+                        RichText::new("Reads refreshed. A missing reply does not prove failure.")
+                            .color(TEXT),
                     );
                     if ui
                         .button("I reviewed server state — allow new actions")
@@ -875,9 +916,9 @@ impl Desktop {
                         .hint_text("Message SeraBot…")
                         .char_limit(8000),
                 );
-                let shortcut = ui.ctx().input_mut(|input| {
-                    input.consume_key(egui::Modifiers::CTRL, egui::Key::Enter)
-                });
+                let shortcut = ui
+                    .ctx()
+                    .input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::Enter));
                 ui.horizontal(|ui| {
                     let enabled = self.ready()
                         && self.active_conversation()
@@ -894,8 +935,7 @@ impl Desktop {
                         self.state.error = None;
                         let text = Zeroizing::new(std::mem::take(&mut self.composer));
                         self.start_request(Operation::Submit(text));
-                        ui.ctx()
-                            .memory_mut(|memory| *memory = Default::default());
+                        ui.ctx().memory_mut(|memory| *memory = Default::default());
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
@@ -923,7 +963,11 @@ impl Desktop {
             },
         );
         self.status_banner(ui);
-        let composer_rows = if ui.available_height() < 420.0 { 2_usize } else { 3_usize };
+        let composer_rows = if ui.available_height() < 420.0 {
+            2_usize
+        } else {
+            3_usize
+        };
         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
             ui.set_width(ui.available_width());
             self.composer_block(ui, composer_rows);
@@ -1153,6 +1197,342 @@ impl Desktop {
                 }
             });
     }
+
+    fn fleet_panel(&mut self, ui: &mut egui::Ui) {
+        self.section_header(ui, "Fleet", "Disabled specialists and conversation nodes");
+        self.status_banner(ui);
+        if !self.state.connected {
+            empty_state(
+                ui,
+                "Connect to change the fleet",
+                "Create a disabled specialist or a section, group, direct, or room node. Nothing is written until you submit.",
+            );
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .id_salt(("fleet", self.state.scope.epoch))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.bot_card(ui);
+                ui.add_space(16.0);
+                self.conversation_card(ui);
+                ui.add_space(8.0);
+            });
+    }
+
+    fn bot_card(&mut self, ui: &mut egui::Ui) {
+        Frame::new()
+            .fill(PANEL_ALT)
+            .stroke(Stroke::new(1.0_f32, STROKE))
+            .corner_radius(14.0)
+            .inner_margin(Margin::symmetric(16, 14))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new("New specialist")
+                        .size(16.0)
+                        .strong()
+                        .color(TEXT),
+                );
+                ui.label(
+                    RichText::new(
+                        "The id is the bot name. The description is stored in the prompt stub. The bot stays disabled until you restart, and it is not added to main.delegates.",
+                    )
+                    .size(12.0)
+                    .color(MUTED),
+                );
+                ui.add_space(8.0);
+                ui.label(RichText::new("Bot id").small().color(MUTED));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.bot_id)
+                        .desired_width(f32::INFINITY)
+                        .char_limit(32)
+                        .hint_text("notes"),
+                );
+                ui.add_space(4.0);
+                ui.label(RichText::new("Description").small().color(MUTED));
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.bot_description)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .char_limit(2000)
+                        .hint_text("Synthetic notes specialist."),
+                );
+                ui.add_space(6.0);
+                ui.label(RichText::new("Tools").small().color(MUTED));
+                ui.label(
+                    RichText::new("Specialist allowlist only. delegate is not offered.")
+                        .size(11.0)
+                        .color(MUTED),
+                );
+                let columns = if ui.available_width() < 520.0 { 1 } else { 2 };
+                egui::ScrollArea::vertical()
+                    .id_salt("specialist-tools")
+                    .max_height(168.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Grid::new("specialist-tool-grid")
+                            .num_columns(columns)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                for (index, name) in SPECIALIST_TOOLS.iter().enumerate() {
+                                    if let Some(flag) = self.bot_tools.get_mut(index) {
+                                        ui.checkbox(flag, *name);
+                                    }
+                                    if (index + 1) % columns == 0 {
+                                        ui.end_row();
+                                    }
+                                }
+                                if !SPECIALIST_TOOLS.is_empty()
+                                    && SPECIALIST_TOOLS.len() % columns != 0
+                                {
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                let selected = self.bot_tools.iter().filter(|on| **on).count();
+                if selected > 32 {
+                    ui.colored_label(WARNING, "Select at most 32 tools.");
+                } else if selected == 0 {
+                    ui.label(
+                        RichText::new(
+                            "No tools selected. The bot file will list an empty tool set.",
+                        )
+                        .size(11.0)
+                        .color(MUTED),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.label(RichText::new("Skills").small().color(MUTED));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.bot_skills)
+                        .desired_width(f32::INFINITY)
+                        .char_limit(512)
+                        .hint_text("ask, notes"),
+                );
+                ui.label(
+                    RichText::new(
+                        "Optional skill ids, separated by commas. The server rejects unknown skills.",
+                    )
+                    .size(11.0)
+                    .color(MUTED),
+                );
+                if let Some(bot) = self.state.created_bot.clone() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!("Created {} · disabled · not live", bot.id))
+                            .color(TEAL),
+                    );
+                    ui.label(
+                        RichText::new(format!("{} · {}", bot.bot_file, bot.prompt_file))
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                    if !bot.require_approval.is_empty() {
+                        ui.label(
+                            RichText::new(format!(
+                                "Approval required · {}",
+                                bot.require_approval.join(", ")
+                            ))
+                            .size(11.0)
+                            .color(MUTED),
+                        );
+                    }
+                    ui.label(
+                        RichText::new("Restart the server before this bot can run.")
+                            .size(11.0)
+                            .color(WARNING),
+                    );
+                }
+                ui.add_space(8.0);
+                let tools = self.selected_tools();
+                let can_create = self.ready()
+                    && !self.state.unknown_outcome
+                    && valid_bot_id(&self.bot_id)
+                    && valid_bot_description(&self.bot_description)
+                    && validate_tool_list(&tools).is_ok()
+                    && parse_skill_list(&self.bot_skills).is_ok();
+                if ui
+                    .add_enabled(
+                        can_create,
+                        egui::Button::new(RichText::new("Create disabled bot").strong().color(TEAL)),
+                    )
+                    .clicked()
+                {
+                    match parse_skill_list(&self.bot_skills) {
+                        Ok(skills) => {
+                            self.state.error = None;
+                            self.start_request(Operation::CreateBot {
+                                id: self.bot_id.clone(),
+                                description: Zeroizing::new(self.bot_description.clone()),
+                                tools,
+                                skills,
+                            });
+                        }
+                        Err(error) => self.state.error = Some(error.to_string()),
+                    }
+                }
+                if !self.bot_id.is_empty() && !valid_bot_id(&self.bot_id) {
+                    ui.label(
+                        RichText::new(
+                            "Use a lowercase slug (max 32). main and Windows device names are reserved.",
+                        )
+                        .size(11.0)
+                        .color(WARNING),
+                    );
+                }
+            });
+    }
+
+    fn conversation_card(&mut self, ui: &mut egui::Ui) {
+        Frame::new()
+            .fill(PANEL_ALT)
+            .stroke(Stroke::new(1.0_f32, STROKE))
+            .corner_radius(14.0)
+            .inner_margin(Margin::symmetric(16, 14))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(
+                    RichText::new("New conversation")
+                        .size(16.0)
+                        .strong()
+                        .color(TEXT),
+                );
+                ui.label(
+                    RichText::new(
+                        "The server assigns the id. Sections and groups do not accept turns. Direct and room nodes do.",
+                    )
+                    .size(12.0)
+                    .color(MUTED),
+                );
+                ui.add_space(8.0);
+                ui.label(RichText::new("Kind").small().color(MUTED));
+                egui::ComboBox::from_id_salt("conversation-kind")
+                    .width((ui.available_width() - 8.0).max(0.0))
+                    .selected_text(self.conv_kind.label())
+                    .show_ui(ui, |ui| {
+                        for kind in ConversationKind::ALL {
+                            if ui
+                                .selectable_label(self.conv_kind == kind, kind.label())
+                                .clicked()
+                            {
+                                self.conv_kind = kind;
+                                if kind == ConversationKind::Section {
+                                    self.conv_parent.clear();
+                                }
+                            }
+                        }
+                    });
+                ui.add_space(4.0);
+                ui.label(RichText::new("Slug").small().color(MUTED));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.conv_slug)
+                        .desired_width(f32::INFINITY)
+                        .char_limit(32)
+                        .hint_text("finance"),
+                );
+                if let Some(id) = conversation_node_id(self.conv_kind, &self.conv_slug) {
+                    ui.label(
+                        RichText::new(format!("Server id {id}"))
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                } else if !self.conv_slug.is_empty() {
+                    ui.label(
+                        RichText::new("Slug must be a lowercase slug of at most 32 characters.")
+                            .size(11.0)
+                            .color(WARNING),
+                    );
+                }
+                let parent_hint = match self.conv_kind {
+                    ConversationKind::Section => {
+                        "No parent. Sections are the top of the tree."
+                    }
+                    ConversationKind::Group => {
+                        "Requires an existing section, for example sec:finance."
+                    }
+                    ConversationKind::Direct => {
+                        "Optional parent: a section (sec:) or group (grp:)."
+                    }
+                    ConversationKind::Room => {
+                        "Optional parent: a section (sec:) or group (grp:)."
+                    }
+                };
+                ui.label(RichText::new(parent_hint).size(11.0).color(MUTED));
+                if self.conv_kind != ConversationKind::Section {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(if self.conv_kind == ConversationKind::Group {
+                            "Parent section"
+                        } else {
+                            "Parent"
+                        })
+                        .small()
+                        .color(MUTED),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.conv_parent)
+                            .desired_width(f32::INFINITY)
+                            .char_limit(128)
+                            .hint_text(if self.conv_kind == ConversationKind::Group {
+                                "sec:finance"
+                            } else {
+                                "sec:finance or grp:ops"
+                            }),
+                    );
+                }
+                if let Some(node) = self.state.created_conversation.clone() {
+                    ui.add_space(8.0);
+                    let turns = if node.accepts_turns {
+                        "accepts turns"
+                    } else {
+                        "does not accept turns"
+                    };
+                    ui.label(RichText::new(format!("Created {} · {turns}", node.id)).color(TEAL));
+                    if ui.button("Use in sidebar").clicked() {
+                        self.conversation = node.id.clone();
+                    }
+                    ui.label(
+                        RichText::new(
+                            "Open that id from the sidebar to load it. Sections and groups still reject turns.",
+                        )
+                        .size(11.0)
+                        .color(MUTED),
+                    );
+                }
+                ui.add_space(8.0);
+                let parent_owned = if self.conv_kind == ConversationKind::Section {
+                    None
+                } else {
+                    let trimmed = self.conv_parent.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_owned())
+                    }
+                };
+                let can_create = self.ready()
+                    && !self.state.unknown_outcome
+                    && valid_slug(&self.conv_slug)
+                    && valid_conversation_parent(self.conv_kind, parent_owned.as_deref()).is_ok();
+                if ui
+                    .add_enabled(
+                        can_create,
+                        egui::Button::new(
+                            RichText::new("Create conversation").strong().color(TEAL),
+                        ),
+                    )
+                    .clicked()
+                {
+                    self.state.error = None;
+                    self.start_request(Operation::CreateConversation {
+                        kind: self.conv_kind,
+                        slug: self.conv_slug.clone(),
+                        parent_id: parent_owned,
+                    });
+                }
+            });
+    }
 }
 
 impl eframe::App for Desktop {
@@ -1171,6 +1551,7 @@ impl eframe::App for Desktop {
             .show(ctx, |ui| match self.section {
                 Section::Chat => self.chat_panel(ui),
                 Section::Approvals => self.approvals_panel(ui),
+                Section::Fleet => self.fleet_panel(ui),
             });
         if self.pending.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -1196,6 +1577,7 @@ impl Drop for Desktop {
     fn drop(&mut self) {
         self.token.zeroize();
         self.composer.zeroize();
+        self.bot_description.zeroize();
         self.credentials = None;
     }
 }
@@ -1213,6 +1595,13 @@ mod tests {
             token: String::new(),
             conversation: "windows-owner".into(),
             composer: String::new(),
+            bot_id: String::new(),
+            bot_description: String::new(),
+            bot_tools: default_tool_flags(),
+            bot_skills: String::new(),
+            conv_kind: ConversationKind::Section,
+            conv_slug: String::new(),
+            conv_parent: String::new(),
             connection_open: true,
             section: Section::Chat,
             pending: None,
@@ -1255,6 +1644,8 @@ mod tests {
         let mut app = app();
         app.token = "synthetic-token".into();
         app.composer = "sensitive synthetic text".into();
+        app.bot_id = "notes".into();
+        app.bot_description = "synthetic description".into();
         app.credentials = Some(Arc::new(Credentials {
             endpoint: validate_endpoint("http://127.0.0.1:1").unwrap(),
             token: SecretString::new("x".repeat(32)),
@@ -1264,9 +1655,29 @@ mod tests {
         app.disconnect(&egui::Context::default());
         assert!(app.token.is_empty());
         assert!(app.composer.is_empty());
+        assert!(app.bot_id.is_empty());
+        assert!(app.bot_description.is_empty());
         assert!(app.credentials.is_none());
         assert!(app.scheduled.is_none());
         assert!(!app.state.scope.accepts(&old));
+    }
+
+    #[test]
+    fn opening_a_conversation_keeps_fleet_drafts() {
+        let mut app = app();
+        app.bot_id = "notes".into();
+        app.bot_description = "synthetic description".into();
+        app.conv_slug = "finance".into();
+        app.state.connected = true;
+        app.conversation = "dir:analyst".into();
+        app.reset_scope(true);
+        assert_eq!(app.bot_id, "notes");
+        assert_eq!(app.bot_description, "synthetic description");
+        assert_eq!(app.conv_slug, "finance");
+        app.reset_scope(false);
+        assert!(app.bot_id.is_empty());
+        assert!(app.bot_description.is_empty());
+        assert!(app.conv_slug.is_empty());
     }
 
     #[test]
@@ -1286,6 +1697,8 @@ mod tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     app.chat_panel(ui);
                     app.approvals_panel(ui);
+                    app.state.connected = true;
+                    app.fleet_panel(ui);
                 });
             });
             assert!(!output.shapes.is_empty());

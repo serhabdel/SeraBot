@@ -166,6 +166,181 @@ fn redirect_is_not_followed_and_mutation_is_not_retried() {
 }
 
 #[test]
+fn creates_bot_and_conversation_with_owner_auth() {
+    let bot = r#"{"bot":{"id":"notes","enabled":false,"role":"specialist","live":false,"tools":["skill_list","rag_search"],"skills":["ask"],"require_approval":[],"bot_file":"bots/notes.toml","prompt_file":"prompts/notes.txt"}}"#;
+    let group = r#"{"conversation":{"id":"grp:ops","kind":"group","parent_id":"sec:finance","accepts_turns":false}}"#;
+    let section = r#"{"conversation":{"id":"sec:finance","kind":"section","parent_id":null,"accepts_turns":false}}"#;
+    let direct = r#"{"conversation":{"id":"dir:analyst","kind":"direct","accepts_turns":true}}"#;
+    let (client, handle) = server(vec![
+        (200, bot.into()),
+        (200, group.into()),
+        (200, section.into()),
+        (200, direct.into()),
+    ]);
+    let created = client
+        .create_bot(
+            "notes",
+            "Synthetic notes specialist.",
+            &["skill_list".into(), "rag_search".into()],
+            &["ask".into()],
+        )
+        .unwrap();
+    assert!(!created.enabled);
+    assert!(!created.live);
+    assert_eq!(created.bot_file, "bots/notes.toml");
+    let node = client
+        .create_conversation(
+            serabot_desktop::ConversationKind::Group,
+            "ops",
+            Some("sec:finance"),
+        )
+        .unwrap();
+    assert_eq!(node.id, "grp:ops");
+    assert!(!node.accepts_turns);
+    let section = client
+        .create_conversation(serabot_desktop::ConversationKind::Section, "finance", None)
+        .unwrap();
+    assert_eq!(section.id, "sec:finance");
+    assert!(section.parent_id.is_none());
+    let direct = client
+        .create_conversation(serabot_desktop::ConversationKind::Direct, "analyst", None)
+        .unwrap();
+    assert!(direct.accepts_turns);
+    let requests = handle.join().unwrap();
+    let routes = [
+        "POST /v1/bots ",
+        "POST /v1/conversations ",
+        "POST /v1/conversations ",
+        "POST /v1/conversations ",
+    ];
+    for (request, route) in requests.iter().zip(routes) {
+        assert!(request.starts_with(route), "wrong route: {request}");
+        assert!(
+            request
+                .to_lowercase()
+                .contains(&format!("authorization: bearer {TOKEN}\r\n"))
+        );
+    }
+    let body = |index: usize| -> serde_json::Value {
+        serde_json::from_str(requests[index].split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    };
+    assert_eq!(
+        body(0),
+        serde_json::json!({
+            "id": "notes",
+            "description": "Synthetic notes specialist.",
+            "tools": ["skill_list", "rag_search"],
+            "skills": ["ask"]
+        })
+    );
+    assert!(body(0).get("path").is_none());
+    assert_eq!(
+        body(1),
+        serde_json::json!({"kind": "group", "slug": "ops", "parent_id": "sec:finance"})
+    );
+    assert_eq!(
+        body(2),
+        serde_json::json!({"kind": "section", "slug": "finance"})
+    );
+    assert!(body(2).get("parent_id").is_none());
+    assert_eq!(
+        body(3),
+        serde_json::json!({"kind": "direct", "slug": "analyst"})
+    );
+}
+
+#[test]
+fn scaffold_requests_reject_unsafe_inputs_before_the_network() {
+    let client = ApiClient::new(
+        validate_endpoint("http://127.0.0.1:9").unwrap(),
+        SecretString::new(TOKEN.into()),
+    )
+    .unwrap();
+    assert!(matches!(
+        client.create_bot("main", "", &[], &[]),
+        Err(ApiError::Validation(_))
+    ));
+    assert!(matches!(
+        client.create_bot("../notes", "", &[], &[]),
+        Err(ApiError::Validation(_))
+    ));
+    assert!(matches!(
+        client.create_bot("notes", "", &["delegate".into()], &[]),
+        Err(ApiError::Validation(_))
+    ));
+    assert!(matches!(
+        client.create_bot("notes", "", &["skill_list".into()], &["../ask".into()]),
+        Err(ApiError::Validation(_))
+    ));
+    assert!(matches!(
+        client.create_conversation(serabot_desktop::ConversationKind::Section, "Finance", None),
+        Err(ApiError::Validation(_))
+    ));
+    assert!(matches!(
+        client.create_conversation(serabot_desktop::ConversationKind::Group, "ops", None),
+        Err(ApiError::Validation(_))
+    ));
+    assert!(matches!(
+        client.create_conversation(
+            serabot_desktop::ConversationKind::Section,
+            "finance",
+            Some("sec:finance")
+        ),
+        Err(ApiError::Validation(_))
+    ));
+    assert!(matches!(
+        client.create_conversation(
+            serabot_desktop::ConversationKind::Direct,
+            "analyst",
+            Some("dir:other")
+        ),
+        Err(ApiError::Validation(_))
+    ));
+}
+
+#[test]
+fn scaffold_responses_must_stay_disabled_and_relative() {
+    let bodies = [
+        r#"{"bot":{"id":"notes","enabled":true,"role":"specialist","live":false,"tools":["skill_list"],"skills":["ask"],"require_approval":[],"bot_file":"bots/notes.toml","prompt_file":"prompts/notes.txt"}}"#,
+        r#"{"bot":{"id":"notes","enabled":false,"role":"specialist","live":true,"tools":["skill_list"],"skills":["ask"],"require_approval":[],"bot_file":"bots/notes.toml","prompt_file":"prompts/notes.txt"}}"#,
+        r#"{"bot":{"id":"notes","enabled":false,"role":"orchestrator","live":false,"tools":["skill_list"],"skills":["ask"],"require_approval":[],"bot_file":"bots/notes.toml","prompt_file":"prompts/notes.txt"}}"#,
+        r#"{"bot":{"id":"other","enabled":false,"role":"specialist","live":false,"tools":["skill_list"],"skills":["ask"],"require_approval":[],"bot_file":"bots/notes.toml","prompt_file":"prompts/notes.txt"}}"#,
+        r#"{"bot":{"id":"notes","enabled":false,"role":"specialist","live":false,"tools":["delegate"],"skills":["ask"],"require_approval":[],"bot_file":"bots/notes.toml","prompt_file":"prompts/notes.txt"}}"#,
+        r#"{"bot":{"id":"notes","enabled":false,"role":"specialist","live":false,"tools":["skill_list"],"skills":["ask"],"require_approval":[],"bot_file":"../notes.toml","prompt_file":"prompts/notes.txt"}}"#,
+        r#"{"bot":{"id":"notes","enabled":false,"role":"specialist","live":false,"tools":["skill_list"],"skills":["ask"],"require_approval":[],"bot_file":"C:/secret/notes.toml","prompt_file":"prompts/notes.txt"}}"#,
+        r#"{"bot":{"id":"notes","enabled":false,"role":"specialist","live":false,"tools":["skill_list"],"skills":["ask"],"require_approval":[],"bot_file":"bots/notes.toml","prompt_file":"/etc/notes.txt"}}"#,
+        r#"{"bot":{"id":"notes","enabled":false,"role":"specialist","live":false,"tools":["skill_list"],"skills":["../ask"],"require_approval":[],"bot_file":"bots/notes.toml","prompt_file":"prompts/notes.txt"}}"#,
+    ];
+    for body in bodies {
+        let (client, handle) = server(vec![(200, body.into())]);
+        assert_eq!(
+            client
+                .create_bot(
+                    "notes",
+                    "Synthetic.",
+                    &["skill_list".into()],
+                    &["ask".into()]
+                )
+                .unwrap_err(),
+            ApiError::InvalidResponse
+        );
+        handle.join().unwrap();
+    }
+    let (client, handle) = server(vec![(
+        200,
+        r#"{"conversation":{"id":"sec:other","kind":"section","parent_id":null,"accepts_turns":false}}"#
+            .into(),
+    )]);
+    assert_eq!(
+        client
+            .create_conversation(serabot_desktop::ConversationKind::Section, "finance", None)
+            .unwrap_err(),
+        ApiError::InvalidResponse
+    );
+    handle.join().unwrap();
+}
+
+#[test]
 fn catalog_without_egress_approval_fails_closed() {
     let (client, handle) = server(vec![(200, r#"{"providers":[{"id":"test","models":["small"]}],"selection":{"provider":"test","model":"small"}}"#.into())]);
     let catalog = client.models("owner").unwrap();

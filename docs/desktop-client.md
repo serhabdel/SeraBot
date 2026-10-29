@@ -52,8 +52,8 @@ scripts\cargo-win.bat build --release -p serabot --locked
 
 ## Behaviour
 
-- Sidebar navigation: **Chat** and **Approvals**, plus conversation id, model
-  routing, and connection controls.
+- Sidebar navigation: **Chat**, **Approvals**, and **Fleet**, plus conversation
+  id, model routing, and connection controls.
 - Chat history comes only from the server; there are no optimistic or demo
   messages. The composer stays in a reserved bottom region so it is not clipped
   at common window sizes.
@@ -71,6 +71,26 @@ scripts\cargo-win.bat build --release -p serabot --locked
 - Polling is conservative to stay inside the API rate limit.
 - Late responses from a previous connection or conversation are discarded.
 - `Ctrl+Enter` sends. `Message` is limited to 8,000 characters.
+
+## Fleet
+
+**Fleet** calls the owner API on demand. Each submit uses the same 3-second gap
+as other requests and is not retried if the outcome is unknown.
+
+- **New specialist** — `POST /v1/bots` with a lowercase bot id, a description
+  (stored in the prompt stub; there is no separate display-name field), tools
+  chosen from the specialist allowlist, and optional skill ids. `delegate` is
+  not offered. The server writes a disabled specialist. Restart before it can
+  run, and add it to `main.delegates` yourself if `main` should hand it work.
+- **New conversation** — `POST /v1/conversations` with kind (`section`, `group`,
+  `direct`, or `room`), a slug, and an optional parent. Sections have no parent.
+  Groups require a section id (`sec:…`). Direct and room nodes may sit under a
+  section or a group. The server assigns the id. **Use in sidebar** copies that
+  id into the conversation field; **Open** loads it. Sections and groups do not
+  accept turns.
+
+The mobile client does not call these endpoints yet. See
+[Mobile client](mobile-client.md).
 
 ## Known limitations
 

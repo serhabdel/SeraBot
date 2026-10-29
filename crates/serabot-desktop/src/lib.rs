@@ -84,6 +84,56 @@ mod tests {
     }
 
     #[test]
+    fn bot_and_conversation_inputs_stay_on_the_safe_subset() {
+        assert!(valid_bot_id("notes"));
+        assert!(valid_bot_id("com"));
+        assert!(!valid_bot_id("main"));
+        assert!(!valid_bot_id("con"));
+        assert!(!valid_bot_id("com1"));
+        assert!(!valid_bot_id("lpt9"));
+        assert!(!valid_bot_id("Notes"));
+        assert!(!valid_bot_id("../notes"));
+        assert!(!valid_bot_id(""));
+        let mut seen = std::collections::HashSet::new();
+        for tool in SPECIALIST_TOOLS {
+            assert!(seen.insert(*tool), "{tool}");
+            assert_ne!(*tool, "delegate");
+        }
+        for tool in DEFAULT_SPECIALIST_TOOLS {
+            assert!(SPECIALIST_TOOLS.contains(tool));
+        }
+        assert!(validate_tool_list(&["skill_list".into(), "rag_search".into()]).is_ok());
+        assert!(validate_tool_list(&[]).is_ok());
+        assert!(validate_tool_list(&["delegate".into()]).is_err());
+        assert!(validate_tool_list(&["../secret".into()]).is_err());
+        assert!(validate_tool_list(&vec!["skill_list".into(); 33]).is_err());
+        assert_eq!(
+            parse_skill_list("ask, notes").unwrap(),
+            vec!["ask".to_string(), "notes".to_string()]
+        );
+        assert!(parse_skill_list("").unwrap().is_empty());
+        assert!(parse_skill_list("Ask").is_err());
+        assert!(parse_skill_list("../ask").is_err());
+        assert!(parse_skill_list("ask ask").is_err());
+        assert!(valid_conversation_parent(ConversationKind::Section, None).is_ok());
+        assert!(valid_conversation_parent(ConversationKind::Section, Some("sec:finance")).is_err());
+        assert!(valid_conversation_parent(ConversationKind::Group, None).is_err());
+        assert!(valid_conversation_parent(ConversationKind::Group, Some("sec:finance")).is_ok());
+        assert!(valid_conversation_parent(ConversationKind::Group, Some("grp:ops")).is_err());
+        assert!(valid_conversation_parent(ConversationKind::Direct, None).is_ok());
+        assert!(valid_conversation_parent(ConversationKind::Direct, Some("grp:ops")).is_ok());
+        assert!(valid_conversation_parent(ConversationKind::Room, Some("dir:analyst")).is_err());
+        assert_eq!(
+            conversation_node_id(ConversationKind::Group, "ops").as_deref(),
+            Some("grp:ops")
+        );
+        assert!(conversation_node_id(ConversationKind::Section, "Finance").is_none());
+        assert!(valid_bot_description("line\nok\t"));
+        assert!(!valid_bot_description("a\u{0}b"));
+        assert!(!valid_bot_description(&"é".repeat(2001)));
+    }
+
+    #[test]
     fn selection_requires_catalog_membership_and_egress_approval() {
         let catalog: Catalog = serde_json::from_str(r#"{"providers":[{"id":"blocked","models":["private"],"data_egress_approved":false},{"id":"allowed","models":["small","large"],"data_egress_approved":true}],"selection":{"provider":"blocked","model":"private"}}"#).unwrap();
         assert_eq!(catalog.providers.len(), 2, "blocked profiles stay visible");

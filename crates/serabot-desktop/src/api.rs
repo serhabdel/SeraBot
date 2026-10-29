@@ -1,7 +1,7 @@
 use reqwest::{Method, blocking::Client, redirect::Policy};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::{fmt, io::Read, net::SocketAddr, time::Duration};
+use std::{collections::HashSet, fmt, io::Read, net::SocketAddr, time::Duration};
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -33,6 +33,12 @@ impl fmt::Display for ApiError {
             Self::Http(403) => f.write_str(
                 "Forbidden (403). Server policy or data-egress approval blocks this request.",
             ),
+            Self::Http(409) => f.write_str(
+                "Conflict (409). That id already exists, or the current state does not allow it.",
+            ),
+            Self::Http(422) => {
+                f.write_str("Rejected (422). The server did not accept the request.")
+            }
             Self::Http(429) => {
                 f.write_str("Rate limited (429). Wait at least one minute, then retry the read.")
             }
@@ -114,6 +120,250 @@ pub fn valid_token(token: &str) -> bool {
 
 pub fn valid_text(text: &str) -> bool {
     !text.trim().is_empty() && text.chars().count() <= 8000
+}
+
+/// Specialist tools the owner may select. Mirrors the server allowlist.
+/// `delegate` is orchestrator-only and is intentionally absent.
+pub const SPECIALIST_TOOLS: &[&str] = &[
+    "skill_list",
+    "skill_search",
+    "skill_load",
+    "rag_search",
+    "xlsx_analyze",
+    "timesheet_analyze",
+    "document_index",
+    "fetch_url",
+    "watch_now",
+    "audio_transcribe",
+    "audio_understand",
+    "firecrawl_scrape",
+    "firecrawl_map",
+    "firecrawl_search",
+    "firecrawl_crawl",
+    "elevenlabs_list_voices",
+    "elevenlabs_text_to_speech",
+    "elevenlabs_sound_effect",
+    "elevenlabs_transcribe",
+    "elevenlabs_generate_image",
+    "elevenlabs_generate_video",
+    "deck_build",
+    "telegram_send_document",
+    "onedrive_upload",
+    "onedrive_list",
+    "browser_session_start",
+    "browser_session_stop",
+    "browser_navigate",
+    "browser_snapshot",
+    "google_drive_list",
+    "google_sheets_read",
+    "google_calendar_list_events",
+    "gmail_list_messages",
+    "outlook_list_messages",
+    "outlook_calendar_list_events",
+    "notion_query_database",
+    "agentmail_inboxes_list",
+    "agentmail_send",
+];
+
+pub const DEFAULT_SPECIALIST_TOOLS: &[&str] = &["skill_list", "skill_search", "skill_load"];
+
+const MAX_BOT_DESCRIPTION_CHARS: usize = 2000;
+const MAX_SCAFFOLD_TOOLS: usize = 32;
+const MAX_SCAFFOLD_SKILLS: usize = 16;
+
+/// Lowercase slug shared by bot ids and conversation slugs (`^[a-z][a-z0-9-]{0,31}$`).
+pub fn valid_slug(slug: &str) -> bool {
+    let mut chars = slug.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    slug.len() <= 32
+        && first.is_ascii_lowercase()
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+pub fn reserved_bot_id(id: &str) -> bool {
+    matches!(id, "main" | "con" | "prn" | "aux" | "nul")
+        || (id.len() == 4
+            && (id.starts_with("com") || id.starts_with("lpt"))
+            && id.as_bytes()[3].is_ascii_digit())
+}
+
+pub fn valid_bot_id(id: &str) -> bool {
+    valid_slug(id) && !reserved_bot_id(id)
+}
+
+pub fn valid_skill_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    id.len() <= 64
+        && first.is_ascii_lowercase()
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+pub fn valid_bot_description(text: &str) -> bool {
+    text.chars().count() <= MAX_BOT_DESCRIPTION_CHARS
+        && !text
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t')
+}
+
+pub fn validate_tool_list(tools: &[String]) -> Result<(), ApiError> {
+    if tools.len() > MAX_SCAFFOLD_TOOLS {
+        return Err(ApiError::Validation("Choose at most 32 specialist tools."));
+    }
+    let mut seen = HashSet::with_capacity(tools.len());
+    for tool in tools {
+        if tool == "delegate" {
+            return Err(ApiError::Validation(
+                "Specialists cannot be granted delegate.",
+            ));
+        }
+        if !SPECIALIST_TOOLS.contains(&tool.as_str()) {
+            return Err(ApiError::Validation(
+                "Choose tools from the specialist list.",
+            ));
+        }
+        if !seen.insert(tool.as_str()) {
+            return Err(ApiError::Validation("Each tool can be selected once."));
+        }
+    }
+    Ok(())
+}
+
+/// Comma- or whitespace-separated skill ids. Empty input means no skills.
+pub fn parse_skill_list(raw: &str) -> Result<Vec<String>, ApiError> {
+    let mut out = Vec::new();
+    for part in raw.split(|c: char| c == ',' || c.is_whitespace()) {
+        if part.is_empty() {
+            continue;
+        }
+        if out.len() >= MAX_SCAFFOLD_SKILLS {
+            return Err(ApiError::Validation("Enter at most 16 skill ids."));
+        }
+        if !valid_skill_id(part) {
+            return Err(ApiError::Validation(
+                "Skill ids are lowercase slugs such as ask.",
+            ));
+        }
+        if out.iter().any(|id| id == part) {
+            return Err(ApiError::Validation("Each skill id can be listed once."));
+        }
+        out.push(part.to_owned());
+    }
+    Ok(out)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConversationKind {
+    Section,
+    Group,
+    Direct,
+    Room,
+}
+
+impl ConversationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Section => "section",
+            Self::Group => "group",
+            Self::Direct => "direct",
+            Self::Room => "room",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Section => "Section",
+            Self::Group => "Group",
+            Self::Direct => "Direct",
+            Self::Room => "Room",
+        }
+    }
+
+    pub fn id_prefix(self) -> &'static str {
+        match self {
+            Self::Section => "sec",
+            Self::Group => "grp",
+            Self::Direct => "dir",
+            Self::Room => "room",
+        }
+    }
+
+    pub fn accepts_turns(self) -> bool {
+        matches!(self, Self::Direct | Self::Room)
+    }
+
+    pub const ALL: [Self; 4] = [Self::Section, Self::Group, Self::Direct, Self::Room];
+}
+
+pub fn conversation_node_id(kind: ConversationKind, slug: &str) -> Option<String> {
+    valid_slug(slug).then(|| format!("{}:{slug}", kind.id_prefix()))
+}
+
+pub fn valid_conversation_parent(
+    kind: ConversationKind,
+    parent: Option<&str>,
+) -> Result<(), ApiError> {
+    match kind {
+        ConversationKind::Section => {
+            if parent.is_some() {
+                return Err(ApiError::Validation("Sections cannot have a parent."));
+            }
+        }
+        ConversationKind::Group => {
+            let Some(parent) = parent.filter(|parent| !parent.is_empty()) else {
+                return Err(ApiError::Validation(
+                    "Groups require a section parent such as sec:finance.",
+                ));
+            };
+            if !scoped_parent(parent, "sec") {
+                return Err(ApiError::Validation(
+                    "A group parent must be a section id such as sec:finance.",
+                ));
+            }
+        }
+        ConversationKind::Direct | ConversationKind::Room => {
+            if let Some(parent) = parent.filter(|parent| !parent.is_empty()) {
+                if !scoped_parent(parent, "sec") && !scoped_parent(parent, "grp") {
+                    return Err(ApiError::Validation(
+                        "Direct and room nodes sit under a section (sec:) or group (grp:).",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn scoped_parent(parent: &str, prefix: &str) -> bool {
+    parent
+        .split_once(':')
+        .is_some_and(|(got, slug)| got == prefix && valid_slug(slug) && parent.len() <= 128)
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct CreatedBot {
+    pub id: String,
+    pub enabled: bool,
+    pub role: String,
+    pub live: bool,
+    pub tools: Vec<String>,
+    pub skills: Vec<String>,
+    pub require_approval: Vec<String>,
+    pub bot_file: String,
+    pub prompt_file: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct CreatedConversation {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    pub accepts_turns: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -296,6 +546,14 @@ struct SelectionEnvelope {
 struct ApprovalsEnvelope {
     approvals: Vec<Approval>,
 }
+#[derive(Deserialize)]
+struct BotEnvelope {
+    bot: CreatedBot,
+}
+#[derive(Deserialize)]
+struct ConversationEnvelope {
+    conversation: CreatedConversation,
+}
 
 /// Construct and use only on a worker thread. No retries, cookies, redirects,
 /// environment proxies or persistent storage. Errors never retain raw bodies/URLs.
@@ -475,11 +733,7 @@ impl ApiClient {
         Ok(response.approvals)
     }
 
-    pub fn decide_approval(
-        &self,
-        id: &str,
-        decision: ApprovalDecision,
-    ) -> Result<(), ApiError> {
+    pub fn decide_approval(&self, id: &str, decision: ApprovalDecision) -> Result<(), ApiError> {
         check_id(id)?;
         #[derive(Serialize)]
         struct Body {
@@ -494,6 +748,92 @@ impl ApiClient {
             }),
         )?;
         Ok(())
+    }
+
+    pub fn create_bot(
+        &self,
+        id: &str,
+        description: &str,
+        tools: &[String],
+        skills: &[String],
+    ) -> Result<CreatedBot, ApiError> {
+        if !valid_bot_id(id) {
+            return Err(ApiError::Validation(
+                "Bot id must be a lowercase slug of at most 32 characters, and cannot be main or a Windows device name.",
+            ));
+        }
+        if !valid_bot_description(description) {
+            return Err(ApiError::Validation(
+                "Description must be at most 2,000 characters, without control characters.",
+            ));
+        }
+        validate_tool_list(tools)?;
+        if skills.len() > MAX_SCAFFOLD_SKILLS {
+            return Err(ApiError::Validation("Enter at most 16 skill ids."));
+        }
+        let mut seen_skills = HashSet::with_capacity(skills.len());
+        for skill in skills {
+            if !valid_skill_id(skill) {
+                return Err(ApiError::Validation(
+                    "Skill ids are lowercase slugs such as ask.",
+                ));
+            }
+            if !seen_skills.insert(skill.as_str()) {
+                return Err(ApiError::Validation("Each skill id can be listed once."));
+            }
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            id: &'a str,
+            description: &'a str,
+            tools: &'a [String],
+            skills: &'a [String],
+        }
+        let response: BotEnvelope = self.request(
+            Method::POST,
+            &["v1", "bots"],
+            &[],
+            Some(&Body {
+                id,
+                description,
+                tools,
+                skills,
+            }),
+        )?;
+        check_created_bot(response.bot, id)
+    }
+
+    pub fn create_conversation(
+        &self,
+        kind: ConversationKind,
+        slug: &str,
+        parent_id: Option<&str>,
+    ) -> Result<CreatedConversation, ApiError> {
+        if !valid_slug(slug) {
+            return Err(ApiError::Validation(
+                "Slug must be a lowercase slug of at most 32 characters.",
+            ));
+        }
+        let parent_id = parent_id.filter(|parent| !parent.is_empty());
+        valid_conversation_parent(kind, parent_id)?;
+        #[derive(Serialize)]
+        struct Body<'a> {
+            kind: &'a str,
+            slug: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            parent_id: Option<&'a str>,
+        }
+        let response: ConversationEnvelope = self.request(
+            Method::POST,
+            &["v1", "conversations"],
+            &[],
+            Some(&Body {
+                kind: kind.as_str(),
+                slug,
+                parent_id,
+            }),
+        )?;
+        check_created_conversation(response.conversation, kind, slug, parent_id)
     }
 }
 
@@ -513,4 +853,75 @@ fn check_task(task: Task) -> Result<Task, ApiError> {
     } else {
         Err(ApiError::InvalidResponse)
     }
+}
+
+fn bounded_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn safe_fleet_file(path: &str, id: &str, ext: &str) -> bool {
+    if path.len() > 256
+        || path.contains('\\')
+        || path.contains(':')
+        || path.contains("..")
+        || path.starts_with('/')
+        || path.contains("//")
+        || !path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+    {
+        return false;
+    }
+    let Some((dir, file)) = path.rsplit_once('/') else {
+        return false;
+    };
+    !dir.is_empty() && file == format!("{id}.{ext}")
+}
+
+fn check_created_bot(bot: CreatedBot, id: &str) -> Result<CreatedBot, ApiError> {
+    if bot.id != id
+        || bot.enabled
+        || bot.live
+        || bot.role != "specialist"
+        || bot.tools.len() > MAX_SCAFFOLD_TOOLS
+        || bot.skills.len() > MAX_SCAFFOLD_SKILLS
+        || bot.require_approval.len() > MAX_SCAFFOLD_TOOLS
+        || !safe_fleet_file(&bot.bot_file, id, "toml")
+        || !safe_fleet_file(&bot.prompt_file, id, "txt")
+        || bot
+            .tools
+            .iter()
+            .any(|tool| tool == "delegate" || !bounded_name(tool))
+        || bot.skills.iter().any(|skill| !valid_skill_id(skill))
+        || bot
+            .require_approval
+            .iter()
+            .any(|tool| !bounded_name(tool) || !bot.tools.iter().any(|listed| listed == tool))
+    {
+        return Err(ApiError::InvalidResponse);
+    }
+    Ok(bot)
+}
+
+fn check_created_conversation(
+    node: CreatedConversation,
+    kind: ConversationKind,
+    slug: &str,
+    parent_id: Option<&str>,
+) -> Result<CreatedConversation, ApiError> {
+    let Some(expected_id) = conversation_node_id(kind, slug) else {
+        return Err(ApiError::InvalidResponse);
+    };
+    if node.id != expected_id
+        || node.kind != kind.as_str()
+        || node.accepts_turns != kind.accepts_turns()
+        || node.parent_id.as_deref() != parent_id
+    {
+        return Err(ApiError::InvalidResponse);
+    }
+    Ok(node)
 }

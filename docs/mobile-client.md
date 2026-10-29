@@ -16,3 +16,10 @@ flutter build apk --release --dart-define=SERABOT_DEFAULT_SERVER_URL=https://you
 ```
 
 See `docs/ci-and-secrets.md`.
+
+## Not in this client yet
+
+Creating a disabled specialist (`POST /v1/bots`) and a conversation node
+(`POST /v1/conversations`) is on the desktop Fleet panel. See
+[Desktop client](desktop-client.md). This Flutter app does not call those
+endpoints yet.

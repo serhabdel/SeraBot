@@ -1,6 +1,6 @@
 use crate::{
-    ApiClient, ApiError, Approval, ApprovalDecision, Catalog, Health, History, Scope, Selection,
-    Task,
+    ApiClient, ApiError, Approval, ApprovalDecision, Catalog, ConversationKind, CreatedBot,
+    CreatedConversation, Health, History, Scope, Selection, Task,
 };
 use secrecy::SecretString;
 use std::sync::{
@@ -26,6 +26,8 @@ pub enum OperationKind {
     Task,
     Approvals,
     Decide,
+    CreateBot,
+    CreateConversation,
 }
 
 pub enum Operation {
@@ -40,6 +42,17 @@ pub enum Operation {
         id: String,
         decision: ApprovalDecision,
     },
+    CreateBot {
+        id: String,
+        description: Zeroizing<String>,
+        tools: Vec<String>,
+        skills: Vec<String>,
+    },
+    CreateConversation {
+        kind: ConversationKind,
+        slug: String,
+        parent_id: Option<String>,
+    },
 }
 
 impl Operation {
@@ -53,6 +66,8 @@ impl Operation {
             Self::Task(_) => OperationKind::Task,
             Self::Approvals => OperationKind::Approvals,
             Self::Decide { .. } => OperationKind::Decide,
+            Self::CreateBot { .. } => OperationKind::CreateBot,
+            Self::CreateConversation { .. } => OperationKind::CreateConversation,
         }
     }
 }
@@ -65,6 +80,8 @@ pub enum Reply {
     Task(Task),
     Approvals(Vec<Approval>),
     Decided,
+    CreatedBot(CreatedBot),
+    CreatedConversation(CreatedConversation),
 }
 
 pub struct Job {
@@ -126,8 +143,10 @@ impl Worker {
     pub fn set_epoch(&self, epoch: u64) {
         self.epoch.store(epoch, Ordering::SeqCst);
     }
-    pub fn dispatch(&self, job: Job) -> Result<(), TrySendError<Job>> {
-        self.sender.try_send(job)
+    pub fn dispatch(&self, job: Job) -> Result<(), Box<TrySendError<Job>>> {
+        // The error carries the unsent job. Box it so a fleet payload does not
+        // inflate the Result error variant.
+        self.sender.try_send(job).map_err(Box::new)
     }
     pub fn completion(&self) -> Option<Completion> {
         self.receiver.try_recv().ok()
@@ -159,9 +178,24 @@ fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
         Operation::Submit(text) => client.submit(conversation, text).map(Reply::Task),
         Operation::Task(id) => client.task(id).map(Reply::Task),
         Operation::Approvals => client.approvals().map(Reply::Approvals),
-        Operation::Decide { id, decision } => {
-            client.decide_approval(id, *decision).map(|_| Reply::Decided)
-        }
+        Operation::Decide { id, decision } => client
+            .decide_approval(id, *decision)
+            .map(|_| Reply::Decided),
+        Operation::CreateBot {
+            id,
+            description,
+            tools,
+            skills,
+        } => client
+            .create_bot(id, description, tools, skills)
+            .map(Reply::CreatedBot),
+        Operation::CreateConversation {
+            kind,
+            slug,
+            parent_id,
+        } => client
+            .create_conversation(*kind, slug, parent_id.as_deref())
+            .map(Reply::CreatedConversation),
     }
 }
 

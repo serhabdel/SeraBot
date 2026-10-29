@@ -1,5 +1,5 @@
 use crate::{
-    ApiError, Approval, Catalog, Message, Scope, Selection, Task,
+    ApiError, Approval, Catalog, CreatedBot, CreatedConversation, Message, Scope, Selection, Task,
     worker::{OperationKind, Reply},
 };
 
@@ -14,6 +14,8 @@ pub struct State {
     pub task: Option<Task>,
     pub approvals: Vec<Approval>,
     pub approvals_loaded: bool,
+    pub created_bot: Option<CreatedBot>,
+    pub created_conversation: Option<CreatedConversation>,
     pub error: Option<String>,
     pub unknown_outcome: bool,
 }
@@ -34,6 +36,8 @@ impl Default for State {
             task: None,
             approvals: Vec::new(),
             approvals_loaded: false,
+            created_bot: None,
+            created_conversation: None,
             error: None,
             unknown_outcome: false,
         }
@@ -43,18 +47,24 @@ impl Default for State {
 impl State {
     pub fn new_scope(&mut self, conversation: String, connected: bool) {
         let epoch = self.scope.epoch.wrapping_add(1);
+        let created_bot = self.created_bot.clone();
+        let created_conversation = self.created_conversation.clone();
         *self = Self {
             scope: Scope {
                 epoch,
                 conversation,
             },
             connected,
+            created_bot,
+            created_conversation,
             ..Self::default()
         };
     }
 
     pub fn disconnect(&mut self) {
         self.new_scope(self.scope.conversation.clone(), false);
+        self.created_bot = None;
+        self.created_conversation = None;
     }
 
     pub fn can_send(&self) -> bool {
@@ -99,6 +109,8 @@ impl State {
                 self.approvals_loaded = true;
             }
             Reply::Decided => {}
+            Reply::CreatedBot(bot) => self.created_bot = Some(bot),
+            Reply::CreatedConversation(node) => self.created_conversation = Some(node),
         }
         true
     }
@@ -109,13 +121,19 @@ impl State {
         }
         let mutation = matches!(
             kind,
-            OperationKind::Submit | OperationKind::Apply | OperationKind::Decide
+            OperationKind::Submit
+                | OperationKind::Apply
+                | OperationKind::Decide
+                | OperationKind::CreateBot
+                | OperationKind::CreateConversation
         );
         if mutation && error.unknown_outcome() {
             self.unknown_outcome = true;
             let operation = match kind {
                 OperationKind::Submit => "submission",
                 OperationKind::Decide => "approval decision",
+                OperationKind::CreateBot => "bot scaffold",
+                OperationKind::CreateConversation => "conversation create",
                 _ => "model change",
             };
             self.error = Some(format!(
@@ -131,7 +149,10 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Catalog, Health, Message, Role, Selection, Task, TaskStatus};
+    use crate::{
+        Catalog, CreatedBot, CreatedConversation, Health, Message, Role, Selection, Task,
+        TaskStatus,
+    };
 
     fn catalog() -> Catalog {
         serde_json::from_str(r#"{"providers":[{"id":"approved","models":["small","large"],"data_egress_approved":true}],"selection":{"provider":"approved","model":"small"}}"#).unwrap()
@@ -229,5 +250,61 @@ mod tests {
         assert!(state.messages.is_empty());
         assert!(state.task.is_none());
         assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn unknown_scaffold_is_not_a_clean_rejection_and_disconnect_clears_fleet_results() {
+        let mut state = State {
+            connected: true,
+            ..State::default()
+        };
+        let scope = state.scope.clone();
+        state.fail(&scope, OperationKind::CreateBot, ApiError::Transport);
+        assert!(state.unknown_outcome);
+        assert!(
+            state
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Unknown bot scaffold outcome")
+        );
+        assert!(state.error.as_deref().unwrap().contains("Do not resend"));
+        let mut clean = State {
+            connected: true,
+            ..State::default()
+        };
+        let clean_scope = clean.scope.clone();
+        clean.fail(&clean_scope, OperationKind::CreateBot, ApiError::Http(409));
+        assert!(!clean.unknown_outcome);
+        clean.fail(
+            &clean_scope,
+            OperationKind::CreateConversation,
+            ApiError::Http(422),
+        );
+        assert!(!clean.unknown_outcome);
+
+        state.created_bot = Some(CreatedBot {
+            id: "notes".into(),
+            enabled: false,
+            role: "specialist".into(),
+            live: false,
+            tools: vec!["skill_list".into()],
+            skills: Vec::new(),
+            require_approval: Vec::new(),
+            bot_file: "bots/notes.toml".into(),
+            prompt_file: "prompts/notes.txt".into(),
+        });
+        state.created_conversation = Some(CreatedConversation {
+            id: "sec:finance".into(),
+            kind: "section".into(),
+            parent_id: None,
+            accepts_turns: false,
+        });
+        state.new_scope("dir:analyst".into(), true);
+        assert!(state.created_bot.is_some());
+        assert!(state.created_conversation.is_some());
+        state.disconnect();
+        assert!(state.created_bot.is_none());
+        assert!(state.created_conversation.is_none());
     }
 }
