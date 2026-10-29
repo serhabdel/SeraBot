@@ -11,6 +11,20 @@ tools = [
   "firecrawl_map",
   "firecrawl_search",
   "firecrawl_crawl",
+  "elevenlabs_list_voices",
+  "elevenlabs_text_to_speech",
+  "elevenlabs_sound_effect",
+  "elevenlabs_transcribe",
+  "elevenlabs_generate_image",
+  "elevenlabs_generate_video",
 ]
-require_approval = ["firecrawl_crawl", "firecrawl_search"]
+require_approval = [
+  "firecrawl_crawl",
+  "firecrawl_search",
+  "elevenlabs_text_to_speech",
+  "elevenlabs_sound_effect",
+  "elevenlabs_transcribe",
+  "elevenlabs_generate_image",
+  "elevenlabs_generate_video",
+]
 enabled = true

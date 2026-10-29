@@ -2,6 +2,25 @@ name = "maker"
 trigger = "command"
 system_prompt = "prompts/maker.txt"
 skills = ["deck", "copy", "write", "design", "onepager", "translate-it-fr"]
-tools = ["rag_search", "deck_build", "telegram_send_document", "onedrive_list", "onedrive_upload"]
-require_approval = ["onedrive_upload"]
+tools = [
+  "rag_search",
+  "deck_build",
+  "telegram_send_document",
+  "onedrive_list",
+  "onedrive_upload",
+  "elevenlabs_list_voices",
+  "elevenlabs_text_to_speech",
+  "elevenlabs_sound_effect",
+  "elevenlabs_transcribe",
+  "elevenlabs_generate_image",
+  "elevenlabs_generate_video",
+]
+require_approval = [
+  "onedrive_upload",
+  "elevenlabs_text_to_speech",
+  "elevenlabs_sound_effect",
+  "elevenlabs_transcribe",
+  "elevenlabs_generate_image",
+  "elevenlabs_generate_video",
+]
 enabled = true
