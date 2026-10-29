@@ -9,7 +9,9 @@ use serabot::api::{ApiNotifier, ApiState};
 use serabot::audio::{
     AudioTranscribeTool, AudioUnderstandTool, MistralAudioClient, resolve_audio_provider,
 };
+use serabot::browser::{register_browser_tools, BrowserSession};
 use serabot::config::{Config, load_bots};
+use serabot::connectors::register_connector_tools;
 use serabot::deck::Brand;
 use serabot::documents::index_directory;
 use serabot::documents::ingest_file;
@@ -429,6 +431,40 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         registry.register(FirecrawlMapTool::new(client.clone(), limits.clone()))?;
         registry.register(FirecrawlSearchTool::new(client.clone(), limits.clone()))?;
         registry.register(FirecrawlCrawlTool::new(client, limits))?;
+    }
+    if config.browser.enabled {
+        let session = Arc::new(BrowserSession::new(config.browser.clone())?);
+        register_browser_tools(&mut registry, session)?;
+    }
+    if config.connectors.any_enabled() {
+        let agentmail_key = if config.connectors.agentmail.enabled {
+            Some(
+                secrets
+                    .require(&config.connectors.agentmail.api_key_secret)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "{error}; run `serabot secrets set {}` before enabling AgentMail",
+                            config.connectors.agentmail.api_key_secret
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        let connector_http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(
+                config.connectors.agentmail.timeout_secs.max(5),
+            ))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .context("build connector HTTP client")?;
+        register_connector_tools(
+            &mut registry,
+            &config.connectors,
+            agentmail_key.as_deref(),
+            connector_http,
+        )?;
     }
     if config.onedrive.enabled {
         let client_id = secrets.require(&config.onedrive.client_id_secret)?;

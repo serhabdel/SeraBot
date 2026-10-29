@@ -203,3 +203,62 @@ understanding_model = "voxtral-small-latest"
 max_bytes = 52428800
 telegram_intake = false
 telegram_max_bytes = 20971520
+
+[browser]
+enabled = false
+provider = "spawn_cdp"
+chromium_executable = ""
+remote_debugging_host = "127.0.0.1"
+remote_debugging_port = 9222
+browseros_neo_base = "http://127.0.0.1:7333"
+user_data_dir = ""
+request_timeout_secs = 30
+
+[connectors.google_drive]
+enabled = false
+client_id_secret = "google_oauth_client_id"
+client_secret_secret = "google_oauth_client_secret"
+refresh_token_secret = "google_drive_refresh_token"
+
+[connectors.google_sheets]
+enabled = false
+client_id_secret = "google_oauth_client_id"
+client_secret_secret = "google_oauth_client_secret"
+refresh_token_secret = "google_sheets_refresh_token"
+
+[connectors.google_calendar]
+enabled = false
+client_id_secret = "google_oauth_client_id"
+client_secret_secret = "google_oauth_client_secret"
+refresh_token_secret = "google_calendar_refresh_token"
+
+[connectors.gmail]
+enabled = false
+client_id_secret = "google_oauth_client_id"
+client_secret_secret = "google_oauth_client_secret"
+refresh_token_secret = "gmail_refresh_token"
+
+[connectors.outlook]
+enabled = false
+client_id_secret = "outlook_client_id"
+client_secret_secret = "outlook_client_secret"
+refresh_token_secret = "outlook_refresh_token"
+
+[connectors.outlook_calendar]
+enabled = false
+client_id_secret = "outlook_client_id"
+client_secret_secret = "outlook_client_secret"
+refresh_token_secret = "outlook_calendar_refresh_token"
+
+[connectors.notion]
+enabled = false
+client_id_secret = "notion_oauth_client_id"
+client_secret_secret = "notion_oauth_client_secret"
+refresh_token_secret = "notion_refresh_token"
+
+[connectors.agentmail]
+enabled = false
+api_base = "https://api.agentmail.to/v0"
+api_key_secret = "agentmail_api_key"
+timeout_secs = 60
+default_inbox_id = ""

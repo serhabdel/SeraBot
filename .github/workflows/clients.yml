@@ -1,0 +1,40 @@
+name: clients
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p serabot-desktop --locked
+      - run: cargo test -p serabot-desktop --locked
+        env:
+          SERABOT_TEST_MODE: "1"
+
+  mobile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get
+        working-directory: apps/serabot_mobile
+      - run: flutter analyze
+        working-directory: apps/serabot_mobile
+      - run: flutter test
+        working-directory: apps/serabot_mobile

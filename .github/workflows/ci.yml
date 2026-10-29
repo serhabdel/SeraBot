@@ -25,9 +25,12 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Check
+        run: cargo check --workspace --all-targets --locked
       - name: Tests
         run: cargo test --workspace --locked
         env:
           SERABOT_TEST_MODE: "1"
       - name: Release build
-        run: cargo build --workspace --release --locked
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build --release -p serabot --locked
