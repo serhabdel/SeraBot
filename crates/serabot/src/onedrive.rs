@@ -6,7 +6,8 @@
 //!
 //! # Permissions
 //!
-//! The refresh-token flow requests `offline_access Files.ReadWrite`. This is a
+//! The refresh-token flow requests `offline_access Files.ReadWrite.All User.Read`,
+//! matching the existing OneDrive MCP registration on the operator host. This is a
 //! broad delegated permission: it can write anywhere in the signed-in drive.
 //! `Files.ReadWrite.AppFolder` would be narrower, but this agent must deliver
 //! into the operator's existing dossier folder, which is not an app folder.
@@ -61,8 +62,11 @@ const UPLOAD_CHUNK_SIZE: usize = 5 * 1024 * 1024;
 /// 250 MiB leaves ample headroom while bounding memory on a small VPS.
 const MAX_UPLOAD_BYTES: usize = 250 * 1024 * 1024;
 
-/// Delegated permission set. `Files.ReadWrite` is broad; see the module docs.
-const TOKEN_SCOPE: &str = "offline_access Files.ReadWrite";
+/// Delegated permission set. `Files.ReadWrite.All` is broad; see the module docs.
+const TOKEN_SCOPE: &str = "offline_access Files.ReadWrite.All User.Read";
+
+const LIST_PAGE_SIZE: u32 = 200;
+const LIST_MAX_PAGES_CAP: usize = 10;
 
 /// Refresh this long before the reported expiry to avoid racing the clock.
 const REFRESH_SKEW: Duration = Duration::from_secs(60);
@@ -91,6 +95,23 @@ pub struct UploadResult {
     pub size: u64,
     /// SHA-256 of the uploaded bytes, computed locally before the request.
     pub sha256: String,
+}
+
+/// One entry from a bounded folder listing below `base_folder`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveListItem {
+    pub id: String,
+    pub name: String,
+    pub folder: bool,
+    pub size: u64,
+    pub path: String,
+}
+
+/// Result of listing a folder under the configured allowlist root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListFolderResult {
+    pub items: Vec<DriveListItem>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,6 +252,67 @@ impl OneDriveClient {
     ///
     /// Errors after a mutating request was dispatched may carry "outcome
     /// unknown": the artifact may or may not have been stored.
+    /// List children of `base_folder` (or `base_folder/subfolder` when set).
+    ///
+    /// Pagination is capped at `max_pages` (clamped to `LIST_MAX_PAGES_CAP`); each
+    /// page requests up to `LIST_PAGE_SIZE` items. Only GETs are retried.
+    pub async fn list_folder(
+        &self,
+        subfolder: Option<&str>,
+        max_pages: usize,
+    ) -> Result<ListFolderResult> {
+        let folders = self.destination_folders(subfolder)?;
+        let max_pages = max_pages.clamp(1, LIST_MAX_PAGES_CAP);
+        let encoded = encode_path(&folders);
+        let mut url = format!(
+            "{}/me/drive/root:/{}:/children?$top={LIST_PAGE_SIZE}",
+            self.graph_base, encoded
+        );
+        let parent_path = display_folder_path(&folders);
+
+        let mut items = Vec::new();
+        let mut pages = 0usize;
+        let mut truncated = false;
+
+        while pages < max_pages {
+            pages += 1;
+            let token = self.access_token().await?;
+            let response = self
+                .graph_get_with_retries(&url, &token, "folder listing")
+                .await?;
+            let body = read_limited(response, MAX_RESPONSE_BYTES).await?;
+            let page: ListPageResponse = serde_json::from_slice(&body).map_err(|error| {
+                SeraError::External(format!("invalid OneDrive list response: {error}"))
+            })?;
+
+            for entry in page.value {
+                if entry.id.is_empty() || entry.name.is_empty() {
+                    continue;
+                }
+                items.push(DriveListItem {
+                    id: entry.id,
+                    name: entry.name.clone(),
+                    folder: entry.folder.is_some(),
+                    size: entry.size,
+                    path: format!("{}/{}", parent_path.trim_end_matches('/'), entry.name),
+                });
+            }
+
+            match page.next_link.filter(|link| !link.is_empty()) {
+                Some(next) if pages < max_pages => {
+                    url = validate_pagination_url(&next, &self.graph_base)?;
+                }
+                Some(_) => {
+                    truncated = true;
+                    break;
+                }
+                None => break,
+            }
+        }
+
+        Ok(ListFolderResult { items, truncated })
+    }
+
     pub async fn upload(
         &mut self,
         filename: &str,
@@ -246,12 +328,7 @@ impl OneDriveClient {
             )));
         }
 
-        let mut folders: Vec<String> = self.base_folder.split('/').map(str::to_owned).collect();
-        if let Some(subfolder) = subfolder {
-            let subfolder = validate_segments(subfolder, MAX_SUBFOLDER_DEPTH, "subfolder")
-                .map_err(SeraError::Validation)?;
-            folders.extend(subfolder);
-        }
+        let folders = self.destination_folders(subfolder)?;
 
         self.ensure_folder(&folders).await?;
 
@@ -539,37 +616,65 @@ impl OneDriveClient {
         Ok(())
     }
 
+    fn destination_folders(&self, subfolder: Option<&str>) -> Result<Vec<String>> {
+        let mut folders: Vec<String> = self.base_folder.split('/').map(str::to_owned).collect();
+        if let Some(subfolder) = subfolder {
+            let subfolder = validate_segments(subfolder, MAX_SUBFOLDER_DEPTH, "subfolder")
+                .map_err(SeraError::Validation)?;
+            folders.extend(subfolder);
+        }
+        Ok(folders)
+    }
+
     /// Idempotent folder lookup with bounded retries for 429/5xx and
     /// transport failures. Returns `false` on a definitive 404.
     async fn folder_exists(&self, encoded_path: &str) -> Result<bool> {
         let token = self.access_token().await?;
         let url = format!("{}/me/drive/root:/{}", self.graph_base, encoded_path);
+        match self.graph_get_with_retries(&url, &token, "folder lookup").await {
+            Ok(response) if response.status().is_success() => Ok(true),
+            Ok(response) if response.status() == StatusCode::NOT_FOUND => Ok(false),
+            Ok(response) => Err(graph_error(response, "folder lookup").await),
+            Err(error) => Err(error),
+        }
+    }
 
+    async fn graph_get_with_retries(
+        &self,
+        url: &str,
+        token: &str,
+        context: &str,
+    ) -> Result<reqwest::Response> {
         let mut last_error: Option<SeraError> = None;
         for attempt in 0..GET_MAX_ATTEMPTS {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
             }
 
-            match self.http.get(&url).bearer_auth(&token).send().await {
-                Ok(response) if response.status().is_success() => return Ok(true),
-                Ok(response) if response.status() == StatusCode::NOT_FOUND => return Ok(false),
+            match self.http.get(url).bearer_auth(token).send().await {
+                Ok(response)
+                    if response.status().is_success()
+                        || response.status() == StatusCode::NOT_FOUND =>
+                {
+                    return Ok(response);
+                }
                 Ok(response)
                     if response.status() == StatusCode::TOO_MANY_REQUESTS
                         || response.status().is_server_error() =>
                 {
-                    last_error = Some(graph_error(response, "folder lookup").await);
+                    last_error = Some(graph_error(response, context).await);
                 }
-                Ok(response) => return Err(graph_error(response, "folder lookup").await),
+                Ok(response) => return Err(graph_error(response, context).await),
                 Err(error) if error.is_timeout() || error.is_connect() => {
-                    last_error = Some(transport_error("folder lookup", error, false));
+                    last_error = Some(transport_error(context, error, false));
                 }
-                Err(error) => return Err(transport_error("folder lookup", error, false)),
+                Err(error) => return Err(transport_error(context, error, false)),
             }
         }
 
-        Err(last_error
-            .unwrap_or_else(|| SeraError::External("OneDrive folder lookup failed".into())))
+        Err(last_error.unwrap_or_else(|| {
+            SeraError::External(format!("OneDrive {context} failed after retries"))
+        }))
     }
 
     /// Create one folder below `parent`. Not retried.
@@ -607,6 +712,30 @@ impl OneDriveClient {
         }
     }
 }
+
+#[derive(Deserialize)]
+struct ListPageResponse {
+    #[serde(default)]
+    value: Vec<ListDriveItem>,
+    #[serde(default, rename = "@odata.nextLink")]
+    next_link: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ListDriveItem {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    folder: Option<FolderFacet>,
+}
+
+#[derive(Deserialize)]
+struct FolderFacet {}
 
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -1056,6 +1185,25 @@ fn display_path(folders: &[String], filename: &str) -> String {
     format!("/{}/{}", folders.join("/"), filename)
 }
 
+fn display_folder_path(folders: &[String]) -> String {
+    format!("/{}", folders.join("/"))
+}
+
+/// Graph pagination links must stay on the configured Graph host.
+fn validate_pagination_url(url: &str, graph_base: &str) -> Result<String> {
+    let url = validate_endpoint(url, "pagination", true)?;
+    let parsed =
+        Url::parse(&url).map_err(|_| SeraError::External("invalid OneDrive pagination URL".into()))?;
+    let base = Url::parse(graph_base)
+        .map_err(|_| SeraError::Config("graph_base is not a valid URL".into()))?;
+    if parsed.host() != base.host() {
+        return Err(SeraError::External(
+            "OneDrive pagination URL host mismatch".into(),
+        ));
+    }
+    Ok(url)
+}
+
 /// Parse the start of a Graph `nextExpectedRanges` entry such as `"5242880-"`.
 fn range_start(value: &str) -> Option<u64> {
     value
@@ -1164,6 +1312,49 @@ mod tests {
             item["file"] = json!({"hashes": {"sha256Hash": sha256}});
         }
         item
+    }
+
+    #[tokio::test]
+    async fn list_folder_returns_items_under_base_path() {
+        let server = MockServer::start().await;
+        mount_token(&server, "access-1", None, 3600).await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1.0/me/drive/root:/SeraBot/Deliverables:/children"))
+            .and(query_param("$top", "200"))
+            .and(header("authorization", "Bearer access-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "value": [
+                    {
+                        "id": "item-1",
+                        "name": "report.pdf",
+                        "size": 42,
+                        "file": {},
+                    },
+                    {
+                        "id": "folder-2",
+                        "name": "archive",
+                        "folder": {},
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server);
+        let result = client
+            .list_folder(Some("Deliverables"), 5)
+            .await
+            .unwrap();
+
+        assert_eq!(result.items.len(), 2);
+        assert!(!result.truncated);
+        assert_eq!(result.items[0].name, "report.pdf");
+        assert_eq!(result.items[0].path, "/SeraBot/Deliverables/report.pdf");
+        assert!(!result.items[0].folder);
+        assert!(result.items[1].folder);
+        server.verify().await;
     }
 
     #[tokio::test]

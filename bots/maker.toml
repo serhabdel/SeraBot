@@ -2,6 +2,6 @@ name = "maker"
 trigger = "command"
 system_prompt = "prompts/maker.txt"
 skills = ["deck", "copy", "write", "design", "onepager", "translate-it-fr"]
-tools = ["rag_search", "deck_build", "telegram_send_document", "onedrive_upload"]
+tools = ["rag_search", "deck_build", "telegram_send_document", "onedrive_list", "onedrive_upload"]
 require_approval = ["onedrive_upload"]
 enabled = true

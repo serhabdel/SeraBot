@@ -23,7 +23,9 @@ use serabot::firecrawl::{
 };
 use serabot::gateway::{Gateway, ToolRegistry};
 use serabot::llm::LlmClient;
-use serabot::maker::{ArtifactStore, DeckBuildTool, OneDriveUploadTool, TelegramDocumentTool};
+use serabot::maker::{
+    ArtifactStore, DeckBuildTool, OneDriveListTool, OneDriveUploadTool, TelegramDocumentTool,
+};
 use serabot::onedrive::OneDriveClient;
 use serabot::policy::Policy;
 use serabot::retrieval::{Retriever, SqliteRetriever};
@@ -445,9 +447,14 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             config.onedrive.folder.clone(),
             config.onedrive.conflict_behavior.clone(),
         )?;
+        let client = Arc::new(Mutex::new(client));
         registry.register(OneDriveUploadTool::new(
-            Arc::new(Mutex::new(client)),
+            client.clone(),
             artifacts.clone(),
+            config.onedrive.folder.clone(),
+        ))?;
+        registry.register(OneDriveListTool::new(
+            client,
             config.onedrive.folder.clone(),
         ))?;
     }

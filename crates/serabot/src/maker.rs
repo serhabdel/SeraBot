@@ -458,6 +458,82 @@ impl Tool for OneDriveUploadTool {
     }
 }
 
+pub struct OneDriveListTool {
+    client: Arc<Mutex<OneDriveClient>>,
+    folder: String,
+}
+
+impl OneDriveListTool {
+    pub fn new(client: Arc<Mutex<OneDriveClient>>, folder: impl Into<String>) -> Self {
+        Self {
+            client,
+            folder: folder.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for OneDriveListTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "onedrive_list".into(),
+            description:
+                "List files and folders in the approved OneDrive dossier folder (read-only)."
+                    .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "subfolder": {"type": "string"},
+                    "max_pages": {"type": "integer", "minimum": 1, "maximum": 10}
+                },
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    fn approval_details(&self, args: &Value) -> Result<ApprovalDetails> {
+        let destination = match args.get("subfolder").and_then(Value::as_str) {
+            Some(subfolder) => format!("{}/{}", self.folder, subfolder),
+            None => self.folder.clone(),
+        };
+        Ok(ApprovalDetails {
+            summary: format!("List OneDrive folder '{destination}'"),
+            destination: Some(format!("onedrive:{destination}")),
+            artifact_hash: None,
+        })
+    }
+
+    async fn execute(&self, args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+        let subfolder = args.get("subfolder").and_then(Value::as_str);
+        let max_pages = args
+            .get("max_pages")
+            .and_then(Value::as_u64)
+            .map(|pages| pages as usize)
+            .unwrap_or(5);
+        let client = self.client.lock().await;
+        let result = client.list_folder(subfolder, max_pages).await?;
+        Ok(ToolOutput {
+            content: format!(
+                "OneDrive listing: {} item(s){}",
+                result.items.len(),
+                if result.truncated { " (truncated)" } else { "" }
+            ),
+            data: Some(json!({
+                "items": result.items.iter().map(|item| json!({
+                    "id": item.id,
+                    "name": item.name,
+                    "folder": item.folder,
+                    "size": item.size,
+                    "path": item.path,
+                })).collect::<Vec<_>>(),
+                "truncated": result.truncated,
+            })),
+            ..ToolOutput::default()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

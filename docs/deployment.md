@@ -102,6 +102,74 @@ printf '%s' "$KEY" | runuser -u serabot -- /opt/serabot/serabot --config /etc/se
 while a bare invocation waits for EOF. Adding an extra provider requires storing
 its referenced secret before the service can start.
 
+## OneDrive (native Graph)
+
+SeraBot uses the same Azure **public client** pattern as the existing
+`onedrive-mcp.service` on the host (`AZURE_CLIENT_ID` in
+`/home/ubuntu/onedrive-mcp/.env`, MSAL device-code auth, refresh tokens in
+`TOKEN_CACHE_PATH` / `.token_cache.bin`). Do not stop or reconfigure the MCP
+service; native Graph is an additive path through the gateway.
+
+Keep `[onedrive].enabled = false` until both secrets exist in the SeraBot age
+store. Align `[onedrive].tenant` with the MCP authority (`consumers` for personal
+OneDrive). Secret names default to `onedrive_client_id` and
+`onedrive_refresh_token`.
+
+On the VPS (as a user who can read the MCP env, never paste values into chat):
+
+1. Copy the MCP application id into SeraBot:
+
+   ```bash
+   CLIENT_ID="$(grep '^AZURE_CLIENT_ID=' /home/ubuntu/onedrive-mcp/.env | cut -d= -f2-)"
+   printf '%s' "$CLIENT_ID" | runuser -u serabot -- /opt/serabot/serabot \
+     --config /etc/serabot/serabot.toml secrets set onedrive_client_id
+   ```
+
+2. Export the MSAL refresh token from the MCP token cache into SeraBot (run in
+   `/home/ubuntu/onedrive-mcp` with the MCP venv; the script prints only to
+   stdout for piping):
+
+   ```bash
+   cd /home/ubuntu/onedrive-mcp
+   ./venv/bin/python - <<'PY' | runuser -u serabot -- /opt/serabot/serabot \
+     --config /etc/serabot/serabot.toml secrets set onedrive_refresh_token
+   import json, os
+   from pathlib import Path
+   import msal
+   load = lambda p: None
+   env = Path(".env")
+   cache_path = Path(".token_cache.bin")
+   if env.exists():
+       for line in env.read_text().splitlines():
+           if line.strip() and not line.startswith("#") and "=" in line:
+               k, v = line.split("=", 1)
+               os.environ.setdefault(k.strip(), v.strip())
+   cache_path = Path(os.environ.get("TOKEN_CACHE_PATH", cache_path))
+   client_id = os.environ["AZURE_CLIENT_ID"]
+   cache = msal.SerializableTokenCache()
+   cache.deserialize(cache_path.read_text())
+   app = msal.PublicClientApplication(
+       client_id, authority="https://login.microsoftonline.com/consumers", token_cache=cache
+   )
+   accounts = app.get_accounts()
+   if not accounts:
+       raise SystemExit("no MSAL account in cache; run: python server.py auth")
+   token = app.acquire_token_silent(["Files.ReadWrite.All", "User.Read"], account=accounts[0])
+   if not token or "refresh_token" not in token:
+       raise SystemExit("could not read refresh_token from MSAL cache")
+   print(token["refresh_token"], end="")
+   PY
+   ```
+
+3. Set `[onedrive] enabled = true` and `tenant = "consumers"` in
+   `/etc/serabot/serabot.toml`, then restart **only** `serabot.service`.
+
+Owner verification (after approval-capable bot, e.g. maker):
+
+- `onedrive_list` with no args lists `/SeraBot` (or your configured folder).
+- `onedrive_upload` remains approval-gated; confirm the approval shows the
+  destination path and artifact hash, then check the file in OneDrive.
+
 ## Verification status
 
 Tests use synthetic fixtures. Do not describe providers, Telegram, OneDrive, or

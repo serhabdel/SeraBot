@@ -979,7 +979,7 @@ fn default_graph_base() -> String {
     "https://graph.microsoft.com/v1.0".into()
 }
 fn default_tenant() -> String {
-    "common".into()
+    "consumers".into()
 }
 fn default_graph_client_secret() -> String {
     "onedrive_client_id".into()
