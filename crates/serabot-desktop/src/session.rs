@@ -755,7 +755,16 @@ impl Session {
                         OperationKind::AdminWrite | OperationKind::AdminRestart
                     ) =>
                 {
-                    self.admin_error = Some(error.to_string());
+                    let message = match &error {
+                        ApiError::Http(404) => {
+                            "This server has no administration API. Update the server to 0.4.0 or later.".to_owned()
+                        }
+                        ApiError::Rejected(text) if text == "not found" => {
+                            "This server has no administration API. Update the server to 0.4.0 or later.".to_owned()
+                        }
+                        _ => error.to_string(),
+                    };
+                    self.admin_error = Some(message);
                     self.scheduled = None;
                 }
                 Err(error) => {
