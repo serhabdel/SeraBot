@@ -1,8 +1,7 @@
 mod api;
-pub mod connect;
 pub mod creds;
-pub mod design;
 pub mod events;
+pub mod session;
 pub mod state;
 pub mod updater;
 pub mod worker;
@@ -197,25 +196,6 @@ mod tests {
     }
 
     #[test]
-    fn selection_requires_catalog_membership_and_egress_approval() {
-        let catalog: Catalog = serde_json::from_str(r#"{"providers":[{"id":"blocked","models":["private"],"data_egress_approved":false},{"id":"allowed","models":["small","large"],"data_egress_approved":true}],"selection":{"provider":"blocked","model":"private"}}"#).unwrap();
-        assert_eq!(catalog.providers.len(), 2, "blocked profiles stay visible");
-        assert!(!catalog.allows(&catalog.selection));
-        assert!(catalog.allows(&Selection {
-            provider: "allowed".into(),
-            model: "small".into()
-        }));
-        assert!(!catalog.allows(&Selection {
-            provider: "allowed".into(),
-            model: "private".into()
-        }));
-        assert!(!catalog.allows(&Selection {
-            provider: "invented".into(),
-            model: "small".into()
-        }));
-    }
-
-    #[test]
     fn conversation_memory_and_secret_inputs_stay_bounded() {
         assert!(valid_conversation_title("Operations review"));
         assert!(!valid_conversation_title("   "));
@@ -235,6 +215,25 @@ mod tests {
         assert!(valid_memory_id("mem_1-2"));
         assert!(!valid_memory_id(""));
         assert!(!valid_memory_id("a/b"));
+    }
+
+    #[test]
+    fn selection_requires_catalog_membership_and_egress_approval() {
+        let catalog: Catalog = serde_json::from_str(r#"{"providers":[{"id":"blocked","models":["private"],"data_egress_approved":false},{"id":"allowed","models":["small","large"],"data_egress_approved":true}],"selection":{"provider":"blocked","model":"private"}}"#).unwrap();
+        assert_eq!(catalog.providers.len(), 2, "blocked profiles stay visible");
+        assert!(!catalog.allows(&catalog.selection));
+        assert!(catalog.allows(&Selection {
+            provider: "allowed".into(),
+            model: "small".into()
+        }));
+        assert!(!catalog.allows(&Selection {
+            provider: "allowed".into(),
+            model: "private".into()
+        }));
+        assert!(!catalog.allows(&Selection {
+            provider: "invented".into(),
+            model: "small".into()
+        }));
     }
 
     #[test]

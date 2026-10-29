@@ -1,22 +1,23 @@
 # Desktop client (Windows)
 
-**Primary owner desktop:** `crates/serabot-desktop` — native Rust with
-`eframe`/`egui` (OpenGL). There is no second desktop shell (no Tauri app in this
-repo). Mobile work lives under `apps/` separately; it does not replace this
+**Primary owner desktop:** `crates/serabot-desktop` — Rust with **Dioxus
+Desktop** (WebView2). The UI layer is Windows-only; the API client, session,
+credentials, updater and event stream are UI-independent Rust and are tested on
+Linux. Mobile work lives under `apps/` separately; it does not replace this
 console.
 
-### Why egui instead of Tauri
+### Why Dioxus Desktop
 
 The owner API client, endpoint/token validation, approval semantics, and
 no-blind-resubmit rules are implemented once in Rust with integration tests.
-Shipping a Tauri webview tonight would duplicate that surface, add a Node
-frontend toolchain, and split documentation without improving security or
-features beyond what the native console already covers (chat, conversations,
-memory, providers, connectors, approvals, fleet and updates).
+Dioxus renders a WebView2 shell from Rust and CSS with no Node runtime, no
+bundled web server, and no web admin UI on the server. The server binary remains
+the default workspace member, so Linux releases and OVH deployments do not
+include the desktop GUI.
 
-The stack adds no Node runtime, web server, or web admin UI on the server. The
-server binary remains the default workspace member, so Linux release builds and
-OVH deployments do not include the desktop GUI.
+A `ui-check` Cargo feature type-checks every Dioxus component on Linux without a
+WebKit toolchain; CI runs it on Ubuntu. The Windows job builds and smoke-runs the
+actual WebView2 binary.
 
 ## Build and launch (Windows, MSVC)
 
@@ -99,35 +100,28 @@ token was cleared.
 
 ## Behaviour
 
-The connected console is a native three-part shell: an icon rail, a
-conversation column in **Chat**, and a content pane. It is responsive down to
-860×560 and never blocks the UI thread on network I/O.
+The connected console is a Dioxus WebView2 shell: a nav rail, a conversation
+column in **Chat**, and a content pane. It is responsive down to 920×620 and all
+network work stays on the Rust worker/SSE threads, never on the UI thread.
 
 - **Rail** — Chat, Conversations, Memory, Providers, Connectors, Approvals,
-  Fleet, and Settings. Icons are painted with the GPU painter; the build ships
-  no image assets.
-- **Appearance** — a Light/Dark switch sits on the connect card, in the top bar,
-  and in **Settings → Appearance**. The whole console switches between a deep
-  teal-black dark palette and a warm paper light palette. The choice is saved
-  locally in `settings.json` and applies before the first connection. Both
-  palettes use a native Segoe UI typeface on Windows, gradient backdrops,
-  elevated cards, painted avatars, and soft status chips.
-- **Top bar** — a full-width header with the SeraBot brand, the active
-  conversation title and kind, connection state, the per-conversation model
-  chip, a **Bots** count, the appearance switch, an update badge, and the
-  command palette (`Ctrl+K`).
-- **Chat** — the conversation column lists server metadata (title, kind,
-  last-message time) and supports search, open, and new direct threads. Messages
-  are bubbles by bot with avatars, tails, and timestamps; clicking a bubble
-  copies its text. An empty conversation shows the specialist roster with quick
-  links to Conversations, Memory, and Providers. The message list is virtualized:
-  only visible rows are drawn, and wrapped galleys are cached by message id and
-  width, so scrolling and resizing do not re-wrap the whole history.
-  `stick_to_bottom` keeps the newest message in view unless you scroll away;
-  **Latest** returns to it.
-- **Composer** — `Ctrl+Enter` sends; **Send** is enabled only when the catalog
-  selection is saved and approved, no unknown outcome is pending, and the
-  conversation accepts turns. Sections and groups are read-only structure.
+  Fleet, and Settings. Icons are inline SVG; the build ships no image assets.
+- **Appearance** — a Light/Dark switch sits on the connect card, in the header,
+  and in **Settings → Appearance**. The CSS palette switches between a deep
+  teal-black dark theme and a warm paper light theme. The choice is saved
+  locally in `settings.json` and applies before the first connection. Typography
+  uses Segoe UI Variable / Segoe UI with gradient backdrops, elevated cards, and
+  soft status chips.
+- **Header** — the active conversation title and kind, connection state, a
+  **Bots** count, the appearance switch, and refresh.
+- **Chat** — the conversation column lists server metadata (title, kind, and
+  id) and supports search, open, and new direct threads. Messages render as
+  bubbles with avatars, speaker, timestamp, and text. An empty conversation
+  shows the specialist roster. Chat history is capped at the server's recent
+  window (100 messages).
+- **Composer** — **Send** is enabled only when the catalog selection is saved and
+  approved, no unknown outcome is pending, and the conversation accepts turns.
+  Sections and groups are read-only structure.
 - **Conversations** — create sections, groups, direct threads, and rooms, rename
   a thread, and archive it (soft; messages stay on the server). Rooms are
   conversations with the orchestrator and the specialists it delegates to, not
@@ -138,21 +132,21 @@ conversation column in **Chat**, and a content pane. It is responsive down to
   orchestrator receives the 20 most recently updated memories; specialists never
   list them on their own.
 - **Providers** — read-only cards for each configured provider: kind, models,
-  routing classes, catalog status, egress approval, and secret **names** with a
-  presence dot. Values never appear. Model selection is saved per conversation
-  through the existing endpoint and still requires the egress confirmation.
-- **Connectors** — enabled/disabled state, redirect URI, API base, default inbox,
-  and secret names for Google, Microsoft, Notion, and AgentMail. Missing secrets
-  offer a copyable `serabot secrets set NAME` command; OAuth login and secret
-  writes stay on the server CLI.
-- **Live updates** — the client opens `GET /v1/events` on a dedicated thread
+  routing classes, and secret **names** with presence. Values never appear.
+  Model selection is saved per conversation and applies to the next turn; a
+  running turn keeps its pinned route. The screen explains that provider blocks
+  and keys stay in `/etc/serabot/serabot.toml` and the age store.
+- **Connectors** — enabled/disabled state, redirect URI, and secret names for
+  Google, Microsoft, Notion, and AgentMail. Secret writes and OAuth login stay on
+  the server CLI.
+- **Live updates** — the Rust core opens `GET /v1/events` on a dedicated thread
   with its own HTTP client, reconnects with backoff, and resumes from the last
   event id (`after=` / `Last-Event-ID`). Events coalesce into at most one
   refreshed read per request gap; task polling remains as a stuck-stream guard
-  and is the only path when the stream is unavailable. All network work stays
-  off the UI thread.
+  and is the only path when the stream is unavailable.
 - **Fleet** — opening the screen loads the bot roster and skill packs
-  automatically (one read each, then on demand with **Refresh**).
+  automatically. Every tool is shown; tools that require owner approval are
+  highlighted amber (for example Firecrawl search/crawl).
 - Approvals load from `GET /v1/approvals`. Once / Always / Deny call
   `POST /v1/approvals/{id}/decide` with the same semantics as Telegram. Decisions
   still bind canonical arguments, destination, artifact hash, policy version,
@@ -161,16 +155,6 @@ conversation column in **Chat**, and a content pane. It is responsive down to
   client reports an unknown outcome and refuses to resend automatically; review
   server state first.
 - Late responses from a previous connection or conversation are discarded.
-
-### Shortcuts
-
-| Keys | Action |
-| --- | --- |
-| `Ctrl+K` | Command palette |
-| `Ctrl+1…7` | Jump to a rail section |
-| `Ctrl+R` | Refresh reads |
-| `Ctrl+Enter` | Send message |
-| `Esc` | Close the palette or model window |
 
 ## Fleet
 

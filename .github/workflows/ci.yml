@@ -27,6 +27,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Check
         run: cargo check --workspace --all-targets --locked
+      - name: Desktop UI check
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo check -p serabot-desktop --features ui-check --locked
       - name: Tests
         run: cargo test --workspace --locked
         env:
