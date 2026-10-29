@@ -42,6 +42,12 @@ pub struct Config {
     pub documents: DocumentsConfig,
     #[serde(default)]
     pub audio: AudioConfig,
+    #[serde(default)]
+    pub skills: SkillsConfig,
+    #[serde(default)]
+    pub browser: BrowserConfig,
+    #[serde(default)]
+    pub connectors: ConnectorsConfig,
     #[serde(skip)]
     pub base_dir: PathBuf,
 }
@@ -66,6 +72,9 @@ impl Default for Config {
             schedule: ScheduleConfig::default(),
             documents: DocumentsConfig::default(),
             audio: AudioConfig::default(),
+            skills: SkillsConfig::default(),
+            browser: BrowserConfig::default(),
+            connectors: ConnectorsConfig::default(),
             base_dir: PathBuf::from("."),
         }
     }
@@ -117,6 +126,27 @@ impl Config {
             return Err(SeraError::Config(
                 "llm.base_url and llm.model are required".into(),
             ));
+        }
+        crate::providers::check_profile(
+            &self.llm.kind,
+            &self.llm.base_url,
+            &self.llm.auth,
+            &self.llm.refresh_token_secret,
+            &self.llm.oauth_client_secret_secret,
+            self.llm.catalog_fetch,
+            self.llm.catalog_ttl_secs,
+        )?;
+        for (id, profile) in &self.llm.providers {
+            crate::providers::check_profile(
+                &profile.kind,
+                &profile.base_url,
+                &profile.auth,
+                &profile.refresh_token_secret,
+                &profile.oauth_client_secret_secret,
+                profile.catalog_fetch,
+                profile.catalog_ttl_secs,
+            )
+            .map_err(|error| SeraError::Config(format!("llm.providers.{id}: {error}")))?;
         }
         if self.embeddings.dimension == 0 || self.embeddings.dimension > 4096 {
             return Err(SeraError::Config(
@@ -218,6 +248,8 @@ impl Config {
                 ));
             }
         }
+        self.browser.validate()?;
+        self.connectors.validate()?;
         Ok(())
     }
 
@@ -335,15 +367,87 @@ pub struct LlmConfig {
     pub models: Vec<String>,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
+    #[serde(default)]
+    pub classes: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub catalog_fetch: bool,
+    #[serde(default = "default_catalog_ttl_secs")]
+    pub catalog_ttl_secs: u64,
+    #[serde(default)]
+    pub auth: String,
+    #[serde(default)]
+    pub refresh_token_secret: String,
+    #[serde(default)]
+    pub oauth_client_id_secret: String,
+    #[serde(default)]
+    pub oauth_client_secret_secret: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
+    #[serde(default)]
     pub base_url: String,
+    #[serde(default)]
     pub api_key_secret: String,
+    #[serde(default)]
     pub models: Vec<String>,
     #[serde(default)]
     pub data_egress_approved: bool,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub catalog_fetch: bool,
+    #[serde(default = "default_catalog_ttl_secs")]
+    pub catalog_ttl_secs: u64,
+    #[serde(default)]
+    pub auth: String,
+    #[serde(default)]
+    pub refresh_token_secret: String,
+    #[serde(default)]
+    pub oauth_client_id_secret: String,
+    #[serde(default)]
+    pub oauth_client_secret_secret: String,
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            api_key_secret: String::new(),
+            models: Vec::new(),
+            data_egress_approved: false,
+            kind: String::new(),
+            catalog_fetch: false,
+            catalog_ttl_secs: default_catalog_ttl_secs(),
+            auth: String::new(),
+            refresh_token_secret: String::new(),
+            oauth_client_id_secret: String::new(),
+            oauth_client_secret_secret: String::new(),
+        }
+    }
+}
+
+impl LlmConfig {
+    pub fn default_provider(&self) -> ProviderConfig {
+        ProviderConfig {
+            base_url: self.base_url.clone(),
+            api_key_secret: self.api_key_secret.clone(),
+            models: std::iter::once(self.model.clone())
+                .chain(self.models.iter().cloned())
+                .chain(self.bot_models.values().cloned())
+                .collect(),
+            data_egress_approved: self.data_egress_approved,
+            kind: self.kind.clone(),
+            catalog_fetch: self.catalog_fetch,
+            catalog_ttl_secs: self.catalog_ttl_secs,
+            auth: self.auth.clone(),
+            refresh_token_secret: self.refresh_token_secret.clone(),
+            oauth_client_id_secret: self.oauth_client_id_secret.clone(),
+            oauth_client_secret_secret: self.oauth_client_secret_secret.clone(),
+        }
+    }
 }
 
 impl Default for LlmConfig {
@@ -359,10 +463,33 @@ impl Default for LlmConfig {
             bot_models: BTreeMap::new(),
             models: Vec::new(),
             providers: BTreeMap::new(),
+            kind: String::new(),
+            catalog_fetch: false,
+            catalog_ttl_secs: default_catalog_ttl_secs(),
+            auth: String::new(),
+            refresh_token_secret: String::new(),
+            oauth_client_id_secret: String::new(),
+            oauth_client_secret_secret: String::new(),
             classes: BTreeMap::new(),
         }
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillsConfig {
+    #[serde(default = "default_skills_dir")]
+    pub dir: String,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_skills_dir(),
+        }
+    }
+}
+
+include!("config_browser_connectors.inc.rs");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingsConfig {
@@ -944,6 +1071,12 @@ fn default_llm_key_secret() -> String {
 }
 fn default_llm_timeout() -> u64 {
     120
+}
+fn default_catalog_ttl_secs() -> u64 {
+    1800
+}
+fn default_skills_dir() -> String {
+    "skills".into()
 }
 fn default_max_tool_rounds() -> usize {
     10
