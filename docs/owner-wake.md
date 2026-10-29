@@ -8,13 +8,14 @@ chat, tickets, or git.
 
 | Item | Value |
 | --- | --- |
-| **`origin/main` tip** | `bd871f9` — *Record why routing stays on the in-process allowlist.* Docs only (`docs/model-routing.md`). |
 | **Code tip for the binary** | `795b139` — *Persist OneDrive refresh rotation and the first connector refresh token.* |
-| **Local `main`** | Matches `origin/main` at `bd871f9` when this page was written. |
+| **Routing decision** | `bd871f9` — *Record why routing stays on the in-process allowlist.* Docs only (`docs/model-routing.md`). |
+| **This checklist** | Documentation on top of `bd871f9`. It does not move the binary. |
 | **Previous wake note** | `6d718fe` (ElevenLabs allowlist). Superseded by this page. |
 
-`bd871f9` does not change the server binary. A host already running `795b139`
-does not need another deploy for that commit.
+Commits after `795b139`, including `bd871f9` and this page, do not change the
+server binary. A host already running `795b139` does not need another deploy
+for them.
 
 Landed on `main` since `6d718fe` (code through `795b139`):
 
