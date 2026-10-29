@@ -19,9 +19,9 @@ See `docs/ci-and-secrets.md`.
 
 ## Fleet
 
-The **Fleet** tab calls `POST /v1/bots` and `POST /v1/conversations`, matching
-the desktop specialist and conversation forms. Desktop also registers skill
-packs; this tab does not.
+The **Fleet** tab calls `POST /v1/bots`, `POST /v1/skills`, and
+`POST /v1/conversations`, matching the desktop specialist, skill, and
+conversation forms.
 Each submit waits at least three seconds after the previous Fleet request and
 is not retried when the outcome is unknown.
 
@@ -30,6 +30,12 @@ is not retried when the outcome is unknown.
   optional comma-separated skill ids. `delegate` is not offered. The server
   writes a disabled specialist. Restart before it can run, and add it to
   `main.delegates` yourself if `main` should hand it work.
+- **New skill** — `POST /v1/skills` with a lowercase skill id, a one-line
+  description, and an optional markdown body. There is no path field. The
+  server writes the pack under the configured skills directory and reports
+  `live: false`. Restart, then add the id to a bot's skills list before that
+  bot can load it. **Refresh skills** calls `GET /v1/skills` for on-disk
+  summaries. Bodies are not returned.
 - **New conversation** — `POST /v1/conversations` with kind (`section`, `group`,
   `direct`, or `room`), a slug, and an optional parent. Sections have no parent.
   Groups require a section id (`sec:…`). Direct and room nodes may sit under a

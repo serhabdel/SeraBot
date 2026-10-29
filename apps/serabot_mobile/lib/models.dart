@@ -382,6 +382,55 @@ class CreatedConversation {
   final bool acceptsTurns;
 }
 
+class CreatedSkill {
+  CreatedSkill({
+    required this.id,
+    required this.name,
+    required this.description,
+    required this.file,
+    required this.live,
+  });
+
+  factory CreatedSkill.fromJson(Map<String, dynamic> json) {
+    return CreatedSkill(
+      id: json['id'] as String,
+      name: json['name'] as String,
+      description: json['description'] as String,
+      file: json['file'] as String,
+      live: json['live'] as bool,
+    );
+  }
+
+  final String id;
+  final String name;
+  final String description;
+  final String file;
+  final bool live;
+}
+
+class SkillSummary {
+  SkillSummary({
+    required this.id,
+    required this.name,
+    required this.description,
+    this.pack,
+  });
+
+  factory SkillSummary.fromJson(Map<String, dynamic> json) {
+    return SkillSummary(
+      id: json['id'] as String,
+      name: json['name'] as String,
+      description: json['description'] as String,
+      pack: json['pack'] as String?,
+    );
+  }
+
+  final String id;
+  final String name;
+  final String description;
+  final String? pack;
+}
+
 List<String> _stringList(dynamic raw) {
   if (raw is! List) {
     throw const FormatException('expected list');

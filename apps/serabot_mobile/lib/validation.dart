@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'models.dart';
 
 // Input validation mirroring `crates/serabot-desktop/src/api.rs`.
@@ -157,6 +159,9 @@ const defaultSpecialistTools = <String>[
 const _maxBotDescriptionChars = 2000;
 const _maxScaffoldTools = 32;
 const _maxScaffoldSkills = 16;
+const maxSkillDescriptionChars = 500;
+const maxSkillBodyBytes = 96000;
+const maxSkillList = 256;
 
 /// Lowercase slug shared by bot ids and conversation slugs (`^[a-z][a-z0-9-]{0,31}$`).
 bool validSlug(String slug) {
@@ -207,6 +212,50 @@ bool validSkillId(String id) {
   }
   return true;
 }
+
+bool _reservedSkillId(String id) {
+  if (id == 'con' || id == 'prn' || id == 'aux' || id == 'nul') {
+    return true;
+  }
+  if (id.length == 4 && (id.startsWith('com') || id.startsWith('lpt'))) {
+    final last = id.codeUnitAt(3);
+    return last >= 0x30 && last <= 0x39;
+  }
+  return false;
+}
+
+/// Skill ids the owner may register. `main` is allowed; Windows device names are not.
+bool validNewSkillId(String id) => validSkillId(id) && !_reservedSkillId(id);
+
+bool validSkillDescription(String text) {
+  final trimmed = text.trim();
+  if (trimmed.runes.length > maxSkillDescriptionChars) {
+    return false;
+  }
+  for (final r in trimmed.runes) {
+    if (_isControlRune(r) || r == 0x22 || r == 0x5c) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool validSkillBody(String text) {
+  if (utf8.encode(text).length > maxSkillBodyBytes) {
+    return false;
+  }
+  for (final r in text.runes) {
+    if (r == 0x09 || r == 0x0a || r == 0x0d) {
+      continue;
+    }
+    if (_isControlRune(r)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool _isControlRune(int r) => r <= 0x1f || (r >= 0x7f && r <= 0x9f);
 
 bool validBotDescription(String text) {
   if (text.runes.length > _maxBotDescriptionChars) {

@@ -135,5 +135,30 @@ void main() {
       expect(validBotDescription('a\u0000b'), isFalse);
       expect(validBotDescription('é' * 2001), isFalse);
     });
+
+    test('new skill ids, descriptions, and bodies', () {
+      expect(validNewSkillId('notes-pack'), isTrue);
+      expect(validNewSkillId('main'), isTrue);
+      expect(validNewSkillId('a'), isTrue);
+      expect(validNewSkillId('a' * 64), isTrue);
+      expect(validNewSkillId(''), isFalse);
+      expect(validNewSkillId('Notes'), isFalse);
+      expect(validNewSkillId('../notes'), isFalse);
+      expect(validNewSkillId('con'), isFalse);
+      expect(validNewSkillId('aux'), isFalse);
+      expect(validNewSkillId('com1'), isFalse);
+      expect(validNewSkillId('lpt9'), isFalse);
+      expect(validNewSkillId('a' * 65), isFalse);
+      expect(validSkillDescription(''), isTrue);
+      expect(validSkillDescription(' Short summary '), isTrue);
+      expect(validSkillDescription('say "hi"'), isFalse);
+      expect(validSkillDescription(r'a\b'), isFalse);
+      expect(validSkillDescription('line\nbreak'), isFalse);
+      expect(validSkillDescription('a' * 501), isFalse);
+      expect(validSkillBody(''), isTrue);
+      expect(validSkillBody('# Notes\n\nSteps.\t'), isTrue);
+      expect(validSkillBody('a\u0000b'), isFalse);
+      expect(validSkillBody('a' * 96001), isFalse);
+    });
   });
 }

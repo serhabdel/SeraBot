@@ -386,6 +386,86 @@ class ApiClient {
     );
     return _checkCreatedConversation(json, kind, slug, parent);
   }
+
+  /// Registers a skill pack on disk. A blank [body] is omitted; the server
+  /// writes a stub and does not echo the markdown.
+  Future<CreatedSkill> createSkill(
+    String id,
+    String description,
+    String? body,
+  ) async {
+    if (!validNewSkillId(id)) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail:
+            'Skill id must be a lowercase slug of at most 64 characters, and cannot be a Windows device name.',
+      );
+    }
+    final summary = description.trim();
+    if (!validSkillDescription(summary)) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail:
+            'Description must be one line of at most 500 characters, without quotes or backslashes.',
+      );
+    }
+    final markdown = body?.trim();
+    final text = (markdown == null || markdown.isEmpty) ? null : markdown;
+    if (text != null && !validSkillBody(text)) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail:
+            'Body must be markdown of at most 96,000 bytes, without control characters.',
+      );
+    }
+    final json = await _request(
+      'POST',
+      ['v1', 'skills'],
+      body: {
+        'id': id,
+        'description': summary,
+        'body': ?text,
+      },
+    );
+    return _checkCreatedSkill(json, id);
+  }
+
+  /// On-disk skill summaries. Bodies are not part of this response.
+  Future<List<SkillSummary>> listSkills() async {
+    final json = await _request('GET', ['v1', 'skills']);
+    try {
+      final list = json['skills'];
+      if (list is! List || list.length > maxSkillList) {
+        throw ApiException(ApiErrorKind.invalidResponse);
+      }
+      final skills = <SkillSummary>[];
+      final seen = <String>{};
+      for (final entry in list) {
+        if (entry is! Map<String, dynamic>) {
+          throw ApiException(ApiErrorKind.invalidResponse);
+        }
+        final skill = SkillSummary.fromJson(entry);
+        if (!validSkillId(skill.id) || !seen.add(skill.id)) {
+          throw ApiException(ApiErrorKind.invalidResponse);
+        }
+        if (!_boundedSkillLabel(skill.name) ||
+            skill.description.runes.length > 2000 ||
+            skill.description.runes.any(_isControlRune)) {
+          throw ApiException(ApiErrorKind.invalidResponse);
+        }
+        final pack = skill.pack;
+        if (pack != null && !validSkillId(pack)) {
+          throw ApiException(ApiErrorKind.invalidResponse);
+        }
+        skills.add(skill);
+      }
+      return skills;
+    } on ApiException {
+      rethrow;
+    } catch (_) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+  }
 }
 
 CreatedBot _checkCreatedBot(Map<String, dynamic> json, String id) {
@@ -488,4 +568,68 @@ bool _safeFleetFile(String path, String id, String ext) {
   final dir = path.substring(0, slash);
   final file = path.substring(slash + 1);
   return dir.isNotEmpty && file == '$id.$ext';
+}
+
+bool _isControlRune(int r) => r <= 0x1f || (r >= 0x7f && r <= 0x9f);
+
+bool _boundedSkillLabel(String value) {
+  if (value.isEmpty || value.runes.length > 128) {
+    return false;
+  }
+  for (final r in value.runes) {
+    if (_isControlRune(r) || r == 0x2f || r == 0x5c || r == 0x3a) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool _safeSkillFile(String path, String id) {
+  final nested = '/$id/SKILL.md';
+  final flat = '$id/SKILL.md';
+  if (path.length > 256 ||
+      path.startsWith('/') ||
+      path.contains('\\') ||
+      path.contains(':') ||
+      path.contains('..') ||
+      path.contains('//') ||
+      !(path.endsWith(nested) || path == flat)) {
+    return false;
+  }
+  for (final b in path.codeUnits) {
+    final ok = (b >= 0x30 && b <= 0x39) ||
+        (b >= 0x41 && b <= 0x5a) ||
+        (b >= 0x61 && b <= 0x7a) ||
+        b == 0x2f ||
+        b == 0x2e ||
+        b == 0x5f ||
+        b == 0x2d;
+    if (!ok) {
+      return false;
+    }
+  }
+  return true;
+}
+
+CreatedSkill _checkCreatedSkill(Map<String, dynamic> json, String id) {
+  try {
+    final raw = json['skill'];
+    if (raw is! Map<String, dynamic>) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+    final skill = CreatedSkill.fromJson(raw);
+    if (skill.id != id ||
+        skill.live ||
+        !_boundedSkillLabel(skill.name) ||
+        skill.description.runes.length > maxSkillDescriptionChars ||
+        skill.description.runes.any(_isControlRune) ||
+        !_safeSkillFile(skill.file, id)) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+    return skill;
+  } on ApiException {
+    rethrow;
+  } catch (_) {
+    throw ApiException(ApiErrorKind.invalidResponse);
+  }
 }

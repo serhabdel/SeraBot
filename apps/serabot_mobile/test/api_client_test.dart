@@ -205,4 +205,181 @@ void main() {
       ),
     );
   });
+
+  test('create and list skills without a path or echoed body', () async {
+    final recorded = <String, String>{};
+    final methods = <String>[];
+    server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final port = server!.port;
+    server!.listen((request) async {
+      final payload = await utf8.decoder.bind(request).join();
+      methods.add('${request.method} ${request.uri.path}');
+      recorded['${methods.length}'] = payload;
+      if (request.uri.path == '/v1/skills' && request.method == 'POST') {
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..write(jsonEncode({
+            'skill': {
+              'id': 'notes-pack',
+              'name': 'Notes Pack',
+              'description': 'Short summary',
+              'file': 'skills/notes-pack/SKILL.md',
+              'live': false,
+            },
+          }));
+      } else if (request.uri.path == '/v1/skills' && request.method == 'GET') {
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..write(jsonEncode({
+            'skills': [
+              {'id': 'ask', 'name': 'Ask', 'description': 'Synthetic summary'},
+              {
+                'id': 'notes-pack',
+                'name': 'Notes Pack',
+                'description': 'Short summary',
+                'pack': 'office',
+              },
+            ],
+          }));
+      } else {
+        request.response.statusCode = HttpStatus.notFound;
+      }
+      await request.response.close();
+    });
+
+    final client = ApiClient.connect('http://127.0.0.1:$port', 'd' * 32);
+    addTearDown(client.close);
+
+    final skill = await client.createSkill(
+      'notes-pack',
+      '  Short summary  ',
+      '  # Notes\n\nUse allowlisted tools.\n  ',
+    );
+    expect(skill.id, 'notes-pack');
+    expect(skill.live, isFalse);
+    expect(skill.file, 'skills/notes-pack/SKILL.md');
+    final created = jsonDecode(recorded['1']!) as Map<String, dynamic>;
+    expect(created, {
+      'id': 'notes-pack',
+      'description': 'Short summary',
+      'body': '# Notes\n\nUse allowlisted tools.',
+    });
+    expect(created.containsKey('path'), isFalse);
+
+    final stub = await client.createSkill('notes-pack', 'Short summary', '   ');
+    expect(stub.live, isFalse);
+    final sent = jsonDecode(recorded['2']!) as Map<String, dynamic>;
+    expect(sent.containsKey('body'), isFalse);
+    expect(sent.containsKey('path'), isFalse);
+    expect(sent, {'id': 'notes-pack', 'description': 'Short summary'});
+
+    final skills = await client.listSkills();
+    expect(skills, hasLength(2));
+    expect(skills[1].pack, 'office');
+    expect(methods, ['POST /v1/skills', 'POST /v1/skills', 'GET /v1/skills']);
+  });
+
+  test('skill responses must stay offline and relative', () async {
+    final bodies = <String>[
+      jsonEncode({
+        'skill': {
+          'id': 'notes-pack',
+          'name': 'Notes Pack',
+          'description': 'Short summary',
+          'file': 'skills/notes-pack/SKILL.md',
+          'live': true,
+        },
+      }),
+      jsonEncode({
+        'skill': {
+          'id': 'other',
+          'name': 'Other',
+          'description': 'Short summary',
+          'file': 'skills/other/SKILL.md',
+          'live': false,
+        },
+      }),
+      jsonEncode({
+        'skill': {
+          'id': 'notes-pack',
+          'name': 'Notes Pack',
+          'description': 'Short summary',
+          'file': '../notes-pack/SKILL.md',
+          'live': false,
+        },
+      }),
+      jsonEncode({
+        'skill': {
+          'id': 'notes-pack',
+          'name': 'Notes Pack',
+          'description': 'Short summary',
+          'file': 'C:/skills/notes-pack/SKILL.md',
+          'live': false,
+        },
+      }),
+      jsonEncode({
+        'skill': {
+          'id': 'notes-pack',
+          'name': '../Notes',
+          'description': 'Short summary',
+          'file': 'skills/notes-pack/SKILL.md',
+          'live': false,
+        },
+      }),
+      jsonEncode({
+        'skills': [
+          {'id': '../ask', 'name': 'Ask', 'description': 'Synthetic summary'},
+        ],
+      }),
+    ];
+    var index = 0;
+    server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final port = server!.port;
+    server!.listen((request) async {
+      request.response
+        ..statusCode = HttpStatus.ok
+        ..write(bodies[index]);
+      index += 1;
+      await request.response.close();
+    });
+
+    final client = ApiClient.connect('http://127.0.0.1:$port', 'e' * 32);
+    addTearDown(client.close);
+
+    await expectLater(
+      client.createSkill('con', 'Short summary', null),
+      throwsA(
+        isA<ApiException>().having(
+          (error) => error.kind,
+          'kind',
+          ApiErrorKind.validation,
+        ),
+      ),
+    );
+    expect(index, 0);
+
+    for (var n = 0; n < 5; n++) {
+      await expectLater(
+        client.createSkill('notes-pack', 'Short summary', null),
+        throwsA(
+          isA<ApiException>().having(
+            (error) => error.kind,
+            'kind',
+            ApiErrorKind.invalidResponse,
+          ),
+        ),
+      );
+      expect(index, n + 1);
+    }
+    await expectLater(
+      client.listSkills(),
+      throwsA(
+        isA<ApiException>().having(
+          (error) => error.kind,
+          'kind',
+          ApiErrorKind.invalidResponse,
+        ),
+      ),
+    );
+  });
 }

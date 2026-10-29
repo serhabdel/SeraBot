@@ -5,7 +5,7 @@ import '../models.dart';
 import '../session.dart';
 import '../validation.dart';
 
-/// Owner fleet edits: disabled specialists and conversation nodes.
+/// Owner fleet edits: disabled specialists, skill packs, and conversation nodes.
 class FleetTab extends StatefulWidget {
   const FleetTab({super.key, required this.session, required this.onUseInChat});
 
@@ -22,6 +22,9 @@ class _FleetTabState extends State<FleetTab> {
   final _skills = TextEditingController();
   final _slug = TextEditingController();
   final _parent = TextEditingController();
+  final _skillId = TextEditingController();
+  final _skillDescription = TextEditingController();
+  final _skillBody = TextEditingController();
   final List<bool> _toolOn = specialistTools
       .map(defaultSpecialistTools.contains)
       .toList();
@@ -29,6 +32,9 @@ class _FleetTabState extends State<FleetTab> {
   ConversationKind _kind = ConversationKind.section;
   CreatedBot? _createdBot;
   CreatedConversation? _createdConversation;
+  CreatedSkill? _createdSkill;
+  List<SkillSummary> _listedSkills = const [];
+  bool _skillsLoaded = false;
   String? _error;
   bool _unknown = false;
   bool _submitting = false;
@@ -43,6 +49,9 @@ class _FleetTabState extends State<FleetTab> {
     _skills.addListener(_rebuild);
     _slug.addListener(_rebuild);
     _parent.addListener(_rebuild);
+    _skillId.addListener(_rebuild);
+    _skillDescription.addListener(_rebuild);
+    _skillBody.addListener(_rebuild);
   }
 
   @override
@@ -53,11 +62,17 @@ class _FleetTabState extends State<FleetTab> {
     _skills.removeListener(_rebuild);
     _slug.removeListener(_rebuild);
     _parent.removeListener(_rebuild);
+    _skillId.removeListener(_rebuild);
+    _skillDescription.removeListener(_rebuild);
+    _skillBody.removeListener(_rebuild);
     _botId.dispose();
     _description.dispose();
     _skills.dispose();
     _slug.dispose();
     _parent.dispose();
+    _skillId.dispose();
+    _skillDescription.dispose();
+    _skillBody.dispose();
     super.dispose();
   }
 
@@ -211,6 +226,83 @@ class _FleetTabState extends State<FleetTab> {
     }
   }
 
+  Future<void> _createSkill() async {
+    if (_blocked) {
+      return;
+    }
+    setState(() {
+      _submitting = true;
+      _error = null;
+    });
+    try {
+      await _throttle();
+      if (!mounted || !widget.session.connected) {
+        return;
+      }
+      final skill = await widget.session.run(
+        (client) => client.createSkill(
+          _skillId.text.trim(),
+          _skillDescription.text,
+          _skillBody.text,
+        ),
+      );
+      if (!mounted) {
+        return;
+      }
+      setState(() => _createdSkill = skill);
+    } on ApiException catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = e.messageForUser();
+          if (e.unknownOutcome) {
+            _unknown = true;
+          }
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _submitting = false);
+      }
+    }
+  }
+
+  Future<void> _refreshSkills() async {
+    if (_blocked) {
+      return;
+    }
+    setState(() {
+      _submitting = true;
+      _error = null;
+    });
+    try {
+      await _throttle();
+      if (!mounted || !widget.session.connected) {
+        return;
+      }
+      final skills = await widget.session.run((client) => client.listSkills());
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _listedSkills = skills;
+        _skillsLoaded = true;
+      });
+    } on ApiException catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = e.messageForUser();
+          if (e.unknownOutcome) {
+            _unknown = true;
+          }
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _submitting = false);
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final tools = _selectedTools();
@@ -226,6 +318,11 @@ class _FleetTabState extends State<FleetTab> {
     final parentError = _parentError();
     final canCreateConversation =
         !_blocked && validSlug(slug) && parentError == null;
+    final skillId = _skillId.text.trim();
+    final canCreateSkill = !_blocked &&
+        validNewSkillId(skillId) &&
+        validSkillDescription(_skillDescription.text) &&
+        validSkillBody(_skillBody.text.trim());
     final preview = conversationNodeId(_kind, slug);
     final muted = Theme.of(context).textTheme.bodySmall;
 
@@ -235,7 +332,7 @@ class _FleetTabState extends State<FleetTab> {
         Text('Fleet', style: Theme.of(context).textTheme.headlineSmall),
         const SizedBox(height: 4),
         Text(
-          'Disabled specialists and conversation nodes. Nothing is written until you submit.',
+          'Disabled specialists, skill packs, and conversation nodes. Nothing is written until you submit.',
           style: muted,
         ),
         if (_error != null) ...[
@@ -373,6 +470,123 @@ class _FleetTabState extends State<FleetTab> {
         const SizedBox(height: 16),
         _card(
           context,
+          title: 'New skill',
+          children: [
+            Text(
+              'The id is the pack name. There is no path field. Description is one line, and the body is optional markdown. The pack stays off the running catalog until you restart, and a bot cannot load it until you add the id to that bot.',
+              style: muted,
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _skillId,
+              maxLength: 64,
+              decoration: const InputDecoration(
+                labelText: 'Skill id',
+                hintText: 'notes-pack',
+                border: OutlineInputBorder(),
+              ),
+              autocorrect: false,
+              enableSuggestions: false,
+            ),
+            if (skillId.isNotEmpty && !validNewSkillId(skillId))
+              Text(
+                'Use a lowercase slug (max 64). Windows device names are reserved.',
+                style: TextStyle(color: Theme.of(context).colorScheme.error, fontSize: 12),
+              ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _skillDescription,
+              maxLength: maxSkillDescriptionChars,
+              maxLines: 1,
+              decoration: const InputDecoration(
+                labelText: 'Description',
+                hintText: 'Short summary',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            if (!validSkillDescription(_skillDescription.text))
+              Text(
+                'One line, at most 500 characters, without quotes or backslashes.',
+                style: TextStyle(color: Theme.of(context).colorScheme.error, fontSize: 12),
+              ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _skillBody,
+              minLines: 4,
+              maxLines: 8,
+              maxLength: maxSkillBodyBytes,
+              decoration: const InputDecoration(
+                labelText: 'Body',
+                hintText: 'Optional markdown. Leave empty for a short stub.',
+                helperText: 'Optional. The server does not echo the body back.',
+                border: OutlineInputBorder(),
+                counterText: '',
+              ),
+            ),
+            if (!validSkillBody(_skillBody.text.trim()))
+              Text(
+                'Markdown only, at most 96,000 bytes, without control characters.',
+                style: TextStyle(color: Theme.of(context).colorScheme.error, fontSize: 12),
+              ),
+            if (_createdSkill != null) ...[
+              const SizedBox(height: 8),
+              Text('Created ${_createdSkill!.id} · not live'),
+              Text(_createdSkill!.file, style: muted),
+              Text(
+                'Restart the server, then add this id to a bot before it can load the pack.',
+                style: TextStyle(color: Theme.of(context).colorScheme.tertiary, fontSize: 12),
+              ),
+            ],
+            const SizedBox(height: 12),
+            FilledButton(
+              onPressed: canCreateSkill ? _createSkill : null,
+              child: const Text('Create skill'),
+            ),
+            const SizedBox(height: 12),
+            const Divider(),
+            Text('On disk', style: Theme.of(context).textTheme.titleSmall),
+            const SizedBox(height: 8),
+            OutlinedButton(
+              onPressed: _blocked ? null : _refreshSkills,
+              child: const Text('Refresh skills'),
+            ),
+            Text(
+              'Summaries only. GET /v1/skills does not return bodies.',
+              style: muted,
+            ),
+            if (_skillsLoaded && _listedSkills.isEmpty)
+              Text('No skill packs on disk.', style: muted),
+            if (_listedSkills.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              SizedBox(
+                height: 160,
+                child: ListView.builder(
+                  itemCount: _listedSkills.length,
+                  itemBuilder: (context, index) {
+                    final skill = _listedSkills[index];
+                    final title = skill.pack == null
+                        ? skill.id
+                        : '${skill.id} · ${skill.pack}';
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 4),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(title),
+                          if (skill.description.isNotEmpty)
+                            Text(_skillBlurb(skill.description), style: muted),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ],
+        ),
+        const SizedBox(height: 16),
+        _card(
+          context,
           title: 'New conversation',
           children: [
             Text(
@@ -492,4 +706,12 @@ class _FleetTabState extends State<FleetTab> {
       ),
     );
   }
+}
+
+String _skillBlurb(String text) {
+  final chars = text.runes.toList();
+  if (chars.length <= 160) {
+    return text;
+  }
+  return '${String.fromCharCodes(chars.take(160))}…';
 }
