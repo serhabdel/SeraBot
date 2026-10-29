@@ -69,17 +69,16 @@ Still on `main` from the earlier wake note (code through `795b139`):
 
 ## OVH
 
-Running **SeraBot 0.2.3**. Binary SHA-256
-`1f7be61ec445bf4e9cea440f385fad90a5a7b1eab564c2526383ff33764ef497`, built
-locally in WSL from commit `64f5d45`. Staged at
-`/var/lib/serabot/releases/serabot-1f7be61e`; the previous binary is
-`/var/lib/serabot/releases/serabot-pre-1f7be61e` (SHA-256
-`b403cab608ff0613e072c579545e8d8025b5e2ac676f34d54831ff2974c46037`). Legacy
-conversations list as turn-capable direct threads, all six models and auto mode
-select successfully, and `GET /v1/bots` now reports approval-gated tools
-(Firecrawl search/crawl are highlighted in the desktop). Only
-`serabot.service` was restarted; `database user_version` is 4. Old release
-binaries were pruned to the current and previous build (2.6 GB free).
+Running **SeraBot 0.3.1**. Binary SHA-256
+`0d98ac9547c37a5acbffd46a0b7dddffabefc1de2d883e2bb9a1df2b8cdd78c5`, built
+locally in WSL from commit `5ad1c65`. Staged at
+`/var/lib/serabot/releases/serabot-0d98ac95`; the previous binary is
+`/var/lib/serabot/releases/serabot-pre-0d98ac95` (SHA-256
+`1f7be61ec445bf4e9cea440f385fad90a5a7b1eab564c2526383ff33764ef497`). The turn
+prompt now lists the callable tools explicitly, so the model should request
+approval for Firecrawl search/crawl instead of calling them unavailable. Legacy
+conversations and all six models remain verified. Only `serabot.service` was
+restarted; `database user_version` is 4.
 
 `bot.seradyx.tech` is served by the dedicated `cloudflared-bot.service` to
 `127.0.0.1:8787`. The pre-existing dashboard-managed `cloudflared.service`, the
@@ -92,7 +91,7 @@ If historical journals ever contained `getUpdates` URLs (a build before
 with `serabot secrets set`. Do not paste the token, the journal line, or the
 URL into chat, tickets, or git.
 
-Roll back by restoring `serabot-pre-1f7be61e` onto `/opt/serabot/serabot` and
+Roll back by restoring `serabot-pre-0d98ac95` onto `/opt/serabot/serabot` and
 restarting **only** `serabot.service`. Leave Docker, OpenBot,
 `onedrive-mcp.service`, and both Cloudflare tunnels alone. Before replacing a
 busy binary, read the queue; it was empty of non-terminal tasks at this deploy.
