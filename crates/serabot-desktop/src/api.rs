@@ -644,17 +644,17 @@ pub struct Health {
     pub ok: bool,
     pub version: String,
     #[serde(default)]
-    pub audio_enabled: bool,
+    pub audio_enabled: Option<bool>,
     #[serde(default)]
-    pub audio_transcription_model: String,
+    pub audio_transcription_model: Option<String>,
     #[serde(default)]
-    pub audio_understanding_model: String,
+    pub audio_understanding_model: Option<String>,
     #[serde(default)]
-    pub firecrawl_enabled: bool,
+    pub firecrawl_enabled: Option<bool>,
     #[serde(default)]
-    pub telegram_enabled: bool,
+    pub telegram_enabled: Option<bool>,
     #[serde(default)]
-    pub catalog_fetch: bool,
+    pub catalog_fetch: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
