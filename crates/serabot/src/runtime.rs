@@ -1081,6 +1081,25 @@ impl Runtime {
                 context.allowed_tools.contains(&spec.name)
             })
             .collect::<Vec<_>>();
+        let tool_names = tool_specs
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !state.messages.iter().any(|message| {
+            message.role == Role::System
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.starts_with("AVAILABLE TOOLS THIS TURN:"))
+        }) {
+            state.messages.insert(
+                1,
+                LlmMessage::system(format!(
+                    "AVAILABLE TOOLS THIS TURN: {tool_names}. These tools are callable. If one requires owner approval, request the approval instead of saying the tool is unavailable."
+                )),
+            );
+        }
         let temperature = bot.config.temperature;
         self.checked_route(&state.route)?;
 
