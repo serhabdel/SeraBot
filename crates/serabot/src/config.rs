@@ -140,6 +140,7 @@ impl Config {
             self.llm.catalog_fetch,
             self.llm.catalog_ttl_secs,
         )?;
+        crate::cloud_code::validate_project_id(&self.llm.kind, &self.llm.project_id)?;
         for (id, profile) in &self.llm.providers {
             crate::providers::check_profile(
                 &profile.kind,
@@ -151,6 +152,8 @@ impl Config {
                 profile.catalog_ttl_secs,
             )
             .map_err(|error| SeraError::Config(format!("llm.providers.{id}: {error}")))?;
+            crate::cloud_code::validate_project_id(&profile.kind, &profile.project_id)
+                .map_err(|error| SeraError::Config(format!("llm.providers.{id}: {error}")))?;
         }
         if self.embeddings.dimension == 0 || self.embeddings.dimension > 4096 {
             return Err(SeraError::Config(
@@ -211,7 +214,8 @@ impl Config {
             }
         }
         if self.audio.enabled {
-            if self.audio.transcription_model.is_empty() || self.audio.understanding_model.is_empty()
+            if self.audio.transcription_model.is_empty()
+                || self.audio.understanding_model.is_empty()
             {
                 return Err(SeraError::Config(
                     "audio.transcription_model and audio.understanding_model are required when audio is enabled"
@@ -389,6 +393,9 @@ pub struct LlmConfig {
     pub oauth_client_id_secret: String,
     #[serde(default)]
     pub oauth_client_secret_secret: String,
+    /// Cloud Code companion project. Empty omits `project` from the envelope.
+    #[serde(default)]
+    pub project_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -415,6 +422,9 @@ pub struct ProviderConfig {
     pub oauth_client_id_secret: String,
     #[serde(default)]
     pub oauth_client_secret_secret: String,
+    /// Cloud Code companion project. Empty omits `project` from the envelope.
+    #[serde(default)]
+    pub project_id: String,
 }
 
 impl Default for ProviderConfig {
@@ -431,6 +441,7 @@ impl Default for ProviderConfig {
             refresh_token_secret: String::new(),
             oauth_client_id_secret: String::new(),
             oauth_client_secret_secret: String::new(),
+            project_id: String::new(),
         }
     }
 }
@@ -452,6 +463,7 @@ impl LlmConfig {
             refresh_token_secret: self.refresh_token_secret.clone(),
             oauth_client_id_secret: self.oauth_client_id_secret.clone(),
             oauth_client_secret_secret: self.oauth_client_secret_secret.clone(),
+            project_id: self.project_id.clone(),
         }
     }
 }
@@ -476,6 +488,7 @@ impl Default for LlmConfig {
             refresh_token_secret: String::new(),
             oauth_client_id_secret: String::new(),
             oauth_client_secret_secret: String::new(),
+            project_id: String::new(),
             classes: BTreeMap::new(),
         }
     }

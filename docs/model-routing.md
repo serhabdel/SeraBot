@@ -148,11 +148,12 @@ Model content is not written to the audit log.
   | `minimax` | `https://api.minimax.io/v1` | `GET https://api.minimax.io/v1/models` |
   | `minimax-cn` | `https://api.minimaxi.com/v1` | `GET https://api.minimaxi.com/v1/models` |
   | `muse-code` | `https://api.meta.ai/v1` | `GET https://api.meta.ai/v1/models` |
+  | `google-antigravity` | `https://daily-cloudcode-pa.googleapis.com` | `POST /v1internal:fetchAvailableModels` on that host, then the other documented Cloud Code origins |
 
   MiniMax M Plan uses the same `minimax` kind and catalog. The subscription key and a pay-as-you-go key are different secrets; store one name in `api_key_secret` (for example `minimax_m_plan_key`). Example allowlist ids from the public docs are `MiniMax-M3.1-Flash` and `MiniMax-M3`. DeepSeek's public list uses ids such as `deepseek-flash` and `deepseek-v4-pro`. The live response is authoritative; new ids are not written back into config.
-- Other builtin kinds (openai, groq, together, fireworks, openrouter, xai, cerebras, moonshot) and `openai-compatible` use `GET {base}/models` with the looser parser. Empty kind or `openai-compatible` requires `base_url`. Cloud Code Assist hosts are rejected.
+- Other builtin kinds (openai, groq, together, fireworks, openrouter, xai, cerebras, moonshot) and `openai-compatible` use `GET {base}/models` with the looser parser. Empty kind or `openai-compatible` requires `base_url`. Those kinds reject Cloud Code Assist hosts. `google-antigravity` is the exception: its base must be a documented Cloud Code origin (or exact loopback in tests).
 - `serabot providers kinds` lists kinds without a network call. `serabot providers login muse-code` stores the minted key and identity token in the age secret store and prints only the verification URL and user code. A later 401 mints a replacement key from that identity token.
-- `google-antigravity` refreshes an OAuth token when a refresh secret and client secret are stored. It has no default chat base and does not speak the Cloud Code Assist protocol.
+- `google-antigravity` uses loopback PKCE (`serabot providers login google-antigravity`) and then speaks Cloud Code chat and catalog on the pinned hosts. See [Antigravity](antigravity.md). A stored refresh token can still be refreshed without repeating login. The client secret stays in the age store.
 - Per-call auditing occurs after each model response, so usage totals are
   approximate if a call fails mid-stream.
 - `max_output_tokens`, timeouts, retries, tool-round limits, and SSRF/fetch policy
@@ -164,7 +165,7 @@ Model content is not written to the audit log.
 
 ## Not in this build
 
-- No browser PKCE login for `google-antigravity`, and no Cloud Code Assist model list or chat.
+- Antigravity does not import local CLI credential files, generate images, ground web search, or report quota. Thought signatures are not stored between turns. Details are in [Antigravity](antigravity.md).
 - No MiniMax Anthropic-compatible protocol (`/anthropic`). M Plan text chat stays on the OpenAI-compatible base above.
 - Muse has device login and key mint. It has no separate catalog protocol beyond the pinned `GET /v1/models`.
 - openai, groq, together, fireworks, openrouter, xai, cerebras, and moonshot are not host-pinned.

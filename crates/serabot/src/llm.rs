@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeroize::Zeroize;
 
+use crate::cloud_code::{self, CLOUD_CODE_API_CLIENT, CLOUD_CODE_USER_AGENT, CloudCodeCompletion};
 use crate::providers::{
     OAuthMaterial, OAuthStyle, USER_AGENT, enforce_oauth_target, muse_mint_api_key,
     parse_model_ids, parse_official_catalog, refresh_token_grant,
@@ -34,7 +35,7 @@ pub struct LlmResponse {
 
 struct OAuthState {
     style: OAuthStyle,
-    refresh_token: SecretString,
+    refresh_token: Mutex<SecretString>,
     token_url: String,
     client_id: String,
     client_secret: SecretString,
@@ -49,6 +50,9 @@ pub struct LlmClient {
     max_output_tokens: u32,
     max_retries: usize,
     oauth: Option<Arc<OAuthState>>,
+    /// `Some` selects the Cloud Code transport. The string is the project id, or
+    /// empty when the envelope must omit `project`.
+    cloud_code: Option<String>,
 }
 
 impl std::fmt::Debug for LlmClient {
@@ -85,7 +89,15 @@ impl LlmClient {
             max_output_tokens,
             max_retries: 2,
             oauth: None,
+            cloud_code: None,
         })
+    }
+
+    pub fn with_cloud_code(mut self, project_id: impl Into<String>) -> Result<Self> {
+        let project_id = project_id.into();
+        cloud_code::validate_project_id("google-antigravity", &project_id)?;
+        self.cloud_code = Some(project_id);
+        Ok(self)
     }
 
     pub fn with_oauth(self, material: OAuthMaterial) -> Result<Self> {
@@ -107,7 +119,7 @@ impl LlmClient {
         }
         self.oauth = Some(Arc::new(OAuthState {
             style: material.style,
-            refresh_token: SecretString::new(material.refresh_token),
+            refresh_token: Mutex::new(SecretString::new(material.refresh_token)),
             token_url,
             client_id: material.client_id,
             client_secret: SecretString::new(material.client_secret),
@@ -139,9 +151,14 @@ impl LlmClient {
         model_override: Option<&str>,
         temperature: Option<f32>,
     ) -> Result<LlmResponse> {
-        let model = model_override.unwrap_or(&self.model);
+        let model = model_override.unwrap_or(&self.model).to_owned();
         if model.is_empty() {
             return Err(SeraError::Config("LLM model is not configured".into()));
+        }
+        if self.cloud_code.is_some() {
+            return self
+                .complete_cloud_code(messages, tools, &model, temperature)
+                .await;
         }
         let mut body = json!({
             "model": model,
@@ -231,6 +248,12 @@ impl LlmClient {
         catalog_url: &str,
         strict: bool,
     ) -> Result<std::collections::BTreeSet<String>> {
+        if url::Url::parse(catalog_url)
+            .ok()
+            .is_some_and(|url| url.path().ends_with(":fetchAvailableModels"))
+        {
+            return self.fetch_cloud_code_catalog(catalog_url).await;
+        }
         let url = validate_base_url(catalog_url)?;
         let mut refreshed = false;
         let mut last_error = None;
@@ -300,22 +323,40 @@ impl LlmClient {
             .ok_or_else(|| SeraError::External("oauth refresh is not configured".into()))?;
         let token = match oauth.style {
             OAuthStyle::MuseMint => {
-                muse_mint_api_key(
-                    &self.http,
-                    &oauth.token_url,
-                    oauth.refresh_token.expose_secret(),
-                )
-                .await?
+                let refresh = oauth
+                    .refresh_token
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .expose_secret()
+                    .to_owned();
+                muse_mint_api_key(&self.http, &oauth.token_url, &refresh).await?
             }
             OAuthStyle::RefreshToken => {
-                refresh_token_grant(
+                let mut refresh = oauth
+                    .refresh_token
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .expose_secret()
+                    .to_owned();
+                let mut client_secret = oauth.client_secret.expose_secret().to_owned();
+                let grant = refresh_token_grant(
                     &self.http,
                     &oauth.token_url,
-                    oauth.refresh_token.expose_secret(),
+                    &refresh,
                     &oauth.client_id,
-                    oauth.client_secret.expose_secret(),
+                    &client_secret,
                 )
-                .await?
+                .await;
+                refresh.zeroize();
+                client_secret.zeroize();
+                let grant = grant?;
+                if let Some(rotated) = grant.refresh_token {
+                    *oauth
+                        .refresh_token
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = SecretString::new(rotated);
+                }
+                grant.access_token
             }
         };
         *self
@@ -324,6 +365,287 @@ impl LlmClient {
             .unwrap_or_else(|error| error.into_inner()) = SecretString::new(token);
         Ok(())
     }
+
+    async fn complete_cloud_code(
+        &self,
+        messages: &[LlmMessage],
+        tools: &[ToolSpec],
+        model: &str,
+        temperature: Option<f32>,
+    ) -> Result<LlmResponse> {
+        let project = self.cloud_code.clone().unwrap_or_default();
+        let targets = cloud_code::chat_targets(&self.base_url)?;
+        let mut refreshed = false;
+        let mut last_status = None;
+        for _ in 0..2 {
+            let mut restart = false;
+            for target in &targets {
+                let mut session_bumped = false;
+                loop {
+                    let envelope = cloud_code::build_cloud_code_envelope(
+                        model,
+                        &project,
+                        messages,
+                        tools,
+                        self.max_output_tokens,
+                        temperature,
+                    )?;
+                    match self
+                        .post_cloud(&target.stream, &envelope, model, true)
+                        .await?
+                    {
+                        CloudPost::Ready(bytes) => {
+                            return cloud_completion(cloud_code::parse_cloud_code_completion(
+                                &bytes,
+                            )?);
+                        }
+                        CloudPost::Unauthorized if !refreshed && self.oauth.is_some() => {
+                            refreshed = true;
+                            self.refresh_oauth().await?;
+                            restart = true;
+                            break;
+                        }
+                        CloudPost::SessionLimited if !session_bumped => {
+                            session_bumped = true;
+                            continue;
+                        }
+                        CloudPost::NotFound => {
+                            match self
+                                .post_cloud(&target.generate, &envelope, model, false)
+                                .await?
+                            {
+                                CloudPost::Ready(bytes) => {
+                                    return cloud_completion(
+                                        cloud_code::parse_cloud_code_completion(&bytes)?,
+                                    );
+                                }
+                                CloudPost::Unauthorized if !refreshed && self.oauth.is_some() => {
+                                    refreshed = true;
+                                    self.refresh_oauth().await?;
+                                    restart = true;
+                                    break;
+                                }
+                                CloudPost::SessionLimited if !session_bumped => {
+                                    session_bumped = true;
+                                    continue;
+                                }
+                                CloudPost::NotFound => {
+                                    last_status = Some(404);
+                                    break;
+                                }
+                                CloudPost::Retryable(status) => {
+                                    last_status = Some(status);
+                                    break;
+                                }
+                                CloudPost::Failed(message) => {
+                                    return Err(SeraError::External(message));
+                                }
+                                CloudPost::Unauthorized => {
+                                    return Err(SeraError::External(
+                                        "Cloud Code request failed with status 401".into(),
+                                    ));
+                                }
+                                CloudPost::SessionLimited | CloudPost::Transport => break,
+                            }
+                        }
+                        CloudPost::Retryable(status) => {
+                            last_status = Some(status);
+                            break;
+                        }
+                        CloudPost::Failed(message) => return Err(SeraError::External(message)),
+                        CloudPost::Unauthorized => {
+                            return Err(SeraError::External(
+                                "Cloud Code request failed with status 401".into(),
+                            ));
+                        }
+                        CloudPost::SessionLimited | CloudPost::Transport => break,
+                    }
+                }
+                if restart {
+                    break;
+                }
+            }
+            if !restart {
+                break;
+            }
+        }
+        Err(match last_status {
+            Some(status) => {
+                SeraError::External(format!("Cloud Code request failed with status {status}"))
+            }
+            None => SeraError::External("Cloud Code request failed".into()),
+        })
+    }
+
+    async fn fetch_cloud_code_catalog(
+        &self,
+        catalog_url: &str,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let urls = cloud_code::catalog_urls(catalog_url)?;
+        let project = self.cloud_code.clone().unwrap_or_default();
+        let body = if project.is_empty() {
+            json!({})
+        } else {
+            json!({"project": project})
+        };
+        let mut refreshed = false;
+        let mut last_status = None;
+        for _ in 0..2 {
+            let mut restart = false;
+            for url in &urls {
+                match self.post_cloud(url, &body, "", false).await? {
+                    CloudPost::Ready(bytes) => return cloud_code::parse_cloud_code_catalog(&bytes),
+                    CloudPost::Unauthorized if !refreshed && self.oauth.is_some() => {
+                        refreshed = true;
+                        self.refresh_oauth().await?;
+                        restart = true;
+                        break;
+                    }
+                    CloudPost::Unauthorized => {
+                        return Err(SeraError::External(
+                            "model catalog failed with status 401".into(),
+                        ));
+                    }
+                    CloudPost::NotFound => last_status = Some(404),
+                    CloudPost::Retryable(status) => last_status = Some(status),
+                    CloudPost::SessionLimited => last_status = Some(400),
+                    CloudPost::Failed(message) => return Err(SeraError::External(message)),
+                    CloudPost::Transport => {}
+                }
+            }
+            if !restart {
+                break;
+            }
+        }
+        Err(match last_status {
+            Some(status) => {
+                SeraError::External(format!("model catalog failed with status {status}"))
+            }
+            None => SeraError::External("model catalog request failed".into()),
+        })
+    }
+
+    async fn post_cloud(
+        &self,
+        url: &str,
+        body: &Value,
+        model: &str,
+        stream: bool,
+    ) -> Result<CloudPost> {
+        let mut key = self.bearer();
+        let mut request = self
+            .http
+            .post(url)
+            .bearer_auth(&key)
+            .header("user-agent", CLOUD_CODE_USER_AGENT)
+            .header("x-goog-api-client", CLOUD_CODE_API_CLIENT)
+            .header(
+                "accept",
+                if stream {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                },
+            )
+            .json(body);
+        if cloud_code::requests_interleaved_thinking(model) {
+            request = request.header("anthropic-beta", "interleaved-thinking-2025-05-14");
+        }
+        let response = request.send().await;
+        key.zeroize();
+        let response = match response {
+            Ok(response) => response,
+            Err(_) => return Ok(CloudPost::Transport),
+        };
+        Ok(classify_cloud(response, stream).await)
+    }
+}
+
+enum CloudPost {
+    Ready(Vec<u8>),
+    Unauthorized,
+    NotFound,
+    SessionLimited,
+    Retryable(u16),
+    Failed(String),
+    Transport,
+}
+
+async fn classify_cloud(response: reqwest::Response, allow_session: bool) -> CloudPost {
+    let status = response.status().as_u16();
+    if status == 200 {
+        if response.content_length().is_some_and(|len| len > 4_194_304) {
+            return CloudPost::Failed("Cloud Code response is too large".into());
+        }
+        return match response.bytes().await {
+            Ok(bytes) if bytes.len() > 4_194_304 => {
+                CloudPost::Failed("Cloud Code response is too large".into())
+            }
+            Ok(bytes) => CloudPost::Ready(bytes.to_vec()),
+            Err(_) => CloudPost::Transport,
+        };
+    }
+    if status == 401 {
+        return CloudPost::Unauthorized;
+    }
+    if status == 404 {
+        return CloudPost::NotFound;
+    }
+    if status == 400 && allow_session {
+        let bytes = response.bytes().await.unwrap_or_default();
+        let limited = bytes.len().min(65_536);
+        let text = String::from_utf8_lossy(&bytes[..limited]);
+        if text
+            .to_ascii_lowercase()
+            .contains("exceeds the maximum number of tokens")
+        {
+            return CloudPost::SessionLimited;
+        }
+        return CloudPost::Failed("Cloud Code request failed with status 400".into());
+    }
+    if status == 403 || status == 429 || status >= 500 {
+        return CloudPost::Retryable(status);
+    }
+    CloudPost::Failed(format!("Cloud Code request failed with status {status}"))
+}
+
+fn cloud_completion(parsed: CloudCodeCompletion) -> Result<LlmResponse> {
+    let content = if parsed.text.is_empty() {
+        None
+    } else {
+        Some(parsed.text)
+    };
+    let tool_calls = parsed
+        .tool_calls
+        .into_iter()
+        .map(|call| ToolCall {
+            id: call.id,
+            name: call.name,
+            arguments: call.arguments,
+        })
+        .collect::<Vec<_>>();
+    if content.as_deref().unwrap_or_default().trim().is_empty() && tool_calls.is_empty() {
+        return Err(SeraError::External(
+            "Cloud Code response contained no content".into(),
+        ));
+    }
+    Ok(LlmResponse {
+        message: LlmMessage {
+            role: Role::Assistant,
+            content,
+            tool_calls,
+            tool_call_id: None,
+            name: None,
+        },
+        usage: Usage {
+            prompt_tokens: parsed.prompt_tokens,
+            completion_tokens: parsed.completion_tokens,
+            total_tokens: parsed
+                .prompt_tokens
+                .saturating_add(parsed.completion_tokens),
+        },
+        finish_reason: parsed.finish_reason,
+    })
 }
 
 fn catalog_body_too_large(response: &reqwest::Response) -> bool {
@@ -664,5 +986,80 @@ mod tests {
         assert!(ids.contains("muse-spark"));
         assert!(!format!("{ids:?}").contains("identity-token"));
         assert!(!format!("{ids:?}").contains("old-key"));
+    }
+
+    #[tokio::test]
+    async fn cloud_code_chat_buffers_sse_without_echoing_the_bearer() {
+        let server = MockServer::start().await;
+        let secret = "synthetic-cloud-token";
+        Mock::given(method("POST"))
+            .and(path("/v1internal:streamGenerateContent"))
+            .and(header("authorization", "Bearer synthetic-cloud-token"))
+            .and(header("user-agent", CLOUD_CODE_USER_AGENT))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"synthetic-thought\"},{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":1}}}\n\n",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), secret, 10, 128)
+            .unwrap()
+            .with_cloud_code("proj-synthetic")
+            .unwrap()
+            .with_model("gemini-3.8-flash");
+        let response = client
+            .complete(&[LlmMessage::user("hello")], &[tool()], None, None)
+            .await
+            .unwrap();
+        assert_eq!(response.message.content.as_deref(), Some("hello"));
+        assert!(
+            !response
+                .message
+                .content
+                .unwrap()
+                .contains("synthetic-thought")
+        );
+        assert_eq!(response.usage.total_tokens, 3);
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = requests[0].body_json().unwrap();
+        assert_eq!(body["project"], "proj-synthetic");
+        assert_eq!(body["model"], "gemini-3.8-flash");
+        assert_eq!(
+            body["request"]["tools"][0]["functionDeclarations"][0]["parameters"]["type"],
+            "OBJECT"
+        );
+        assert!(body.get("access_token").is_none());
+        assert!(!body.to_string().contains(secret));
+    }
+
+    #[tokio::test]
+    async fn cloud_code_catalog_is_a_post_and_drops_error_bodies() {
+        let server = MockServer::start().await;
+        let secret = "synthetic-catalog-secret";
+        Mock::given(method("POST"))
+            .and(path("/v1internal:fetchAvailableModels"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(secret))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), "synthetic-key", 10, 100)
+            .unwrap()
+            .with_cloud_code("")
+            .unwrap();
+        let error = client
+            .fetch_model_catalog(
+                &format!("{}/v1internal:fetchAvailableModels", server.uri()),
+                true,
+            )
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("500"));
+        assert!(!message.contains(secret));
+        assert!(!message.contains("synthetic-key"));
+        let evil = client
+            .fetch_model_catalog("https://evil.example/v1internal:fetchAvailableModels", true)
+            .await
+            .unwrap_err();
+        assert!(!evil.to_string().contains("evil.example"));
     }
 }

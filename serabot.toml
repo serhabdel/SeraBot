@@ -103,12 +103,18 @@ models = [
 # [llm.providers.antigravity]
 # kind = "google-antigravity"
 # auth = "oauth"
-# base_url = "https://api.example.com/v1"
+# # Empty base_url uses https://daily-cloudcode-pa.googleapis.com. Other documented
+# # Cloud Code origins are allowed; OpenAI-compatible hosts are not.
 # api_key_secret = "antigravity_access_token"
 # refresh_token_secret = "antigravity_refresh_token"
 # oauth_client_secret_secret = "antigravity_oauth_client_secret"
+# # Leave oauth_client_id_secret empty to use the built-in Antigravity client id.
+# project_id = ""
 # models = ["example-model"]
+# catalog_fetch = true
 # data_egress_approved = false
+# One-time sign-in: store the published desktop client secret, then
+# `serabot providers login google-antigravity`. See docs/antigravity.md.
 
 [embeddings]
 model = "multilingual-e5-small"

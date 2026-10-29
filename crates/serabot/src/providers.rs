@@ -1,10 +1,11 @@
 //! Native provider registry.
 //!
-//! Chat stays on OpenAI-compatible `/chat/completions`. OAuth credentials stay in
-//! the age secret store. Live catalogs are fetched only after egress consent and
-//! are intersected with the owner allowlist. Mistral, DeepSeek, MiniMax (including
-//! M Plan on the same OpenAI-compatible host), MiniMax China, and Muse pin catalog
-//! fetches to their documented hosts.
+//! OpenAI-compatible providers chat on `/chat/completions`. `google-antigravity`
+//! chats on the Cloud Code envelope instead. OAuth credentials stay in the age
+//! secret store. Live catalogs are fetched only after egress consent and are
+//! intersected with the owner allowlist. Mistral, DeepSeek, MiniMax (including
+//! M Plan on the same OpenAI-compatible host), MiniMax China, Muse, and
+//! Antigravity pin catalog fetches to their documented hosts.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -19,8 +20,7 @@ use crate::llm::validate_base_url;
 
 pub const MUSE_CLIENT_ID: &str = "1031625952748946";
 pub const MUSE_API_VERSION: &str = "1.0.0";
-pub const ANTIGRAVITY_CLIENT_ID: &str =
-    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+pub use crate::cloud_code::ANTIGRAVITY_CLIENT_ID;
 
 const MUSE_AUTH_HOST: &str = "auth.meta.com";
 const MUSE_API_HOST: &str = "api.meta.ai";
@@ -160,9 +160,9 @@ const BUILTINS: &[BuiltinProvider] = &[
     },
     BuiltinProvider {
         kind: "google-antigravity",
-        base_url: None,
+        base_url: Some("https://daily-cloudcode-pa.googleapis.com"),
         auth: "oauth",
-        summary: "Google OAuth refresh; chat base must be OpenAI-compatible",
+        summary: "Antigravity PKCE; Cloud Code chat and POST /v1internal:fetchAvailableModels",
     },
 ];
 
@@ -220,6 +220,16 @@ pub fn canonical_kind(kind: &str) -> Result<String> {
 
 pub fn resolve_base_url(kind: &str, base_url: &str) -> Result<String> {
     let kind = canonical_kind(kind)?;
+    if kind == "google-antigravity" {
+        let chosen = if base_url.trim().is_empty() {
+            "https://daily-cloudcode-pa.googleapis.com"
+        } else {
+            base_url
+        };
+        let endpoint = validate_base_url(chosen)?;
+        let _ = crate::cloud_code::cloud_code_origins(&endpoint)?;
+        return Ok(endpoint);
+    }
     let chosen = if base_url.trim().is_empty() {
         BUILTINS
             .iter()
@@ -321,6 +331,12 @@ pub fn check_profile(
 
 pub fn resolve_catalog(kind: &str, base_url: &str) -> Result<ResolvedCatalog> {
     let kind = canonical_kind(kind)?;
+    if kind == "google-antigravity" {
+        return Ok(ResolvedCatalog {
+            url: crate::cloud_code::primary_catalog_url(base_url)?,
+            strict: true,
+        });
+    }
     let base = validate_base_url(base_url)?;
     let parsed =
         url::Url::parse(&base).map_err(|_| SeraError::Config("invalid catalog base url".into()))?;
@@ -508,13 +524,30 @@ pub async fn muse_mint_api_key(
     Ok(key.to_owned())
 }
 
+pub struct AccessGrant {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+}
+
+impl fmt::Debug for AccessGrant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AccessGrant")
+            .field("access_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
 pub async fn refresh_token_grant(
     http: &reqwest::Client,
     token_url: &str,
     refresh_token: &str,
     client_id: &str,
     client_secret: &str,
-) -> Result<String> {
+) -> Result<AccessGrant> {
     let response = http
         .post(token_url)
         .header("user-agent", USER_AGENT)
@@ -546,7 +579,15 @@ pub async fn refresh_token_grant(
         .and_then(Value::as_str)
         .filter(|token| credential_ok(token))
         .ok_or_else(|| SeraError::External("oauth token refresh failed".into()))?;
-    Ok(token.to_owned())
+    let rotated = value
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .filter(|token| credential_ok(token))
+        .map(str::to_owned);
+    Ok(AccessGrant {
+        access_token: token.to_owned(),
+        refresh_token: rotated,
+    })
 }
 
 pub async fn login_muse_code<F>(http: &reqwest::Client, on_code: F) -> Result<MuseCredentials>
@@ -785,9 +826,14 @@ mod tests {
             resolve_base_url("minimax", "").unwrap(),
             "https://api.minimax.io/v1"
         );
-        assert!(
-            resolve_base_url("google-antigravity", "https://cloudcode-pa.googleapis.com").is_err()
+        assert_eq!(
+            resolve_base_url("google-antigravity", "").unwrap(),
+            "https://daily-cloudcode-pa.googleapis.com"
         );
+        assert!(
+            resolve_base_url("google-antigravity", "https://cloudcode-pa.googleapis.com").is_ok()
+        );
+        assert!(resolve_base_url("google-antigravity", "https://evil.example").is_err());
         assert!(
             resolve_base_url(
                 "openai-compatible",
@@ -955,6 +1001,14 @@ mod tests {
                 .url,
             "https://api.meta.ai/v1/models"
         );
+        assert_eq!(
+            resolve_catalog("google-antigravity", "https://cloudcode-pa.googleapis.com")
+                .unwrap()
+                .url,
+            "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
+        );
+        assert!(resolve_catalog("google-antigravity", "https://evil.example").is_err());
+        assert!(check_profile("google-antigravity", "", "", "", "", true, 1800).is_ok());
         let loopback = resolve_catalog("mistral", "http://127.0.0.1:9/v1").unwrap();
         assert!(loopback.strict);
         assert_eq!(loopback.url, "http://127.0.0.1:9/v1/models");

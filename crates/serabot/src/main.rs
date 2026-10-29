@@ -4,13 +4,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use secrecy::ExposeSecret;
 use clap::{Parser, Subcommand};
+use secrecy::ExposeSecret;
 use serabot::api::{ApiNotifier, ApiState};
 use serabot::audio::{
     AudioTranscribeTool, AudioUnderstandTool, MistralAudioClient, resolve_audio_provider,
 };
-use serabot::browser::{register_browser_tools, BrowserSession};
+use serabot::browser::{BrowserSession, register_browser_tools};
 use serabot::config::{Config, load_bots};
 use serabot::connectors::register_connector_tools;
 use serabot::deck::Brand;
@@ -33,9 +33,9 @@ use serabot::onedrive::OneDriveClient;
 use serabot::policy::Policy;
 use serabot::retrieval::{Retriever, SqliteRetriever};
 use serabot::runtime::{CompositeNotifier, Notifier, RagSearchTool, Runtime, ScheduledPayload};
-use serabot::skills::{SkillCatalog, SkillRuntime, init_skill, register_skill_tools};
 use serabot::scheduler::{due_routines, ensure_daily_routine};
 use serabot::secrets::{SecretStore, ensure_identity};
+use serabot::skills::{SkillCatalog, SkillRuntime, init_skill, register_skill_tools};
 use serabot::store::Store;
 use serabot::telegram::TelegramClient;
 use serabot::tools::{
@@ -101,7 +101,7 @@ enum SkillCommand {
 enum ProvidersCommand {
     /// Print builtin provider kinds. Does not contact a provider.
     Kinds,
-    /// Device login for muse-code. Prints the verification URL and user code only.
+    /// Device login for muse-code, or loopback PKCE for google-antigravity.
     Login { kind: String },
 }
 
@@ -175,12 +175,13 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
             }
-            ProvidersCommand::Login { kind } => {
-                if kind != "muse-code" {
-                    anyhow::bail!("provider login is implemented for muse-code");
-                }
-                login_muse(&cli.config).await?;
-            }
+            ProvidersCommand::Login { kind } => match kind.as_str() {
+                "muse-code" => login_muse(&cli.config).await?,
+                "google-antigravity" => login_antigravity(&cli.config).await?,
+                _ => anyhow::bail!(
+                    "provider login is implemented for muse-code and google-antigravity"
+                ),
+            },
         },
         Command::Skill { command } => match command {
             SkillCommand::Init { name, description } => {
@@ -481,12 +482,14 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         telegram = Some(client);
     }
     if config.firecrawl.enabled {
-        let api_key = secrets.require(&config.firecrawl.api_key_secret).map_err(|error| {
-            anyhow::anyhow!(
-                "{error}; run `serabot secrets set {}` first",
-                config.firecrawl.api_key_secret
-            )
-        })?;
+        let api_key = secrets
+            .require(&config.firecrawl.api_key_secret)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "{error}; run `serabot secrets set {}` first",
+                    config.firecrawl.api_key_secret
+                )
+            })?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(config.firecrawl.timeout_secs.max(5)))
             .redirect(reqwest::redirect::Policy::none())
@@ -571,17 +574,13 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         notifiers.push(Arc::new(ApiNotifier::new(store.clone())));
     }
     let catalog = Arc::new(SkillCatalog::load(&config)?);
-    register_skill_tools(
-        &mut registry,
-        SkillRuntime::new(catalog, &bots),
-    )?;
-    let bot_map: Arc<std::collections::HashMap<String, serabot::config::LoadedBot>> =
-        Arc::new(
-            bots.iter()
-                .cloned()
-                .map(|bot| (bot.config.name.clone(), bot))
-                .collect(),
-        );
+    register_skill_tools(&mut registry, SkillRuntime::new(catalog, &bots))?;
+    let bot_map: Arc<std::collections::HashMap<String, serabot::config::LoadedBot>> = Arc::new(
+        bots.iter()
+            .cloned()
+            .map(|bot| (bot.config.name.clone(), bot))
+            .collect(),
+    );
     registry.register(serabot::delegate::DelegateTool::new(
         store.clone(),
         bot_map,
@@ -755,40 +754,97 @@ fn open_provider_client(
     use serabot::providers::{AuthPlan, OAuthMaterial, OAuthStyle, auth_plan, resolve_base_url};
     let endpoint = resolve_base_url(&profile.kind, &profile.base_url)?;
     let api_key = secrets.require(&profile.api_key_secret)?.to_owned();
-    let client = LlmClient::new(&endpoint, api_key, timeout_secs, max_output_tokens)?;
+    let mut client = LlmClient::new(&endpoint, api_key, timeout_secs, max_output_tokens)?;
     let plan = auth_plan(&profile.kind, &profile.auth)?;
-    let AuthPlan::OAuth {
+    if let AuthPlan::OAuth {
         style,
         token_url,
         client_id_fallback,
     } = plan
-    else {
-        return Ok(client);
-    };
-    if profile.refresh_token_secret.trim().is_empty() {
-        return Ok(client);
+    {
+        if !profile.refresh_token_secret.trim().is_empty() {
+            let refresh_token = secrets.require(&profile.refresh_token_secret)?.to_owned();
+            let client_id = if profile.oauth_client_id_secret.trim().is_empty() {
+                client_id_fallback.unwrap_or("").to_owned()
+            } else {
+                secrets.require(&profile.oauth_client_id_secret)?.to_owned()
+            };
+            let client_secret = if profile.oauth_client_secret_secret.trim().is_empty() {
+                String::new()
+            } else {
+                secrets
+                    .require(&profile.oauth_client_secret_secret)?
+                    .to_owned()
+            };
+            if style == OAuthStyle::RefreshToken && client_secret.is_empty() {
+                anyhow::bail!("oauth client secret is required to refresh this provider");
+            }
+            client = client.with_oauth(OAuthMaterial {
+                style,
+                refresh_token,
+                token_url: token_url.to_owned(),
+                client_id,
+                client_secret,
+            })?;
+        }
     }
-    let refresh_token = secrets.require(&profile.refresh_token_secret)?.to_owned();
-    let client_id = if profile.oauth_client_id_secret.trim().is_empty() {
-        client_id_fallback.unwrap_or("").to_owned()
-    } else {
-        secrets.require(&profile.oauth_client_id_secret)?.to_owned()
-    };
-    let client_secret = if profile.oauth_client_secret_secret.trim().is_empty() {
-        String::new()
-    } else {
-        secrets.require(&profile.oauth_client_secret_secret)?.to_owned()
-    };
-    if style == OAuthStyle::RefreshToken && client_secret.is_empty() {
-        anyhow::bail!("oauth client secret is required to refresh this provider");
+    if serabot::providers::canonical_kind(&profile.kind)? == "google-antigravity" {
+        client = client.with_cloud_code(&profile.project_id)?;
     }
-    Ok(client.with_oauth(OAuthMaterial {
-        style,
-        refresh_token,
-        token_url: token_url.to_owned(),
-        client_id,
-        client_secret,
-    })?)
+    Ok(client)
+}
+
+async fn login_antigravity(config_path: &std::path::Path) -> anyhow::Result<()> {
+    use zeroize::Zeroize;
+    let config = Config::load(config_path)?;
+    let mut store = SecretStore::open(&config)?;
+    let profile = config.llm.providers.iter().find(|(id, profile)| {
+        *id == "antigravity" || *id == "google-antigravity" || profile.kind == "google-antigravity"
+    });
+    let api_name = profile
+        .map(|(_, profile)| profile.api_key_secret.clone())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "antigravity_access_token".into());
+    let refresh_name = profile
+        .map(|(_, profile)| profile.refresh_token_secret.clone())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "antigravity_refresh_token".into());
+    let secret_name = profile
+        .map(|(_, profile)| profile.oauth_client_secret_secret.clone())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "antigravity_oauth_client_secret".into());
+    if let Some(id_name) = profile
+        .map(|(_, profile)| profile.oauth_client_id_secret.clone())
+        .filter(|name| !name.trim().is_empty())
+    {
+        let stored = store.require(&id_name)?;
+        if stored != serabot::providers::ANTIGRAVITY_CLIENT_ID {
+            anyhow::bail!("oauth client id does not match the Antigravity client");
+        }
+    }
+    let mut client_secret = store.require(&secret_name)?.to_owned();
+    let login = serabot::cloud_code::login_antigravity(&client_secret, |url| {
+        println!("Open {url}");
+    })
+    .await;
+    client_secret.zeroize();
+    let login = login?;
+    store.set(&api_name, login.access_token.expose_secret())?;
+    store.set(&refresh_name, login.refresh_token.expose_secret())?;
+    store.save()?;
+    println!("stored secret names {api_name} and {refresh_name}");
+    match login.project_id.as_deref() {
+        Some(project) => {
+            println!("project_id={project}");
+            println!(
+                "Set project_id on the google-antigravity provider. An empty project_id omits the field."
+            );
+        }
+        None => println!(
+            "No Cloud Code project was provisioned. Chat and catalog omit project until project_id is set."
+        ),
+    }
+    Ok(())
 }
 
 async fn login_muse(config_path: &std::path::Path) -> anyhow::Result<()> {

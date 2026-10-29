@@ -132,6 +132,7 @@ impl ModelRouter {
                 profile.catalog_fetch,
                 profile.catalog_ttl_secs,
             )?;
+            crate::cloud_code::validate_project_id(&kind, &profile.project_id)?;
             let endpoint = resolve_base_url(&kind, &profile.base_url)?;
             if profile.api_key_secret.trim().is_empty() || profile.models.is_empty() {
                 return Err(SeraError::Config(
@@ -168,6 +169,7 @@ impl ModelRouter {
                 profile.catalog_fetch,
                 &catalog_url,
                 auth_label,
+                &profile.project_id,
             ))?);
             providers.insert(
                 id.to_owned(),
@@ -1214,5 +1216,89 @@ mod tests {
             .map(|request| request.url.path().to_owned())
             .collect();
         assert_eq!(paths, vec!["/models".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn antigravity_catalog_posts_to_cloud_code_and_fails_closed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1internal:fetchAvailableModels"))
+            .and(header("authorization", "Bearer synthetic-antigravity"))
+            .and(body_partial_json(json!({"project": "proj-synthetic"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": {
+                    "kept-model": {},
+                    "extra-model": {},
+                    "bad/id": {"note": "synthetic-catalog-secret"}
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let base = server.uri();
+        let config = LlmConfig {
+            base_url: base.clone(),
+            model: "kept-model".into(),
+            data_egress_approved: true,
+            kind: "google-antigravity".into(),
+            catalog_fetch: true,
+            catalog_ttl_secs: 60,
+            project_id: "proj-synthetic".into(),
+            models: vec!["missing-model".into()],
+            ..LlmConfig::default()
+        };
+        let clients = BTreeMap::from([(
+            "default".into(),
+            LlmClient::new(&base, "synthetic-antigravity", 1, 100)
+                .unwrap()
+                .with_cloud_code("proj-synthetic")
+                .unwrap(),
+        )]);
+        let router = ModelRouter::new(&config, clients).unwrap();
+        let reports = router.refresh_catalogs().await.unwrap();
+        assert!(reports[0].fetched && reports[0].verified);
+        assert_eq!(reports[0].model_count, 1);
+        assert_eq!(router.catalog()[0].models, vec!["kept-model".to_string()]);
+        assert!(
+            router
+                .catalog_gate(&ModelSelection {
+                    provider: "default".into(),
+                    model: "missing-model".into(),
+                })
+                .is_err()
+        );
+
+        let loose = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1internal:fetchAvailableModels"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [{"id": "kept-model"}],
+                "note": "synthetic-catalog-secret"
+            })))
+            .mount(&loose)
+            .await;
+        let loose_router = ModelRouter::new(
+            &LlmConfig {
+                base_url: loose.uri(),
+                model: "kept-model".into(),
+                data_egress_approved: true,
+                kind: "google-antigravity".into(),
+                catalog_fetch: true,
+                catalog_ttl_secs: 60,
+                ..LlmConfig::default()
+            },
+            BTreeMap::from([(
+                "default".into(),
+                LlmClient::new(loose.uri(), "synthetic-key", 1, 100)
+                    .unwrap()
+                    .with_cloud_code("")
+                    .unwrap(),
+            )]),
+        )
+        .unwrap();
+        let loose_reports = loose_router.refresh_catalogs().await.unwrap();
+        assert!(loose_reports[0].fetched && !loose_reports[0].verified);
+        assert!(loose_router.catalog()[0].models.is_empty());
     }
 }
