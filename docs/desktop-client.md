@@ -136,18 +136,21 @@ network work stays on the Rust worker/SSE threads, never on the UI thread.
   provider catalog (requires `catalog_fetch = true` on the server). Model
   selection is saved per conversation and applies to the next turn; a running
   turn keeps its pinned route. Only egress-approved providers are selectable;
-  the separate confirmation checkbox was removed. An "Add a provider" generator
-  produces the TOML block and secret command for an OpenAI-compatible provider;
-  the app never writes server config or secrets.
+  the separate confirmation checkbox was removed. The form adds or updates an
+  OpenAI-compatible or built-in provider, stores the key in the age store, and
+  can delete providers created here. Anthropic's native Messages API is not a
+  transport yet; an OpenAI-compatible gateway in front of Anthropic works.
 - **Connectors** — all configured connectors are listed with enabled state,
-  redirect URI, and secret names. Each card has copyable `serabot secrets set`
-  commands for missing keys. Secret writes and OAuth login stay on the server
-  CLI.
+  redirect URI, and secret names. Toggle a connector, paste its client id,
+  client secret, refresh token, or AgentMail key, then save. OAuth authorization
+  itself still happens out of band; the app stores the refresh token. Enabling a
+  connector only makes its tools available; grant them to a bot in **Fleet**.
 - **Settings → Capabilities** — reads the authenticated health payload and
   shows Audio (on/off with the configured transcription and understanding
   models), Firecrawl, Telegram, and whether model catalogs are live or static.
-  These are server flags; the card points at the exact key to change when a
-  capability is off.
+  Audio can be enabled and its two Mistral model names edited here. Audio uses
+  the provider credentials already in the age store; the console never asks for
+  a second copy of the chat key.
 - **Live updates** — the Rust core opens `GET /v1/events` on a dedicated thread
   with its own HTTP client, reconnects with backoff, and resumes from the last
   event id (`after=` / `Last-Event-ID`). Events coalesce into at most one
@@ -164,6 +167,28 @@ network work stays on the Rust worker/SSE threads, never on the UI thread.
   client reports an unknown outcome and refuses to resend automatically; review
   server state first.
 - Late responses from a previous connection or conversation are discarded.
+
+## Administration
+
+Provider, connector, and audio writes use the owner token and land in
+`admin-overrides.json` beside the SQLite database (on the standard host,
+`/var/lib/serabot/admin-overrides.json`). That file holds non-secret settings
+only; credentials go to the age store and are never returned by the API. The
+overlay is merged over `serabot.toml` at startup, so saved changes take effect
+after **Restart server and apply** in the status banner.
+
+- The restart endpoint refuses while a task is queued, running, or awaiting
+  approval, and requires an explicit `confirm` in the request.
+- The service exits with a failure status so `serabot.service`
+  (`Restart=on-failure`) brings it back; the console reconnects automatically.
+  A server started by hand will stop instead.
+- Every write is audited (`config.provider_saved`, `config.connector_saved`,
+  `config.audio_saved`, `config.restart_requested`). Rejection messages name the
+  field or secret to fix, never a secret value.
+- A provider id cannot be `default` or `auto`, and a new key cannot overwrite a
+  secret that another provider still uses.
+- `serabot.toml` remains the source for server bind, tunnels, OAuth client IDs,
+  and the base provider set; the app never edits it.
 
 ## Fleet
 
@@ -222,4 +247,10 @@ collapsible release notes, **Install and restart**, **Later**, and
   disconnects.
 - Deck artifact download / Italian→French approve flows remain server/Telegram
   oriented (`/v1/artifacts/...`); they are not yet a first-class desktop panel.
+- Anthropic's native Messages API is not implemented; use an OpenAI-compatible
+  gateway or the built-in providers.
+- OAuth consent for Google, Microsoft, and Notion still happens outside the app;
+  paste the resulting refresh token in **Connectors**.
+- Admin saves require a service restart. If the unit is not managed by systemd
+  with `Restart=on-failure`, restart it yourself.
 - No live provider or Telegram verification is implied by the synthetic tests.

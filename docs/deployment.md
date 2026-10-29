@@ -70,6 +70,17 @@ ldd target/release/serabot | head
 
 7. Roll back by restoring the previous binary and restarting only this service.
 
+### Owner-managed settings
+
+The owner console writes only to `admin-overrides.json` next to the SQLite
+database (`/var/lib/serabot/admin-overrides.json` on the standard host), which
+is inside `ReadWritePaths`. Providers, connector enable flags, and audio
+settings in that file are merged over `serabot.toml` at startup; secrets are
+written to the age store. `/etc/serabot` stays read-only. Applying a change
+restarts only `serabot.service`: the process exits non-zero, and the unit's
+`Restart=on-failure` brings it back. Keep that restart policy in place if you
+want the console's **Restart server and apply** button to work.
+
 Do not touch Docker, OpenBot, the OneDrive MCP service, or the existing
 Cloudflare tunnel. The separate additive `cloudflared-bot` unit below is a new
 service, not a change to that tunnel.
