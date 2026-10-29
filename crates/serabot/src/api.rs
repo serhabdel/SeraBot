@@ -3,7 +3,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -144,6 +144,10 @@ pub fn router(state: ApiState) -> Router {
             "/v1/conversations/{id}/messages",
             get(conversation_messages),
         )
+        .route(
+            "/v1/conversations/{id}/team",
+            get(conversation_team).put(set_conversation_team),
+        )
         .route("/v1/tasks/{id}", get(task))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}/decide", post(decide_approval))
@@ -151,11 +155,20 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/audit", get(audit))
         .route("/v1/artifacts/{hash}", get(artifact))
         .route("/v1/artifacts/{hash}/approve", post(approve_artifact))
-        .layer(middleware::from_fn_with_state(shared.clone(), authorize))
-        .layer(middleware::from_fn_with_state(shared.clone(), rate_limit))
         .layer(RequestBodyLimitLayer::new(
             shared.config.server.body_limit_bytes,
         ));
+    // Voice capture posts raw bytes up to the Telegram voice ceiling; the JSON
+    // endpoints keep the smaller server body limit.
+    let audio = Router::new()
+        .route("/v1/audio/transcribe", post(transcribe_audio))
+        .layer(RequestBodyLimitLayer::new(
+            crate::audio::DEFAULT_TELEGRAM_AUDIO_MAX_BYTES as usize,
+        ));
+    let protected = protected
+        .merge(audio)
+        .layer(middleware::from_fn_with_state(shared.clone(), authorize))
+        .layer(middleware::from_fn_with_state(shared.clone(), rate_limit));
     crate::web::router()
         .merge(protected)
         .layer(TraceLayer::new_for_http())
@@ -352,6 +365,242 @@ async fn conversation_messages(
         })
         .collect::<Vec<_>>();
     Ok(Json(json!({"messages": messages})))
+}
+
+/// Team rejections must be HTTP 400 with the offending value named, so they do
+/// not use the generic `SeraError::Validation` mapping (422, message dropped).
+fn team_error(error: SeraError) -> Response {
+    match error {
+        SeraError::Validation(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": message, "code": "invalid_team"})),
+        )
+            .into_response(),
+        other => other.into_response(),
+    }
+}
+
+/// A conversation that may carry a team: it must exist and be a `room:`.
+fn team_conversation(state: &ApiState, id: &str) -> Result<StoredConversation> {
+    validate_conversation_id(id)?;
+    let record = state
+        .store
+        .get_conversation(id)?
+        .ok_or_else(|| SeraError::NotFound(format!("conversation {id}")))?;
+    if crate::store::parse_stored_conversation_kind(&record.kind)? != ConversationKind::Room {
+        return Err(SeraError::Validation(
+            "a team is only available on a room conversation".into(),
+        ));
+    }
+    Ok(record)
+}
+
+fn team_member_view(state: &ApiState, bots: &[crate::config::ConfiguredBot], bot: &str) -> Value {
+    let entry = bots.iter().find(|candidate| candidate.id == bot);
+    json!({
+        "bot": bot,
+        "role": entry.map(|entry| entry.role.clone()).unwrap_or_else(|| "unknown".into()),
+        "enabled": entry.is_some_and(|entry| entry.enabled),
+        "live": state.runtime.bot_loaded(bot),
+    })
+}
+
+fn team_view(
+    state: &ApiState,
+    conversation_id: &str,
+    members: &[String],
+    mode: &str,
+) -> Result<Value> {
+    let bots = crate::config::list_configured_bots(&state.config)?;
+    let members = members
+        .iter()
+        .map(|bot| team_member_view(state, &bots, bot))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "conversation_id": conversation_id,
+        "mode": mode,
+        "members": members,
+        "max_members": crate::teams::MAX_TEAM_MEMBERS,
+    }))
+}
+
+async fn conversation_team(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> Response {
+    let body = (|| -> Result<Value> {
+        team_conversation(&state, &id)?;
+        let (members, mode) = match state.store.get_conversation_team(&id)? {
+            Some(team) => (team.members, team.mode),
+            // No team yet is an empty shape, never a 404.
+            None => (
+                Vec::new(),
+                crate::teams::TeamMode::Selected.as_str().to_owned(),
+            ),
+        };
+        let body = team_view(&state, &id, &members, &mode)?;
+        state.runtime.scan_owner_output(&body.to_string())?;
+        Ok(body)
+    })();
+    match body {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => team_error(error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetTeamRequest {
+    members: Vec<String>,
+    #[serde(default = "default_team_mode")]
+    mode: String,
+}
+
+fn default_team_mode() -> String {
+    crate::teams::TeamMode::Selected.as_str().to_owned()
+}
+
+async fn set_conversation_team(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(request): Json<SetTeamRequest>,
+) -> Response {
+    let body = (|| -> Result<Value> {
+        team_conversation(&state, &id)?;
+        let mode = crate::teams::TeamMode::from_name(&request.mode)?;
+        crate::teams::validate_members(&request.members)?;
+        let bots = crate::config::list_configured_bots(&state.config)?;
+        for member in &request.members {
+            let entry = bots.iter().find(|candidate| candidate.id == *member);
+            let Some(entry) = entry else {
+                return Err(SeraError::Validation(format!("unknown bot {member}")));
+            };
+            if member == crate::orchestration::ORCHESTRATOR_BOT || entry.role == "orchestrator" {
+                return Err(SeraError::Validation(format!(
+                    "bot {member} cannot be a team member"
+                )));
+            }
+            if !entry.enabled {
+                return Err(SeraError::Validation(format!("bot {member} is disabled")));
+            }
+            if !state.runtime.bot_loaded(member) {
+                return Err(SeraError::Validation(format!("bot {member} is not loaded")));
+            }
+        }
+        state
+            .store
+            .set_conversation_team(&id, &request.members, mode.as_str())?;
+        let details = json!({
+            "conversation_id": id,
+            "members": request.members,
+            "mode": mode.as_str(),
+        });
+        state.store.record_audit(
+            "owner",
+            crate::teams::AUDIT_MEMBER_SET,
+            None,
+            None,
+            None,
+            None,
+            Some(state.runtime.policy_version()),
+            Some(&details),
+        )?;
+        state
+            .store
+            .append_event(crate::teams::AUDIT_MEMBER_SET, &details)?;
+        let body = team_view(&state, &id, &request.members, mode.as_str())?;
+        state.runtime.scan_owner_output(&body.to_string())?;
+        Ok(body)
+    })();
+    match body {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => team_error(error),
+    }
+}
+
+/// Raw owner audio, transcribed with the configured audio provider.
+async fn transcribe_audio(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let filename = headers
+        .get("x-audio-filename")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let Some(filename) = filename else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "X-Audio-Filename header is required",
+                "code": "validation",
+            })),
+        )
+            .into_response();
+    };
+    if filename.len() > 128
+        || filename
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':' | '"' | '\''))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid audio filename", "code": "validation"})),
+        )
+            .into_response();
+    }
+    if body.len() as u64 > crate::audio::DEFAULT_TELEGRAM_AUDIO_MAX_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "error": format!(
+                    "audio payload exceeds the {} byte limit",
+                    crate::audio::DEFAULT_TELEGRAM_AUDIO_MAX_BYTES
+                ),
+                "code": "validation",
+            })),
+        )
+            .into_response();
+    }
+    if let crate::audio::AudioProviderState::Unavailable(message) =
+        crate::audio::audio_provider_state(&state.config)
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": message, "code": "audio_unavailable"})),
+        )
+            .into_response();
+    }
+    match crate::audio::transcribe_audio_bytes(&state.config, &body, &filename).await {
+        Ok(text) => {
+            if let Err(error) = state.runtime.scan_owner_output(&text) {
+                return error.into_response();
+            }
+            Json(json!({
+                "text": text,
+                "filename": filename,
+                "bytes": body.len(),
+            }))
+            .into_response()
+        }
+        Err(SeraError::Validation(message)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": message, "code": "validation"})),
+        )
+            .into_response(),
+        Err(SeraError::Config(message)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": message, "code": "audio_unavailable"})),
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(%error, "audio transcription failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "transcription failed", "code": "audio_failed"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 fn task_view(task: &Task) -> Value {
@@ -1511,6 +1760,42 @@ mod tests {
         policy: Policy,
         base_dir: std::path::PathBuf,
     ) -> (Router, Arc<Config>, Store) {
+        app_with_fleet(
+            egress_approved,
+            policy,
+            base_dir,
+            vec![test_bot(
+                "main",
+                crate::orchestration::BotRole::Orchestrator,
+            )],
+        )
+    }
+
+    fn test_bot(name: &str, role: crate::orchestration::BotRole) -> LoadedBot {
+        LoadedBot {
+            config: BotConfig {
+                name: name.into(),
+                trigger: "command".into(),
+                model: None,
+                system_prompt: format!("prompts/{name}.txt"),
+                skills: vec![],
+                tools: vec![],
+                require_approval: vec![],
+                enabled: true,
+                temperature: None,
+                role,
+                delegates: vec![],
+            },
+            prompt: "test prompt".into(),
+        }
+    }
+
+    fn app_with_fleet(
+        egress_approved: bool,
+        policy: Policy,
+        base_dir: std::path::PathBuf,
+        bots: Vec<LoadedBot>,
+    ) -> (Router, Arc<Config>, Store) {
         let mut config = Config::default();
         config.api.enabled = true;
         config.api.token_hash = sha256_hex("test-token-that-is-long-enough-123");
@@ -1525,22 +1810,6 @@ mod tests {
         config.database.path = database.to_string_lossy().into_owned();
         let config = Arc::new(config);
         let store = Store::open(&database, 384, 5000).unwrap();
-        let bot = LoadedBot {
-            config: BotConfig {
-                name: "main".into(),
-                trigger: "command".into(),
-                model: None,
-                system_prompt: "prompts/main.txt".into(),
-                skills: vec![],
-                tools: vec![],
-                require_approval: vec![],
-                enabled: true,
-                temperature: None,
-                role: Default::default(),
-                delegates: vec![],
-            },
-            prompt: "test prompt".into(),
-        };
         let gateway = Gateway::new(
             store.clone(),
             Arc::new(policy),
@@ -1560,7 +1829,7 @@ mod tests {
                 std::collections::BTreeMap::from([("default".into(), llm)]),
             )
             .unwrap(),
-            vec![bot],
+            bots,
             Arc::new(NullNotifier),
             tokio_util::sync::CancellationToken::new(),
         )
@@ -3228,5 +3497,265 @@ mod tests {
         assert_eq!(resume_cursor(&HeaderMap::new(), Some(-3)), 0);
         headers.insert("last-event-id", "not-a-number".parse().unwrap());
         assert_eq!(resume_cursor(&headers, None), 0);
+    }
+
+    /// A running fleet that matches the on-disk fleet directory used by
+    /// `list_configured_bots` (analyst, maker, watcher enabled; legal disabled).
+    fn app_with_team() -> (Router, Arc<Config>, Store) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::env::current_dir().unwrap());
+        app_with_fleet(
+            true,
+            Policy::empty(),
+            root,
+            vec![
+                test_bot("main", crate::orchestration::BotRole::Orchestrator),
+                test_bot("analyst", crate::orchestration::BotRole::Specialist),
+                test_bot("maker", crate::orchestration::BotRole::Specialist),
+                test_bot("watcher", crate::orchestration::BotRole::Specialist),
+            ],
+        )
+    }
+
+    #[tokio::test]
+    async fn team_endpoint_round_trip_and_member_validation() {
+        let (app, _, store) = app_with_team();
+        let created = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/conversations",
+                true,
+                Some(json!({"kind": "room", "slug": "review"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+
+        // No team yet: an empty shape, never a 404.
+        let empty = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/conversations/room:review/team",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::OK);
+        let body = read_json(empty).await;
+        assert_eq!(body["conversation_id"], "room:review");
+        assert_eq!(body["mode"], "selected");
+        assert_eq!(body["members"], json!([]));
+        assert_eq!(body["max_members"], 5);
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PUT",
+                "/v1/conversations/room:review/team",
+                true,
+                Some(json!({
+                    "members": ["analyst", "maker", "watcher"],
+                    "mode": "selected"
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        assert_eq!(
+            body["members"][0],
+            json!({"bot": "analyst", "role": "specialist", "enabled": true, "live": true})
+        );
+        assert_eq!(body["members"][1]["bot"], "maker");
+        assert_eq!(body["members"][2]["bot"], "watcher");
+        assert_eq!(body["mode"], "selected");
+
+        let stored = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/conversations/room:review/team",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        let body = read_json(stored).await;
+        assert_eq!(body["members"].as_array().unwrap().len(), 3);
+        assert_eq!(body["members"][1]["live"], true);
+
+        let audit = store.list_audit(50).unwrap();
+        let entry = audit
+            .iter()
+            .find(|entry| entry.event == "team.member_set")
+            .expect("team.member_set audit");
+        let details = entry.details.as_ref().unwrap();
+        assert_eq!(details["members"], json!(["analyst", "maker", "watcher"]));
+        assert_eq!(details["mode"], "selected");
+        assert!(
+            store
+                .events_after(0, 100)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "team.member_set")
+        );
+
+        let cases = [
+            (
+                json!({"members": [], "mode": "selected"}),
+                "at least one member",
+            ),
+            (
+                json!({"members": ["analyst", "analyst"], "mode": "selected"}),
+                "unique",
+            ),
+            (
+                json!({"members": ["bot-1", "bot-2", "bot-3", "bot-4", "bot-5", "bot-6"], "mode": "selected"}),
+                "at most 5",
+            ),
+            (json!({"members": ["ghost"], "mode": "selected"}), "ghost"),
+            (json!({"members": ["main"], "mode": "selected"}), "main"),
+            (json!({"members": ["legal"], "mode": "selected"}), "legal"),
+            (
+                json!({"members": ["analyst"], "mode": "everyone"}),
+                "selected or all",
+            ),
+        ];
+        for (payload, needle) in cases {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    &app,
+                    "PUT",
+                    "/v1/conversations/room:review/team",
+                    true,
+                    Some(payload),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let value = read_json(response).await;
+            let message = value["error"].as_str().unwrap().to_owned();
+            assert!(
+                message.contains(needle),
+                "{message} should mention {needle}"
+            );
+        }
+
+        // Mode `all` is stored as given.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PUT",
+                "/v1/conversations/room:review/team",
+                true,
+                Some(json!({"members": ["analyst", "maker"], "mode": "all"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        assert_eq!(body["mode"], "all");
+        assert_eq!(body["members"].as_array().unwrap().len(), 2);
+
+        // Unknown conversation, non-room conversation, unauthenticated call.
+        let missing = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PUT",
+                "/v1/conversations/room:ghost/team",
+                true,
+                Some(json!({"members": ["analyst"], "mode": "selected"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let direct = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/conversations",
+                true,
+                Some(json!({"kind": "direct", "slug": "analyst"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(direct.status(), StatusCode::OK);
+        let wrong_kind = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PUT",
+                "/v1/conversations/dir:analyst/team",
+                true,
+                Some(json!({"members": ["analyst"], "mode": "selected"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong_kind.status(), StatusCode::BAD_REQUEST);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/conversations/room:review/team",
+                false,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn audio_transcribe_requires_a_configured_provider() {
+        let (app, _, _) = app();
+        let no_filename = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/audio/transcribe")
+                    .header("authorization", "Bearer test-token-that-is-long-enough-123")
+                    .body(Body::from(vec![0u8, 1, 2]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_filename.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/audio/transcribe")
+                    .header("authorization", "Bearer test-token-that-is-long-enough-123")
+                    .header("x-audio-filename", "note.webm")
+                    .body(Body::from(vec![0u8, 1, 2]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = read_json(response).await;
+        let message = body["error"].as_str().unwrap().to_owned();
+        assert!(message.contains("audio.enabled"), "{message}");
+        assert!(!message.contains("synthetic-test-key"), "{message}");
     }
 }

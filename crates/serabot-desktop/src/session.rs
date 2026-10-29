@@ -6,7 +6,7 @@
 use crate::{
     ApiError, ApprovalDecision, AudioUpdate, BotProfileUpdate, ConnectorUpdate, ConversationKind,
     MAX_SKILL_BODY_BYTES, MAX_SKILL_DESCRIPTION_CHARS, Message, NewProvider, Role,
-    SPECIALIST_TOOLS, Selection, TaskStatus,
+    SPECIALIST_TOOLS, Selection, TaskStatus, TeamMode,
     api::{
         MEMORY_KINDS, valid_conversation_title, valid_credential, valid_memory_content,
         valid_memory_kind, valid_memory_source, valid_model_id, valid_provider_id,
@@ -15,9 +15,9 @@ use crate::{
     creds,
     events::{EventStream, EventUpdate},
     state::State,
-    updater, valid_bot_description, valid_bot_id, valid_conversation_parent, valid_id,
+    teams, updater, valid_bot_description, valid_bot_id, valid_conversation_parent, valid_id,
     valid_new_skill_id, valid_skill_body, valid_skill_description, valid_slug, valid_text,
-    valid_token, validate_tool_list,
+    valid_token, validate_team_members, validate_tool_list,
     worker::{Credentials, Job, Operation, OperationKind, Worker},
 };
 use secrecy::ExposeSecret;
@@ -240,6 +240,19 @@ pub struct UpdateUi {
     pub rx: Option<std::sync::mpsc::Receiver<Result<Option<updater::UpdateInfo>, String>>>,
 }
 
+/// The live sandbox posture read from `GET /v1/status`.
+///
+/// The read runs on its own thread so the console never blocks on it. A
+/// failed read keeps the last known posture and reports the error; nothing
+/// here is ever guessed.
+#[derive(Default)]
+pub struct StatusUi {
+    pub status: Option<crate::ServerStatus>,
+    pub error: Option<String>,
+    pub loading: bool,
+    rx: Option<std::sync::mpsc::Receiver<Result<crate::ServerStatus, String>>>,
+}
+
 pub struct Session {
     pub state: State,
     pub worker: Option<Worker>,
@@ -271,8 +284,14 @@ pub struct Session {
     pub rename: Option<RenameDraft>,
     pub archive_confirm: Option<String>,
     pub update: UpdateUi,
+    pub status: StatusUi,
     pub toast: Option<String>,
     pending: Option<OperationKind>,
+    /// The team to write on a room that is being created right now.
+    pending_team: Option<Vec<String>>,
+    /// Set when the console opened a freshly created room: the room is
+    /// reloaded once its team has been written.
+    pending_room_refresh: bool,
     reconnect_at: Option<Instant>,
     scheduled: Option<(Instant, Operation)>,
     next_request: Instant,
@@ -328,8 +347,11 @@ impl Session {
             rename: None,
             archive_confirm: None,
             update: UpdateUi::default(),
+            status: StatusUi::default(),
             toast: None,
             pending: None,
+            pending_team: None,
+            pending_room_refresh: false,
             reconnect_at: None,
             scheduled: None,
             next_request: Instant::now(),
@@ -459,7 +481,13 @@ impl Session {
         self.events_dirty = false;
         self.rename = None;
         self.archive_confirm = None;
+        self.pending_team = None;
+        self.pending_room_refresh = false;
         if !connected {
+            self.status.status = None;
+            self.status.rx = None;
+            self.status.loading = false;
+            self.status.error = None;
             self.state.created_bot = None;
             self.state.created_conversation = None;
             self.state.created_skill = None;
@@ -514,7 +542,64 @@ impl Session {
         if section != Section::Fleet {
             self.selected_bot = None;
         }
+        if section == Section::Settings {
+            self.refresh_status();
+        }
         self.ensure_section_data();
+    }
+
+    /// Read the live sandbox posture from `GET /v1/status`.
+    ///
+    /// The read runs on its own thread so the console never blocks on it. A
+    /// failed read keeps the last known posture and reports the error.
+    pub fn refresh_status(&mut self) {
+        if self.status.loading {
+            return;
+        }
+        let Some(credentials) = &self.credentials else {
+            self.status.status = None;
+            self.status.error = Some("Not connected.".into());
+            return;
+        };
+        let endpoint = credentials.endpoint.clone();
+        let token = secrecy::SecretString::new(credentials.token.expose_secret().to_owned());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.status.rx = Some(receiver);
+        self.status.loading = true;
+        self.status.error = None;
+        if std::thread::Builder::new()
+            .name("serabot-status".into())
+            .spawn(move || {
+                let result = crate::api::ApiClient::new(endpoint, token)
+                    .and_then(|client| client.status())
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(result);
+            })
+            .is_err()
+        {
+            self.status.rx = None;
+            self.status.loading = false;
+            self.status.error = Some("Could not read the server status.".into());
+        }
+    }
+
+    /// Drain the status read, if one is running.
+    fn poll_status(&mut self) {
+        let Some(receiver) = &self.status.rx else {
+            return;
+        };
+        let Ok(result) = receiver.try_recv() else {
+            return;
+        };
+        self.status.rx = None;
+        self.status.loading = false;
+        match result {
+            Ok(status) => {
+                self.status.status = Some(status);
+                self.status.error = None;
+            }
+            Err(error) => self.status.error = Some(error),
+        }
     }
 
     pub fn open_conversation(&mut self, id: String) {
@@ -784,6 +869,7 @@ impl Session {
         self.receive();
         self.flush_events();
         self.poll_updates();
+        self.poll_status();
         if let Some(at) = self.reconnect_at {
             if Instant::now() >= at {
                 self.reconnect_at = None;
@@ -984,6 +1070,42 @@ impl Session {
                     self.refreshing = false;
                     self.scheduled = None;
                     self.poll_paused = true;
+                    // Team and transcript problems stay in their own surface
+                    // instead of the global banner. An unknown team write keeps
+                    // the global message: it must not be replayed.
+                    match completion.kind {
+                        OperationKind::Team | OperationKind::TeamWrite => {
+                            self.state.team_error = Some(message.clone());
+                            self.state.team_loading = false;
+                            // The room stays; the team can be written again
+                            // from the Team sheet.
+                            let initial = self.pending_room_refresh;
+                            self.pending_room_refresh = false;
+                            if initial {
+                                // The room was created but its team was not
+                                // written. The room is kept and the owner is
+                                // told; nothing is deleted or resent.
+                                self.admin_notice = Some(format!(
+                                    "The room was created, but its team was not set: {message}"
+                                ));
+                                if !self.state.unknown_outcome {
+                                    self.state.error = None;
+                                }
+                            } else if !self.state.unknown_outcome {
+                                self.state.error = None;
+                            }
+                        }
+                        OperationKind::CreateConversation => {
+                            // No room was created, so no team is pending.
+                            self.pending_team = None;
+                        }
+                        OperationKind::Transcribe => {
+                            self.state.transcript_error = Some(message.clone());
+                            self.state.transcript_loading = false;
+                            self.state.error = None;
+                        }
+                        _ => {}
+                    }
                     if !self.state.connected {
                         self.connect_error = Some(message);
                         self.restarting = false;
@@ -1097,12 +1219,18 @@ impl Session {
                             self.fleet.conv_title.clear();
                             self.fleet.conv_slug.clear();
                             self.fleet.conv_parent.clear();
-                            self.schedule(
-                                Operation::ListConversations {
-                                    include_archived: false,
-                                },
-                                Duration::ZERO,
-                            );
+                            if let Some(members) = self.pending_team.take() {
+                                // The room exists now; its team is written on
+                                // the room itself in the next step.
+                                self.apply_initial_team(members);
+                            } else {
+                                self.schedule(
+                                    Operation::ListConversations {
+                                        include_archived: false,
+                                    },
+                                    Duration::ZERO,
+                                );
+                            }
                         }
                         OperationKind::RenameConversation | OperationKind::ArchiveConversation => {
                             let archived_current = completion.kind
@@ -1150,6 +1278,31 @@ impl Session {
                             self.schedule(Operation::Approvals, Duration::ZERO)
                         }
                         OperationKind::Connectors => self.sync_connector_drafts(),
+                        OperationKind::TeamWrite => {
+                            // The write returned the saved team; read it back so
+                            // the console shows the server's own view.
+                            self.state.team_loading = true;
+                            self.schedule(Operation::GetTeam, Duration::ZERO);
+                        }
+                        OperationKind::Team => {
+                            // A freshly created room is reloaded once its team
+                            // has been written, so the chat opens on the room.
+                            if self.pending_room_refresh {
+                                self.pending_room_refresh = false;
+                                self.refresh();
+                            }
+                        }
+                        OperationKind::Transcribe => {
+                            // The transcript is untrusted model output: it goes
+                            // into the composer as a draft and is never sent.
+                            self.state.transcript_loading = false;
+                            if let Some(text) = self.state.transcript.clone() {
+                                if !self.composer.trim().is_empty() {
+                                    self.composer.push('\n');
+                                }
+                                self.composer.push_str(&text);
+                            }
+                        }
                         OperationKind::AdminWrite => {
                             self.provider.api_key.zeroize();
                             for draft in self.connector_drafts.values_mut() {
@@ -1596,14 +1749,29 @@ impl Session {
         parent: Option<String>,
         title: String,
     ) {
+        if let Some(operation) = self.prepare_conversation(kind, slug, parent, title) {
+            self.start_request(operation);
+        }
+    }
+
+    /// Validate a conversation draft and return the create operation.
+    ///
+    /// The checks are local: nothing is sent to the server until they pass.
+    fn prepare_conversation(
+        &mut self,
+        kind: ConversationKind,
+        slug: String,
+        parent: Option<String>,
+        title: String,
+    ) -> Option<Operation> {
         if !valid_slug(&slug) || valid_conversation_parent(kind, parent.as_deref()).is_err() {
             self.state.error = Some("Check the conversation slug and parent.".into());
-            return;
+            return None;
         }
         let title = title.trim().to_owned();
         if !title.is_empty() && !valid_conversation_title(&title) {
             self.state.error = Some("Conversation name must be 1–120 characters.".into());
-            return;
+            return None;
         }
         let title = if self.state.conversation_titles == Some(true) {
             title
@@ -1616,12 +1784,88 @@ impl Session {
             }
             String::new()
         };
-        self.start_request(Operation::CreateConversation {
+        Some(Operation::CreateConversation {
             kind,
             slug,
             parent_id: parent.filter(|parent| !parent.trim().is_empty()),
             title: (!title.is_empty()).then_some(title),
-        });
+        })
+    }
+
+    /// Create a room and give it its team in one step.
+    ///
+    /// The room is created first (`POST /v1/conversations`). When the created
+    /// conversation is a `room:` and the owner picked members, the team is
+    /// written afterwards (`PUT /v1/conversations/{id}/team`, mode
+    /// `selected`). A failed team write keeps the room: the error is shown
+    /// and the room stays, so nothing is deleted and nothing is replayed.
+    pub fn create_conversation_with_team(
+        &mut self,
+        kind: ConversationKind,
+        slug: String,
+        parent: Option<String>,
+        title: String,
+        members: Vec<String>,
+    ) {
+        let members = if kind == ConversationKind::Room && !members.is_empty() {
+            if let Err(error) = validate_team_members(&members) {
+                self.state.team_error = Some(error.to_string());
+                return;
+            }
+            Some(members)
+        } else {
+            if kind != ConversationKind::Room && !members.is_empty() {
+                self.admin_notice =
+                    Some("Only rooms carry a team; this one was created without it.".into());
+            }
+            None
+        };
+        let Some(operation) = self.prepare_conversation(kind, slug, parent, title) else {
+            return;
+        };
+        self.pending_team = members;
+        self.start_request(operation);
+    }
+
+    /// Write the team of the room that was just created.
+    ///
+    /// The console opens the new room and writes the team there, because the
+    /// team endpoint only works on the open room.
+    fn apply_initial_team(&mut self, members: Vec<String>) {
+        let Some(created) = self.state.created_conversation.clone() else {
+            self.admin_notice = Some("The room was created but its team was not set.".into());
+            self.schedule(
+                Operation::ListConversations {
+                    include_archived: false,
+                },
+                Duration::ZERO,
+            );
+            return;
+        };
+        if !crate::is_room_conversation(&created.id) {
+            self.admin_notice =
+                Some("Only rooms carry a team; this one was created without it.".into());
+            self.schedule(
+                Operation::ListConversations {
+                    include_archived: false,
+                },
+                Duration::ZERO,
+            );
+            return;
+        }
+        self.conversation = created.id.clone();
+        self.section = Section::Chat;
+        self.reset_scope(true);
+        self.state.team_error = None;
+        self.state.team_loading = true;
+        self.pending_room_refresh = true;
+        self.schedule(
+            Operation::SetTeam {
+                members,
+                mode: TeamMode::Selected,
+            },
+            Duration::ZERO,
+        );
     }
 
     pub fn rename_conversation(&mut self, id: String, title: String) {
@@ -1667,6 +1911,146 @@ impl Session {
 
     pub fn skill_limits() -> (usize, usize) {
         (MAX_SKILL_DESCRIPTION_CHARS, MAX_SKILL_BODY_BYTES)
+    }
+
+    /// Load the team of the open room. Only a `room:` conversation has one;
+    /// anywhere else the call sets a clear error and makes no request.
+    pub fn refresh_team(&mut self) {
+        if !self.team_allowed() {
+            return;
+        }
+        if !self.ready() {
+            self.state.team_error = Some("Wait for the current request to finish.".into());
+            return;
+        }
+        self.state.team_loading = true;
+        self.state.team_error = None;
+        self.start_request(Operation::GetTeam);
+        if self.pending.is_none() {
+            self.state.team_loading = false;
+        }
+    }
+
+    /// Replace the team members. The list is validated locally first, then
+    /// written with `PUT`, then the team is read back.
+    pub fn set_team_members(&mut self, members: Vec<String>) {
+        if !self.team_allowed() {
+            return;
+        }
+        if let Err(error) = validate_team_members(&members) {
+            self.state.team_error = Some(error.to_string());
+            return;
+        }
+        if !self.ready() {
+            self.state.team_error = Some("Wait for the current request to finish.".into());
+            return;
+        }
+        let mode = self
+            .state
+            .team
+            .as_ref()
+            .map(|team| team.mode)
+            .unwrap_or(TeamMode::Selected);
+        self.state.team_error = None;
+        self.state.team_loading = true;
+        self.start_request(Operation::SetTeam { members, mode });
+        if self.pending.is_none() {
+            self.state.team_loading = false;
+        }
+    }
+
+    /// Switch the team mode. The current member list is written with it.
+    pub fn set_team_mode(&mut self, mode: TeamMode) {
+        if !self.team_allowed() {
+            return;
+        }
+        let Some(team) = self.state.team.clone() else {
+            self.state.team_error = Some("Load the team before changing its mode.".into());
+            return;
+        };
+        if team.mode == mode {
+            return;
+        }
+        let members = teams::member_ids(&team);
+        if let Err(error) = validate_team_members(&members) {
+            self.state.team_error = Some(error.to_string());
+            return;
+        }
+        if !self.ready() {
+            self.state.team_error = Some("Wait for the current request to finish.".into());
+            return;
+        }
+        self.state.team_error = None;
+        self.state.team_loading = true;
+        self.start_request(Operation::SetTeam { members, mode });
+        if self.pending.is_none() {
+            self.state.team_loading = false;
+        }
+    }
+
+    /// Add one bot to the team. A bot that is already a member is ignored.
+    pub fn add_team_member(&mut self, bot: String) {
+        if !self.team_allowed() {
+            return;
+        }
+        let Some(team) = self.state.team.clone() else {
+            self.state.team_error = Some("Load the team before adding a bot.".into());
+            return;
+        };
+        let Some(members) = teams::with_member(&team, &bot) else {
+            return;
+        };
+        self.set_team_members(members);
+    }
+
+    /// Remove one bot from the team. A bot that is not a member is ignored.
+    pub fn remove_team_member(&mut self, bot: String) {
+        if !self.team_allowed() {
+            return;
+        }
+        let Some(team) = self.state.team.clone() else {
+            self.state.team_error = Some("Load the team before removing a bot.".into());
+            return;
+        };
+        if teams::member(&team, &bot).is_none() {
+            return;
+        }
+        let members: Vec<String> = teams::member_ids(&team)
+            .into_iter()
+            .filter(|member| member != &bot)
+            .collect();
+        if members.is_empty() {
+            self.state.team_error = Some("A team needs at least one member.".into());
+            return;
+        }
+        self.set_team_members(members);
+    }
+
+    /// Send a recorded note for transcription. The transcript returns as a
+    /// draft in the composer; it is never sent on its own.
+    pub fn transcribe_audio(&mut self, filename: String, bytes: Vec<u8>) {
+        if !self.ready() {
+            self.state.transcript_error = Some("Wait for the current request to finish.".into());
+            return;
+        }
+        self.state.transcript_error = None;
+        self.state.transcript_loading = true;
+        self.start_request(Operation::TranscribeAudio { filename, bytes });
+        if self.pending.is_none() {
+            self.state.transcript_loading = false;
+        }
+    }
+
+    /// True when the open conversation may carry a team.
+    fn team_allowed(&mut self) -> bool {
+        if teams::is_room(&self.conversation) {
+            return true;
+        }
+        self.state.team = None;
+        self.state.team_loaded = false;
+        self.state.team_loading = false;
+        self.state.team_error = Some("Only room conversations carry a team.".into());
+        false
     }
 }
 

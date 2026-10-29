@@ -100,31 +100,34 @@ token was cleared.
 
 ## Behaviour
 
-The connected console is a Dioxus WebView2 shell: a nav rail, a conversation
-column in **Chat**, and a content pane. It is responsive down to 920×620 and all
-network work stays on the Rust worker/SSE threads, never on the UI thread.
+The connected console is a Dioxus WebView2 shell with a three-pane, glass
+layout: a 260px glass **sidebar**, the conversation column, and an optional
+300px **inspector** (which becomes a sheet below 1100px; below 920px the
+sidebar becomes an overlay drawer). All network work stays on the Rust
+worker/SSE threads, never on the UI thread. The design system — tokens,
+materials, motion, and the shared class contract — is specified in
+[Desktop redesign](desktop-redesign.md) and implemented in
+`crates/serabot-desktop/assets/app.css`.
 
-- **Rail** — Chat, Conversations, Memory, Providers, Connectors, Approvals,
-  Fleet, and Settings. Icons are inline SVG; the build ships no image assets.
-- **Appearance** — a Light/Dark switch sits on the connect card, in the header,
-  and in **Settings → Appearance**. The CSS palette switches between a deep
-  teal-black dark theme and a warm paper light theme. The choice is saved
-  locally in `settings.json` and applies before the first connection. Typography
-  uses Segoe UI Variable / Segoe UI with gradient backdrops, elevated cards, and
-  soft status chips.
-- **Header** — the active conversation title and kind, connection state, a
-  **Bots** count, the appearance switch, and refresh.
-- **Chat rail** — grouped into **Bots**, sections, rooms, and direct chats.
-  Every bot has a one-to-one row with its avatar and display name; sections and
-  groups are collapsible and show their children indented. Search filters labels
-  and assistant names. Raw ids are never the primary label: titles win, then the
-  bot profile, then a humanized slug, and numeric Telegram chats become
-  `Chat <last four>`.
-- **Chat** — messages render as bubbles with the producing bot's avatar, display
-  name, timestamp, and text. Assistant messages carry the bot that ran the turn;
-  legacy messages fall back to the orchestrator profile. An empty conversation
-  shows the bot roster. Chat history is capped at the server's recent window
-  (100 messages).
+- **Sidebar** — brand mark, **New chat**, a search field that filters labels
+  and assistant names (`Cmd/Ctrl+K`), the nav list (Chat, Conversations,
+  Memory, Providers, Connectors, Approvals, Fleet, Settings), the connection
+  status chip, and the owner chip. Thread rows reveal new-message, rename and
+  archive actions on hover.
+- **Appearance** — a Light/Dark switch sits on the connect card, in the
+  topbar, and in **Settings → Appearance**. The palette is a true Apple-style
+  pair: a deep neutral dark theme (`#0b0b0f` surfaces, `#0a84ff` accent) and a
+  true light theme (`#f5f5f7` canvas, white surfaces, `#0071e3` accent), with
+  glass materials, layered soft shadows, and spring easing. The choice is
+  saved locally in `settings.json` and applies before the first connection.
+- **Topbar** — the active conversation title and kind badge, the team avatar
+  stack for a group, the model selector, the appearance switch, and refresh.
+- **Chat** — flat avatar-led message rows, not heavy bubbles: avatar, display
+  name, role and live state, timestamp, then the body. The owner's own
+  messages align right in a capsule. A peer bot's message in a group carries
+  a hairline accent border in that bot's hue. An empty conversation shows the
+  bot roster, and a group shows its team roster with a one-tap add action.
+  Chat history is capped at the server's recent window (100 messages).
 - **Bot profiles** — open a profile from a Fleet card or from a bot chat header.
   The page shows the avatar, display name, description, role, live state,
   configured model, attached skills, and a "Can produce" summary. Display name,
@@ -132,9 +135,27 @@ network work stays on the Rust worker/SSE threads, never on the UI thread.
   admin overlay; tools, prompts, and model stay in the bot file. **Open 1:1
   chat** opens `dir:<bot>`, which the server routes to that bot rather than the
   orchestrator.
-- **Composer** — **Send** is enabled only when the catalog selection is saved and
-  approved, no unknown outcome is pending, and the conversation accepts turns.
-  Sections and groups are read-only structure.
+- **Composer** — a floating capsule with a gradient scrim so text scrolls
+  under it. **Enter** sends, **Shift+Enter** adds a line, **Esc** closes the
+  topmost sheet or menu. **Send** is enabled only when the catalog selection
+  is saved and approved, no unknown outcome is pending, and the conversation
+  accepts turns. Sections and groups are read-only structure.
+- **The "+" menu** — in the chat column header and the composer row. It opens
+  New direct chat, New group, New section and New bot. A new group can be
+  created together with its initial team (1–5 bots); the room is created
+  first and its team is set immediately after, so the two steps are one
+  gesture.
+- **Team sheet** — the group header shows the team as an avatar stack;
+  clicking it opens the sheet with each member's role, live state and model, a
+  remove action, an add-bot picker with search, and the room mode
+  (**selected** — the orchestrator picks who answers — or **all** — every
+  member answers every owner message). Changes are written through
+  `PUT /v1/conversations/{id}/team` and are audited server-side.
+- **Microphone** — the composer has a mic button. It records through the
+  WebView2 `MediaRecorder` (opus/webm, with an mp4 fallback), posts the bytes
+  to `POST /v1/audio/transcribe`, and drops the transcript into the composer
+  as an editable draft. Nothing is sent until the owner sends it, and a
+  recording failure never blocks the chat.
 - **Conversations** — create sections, groups, direct threads, and rooms with a
   display name (stored as the conversation title) and an optional parent,
   rename a thread, and archive it (soft; messages stay on the server). Rooms are
@@ -149,27 +170,36 @@ network work stays on the Rust worker/SSE threads, never on the UI thread.
   classes, and secret **names** with presence. **Fetch models** re-reads the
   provider catalog (requires `catalog_fetch = true` on the server). Model
   selection is saved per conversation and applies to the next turn; a running
-  turn keeps its pinned route. Only egress-approved providers are selectable;
-  the separate confirmation checkbox was removed. The form adds or updates an
-  OpenAI-compatible or built-in provider, stores the key in the age store, and
-  can delete providers created here. Anthropic's native Messages API is not a
-  transport yet; an OpenAI-compatible gateway in front of Anthropic works.
+  turn keeps its pinned route. Only egress-approved providers are selectable.
+  **Add provider** offers presets for OpenAI-compatible, Mistral, Groq,
+  OpenRouter-compatible, Ollama / local OpenAI-compatible, and a custom
+  entry, so the owner normally only pastes the key. Anthropic's native
+  Messages API is not a transport yet; an OpenAI-compatible gateway in front
+  of Anthropic works.
 - **Connectors** — all configured connectors are listed with enabled state,
-  redirect URI, and secret names. Toggle a connector, paste its client id,
-  client secret, refresh token, or AgentMail key, then save. OAuth authorization
-  itself still happens out of band; the app stores the refresh token. Enabling a
-  connector only makes its tools available; grant them to a bot in **Fleet**.
+  redirect URI, and secret names. **Connect** opens the provider's
+  authorization URL in the system browser (never an embedded webview), the
+  owner pastes the resulting client id, client secret, refresh token, or
+  AgentMail key, then saves. OAuth authorization itself still happens out of
+  band; the app stores the refresh token. Enabling a connector only makes its
+  tools available; grant them to a bot in **Fleet**.
 - **Settings → Capabilities** — reads the authenticated health payload and
   shows Audio (on/off with the configured transcription and understanding
   models), Firecrawl, Telegram, and whether model catalogs are live or static.
   Audio can be enabled and its two Mistral model names edited here. Audio uses
   the provider credentials already in the age store; the console never asks for
   a second copy of the chat key.
+- **Settings → Sandbox** — the live posture of the remote server: policy
+  version, pending tasks and approvals, which tools require owner approval,
+  data-egress consent per provider, and whether a restart is pending. Values
+  that the server does not report are shown as unknown, never invented.
 - **Live updates** — the Rust core opens `GET /v1/events` on a dedicated thread
   with its own HTTP client, reconnects with backoff, and resumes from the last
   event id (`after=` / `Last-Event-ID`). Events coalesce into at most one
   refreshed read per request gap; task polling remains as a stuck-stream guard
-  and is the only path when the stream is unavailable.
+  and is the only path when the stream is unavailable. Team events
+  (`team.member_set`, `team.asked`, `team.replied`, `team.turn_completed`)
+  arrive on the same stream, so an open group sheet stays current.
 - **Fleet** — opening the screen loads the bot roster and skill packs
   automatically. Every tool is shown; tools that require owner approval are
   highlighted amber (for example Firecrawl search/crawl).
@@ -263,6 +293,13 @@ collapsible release notes, **Install and restart**, **Later**, and
 
 - The desktop client cannot cancel work already accepted by the server when it
   disconnects.
+- The composer's attachment button stays disabled: the client has no inbox
+  upload path, so there is nothing honest to send yet.
+- A bot must be **enabled and loaded** before it can join a team, so a bot
+  enabled in configuration needs a server restart before it can be added.
+- A group room is a team of bots, not a multi-person chat: there are no guest
+  users and no free-form agent-to-agent chatter. The peer exchange is capped at
+  two replies per bot, three rounds, and eight messages per room turn.
 - Deck artifact download / Italian→French approve flows remain server/Telegram
   oriented (`/v1/artifacts/...`); they are not yet a first-class desktop panel.
 - Anthropic's native Messages API is not implemented; use an OpenAI-compatible

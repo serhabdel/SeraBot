@@ -26,6 +26,10 @@ use crate::orchestration::{
 use crate::retrieval::{RetrievedChunk, Retriever, evidence_block};
 use crate::skills::on_demand_skill_clause;
 use crate::store::Store;
+use crate::teams::{
+    AUDIT_ASKED, AUDIT_ROUND_COMPLETED, AUDIT_TURN_COMPLETED, TEAM_ASK_QUEUED_KEY, TEAM_ASK_TOOL,
+    TEAM_REPLY_TOOL, TeamContext, TeamMode,
+};
 use crate::util::truncate_chars;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +45,10 @@ pub struct TurnPayload {
     pub route: Option<PinnedRoute>,
     #[serde(default)]
     pub handoff: Option<HandoffContext>,
+    /// Present on turns created by `team_ask`, `team_reply`, or the room-mode
+    /// `all` fan-out. Carries the room-turn frame used to enforce the bounds.
+    #[serde(default)]
+    pub team: Option<TeamContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +86,11 @@ struct TurnState {
     /// the handoff instead of parsing the parent turn body.
     #[serde(default)]
     handoff: Option<HandoffContext>,
+    /// Present for turns created by a room team ask or peer reply.
+    #[serde(default)]
+    team: Option<TeamContext>,
+    #[serde(default)]
+    team_asked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -571,6 +584,7 @@ impl Runtime {
         }
         let selection = self.effective_model_selection(conversation_id, &bot)?;
         let route = self.router.pin(&selection)?;
+        let owner_text = text.clone();
         let payload = TurnPayload {
             conversation_id: conversation_id.to_owned(),
             text,
@@ -579,6 +593,7 @@ impl Runtime {
             ask_mode,
             route: Some(route),
             handoff: None,
+            team: None,
         };
         let task = self.store.enqueue_task(
             "turn",
@@ -591,7 +606,93 @@ impl Runtime {
             "task.queued",
             &json!({"task_id": task.id, "kind": "turn", "bot": bot}),
         )?;
+        // Room mode `all`: every team member answers the owner's message without
+        // waiting for the orchestrator to select.
+        if !ask_mode && bot == ORCHESTRATOR_BOT {
+            if let Some(team) = self.store.get_conversation_team(conversation_id)? {
+                if team.mode == TeamMode::All.as_str() {
+                    self.enqueue_team_fanout(conversation_id, &owner_text, &task.id, &team.members);
+                }
+            }
+        }
         Ok(task)
+    }
+
+    /// Queue one turn per room team member for the owner message that opened
+    /// this room turn. Members that cannot be routed are skipped: the owner's
+    /// own message never fails because of the team.
+    fn enqueue_team_fanout(
+        &self,
+        conversation_id: &str,
+        text: &str,
+        root_task_id: &str,
+        members: &[String],
+    ) {
+        for member in members {
+            let Some(bot) = self.bots.get(member) else {
+                warn!(bot = %member, "room team member is not loaded; skipped");
+                continue;
+            };
+            if !bot.config.enabled || member == ORCHESTRATOR_BOT {
+                warn!(bot = %member, "room team member cannot take a turn; skipped");
+                continue;
+            }
+            let frame = TeamContext {
+                root_task_id: root_task_id.to_owned(),
+                root_turn_id: None,
+                from_bot: ORCHESTRATOR_BOT.to_owned(),
+                round: 0,
+            };
+            let payload = (|| -> Result<serde_json::Value> {
+                let selection = self.effective_model_selection(conversation_id, member)?;
+                let route = self.router.pin(&selection)?;
+                Ok(serde_json::to_value(TurnPayload {
+                    conversation_id: conversation_id.to_owned(),
+                    text: text.to_owned(),
+                    bot: member.clone(),
+                    source: "team".into(),
+                    ask_mode: false,
+                    route: Some(route),
+                    handoff: None,
+                    team: Some(frame.clone()),
+                })?)
+            })();
+            let child = match payload.and_then(|payload| {
+                self.store
+                    .enqueue_task("turn", member, &payload, 0, Utc::now())
+            }) {
+                Ok(child) => child,
+                Err(error) => {
+                    warn!(bot = %member, %error, "room team member turn was not queued");
+                    continue;
+                }
+            };
+            let details = json!({
+                "root_task_id": root_task_id,
+                "conversation_id": conversation_id,
+                "from_bot": ORCHESTRATOR_BOT,
+                "to_bot": member,
+                "child_task_id": child.id,
+                "round": 0,
+                "mode": TeamMode::All.as_str(),
+            });
+            if let Err(error) = self
+                .store
+                .record_audit(
+                    "system",
+                    AUDIT_ASKED,
+                    None,
+                    Some(root_task_id),
+                    None,
+                    None,
+                    Some(self.gateway.policy().version()),
+                    Some(&details),
+                )
+                .and_then(|_| self.store.append_event(AUDIT_ASKED, &details))
+            {
+                warn!(bot = %member, %error, "room team ask was not audited");
+            }
+        }
     }
 
     pub async fn handle_approval(
@@ -911,7 +1012,9 @@ impl Runtime {
         let turn =
             self.store
                 .create_turn(&task.id, &payload.bot, &payload.conversation_id, &json!({}))?;
-        if payload.handoff.is_none() {
+        // A handoff or team turn reposts an objective the room already holds as
+        // the owner's message; only an owner turn appends it again.
+        if payload.handoff.is_none() && payload.team.is_none() {
             self.store.append_message(
                 &payload.conversation_id,
                 Some(&turn.id),
@@ -929,11 +1032,15 @@ impl Runtime {
             handoff_queued: false,
             handoff_to_bot: None,
             handoff: payload.handoff.clone(),
+            team: payload.team.clone(),
+            team_asked: false,
         };
         let system = if let Some(ref handoff) = payload.handoff {
             self.handoff_system_prompt(bot, &payload.text, handoff)?
+        } else if let Some(team) = &payload.team {
+            self.team_system_prompt(&payload.conversation_id, bot, &payload.text, team)?
         } else {
-            self.system_prompt(bot, payload.ask_mode)
+            self.system_prompt(&payload.conversation_id, bot, payload.ask_mode)
         };
         state.messages.push(LlmMessage::system(system));
         state.messages.extend(history);
@@ -959,7 +1066,7 @@ impl Runtime {
             .pending
             .clone()
             .ok_or_else(|| SeraError::InvalidState("turn has no pending approval".into()))?;
-        let context = self.tool_context(task, &turn, bot);
+        let context = self.tool_context(task, &turn, bot, &state)?;
         if payload.decision == "approved" {
             match self
                 .gateway
@@ -1068,6 +1175,51 @@ impl Runtime {
         } else {
             self.record_assistant(conversation_id, turn, text, false)?;
         }
+        if let Some(team) = &state.team {
+            self.record_team_completion(task, turn, team)?;
+        }
+        Ok(())
+    }
+
+    /// `team.round_completed` closes one member contribution; `team.turn_completed`
+    /// closes the room turn once no team task of it is still pending.
+    fn record_team_completion(&self, task: &Task, turn: &Turn, team: &TeamContext) -> Result<()> {
+        let details = json!({
+            "root_task_id": team.root_task_id,
+            "root_turn_id": team.root_turn_id,
+            "bot": turn.bot,
+            "from_bot": team.from_bot,
+            "round": team.round,
+        });
+        self.store.record_audit(
+            "system",
+            AUDIT_ROUND_COMPLETED,
+            None,
+            Some(&task.id),
+            None,
+            None,
+            Some(self.gateway.policy().version()),
+            Some(&details),
+        )?;
+        self.store.append_event(AUDIT_ROUND_COMPLETED, &details)?;
+        if self.store.count_pending_team_tasks(&team.root_task_id)? <= 1 {
+            let closing = json!({
+                "root_task_id": team.root_task_id,
+                "bot": turn.bot,
+                "round": team.round,
+            });
+            self.store.record_audit(
+                "system",
+                AUDIT_TURN_COMPLETED,
+                None,
+                Some(&task.id),
+                None,
+                None,
+                Some(self.gateway.policy().version()),
+                Some(&closing),
+            )?;
+            self.store.append_event(AUDIT_TURN_COMPLETED, &closing)?;
+        }
         Ok(())
     }
 
@@ -1082,11 +1234,18 @@ impl Runtime {
             .bots
             .get(&turn.bot)
             .ok_or_else(|| SeraError::NotFound(format!("bot {}", turn.bot)))?;
-        let context = self.tool_context(task, turn, bot);
+        let context = self.tool_context(task, turn, bot, &state)?;
+        let mut tool_names = bot.config.tools.clone();
+        for extra in [TEAM_ASK_TOOL, TEAM_REPLY_TOOL] {
+            if context.allowed_tools.contains(extra) && !tool_names.iter().any(|name| name == extra)
+            {
+                tool_names.push(extra.to_string());
+            }
+        }
         let tool_specs = self
             .gateway
             .registry()
-            .tools_for(&bot.config.tools)
+            .tools_for(&tool_names)
             .into_iter()
             .filter(|spec| {
                 if spec.name == DELEGATE_TOOL && bot.config.role != BotRole::Orchestrator {
@@ -1225,6 +1384,18 @@ impl Runtime {
                 )?;
                 return Ok(TurnOutcome::Completed);
             }
+            if state.team_asked {
+                let text = "Asked the room team to answer.".to_string();
+                self.notifier.send_text(conversation_id, &text).await?;
+                self.record_assistant(conversation_id, turn, &text, false)?;
+                self.store
+                    .update_turn(&turn.id, "completed", &serde_json::to_value(&state)?)?;
+                self.store.append_event(
+                    "turn.completed",
+                    &json!({"turn_id": turn.id, "task_id": task.id, "team_asked": true}),
+                )?;
+                return Ok(TurnOutcome::Completed);
+            }
             self.store
                 .update_turn(&turn.id, "active", &serde_json::to_value(&state)?)?;
         }
@@ -1260,6 +1431,23 @@ impl Runtime {
                     ));
                 }
             }
+            if call.name == TEAM_ASK_TOOL {
+                if context.bot != ORCHESTRATOR_BOT {
+                    return Err(SeraError::Forbidden(
+                        "only the orchestrator may ask the team".into(),
+                    ));
+                }
+                if state.team_asked {
+                    return Err(SeraError::Validation(
+                        "only one team_ask is allowed per turn".into(),
+                    ));
+                }
+            }
+            if call.name == TEAM_REPLY_TOOL && state.team.is_none() {
+                return Err(SeraError::Forbidden(
+                    "team_reply is only available to bots taking part in a team turn".into(),
+                ));
+            }
             state.tool_calls += 1;
             match self
                 .gateway
@@ -1282,6 +1470,16 @@ impl Runtime {
                             .and_then(|data| data.get("to_bot"))
                             .and_then(Value::as_str)
                             .map(str::to_owned);
+                    }
+                    if call.name == TEAM_ASK_TOOL
+                        && output
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.get(TEAM_ASK_QUEUED_KEY))
+                            .and_then(Value::as_bool)
+                            == Some(true)
+                    {
+                        state.team_asked = true;
                     }
                     self.record_tool_result(state, call, &output);
                 }
@@ -1393,12 +1591,37 @@ impl Runtime {
         Ok(TurnOutcome::Suspended)
     }
 
-    fn tool_context(&self, task: &Task, turn: &Turn, bot: &LoadedBot) -> ToolContext {
+    fn tool_context(
+        &self,
+        task: &Task,
+        turn: &Turn,
+        bot: &LoadedBot,
+        state: &TurnState,
+    ) -> Result<ToolContext> {
         let mut allowed_tools = bot.config.tools.iter().cloned().collect::<HashSet<_>>();
         if bot.config.role != BotRole::Orchestrator {
             allowed_tools.remove(DELEGATE_TOOL);
         }
-        ToolContext {
+        // Team tools are granted by the runtime, never by a bot's tool list: a
+        // member only gets `team_reply` inside a team turn, and only the
+        // orchestrator gets `team_ask` in a selected-mode room team.
+        allowed_tools.remove(TEAM_ASK_TOOL);
+        allowed_tools.remove(TEAM_REPLY_TOOL);
+        if state.team.is_some() {
+            allowed_tools.insert(TEAM_REPLY_TOOL.to_string());
+        } else if bot.config.name == ORCHESTRATOR_BOT
+            && matches!(
+                parse_conversation_scope(&turn.conversation_id),
+                Ok(scope) if scope.kind == ConversationKind::Room
+            )
+            && self
+                .store
+                .get_conversation_team(&turn.conversation_id)?
+                .is_some_and(|team| team.mode == TeamMode::Selected.as_str())
+        {
+            allowed_tools.insert(TEAM_ASK_TOOL.to_string());
+        }
+        Ok(ToolContext {
             actor: "owner".into(),
             bot: bot.config.name.clone(),
             task_id: Some(task.id.clone()),
@@ -1406,7 +1629,37 @@ impl Runtime {
             conversation_id: Some(turn.conversation_id.clone()),
             allowed_tools,
             require_approval: bot.config.require_approval.iter().cloned().collect(),
-        }
+        })
+    }
+
+    /// Participant prompt for a bot taking part in a room team turn.
+    fn team_system_prompt(
+        &self,
+        conversation_id: &str,
+        bot: &LoadedBot,
+        objective: &str,
+        context: &TeamContext,
+    ) -> Result<String> {
+        let members = self
+            .store
+            .get_conversation_team(conversation_id)?
+            .map(|team| team.members)
+            .unwrap_or_default();
+        let mut prompt = String::new();
+        prompt.push_str(&bot.prompt);
+        prompt.push_str(&crate::teams::team_room_clause(
+            &bot.config.name,
+            &members,
+            context.round,
+        ));
+        prompt.push_str("\nOBJECTIVE\n");
+        prompt.push_str(objective);
+        prompt.push('\n');
+        prompt.push_str(&format!(
+            "\nCurrent UTC date: {}.\n",
+            Utc::now().format("%Y-%m-%d")
+        ));
+        Ok(prompt)
     }
 
     fn handoff_system_prompt(
@@ -1449,7 +1702,7 @@ impl Runtime {
         Ok(prompt)
     }
 
-    fn system_prompt(&self, bot: &LoadedBot, ask_mode: bool) -> String {
+    fn system_prompt(&self, conversation_id: &str, bot: &LoadedBot, ask_mode: bool) -> String {
         let mut prompt = String::new();
         prompt.push_str(&bot.prompt);
         prompt.push_str("\n\nOPERATING RULES\n");
@@ -1463,6 +1716,14 @@ impl Runtime {
         prompt.push_str("- Be concise and explicit about uncertainty.\n");
         if ask_mode {
             prompt.push_str("- Call rag_search before answering. Cite every factual claim as [doc:<document_id> p.<page>] using only returned evidence. If evidence is insufficient, abstain.\n");
+        }
+        if bot.config.name == ORCHESTRATOR_BOT {
+            if let Ok(Some(team)) = self.store.get_conversation_team(conversation_id) {
+                prompt.push_str(&crate::teams::orchestrator_team_clause(
+                    &team.members,
+                    &team.mode,
+                ));
+            }
         }
         prompt.push_str(&format!(
             "- Current UTC date: {}.\n",
@@ -2040,6 +2301,22 @@ mod tests {
                 },
                 prompt: "analyst".into(),
             },
+            LoadedBot {
+                config: BotConfig {
+                    name: "maker".into(),
+                    trigger: "command".into(),
+                    model: None,
+                    system_prompt: "prompts/maker.txt".into(),
+                    skills: vec![],
+                    tools: vec![],
+                    require_approval: vec![],
+                    enabled: true,
+                    temperature: None,
+                    role: crate::orchestration::BotRole::Specialist,
+                    delegates: vec![],
+                },
+                prompt: "maker".into(),
+            },
         ]
     }
 
@@ -2077,8 +2354,23 @@ mod tests {
         registry
             .register(crate::delegate::DelegateTool::new(
                 store.clone(),
+                bot_map.clone(),
+                router.clone(),
+            ))
+            .unwrap();
+        registry
+            .register(crate::teams::TeamAskTool::new(
+                store.clone(),
+                bot_map.clone(),
+                router.clone(),
+            ))
+            .unwrap();
+        registry
+            .register(crate::teams::TeamReplyTool::new(
+                store.clone(),
                 bot_map,
                 router.clone(),
+                Arc::new(crate::policy::Policy::empty()),
             ))
             .unwrap();
         let gateway = Gateway::new(
@@ -2212,6 +2504,14 @@ mod tests {
             ]
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        // A room without a team keeps the legacy single-specialist behaviour.
+        assert!(
+            !store
+                .list_audit(50)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.event.starts_with("team."))
+        );
     }
 
     #[tokio::test]
@@ -2314,6 +2614,240 @@ mod tests {
                     .and_then(|details| details.get("specialist"))
                     .and_then(Value::as_str)
                     == Some("analyst")
+        }));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn room_team_ask_runs_each_member_and_audits_the_round() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(Sequence::new(vec![
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_team",
+                                "type": "function",
+                                "function": {
+                                    "name": "team_ask",
+                                    "arguments": "{\"to_bots\":[\"analyst\",\"maker\"],\"objective\":\"Review the synthetic room notes.\",\"model_class\":\"routine\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                }),
+                json!({
+                    "choices": [{"message": {"role": "assistant", "content": "Synthetic analyst note."}, "finish_reason": "stop"}]
+                }),
+                json!({
+                    "choices": [{"message": {"role": "assistant", "content": "Synthetic maker note."}, "finish_reason": "stop"}]
+                }),
+            ]))
+            .mount(&server)
+            .await;
+        let notifier = Arc::new(Capture::default());
+        let (runtime, store) = setup_orchestration(&server.uri(), notifier);
+        store
+            .create_conversation("room:review", "room", None)
+            .unwrap();
+        store
+            .set_conversation_team(
+                "room:review",
+                &["analyst".into(), "maker".into()],
+                "selected",
+            )
+            .unwrap();
+        runtime
+            .submit_text("room:review", "review the notes", None)
+            .unwrap();
+        let main_task = store.claim_task("worker", 30).unwrap().unwrap();
+        assert_eq!(main_task.bot, "main");
+        runtime.process_task(main_task).await.unwrap();
+        assert_eq!(store.pending_task_count().unwrap(), 2);
+
+        let analyst = store.claim_task("worker", 30).unwrap().unwrap();
+        assert_eq!(analyst.bot, "analyst");
+        runtime.process_task(analyst).await.unwrap();
+        // The other member is still queued: the room turn is not closed yet.
+        assert!(
+            !store
+                .list_audit(50)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.event == "team.turn_completed")
+        );
+
+        let maker = store.claim_task("worker", 30).unwrap().unwrap();
+        assert_eq!(maker.bot, "maker");
+        runtime.process_task(maker).await.unwrap();
+
+        let messages = store.list_visible_messages("room:review", 20).unwrap();
+        let speakers = messages
+            .iter()
+            .map(|message| {
+                (
+                    message.role,
+                    message.name.as_deref(),
+                    message.content.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            speakers,
+            vec![
+                (Role::User, None, "review the notes"),
+                (
+                    Role::Assistant,
+                    Some("main"),
+                    "Asked the room team to answer."
+                ),
+                (Role::Assistant, Some("analyst"), "Synthetic analyst note."),
+                (Role::Assistant, Some("maker"), "Synthetic maker note."),
+            ]
+        );
+        let audit = store.list_audit(200).unwrap();
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|entry| entry.event == "team.asked")
+                .count(),
+            2
+        );
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|entry| entry.event == "team.round_completed")
+                .count(),
+            2
+        );
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|entry| entry.event == "team.turn_completed")
+                .count(),
+            1
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn room_mode_all_fans_out_without_team_ask() {
+        let server = MockServer::start().await;
+        let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
+        store
+            .create_conversation("room:review", "room", None)
+            .unwrap();
+        store
+            .set_conversation_team("room:review", &["analyst".into(), "maker".into()], "all")
+            .unwrap();
+        let task = runtime
+            .submit_text("room:review", "synthetic", None)
+            .unwrap();
+        assert_eq!(task.bot, "main");
+        assert_eq!(store.pending_task_count().unwrap(), 3);
+        let mut bots = Vec::new();
+        for _ in 0..3 {
+            bots.push(store.claim_task("worker", 30).unwrap().unwrap().bot);
+        }
+        bots.sort();
+        assert_eq!(bots, vec!["analyst", "main", "maker"]);
+        let audit = store.list_audit(50).unwrap();
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|entry| entry.event == "team.asked")
+                .count(),
+            2
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn team_reply_stops_after_two_peer_questions_per_bot() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(Sequence::new(vec![
+                json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [
+                                {"id": "peer_1", "type": "function", "function": {"name": "team_reply", "arguments": "{\"to_bot\":\"maker\",\"message\":\"Question one\"}"}},
+                                {"id": "peer_2", "type": "function", "function": {"name": "team_reply", "arguments": "{\"to_bot\":\"maker\",\"message\":\"Question two\"}"}},
+                                {"id": "peer_3", "type": "function", "function": {"name": "team_reply", "arguments": "{\"to_bot\":\"maker\",\"message\":\"Question three\"}"}}
+                            ]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                }),
+                json!({
+                    "choices": [{"message": {"role": "assistant", "content": "Synthetic analyst answer."}, "finish_reason": "stop"}]
+                }),
+            ]))
+            .mount(&server)
+            .await;
+        let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
+        store
+            .create_conversation("room:review", "room", None)
+            .unwrap();
+        store
+            .set_conversation_team(
+                "room:review",
+                &["analyst".into(), "maker".into()],
+                "selected",
+            )
+            .unwrap();
+        let selection = runtime
+            .effective_model_selection("room:review", "analyst")
+            .unwrap();
+        let route = runtime.router.pin(&selection).unwrap();
+        let task = store
+            .enqueue_task(
+                "turn",
+                "analyst",
+                &json!({
+                    "conversation_id": "room:review",
+                    "text": "Synthetic owner question",
+                    "bot": "analyst",
+                    "source": "team",
+                    "ask_mode": false,
+                    "route": route,
+                    "team": {"root_task_id": "root-task", "from_bot": "main", "round": 0},
+                }),
+                0,
+                Utc::now(),
+            )
+            .unwrap();
+        let claimed = store.claim_task("worker", 30).unwrap().unwrap();
+        assert_eq!(claimed.id, task.id);
+        runtime.process_task(claimed).await.unwrap();
+
+        assert_eq!(store.count_peer_replies("root-task", "analyst").unwrap(), 2);
+        assert_eq!(store.count_team_events("root-task").unwrap(), 2);
+        assert_eq!(store.pending_task_count().unwrap(), 2);
+        let messages = store.list_messages("room:review", 20).unwrap();
+        let peer: Vec<_> = messages
+            .iter()
+            .filter(|message| message.content.starts_with("(to maker)"))
+            .collect();
+        assert_eq!(peer.len(), 2);
+        assert!(
+            peer.iter()
+                .all(|message| message.name.as_deref() == Some("analyst"))
+        );
+        assert!(store.list_audit(100).unwrap().iter().any(|entry| {
+            entry.event == "team.bound_refused"
+                && entry
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.get("bound"))
+                    .and_then(Value::as_str)
+                    == Some("peer replies per bot")
         }));
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }

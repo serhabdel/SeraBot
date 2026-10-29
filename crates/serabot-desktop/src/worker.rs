@@ -2,7 +2,8 @@ use crate::{
     ApiClient, ApiError, Approval, ApprovalDecision, AudioUpdate, BotProfileUpdate, BotSummary,
     Catalog, ConnectorStatus, ConnectorUpdate, ConversationKind, ConversationPage,
     ConversationSummary, CreatedBot, CreatedConversation, CreatedSkill, Health, History,
-    MemoryEntry, NewProvider, ProviderStatus, Scope, Selection, SkillSummary, Task,
+    MemoryEntry, NewProvider, ProviderStatus, Scope, Selection, SkillSummary, Task, Team, TeamMode,
+    Transcription,
 };
 use secrecy::SecretString;
 use std::sync::{
@@ -41,6 +42,9 @@ pub enum OperationKind {
     DeleteMemory,
     Providers,
     Connectors,
+    Team,
+    TeamWrite,
+    Transcribe,
     AdminWrite,
     AdminProfile,
     AdminRestart,
@@ -100,6 +104,15 @@ pub enum Operation {
     },
     Providers,
     Connectors,
+    GetTeam,
+    SetTeam {
+        members: Vec<String>,
+        mode: TeamMode,
+    },
+    TranscribeAudio {
+        filename: String,
+        bytes: Vec<u8>,
+    },
     AdminSaveProvider(NewProvider),
     AdminRemoveProvider(String),
     AdminSetConnector {
@@ -138,6 +151,9 @@ impl Operation {
             Self::DeleteMemory { .. } => OperationKind::DeleteMemory,
             Self::Providers => OperationKind::Providers,
             Self::Connectors => OperationKind::Connectors,
+            Self::GetTeam => OperationKind::Team,
+            Self::SetTeam { .. } => OperationKind::TeamWrite,
+            Self::TranscribeAudio { .. } => OperationKind::Transcribe,
             Self::AdminSaveProvider(_)
             | Self::AdminRemoveProvider(_)
             | Self::AdminSetConnector { .. }
@@ -169,6 +185,8 @@ pub enum Reply {
     DeletedMemory(String),
     Providers(Vec<ProviderStatus>),
     Connectors(Vec<ConnectorStatus>),
+    Team(Team),
+    Transcribed(Transcription),
     AdminSaved,
     BotProfileSaved,
     AdminRestarted,
@@ -327,6 +345,13 @@ fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
             .map(|_| Reply::DeletedMemory(id.clone())),
         Operation::Providers => client.providers().map(Reply::Providers),
         Operation::Connectors => client.connectors().map(Reply::Connectors),
+        Operation::GetTeam => client.get_team(conversation).map(Reply::Team),
+        Operation::SetTeam { members, mode } => client
+            .set_team(conversation, members, *mode)
+            .map(Reply::Team),
+        Operation::TranscribeAudio { filename, bytes } => client
+            .transcribe_audio(filename, bytes)
+            .map(Reply::Transcribed),
         Operation::AdminSaveProvider(request) => client
             .admin_add_provider(request)
             .map(|_| Reply::AdminSaved),

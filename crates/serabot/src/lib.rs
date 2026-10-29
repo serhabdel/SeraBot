@@ -34,6 +34,7 @@ pub mod secrets;
 pub mod skills;
 pub mod spreadsheets;
 pub mod store;
+pub mod teams;
 pub mod telegram;
 pub mod token_cli;
 pub mod tools;

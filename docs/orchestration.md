@@ -2,7 +2,10 @@
 
 SeraBot is a single-operator pipeline: one orchestrator bot delegates bounded work
 to specialists. There is no free-form agent-to-agent chat, no multi-user auth, and
-no plugin marketplace. Examples below use synthetic ids only.
+no plugin marketplace. A room may carry a **team** of 1–5 bots: they answer the
+owner together and may ask each other one bounded question, but the exchange is
+capped, audited, and deterministic (see [Team rooms](#team-rooms)). Examples below
+use synthetic ids only.
 
 ## Decisions
 
@@ -149,6 +152,80 @@ tool-iteration limit, the final message is still named with the specialist id
 and still records `handoff.completed`. There is no separate specialist
 transcript and no free-form agent-to-agent exchange.
 
+## Team rooms
+
+A **room** may carry a **team**: an ordered list of 1–5 bot ids that participate
+in that room. `main` is always the orchestrator and is never a team member.
+The owner chooses the team; the team then answers the owner's question
+together, and may talk to each other inside a strictly bounded exchange.
+
+Persistence: `conversation_teams` (migration `0005_conversation_teams.sql`) —
+`conversation_id`, `members` (JSON array), `mode`, `updated_at`. `mode` is
+`selected` (the orchestrator picks who answers) or `all` (every member answers
+every owner message).
+
+### HTTP API
+
+```
+GET /v1/conversations/{id}/team
+  200 {"conversation_id":"room:review","mode":"selected",
+       "members":[{"bot":"analyst","role":"specialist","enabled":true,"live":true}],
+       "max_members":5}
+
+PUT /v1/conversations/{id}/team
+  body {"members":["analyst","maker","watcher"],"mode":"selected"}
+  200 same shape as GET
+```
+
+Both routes require the owner token and live in the protected router, so
+`authorize` and `rate_limit` apply. A conversation without a team returns the
+empty shape, never 404. Rejections are HTTP 400 with `code: "invalid_team"` and
+the offending value named: not a `room:` conversation, zero members, more than
+five members, duplicates, an invalid slug, `main`, a disabled bot, an unknown
+bot, or a mode outside `{selected, all}`. Writes are audited as
+`team.member_set` and appended to the event stream.
+
+A member that is configured but not loaded yet (the fleet has not been
+reloaded) is rejected by id, so a newly enabled bot needs a restart before it
+can join a team. A stored member that later leaves the fleet is reported as
+`{"role":"unknown","enabled":false,"live":false}` so the owner can see and
+remove it.
+
+### Tools
+
+| Tool | Who may call | Effect |
+| --- | --- | --- |
+| `team_ask` | `main`, only in a `room:` with a team, at most once per turn | `{"to_bots":[...],"objective":"...","model_class":"routine|synthesis"}` queues one ordinary turn per listed member on the same conversation |
+| `team_reply` | a bot taking part in a team turn | `{"to_bot":"maker","message":"..."}` hands one question to one teammate and queues that teammate's turn |
+
+`to_bots` must be a subset of the room team. Availability is granted by the
+runtime (`team_reply` only when the turn has team context; `team_ask` only to
+`main` in a room whose mode is `selected`), not by `bots/*.toml`. Both tools
+only queue ordinary turns, so approvals, policy scanning, the gateway and the
+audit log are never bypassed.
+
+In mode `all` the runtime fans out to every member on the owner's message
+without waiting for the orchestrator to select, and `team_ask` is not required.
+
+### Bounds
+
+Every bound is enforced in Rust and counted from persisted state, so it
+survives a restart or an approval resume.
+
+| Bound | Limit | Counting |
+| --- | --- | --- |
+| Peer replies per bot per room turn | 2 | `audit_log` rows `team.replied` for that `root_task_id` and `from_bot` |
+| Peer-reply rounds per room turn | 3 | the `round` counter carried on the queued turn |
+| Team messages per room turn | 8 | `audit_log` rows `team.asked` / `team.replied` for that `root_task_id` |
+
+A refused attempt returns a plain tool error to the model **and** writes
+`team.bound_refused` to the audit log and the event stream, so it is never
+silent. Audit events: `team.asked`, `team.replied`, `team.round_completed`,
+`team.turn_completed`, `team.member_set`, `team.bound_refused`.
+
+A room without a team, a direct conversation, and a legacy conversation behave
+exactly as before: `delegate` is still one bounded handoff to one specialist.
+
 ## Runtime concurrency
 
 `runtime` holds a concurrency permit for the whole `process_task` turn. The
@@ -158,7 +235,9 @@ delegate tool enqueues the child and ends the parent turn before the child runs.
 
 ## Non-goals
 
-- Free-form agent-to-agent messaging
+- Free-form agent-to-agent messaging (peer exchange inside a team room is
+  bounded, audited, and capped at two replies per bot, three rounds, and eight
+  messages per room turn)
 - Hot-reloading bot definitions without restart
 - Copying specialist tool transcripts into room/direct transcripts (only the
   final assistant text)

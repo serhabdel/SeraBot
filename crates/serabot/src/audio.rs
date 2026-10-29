@@ -17,6 +17,7 @@ use crate::config::{AudioConfig, Config, LlmConfig};
 use crate::error::{Result, SeraError};
 use crate::gateway::{ApprovalDetails, Tool, ToolContext, ToolOutput, ToolSpec};
 use crate::llm::validate_base_url;
+use crate::secrets::SecretStore;
 use crate::util::sha256_hex;
 
 /// Conservative default aligned with Mistral offline transcription limits (docs ~2026-10).
@@ -70,6 +71,101 @@ pub fn resolve_audio_provider(
             .unwrap_or_else(|| llm.api_key_secret.clone()),
         data_egress_approved: llm.data_egress_approved,
     })
+}
+
+/// Readiness of the configured audio provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioProviderState {
+    /// Audio is enabled, the provider resolves, its key is stored, and data
+    /// egress is approved.
+    Ready,
+    /// Transcription is unavailable. The message names the missing setting and
+    /// never carries a secret.
+    Unavailable(String),
+}
+
+/// Resolve the configured audio provider and read its credential from the age
+/// store. Failures name the missing configuration; no secret is ever returned
+/// in an error message.
+fn audio_provider_credential(config: &Config) -> Result<(AudioProviderSettings, String)> {
+    if !config.audio.enabled {
+        return Err(SeraError::Config(
+            "audio provider is not configured: audio.enabled is off".into(),
+        ));
+    }
+    let provider = resolve_audio_provider(&config.llm, &config.audio)
+        .map_err(|error| SeraError::Config(format!("audio provider is not configured: {error}")))?;
+    if !provider.data_egress_approved {
+        return Err(SeraError::Config(
+            "audio provider is not configured: data-egress consent is not approved for the audio provider"
+                .into(),
+        ));
+    }
+    let store = SecretStore::open(config).map_err(|error| {
+        SeraError::Config(format!(
+            "audio provider is not configured: secret store is unavailable ({error})"
+        ))
+    })?;
+    let api_key = store
+        .require(&provider.api_key_secret)
+        .map(str::to_owned)
+        .map_err(|_| {
+            SeraError::Config(format!(
+                "audio provider is not configured: secret '{}' is not stored",
+                provider.api_key_secret
+            ))
+        })?;
+    Ok((provider, api_key))
+}
+
+/// Owner-facing readiness of the audio provider.
+pub fn audio_provider_state(config: &Config) -> AudioProviderState {
+    match audio_provider_credential(config) {
+        Ok(_) => AudioProviderState::Ready,
+        Err(error) => AudioProviderState::Unavailable(error.to_string()),
+    }
+}
+
+/// Transcribe raw audio bytes with the configured audio provider.
+///
+/// The provider, the transcription model and the credential are the ones the
+/// server already uses — no new provider, secret or setting. Unsupported
+/// formats and oversized payloads are rejected before any network call. Every
+/// error is safe to show the owner: it names the missing setting or the
+/// provider failure and never carries a secret or a raw provider body.
+pub async fn transcribe_audio_bytes(
+    config: &Config,
+    bytes: &[u8],
+    filename: &str,
+) -> Result<String> {
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !ALLOWED_EXTENSIONS.contains(&extension.as_str()) {
+        return Err(SeraError::Validation(format!(
+            "unsupported audio type '.{extension}'; allowed: {}",
+            ALLOWED_EXTENSIONS.join(", ")
+        )));
+    }
+    if bytes.is_empty() {
+        return Err(SeraError::Validation("audio payload is empty".into()));
+    }
+    if bytes.len() as u64 > DEFAULT_TELEGRAM_AUDIO_MAX_BYTES {
+        return Err(SeraError::Validation(format!(
+            "audio payload exceeds the {DEFAULT_TELEGRAM_AUDIO_MAX_BYTES} byte limit"
+        )));
+    }
+    let (provider, api_key) = audio_provider_credential(config)?;
+    let client = MistralAudioClient::new(
+        provider.base_url,
+        api_key,
+        config.llm.timeout_secs,
+        &config.audio,
+        provider.data_egress_approved,
+    )?;
+    client.transcribe_bytes(bytes, filename, None).await
 }
 
 #[derive(Clone)]
@@ -151,24 +247,39 @@ impl MistralAudioClient {
     }
 
     pub async fn transcribe_file(&self, path: &Path, language: Option<&str>) -> Result<String> {
-        self.ensure_egress()?;
         let bytes = std::fs::read(path)?;
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("audio.wav");
+        self.transcribe_bytes(&bytes, filename, language).await
+    }
+
+    /// Transcribe in-memory audio. `filename` only carries the format (its
+    /// extension) and the provider-side file name; the bytes never touch disk.
+    pub async fn transcribe_bytes(
+        &self,
+        bytes: &[u8],
+        filename: &str,
+        language: Option<&str>,
+    ) -> Result<String> {
+        self.ensure_egress()?;
+        if bytes.is_empty() {
+            return Err(SeraError::Validation("audio payload is empty".into()));
+        }
         if bytes.len() as u64 > self.max_bytes {
             return Err(SeraError::Validation(format!(
                 "audio file exceeds configured limit of {} bytes",
                 self.max_bytes
             )));
         }
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("audio.wav");
-        let mime = mime_for_filename(filename);
+        let filename = safe_audio_filename(filename);
+        let mime = mime_for_filename(&filename);
         let mut form = Form::new()
             .text("model", self.transcription_model.clone())
             .part(
                 "file",
-                Part::bytes(bytes)
+                Part::bytes(bytes.to_vec())
                     .file_name(filename.to_owned())
                     .mime_str(mime)
                     .map_err(|error| SeraError::External(error.to_string()))?,
@@ -197,10 +308,20 @@ impl MistralAudioClient {
             return Err(SeraError::External(format!(
                 "audio transcription failed with status {}: {}",
                 status.as_u16(),
-                sanitize_provider_error(&body)
+                self.redact_secret(sanitize_provider_error(&body))
             )));
         }
         parse_transcription_response(&body)
+    }
+
+    /// Provider errors are shown to the owner, so the credential must never
+    /// survive into an error message.
+    fn redact_secret(&self, text: String) -> String {
+        let secret = self.api_key.expose_secret();
+        if secret.trim().is_empty() {
+            return text;
+        }
+        text.replace(secret, "<redacted>")
     }
 
     pub async fn understand_file(&self, path: &Path, instruction: &str) -> Result<String> {
@@ -305,6 +426,25 @@ pub fn resolve_inbox_audio(config: &Config, relative: &str) -> Result<PathBuf> {
         return Err(SeraError::Validation("path is not a file".into()));
     }
     Ok(candidate)
+}
+
+/// Keep only the base name of an audio file name and strip path separators and
+/// control characters. The name is sent to the provider as a file label.
+fn safe_audio_filename(filename: &str) -> String {
+    let base = Path::new(filename)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("audio.wav");
+    let cleaned: String = base
+        .chars()
+        .filter(|character| !character.is_control() && !matches!(character, '/' | '\\'))
+        .take(180)
+        .collect();
+    if cleaned.is_empty() {
+        "audio.wav".into()
+    } else {
+        cleaned
+    }
 }
 
 fn mime_for_filename(filename: &str) -> &'static str {
@@ -632,11 +772,37 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    const TEST_SECRET: &str = "sk-test-audio-value";
+
     fn sample_config(inbox: &Path) -> Arc<Config> {
         let mut config = Config::default();
         config.documents.watch_dir = inbox.to_string_lossy().into_owned();
         config.audio.enabled = true;
         Arc::new(config)
+    }
+
+    /// Config with a real age store so the credential lookup can succeed.
+    fn provider_config(dir: &TempDir, base_url: &str, store_key: Option<&str>) -> Config {
+        use crate::secrets::{SecretStore, ensure_identity};
+        let identity = dir.path().join("identity.txt");
+        let secrets = dir.path().join("secrets.age");
+        ensure_identity(&identity).unwrap();
+        if let Some(key) = store_key {
+            let mut store = SecretStore::open_paths(&secrets, &identity).unwrap();
+            store.set("test_audio_key", key).unwrap();
+            store.save().unwrap();
+        }
+        let mut config = Config {
+            base_dir: dir.path().to_path_buf(),
+            ..Config::default()
+        };
+        config.secrets.encrypted_file = secrets.to_string_lossy().into_owned();
+        config.secrets.identity_file = identity.to_string_lossy().into_owned();
+        config.audio.enabled = true;
+        config.audio.base_url = Some(base_url.into());
+        config.audio.api_key_secret = Some("test_audio_key".into());
+        config.llm.data_egress_approved = true;
+        config
     }
 
     #[test]
@@ -709,5 +875,120 @@ mod tests {
         let report = save_telegram_audio_bytes(&config, 42, "ogg", b"fake-ogg", 1024).unwrap();
         assert_eq!(report.relative_path, "telegram/42.ogg");
         assert!(dir.path().join("telegram/42.ogg").is_file());
+    }
+
+    #[tokio::test]
+    async fn transcribe_bytes_rejects_unsupported_extension_before_any_request() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let config = provider_config(&dir, &server.uri(), Some(TEST_SECRET));
+        let error = transcribe_audio_bytes(&config, b"RIFF", "note.txt")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SeraError::Validation(_)));
+        assert!(error.to_string().contains("unsupported audio type"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transcribe_bytes_rejects_oversized_payload_before_any_request() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let config = provider_config(&dir, &server.uri(), Some(TEST_SECRET));
+        let bytes = vec![0u8; (DEFAULT_TELEGRAM_AUDIO_MAX_BYTES + 1) as usize];
+        let error = transcribe_audio_bytes(&config, &bytes, "note.ogg")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SeraError::Validation(_)));
+        assert!(error.to_string().contains("exceeds"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transcribe_bytes_without_a_configured_provider_names_the_setting() {
+        let server = MockServer::start().await;
+        let disabled_dir = TempDir::new().unwrap();
+        let mut disabled = provider_config(&disabled_dir, &server.uri(), Some(TEST_SECRET));
+        disabled.audio.enabled = false;
+        let error = transcribe_audio_bytes(&disabled, b"RIFF", "note.ogg")
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("audio provider is not configured"),
+            "{message}"
+        );
+        assert!(message.contains("audio.enabled"), "{message}");
+        assert!(!message.contains(TEST_SECRET), "{message}");
+
+        let missing_dir = TempDir::new().unwrap();
+        let missing_key = provider_config(&missing_dir, &server.uri(), None);
+        let error = transcribe_audio_bytes(&missing_key, b"RIFF", "note.ogg")
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("audio provider is not configured"),
+            "{message}"
+        );
+        assert!(message.contains("test_audio_key"), "{message}");
+        assert!(!message.contains(TEST_SECRET), "{message}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transcribe_bytes_uses_the_configured_provider() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .and(header("authorization", format!("Bearer {TEST_SECRET}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"text": "buongiorno"})))
+            .mount(&server)
+            .await;
+        let dir = TempDir::new().unwrap();
+        let config = provider_config(&dir, &server.uri(), Some(TEST_SECRET));
+        let text = transcribe_audio_bytes(&config, b"RIFFfake", "note.ogg")
+            .await
+            .unwrap();
+        assert_eq!(text, "buongiorno");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn transcribe_bytes_never_leaks_the_provider_key_in_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {"message": format!("invalid api key {TEST_SECRET}")}
+            })))
+            .mount(&server)
+            .await;
+        let dir = TempDir::new().unwrap();
+        let config = provider_config(&dir, &server.uri(), Some(TEST_SECRET));
+        let error = transcribe_audio_bytes(&config, b"RIFFfake", "note.ogg")
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(!message.contains(TEST_SECRET), "{message}");
+        assert!(message.contains("<redacted>"), "{message}");
+    }
+
+    #[test]
+    fn provider_state_reports_the_missing_setting() {
+        let dir = TempDir::new().unwrap();
+        let config = provider_config(&dir, "https://example.test/v1", None);
+        match audio_provider_state(&config) {
+            AudioProviderState::Unavailable(reason) => {
+                assert!(
+                    reason.contains("audio provider is not configured"),
+                    "{reason}"
+                );
+                assert!(reason.contains("test_audio_key"), "{reason}");
+            }
+            AudioProviderState::Ready => panic!("provider must not be ready without a key"),
+        }
+        let ready = provider_config(&dir, "https://example.test/v1", Some(TEST_SECRET));
+        assert_eq!(audio_provider_state(&ready), AudioProviderState::Ready);
     }
 }

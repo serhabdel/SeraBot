@@ -18,6 +18,7 @@ const MIGRATION_1: &str = include_str!("../migrations/0001_core.sql");
 const MIGRATION_2: &str = include_str!("../migrations/0002_conversations.sql");
 const MIGRATION_3: &str = include_str!("../migrations/0003_device_tokens.sql");
 const MIGRATION_4: &str = include_str!("../migrations/0004_conversation_meta.sql");
+const MIGRATION_5: &str = include_str!("../migrations/0005_conversation_teams.sql");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceToken {
@@ -36,6 +37,15 @@ impl DeviceToken {
 }
 
 pub type StoreConnection = PooledConnection<SqliteConnectionManager>;
+
+/// The team attached to a `room:` conversation: an ordered list of bot ids.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversationTeam {
+    pub conversation_id: String,
+    pub members: Vec<String>,
+    pub mode: String,
+    pub updated_at: DateTime<Utc>,
+}
 
 static INIT_VEC: Once = Once::new();
 
@@ -156,6 +166,11 @@ impl Store {
         if version < 4 {
             connection.execute_batch(MIGRATION_4)?;
             connection.pragma_update(None, "user_version", 4)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 5 {
+            connection.execute_batch(MIGRATION_5)?;
+            connection.pragma_update(None, "user_version", 5)?;
         }
         let stored_dimension: Option<String> = connection
             .query_row(
@@ -496,6 +511,92 @@ impl Store {
             params![id, conversation_kind_str(scope.kind), now_string()],
         )?;
         Ok(())
+    }
+
+    /// Team attached to a room conversation, if the owner set one.
+    pub fn get_conversation_team(&self, conversation_id: &str) -> Result<Option<ConversationTeam>> {
+        let connection = self.connection()?;
+        let row: Option<(String, String, String, String)> = connection
+            .query_row(
+                "SELECT conversation_id, members, mode, updated_at
+                 FROM conversation_teams WHERE conversation_id = ?1",
+                params![conversation_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(SeraError::from)?;
+        let Some((conversation_id, members, mode, updated_at)) = row else {
+            return Ok(None);
+        };
+        let members: Vec<String> = serde_json::from_str(&members)
+            .map_err(|_| SeraError::InvalidState("stored team members are invalid".into()))?;
+        Ok(Some(ConversationTeam {
+            conversation_id,
+            members,
+            mode,
+            updated_at: parse_datetime(&updated_at),
+        }))
+    }
+
+    pub fn set_conversation_team(
+        &self,
+        conversation_id: &str,
+        members: &[String],
+        mode: &str,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO conversation_teams(conversation_id, members, mode, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                 members=excluded.members, mode=excluded.mode, updated_at=excluded.updated_at",
+            params![
+                conversation_id,
+                serde_json::to_string(members)?,
+                mode,
+                now_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Team messages already queued or posted in one room turn. Counted from the
+    /// audit ledger, which is the append-only record of every `team.asked` and
+    /// `team.replied` decision.
+    pub fn count_team_events(&self, root_task_id: &str) -> Result<i64> {
+        let connection = self.connection()?;
+        Ok(connection.query_row(
+            "SELECT COUNT(*) FROM audit_log
+             WHERE event IN ('team.asked','team.replied')
+               AND json_extract(details_json, '$.root_task_id') = ?1",
+            params![root_task_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Peer replies one bot already handed to peers in one room turn.
+    pub fn count_peer_replies(&self, root_task_id: &str, from_bot: &str) -> Result<i64> {
+        let connection = self.connection()?;
+        Ok(connection.query_row(
+            "SELECT COUNT(*) FROM audit_log
+             WHERE event = 'team.replied'
+               AND json_extract(details_json, '$.root_task_id') = ?1
+               AND json_extract(details_json, '$.from_bot') = ?2",
+            params![root_task_id, from_bot],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Team turns of one room turn that are still queued or running.
+    pub fn count_pending_team_tasks(&self, root_task_id: &str) -> Result<i64> {
+        let connection = self.connection()?;
+        Ok(connection.query_row(
+            "SELECT COUNT(*) FROM tasks
+             WHERE status IN ('queued','running','awaiting_approval')
+               AND json_extract(payload_json, '$.team.root_task_id') = ?1",
+            params![root_task_id],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn list_messages(&self, conversation_id: &str, limit: usize) -> Result<Vec<StoredMessage>> {
@@ -1525,10 +1626,17 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        connection
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='conversation_teams'",
                 [],
                 |row| row.get::<_, String>(0),
             )
@@ -1569,8 +1677,15 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         assert!(store.list_device_tokens().unwrap().is_empty());
+        // The team table arrives with the same migration batch.
+        assert!(
+            store
+                .get_conversation_team("room:review")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::{
     ApiError, Approval, BotSummary, Catalog, ConnectorStatus, ConversationSummary, CreatedBot,
     CreatedConversation, CreatedSkill, MemoryEntry, Message, ProviderStatus, Scope, Selection,
-    SkillSummary, Task,
+    SkillSummary, Task, Team,
     worker::{OperationKind, Reply},
 };
 
@@ -33,6 +33,17 @@ pub struct State {
     pub providers_loaded: bool,
     pub connectors: Vec<ConnectorStatus>,
     pub connectors_loaded: bool,
+    /// Team of the open room conversation. Conversation-scoped: it is cleared
+    /// whenever the conversation changes or the session disconnects.
+    pub team: Option<Team>,
+    pub team_loaded: bool,
+    pub team_loading: bool,
+    pub team_error: Option<String>,
+    /// Last transcript of a recorded note. Untrusted model output: it is a
+    /// draft for the owner, never a sent message.
+    pub transcript: Option<String>,
+    pub transcript_error: Option<String>,
+    pub transcript_loading: bool,
     pub created_bot: Option<CreatedBot>,
     pub created_conversation: Option<CreatedConversation>,
     pub created_skill: Option<CreatedSkill>,
@@ -77,6 +88,13 @@ impl Default for State {
             providers_loaded: false,
             connectors: Vec::new(),
             connectors_loaded: false,
+            team: None,
+            team_loaded: false,
+            team_loading: false,
+            team_error: None,
+            transcript: None,
+            transcript_error: None,
+            transcript_loading: false,
             created_bot: None,
             created_conversation: None,
             created_skill: None,
@@ -280,6 +298,16 @@ impl State {
                 self.connectors = connectors;
                 self.connectors_loaded = true;
             }
+            Reply::Team(team) => {
+                self.team = Some(team);
+                self.team_loaded = true;
+                self.team_loading = false;
+                self.team_error = None;
+            }
+            Reply::Transcribed(transcription) => {
+                self.transcript = Some(transcription.text);
+                self.transcript_error = None;
+            }
             Reply::AdminSaved | Reply::BotProfileSaved | Reply::AdminRestarted => {}
         }
         true
@@ -300,6 +328,7 @@ impl State {
                 | OperationKind::RenameConversation
                 | OperationKind::ArchiveConversation
                 | OperationKind::AddMemory
+                | OperationKind::TeamWrite
         );
         if mutation && error.unknown_outcome() {
             self.unknown_outcome = true;
@@ -312,6 +341,7 @@ impl State {
                 OperationKind::RenameConversation => "rename",
                 OperationKind::ArchiveConversation => "archive",
                 OperationKind::AddMemory => "memory write",
+                OperationKind::TeamWrite => "team update",
                 _ => "model change",
             };
             self.error = Some(format!(
@@ -335,7 +365,7 @@ mod tests {
     use crate::{
         BotSummary, Catalog, ConnectorStatus, ConversationPage, ConversationSummary, CreatedBot,
         CreatedConversation, CreatedSkill, Health, MemoryEntry, Message, ProviderStatus, Role,
-        SecretStatus, Selection, SkillSummary, Task, TaskStatus,
+        SecretStatus, Selection, SkillSummary, Task, TaskStatus, Team, TeamMember, TeamMode,
     };
 
     fn catalog() -> Catalog {
@@ -647,5 +677,64 @@ mod tests {
         assert!(state.providers.is_empty());
         assert!(!state.providers_loaded);
         assert!(state.connectors.is_empty());
+    }
+
+    #[test]
+    fn the_team_is_loaded_and_cleared_with_the_conversation() {
+        let mut state = State::default();
+        let scope = state.scope.clone();
+        let team = Team {
+            conversation_id: "room:review".into(),
+            mode: TeamMode::Selected,
+            members: vec![TeamMember {
+                bot: "analyst".into(),
+                role: "specialist".into(),
+                enabled: true,
+                live: true,
+            }],
+        };
+        state.receive(&scope, Reply::Team(team.clone()));
+        assert!(state.team_loaded);
+        assert_eq!(state.team.as_ref(), Some(&team));
+        assert!(state.team_error.is_none());
+
+        // A late team from another conversation never lands.
+        let other = Scope {
+            epoch: scope.epoch + 9,
+            conversation: "room:other".into(),
+        };
+        assert!(!state.receive(&other, Reply::Team(team.clone())));
+
+        state.new_scope("room:other".into(), true);
+        assert!(
+            state.team.is_none(),
+            "the team does not cross conversations"
+        );
+        assert!(!state.team_loaded);
+        assert!(state.team_error.is_none());
+        state.disconnect();
+        assert!(state.team.is_none());
+    }
+
+    #[test]
+    fn an_unknown_team_write_blocks_further_sends() {
+        let mut state = State {
+            connected: true,
+            ..State::default()
+        };
+        let scope = state.scope.clone();
+        state.receive(&scope, Reply::Catalog(catalog()));
+        state.history_loaded = true;
+        assert!(state.can_send());
+        state.fail(&scope, OperationKind::TeamWrite, ApiError::Transport);
+        assert!(state.unknown_outcome);
+        assert!(!state.can_send());
+        assert!(
+            state
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("Unknown team update outcome")
+        );
     }
 }

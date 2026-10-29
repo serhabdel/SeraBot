@@ -649,8 +649,19 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     );
     registry.register(serabot::delegate::DelegateTool::new(
         store.clone(),
+        bot_map.clone(),
+        router.clone(),
+    ))?;
+    registry.register(serabot::teams::TeamAskTool::new(
+        store.clone(),
+        bot_map.clone(),
+        router.clone(),
+    ))?;
+    registry.register(serabot::teams::TeamReplyTool::new(
+        store.clone(),
         bot_map,
         router.clone(),
+        policy.clone(),
     ))?;
     let notifier = Arc::new(CompositeNotifier::new(notifiers));
 

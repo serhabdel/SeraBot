@@ -48,15 +48,45 @@ ldd target/release/serabot | head
 
 ## Upgrade procedure (additive, single service)
 
+### Build the binary for THIS host's glibc
+
+The host runs **Ubuntu 24.04 (glibc 2.39)**. A binary linked against a newer
+glibc fails to start with
+`/opt/serabot/serabot: /lib/x86_64-linux-gnu/libm.so.6: version 'GLIBC_2.43' not found`
+and, because the unit has `Restart=on-failure`, the service enters a restart
+loop.
+
+Build the release binary in a **glibc-matched** environment before uploading:
+
+- Preferred: a WSL `Ubuntu-24.04` environment (glibc 2.39), or a
+  `ubuntu:24.04` container, with
+  `CARGO_TARGET_DIR` on a drive with free space.
+- Never build the production binary in an environment with a newer glibc
+  (for example a newer WSL distribution) and upload it as-is.
+- Always check the requirement before installing:
+
+  ```bash
+  objdump -T target/release/serabot | grep -o 'GLIBC_2\.[0-9]*' | sort -uV | tail -1
+  ```
+
+  The highest version shown must be **2.39 or lower**. The equivalent check on
+  the host, before swapping anything, is `ldd --version | head -1`.
+- A static `x86_64-unknown-linux-musl` build is also acceptable and is immune
+  to host glibc drift.
+
+### Steps
+
 1. Read-only preflight on the host:
 
    ```bash
-   ssh ovh-vps 'systemctl is-active serabot; systemctl is-enabled serabot; df -h /; ls -l /opt/serabot/serabot'
+   ssh ovh-vps 'systemctl is-active serabot; systemctl is-enabled serabot; df -h /; ls -l /opt/serabot/serabot; ldd --version | head -1'
    ```
 
 2. Upload the binary to a staging path, for example
    `/var/lib/serabot/releases/serabot-<short-sha>`.
-3. Back up the current binary to `/var/lib/serabot/releases/serabot-<timestamp>`.
+3. Back up the current binary to `/var/lib/serabot/releases/serabot-<timestamp>`
+   and take a consistent database snapshot (the SQLite online backup API, so
+   the WAL is included).
 4. Replace `/opt/serabot/serabot` only after verifying the staged SHA-256.
 5. Restart only `serabot.service`.
 6. Verify:
@@ -69,6 +99,13 @@ ldd target/release/serabot | head
    ```
 
 7. Roll back by restoring the previous binary and restarting only this service.
+
+**If the new binary fails to start**, the service is down, not degraded: with
+`Restart=on-failure` it will retry every few seconds. Restore the backup
+immediately (`cp /var/lib/serabot/releases/serabot-<timestamp>
+/opt/serabot/serabot && systemctl restart serabot`) and diagnose locally
+before trying again. A failed start before any migration runs leaves the
+database untouched — confirm with `PRAGMA user_version`.
 
 ### Owner-managed settings
 

@@ -244,6 +244,17 @@ const MAX_SKILL_LIST: usize = 256;
 const MAX_BOT_LIST: usize = 64;
 const MAX_BOT_SUMMARY_ITEMS: usize = 64;
 
+/// Maximum team members a room may carry. Mirrors the server limit.
+pub const MAX_TEAM_MEMBERS: usize = 5;
+
+/// Maximum audio body accepted by `POST /v1/audio/transcribe` (20 MiB).
+pub const MAX_AUDIO_BYTES: usize = 20 * 1024 * 1024;
+
+/// Audio extensions the server accepts. Mirrors the server allowlist.
+pub const AUDIO_EXTENSIONS: &[&str] = &[
+    "wav", "mp3", "mpeg", "ogg", "oga", "opus", "m4a", "aac", "flac", "webm",
+];
+
 /// Bot id safe to show in the fleet list or on a chat bubble.
 pub fn valid_speaker(name: &str) -> bool {
     let mut chars = name.chars();
@@ -275,6 +286,62 @@ pub fn reserved_bot_id(id: &str) -> bool {
 
 pub fn valid_bot_id(id: &str) -> bool {
     valid_slug(id) && !reserved_bot_id(id)
+}
+
+/// A team member bot id: a lowercase slug that is never `main` (the
+/// orchestrator) and never a Windows device name.
+pub fn valid_team_member(bot: &str) -> bool {
+    valid_slug(bot) && !reserved_bot_id(bot)
+}
+
+/// Validate a team member list before it leaves the console: 1–5 unique bot
+/// ids, lowercase, never `main`.
+pub fn validate_team_members(members: &[String]) -> Result<(), ApiError> {
+    if members.is_empty() || members.len() > MAX_TEAM_MEMBERS {
+        return Err(ApiError::Validation(
+            "A team needs between 1 and 5 members.",
+        ));
+    }
+    let mut seen = HashSet::with_capacity(members.len());
+    for member in members {
+        if !valid_team_member(member) {
+            return Err(ApiError::Validation(
+                "Team members are lowercase bot ids such as analyst. main is the orchestrator and cannot be a member.",
+            ));
+        }
+        if !seen.insert(member.as_str()) {
+            return Err(ApiError::Validation(
+                "Each bot can be in the team only once.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A room conversation id, the only kind that carries a team.
+pub fn is_room_conversation(conversation: &str) -> bool {
+    conversation.starts_with("room:")
+}
+
+/// A safe recording name: no path separators, no control characters, and an
+/// extension the server accepts.
+pub fn valid_audio_filename(name: &str) -> bool {
+    if name.is_empty() || name.len() > 128 {
+        return false;
+    }
+    if name
+        .chars()
+        .any(|c| c.is_control() || c == '/' || c == '\\' || c == ':')
+    {
+        return false;
+    }
+    let Some((stem, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
+    if stem.is_empty() {
+        return false;
+    }
+    AUDIO_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
 }
 
 pub fn valid_skill_id(id: &str) -> bool {
@@ -761,6 +828,40 @@ pub struct Health {
     pub conversation_titles: Option<bool>,
 }
 
+/// Live sandbox posture from `GET /v1/status`.
+///
+/// Every field is optional on purpose: an older server, or a count the
+/// server could not read, must read as "unknown" in the console instead of
+/// being invented.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ServerStatus {
+    #[serde(default)]
+    pub ok: bool,
+    /// Pending task count. `-1` means the server could not read it.
+    #[serde(default)]
+    pub pending_tasks: Option<i64>,
+    #[serde(default)]
+    pub pending_approvals: Option<i64>,
+    #[serde(default)]
+    pub approvals: Vec<StatusApproval>,
+    #[serde(default)]
+    pub policy_version: Option<String>,
+}
+
+/// One pending approval as reported by `GET /v1/status`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct StatusApproval {
+    pub id: String,
+    #[serde(default)]
+    pub tool: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub action_id: Option<String>,
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -867,6 +968,63 @@ impl ApprovalDecision {
             Self::Deny => "Deny",
         }
     }
+}
+
+/// How a room picks the bots that answer. `selected` leaves the choice to the
+/// orchestrator; `all` sends every owner message to every team member.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TeamMode {
+    Selected,
+    All,
+}
+
+impl TeamMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Selected => "selected",
+            Self::All => "all",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Selected => "Selected",
+            Self::All => "All members",
+        }
+    }
+}
+
+/// One member of a room team. `live` is the server's view of the bot.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct TeamMember {
+    pub bot: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub live: bool,
+}
+
+/// The team of a `room:` conversation.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct Team {
+    pub conversation_id: String,
+    pub mode: TeamMode,
+    #[serde(default)]
+    pub members: Vec<TeamMember>,
+}
+
+/// Transcript of one recorded audio note. The text is model output: untrusted
+/// content that the owner reviews before it is sent.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct Transcription {
+    pub text: String,
+    #[serde(default)]
+    pub filename: String,
+    #[serde(default)]
+    pub bytes: usize,
 }
 
 #[derive(Deserialize)]
@@ -1006,6 +1164,11 @@ impl ApiClient {
 
     pub fn health(&self) -> Result<Health, ApiError> {
         self.get(&["v1", "health"], &[])
+    }
+    /// The live sandbox posture: pending work, pending approvals and the
+    /// policy version the server enforces right now.
+    pub fn status(&self) -> Result<ServerStatus, ApiError> {
+        self.get(&["v1", "status"], &[])
     }
     pub fn models(&self, conversation: &str) -> Result<Catalog, ApiError> {
         check_id(conversation)?;
@@ -1572,6 +1735,101 @@ impl ApiClient {
         Ok(response.connectors)
     }
 
+    /// Read the team of a room conversation.
+    pub fn get_team(&self, conversation: &str) -> Result<Team, ApiError> {
+        check_id(conversation)?;
+        check_room(conversation)?;
+        self.get(&["v1", "conversations", conversation, "team"], &[])
+    }
+
+    /// Replace the team of a room conversation. The call is a write: when the
+    /// outcome is unknown it must never be replayed.
+    pub fn set_team(
+        &self,
+        conversation: &str,
+        members: &[String],
+        mode: TeamMode,
+    ) -> Result<Team, ApiError> {
+        check_id(conversation)?;
+        check_room(conversation)?;
+        validate_team_members(members)?;
+        #[derive(Serialize)]
+        struct Body<'a> {
+            members: &'a [String],
+            mode: TeamMode,
+        }
+        self.request(
+            Method::PUT,
+            &["v1", "conversations", conversation, "team"],
+            &[],
+            Some(&Body { members, mode }),
+        )
+    }
+
+    /// Transcribe one recorded audio note. The body is the raw recording; the
+    /// transcript is model output and stays untrusted until the owner sends it.
+    pub fn transcribe_audio(
+        &self,
+        filename: &str,
+        bytes: &[u8],
+    ) -> Result<Transcription, ApiError> {
+        if bytes.is_empty() {
+            return Err(ApiError::Validation("The recording is empty."));
+        }
+        if bytes.len() > MAX_AUDIO_BYTES {
+            return Err(ApiError::Validation(
+                "The recording is larger than the 20 MiB limit.",
+            ));
+        }
+        if !valid_audio_filename(filename) {
+            return Err(ApiError::Validation(
+                "Recordings must be wav, mp3, mpeg, ogg, oga, opus, m4a, aac, flac or webm files.",
+            ));
+        }
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .map_err(|_| ApiError::InvalidResponse)?
+            .clear()
+            .extend(["v1", "audio", "transcribe"]);
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(self.token.expose_secret())
+            .header("X-Audio-Filename", filename)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(bytes.to_vec())
+            .send()
+            .map_err(|_| ApiError::Transport)?;
+        let status = response.status();
+        let mut body = Zeroizing::new(Vec::new());
+        response
+            .take(MAX_RESPONSE + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| ApiError::Transport)?;
+        if body.len() as u64 > MAX_RESPONSE {
+            return Err(ApiError::TooLarge);
+        }
+        if !status.is_success() {
+            // Keep a safe server-authored message for the owner-facing errors
+            // (for example "audio is not configured"). Other statuses stay
+            // numeric so the session keeps its token and back-off paths.
+            if matches!(status.as_u16(), 400 | 404 | 409 | 422 | 503) {
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
+                    if let Some(message) = value.get("error").and_then(|value| value.as_str()) {
+                        if !message.is_empty()
+                            && message.len() <= 512
+                            && !message.chars().any(char::is_control)
+                        {
+                            return Err(ApiError::Rejected(message.to_owned()));
+                        }
+                    }
+                }
+            }
+            return Err(ApiError::Http(status.as_u16()));
+        }
+        serde_json::from_slice(&body).map_err(|_| ApiError::InvalidResponse)
+    }
+
     /// Admin writes carry a safe server-authored message on rejection so the
     /// console can say what to fix instead of only "422".
     fn admin_request<T: DeserializeOwned, B: Serialize + ?Sized>(
@@ -1746,6 +2004,16 @@ fn check_id(id: &str) -> Result<(), ApiError> {
     } else {
         Err(ApiError::Validation(
             "IDs must be 1–128 ASCII letters, digits, underscores, colons or hyphens.",
+        ))
+    }
+}
+
+fn check_room(conversation: &str) -> Result<(), ApiError> {
+    if is_room_conversation(conversation) {
+        Ok(())
+    } else {
+        Err(ApiError::Validation(
+            "Only room conversations carry a team.",
         ))
     }
 }
@@ -2024,5 +2292,107 @@ mod tests {
         assert!(check_conversation_summary(&summary("section", true)).is_err());
         assert!(check_conversation_summary(&summary("direct", false)).is_err());
         assert_eq!(summary("legacy", true).normalized_kind(), "direct");
+    }
+
+    #[test]
+    fn team_members_stay_on_the_safe_subset() {
+        assert!(valid_team_member("analyst"));
+        assert!(valid_team_member("maker-2"));
+        assert!(!valid_team_member("main"));
+        assert!(!valid_team_member(""));
+        assert!(!valid_team_member("Analyst"));
+        assert!(!valid_team_member("../analyst"));
+        assert!(!valid_team_member("con"));
+
+        assert!(validate_team_members(&["analyst".into()]).is_ok());
+        assert!(
+            validate_team_members(&["analyst".into(), "maker".into(), "watcher".into()]).is_ok()
+        );
+        assert!(validate_team_members(&[]).is_err());
+        assert!(validate_team_members(&["main".into()]).is_err());
+        assert!(validate_team_members(&["analyst".into(), "analyst".into()]).is_err());
+        assert!(validate_team_members(&["Analyst".into()]).is_err());
+        assert!(
+            validate_team_members(&[
+                "a".into(),
+                "b".into(),
+                "c".into(),
+                "d".into(),
+                "e".into(),
+                "f".into()
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn team_mode_round_trips_the_server_wire_values() {
+        assert_eq!(
+            serde_json::to_string(&TeamMode::Selected).unwrap(),
+            "\"selected\""
+        );
+        assert_eq!(serde_json::to_string(&TeamMode::All).unwrap(), "\"all\"");
+        assert_eq!(
+            serde_json::from_str::<TeamMode>("\"selected\"").unwrap(),
+            TeamMode::Selected
+        );
+        assert_eq!(
+            serde_json::from_str::<TeamMode>("\"all\"").unwrap(),
+            TeamMode::All
+        );
+        assert!(serde_json::from_str::<TeamMode>("\"everyone\"").is_err());
+        assert_eq!(TeamMode::Selected.as_str(), "selected");
+        assert_eq!(TeamMode::All.as_str(), "all");
+    }
+
+    #[test]
+    fn team_reads_the_server_shape_including_a_member_that_is_not_live() {
+        let team: Team = serde_json::from_str(
+            r#"{"conversation_id":"room:review",
+                "mode":"selected",
+                "members":[{"bot":"analyst","role":"specialist","enabled":true,"live":true}],
+                "max_members":5}"#,
+        )
+        .unwrap();
+        assert_eq!(team.conversation_id, "room:review");
+        assert_eq!(team.mode, TeamMode::Selected);
+        assert_eq!(team.members.len(), 1);
+        assert_eq!(team.members[0].bot, "analyst");
+        assert_eq!(team.members[0].role, "specialist");
+        assert!(team.members[0].enabled);
+        assert!(team.members[0].live);
+
+        let offline: Team = serde_json::from_str(
+            r#"{"conversation_id":"room:review",
+                "mode":"all",
+                "members":[{"bot":"maker","role":"specialist","enabled":true,"live":false}]}"#,
+        )
+        .unwrap();
+        assert_eq!(offline.mode, TeamMode::All);
+        assert!(!offline.members[0].live);
+        assert!(offline.members[0].enabled);
+    }
+
+    #[test]
+    fn transcription_reads_the_server_shape() {
+        let transcription: Transcription =
+            serde_json::from_str(r#"{"text":"hello there","filename":"note.webm","bytes":1234}"#)
+                .unwrap();
+        assert_eq!(transcription.text, "hello there");
+        assert_eq!(transcription.filename, "note.webm");
+        assert_eq!(transcription.bytes, 1234);
+    }
+
+    #[test]
+    fn recording_names_are_bounded_and_use_the_server_allowlist() {
+        assert!(valid_audio_filename("note.webm"));
+        assert!(valid_audio_filename("note.WEBM"));
+        assert!(valid_audio_filename("note.m4a"));
+        assert!(!valid_audio_filename("note.txt"));
+        assert!(!valid_audio_filename("note"));
+        assert!(!valid_audio_filename("../note.webm"));
+        assert!(!valid_audio_filename("notes/note.webm"));
+        assert!(!valid_audio_filename("note.webm\r\n"));
+        assert!(!valid_audio_filename(""));
     }
 }

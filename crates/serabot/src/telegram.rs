@@ -8,15 +8,57 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::audio::save_telegram_audio_bytes;
+use crate::audio::{
+    AudioProviderState, audio_provider_state, save_telegram_audio_bytes, transcribe_audio_bytes,
+};
 use crate::error::{Result, SeraError};
 use crate::gateway::Decision;
 use crate::maker::ArtifactStore;
 use crate::memory;
 use crate::runtime::{ApprovalNotice, Notifier, Runtime};
 use crate::store::Store;
+use crate::util::truncate_chars;
 
 const MAX_MESSAGE_CHARS: usize = 3900;
+
+/// Longest transcript the turn pipeline accepts as one owner message.
+const MAX_TRANSCRIPT_CHARS: usize = 8000;
+
+/// Owner-facing line: voice is off or the audio provider is not configured.
+const AUDIO_UNAVAILABLE_MESSAGE: &str = "Voice notes are off — turn on audio in Settings (and store its provider key) to have them transcribed automatically.";
+
+/// Owner-facing line: the Telegram attachment could not be downloaded.
+const AUDIO_DOWNLOAD_FAILED_MESSAGE: &str =
+    "I couldn't download that voice note — please send it again.";
+
+/// Owner-facing line: the provider rejected the audio.
+const AUDIO_PROVIDER_FAILED_MESSAGE: &str = "I couldn't transcribe that voice note — the audio provider is unavailable right now, so please try again or send it as text.";
+
+/// Owner-facing line: the audio is larger than the transcription limit.
+const AUDIO_TOO_LARGE_MESSAGE: &str =
+    "That voice note is too large to transcribe — please send a shorter clip or type your message.";
+
+/// Owner-facing line: the audio format is not supported.
+const AUDIO_UNSUPPORTED_FORMAT_MESSAGE: &str = "That audio format can't be transcribed — please send a WAV, MP3, OGG, M4A, FLAC, or WebM file.";
+
+/// Owner-facing line: the transcript was empty.
+const AUDIO_EMPTY_MESSAGE: &str =
+    "I couldn't hear anything in that voice note — please try again or type your message.";
+
+/// Outcome of an owner voice/audio message.
+enum OwnerAudioOutcome {
+    /// The message carries no audio; the normal text path applies.
+    NotAudio,
+    /// Voice transcription is not available; one line explains how to enable it.
+    Unavailable,
+    /// The voice note was transcribed; the transcript is the owner's message.
+    Transcribed {
+        transcript: String,
+        saved_path: Option<String>,
+    },
+    /// Transcription failed; one line explains what happened.
+    Failed(&'static str),
+}
 
 #[derive(Clone)]
 pub struct TelegramClient {
@@ -405,18 +447,24 @@ impl TelegramClient {
         info!("Telegram polling stopped");
     }
 
-    async fn maybe_save_owner_audio(
+    /// Handle an owner voice/audio message: save the original in the inbox,
+    /// transcribe it, and report the outcome with one owner-facing line.
+    async fn handle_owner_audio(
         &self,
         runtime: &Runtime,
         store: &Store,
         message: &TelegramMessage,
-    ) -> Result<Option<String>> {
+    ) -> Result<OwnerAudioOutcome> {
         let config = runtime.config();
-        if !config.audio.enabled || !config.audio.telegram_intake {
-            return Ok(None);
-        }
         if message.voice.is_none() && message.audio.is_none() {
-            return Ok(None);
+            return Ok(OwnerAudioOutcome::NotAudio);
+        }
+        if !config.audio.enabled || !config.audio.telegram_intake {
+            return Ok(OwnerAudioOutcome::Unavailable);
+        }
+        if let AudioProviderState::Unavailable(reason) = audio_provider_state(config) {
+            warn!(reason = %reason, "owner voice transcription is not configured");
+            return Ok(OwnerAudioOutcome::Unavailable);
         }
         let attachment = message
             .voice
@@ -424,9 +472,16 @@ impl TelegramClient {
             .or(message.audio.as_ref())
             .expect("voice or audio present");
         let max_bytes = config.audio.telegram_max_bytes;
-        let bytes = self
+        let bytes = match self
             .download_attachment(&attachment.file_id, max_bytes)
-            .await?;
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(%error, "owner audio download failed");
+                return Ok(OwnerAudioOutcome::Failed(AUDIO_DOWNLOAD_FAILED_MESSAGE));
+            }
+        };
         let extension = if message.voice.is_some() {
             "ogg".into()
         } else {
@@ -437,19 +492,49 @@ impl TelegramClient {
                 .unwrap_or("mpeg")
                 .to_ascii_lowercase()
         };
-        let report =
-            save_telegram_audio_bytes(config, message.message_id, &extension, &bytes, max_bytes)?;
-        store.record_audit(
-            "owner",
-            "audio.telegram_intake",
-            Some(&report.relative_path),
-            None,
-            None,
-            Some(&report.sha256),
-            None,
-            Some(&json!({"bytes": report.bytes})),
-        )?;
-        Ok(Some(report.relative_path))
+        let saved_path = match save_telegram_audio_bytes(
+            config,
+            message.message_id,
+            &extension,
+            &bytes,
+            max_bytes,
+        ) {
+            Ok(report) => {
+                store.record_audit(
+                    "owner",
+                    "audio.telegram_intake",
+                    Some(&report.relative_path),
+                    None,
+                    None,
+                    Some(&report.sha256),
+                    None,
+                    Some(&json!({"bytes": report.bytes})),
+                )?;
+                Some(report.relative_path)
+            }
+            Err(error) => {
+                warn!(%error, "owner audio could not be stored in the inbox");
+                None
+            }
+        };
+        let filename = format!("{}.{extension}", message.message_id);
+        match transcribe_audio_bytes(config, &bytes, &filename).await {
+            Ok(transcript) => {
+                let transcript = transcript.trim();
+                if transcript.is_empty() {
+                    return Ok(OwnerAudioOutcome::Failed(AUDIO_EMPTY_MESSAGE));
+                }
+                Ok(OwnerAudioOutcome::Transcribed {
+                    transcript: truncate_chars(transcript, MAX_TRANSCRIPT_CHARS),
+                    saved_path,
+                })
+            }
+            Err(error) => {
+                // The transcript is owner content and never reaches the logs.
+                warn!(%error, "owner voice transcription failed");
+                Ok(OwnerAudioOutcome::Failed(audio_failure_line(&error)))
+            }
+        }
     }
 
     async fn handle_update(
@@ -470,19 +555,31 @@ impl TelegramClient {
                 warn!("ignored Telegram message from non-owner");
                 return Ok(());
             }
-            if let Some(saved) = self
-                .maybe_save_owner_audio(runtime, store, &message)
-                .await?
-            {
-                self.send_message(
-                    self.owner_chat_id,
-                    &format!(
-                        "Saved owner audio to inbox/{saved}. Use audio_transcribe or \
-                         audio_understand on that path (data-egress consent and approval required)."
-                    ),
-                )
-                .await?;
-                return Ok(());
+            match self.handle_owner_audio(runtime, store, &message).await? {
+                OwnerAudioOutcome::NotAudio => {}
+                OwnerAudioOutcome::Unavailable => {
+                    self.send_message(self.owner_chat_id, AUDIO_UNAVAILABLE_MESSAGE)
+                        .await?;
+                    return Ok(());
+                }
+                OwnerAudioOutcome::Failed(line) => {
+                    self.send_message(self.owner_chat_id, line).await?;
+                    return Ok(());
+                }
+                OwnerAudioOutcome::Transcribed {
+                    transcript,
+                    saved_path,
+                } => {
+                    // The transcript is the owner's message in this chat, so the
+                    // normal turn pipeline answers it like any typed message.
+                    runtime.submit_text(&message.chat.id.to_string(), &transcript, None)?;
+                    self.send_message(
+                        self.owner_chat_id,
+                        &audio_transcribed_message(saved_path.as_deref()),
+                    )
+                    .await?;
+                    return Ok(());
+                }
             }
             let text = message.text.unwrap_or_default();
             let text = text.trim();
@@ -490,8 +587,8 @@ impl TelegramClient {
                 let _ = self
                     .send_message(
                         self.owner_chat_id,
-                        "Text messages are supported. Voice notes are saved when audio.telegram_intake \
-                         is enabled; otherwise drop audio into the inbox and use the analyst bot tools.",
+                        "Send a text message, or a voice note — voice notes are transcribed \
+                         automatically when audio is enabled in Settings.",
                     )
                     .await;
                 return Ok(());
@@ -576,7 +673,8 @@ impl TelegramClient {
                          /brief and /watch — on-demand brief or watch (also see [schedule])\n\
                          /approvals — resend pending approvals\n\
                          /approve_deck <sha256> — approve Italian deck content for French\n\
-                         /revoke — revoke all standing grants",
+                         /revoke — revoke all standing grants\n\
+                         Voice notes are transcribed automatically when audio is enabled in Settings",
                     )
                     .await?;
                 }
@@ -780,6 +878,35 @@ fn is_model_command(text: &str) -> bool {
     let command = text.split_whitespace().next().unwrap_or("");
     let command = command.split('@').next().unwrap_or(command);
     matches!(command, "/model" | "/models" | "/providers" | "/providors")
+}
+
+/// Map a transcription failure to one short owner-facing line. The line names
+/// the cause, never a tool, an inbox path or a provider body.
+fn audio_failure_line(error: &SeraError) -> &'static str {
+    match error {
+        SeraError::Validation(message) => {
+            if message.contains("exceeds") {
+                AUDIO_TOO_LARGE_MESSAGE
+            } else if message.contains("unsupported") {
+                AUDIO_UNSUPPORTED_FORMAT_MESSAGE
+            } else {
+                AUDIO_PROVIDER_FAILED_MESSAGE
+            }
+        }
+        SeraError::Config(_) | SeraError::Forbidden(_) => AUDIO_UNAVAILABLE_MESSAGE,
+        _ => AUDIO_PROVIDER_FAILED_MESSAGE,
+    }
+}
+
+/// Owner-facing line after a successful transcription. The saved original is
+/// mentioned in one short line.
+fn audio_transcribed_message(saved_path: Option<&str>) -> String {
+    match saved_path {
+        Some(path) => format!(
+            "Voice note transcribed — answering now. The original recording is saved as inbox/{path}."
+        ),
+        None => "Voice note transcribed — answering now.".into(),
+    }
 }
 
 fn provider_state(provider: &crate::model_router::ProviderView) -> String {
@@ -1375,17 +1502,21 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn model_runtime() -> (Runtime, Store) {
-        use crate::config::{BotConfig, Config, LoadedBot};
-        use crate::gateway::{Gateway, ToolRegistry};
-        use crate::llm::LlmClient;
-        use crate::model_router::ModelRouter;
-        use crate::policy::Policy;
-        let mut config = Config::default();
+    fn default_test_config() -> crate::config::Config {
+        let mut config = crate::config::Config::default();
         config.llm.model = "test".into();
         config.llm.base_url = "https://example.com/v1".into();
         config.llm.models = vec!["alternative".into()];
         config.llm.data_egress_approved = true;
+        config
+    }
+
+    fn runtime_with_config(config: crate::config::Config) -> (Runtime, Store) {
+        use crate::config::{BotConfig, LoadedBot};
+        use crate::gateway::{Gateway, ToolRegistry};
+        use crate::llm::LlmClient;
+        use crate::model_router::ModelRouter;
+        use crate::policy::Policy;
         let store = Store::open_in_memory(384).unwrap();
         let llm = LlmClient::new("https://example.com/v1", "synthetic-key", 5, 100)
             .unwrap()
@@ -1428,6 +1559,10 @@ mod tests {
         )
         .unwrap();
         (runtime, store)
+    }
+
+    fn model_runtime() -> (Runtime, Store) {
+        runtime_with_config(default_test_config())
     }
 
     #[test]
@@ -1724,5 +1859,183 @@ mod tests {
             "error sending request"
         );
         assert_eq!(redact_for_log("botanical both:no"), "botanical both:no");
+    }
+
+    const AUDIO_TEST_KEY: &str = "sk-test-audio-value";
+
+    fn audio_test_config(
+        dir: &tempfile::TempDir,
+        provider_base_url: &str,
+        store_key: Option<&str>,
+    ) -> crate::config::Config {
+        use crate::secrets::{SecretStore, ensure_identity};
+        let identity = dir.path().join("identity.txt");
+        let secrets = dir.path().join("secrets.age");
+        ensure_identity(&identity).unwrap();
+        if let Some(key) = store_key {
+            let mut store = SecretStore::open_paths(&secrets, &identity).unwrap();
+            store.set("test_audio_key", key).unwrap();
+            store.save().unwrap();
+        }
+        let mut config = default_test_config();
+        config.base_dir = dir.path().to_path_buf();
+        config.secrets.encrypted_file = secrets.to_string_lossy().into_owned();
+        config.secrets.identity_file = identity.to_string_lossy().into_owned();
+        config.documents.watch_dir = dir.path().join("inbox").to_string_lossy().into_owned();
+        config.audio.enabled = true;
+        config.audio.telegram_intake = true;
+        config.audio.base_url = Some(provider_base_url.into());
+        config.audio.api_key_secret = Some("test_audio_key".into());
+        config
+    }
+
+    fn voice_update(update_id: i64, message_id: i64) -> Update {
+        serde_json::from_value(json!({
+            "update_id": update_id,
+            "message": {
+                "message_id": message_id,
+                "chat": {"id": 20, "type": "private"},
+                "from": {"id": 10},
+                "voice": {"file_id": "voice-1", "file_size": 8, "mime_type": "audio/ogg"}
+            }
+        }))
+        .unwrap()
+    }
+
+    async fn telegram_voice_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:abc/getFile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "result": {"file_path": "voice/note.ogg", "file_size": 8}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file/bot123:abc/voice/note.ogg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"RIFFfake".to_vec()))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:abc/sendMessage"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": {}})),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn sent_messages(server: &MockServer) -> Vec<String> {
+        let requests = server.received_requests().await.unwrap();
+        requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/sendMessage"))
+            .filter_map(|request| {
+                let payload: Value = serde_json::from_slice(&request.body).ok()?;
+                payload.get("text")?.as_str().map(str::to_owned)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn voice_note_without_audio_gets_one_friendly_line() {
+        let telegram = telegram_voice_server().await;
+        let (runtime, store) = runtime_with_config(default_test_config());
+        let client = TelegramClient::new("123:abc", 10, 20)
+            .unwrap()
+            .with_base_url(telegram.uri());
+        client
+            .handle_update(&runtime, &store, None, voice_update(501, 7))
+            .await
+            .unwrap();
+        let messages = sent_messages(&telegram).await;
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        let text = &messages[0];
+        assert!(!text.contains('\n'), "{text}");
+        assert!(!text.contains("audio_transcribe"), "{text}");
+        assert!(!text.contains("audio_understand"), "{text}");
+        assert!(!text.contains("inbox"), "{text}");
+        assert!(text.contains("Settings"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn voice_note_with_a_failing_provider_gets_exactly_one_line() {
+        let provider = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_json(json!({"error": {"message": "provider unavailable"}})),
+            )
+            .mount(&provider)
+            .await;
+        let telegram = telegram_voice_server().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = audio_test_config(&dir, &provider.uri(), Some(AUDIO_TEST_KEY));
+        let (runtime, store) = runtime_with_config(config);
+        let client = TelegramClient::new("123:abc", 10, 20)
+            .unwrap()
+            .with_base_url(telegram.uri());
+        client
+            .handle_update(&runtime, &store, None, voice_update(502, 8))
+            .await
+            .unwrap();
+        assert_eq!(provider.received_requests().await.unwrap().len(), 1);
+        let messages = sent_messages(&telegram).await;
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        let text = &messages[0];
+        assert!(!text.contains('\n'), "{text}");
+        assert!(!text.contains("audio_transcribe"), "{text}");
+        assert!(!text.contains("audio_understand"), "{text}");
+        assert!(!text.contains("inbox"), "{text}");
+        assert_eq!(store.pending_task_count().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_note_is_transcribed_and_answered_as_the_owner_message() {
+        let provider = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"text": "buongiorno"})))
+            .mount(&provider)
+            .await;
+        let telegram = telegram_voice_server().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = audio_test_config(&dir, &provider.uri(), Some(AUDIO_TEST_KEY));
+        let (runtime, store) = runtime_with_config(config);
+        let client = TelegramClient::new("123:abc", 10, 20)
+            .unwrap()
+            .with_base_url(telegram.uri());
+        client
+            .handle_update(&runtime, &store, None, voice_update(503, 9))
+            .await
+            .unwrap();
+        let messages = sent_messages(&telegram).await;
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].contains("inbox/telegram/9.ogg"),
+            "{:?}",
+            messages[0]
+        );
+        // The transcript is the owner's message in the same chat, so the normal
+        // turn pipeline answers it.
+        let task = store
+            .claim_task("test-worker", 60)
+            .unwrap()
+            .expect("a queued owner turn");
+        assert_eq!(task.kind, "turn");
+        assert_eq!(task.payload["text"], json!("buongiorno"));
+        assert_eq!(task.payload["conversation_id"], json!("20"));
+        assert_eq!(task.payload["source"], json!("owner"));
+        // The original recording is still stored in the inbox.
+        assert!(
+            dir.path()
+                .join("inbox")
+                .join("telegram")
+                .join("9.ogg")
+                .is_file()
+        );
     }
 }
