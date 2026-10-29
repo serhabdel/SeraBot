@@ -475,6 +475,7 @@ mod tests {
             live: true,
             tools: vec!["skill_list".into()],
             skills: vec!["ask".into()],
+            require_approval: Vec::new(),
         });
         state.bots_loaded = true;
         state.new_scope("dir:analyst".into(), true);

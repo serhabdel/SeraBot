@@ -417,7 +417,26 @@ impl Desktop {
                                     RichText::new("tools").size(10.0).color(design::muted_dim()),
                                 );
                                 for tool in &bot.tools {
-                                    design::chip(ui, tool, design::muted(), design::panel_alt());
+                                    let needs_approval = bot.require_approval.contains(tool);
+                                    let response = design::chip(
+                                        ui,
+                                        tool,
+                                        if needs_approval {
+                                            design::warning()
+                                        } else {
+                                            design::muted()
+                                        },
+                                        if needs_approval {
+                                            design::warning_bg()
+                                        } else {
+                                            design::panel_alt()
+                                        },
+                                    );
+                                    if needs_approval {
+                                        response.on_hover_text(
+                                            "Owner approval required before each call",
+                                        );
+                                    }
                                 }
                             });
                             ui.horizontal_wrapped(|ui| {

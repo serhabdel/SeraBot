@@ -1027,6 +1027,7 @@ pub struct ConfiguredBot {
     pub enabled: bool,
     pub tools: Vec<String>,
     pub skills: Vec<String>,
+    pub require_approval: Vec<String>,
 }
 
 pub fn list_configured_bots(config: &Config) -> Result<Vec<ConfiguredBot>> {
@@ -1085,8 +1086,13 @@ pub fn list_configured_bots(config: &Config) -> Result<Vec<ConfiguredBot>> {
         }
         if bot.tools.len() > MAX_ITEMS
             || bot.skills.len() > MAX_ITEMS
+            || bot.require_approval.len() > MAX_ITEMS
             || bot.tools.iter().any(|item| !safe_bot_label(item))
             || bot.skills.iter().any(|item| !safe_bot_label(item))
+            || bot
+                .require_approval
+                .iter()
+                .any(|item| !safe_bot_label(item) || !bot.tools.contains(item))
         {
             return Err(SeraError::Config("bot file is invalid".into()));
         }
@@ -1096,6 +1102,7 @@ pub fn list_configured_bots(config: &Config) -> Result<Vec<ConfiguredBot>> {
             enabled: bot.enabled,
             tools: bot.tools,
             skills: bot.skills,
+            require_approval: bot.require_approval,
         });
     }
     bots.sort_by(|left, right| left.id.cmp(&right.id));

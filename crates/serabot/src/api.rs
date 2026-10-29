@@ -582,6 +582,7 @@ async fn list_bots(State(state): State<Arc<ApiState>>) -> Result<Json<Value>> {
                 "live": state.runtime.bot_loaded(&bot.id),
                 "tools": bot.tools,
                 "skills": bot.skills,
+                "require_approval": bot.require_approval,
             })
         })
         .collect::<Vec<_>>();

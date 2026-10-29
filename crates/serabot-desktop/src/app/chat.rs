@@ -736,6 +736,7 @@ mod tests {
             live: true,
             tools: Vec::new(),
             skills: Vec::new(),
+            require_approval: Vec::new(),
         }];
         for mode in [design::ThemeMode::Dark, design::ThemeMode::Light] {
             let ctx = egui::Context::default();

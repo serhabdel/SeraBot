@@ -183,7 +183,9 @@ as other requests and is not retried if the outcome is unknown.
   not offered. The server writes a disabled specialist. Restart before it can
   run, and add it to `main.delegates` yourself if `main` should hand it work.
   **Refresh bots** calls `GET /v1/bots` for on-disk summaries (`id`, `role`,
-  `enabled`, `live`, tools, skills). Prompts and secrets are not returned.
+  `enabled`, `live`, tools, skills, approval-gated tools). Prompts and secrets
+  are not returned. Tools that require owner approval are highlighted (for
+  example Firecrawl search/crawl); hover shows the approval rule.
   `live: false` means the file is not loaded until you restart.
 - **New skill** — `POST /v1/skills` with a lowercase skill id, a one-line
   description, and an optional markdown body. There is no path field. The

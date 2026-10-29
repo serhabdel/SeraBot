@@ -467,6 +467,8 @@ pub struct BotSummary {
     pub live: bool,
     pub tools: Vec<String>,
     pub skills: Vec<String>,
+    #[serde(default)]
+    pub require_approval: Vec<String>,
 }
 
 /// One conversation row from `GET /v1/conversations`.
@@ -1174,6 +1176,13 @@ impl ApiClient {
                 return Err(ApiError::InvalidResponse);
             }
             if bot.tools.len() > MAX_BOT_SUMMARY_ITEMS || bot.skills.len() > MAX_BOT_SUMMARY_ITEMS {
+                return Err(ApiError::InvalidResponse);
+            }
+            if bot.require_approval.len() > MAX_BOT_SUMMARY_ITEMS
+                || bot.require_approval.iter().any(|tool| {
+                    !valid_speaker(tool) || !bot.tools.iter().any(|listed| listed == tool)
+                })
+            {
                 return Err(ApiError::InvalidResponse);
             }
             if bot.tools.iter().any(|tool| !valid_speaker(tool))
