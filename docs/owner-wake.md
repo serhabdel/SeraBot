@@ -18,7 +18,7 @@ tokens, or MSAL cache contents into chat, tickets, or git.
 ## Telegram (5 minutes)
 
 1. Open the owner chat — confirm the **command menu** is populated (bot calls `setMyCommands` on poll startup).
-2. **`/providers`** — models grouped by provider (same allowlist as flat **`/models`**).
+2. **`/providers`** — models grouped by provider (same allowlist as flat **`/models`**). Dynamic catalogs are cached and fail closed when refresh fails.
 3. **`/model auto`** then **`/model <provider> <model>`** — confirm selection pins for this conversation ([model-routing.md](model-routing.md)).
 4. **`/help`** — lists `/brief`, `/watch`, schedules note, approvals, deck flows.
 5. **Firecrawl** — only after secrets + config below; trigger a small **`firecrawl_scrape`** and confirm approval UI (destination + policy bind).

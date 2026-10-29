@@ -47,10 +47,10 @@ resubmitting.
 ```json
 {
   "providers": [
-    {"id": "default", "models": ["mistral-large-latest"], "data_egress_approved": false}
+    {"id": "default", "models": ["mistral-large-latest"], "data_egress_approved": false, "kind": "mistral", "catalog_fetch": false, "catalog_verified": false}
   ],
   "entries": [
-    {"provider": "default", "model": "mistral-large-latest", "data_egress_approved": false}
+    {"provider": "default", "model": "mistral-large-latest", "data_egress_approved": false, "catalog_verified": false}
   ],
   "selection": {"provider": "default", "model": "mistral-large-latest"},
   "effective_selection": {"provider": "default", "model": "mistral-large-latest"}

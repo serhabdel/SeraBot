@@ -1,8 +1,7 @@
 # Model routing
 
 SeraBot talks to OpenAI-compatible chat-completion endpoints. Routing is
-configuration-driven; there is no automatic provider discovery, no automatic
-cross-provider fallback, and no client-supplied endpoint.
+configuration-driven. Builtin kinds supply an OpenAI-compatible base. A live `GET /models` catalog is optional, cached, and intersected with the allowlist. There is no automatic cross-provider fallback and no client-supplied endpoint.
 
 ## Providers and allowed models
 
@@ -13,6 +12,8 @@ cross-provider fallback, and no client-supplied endpoint.
 base_url = "https://api.mistral.ai/v1"
 model = "mistral-large-latest"
 api_key_secret = "llm_api_key"        # name in the encrypted secret store
+kind = "mistral"                      # or deepseek, minimax, openai, groq, ...
+catalog_fetch = false                 # true fetches GET {base}/models
 data_egress_approved = false
 models = [
   "mistral-medium-latest",
@@ -132,8 +133,12 @@ Model content is not written to the audit log.
 
 ## Operational notes
 
-- The catalog is not discovered from provider APIs; it is exactly the configured
-  allowlist.
+- With `catalog_fetch = false`, advertised models are exactly the configured allowlist.
+- With `catalog_fetch = true` and `data_egress_approved = true`, SeraBot caches `GET {base}/models` for `catalog_ttl_secs` (1..=86400, default 1800) and advertises only the allowlist intersection. A failed or stale refresh closes the cache: no models are advertised and chat is refused. Unapproved providers are not contacted.
+- Builtin kinds: mistral, deepseek, minimax, minimax-cn, openai, groq, together, fireworks, openrouter, xai, cerebras, moonshot, muse-code, google-antigravity. Empty kind or `openai-compatible` requires `base_url`. Cloud Code Assist hosts are rejected.
+- `serabot providers kinds` lists kinds without a network call. `serabot providers login muse-code` stores the minted key and identity token in the age secret store and prints only the verification URL and user code.
+- `google-antigravity` refreshes an OAuth token when a refresh secret and client secret are stored. It has no default chat base and does not speak the Cloud Code Assist protocol.
+- Audit event `model.catalog_refreshed` records provider, verified, and model_count only.
 - Per-call auditing occurs after each model response, so usage totals are
   approximate if a call fails mid-stream.
 - `max_output_tokens`, timeouts, retries, tool-round limits, and SSRF/fetch policy

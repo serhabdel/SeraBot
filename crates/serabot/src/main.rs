@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use secrecy::ExposeSecret;
 use clap::{Parser, Subcommand};
 use serabot::api::{ApiNotifier, ApiState};
 use serabot::audio::{
@@ -32,6 +33,7 @@ use serabot::onedrive::OneDriveClient;
 use serabot::policy::Policy;
 use serabot::retrieval::{Retriever, SqliteRetriever};
 use serabot::runtime::{CompositeNotifier, Notifier, RagSearchTool, Runtime, ScheduledPayload};
+use serabot::skills::{SkillCatalog, SkillRuntime, init_skill, register_skill_tools};
 use serabot::scheduler::{due_routines, ensure_daily_routine};
 use serabot::secrets::{SecretStore, ensure_identity};
 use serabot::store::Store;
@@ -71,6 +73,36 @@ enum Command {
     SelftestEmbedding,
     /// Ingest a document and run one real vector retrieval against it.
     SelftestRag { path: PathBuf, query: String },
+    /// Create or inspect on-demand skill packs.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
+    /// List builtin provider kinds or sign in to Muse Code.
+    Providers {
+        #[command(subcommand)]
+        command: ProvidersCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillCommand {
+    /// Scaffold skills/<name>/SKILL.md under the configuration directory.
+    Init {
+        name: String,
+        #[arg(long, default_value = "Operator-defined skill")]
+        description: String,
+    },
+    /// List skill ids discovered under skills.dir.
+    List,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProvidersCommand {
+    /// Print builtin provider kinds. Does not contact a provider.
+    Kinds,
+    /// Device login for muse-code. Prints the verification URL and user code only.
+    Login { kind: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -132,6 +164,45 @@ async fn main() -> anyhow::Result<()> {
             }
             println!("{}", sha256_hex(token));
         }
+        Command::Providers { command } => match command {
+            ProvidersCommand::Kinds => {
+                for item in serabot::providers::builtins() {
+                    println!(
+                        "{}\t{}\t{}",
+                        item.kind,
+                        item.base_url.unwrap_or("-"),
+                        item.summary
+                    );
+                }
+            }
+            ProvidersCommand::Login { kind } => {
+                if kind != "muse-code" {
+                    anyhow::bail!("provider login is implemented for muse-code");
+                }
+                login_muse(&cli.config).await?;
+            }
+        },
+        Command::Skill { command } => match command {
+            SkillCommand::Init { name, description } => {
+                let config = Config::load(&cli.config)?;
+                let path = init_skill(&config.base_dir, &config.skills.dir, &name, &description)?;
+                println!("skill scaffold written to {}", path.display());
+            }
+            SkillCommand::List => {
+                let config = Config::load(&cli.config)?;
+                let catalog = SkillCatalog::load(&config)?;
+                for summary in catalog.summaries() {
+                    if let Some(pack) = &summary.pack {
+                        println!(
+                            "{}\t{}\tpack={}\t{}",
+                            summary.id, summary.name, pack, summary.description
+                        );
+                    } else {
+                        println!("{}\t{}\t{}", summary.id, summary.name, summary.description);
+                    }
+                }
+            }
+        },
         Command::Run => run(&cli.config).await?,
         Command::Backup { destination } => {
             let config = Config::load(&cli.config)?;
@@ -217,6 +288,7 @@ fn load(
     {
         anyhow::bail!("an enabled 'main' bot is required");
     }
+    SkillCatalog::load(&config)?.validate_bot_skills(&bots)?;
     Ok((config, bots))
 }
 
@@ -238,10 +310,12 @@ fn check(config_path: &std::path::Path) -> anyhow::Result<()> {
             bot.config.enabled,
         )?;
     }
+    let catalog = SkillCatalog::load(&config)?;
     println!(
-        "ok: database={}, bots={}, blocklist_terms={}, api={}, telegram={}",
+        "ok: database={}, bots={}, skills={}, blocklist_terms={}, api={}, telegram={}",
         store.path().display(),
         bots.len(),
+        catalog.skill_ids().len(),
         policy.term_count(),
         config.api.enabled,
         config.telegram.enabled
@@ -269,7 +343,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         )?;
     }
 
-    let api_key = secrets
+    secrets
         .require(&config.llm.api_key_secret)
         .map_err(|error| {
             anyhow::anyhow!(
@@ -277,21 +351,20 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
                 config.llm.api_key_secret
             )
         })?;
-    let llm = LlmClient::new(
-        &config.llm.base_url,
-        api_key,
+    let llm = open_provider_client(
+        &config.llm.default_provider(),
+        &secrets,
         config.llm.timeout_secs,
         config.llm.max_output_tokens,
     )?
     .with_model(&config.llm.model);
     let mut clients = std::collections::BTreeMap::from([("default".to_owned(), llm)]);
     for (id, provider) in &config.llm.providers {
-        let api_key = secrets.require(&provider.api_key_secret)?;
         clients.insert(
             id.clone(),
-            LlmClient::new(
-                &provider.base_url,
-                api_key,
+            open_provider_client(
+                provider,
+                &secrets,
                 config.llm.timeout_secs,
                 config.llm.max_output_tokens,
             )?,
@@ -497,6 +570,11 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     if config.api.enabled {
         notifiers.push(Arc::new(ApiNotifier::new(store.clone())));
     }
+    let catalog = Arc::new(SkillCatalog::load(&config)?);
+    register_skill_tools(
+        &mut registry,
+        SkillRuntime::new(catalog, &bots),
+    )?;
     let notifier = Arc::new(CompositeNotifier::new(notifiers));
 
     let gateway = Gateway::new(
@@ -635,5 +713,88 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     for service in services {
         let _ = tokio::time::timeout(Duration::from_secs(10), service).await;
     }
+    Ok(())
+}
+
+fn muse_secret_names(config: &Config) -> (String, String) {
+    let profile = config
+        .llm
+        .providers
+        .iter()
+        .find(|(id, profile)| *id == "muse-code" || profile.kind == "muse-code")
+        .map(|(_, profile)| profile);
+    let api = profile
+        .map(|profile| profile.api_key_secret.clone())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "muse_code_api_key".into());
+    let identity = profile
+        .map(|profile| profile.refresh_token_secret.clone())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "muse_code_identity".into());
+    (api, identity)
+}
+
+fn open_provider_client(
+    profile: &serabot::config::ProviderConfig,
+    secrets: &SecretStore,
+    timeout_secs: u64,
+    max_output_tokens: u32,
+) -> anyhow::Result<LlmClient> {
+    use serabot::providers::{AuthPlan, OAuthMaterial, OAuthStyle, auth_plan, resolve_base_url};
+    let endpoint = resolve_base_url(&profile.kind, &profile.base_url)?;
+    let api_key = secrets.require(&profile.api_key_secret)?.to_owned();
+    let client = LlmClient::new(&endpoint, api_key, timeout_secs, max_output_tokens)?;
+    let plan = auth_plan(&profile.kind, &profile.auth)?;
+    let AuthPlan::OAuth {
+        style,
+        token_url,
+        client_id_fallback,
+    } = plan
+    else {
+        return Ok(client);
+    };
+    if profile.refresh_token_secret.trim().is_empty() {
+        return Ok(client);
+    }
+    let refresh_token = secrets.require(&profile.refresh_token_secret)?.to_owned();
+    let client_id = if profile.oauth_client_id_secret.trim().is_empty() {
+        client_id_fallback.unwrap_or("").to_owned()
+    } else {
+        secrets.require(&profile.oauth_client_id_secret)?.to_owned()
+    };
+    let client_secret = if profile.oauth_client_secret_secret.trim().is_empty() {
+        String::new()
+    } else {
+        secrets.require(&profile.oauth_client_secret_secret)?.to_owned()
+    };
+    if style == OAuthStyle::RefreshToken && client_secret.is_empty() {
+        anyhow::bail!("oauth client secret is required to refresh this provider");
+    }
+    Ok(client.with_oauth(OAuthMaterial {
+        style,
+        refresh_token,
+        token_url: token_url.to_owned(),
+        client_id,
+        client_secret,
+    })?)
+}
+
+async fn login_muse(config_path: &std::path::Path) -> anyhow::Result<()> {
+    let config = Config::load(config_path)?;
+    let mut store = SecretStore::open(&config)?;
+    let (api_name, identity_name) = muse_secret_names(&config);
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let credentials = serabot::providers::login_muse_code(&http, |url, code| {
+        println!("Open {url}");
+        println!("Code: {code}");
+    })
+    .await?;
+    store.set(&api_name, credentials.api_key.expose_secret())?;
+    store.set(&identity_name, credentials.identity_token.expose_secret())?;
+    store.save()?;
+    println!("stored secret names {api_name} and {identity_name}");
     Ok(())
 }

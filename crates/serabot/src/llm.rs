@@ -1,8 +1,15 @@
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use zeroize::Zeroize;
+
+use crate::providers::{
+    OAuthMaterial, OAuthStyle, enforce_oauth_target, muse_mint_api_key, parse_model_ids,
+    refresh_token_grant,
+};
 
 use crate::domain::{LlmMessage, Role, ToolCall};
 use crate::error::{Result, SeraError};
@@ -25,14 +32,23 @@ pub struct LlmResponse {
     pub finish_reason: Option<String>,
 }
 
+struct OAuthState {
+    style: OAuthStyle,
+    refresh_token: SecretString,
+    token_url: String,
+    client_id: String,
+    client_secret: SecretString,
+}
+
 #[derive(Clone)]
 pub struct LlmClient {
     http: reqwest::Client,
     base_url: String,
-    api_key: SecretString,
+    api_key: Arc<Mutex<SecretString>>,
     model: String,
     max_output_tokens: u32,
     max_retries: usize,
+    oauth: Option<Arc<OAuthState>>,
 }
 
 impl std::fmt::Debug for LlmClient {
@@ -64,11 +80,47 @@ impl LlmClient {
         Ok(Self {
             http,
             base_url,
-            api_key: SecretString::new(api_key),
+            api_key: Arc::new(Mutex::new(SecretString::new(api_key))),
             model: String::new(),
             max_output_tokens,
             max_retries: 2,
+            oauth: None,
         })
+    }
+
+    pub fn with_oauth(self, material: OAuthMaterial) -> Result<Self> {
+        let token_url = enforce_oauth_target(material.style, &material.token_url)?;
+        self.install_oauth(material, token_url)
+    }
+
+    #[cfg(test)]
+    pub fn with_oauth_unpinned(self, material: OAuthMaterial) -> Result<Self> {
+        let token_url = validate_base_url(&material.token_url)?;
+        self.install_oauth(material, token_url)
+    }
+
+    fn install_oauth(mut self, material: OAuthMaterial, token_url: String) -> Result<Self> {
+        if material.refresh_token.trim().is_empty() {
+            return Err(SeraError::Config(
+                "oauth refresh credential is missing".into(),
+            ));
+        }
+        self.oauth = Some(Arc::new(OAuthState {
+            style: material.style,
+            refresh_token: SecretString::new(material.refresh_token),
+            token_url,
+            client_id: material.client_id,
+            client_secret: SecretString::new(material.client_secret),
+        }));
+        Ok(self)
+    }
+
+    fn bearer(&self) -> String {
+        self.api_key
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .expose_secret()
+            .to_owned()
     }
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
@@ -120,17 +172,25 @@ impl LlmClient {
 
         let url = format!("{}/chat/completions", self.base_url);
         let mut last_error = None;
-        for attempt in 0..=self.max_retries {
+        let mut refreshed = false;
+        for attempt in 0..=self.max_retries + 1 {
+            let mut key = self.bearer();
             let response = self
                 .http
                 .post(&url)
-                .bearer_auth(self.api_key.expose_secret())
+                .bearer_auth(&key)
                 .json(&body)
                 .send()
                 .await;
+            key.zeroize();
             match response {
                 Ok(response) => {
                     let status = response.status();
+                    if status.as_u16() == 401 && self.oauth.is_some() && !refreshed {
+                        refreshed = true;
+                        self.refresh_oauth().await?;
+                        continue;
+                    }
                     if status.is_success() {
                         let bytes = response.bytes().await.map_err(|error| {
                             SeraError::External(format!("LLM response read failed: {error}"))
@@ -159,6 +219,87 @@ impl LlmClient {
             }
         }
         Err(last_error.unwrap_or_else(|| SeraError::External("LLM request failed".into())))
+    }
+
+    pub async fn list_models(&self) -> Result<std::collections::BTreeSet<String>> {
+        let url = format!("{}/models", self.base_url);
+        let mut refreshed = false;
+        let mut last_error = None;
+        for attempt in 0..=self.max_retries + 1 {
+            let mut key = self.bearer();
+            let response = self
+                .http
+                .get(&url)
+                .bearer_auth(&key)
+                .header("accept", "application/json")
+                .send()
+                .await;
+            key.zeroize();
+            match response {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.as_u16() == 401 && self.oauth.is_some() && !refreshed {
+                        refreshed = true;
+                        self.refresh_oauth().await?;
+                        continue;
+                    }
+                    if status.is_success() {
+                        let bytes = response.bytes().await.map_err(|_| {
+                            SeraError::External("model catalog read failed".into())
+                        })?;
+                        return parse_model_ids(&bytes);
+                    }
+                    let retryable = status.as_u16() == 429 || status.is_server_error();
+                    last_error = Some(SeraError::External(format!(
+                        "model catalog failed with status {}",
+                        status.as_u16()
+                    )));
+                    if !retryable || attempt == self.max_retries {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200 * (1 << attempt))).await;
+                }
+                Err(_) => {
+                    last_error = Some(SeraError::External("model catalog request failed".into()));
+                    if attempt == self.max_retries {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200 * (1 << attempt))).await;
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| SeraError::External("model catalog request failed".into())))
+    }
+
+    async fn refresh_oauth(&self) -> Result<()> {
+        let oauth = self.oauth.as_ref().ok_or_else(|| {
+            SeraError::External("oauth refresh is not configured".into())
+        })?;
+        let token = match oauth.style {
+            OAuthStyle::MuseMint => {
+                muse_mint_api_key(
+                    &self.http,
+                    &oauth.token_url,
+                    oauth.refresh_token.expose_secret(),
+                )
+                .await?
+            }
+            OAuthStyle::RefreshToken => {
+                refresh_token_grant(
+                    &self.http,
+                    &oauth.token_url,
+                    oauth.refresh_token.expose_secret(),
+                    &oauth.client_id,
+                    oauth.client_secret.expose_secret(),
+                )
+                .await?
+            }
+        };
+        *self
+            .api_key
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = SecretString::new(token);
+        Ok(())
     }
 }
 
