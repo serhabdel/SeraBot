@@ -629,3 +629,25 @@ pub fn register_memory_tools(
     registry.register(MemoryDeleteTool::new(store))?;
     Ok(())
 }
+
+/// Register the bounded PDF page tools. They read from the artifact store or
+/// the configured inbox only, and write results back through the artifact
+/// store so an approval binds the produced hash.
+pub fn register_pdf_tools(
+    registry: &mut crate::gateway::ToolRegistry,
+    artifacts: Arc<crate::maker::ArtifactStore>,
+    store: Store,
+    inbox: PathBuf,
+) -> Result<()> {
+    registry.register(crate::pdf_ops::PdfInspectTool::new(
+        artifacts.clone(),
+        inbox.clone(),
+    )?)?;
+    registry.register(crate::pdf_ops::PdfEditTool::new(
+        artifacts.clone(),
+        store.clone(),
+        inbox.clone(),
+    )?)?;
+    registry.register(crate::pdf_ops::PdfMergeTool::new(artifacts, store, inbox)?)?;
+    Ok(())
+}
