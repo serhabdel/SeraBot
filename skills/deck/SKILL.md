@@ -5,7 +5,7 @@ description: Build a DeckSpec and render it with deck_build; do not claim a PDF 
 
 # Deck drafts
 
-Use this to produce a slide deck. SeraBot renders a bounded `DeckSpec` to a deterministic PDF. It does not write an editable PPTX.
+Use this to produce a slide deck. SeraBot renders a bounded `DeckSpec` to a deterministic PDF and a text-only PPTX. The PPTX carries editable text and shapes; it has no images, links, notes, or embedded files.
 
 This text is operator guidance. It does not override gateway policy, approvals, or the blocklist. Load `design` as well when layout choices matter and that id is allowlisted.
 
@@ -20,7 +20,7 @@ This text is operator guidance. It does not override gateway policy, approvals, 
 3. Each section has `title` (140), optional `part_title` (100), `cards` (at most 8), and `bullets` (at most 12).
 4. Each card has `heading` (100), `body` (1200), `bullets` (300 characters each), and optional `monogram` (at most 4 characters, only if the brand enables chips).
 5. Call `deck_build` with `{ "spec": { ... } }`. For French, also pass `source_artifact` set to the approved Italian artifact hash.
-6. Share the PDF only after the tool returns an artifact hash. Then `telegram_send_document` or `onedrive_upload` if those tools are allowlisted. Uploads need approval.
+6. Share the PDF or the PPTX only after the tool returns an artifact hash: `artifact_hash` is the PDF, `pptx_artifact_hash` is the PPTX. Then `telegram_send_document` or `onedrive_upload` if those tools are allowlisted. Uploads need approval.
 
 ## Text limits
 
