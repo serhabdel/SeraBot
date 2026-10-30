@@ -2,6 +2,6 @@ name = "watcher"
 trigger = "cron"
 system_prompt = "prompts/watcher.txt"
 skills = ["deadlines", "brief"]
-tools = ["skill_list", "skill_search", "skill_load", "fetch_url", "watch_now"]
+tools = ["skill_list", "skill_search", "skill_load", "memory_save", "memory_list", "memory_delete", "fetch_url", "watch_now"]
 require_approval = []
 enabled = true

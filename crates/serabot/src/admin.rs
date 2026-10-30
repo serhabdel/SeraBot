@@ -15,12 +15,20 @@ use serde::{Deserialize, Serialize};
 use crate::audio::resolve_audio_provider;
 use crate::config::{Config, ConnectorsConfig, OAuthConnectorSettings, ProviderConfig};
 use crate::error::{Result, SeraError};
-use crate::providers::{AuthPlan, auth_plan, canonical_kind, check_profile};
+use crate::providers::{canonical_kind, check_profile};
 use crate::secrets::SharedSecrets;
 
 pub const OVERLAY_FILE: &str = "admin-overrides.json";
 const MAX_OVERLAY_BYTES: u64 = 1_048_576;
 const MAX_CREDENTIAL_LEN: usize = 8_192;
+
+#[derive(Debug, Clone, Default)]
+pub struct ProviderSecrets<'a> {
+    pub api_key: Option<&'a str>,
+    pub refresh_token: Option<&'a str>,
+    pub oauth_client_id: Option<&'a str>,
+    pub oauth_client_secret: Option<&'a str>,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AdminOverlay {
@@ -189,8 +197,30 @@ impl AdminStore {
         base: &Config,
         secrets: &SharedSecrets,
         id: &str,
-        mut profile: ProviderConfig,
+        profile: ProviderConfig,
         api_key: Option<&str>,
+    ) -> Result<()> {
+        self.add_provider_with_secrets(
+            base,
+            secrets,
+            id,
+            profile,
+            ProviderSecrets {
+                api_key,
+                refresh_token: None,
+                oauth_client_id: None,
+                oauth_client_secret: None,
+            },
+        )
+    }
+
+    pub fn add_provider_with_secrets(
+        &self,
+        base: &Config,
+        secrets: &SharedSecrets,
+        id: &str,
+        mut profile: ProviderConfig,
+        provider_secrets: ProviderSecrets<'_>,
     ) -> Result<()> {
         validate_provider_id(id)?;
         if id == "default" {
@@ -205,23 +235,75 @@ impl AdminStore {
             )));
         }
         let kind = canonical_kind(&profile.kind)?;
-        if matches!(auth_plan(&kind, "")?, AuthPlan::OAuth { .. }) {
-            return Err(SeraError::Config(
-                "OAuth providers are configured in serabot.toml".into(),
-            ));
+        let is_oauth = matches!(kind.as_str(), "google-antigravity" | "muse-code")
+            || profile.auth.trim().eq_ignore_ascii_case("oauth");
+        if is_oauth {
+            if profile.auth.trim().is_empty() {
+                profile.auth = "oauth".to_owned();
+            }
+            if kind == "google-antigravity" {
+                if profile.api_key_secret.trim().is_empty() {
+                    profile.api_key_secret = "antigravity_access_token".to_owned();
+                }
+                if profile.refresh_token_secret.trim().is_empty() {
+                    profile.refresh_token_secret = "antigravity_refresh_token".to_owned();
+                }
+                if profile.oauth_client_secret_secret.trim().is_empty() {
+                    profile.oauth_client_secret_secret =
+                        "antigravity_oauth_client_secret".to_owned();
+                }
+            } else if kind == "muse-code" {
+                if profile.api_key_secret.trim().is_empty() {
+                    profile.api_key_secret = "muse_code_api_key".to_owned();
+                }
+                if profile.refresh_token_secret.trim().is_empty() {
+                    profile.refresh_token_secret = "muse_code_identity".to_owned();
+                }
+            } else {
+                return Err(SeraError::Config(
+                    "oauth auth is only supported for muse-code and google-antigravity".into(),
+                ));
+            }
+        } else {
+            profile.auth = "api_key".to_owned();
+            profile.refresh_token_secret.clear();
+            profile.oauth_client_id_secret.clear();
+            profile.oauth_client_secret_secret.clear();
+            profile.project_id.clear();
         }
         profile.kind = kind;
-        profile.auth.clear();
-        profile.refresh_token_secret.clear();
-        profile.oauth_client_id_secret.clear();
-        profile.oauth_client_secret_secret.clear();
-        profile.project_id.clear();
         profile.data_egress_approved = true;
         profile.base_url = profile.base_url.trim().to_owned();
         profile.api_key_secret = profile.api_key_secret.trim().to_owned();
+        profile.refresh_token_secret = profile.refresh_token_secret.trim().to_owned();
+        profile.oauth_client_id_secret = profile.oauth_client_id_secret.trim().to_owned();
+        profile.oauth_client_secret_secret = profile.oauth_client_secret_secret.trim().to_owned();
+        profile.project_id = profile.project_id.trim().to_owned();
+
         if !crate::config::valid_secret_name(&profile.api_key_secret) {
             return Err(SeraError::Validation(
                 "api_key_secret must be a secret-store key name".into(),
+            ));
+        }
+        if !profile.refresh_token_secret.is_empty()
+            && !crate::config::valid_secret_name(&profile.refresh_token_secret)
+        {
+            return Err(SeraError::Validation(
+                "refresh_token_secret must be a secret-store key name".into(),
+            ));
+        }
+        if !profile.oauth_client_id_secret.is_empty()
+            && !crate::config::valid_secret_name(&profile.oauth_client_id_secret)
+        {
+            return Err(SeraError::Validation(
+                "oauth_client_id_secret must be a secret-store key name".into(),
+            ));
+        }
+        if !profile.oauth_client_secret_secret.is_empty()
+            && !crate::config::valid_secret_name(&profile.oauth_client_secret_secret)
+        {
+            return Err(SeraError::Validation(
+                "oauth_client_secret_secret must be a secret-store key name".into(),
             ));
         }
         if profile.models.is_empty() || profile.models.len() > 256 {
@@ -244,35 +326,91 @@ impl AdminStore {
         check_profile(
             &profile.kind,
             &profile.base_url,
-            "",
-            "",
-            "",
+            &profile.auth,
+            &profile.refresh_token_secret,
+            &profile.oauth_client_secret_secret,
             profile.catalog_fetch,
             profile.catalog_ttl_secs,
         )?;
 
-        if let Some(key) = api_key {
-            if !credential_ok(key) {
-                return Err(SeraError::Validation(
-                    "the API key is empty, too long, or contains control characters".into(),
-                ));
+        let mut to_persist: Vec<(&str, &str)> = Vec::new();
+
+        if let Some(key) = provider_secrets.api_key {
+            let key = key.trim();
+            if !key.is_empty() {
+                if !credential_ok(key) {
+                    return Err(SeraError::Validation(
+                        "the API key is empty, too long, or contains control characters".into(),
+                    ));
+                }
+                let shared = base.llm.api_key_secret == profile.api_key_secret
+                    || base.llm.providers.iter().any(|(other, configured)| {
+                        other != id && configured.api_key_secret == profile.api_key_secret
+                    })
+                    || self.snapshot().providers.iter().any(|(other, configured)| {
+                        other != id && configured.api_key_secret == profile.api_key_secret
+                    });
+                if shared {
+                    return Err(SeraError::Validation(format!(
+                        "secret {} already belongs to another provider; choose a new secret name",
+                        profile.api_key_secret
+                    )));
+                }
+                to_persist.push((profile.api_key_secret.as_str(), key));
             }
-            let shared = base.llm.api_key_secret == profile.api_key_secret
-                || base.llm.providers.iter().any(|(other, configured)| {
-                    other != id && configured.api_key_secret == profile.api_key_secret
-                })
-                || self.snapshot().providers.iter().any(|(other, configured)| {
-                    other != id && configured.api_key_secret == profile.api_key_secret
-                });
-            if shared {
+        }
+
+        if let Some(token) = provider_secrets.refresh_token {
+            let token = token.trim();
+            if !token.is_empty() && !profile.refresh_token_secret.is_empty() {
+                if !credential_ok(token) {
+                    return Err(SeraError::Validation(
+                        "the refresh token is empty, too long, or contains control characters"
+                            .into(),
+                    ));
+                }
+                to_persist.push((profile.refresh_token_secret.as_str(), token));
+            }
+        }
+
+        if let Some(client_id) = provider_secrets.oauth_client_id {
+            let client_id = client_id.trim();
+            if !client_id.is_empty() && !profile.oauth_client_id_secret.is_empty() {
+                if !credential_ok(client_id) {
+                    return Err(SeraError::Validation(
+                        "the oauth client id is empty, too long, or contains control characters"
+                            .into(),
+                    ));
+                }
+                to_persist.push((profile.oauth_client_id_secret.as_str(), client_id));
+            }
+        }
+
+        if let Some(client_secret) = provider_secrets.oauth_client_secret {
+            let client_secret = client_secret.trim();
+            if !client_secret.is_empty() && !profile.oauth_client_secret_secret.is_empty() {
+                if !credential_ok(client_secret) {
+                    return Err(SeraError::Validation(
+                        "the oauth client secret is empty, too long, or contains control characters".into(),
+                    ));
+                }
+                to_persist.push((profile.oauth_client_secret_secret.as_str(), client_secret));
+            }
+        }
+
+        if !to_persist.is_empty() {
+            secrets.persist(&to_persist)?;
+        }
+
+        if is_oauth {
+            if !secrets.has(&profile.refresh_token_secret) && !secrets.has(&profile.api_key_secret)
+            {
                 return Err(SeraError::Validation(format!(
-                    "secret {} already belongs to another provider; choose a new secret name",
-                    profile.api_key_secret
+                    "secret {} is empty; provide credentials",
+                    profile.refresh_token_secret
                 )));
             }
-            secrets.persist(&[(profile.api_key_secret.as_str(), key)])?;
-        }
-        if !secrets.has(&profile.api_key_secret) {
+        } else if !secrets.has(&profile.api_key_secret) {
             return Err(SeraError::Validation(format!(
                 "secret {} is empty; provide an API key",
                 profile.api_key_secret
@@ -389,7 +527,7 @@ impl AdminStore {
         connector_secret_roles(&base.connectors, id)
     }
 
-    fn snapshot(&self) -> AdminOverlay {
+    pub fn snapshot(&self) -> AdminOverlay {
         self.overlay
             .lock()
             .unwrap_or_else(|error| error.into_inner())

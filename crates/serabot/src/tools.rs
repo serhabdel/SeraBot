@@ -386,3 +386,246 @@ impl Tool for DocumentIndexTool {
         })
     }
 }
+
+fn normalize_memory_category(cat: &str) -> &'static str {
+    match cat.trim().to_ascii_lowercase().as_str() {
+        "preference" => "preference",
+        "fact" => "fact",
+        "decision" => "decision",
+        "context" | "project" | "contact" => "context",
+        "note" | "deadline" => "note",
+        _ => "fact",
+    }
+}
+
+pub struct MemorySaveTool {
+    store: Store,
+}
+
+impl MemorySaveTool {
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl Tool for MemorySaveTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "memory_save".into(),
+            description: "Save a durable fact, preference, or note to the owner's memory store so all bots remember it across conversations and sessions.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "Concise fact or preference to remember (max 2000 chars)"
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "Optional category (e.g. preference, project, contact, deadline, general)"
+                    }
+                },
+                "required": ["content"],
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let content = args
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SeraError::Validation("content is required".into()))?;
+        let content = content.trim();
+        if content.is_empty() {
+            return Err(SeraError::Validation("content must not be empty".into()));
+        }
+        if content.chars().count() > 2000 {
+            return Err(SeraError::Validation(
+                "content exceeds 2000 characters".into(),
+            ));
+        }
+        let category = args
+            .get("category")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("general");
+        let kind = normalize_memory_category(category);
+        let source = format!("chat:{}", context.bot);
+        let memory = crate::memory::add(&self.store, kind, content, &source)?;
+        self.store.record_audit(
+            &context.actor,
+            "memory.created",
+            Some("memory_save"),
+            context.task_id.as_deref(),
+            None,
+            None,
+            None,
+            Some(&json!({
+                "id": memory.id,
+                "kind": memory.kind,
+                "category": category,
+                "source": memory.source,
+            })),
+        )?;
+        let result = json!({
+            "id": memory.id,
+            "content": memory.content,
+            "category": category,
+        });
+        Ok(ToolOutput {
+            content: serde_json::to_string(&result)?,
+            data: Some(result),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+pub struct MemoryListTool {
+    store: Store,
+}
+
+impl MemoryListTool {
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl Tool for MemoryListTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "memory_list".into(),
+            description: "List or search saved owner memories and facts across all conversations."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional case-insensitive keyword filter"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max memories to return (1..50, default 20)"
+                    }
+                },
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(20)
+            .clamp(1, 50) as usize;
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let memories = crate::memory::list(&self.store, limit)?;
+        let filtered = if let Some(q) = query {
+            let q_lower = q.to_lowercase();
+            memories
+                .into_iter()
+                .filter(|m| {
+                    m.content.to_lowercase().contains(&q_lower)
+                        || m.category.to_lowercase().contains(&q_lower)
+                })
+                .collect()
+        } else {
+            memories
+        };
+        let result = json!({
+            "memories": filtered.into_iter().map(|m| json!({
+                "id": m.id,
+                "content": m.content,
+                "category": m.category,
+                "created_at": m.created_at,
+            })).collect::<Vec<_>>()
+        });
+        Ok(ToolOutput {
+            content: serde_json::to_string(&result)?,
+            data: Some(result),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+pub struct MemoryDeleteTool {
+    store: Store,
+}
+
+impl MemoryDeleteTool {
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl Tool for MemoryDeleteTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "memory_delete".into(),
+            description: "Delete a saved owner memory by its id when the owner asks to forget or remove an outdated fact.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Memory ID to delete"
+                    }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let id = args
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SeraError::Validation("id is required".into()))?;
+        let deleted = crate::memory::delete(&self.store, id)?;
+        self.store.record_audit(
+            &context.actor,
+            "memory.deleted",
+            Some("memory_delete"),
+            context.task_id.as_deref(),
+            None,
+            None,
+            None,
+            Some(&json!({
+                "id": id,
+                "found": deleted,
+            })),
+        )?;
+        let result = json!({
+            "deleted": id,
+            "found": deleted,
+        });
+        Ok(ToolOutput {
+            content: serde_json::to_string(&result)?,
+            data: Some(result),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+pub fn register_memory_tools(
+    registry: &mut crate::gateway::ToolRegistry,
+    store: Store,
+) -> Result<()> {
+    registry.register(MemorySaveTool::new(store.clone()))?;
+    registry.register(MemoryListTool::new(store.clone()))?;
+    registry.register(MemoryDeleteTool::new(store))?;
+    Ok(())
+}

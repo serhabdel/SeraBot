@@ -20,7 +20,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 
-use crate::admin::{AdminStore, BotProfile};
+use crate::admin::{AdminStore, BotProfile, ProviderSecrets};
 use crate::config::{Config, OAuthConnectorSettings, ProviderConfig, scaffold_specialist_bot};
 use crate::domain::Task;
 use crate::error::{Result, SeraError};
@@ -712,7 +712,7 @@ async fn events(
     let store = state.store.clone();
     let stream = futures::stream::unfold((last, store), move |(last, store)| async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_millis(180)).await;
             match store.events_after(last, limit) {
                 Ok(events) if !events.is_empty() => {
                     let next = events.last().map(|event| event.id).unwrap_or(last);
@@ -1280,7 +1280,7 @@ async fn list_providers(State(state): State<Arc<ApiState>>) -> Result<Json<Value
     let llm = &state.config.llm;
     let mut settings: BTreeMap<String, ProviderConfig> = llm.providers.clone();
     settings.insert("default".to_owned(), llm.default_provider());
-    let providers = catalog
+    let mut providers = catalog
         .into_iter()
         .map(|provider| {
             let managed = state
@@ -1298,24 +1298,102 @@ async fn list_providers(State(state): State<Arc<ApiState>>) -> Result<Json<Value
                 })
                 .map(|(name, _)| name.clone())
                 .collect::<Vec<_>>();
+            let is_oauth =
+                config.is_some_and(|c| {
+                    c.auth.eq_ignore_ascii_case("oauth")
+                        || matches!(c.kind.as_str(), "google-antigravity" | "muse-code")
+                }) || matches!(provider.kind.as_str(), "google-antigravity" | "muse-code");
+            let mut secrets = json!({
+                "api_key": secret_status(&state.secrets, config.map(|c| c.api_key_secret.as_str())),
+            });
+            if is_oauth || config.is_some_and(|c| !c.refresh_token_secret.is_empty()) {
+                secrets["refresh_token"] = secret_status(
+                    &state.secrets,
+                    config.map(|c| c.refresh_token_secret.as_str()),
+                );
+            }
+            if is_oauth || config.is_some_and(|c| !c.oauth_client_id_secret.is_empty()) {
+                secrets["oauth_client_id"] = secret_status(
+                    &state.secrets,
+                    config.map(|c| c.oauth_client_id_secret.as_str()),
+                );
+            }
+            if is_oauth || config.is_some_and(|c| !c.oauth_client_secret_secret.is_empty()) {
+                secrets["oauth_client_secret"] = secret_status(
+                    &state.secrets,
+                    config.map(|c| c.oauth_client_secret_secret.as_str()),
+                );
+            }
             json!({
                 "id": provider.id,
                 "kind": provider.kind,
+                "auth": if is_oauth { "oauth" } else { "api_key" },
+                "base_url": config.map(|c| c.base_url.as_str()).unwrap_or(""),
                 "models": provider.models,
                 "routing_classes": routing_classes,
                 "data_egress_approved": provider.data_egress_approved,
                 "catalog_fetch": provider.catalog_fetch,
                 "catalog_verified": provider.catalog_verified,
                 "managed": managed,
-                "secrets": {
-                    "api_key": secret_status(&state.secrets, config.map(|c| c.api_key_secret.as_str())),
-                    "refresh_token": secret_status(&state.secrets, config.map(|c| c.refresh_token_secret.as_str())),
-                    "oauth_client_id": secret_status(&state.secrets, config.map(|c| c.oauth_client_id_secret.as_str())),
-                    "oauth_client_secret": secret_status(&state.secrets, config.map(|c| c.oauth_client_secret_secret.as_str())),
-                },
+                "secrets": secrets,
             })
         })
         .collect::<Vec<_>>();
+
+    if let Some(admin) = &state.admin {
+        for (id, profile) in admin.snapshot().providers {
+            if !providers
+                .iter()
+                .any(|p| p.get("id").and_then(Value::as_str) == Some(&id))
+            {
+                let is_oauth = profile.auth.eq_ignore_ascii_case("oauth")
+                    || matches!(profile.kind.as_str(), "google-antigravity" | "muse-code");
+                let mut secrets = json!({
+                    "api_key": secret_status(&state.secrets, Some(profile.api_key_secret.as_str())),
+                });
+                if is_oauth || !profile.refresh_token_secret.is_empty() {
+                    secrets["refresh_token"] =
+                        secret_status(&state.secrets, Some(profile.refresh_token_secret.as_str()));
+                }
+                if is_oauth || !profile.oauth_client_id_secret.is_empty() {
+                    secrets["oauth_client_id"] = secret_status(
+                        &state.secrets,
+                        Some(profile.oauth_client_id_secret.as_str()),
+                    );
+                }
+                if is_oauth || !profile.oauth_client_secret_secret.is_empty() {
+                    secrets["oauth_client_secret"] = secret_status(
+                        &state.secrets,
+                        Some(profile.oauth_client_secret_secret.as_str()),
+                    );
+                }
+                let routing_classes = llm
+                    .classes
+                    .iter()
+                    .filter(|(_, models)| {
+                        models.iter().any(|model| {
+                            profile.models.iter().any(|advertised| advertised == model)
+                        })
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>();
+                providers.push(json!({
+                    "id": id,
+                    "kind": profile.kind,
+                    "auth": if is_oauth { "oauth" } else { "api_key" },
+                    "base_url": profile.base_url,
+                    "models": profile.models,
+                    "routing_classes": routing_classes,
+                    "data_egress_approved": profile.data_egress_approved,
+                    "catalog_fetch": profile.catalog_fetch,
+                    "catalog_verified": false,
+                    "managed": true,
+                    "secrets": secrets,
+                }));
+            }
+        }
+    }
+
     Ok(Json(json!({"providers": providers})))
 }
 
@@ -1335,13 +1413,15 @@ async fn list_connectors(State(state): State<Arc<ApiState>>) -> Result<Json<Valu
         .map(|(id, connector)| oauth_connector_view(&state, id, connector))
         .collect::<Vec<_>>();
     let agentmail = &connectors.agentmail;
+    let api_base = agentmail.api_base.trim();
+    let inbox_id = agentmail.default_inbox_id.trim();
     views.push(json!({
         "id": "agentmail",
         "kind": "api_key",
         "enabled": agentmail.enabled,
         "redirect_uri": Value::Null,
-        "api_base": agentmail.api_base,
-        "default_inbox_id": agentmail.default_inbox_id,
+        "api_base": if api_base.is_empty() { Value::Null } else { json!(api_base) },
+        "default_inbox_id": if inbox_id.is_empty() { Value::Null } else { json!(inbox_id) },
         "secrets": {
             "api_key": secret_status(&state.secrets, Some(agentmail.api_key_secret.as_str())),
         },
@@ -1433,6 +1513,22 @@ struct AddProviderRequest {
     catalog_fetch: bool,
     #[serde(default)]
     api_key: Option<String>,
+    #[serde(default)]
+    auth: String,
+    #[serde(default)]
+    refresh_token_secret: String,
+    #[serde(default)]
+    oauth_client_id_secret: String,
+    #[serde(default)]
+    oauth_client_secret_secret: String,
+    #[serde(default)]
+    project_id: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    oauth_client_id: Option<String>,
+    #[serde(default)]
+    oauth_client_secret: Option<String>,
 }
 
 async fn admin_add_provider(
@@ -1447,17 +1543,27 @@ async fn admin_add_provider(
         data_egress_approved: true,
         kind: request.kind,
         catalog_fetch: request.catalog_fetch,
+        auth: request.auth,
+        refresh_token_secret: request.refresh_token_secret,
+        oauth_client_id_secret: request.oauth_client_id_secret,
+        oauth_client_secret_secret: request.oauth_client_secret_secret,
+        project_id: request.project_id,
         ..ProviderConfig::default()
     };
     let kind = profile.kind.clone();
     let catalog_fetch = profile.catalog_fetch;
     admin
-        .add_provider(
+        .add_provider_with_secrets(
             &state.config,
             &state.secrets,
             &request.id,
             profile,
-            request.api_key.as_deref(),
+            ProviderSecrets {
+                api_key: request.api_key.as_deref(),
+                refresh_token: request.refresh_token.as_deref(),
+                oauth_client_id: request.oauth_client_id.as_deref(),
+                oauth_client_secret: request.oauth_client_secret.as_deref(),
+            },
         )
         .map_err(admin_error)?;
     audit_config(

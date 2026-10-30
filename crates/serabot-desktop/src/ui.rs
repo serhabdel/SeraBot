@@ -49,8 +49,9 @@ type ProviderRow = (
 );
 
 /// The provider kinds the server understands.
-const PROVIDER_KINDS: [&str; 13] = [
+const PROVIDER_KINDS: [&str; 15] = [
     "openai-compatible",
+    "google-antigravity",
     "mistral",
     "deepseek",
     "minimax",
@@ -63,6 +64,7 @@ const PROVIDER_KINDS: [&str; 13] = [
     "xai",
     "cerebras",
     "moonshot",
+    "muse-code",
 ];
 
 /// The provider authorization pages the console can open.
@@ -379,6 +381,604 @@ fn Icon(name: String, #[props(default = 20)] size: u32) -> Element {
             "stroke-linejoin": "round",
             path { d: "{path}" }
         }
+    }
+}
+
+/// Inline brand SVG logos for all supported connectors and providers.
+#[component]
+pub fn BrandLogo(brand: String, #[props(default = 24)] size: u32) -> Element {
+    let key = brand.to_ascii_lowercase().replace('_', "-");
+    let key = key.as_str();
+    rsx! {
+        div {
+            class: "brand-logo",
+            style: "width: {size}px; height: {size}px;",
+            match key {
+                "google-drive" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        path { d: "M8.3 3.5L2.2 14.1l3.5 6.1 6.1-10.6z", fill: "#0F9D58" }
+                        path { d: "M15.7 3.5H8.3l6.1 10.6h7.4z", fill: "#FFC107" }
+                        path { d: "M11.8 14.1l-3.5 6.1h12.2l3.5-6.1z", fill: "#2196F3" }
+                    }
+                },
+                "google-sheets" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "3", y: "3", width: "18", height: "18", rx: "3.5", fill: "#0F9D58" }
+                        path { d: "M7 8h10M7 12h10M7 16h10M12 8v8", stroke: "#ffffff", "stroke-width": "1.8", "stroke-linecap": "round" }
+                    }
+                },
+                "google-calendar" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "3", y: "4", width: "18", height: "17", rx: "3", fill: "#ffffff" }
+                        path { d: "M3 7a3 3 0 0 1 3-3h12a3 3 0 0 1 3 3v3H3V7z", fill: "#4285F4" }
+                        rect { x: "7", y: "2", width: "2", height: "3.5", rx: "1", fill: "#EA4335" }
+                        rect { x: "15", y: "2", width: "2", height: "3.5", rx: "1", fill: "#FBBC05" }
+                        path { d: "M8 13.5h3a1 1 0 0 1 1 1v0a1 1 0 0 1-1 1h-2m2 0a1 1 0 0 1 1 1v0a1 1 0 0 1-1 1H8M15 13.5v5m-1.5-3.5L15 13.5", stroke: "#4285F4", "stroke-width": "1.5", "stroke-linecap": "round", "stroke-linejoin": "round" }
+                    }
+                },
+                "gmail" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        path { d: "M4 6.5v11a1.5 1.5 0 0 0 1.5 1.5H8V11l4 3 4-3v8h2.5a1.5 1.5 0 0 0 1.5-1.5v-11l-8 6-8-6z", fill: "#EA4335" }
+                        path { d: "M4 6.5A1.5 1.5 0 0 1 5.5 5H7l5 3.8L17 5h1.5A1.5 1.5 0 0 1 20 6.5V9l-8 6-8-6V6.5z", fill: "#4285F4" }
+                        path { d: "M4 6.5L12 12.5l8-6v-1a1.5 1.5 0 0 0-1.5-1.5H5.5A1.5 1.5 0 0 0 4 5.5v1z", fill: "#FBBC05" }
+                    }
+                },
+                "outlook" | "outlook-calendar" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "3", y: "4", width: "18", height: "16", rx: "3", fill: "#0078D4" }
+                        circle { cx: "9.5", cy: "12", r: "4.5", fill: "#106EBE" }
+                        path { d: "M3 6l9 6 9-6", stroke: "#ffffff", "stroke-width": "1.5", "stroke-linecap": "round" }
+                        circle { cx: "9.5", cy: "12", r: "2.3", fill: "none", stroke: "#ffffff", "stroke-width": "1.8" }
+                    }
+                },
+                "notion" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "3", y: "3", width: "18", height: "18", rx: "3.5", fill: "#000000" }
+                        path { d: "M7 6.5h3l4 6.5V6.5h3v11h-3l-4-6.5v6.5H7v-11z", fill: "#ffffff" }
+                    }
+                },
+                "agentmail" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "3", y: "4", width: "18", height: "16", rx: "3", fill: "#6366F1" }
+                        path { d: "M3 6.5l9 6.5 9-6.5", stroke: "#ffffff", "stroke-width": "1.5" }
+                        path { d: "M13 8l-3 4.5h3.5L11 17l5-5.5h-3.5L14 8z", fill: "#FBBF24" }
+                    }
+                },
+                "google-antigravity" | "antigravity" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#1E1B4B" }
+                        circle { cx: "12", cy: "12", r: "7", stroke: "#818CF8", "stroke-width": "1.4", "stroke-dasharray": "3 2" }
+                        path { d: "M12 4v16M4 12h16M7 7l10 10M17 7L7 17", stroke: "#38BDF8", "stroke-width": "1.2", "stroke-linecap": "round" }
+                        circle { cx: "12", cy: "12", r: "3", fill: "#F43F5E" }
+                    }
+                },
+                "deepseek" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#1D4ED8" }
+                        path { d: "M6 15c2-4 5-7 10-7-2 4-5 7-10 7zM12 8c1-3 3-5 5-5-1 3-3 5-5 5zM8 15c-1 2-2 3-4 4 1-2 2-3 4-4z", fill: "#93C5FD" }
+                        circle { cx: "15", cy: "10", r: "1.2", fill: "#ffffff" }
+                    }
+                },
+                "minimax" | "minimax-cn" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#FF4D4D" }
+                        path { d: "M6 16V8l3.5 4L12 9l2.5 3L18 8v8", stroke: "#ffffff", "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round" }
+                    }
+                },
+                "mistral" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#FA520F" }
+                        rect { x: "6", y: "7", width: "2.8", height: "2.8", fill: "#ffffff" }
+                        rect { x: "15.2", y: "7", width: "2.8", height: "2.8", fill: "#ffffff" }
+                        rect { x: "6", y: "10.2", width: "2.8", height: "2.8", fill: "#ffffff" }
+                        rect { x: "9.1", y: "10.2", width: "2.8", height: "2.8", fill: "#ffffff" }
+                        rect { x: "12.1", y: "10.2", width: "2.8", height: "2.8", fill: "#ffffff" }
+                        rect { x: "15.2", y: "10.2", width: "2.8", height: "2.8", fill: "#ffffff" }
+                        rect { x: "6", y: "13.4", width: "2.8", height: "2.8", fill: "#ffffff" }
+                        rect { x: "15.2", y: "13.4", width: "2.8", height: "2.8", fill: "#ffffff" }
+                    }
+                },
+                "openai" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#10A37F" }
+                        path { d: "M12 6.5a2.5 2.5 0 0 1 2.4 1.8l-1.3.7a1.2 1.2 0 0 0-1.8.3L12 6.5zm3.5 2a2.5 2.5 0 0 1 .5 3l-1.3-.7a1.2 1.2 0 0 0-.6-1.8l1.4-.5zm-.5 4.5a2.5 2.5 0 0 1-2.4 1.8l.1-1.5a1.2 1.2 0 0 0 1.2-.8l1.1.5zm-4 1.5a2.5 2.5 0 0 1-2.4-1.8l1.3-.7a1.2 1.2 0 0 0 1.8-.3L11 14.5zm-3.5-2a2.5 2.5 0 0 1-.5-3l1.3.7a1.2 1.2 0 0 0 .6 1.8l-1.4.5zm.5-4.5A2.5 2.5 0 0 1 10.4 6.2l-.1 1.5a1.2 1.2 0 0 0-1.2.8l-1.1-.5z", stroke: "#ffffff", "stroke-width": "1.3" }
+                    }
+                },
+                "openrouter" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#6366F1" }
+                        path { d: "M6 18V12a4 4 0 0 1 4-4h8M14 4l4 4-4 4M14 14l4 4-4 4", stroke: "#ffffff", "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round" }
+                    }
+                },
+                "groq" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#F55036" }
+                        path { d: "M15 8.5A5 5 0 1 0 16 14h-4v-2h6v2a7 7 0 1 1-1.8-7.5L15 8.5z", fill: "#ffffff" }
+                    }
+                },
+                "xai" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#000000" }
+                        path { d: "M6 6l8 12h4L10 6H6zM15 6l3 4.5-1.8 2.2L13 6h2zM6 18l3-4.5 1.8 2.2L8 18H6z", fill: "#ffffff" }
+                    }
+                },
+                "moonshot" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#0B132B" }
+                        path { d: "M12 5a7 7 0 1 0 7 7c-.2 0-.4 0-.6-.03A6 6 0 0 1 12 5.03V5z", fill: "#38BDF8" }
+                        circle { cx: "16", cy: "8", r: "1", fill: "#FDE047" }
+                    }
+                },
+                "cerebras" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#D946EF" }
+                        rect { x: "6", y: "6", width: "4.5", height: "4.5", rx: "1", fill: "#ffffff" }
+                        rect { x: "13.5", y: "6", width: "4.5", height: "4.5", rx: "1", fill: "#ffffff" }
+                        rect { x: "6", y: "13.5", width: "4.5", height: "4.5", rx: "1", fill: "#ffffff" }
+                        rect { x: "13.5", y: "13.5", width: "4.5", height: "4.5", rx: "1", fill: "#ffffff" }
+                    }
+                },
+                "together" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#2563EB" }
+                        path { d: "M7 12h10M12 7v10M7 7l10 10M17 7L7 17", stroke: "rgba(255,255,255,0.4)", "stroke-width": "1.2" }
+                        circle { cx: "7", cy: "12", r: "2", fill: "#ffffff" }
+                        circle { cx: "17", cy: "12", r: "2", fill: "#ffffff" }
+                        circle { cx: "12", cy: "7", r: "2", fill: "#ffffff" }
+                        circle { cx: "12", cy: "17", r: "2", fill: "#ffffff" }
+                    }
+                },
+                "fireworks" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#7C3AED" }
+                        path { d: "M12 4v4m0 8v4M4 12h4m8 0h4m-11.5-5.5l3 3m5 5l3 3m-11 0l3-3m5-5l3-3", stroke: "#FBBF24", "stroke-width": "1.8", "stroke-linecap": "round" }
+                        circle { cx: "12", cy: "12", r: "2.5", fill: "#ffffff" }
+                    }
+                },
+                "muse-code" | "muse" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#0891B2" }
+                        path { d: "M8 8l-4 4 4 4M16 8l4 4-4 4M12 6v12", stroke: "#ffffff", "stroke-width": "1.8", "stroke-linecap": "round", "stroke-linejoin": "round" }
+                    }
+                },
+                "ollama" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#334155" }
+                        path { d: "M9 17v-4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v4M10 8h.01M14 8h.01M10 5v3M14 5v3M9 17h6", stroke: "#ffffff", "stroke-width": "1.8", "stroke-linecap": "round", "stroke-linejoin": "round" }
+                    }
+                },
+                _ => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#475569" }
+                        path { d: "M12 4l7 4-7 4-7-4 7-4zM5 10.5l7 4 7-4M5 14.5l7 4 7-4", stroke: "#ffffff", "stroke-width": "1.6", "stroke-linecap": "round", "stroke-linejoin": "round" }
+                    }
+                },
+            }
+        }
+    }
+}
+
+// ------------------------------------------------ Pure-Rust Markdown Renderer ---
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MdBlock {
+    Heading {
+        level: usize,
+        text: String,
+    },
+    CodeBlock {
+        lang: String,
+        code: String,
+    },
+    Rule,
+    Quote(Vec<String>),
+    UnorderedList(Vec<String>),
+    OrderedList(Vec<String>),
+    Table {
+        headers: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
+    Paragraph(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum InlineSpan {
+    Text(String),
+    Code(String),
+    Bold(Vec<InlineSpan>),
+    Italic(String),
+    Link { label: String, url: String },
+}
+
+pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
+    let mut blocks = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Fenced code block
+        if trimmed.starts_with("```") {
+            let lang = trimmed.trim_start_matches('`').trim().to_owned();
+            let mut code_lines = Vec::new();
+            i += 1;
+            while i < lines.len() {
+                if lines[i].trim().starts_with("```") {
+                    i += 1;
+                    break;
+                }
+                code_lines.push(lines[i]);
+                i += 1;
+            }
+            blocks.push(MdBlock::CodeBlock {
+                lang,
+                code: code_lines.join("\n"),
+            });
+            continue;
+        }
+
+        // Horizontal rule (---, ***, ___)
+        if (trimmed == "---" || trimmed == "***" || trimmed == "___")
+            || (trimmed.len() >= 3 && trimmed.chars().all(|c| c == '-' || c == '*' || c == '_'))
+        {
+            blocks.push(MdBlock::Rule);
+            i += 1;
+            continue;
+        }
+
+        // Heading
+        if trimmed.starts_with('#') {
+            let hash_count = trimmed.chars().take_while(|c| *c == '#').count();
+            if hash_count <= 6 && trimmed[hash_count..].starts_with(' ') {
+                let rest = trimmed[hash_count..].trim();
+                let title = if rest.starts_with("**") && rest.ends_with("**") && rest.len() >= 4 {
+                    &rest[2..rest.len() - 2]
+                } else {
+                    rest
+                };
+                blocks.push(MdBlock::Heading {
+                    level: hash_count,
+                    text: title.trim().to_owned(),
+                });
+                i += 1;
+                continue;
+            }
+        }
+
+        // Blockquote
+        if trimmed.starts_with("> ") || trimmed == ">" {
+            let mut quote_lines = Vec::new();
+            while i < lines.len() {
+                let q_trim = lines[i].trim();
+                if q_trim.starts_with("> ") {
+                    quote_lines.push(q_trim[2..].trim().to_owned());
+                    i += 1;
+                } else if q_trim == ">" {
+                    quote_lines.push(String::new());
+                    i += 1;
+                } else if !q_trim.is_empty()
+                    && !quote_lines.is_empty()
+                    && !q_trim.starts_with('#')
+                    && !q_trim.starts_with('-')
+                    && !q_trim.starts_with("```")
+                {
+                    quote_lines.push(q_trim.to_owned());
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            blocks.push(MdBlock::Quote(quote_lines));
+            continue;
+        }
+
+        // Markdown Table
+        if trimmed.starts_with('|')
+            && i + 1 < lines.len()
+            && lines[i + 1].trim().starts_with('|')
+            && lines[i + 1].contains("---")
+        {
+            let parse_table_row = |row: &str| -> Vec<String> {
+                let trimmed_row = row.trim().trim_start_matches('|').trim_end_matches('|');
+                trimmed_row
+                    .split('|')
+                    .map(|c| c.trim().to_owned())
+                    .collect()
+            };
+            let headers = parse_table_row(trimmed);
+            i += 2;
+            let mut rows = Vec::new();
+            while i < lines.len() && lines[i].trim().starts_with('|') {
+                rows.push(parse_table_row(lines[i]));
+                i += 1;
+            }
+            blocks.push(MdBlock::Table { headers, rows });
+            continue;
+        }
+
+        // Unordered list
+        if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("• ") {
+            let mut items = Vec::new();
+            while i < lines.len() {
+                let l_trim = lines[i].trim();
+                if l_trim.starts_with("- ") || l_trim.starts_with("* ") || l_trim.starts_with("• ")
+                {
+                    let marker_len = if l_trim.starts_with("• ") { 3 } else { 2 };
+                    items.push(l_trim[marker_len..].trim().to_owned());
+                    i += 1;
+                } else if !l_trim.is_empty()
+                    && (lines[i].starts_with("  ") || lines[i].starts_with('\t'))
+                    && !items.is_empty()
+                {
+                    let last = items.last_mut().unwrap();
+                    last.push(' ');
+                    last.push_str(l_trim);
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            blocks.push(MdBlock::UnorderedList(items));
+            continue;
+        }
+
+        // Ordered list
+        let first_word = trimmed.split_whitespace().next().unwrap_or("");
+        if first_word.ends_with('.')
+            && first_word
+                .trim_end_matches('.')
+                .chars()
+                .all(|c| c.is_ascii_digit())
+        {
+            let mut items = Vec::new();
+            while i < lines.len() {
+                let l_trim = lines[i].trim();
+                let fw = l_trim.split_whitespace().next().unwrap_or("");
+                if fw.ends_with('.') && fw.trim_end_matches('.').chars().all(|c| c.is_ascii_digit())
+                {
+                    let item_text = l_trim[fw.len()..].trim().to_owned();
+                    items.push(item_text);
+                    i += 1;
+                } else if !l_trim.is_empty()
+                    && (lines[i].starts_with("  ") || lines[i].starts_with('\t'))
+                    && !items.is_empty()
+                {
+                    let last = items.last_mut().unwrap();
+                    last.push(' ');
+                    last.push_str(l_trim);
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            blocks.push(MdBlock::OrderedList(items));
+            continue;
+        }
+
+        // Paragraph
+        let mut para_lines = Vec::new();
+        while i < lines.len() {
+            let p_trim = lines[i].trim();
+            if p_trim.is_empty()
+                || p_trim.starts_with("```")
+                || p_trim.starts_with('#')
+                || p_trim.starts_with("> ")
+                || p_trim == ">"
+                || p_trim.starts_with("- ")
+                || p_trim.starts_with("* ")
+                || p_trim.starts_with("• ")
+                || (p_trim.starts_with('|')
+                    && i + 1 < lines.len()
+                    && lines[i + 1].trim().starts_with('|'))
+                || (p_trim == "---" || p_trim == "***" || p_trim == "___")
+            {
+                break;
+            }
+            para_lines.push(p_trim);
+            i += 1;
+        }
+        if !para_lines.is_empty() {
+            blocks.push(MdBlock::Paragraph(para_lines.join(" ")));
+        }
+    }
+    blocks
+}
+
+pub fn parse_inline(text: &str) -> Vec<InlineSpan> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+
+    while !rest.is_empty() {
+        // 1. Bold with inline code: **`code`**
+        if rest.starts_with("**`") {
+            if let Some(end_code) = rest[3..].find('`') {
+                let code = &rest[3..3 + end_code];
+                let after_code = &rest[3 + end_code + 1..];
+                if after_code.starts_with("**") {
+                    spans.push(InlineSpan::Bold(vec![InlineSpan::Code(code.to_owned())]));
+                    rest = &after_code[2..];
+                    continue;
+                }
+            }
+        }
+
+        // 2. Bold: **...**
+        if rest.starts_with("**") {
+            if let Some(end) = rest[2..].find("**") {
+                let inner = &rest[2..2 + end];
+                let sub_spans = parse_inline(inner);
+                spans.push(InlineSpan::Bold(sub_spans));
+                rest = &rest[2 + end + 2..];
+                continue;
+            }
+        }
+
+        // 3. Inline Code: `...`
+        if rest.starts_with('`') {
+            if let Some(end) = rest[1..].find('`') {
+                let code = &rest[1..1 + end];
+                spans.push(InlineSpan::Code(code.to_owned()));
+                rest = &rest[1 + end + 1..];
+                continue;
+            }
+        }
+
+        // 4. Link: [label](url)
+        if rest.starts_with('[') {
+            if let Some(close_bracket) = rest.find(']') {
+                if rest[close_bracket..].starts_with("](") {
+                    let after_bracket = &rest[close_bracket + 2..];
+                    if let Some(close_paren) = after_bracket.find(')') {
+                        let label = &rest[1..close_bracket];
+                        let url = &after_bracket[..close_paren];
+                        spans.push(InlineSpan::Link {
+                            label: label.to_owned(),
+                            url: url.to_owned(),
+                        });
+                        rest = &after_bracket[close_paren + 1..];
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // 5. Italic: *...* (where not **)
+        if rest.starts_with('*') && !rest.starts_with("**") {
+            if let Some(end) = rest[1..].find('*') {
+                let inner = &rest[1..1 + end];
+                if !inner.is_empty() && !inner.starts_with('*') && !inner.ends_with('*') {
+                    spans.push(InlineSpan::Italic(inner.to_owned()));
+                    rest = &rest[1 + end + 1..];
+                    continue;
+                }
+            }
+        }
+
+        // Consume normal text up to the next formatting token
+        let next_pos = rest[1..]
+            .find(|c| c == '*' || c == '`' || c == '[')
+            .map(|idx| idx + 1)
+            .unwrap_or(rest.len());
+
+        let chunk = &rest[..next_pos];
+        if let Some(InlineSpan::Text(last_text)) = spans.last_mut() {
+            last_text.push_str(chunk);
+        } else {
+            spans.push(InlineSpan::Text(chunk.to_owned()));
+        }
+        rest = &rest[next_pos..];
+    }
+
+    spans
+}
+
+#[component]
+pub fn MarkdownBody(content: String) -> Element {
+    let blocks = parse_markdown_blocks(&content);
+    rsx! {
+        div { class: "md-body",
+            for (idx, block) in blocks.into_iter().enumerate() {
+                {match block {
+                    MdBlock::Heading { level, text } => match level {
+                        1 => rsx! { h1 { key: "{idx}", class: "md-h1", InlineMarkdown { text } } },
+                        2 => rsx! { h2 { key: "{idx}", class: "md-h2", InlineMarkdown { text } } },
+                        3 => rsx! { h3 { key: "{idx}", class: "md-h3", InlineMarkdown { text } } },
+                        _ => rsx! { h4 { key: "{idx}", class: "md-h4", InlineMarkdown { text } } },
+                    },
+                    MdBlock::CodeBlock { lang, code } => rsx! {
+                        div { key: "{idx}", class: "md-code-block",
+                            if !lang.is_empty() {
+                                div { class: "md-code-head", span { "{lang}" } }
+                            }
+                            pre { code { "{code}" } }
+                        }
+                    },
+                    MdBlock::Rule => rsx! {
+                        hr { key: "{idx}", class: "md-hr" }
+                    },
+                    MdBlock::Quote(lines) => rsx! {
+                        blockquote { key: "{idx}", class: "md-quote",
+                            for (l_idx, line) in lines.into_iter().enumerate() {
+                                p { key: "{l_idx}", InlineMarkdown { text: line } }
+                            }
+                        }
+                    },
+                    MdBlock::UnorderedList(items) => rsx! {
+                        ul { key: "{idx}", class: "md-list",
+                            for (i_idx, item) in items.into_iter().enumerate() {
+                                li { key: "{i_idx}", InlineMarkdown { text: item } }
+                            }
+                        }
+                    },
+                    MdBlock::OrderedList(items) => rsx! {
+                        ol { key: "{idx}", class: "md-list md-ol",
+                            for (i_idx, item) in items.into_iter().enumerate() {
+                                li { key: "{i_idx}", InlineMarkdown { text: item } }
+                            }
+                        }
+                    },
+                    MdBlock::Table { headers, rows } => rsx! {
+                        div { key: "{idx}", class: "md-table-wrap",
+                            table { class: "md-table",
+                                thead {
+                                    tr {
+                                        for (h_idx, header) in headers.into_iter().enumerate() {
+                                            th { key: "{h_idx}", InlineMarkdown { text: header } }
+                                        }
+                                    }
+                                }
+                                tbody {
+                                    for (r_idx, row) in rows.into_iter().enumerate() {
+                                        tr { key: "{r_idx}",
+                                            for (c_idx, cell) in row.into_iter().enumerate() {
+                                                td { key: "{c_idx}", InlineMarkdown { text: cell } }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    MdBlock::Paragraph(text) => rsx! {
+                        p { key: "{idx}", class: "md-p", InlineMarkdown { text } }
+                    },
+                }}
+            }
+        }
+    }
+}
+
+#[component]
+pub fn InlineMarkdown(text: String) -> Element {
+    let spans = parse_inline(&text);
+    rsx! {
+        for (idx, span) in spans.into_iter().enumerate() {
+            RenderSpan { key: "{idx}", span }
+        }
+    }
+}
+
+#[component]
+fn RenderSpan(span: InlineSpan) -> Element {
+    match span {
+        InlineSpan::Text(s) => rsx! { "{s}" },
+        InlineSpan::Code(code) => rsx! { code { class: "md-inline-code", "{code}" } },
+        InlineSpan::Bold(sub_spans) => rsx! {
+            strong {
+                for (idx, sub) in sub_spans.into_iter().enumerate() {
+                    RenderSpan { key: "{idx}", span: sub }
+                }
+            }
+        },
+        InlineSpan::Italic(s) => rsx! { em { "{s}" } },
+        InlineSpan::Link { label, url } => rsx! {
+            a { class: "md-link", href: "{url}", target: "_blank", rel: "noopener noreferrer", "{label}" }
+        },
     }
 }
 
@@ -841,7 +1441,7 @@ fn Sidebar(
                         RailItem::Bot { id, label, role, avatar, active, enabled, live } => rsx! {
                             div { key: "{id}", class: if active { "thread active" } else { "thread" },
                                 button {
-                                    class: "thread-main",
+                                    class: "thread-main thread-bot",
                                     onclick: {
                                         let id = id.clone();
                                         move |_| {
@@ -850,8 +1450,10 @@ fn Sidebar(
                                         }
                                     },
                                     span { class: "avatar sm bot", style: avatar_style(&id), "{avatar}" }
-                                    span { class: "thread-title", "{label}" }
-                                    span { class: "thread-meta", if enabled { "{role}" } else { "{role} · disabled" } }
+                                    div { class: "thread-copy",
+                                        span { class: "thread-title", "{label}" }
+                                        span { class: "thread-meta", if enabled { "{role}" } else { "{role} · disabled" } }
+                                    }
                                 }
                                 span {
                                     class: if live { "thread-dot live" } else { "thread-dot off" },
@@ -1561,7 +2163,9 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                                         span { class: "team-chip", "peer bot" }
                                     }
                                 }
-                                div { class: "msg-body", "{content}" }
+                                div { class: "msg-body",
+                                    MarkdownBody { content: content.clone() }
+                                }
                             }
                         }
                     }
@@ -3054,13 +3658,17 @@ fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Eleme
                             };
                             let mut session = session;
                             let mut draft = session.write();
-                            draft.provider.id = preset.id.to_owned();
+                            draft.provider.id = if preset.default_id.is_empty() {
+                                String::new()
+                            } else {
+                                preset.default_id.to_owned()
+                            };
                             draft.provider.kind = preset.kind.to_owned();
                             draft.provider.base_url = preset.base_url.to_owned();
                             draft.provider.secret_name = preset.secret_name.to_owned();
                             draft.provider.models = preset.models.join(", ");
-                            // The key belongs to one provider; a new preset
-                            // starts without one.
+                            draft.provider.catalog_fetch = preset.catalog_fetch;
+                            // The key belongs to one provider; a new preset starts without one.
                             draft.provider.api_key.clear();
                             selected.set(preset.id.to_owned());
                         },
@@ -3073,10 +3681,23 @@ fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Eleme
                 if let Some(preset) = chosen {
                     div { class: "card",
                         div { class: "card-head",
-                            h3 { class: "card-title", "{preset.label}" }
-                            span { class: "chip accent", "{preset.kind}" }
+                            div { style: "display: flex; align-items: center; gap: 10px;",
+                                BrandLogo { brand: preset.id.to_owned(), size: 28 }
+                                div {
+                                    h3 { class: "card-title", "{preset.label}" }
+                                    span { class: "card-sub", "{preset.subtitle}" }
+                                }
+                            }
+                            span { class: "chip accent", "{preset.badge}" }
                         }
-                        p { class: "tiny", "{preset.note}" }
+                        if preset.auth == "oauth" {
+                            div { class: "banner info", style: "margin: 8px 0; display: flex; flex-direction: column; gap: 6px;",
+                                strong { "OAuth PKCE Authentication" }
+                                p { class: "tiny", "To authenticate via browser, run this command in terminal/PowerShell:" }
+                                code { class: "tiny", style: "background: rgba(0,0,0,0.35); padding: 4px 8px; border-radius: 4px; user-select: all;", "serabot providers login {preset.kind}" }
+                                p { class: "tiny", "Or paste your access token or refresh token directly below." }
+                            }
+                        }
                         div { class: "chips",
                             for model in preset.models {
                                 span { class: "chip", "{model}" }
@@ -3255,73 +3876,162 @@ fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element 
                 }
                 div { class: "card-grid",
                     for (provider_id, provider_kind, managed, catalog_verified, catalog_fetch, egress, models, routing, secrets) in provider_rows {
-                        div { class: "card", key: "{provider_id}",
-                            div { class: "card-head",
-                                div {
-                                    h3 { class: "card-title", "{provider_id}" }
-                                    span { class: "card-sub", "{provider_kind}" }
-                                }
-                                if managed {
-                                    span { class: "chip accent", "managed here" }
-                                }
-                            }
-                            div { class: "chips",
-                                if catalog_verified {
-                                    span { class: "chip ok", "catalog verified" }
-                                } else if catalog_fetch {
-                                    span { class: "chip warn", "catalog fetch on" }
-                                } else {
-                                    span { class: "chip muted", "static models" }
-                                }
-                                if egress {
-                                    span { class: "chip ok", "ready" }
-                                } else {
-                                    span { class: "chip warn", "egress blocked" }
-                                }
-                            }
-                            div { class: "chips",
-                                for model in models {
-                                    span { class: "chip", "{model}" }
-                                }
-                            }
-                            p { class: "tiny", "Routing: {routing}" }
-                            div { class: "chips",
-                                for (role, secret_name, configured) in secrets {
-                                    span { class: if configured { "chip accent" } else { "chip warn" },
-                                        "{role}: {secret_name}"
+                        {
+                            let is_connected = secrets.iter().any(|(_, _, configured)| *configured) || provider_id == "ollama";
+                            rsx! {
+                                div { class: "card", key: "{provider_id}",
+                                    div { class: "card-head",
+                                        div { style: "display: flex; align-items: center; gap: 10px;",
+                                            BrandLogo { brand: provider_id.clone(), size: 28 }
+                                            div {
+                                                h3 { class: "card-title", "{provider_id}" }
+                                                span { class: "card-sub", "{provider_kind}" }
+                                            }
+                                        }
+                                        div { style: "display: flex; align-items: center; gap: 6px;",
+                                            span {
+                                                class: if is_connected { "status-pill connected" } else { "status-pill disconnected" },
+                                                if is_connected { "Connected" } else { "Not connected" }
+                                            }
+                                            if managed {
+                                                span { class: "chip accent", "managed" }
+                                            }
+                                        }
                                     }
-                                }
-                            }
-                            if managed {
-                                if confirm() == Some(provider_id.clone()) {
-                                    div { class: "row",
-                                        span { class: "tiny", "Remove {provider_id}? Conversations pinned to it must pick another route." }
-                                        button {
-                                            class: "btn danger sm",
-                                            disabled: !can_save,
-                                            onclick: {
-                                                let id = provider_id.clone();
-                                                move |_| {
-                                                    session.write().remove_provider(id.clone());
-                                                    confirm.set(None);
+                                    div { class: "chips",
+                                        if catalog_verified {
+                                            span { class: "chip ok", "catalog verified" }
+                                        } else if catalog_fetch {
+                                            span { class: "chip warn", "catalog fetch on" }
+                                        } else {
+                                            span { class: "chip muted", "static models" }
+                                        }
+                                        if egress {
+                                            span { class: "chip ok", "ready" }
+                                        } else {
+                                            span { class: "chip warn", "egress blocked" }
+                                        }
+                                    }
+                                    div { class: "chips",
+                                        for model in models {
+                                            span { class: "chip", "{model}" }
+                                        }
+                                    }
+                                    p { class: "tiny", "Routing: {routing}" }
+                                    div { class: "chips",
+                                        for (role, secret_name, configured) in secrets {
+                                            if configured || !secret_name.is_empty() {
+                                                span { class: if configured { "chip accent" } else { "chip warn" },
+                                                    "{role}: {secret_name}"
                                                 }
-                                            },
-                                            "Remove"
-                                        }
-                                        button {
-                                            class: "btn ghost sm",
-                                            onclick: move |_| confirm.set(None),
-                                            "Cancel"
+                                            }
                                         }
                                     }
-                                } else {
-                                    button {
-                                        class: "btn ghost sm",
-                                        onclick: {
-                                            let id = provider_id.clone();
-                                            move |_| confirm.set(Some(id.clone()))
-                                        },
-                                        "Remove provider"
+                                    if managed {
+                                        if confirm() == Some(provider_id.clone()) {
+                                            div { class: "row",
+                                                span { class: "tiny", "Remove {provider_id}? Conversations pinned to it must pick another route." }
+                                                button {
+                                                    class: "btn danger sm",
+                                                    disabled: !can_save,
+                                                    onclick: {
+                                                        let id = provider_id.clone();
+                                                        move |_| {
+                                                            session.write().remove_provider(id.clone());
+                                                            confirm.set(None);
+                                                        }
+                                                    },
+                                                    "Remove"
+                                                }
+                                                button {
+                                                    class: "btn ghost sm",
+                                                    onclick: move |_| confirm.set(None),
+                                                    "Cancel"
+                                                }
+                                            }
+                                        } else {
+                                            button {
+                                                class: "btn ghost sm",
+                                                onclick: {
+                                                    let id = provider_id.clone();
+                                                    move |_| confirm.set(Some(id.clone()))
+                                                },
+                                                "Remove provider"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                div { class: "card",
+                    div { class: "card-head",
+                        div {
+                            h3 { class: "card-title", "Provider Directory — Available Integrations" }
+                            p { class: "muted", "All supported model providers and gateways. Connect in one click or configure credentials." }
+                        }
+                    }
+                    div { class: "integration-grid",
+                        for preset in provider_presets::presets() {
+                            {
+                                let is_connected = providers.iter().any(|p| {
+                                    (p.id == preset.id
+                                        || p.kind == preset.kind
+                                        || (preset.id == "antigravity" && p.kind == "google-antigravity"))
+                                        && (p.secrets.values().any(|s| s.configured) || preset.id == "ollama")
+                                });
+                                rsx! {
+                                    div { class: "integration-card", key: "{preset.id}",
+                                        div {
+                                            div { class: "card-head", style: "align-items: flex-start; margin-bottom: 8px;",
+                                                div { style: "display: flex; align-items: center; gap: 10px;",
+                                                    BrandLogo { brand: preset.id.to_owned(), size: 30 }
+                                                    div {
+                                                        h4 { style: "margin: 0; font-size: 0.98rem; font-weight: 600;", "{preset.label}" }
+                                                        span { class: "card-sub", style: "font-size: 0.78rem;", "{preset.kind}" }
+                                                    }
+                                                }
+                                                span { class: "chip accent", style: "font-size: 0.72rem; padding: 2px 7px;", "{preset.badge}" }
+                                            }
+                                            p { class: "tiny", style: "margin-bottom: 10px; line-height: 1.45;", "{preset.subtitle}" }
+                                            div { class: "chips", style: "margin-bottom: 12px;",
+                                                for model in preset.models.iter().take(3) {
+                                                    span { class: "chip", style: "font-size: 0.7rem;", "{model}" }
+                                                }
+                                                if preset.models.len() > 3 {
+                                                    span { class: "chip muted", style: "font-size: 0.7rem;", "+{preset.models.len() - 3} more" }
+                                                }
+                                            }
+                                        }
+                                        div { style: "display: flex; align-items: center; justify-content: space-between; border-top: 1px solid var(--hairline); padding-top: 10px; margin-top: 6px;",
+                                            span {
+                                                class: if is_connected { "status-pill connected" } else { "status-pill disconnected" },
+                                                if is_connected { "Connected" } else { "Not connected" }
+                                            }
+                                            button {
+                                                class: if is_connected { "btn ghost sm" } else { "btn primary sm" },
+                                                onclick: {
+                                                    let preset = *preset;
+                                                    move |_| {
+                                                        let mut draft = session.write();
+                                                        draft.provider.id = if preset.default_id.is_empty() {
+                                                            String::new()
+                                                        } else {
+                                                            preset.default_id.to_owned()
+                                                        };
+                                                        draft.provider.kind = preset.kind.to_owned();
+                                                        draft.provider.base_url = preset.base_url.to_owned();
+                                                        draft.provider.secret_name = preset.secret_name.to_owned();
+                                                        draft.provider.models = preset.models.join(", ");
+                                                        draft.provider.catalog_fetch = preset.catalog_fetch;
+                                                        draft.provider.api_key.clear();
+                                                        overlay.set(Overlay::AddProvider);
+                                                    }
+                                                },
+                                                if is_connected { "Configure" } else { "Connect" }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -3439,114 +4149,157 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
                         div { class: "skeleton block" }
                     }
                 }
-                div { class: "card-grid",
-                    for connector in connectors {
-                        {
-                            let id = connector.id.clone();
-                            let enabled = session
-                                .read()
-                                .connector_drafts
-                                .get(&id)
-                                .map(|draft| draft.enabled)
-                                .unwrap_or(connector.enabled);
-                            let values = session
-                                .read()
-                                .connector_drafts
-                                .get(&id)
-                                .map(|draft| draft.values.clone())
-                                .unwrap_or_default();
+                for (suite_title, suite_ids) in [
+                    ("Google Workspace", &["google_drive", "google_sheets", "google_calendar", "gmail"][..]),
+                    ("Microsoft 365", &["outlook", "outlook_calendar"][..]),
+                    ("Knowledge & Email", &["notion", "agentmail"][..]),
+                ] {
+                    {
+                        let suite_connectors: Vec<_> = connectors
+                            .iter()
+                            .filter(|c| suite_ids.contains(&c.id.as_str()))
+                            .cloned()
+                            .collect();
+                        if !suite_connectors.is_empty() {
                             rsx! {
-                                div { class: "card", key: "{id}",
-                                    div { class: "card-head",
-                                        div {
-                                            h3 { class: "card-title", "{id}" }
-                                            span { class: "card-sub", "{connector.kind}" }
-                                        }
-                                        span { class: if enabled { "chip ok" } else { "chip muted" },
-                                            if enabled { "enabled" } else { "disabled" }
-                                        }
-                                    }
-                                    if let Some(uri) = connector.redirect_uri.clone() {
-                                        code { class: "tiny", "{uri}" }
-                                    }
-                                    div { class: "chips",
-                                        for (role, secret) in &connector.secrets {
-                                            span { class: if secret.configured { "chip accent" } else { "chip warn" },
-                                                "{role}: {secret.name.clone().unwrap_or_default()}"
-                                            }
-                                        }
-                                    }
-                                    div { class: "form-grid",
-                                        for (role, secret) in &connector.secrets {
-                                            {
-                                                let role = role.clone();
-                                                let name = secret.name.clone().unwrap_or_default();
-                                                let value = values.get(&role).cloned().unwrap_or_default();
-                                                rsx! {
-                                                    div { class: "field",
-                                                        label { class: "field-label", "{role}" }
-                                                        input {
-                                                            class: "input",
-                                                            "type": "password",
-                                                            value: "{value}",
-                                                            placeholder: if secret.configured { format!("replace {name}") } else { format!("set {name}") },
-                                                            oninput: {
-                                                                let id = id.clone();
+                                h2 { class: "connector-suite-title", "{suite_title}" }
+                                div { class: "card-grid",
+                                    for connector in suite_connectors {
+                                        {
+                                            let id = connector.id.clone();
+                                            let is_connected = connector.secrets.values().any(|s| s.configured);
+                                            let display_title = match id.as_str() {
+                                                "google_drive" => "Google Drive",
+                                                "google_sheets" => "Google Sheets",
+                                                "google_calendar" => "Google Calendar",
+                                                "gmail" => "Gmail",
+                                                "outlook" => "Microsoft Outlook",
+                                                "outlook_calendar" => "Outlook Calendar",
+                                                "notion" => "Notion",
+                                                "agentmail" => "AgentMail",
+                                                _ => &id,
+                                            };
+                                            let enabled = session
+                                                .read()
+                                                .connector_drafts
+                                                .get(&id)
+                                                .map(|draft| draft.enabled)
+                                                .unwrap_or(connector.enabled);
+                                            let values = session
+                                                .read()
+                                                .connector_drafts
+                                                .get(&id)
+                                                .map(|draft| draft.values.clone())
+                                                .unwrap_or_default();
+                                            rsx! {
+                                                div { class: "card", key: "{id}",
+                                                    div { class: "card-head",
+                                                        div { style: "display: flex; align-items: center; gap: 10px;",
+                                                            BrandLogo { brand: id.clone(), size: 28 }
+                                                            div {
+                                                                h3 { class: "card-title", "{display_title}" }
+                                                                span { class: "card-sub", "{connector.kind}" }
+                                                            }
+                                                        }
+                                                        div { style: "display: flex; align-items: center; gap: 6px;",
+                                                            span {
+                                                                class: if is_connected { "status-pill connected" } else { "status-pill disconnected" },
+                                                                if is_connected { "Connected" } else { "Not connected" }
+                                                            }
+                                                            span { class: if enabled { "chip ok" } else { "chip muted" },
+                                                                if enabled { "enabled" } else { "disabled" }
+                                                            }
+                                                        }
+                                                    }
+                                                    if let Some(uri) = connector.redirect_uri.clone() {
+                                                        code { class: "tiny", "{uri}" }
+                                                    }
+                                                    div { class: "chips",
+                                                        for (role, secret) in &connector.secrets {
+                                                            if secret.configured || secret.name.as_deref().is_some_and(|n| !n.is_empty()) {
+                                                                span { class: if secret.configured { "chip accent" } else { "chip warn" },
+                                                                    "{role}: {secret.name.clone().unwrap_or_default()}"
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    div { class: "form-grid",
+                                                        for (role, secret) in &connector.secrets {
+                                                            {
                                                                 let role = role.clone();
-                                                                move |event| session.write().set_connector_value(&id, &role, event.value())
+                                                                let name = secret.name.clone().unwrap_or_default();
+                                                                let value = values.get(&role).cloned().unwrap_or_default();
+                                                                rsx! {
+                                                                    div { class: "field",
+                                                                        label { class: "field-label", "{role}" }
+                                                                        input {
+                                                                            class: "input",
+                                                                            "type": "password",
+                                                                            value: "{value}",
+                                                                            placeholder: if secret.configured { format!("replace {name}") } else { format!("set {name}") },
+                                                                            oninput: {
+                                                                                let id = id.clone();
+                                                                                let role = role.clone();
+                                                                                move |event| session.write().set_connector_value(&id, &role, event.value())
+                                                                            },
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    p { class: "tiny",
+                                                        "Enabling makes the connector available; grant its tools to a bot in Fleet. Reads and sends stay approval-gated."
+                                                    }
+                                                    if connector_auth_url(&id, connector.redirect_uri.as_deref()).is_some() {
+                                                        p { class: "tiny",
+                                                            "Connect opens the provider's consent page in your browser. Register the redirect URI above with the client id the server stores, then paste the refresh token here."
+                                                        }
+                                                    }
+                                                    div { class: "card-actions",
+                                                        if let Some(url) = connector_auth_url(&id, connector.redirect_uri.as_deref()) {
+                                                            button {
+                                                                class: "btn ghost sm",
+                                                                title: "Open the provider's authorization page in your browser",
+                                                                onclick: {
+                                                                    let url = url.clone();
+                                                                    move |_| {
+                                                                        if let Err(error) = webbrowser::open(&url) {
+                                                                            session.write().state.error =
+                                                                                Some(format!("Could not open the browser: {error}"));
+                                                                        }
+                                                                    }
+                                                                },
+                                                                Icon { name: "external", size: 14 }
+                                                                "Connect"
+                                                            }
+                                                        }
+                                                        button {
+                                                            class: if enabled { "btn ghost sm" } else { "btn primary sm" },
+                                                            onclick: {
+                                                                let id = id.clone();
+                                                                move |_| session.write().toggle_connector(&id)
                                                             },
+                                                            if enabled { "Disable" } else { "Enable" }
+                                                        }
+                                                        button {
+                                                            class: "btn ghost sm",
+                                                            disabled: !can_save,
+                                                            onclick: {
+                                                                let id = id.clone();
+                                                                move |_| session.write().save_connector(id.clone())
+                                                            },
+                                                            "Save connector"
                                                         }
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                    p { class: "tiny",
-                                        "Enabling makes the connector available; grant its tools to a bot in Fleet. Reads and sends stay approval-gated."
-                                    }
-                                    if connector_auth_url(&id, connector.redirect_uri.as_deref()).is_some() {
-                                        p { class: "tiny",
-                                            "Connect opens the provider's consent page in your browser. Register the redirect URI above with the client id the server stores, then paste the refresh token here."
-                                        }
-                                    }
-                                    div { class: "card-actions",
-                                        if let Some(url) = connector_auth_url(&id, connector.redirect_uri.as_deref()) {
-                                            button {
-                                                class: "btn ghost sm",
-                                                title: "Open the provider's authorization page in your browser",
-                                                onclick: {
-                                                    let url = url.clone();
-                                                    move |_| {
-                                                        if let Err(error) = webbrowser::open(&url) {
-                                                            session.write().state.error =
-                                                                Some(format!("Could not open the browser: {error}"));
-                                                        }
-                                                    }
-                                                },
-                                                Icon { name: "external", size: 14 }
-                                                "Connect"
-                                            }
-                                        }
-                                        button {
-                                            class: if enabled { "btn ghost sm" } else { "btn primary sm" },
-                                            onclick: {
-                                                let id = id.clone();
-                                                move |_| session.write().toggle_connector(&id)
-                                            },
-                                            if enabled { "Disable" } else { "Enable" }
-                                        }
-                                        button {
-                                            class: "btn ghost sm",
-                                            disabled: !can_save,
-                                            onclick: {
-                                                let id = id.clone();
-                                                move |_| session.write().save_connector(id.clone())
-                                            },
-                                            "Save connector"
-                                        }
-                                    }
                                 }
                             }
+                        } else {
+                            rsx! {}
                         }
                     }
                 }
@@ -4266,5 +5019,82 @@ mod tests {
         assert!(connector_auth_url("gmail", Some("https://ok.example/cb?state=1")).is_none());
         assert!(connector_auth_url("gmail", Some("https://ok.example/\"")).is_none());
         assert!(connector_auth_url("gmail", Some("   ")).is_some());
+    }
+
+    #[test]
+    fn markdown_parser_handles_screenshot_patterns() {
+        let text = r#"### **3. Cosa NON ho in questa sessione**
+- **`firecrawl_search`** o **`firecrawl_scrape`**: non sono attivi
+---
+*Nota*: i connettori sono configurabili via UI."#;
+
+        let blocks = parse_markdown_blocks(text);
+        assert_eq!(blocks.len(), 4);
+
+        match &blocks[0] {
+            MdBlock::Heading { level, text } => {
+                assert_eq!(*level, 3);
+                assert_eq!(text, "3. Cosa NON ho in questa sessione");
+            }
+            other => panic!("expected Heading, got {:?}", other),
+        }
+
+        match &blocks[1] {
+            MdBlock::UnorderedList(items) => {
+                assert_eq!(items.len(), 1);
+                let spans = parse_inline(&items[0]);
+                assert_eq!(
+                    spans,
+                    vec![
+                        InlineSpan::Bold(vec![InlineSpan::Code("firecrawl_search".into())]),
+                        InlineSpan::Text(" o ".into()),
+                        InlineSpan::Bold(vec![InlineSpan::Code("firecrawl_scrape".into())]),
+                        InlineSpan::Text(": non sono attivi".into()),
+                    ]
+                );
+            }
+            other => panic!("expected UnorderedList, got {:?}", other),
+        }
+
+        assert_eq!(blocks[2], MdBlock::Rule);
+
+        match &blocks[3] {
+            MdBlock::Paragraph(para) => {
+                let spans = parse_inline(para);
+                assert_eq!(
+                    spans,
+                    vec![
+                        InlineSpan::Italic("Nota".into()),
+                        InlineSpan::Text(": i connettori sono configurabili via UI.".into()),
+                    ]
+                );
+            }
+            other => panic!("expected Paragraph, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn markdown_parser_handles_tables_and_codeblocks() {
+        let text = "```rust\nfn main() {\n    println!(\"Hello\");\n}\n```\n\n| Name | Role | Status |\n|---|---|---|\n| Analyst | Finance | Live |\n| Maker | Slides | Off |\n";
+        let blocks = parse_markdown_blocks(text);
+        assert_eq!(blocks.len(), 2);
+
+        match &blocks[0] {
+            MdBlock::CodeBlock { lang, code } => {
+                assert_eq!(lang, "rust");
+                assert!(code.contains("println!"));
+            }
+            other => panic!("expected CodeBlock, got {:?}", other),
+        }
+
+        match &blocks[1] {
+            MdBlock::Table { headers, rows } => {
+                assert_eq!(headers, &["Name", "Role", "Status"]);
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0], &["Analyst", "Finance", "Live"]);
+                assert_eq!(rows[1], &["Maker", "Slides", "Off"]);
+            }
+            other => panic!("expected Table, got {:?}", other),
+        }
     }
 }

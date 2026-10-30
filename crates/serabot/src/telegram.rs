@@ -1093,18 +1093,98 @@ fn escape_html(text: &str) -> String {
 fn markdown_to_telegram_html(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 32);
     let mut rest = text;
+    let mut at_line_start = true;
+
     while !rest.is_empty() {
         if let Some(after_fence) = rest.strip_prefix("```") {
-            let body = after_fence.strip_prefix('\n').unwrap_or(after_fence);
-            if let Some((code, tail)) = body.split_once("```") {
+            if let Some((raw_body, tail)) = after_fence.split_once("```") {
+                let code = if let Some((_lang, code_part)) = raw_body.split_once('\n') {
+                    code_part
+                } else {
+                    raw_body
+                };
                 let code = code.strip_suffix('\n').unwrap_or(code);
                 out.push_str("<pre>");
                 out.push_str(&escape_html(code));
                 out.push_str("</pre>");
                 rest = tail.strip_prefix('\n').unwrap_or(tail);
+                at_line_start = true;
                 continue;
             }
         }
+
+        if at_line_start {
+            let line_end = rest.find('\n').unwrap_or(rest.len());
+            let line = &rest[..line_end];
+            let trimmed = line.trim();
+
+            // Horizontal rule: ---, ***, ___
+            if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+                out.push_str("──────────");
+                if line_end < rest.len() {
+                    out.push('\n');
+                    rest = &rest[line_end + 1..];
+                } else {
+                    rest = "";
+                }
+                at_line_start = true;
+                continue;
+            }
+
+            // Headings: 1..=6 '#' followed by space
+            let line_trimmed = line.trim_start();
+            let hash_count = line_trimmed.chars().take_while(|c| *c == '#').count();
+            if (1..=6).contains(&hash_count)
+                && line_trimmed.as_bytes().get(hash_count) == Some(&b' ')
+            {
+                let mut title = line_trimmed[hash_count..].trim();
+                if let Some(stripped) = title.strip_prefix("**").and_then(|s| s.strip_suffix("**"))
+                {
+                    title = stripped.trim();
+                }
+                out.push_str("<b>");
+                out.push_str(&markdown_to_telegram_html(title));
+                out.push_str("</b>");
+                if line_end < rest.len() {
+                    out.push('\n');
+                    rest = &rest[line_end + 1..];
+                } else {
+                    rest = "";
+                }
+                at_line_start = true;
+                continue;
+            }
+
+            // Bullet lists: '- ' or '* ' (followed by space, not '**')
+            let indent_len = line.chars().take_while(|c| *c == ' ').count();
+            let after_indent = &line[indent_len..];
+            if (after_indent.starts_with("- ") || after_indent.starts_with("* "))
+                && !after_indent.starts_with("**")
+            {
+                out.push_str(&line[..indent_len]);
+                out.push_str("• ");
+                rest = &rest[indent_len + 2..];
+                at_line_start = false;
+                continue;
+            }
+
+            // Blockquotes: line starting with '> '
+            if let Some(quote_content) = line.strip_prefix("> ") {
+                out.push_str("<blockquote>");
+                out.push_str(&markdown_to_telegram_html(quote_content));
+                out.push_str("</blockquote>");
+                if line_end < rest.len() {
+                    out.push('\n');
+                    rest = &rest[line_end + 1..];
+                } else {
+                    rest = "";
+                }
+                at_line_start = true;
+                continue;
+            }
+        }
+
+        // Inline code: `...`
         if rest.starts_with('`') {
             if let Some(end) = rest[1..].find('`') {
                 let code = &rest[1..1 + end];
@@ -1113,10 +1193,13 @@ fn markdown_to_telegram_html(text: &str) -> String {
                     out.push_str(&escape_html(code));
                     out.push_str("</code>");
                     rest = &rest[2 + end..];
+                    at_line_start = false;
                     continue;
                 }
             }
         }
+
+        // Inline bold: **...**
         if rest.starts_with("**") {
             if let Some(end) = rest[2..].find("**") {
                 let inner = &rest[2..2 + end];
@@ -1125,10 +1208,34 @@ fn markdown_to_telegram_html(text: &str) -> String {
                     out.push_str(&markdown_to_telegram_html(inner));
                     out.push_str("</b>");
                     rest = &rest[4 + end..];
+                    at_line_start = false;
                     continue;
                 }
             }
         }
+
+        // Inline italic: *...*
+        if rest.starts_with('*') && !rest.starts_with("**") {
+            let line_end = rest.find('\n').unwrap_or(rest.len());
+            let line_slice = &rest[1..line_end];
+            if let Some(first_char) = line_slice.chars().next() {
+                if !first_char.is_whitespace() && first_char != '*' {
+                    if let Some(end) = line_slice.find('*') {
+                        let inner = &line_slice[..end];
+                        if !inner.is_empty() && !inner.ends_with(char::is_whitespace) {
+                            out.push_str("<i>");
+                            out.push_str(&markdown_to_telegram_html(inner));
+                            out.push_str("</i>");
+                            rest = &rest[2 + end..];
+                            at_line_start = false;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Links: [label](url)
         if rest.starts_with('[') {
             if let Some((label, after_label)) = rest[1..].split_once("](") {
                 if let Some((url, after_url)) = after_label.split_once(')') {
@@ -1144,40 +1251,27 @@ fn markdown_to_telegram_html(text: &str) -> String {
                         out.push_str(&escape_html(label));
                         out.push_str("</a>");
                         rest = after_url;
+                        at_line_start = false;
                         continue;
                     }
                 }
             }
         }
-        if rest.starts_with('#') {
-            let line_end = rest.find('\n').unwrap_or(rest.len());
-            let line = &rest[..line_end];
-            if line.starts_with('#')
-                && line
-                    .chars()
-                    .take_while(|c| *c == '#')
-                    .count()
-                    .saturating_mul(1)
-                    <= 6
-                && line
-                    .find(|c: char| c != '#')
-                    .is_some_and(|i| line.as_bytes().get(i) == Some(&b' '))
-            {
-                let title = line.trim_start_matches('#').trim();
-                out.push_str("<b>");
-                out.push_str(&escape_html(title));
-                out.push_str("</b>");
-                rest = &rest[line_end..];
-                continue;
-            }
-        }
+
         let next = rest.chars().next().unwrap();
         match next {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
+            '\n' => {
+                out.push('\n');
+                at_line_start = true;
+                rest = &rest[1..];
+                continue;
+            }
             _ => out.push(next),
         }
+        at_line_start = false;
         rest = &rest[next.len_utf8()..];
     }
     out
@@ -2037,5 +2131,23 @@ mod tests {
                 .join("9.ogg")
                 .is_file()
         );
+    }
+
+    #[test]
+    fn markdown_to_telegram_html_renders_expected_constructs() {
+        assert_eq!(
+            markdown_to_telegram_html("### **3. Cosa NON ho**"),
+            "<b>3. Cosa NON ho</b>"
+        );
+        assert_eq!(
+            markdown_to_telegram_html("- **`firecrawl_search`**"),
+            "• <b><code>firecrawl_search</code></b>"
+        );
+        assert_eq!(markdown_to_telegram_html("---"), "──────────");
+        assert_eq!(
+            markdown_to_telegram_html("```json\n{\"a\": 1}\n```"),
+            "<pre>{\"a\": 1}</pre>"
+        );
+        assert_eq!(markdown_to_telegram_html("*Nota*"), "<i>Nota</i>");
     }
 }

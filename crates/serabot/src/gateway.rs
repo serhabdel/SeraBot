@@ -109,6 +109,10 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
+    pub fn is_registered(&self, name: &str) -> bool {
+        self.specs.contains_key(name)
+    }
+
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.specs.values().cloned().collect()
     }
@@ -184,6 +188,10 @@ impl Gateway {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    pub fn is_registered(&self, name: &str) -> bool {
+        self.registry.is_registered(name)
     }
 
     pub async fn execute(

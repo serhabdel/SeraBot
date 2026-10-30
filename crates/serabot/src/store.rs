@@ -603,7 +603,7 @@ impl Store {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id, conversation_id, turn_id, role, content, name, tool_call_id, created_at
-             FROM messages WHERE conversation_id = ?1 ORDER BY created_at DESC LIMIT ?2",
+             FROM messages WHERE conversation_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT ?2",
         )?;
         let rows = statement.query_map(params![conversation_id, limit as i64], |row| {
             Ok(StoredMessage {

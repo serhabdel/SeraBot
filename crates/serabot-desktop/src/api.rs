@@ -231,6 +231,9 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
     "notion_query_database",
     "agentmail_inboxes_list",
     "agentmail_send",
+    "memory_save",
+    "memory_list",
+    "memory_delete",
 ];
 
 pub const DEFAULT_SPECIALIST_TOOLS: &[&str] = &["skill_list", "skill_search", "skill_load"];
@@ -1072,8 +1075,8 @@ struct ProvidersEnvelope {
     providers: Vec<ProviderStatus>,
 }
 #[derive(Deserialize)]
-struct ConnectorsEnvelope {
-    connectors: Vec<ConnectorStatus>,
+pub(crate) struct ConnectorsEnvelope {
+    pub(crate) connectors: Vec<ConnectorStatus>,
 }
 
 /// Construct and use only on a worker thread. No retries, cookies, redirects,
@@ -1707,8 +1710,37 @@ impl ApiClient {
 
     pub fn connectors(&self) -> Result<Vec<ConnectorStatus>, ApiError> {
         let response: ConnectorsEnvelope = self.get(&["v1", "connectors"], &[])?;
+        Self::normalize_and_validate_connectors(response)
+    }
+
+    pub(crate) fn normalize_and_validate_connectors(
+        mut response: ConnectorsEnvelope,
+    ) -> Result<Vec<ConnectorStatus>, ApiError> {
         if response.connectors.len() > 64 {
             return Err(ApiError::InvalidResponse);
+        }
+        for connector in &mut response.connectors {
+            if connector
+                .redirect_uri
+                .as_deref()
+                .is_some_and(|s| s.trim().is_empty())
+            {
+                connector.redirect_uri = None;
+            }
+            if connector
+                .api_base
+                .as_deref()
+                .is_some_and(|s| s.trim().is_empty())
+            {
+                connector.api_base = None;
+            }
+            if connector
+                .default_inbox_id
+                .as_deref()
+                .is_some_and(|s| s.trim().is_empty())
+            {
+                connector.default_inbox_id = None;
+            }
         }
         let mut seen = HashSet::with_capacity(response.connectors.len());
         for connector in &response.connectors {
@@ -2394,5 +2426,28 @@ mod tests {
         assert!(!valid_audio_filename("notes/note.webm"));
         assert!(!valid_audio_filename("note.webm\r\n"));
         assert!(!valid_audio_filename(""));
+    }
+
+    #[test]
+    fn connectors_normalizes_empty_strings_and_succeeds() {
+        let raw = r#"{
+            "connectors": [{
+                "id": "agentmail",
+                "kind": "agentmail",
+                "enabled": true,
+                "redirect_uri": "",
+                "api_base": "   ",
+                "default_inbox_id": "",
+                "secrets": {}
+            }]
+        }"#;
+        let envelope: ConnectorsEnvelope = serde_json::from_str(raw).unwrap();
+        let validated = ApiClient::normalize_and_validate_connectors(envelope)
+            .expect("validation should succeed when optional fields are empty strings");
+        assert_eq!(validated.len(), 1);
+        assert_eq!(validated[0].id, "agentmail");
+        assert_eq!(validated[0].default_inbox_id, None);
+        assert_eq!(validated[0].redirect_uri, None);
+        assert_eq!(validated[0].api_base, None);
     }
 }

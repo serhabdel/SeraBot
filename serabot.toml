@@ -54,11 +54,16 @@ catalog_ttl_secs = 1800
 # routine = ["mistral-small-latest", "ministral-8b-latest"]
 # synthesis = ["mistral-large-latest", "mistral-medium-latest"]
 models = [
+  "mistral-large-latest",
   "mistral-medium-latest",
   "mistral-small-latest",
   "codestral-latest",
   "ministral-8b-latest",
   "open-mistral-nemo",
+  "magistral-medium-latest",
+  "magistral-small-latest",
+  "devstral-small-latest",
+  "pixtral-large-latest",
 ]
 # Optional profiles. Store each api_key_secret with `serabot secrets set` before enabling.
 # Selection never grants consent. catalog_fetch narrows `models` and hides them if refresh fails.

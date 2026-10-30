@@ -28,9 +28,9 @@ use std::{
 };
 use zeroize::Zeroize;
 
-pub const REQUEST_GAP: Duration = Duration::from_secs(2);
-pub const POLL_GAP: Duration = Duration::from_secs(5);
-pub const POLL_SAFETY: Duration = Duration::from_secs(20);
+pub const REQUEST_GAP: Duration = Duration::from_millis(60);
+pub const POLL_GAP: Duration = Duration::from_millis(750);
+pub const POLL_SAFETY: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Theme {
@@ -641,8 +641,21 @@ impl Session {
         self.conversation = id;
         self.section = Section::Chat;
         self.selected_bot = None;
+        let has_models = !self.state.providers.is_empty()
+            || self
+                .state
+                .catalog
+                .as_ref()
+                .is_some_and(|c| !c.providers.is_empty());
         self.reset_scope(true);
-        self.refresh();
+        self.state.error = None;
+        self.refreshing = true;
+        self.poll_paused = false;
+        if has_models {
+            self.start_request(Operation::History);
+        } else {
+            self.start_request(Operation::Catalog);
+        }
     }
 
     pub fn open_bot(&mut self, id: String) {
@@ -839,6 +852,14 @@ impl Session {
         }
         self.state.error = None;
         let text = std::mem::take(&mut self.composer);
+        self.state.messages.push(Message {
+            id: format!("opt-{}", Instant::now().elapsed().as_nanos()),
+            role: Role::User,
+            content: text.clone(),
+            created_at: "Just now".into(),
+            name: None,
+            bot: None,
+        });
         self.start_request(Operation::Submit(zeroize::Zeroizing::new(text)));
     }
 
@@ -1177,10 +1198,18 @@ impl Session {
                                 .or_else(|| Some("Server is not ready.".into()));
                         }
                         OperationKind::Catalog if self.refreshing => {
-                            self.schedule(Operation::History, Duration::ZERO)
+                            if self.state.history_loaded {
+                                self.schedule(Operation::Approvals, Duration::ZERO);
+                            } else {
+                                self.schedule(Operation::History, Duration::ZERO);
+                            }
                         }
                         OperationKind::History if self.refreshing => {
-                            self.schedule(Operation::Approvals, Duration::ZERO)
+                            if self.state.catalog.is_none() {
+                                self.schedule(Operation::Catalog, Duration::ZERO);
+                            } else {
+                                self.schedule(Operation::Approvals, Duration::ZERO);
+                            }
                         }
                         OperationKind::Approvals if self.refreshing => self.schedule(
                             Operation::ListConversations {

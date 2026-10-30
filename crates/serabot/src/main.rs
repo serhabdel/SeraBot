@@ -481,6 +481,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         embedder.clone(),
         config.clone(),
     ))?;
+    serabot::tools::register_memory_tools(&mut registry, store.clone())?;
     let fetcher = SafeFetcher::new(
         config.watcher.user_agent.clone(),
         config.watcher.timeout_secs,

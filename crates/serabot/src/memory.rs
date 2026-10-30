@@ -25,6 +25,8 @@ pub const MAX_LIST_LIMIT: usize = 500;
 pub struct Memory {
     pub id: String,
     pub kind: String,
+    #[serde(default)]
+    pub category: String,
     pub content: String,
     pub source: String,
     pub created_at: DateTime<Utc>,
@@ -40,6 +42,7 @@ pub fn add(store: &Store, kind: &str, content: &str, source: &str) -> Result<Mem
     let now = parse_datetime(&now_string(Utc::now()));
     let memory = Memory {
         id: new_id(),
+        category: kind.to_owned(),
         kind: kind.to_owned(),
         content: content.to_owned(),
         source: source.to_owned(),
@@ -110,9 +113,11 @@ pub fn delete(store: &Store, id: &str) -> Result<bool> {
 }
 
 fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
+    let kind: String = row.get(1)?;
     Ok(Memory {
         id: row.get(0)?,
-        kind: row.get(1)?,
+        category: kind.clone(),
+        kind,
         content: row.get(2)?,
         source: row.get(3)?,
         created_at: parse_datetime(&row.get::<_, String>(4)?),
