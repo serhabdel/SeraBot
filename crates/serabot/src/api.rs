@@ -1427,6 +1427,31 @@ async fn list_connectors(State(state): State<Arc<ApiState>>) -> Result<Json<Valu
             "api_key": secret_status(&state.secrets, Some(agentmail.api_key_secret.as_str())),
         },
     }));
+    for (id, enabled, api_base, key_secret) in [
+        (
+            "tavily",
+            state.config.tavily.enabled,
+            state.config.tavily.api_base.as_str(),
+            state.config.tavily.api_key_secret.as_str(),
+        ),
+        (
+            "firecrawl",
+            state.config.firecrawl.enabled,
+            state.config.firecrawl.api_base.as_str(),
+            state.config.firecrawl.api_key_secret.as_str(),
+        ),
+    ] {
+        views.push(json!({
+            "id": id,
+            "kind": "api_key",
+            "enabled": enabled,
+            "redirect_uri": Value::Null,
+            "api_base": api_base,
+            "secrets": {
+                "api_key": secret_status(&state.secrets, Some(key_secret)),
+            },
+        }));
+    }
     Ok(Json(json!({"connectors": views})))
 }
 
@@ -3573,7 +3598,7 @@ mod tests {
         )
         .await;
         let list = connectors["connectors"].as_array().unwrap();
-        assert_eq!(list.len(), 8);
+        assert_eq!(list.len(), 10);
         let gmail = list
             .iter()
             .find(|connector| connector["id"] == "gmail")
@@ -3585,6 +3610,13 @@ mod tests {
             "google_oauth_client_id"
         );
         assert_eq!(gmail["secrets"]["client_id"]["configured"], false);
+        let tavily = list
+            .iter()
+            .find(|connector| connector["id"] == "tavily")
+            .expect("tavily connector");
+        assert_eq!(tavily["kind"], "api_key");
+        assert_eq!(tavily["secrets"]["api_key"]["name"], "tavily_api_key");
+        assert!(list.iter().any(|connector| connector["id"] == "firecrawl"));
         assert!(!connectors.to_string().contains("synthetic-test-key"));
     }
 

@@ -444,6 +444,21 @@ pub fn BrandLogo(brand: String, #[props(default = 24)] size: u32) -> Element {
                         path { d: "M13 8l-3 4.5h3.5L11 17l5-5.5h-3.5L14 8z", fill: "#FBBF24" }
                     }
                 },
+                "tavily" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#0F766E" }
+                        circle { cx: "12", cy: "12", r: "6.5", stroke: "#5EEAD4", "stroke-width": "1.6" }
+                        circle { cx: "12", cy: "12", r: "3", fill: "#14B8A6" }
+                        path { d: "M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3", stroke: "#99F6E4", "stroke-width": "1.6", "stroke-linecap": "round" }
+                    }
+                },
+                "firecrawl" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#7C2D12" }
+                        path { d: "M12 4.5c2.5 3 5.5 5 5.5 9a5.5 5.5 0 0 1-11 0c0-4 3-6 5.5-9z", fill: "#F97316" }
+                        path { d: "M12 9.5c1.2 1.6 2.6 2.6 2.6 4.6a2.6 2.6 0 0 1-5.2 0c0-2 1.4-3 2.6-4.6z", fill: "#FDBA74" }
+                    }
+                },
                 "google-antigravity" | "antigravity" => rsx! {
                     svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
                         rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#1E1B4B" }
@@ -4134,7 +4149,7 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
             div { class: "pane-head",
                 div {
                     h1 { class: "pane-title", "Connectors" }
-                    p { class: "muted", "Enable Google, Microsoft, Notion and AgentMail, and store their credentials." }
+                    p { class: "muted", "Enable Google, Microsoft, Notion, AgentMail and web research, and store their credentials." }
                 }
                 button {
                     class: "btn ghost",
@@ -4153,6 +4168,7 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
                     ("Google Workspace", &["google_drive", "google_sheets", "google_calendar", "gmail"][..]),
                     ("Microsoft 365", &["outlook", "outlook_calendar"][..]),
                     ("Knowledge & Email", &["notion", "agentmail"][..]),
+                    ("Web Research", &["tavily", "firecrawl"][..]),
                 ] {
                     {
                         let suite_connectors: Vec<_> = connectors
@@ -4177,6 +4193,8 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
                                                 "outlook_calendar" => "Outlook Calendar",
                                                 "notion" => "Notion",
                                                 "agentmail" => "AgentMail",
+                                                "tavily" => "Tavily Search",
+                                                "firecrawl" => "Firecrawl",
                                                 _ => &id,
                                             };
                                             let enabled = session

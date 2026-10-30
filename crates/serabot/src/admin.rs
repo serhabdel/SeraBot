@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::audio::resolve_audio_provider;
-use crate::config::{Config, ConnectorsConfig, OAuthConnectorSettings, ProviderConfig};
+use crate::config::{Config, OAuthConnectorSettings, ProviderConfig};
 use crate::error::{Result, SeraError};
 use crate::providers::{canonical_kind, check_profile};
 use crate::secrets::SharedSecrets;
@@ -99,7 +99,11 @@ impl AdminOverlay {
             config.llm.providers.insert(id.clone(), profile.clone());
         }
         for (id, enabled) in &self.connectors {
-            config.connectors.set_enabled(id, *enabled)?;
+            match id.as_str() {
+                "tavily" => config.tavily.enabled = *enabled,
+                "firecrawl" => config.firecrawl.enabled = *enabled,
+                _ => config.connectors.set_enabled(id, *enabled)?,
+            }
         }
         if let Some(audio) = &self.audio {
             if audio.enabled
@@ -438,7 +442,7 @@ impl AdminStore {
         enabled: bool,
         values: &BTreeMap<String, String>,
     ) -> Result<()> {
-        let roles = connector_secret_roles(&base.connectors, id)?;
+        let roles = connector_secret_roles(base, id)?;
         for key in values.keys() {
             if !roles.iter().any(|(role, _)| role == key) {
                 return Err(SeraError::Validation(format!(
@@ -524,7 +528,7 @@ impl AdminStore {
     }
 
     pub fn connector_roles(&self, base: &Config, id: &str) -> Result<Vec<(&'static str, String)>> {
-        connector_secret_roles(&base.connectors, id)
+        connector_secret_roles(base, id)
     }
 
     pub fn snapshot(&self) -> AdminOverlay {
@@ -616,10 +620,8 @@ fn credential_ok(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
-pub fn connector_secret_roles(
-    connectors: &ConnectorsConfig,
-    id: &str,
-) -> Result<Vec<(&'static str, String)>> {
+pub fn connector_secret_roles(config: &Config, id: &str) -> Result<Vec<(&'static str, String)>> {
+    let connectors = &config.connectors;
     let oauth: Option<&dyn OAuthConnectorSettings> = match id {
         "google_drive" => Some(&connectors.google_drive),
         "google_sheets" => Some(&connectors.google_sheets),
@@ -648,6 +650,12 @@ pub fn connector_secret_roles(
             "api_key",
             connectors.agentmail.api_key_secret.clone(),
         )]);
+    }
+    if id == "tavily" {
+        return Ok(vec![("api_key", config.tavily.api_key_secret.clone())]);
+    }
+    if id == "firecrawl" {
+        return Ok(vec![("api_key", config.firecrawl.api_key_secret.clone())]);
     }
     Err(SeraError::NotFound(format!("connector {id}")))
 }
@@ -777,6 +785,49 @@ mod tests {
                 .set_connector(&config, &empty, "agentmail", true, &values)
                 .is_ok()
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn tavily_and_firecrawl_are_owner_manageable_search_connectors() {
+        let root = std::env::temp_dir().join(format!("serabot-admin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = config_with_root(&root);
+        let store = AdminStore::open(&config).unwrap();
+        let empty = SharedSecrets::new(
+            crate::secrets::SecretStore::open_paths(
+                root.join("secrets.age"),
+                root.join("identity.txt"),
+            )
+            .unwrap(),
+        );
+        for id in ["tavily", "firecrawl"] {
+            let roles = store.connector_roles(&config, id).unwrap();
+            assert!(
+                roles
+                    .iter()
+                    .any(|(role, name)| *role == "api_key" && name == &format!("{id}_api_key")),
+                "{id} roles: {roles:?}"
+            );
+            assert!(
+                store
+                    .set_connector(&config, &empty, id, true, &BTreeMap::new())
+                    .is_err(),
+                "{id} must not enable without its secret"
+            );
+            let mut values = BTreeMap::new();
+            values.insert("api_key".to_owned(), "synthetic-key".to_owned());
+            assert!(
+                store
+                    .set_connector(&config, &empty, id, true, &values)
+                    .is_ok(),
+                "{id} enables once its key is stored"
+            );
+        }
+        let mut merged = config.clone();
+        store.snapshot().apply(&mut merged).unwrap();
+        assert!(merged.tavily.enabled);
+        assert!(merged.firecrawl.enabled);
         std::fs::remove_dir_all(&root).ok();
     }
 }
