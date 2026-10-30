@@ -1209,7 +1209,7 @@ fn probe_request(
             .get(format!("{}/v2/team/credit-usage", probe_base(base)?))
             .bearer_auth(api_key),
         ApiKeyProbe::ElevenLabs(base) => http
-            .get(format!("{}/v1/user", probe_base(base)?))
+            .get(format!("{}/v2/voices?page_size=1", probe_base(base)?))
             .header("xi-api-key", api_key),
         ApiKeyProbe::Tavily(base) => {
             http.post(format!("{}/search", probe_base(base)?))
@@ -2567,7 +2567,7 @@ mod tests {
 
         let rejected = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/v1/user"))
+            .and(path("/v2/voices"))
             .respond_with(ResponseTemplate::new(401).set_body_string("provider-echo-body"))
             .mount(&rejected)
             .await;
@@ -2579,7 +2579,7 @@ mod tests {
 
         let elevenlabs = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/v1/user"))
+            .and(path("/v2/voices"))
             .and(header("xi-api-key", "synthetic-key"))
             .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
             .mount(&elevenlabs)
@@ -2618,7 +2618,7 @@ mod tests {
 
         let broken = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/v1/user"))
+            .and(path("/v2/voices"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&broken)
             .await;
@@ -2634,7 +2634,7 @@ mod tests {
     async fn api_key_probe_is_bounded_and_refuses_plain_remote_http() {
         let slow = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/v1/user"))
+            .and(path("/v2/voices"))
             .respond_with(
                 ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(500)),
             )

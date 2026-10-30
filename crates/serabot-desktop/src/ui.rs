@@ -4061,23 +4061,34 @@ fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Eleme
                         }
                         span { class: "hint", "At least one model id is required." }
                     }
-                    div { class: "field",
-                        label { class: "field-label", "Secret name" }
-                        input {
-                            class: "input",
-                            value: "{secret_name}",
-                            placeholder: "secret name (for example WORK_API_KEY)",
-                            oninput: move |event| session.write().provider.secret_name = event.value(),
+                    if chosen.is_some_and(|preset| preset.auth == "oauth") {
+                        div { class: "field", style: "grid-column: 1 / -1;",
+                            label { class: "field-label", "Sign-in" }
+                            div { class: "banner info", style: "display: flex; flex-direction: column; gap: 6px;",
+                                strong { "This provider uses OAuth, not an API key." }
+                                p { class: "tiny", "Save the provider first, then sign in once with the browser flow. Tokens are stored in the server's encrypted secret store as {secret_name} and its refresh token." }
+                                code { class: "tiny", style: "user-select: all;", "serabot providers login {kind}" }
+                            }
                         }
-                    }
-                    div { class: "field",
-                        label { class: "field-label", "API key" }
-                        input {
-                            class: "input",
-                            "type": "password",
-                            value: "{api_key}",
-                            placeholder: "API key (leave empty if already stored)",
-                            oninput: move |event| session.write().provider.api_key = event.value(),
+                    } else {
+                        div { class: "field",
+                            label { class: "field-label", "Secret name" }
+                            input {
+                                class: "input",
+                                value: "{secret_name}",
+                                placeholder: "secret name (for example WORK_API_KEY)",
+                                oninput: move |event| session.write().provider.secret_name = event.value(),
+                            }
+                        }
+                        div { class: "field",
+                            label { class: "field-label", "API key" }
+                            input {
+                                class: "input",
+                                "type": "password",
+                                value: "{api_key}",
+                                placeholder: "API key (leave empty if already stored)",
+                                oninput: move |event| session.write().provider.api_key = event.value(),
+                            }
                         }
                     }
                 }

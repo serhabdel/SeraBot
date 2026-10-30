@@ -1467,6 +1467,10 @@ impl Session {
                             self.admin_notice =
                                 Some("Saved. Restart the server to apply the change.".into());
                             self.restart_pending = true;
+                            // Re-read the lists so "Connected" reflects what the
+                            // server now holds instead of the pre-save snapshot.
+                            self.state.connectors_loaded = false;
+                            self.schedule(Operation::Connectors, Duration::ZERO);
                         }
                         OperationKind::AdminRestart => {
                             self.admin_error = None;
