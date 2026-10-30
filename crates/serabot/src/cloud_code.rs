@@ -343,15 +343,14 @@ pub fn build_cloud_code_envelope(
     let mut system = Vec::new();
     let mut names = std::collections::BTreeMap::new();
     for message in messages {
-        if message.role == Role::System {
-            if let Some(text) = message
+        if message.role == Role::System
+            && let Some(text) = message
                 .content
                 .as_deref()
                 .map(str::trim)
                 .filter(|text| !text.is_empty())
-            {
-                system.push(text.to_owned());
-            }
+        {
+            system.push(text.to_owned());
         }
         if message.role == Role::Assistant {
             for call in &message.tool_calls {
@@ -652,11 +651,12 @@ fn push_turn(
     if parts.is_empty() {
         return;
     }
-    if let Some(last) = turns.last_mut() {
-        if last.role == role && last.function_only == function_only {
-            last.parts.extend(parts);
-            return;
-        }
+    if let Some(last) = turns.last_mut()
+        && last.role == role
+        && last.function_only == function_only
+    {
+        last.parts.extend(parts);
+        return;
     }
     turns.push(DraftTurn {
         role,
@@ -788,14 +788,14 @@ fn hoist_refs(value: &mut Value, defs: &Value, depth: u8, stack: &mut Vec<String
         let name = reference
             .strip_prefix("#/$defs/")
             .or_else(|| reference.strip_prefix("#/definitions/"));
-        if let Some(name) = name {
-            if let Some(target) = defs.get(name).cloned() {
-                stack.push(reference);
-                *value = target;
-                hoist_refs(value, defs, depth + 1, stack);
-                stack.pop();
-                return;
-            }
+        if let Some(name) = name
+            && let Some(target) = defs.get(name).cloned()
+        {
+            stack.push(reference);
+            *value = target;
+            hoist_refs(value, defs, depth + 1, stack);
+            stack.pop();
+            return;
         }
     }
     match value {
@@ -876,10 +876,10 @@ fn sanitize_schema_in(value: &mut Value, depth: u8) {
             }
         }
     }
-    if let Some(constant) = obj.remove("const") {
-        if !obj.contains_key("enum") {
-            obj.insert("enum".into(), Value::Array(vec![json_string(&constant)]));
-        }
+    if let Some(constant) = obj.remove("const")
+        && !obj.contains_key("enum")
+    {
+        obj.insert("enum".into(), Value::Array(vec![json_string(&constant)]));
     }
     if let Some(Value::Array(items)) = obj.get_mut("enum") {
         for item in items.iter_mut() {
@@ -1399,12 +1399,11 @@ async fn discover_project(
             else {
                 break;
             };
-            if status.is_success() {
-                if let Some(project) = extract_project(&onboard)
+            if status.is_success()
+                && let Some(project) = extract_project(&onboard)
                     .or_else(|| onboard.get("response").and_then(extract_project))
-                {
-                    return Some(project);
-                }
+            {
+                return Some(project);
             }
             sleep_pause(pause).await;
             let Ok((status, again)) = post_cloud_json(
@@ -1417,10 +1416,10 @@ async fn discover_project(
             else {
                 break;
             };
-            if status.is_success() {
-                if let Some(project) = extract_project(&again) {
-                    return Some(project);
-                }
+            if status.is_success()
+                && let Some(project) = extract_project(&again)
+            {
+                return Some(project);
             }
         }
     }

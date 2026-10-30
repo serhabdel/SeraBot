@@ -301,12 +301,12 @@ impl TelegramClient {
         let file = response
             .result
             .ok_or_else(|| SeraError::External("Telegram getFile returned no file".into()))?;
-        if let Some(size) = file.file_size {
-            if size <= 0 || size as u64 > max_bytes {
-                return Err(SeraError::Validation(format!(
-                    "Telegram file exceeds configured limit of {max_bytes} bytes"
-                )));
-            }
+        if let Some(size) = file.file_size
+            && (size <= 0 || size as u64 > max_bytes)
+        {
+            return Err(SeraError::Validation(format!(
+                "Telegram file exceeds configured limit of {max_bytes} bytes"
+            )));
         }
         let file_path = file
             .file_path
@@ -749,11 +749,11 @@ impl TelegramClient {
                 let _ = self.answer_callback(&callback.id, "Not authorized.").await;
                 return Ok(());
             }
-            if let Some(message) = &callback.message {
-                if message.chat.id != self.owner_chat_id {
-                    let _ = self.answer_callback(&callback.id, "Not authorized.").await;
-                    return Ok(());
-                }
+            if let Some(message) = &callback.message
+                && message.chat.id != self.owner_chat_id
+            {
+                let _ = self.answer_callback(&callback.id, "Not authorized.").await;
+                return Ok(());
             }
             let data = callback.data.unwrap_or_default();
             let Some((decision, approval_id)) = parse_callback(&data) else {
@@ -1066,21 +1066,21 @@ fn markdown_to_telegram_html(text: &str) -> String {
     let mut at_line_start = true;
 
     while !rest.is_empty() {
-        if let Some(after_fence) = rest.strip_prefix("```") {
-            if let Some((raw_body, tail)) = after_fence.split_once("```") {
-                let code = if let Some((_lang, code_part)) = raw_body.split_once('\n') {
-                    code_part
-                } else {
-                    raw_body
-                };
-                let code = code.strip_suffix('\n').unwrap_or(code);
-                out.push_str("<pre>");
-                out.push_str(&escape_html(code));
-                out.push_str("</pre>");
-                rest = tail.strip_prefix('\n').unwrap_or(tail);
-                at_line_start = true;
-                continue;
-            }
+        if let Some(after_fence) = rest.strip_prefix("```")
+            && let Some((raw_body, tail)) = after_fence.split_once("```")
+        {
+            let code = if let Some((_lang, code_part)) = raw_body.split_once('\n') {
+                code_part
+            } else {
+                raw_body
+            };
+            let code = code.strip_suffix('\n').unwrap_or(code);
+            out.push_str("<pre>");
+            out.push_str(&escape_html(code));
+            out.push_str("</pre>");
+            rest = tail.strip_prefix('\n').unwrap_or(tail);
+            at_line_start = true;
+            continue;
         }
 
         if at_line_start {
@@ -1155,32 +1155,32 @@ fn markdown_to_telegram_html(text: &str) -> String {
         }
 
         // Inline code: `...`
-        if rest.starts_with('`') {
-            if let Some(end) = rest[1..].find('`') {
-                let code = &rest[1..1 + end];
-                if !code.is_empty() && !code.contains('\n') {
-                    out.push_str("<code>");
-                    out.push_str(&escape_html(code));
-                    out.push_str("</code>");
-                    rest = &rest[2 + end..];
-                    at_line_start = false;
-                    continue;
-                }
+        if rest.starts_with('`')
+            && let Some(end) = rest[1..].find('`')
+        {
+            let code = &rest[1..1 + end];
+            if !code.is_empty() && !code.contains('\n') {
+                out.push_str("<code>");
+                out.push_str(&escape_html(code));
+                out.push_str("</code>");
+                rest = &rest[2 + end..];
+                at_line_start = false;
+                continue;
             }
         }
 
         // Inline bold: **...**
-        if rest.starts_with("**") {
-            if let Some(end) = rest[2..].find("**") {
-                let inner = &rest[2..2 + end];
-                if !inner.is_empty() && !inner.contains('\n') {
-                    out.push_str("<b>");
-                    out.push_str(&markdown_to_telegram_html(inner));
-                    out.push_str("</b>");
-                    rest = &rest[4 + end..];
-                    at_line_start = false;
-                    continue;
-                }
+        if rest.starts_with("**")
+            && let Some(end) = rest[2..].find("**")
+        {
+            let inner = &rest[2..2 + end];
+            if !inner.is_empty() && !inner.contains('\n') {
+                out.push_str("<b>");
+                out.push_str(&markdown_to_telegram_html(inner));
+                out.push_str("</b>");
+                rest = &rest[4 + end..];
+                at_line_start = false;
+                continue;
             }
         }
 
@@ -1188,44 +1188,41 @@ fn markdown_to_telegram_html(text: &str) -> String {
         if rest.starts_with('*') && !rest.starts_with("**") {
             let line_end = rest.find('\n').unwrap_or(rest.len());
             let line_slice = &rest[1..line_end];
-            if let Some(first_char) = line_slice.chars().next() {
-                if !first_char.is_whitespace() && first_char != '*' {
-                    if let Some(end) = line_slice.find('*') {
-                        let inner = &line_slice[..end];
-                        if !inner.is_empty() && !inner.ends_with(char::is_whitespace) {
-                            out.push_str("<i>");
-                            out.push_str(&markdown_to_telegram_html(inner));
-                            out.push_str("</i>");
-                            rest = &rest[2 + end..];
-                            at_line_start = false;
-                            continue;
-                        }
-                    }
+            if let Some(first_char) = line_slice.chars().next()
+                && !first_char.is_whitespace()
+                && first_char != '*'
+                && let Some(end) = line_slice.find('*')
+            {
+                let inner = &line_slice[..end];
+                if !inner.is_empty() && !inner.ends_with(char::is_whitespace) {
+                    out.push_str("<i>");
+                    out.push_str(&markdown_to_telegram_html(inner));
+                    out.push_str("</i>");
+                    rest = &rest[2 + end..];
+                    at_line_start = false;
+                    continue;
                 }
             }
         }
 
         // Links: [label](url)
-        if rest.starts_with('[') {
-            if let Some((label, after_label)) = rest[1..].split_once("](") {
-                if let Some((url, after_url)) = after_label.split_once(')') {
-                    if !label.is_empty()
-                        && (url.starts_with("https://") || url.starts_with("http://"))
-                        && !url
-                            .chars()
-                            .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '<'))
-                    {
-                        out.push_str("<a href=\"");
-                        out.push_str(&escape_html(url));
-                        out.push_str("\">");
-                        out.push_str(&escape_html(label));
-                        out.push_str("</a>");
-                        rest = after_url;
-                        at_line_start = false;
-                        continue;
-                    }
-                }
-            }
+        if rest.starts_with('[')
+            && let Some((label, after_label)) = rest[1..].split_once("](")
+            && let Some((url, after_url)) = after_label.split_once(')')
+            && !label.is_empty()
+            && (url.starts_with("https://") || url.starts_with("http://"))
+            && !url
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '<'))
+        {
+            out.push_str("<a href=\"");
+            out.push_str(&escape_html(url));
+            out.push_str("\">");
+            out.push_str(&escape_html(label));
+            out.push_str("</a>");
+            rest = after_url;
+            at_line_start = false;
+            continue;
         }
 
         let next = rest.chars().next().unwrap();

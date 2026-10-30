@@ -400,10 +400,10 @@ impl OneDriveClient {
             state.refresh_unpersisted = false;
         }
 
-        if let (Some(token), Some(expires_at)) = (state.access_token.as_deref(), state.expires_at) {
-            if Instant::now() + REFRESH_SKEW < expires_at {
-                return Ok(token.to_owned());
-            }
+        if let (Some(token), Some(expires_at)) = (state.access_token.as_deref(), state.expires_at)
+            && Instant::now() + REFRESH_SKEW < expires_at
+        {
+            return Ok(token.to_owned());
         }
 
         let current_refresh_token = state.refresh_token.clone();
@@ -479,11 +479,11 @@ impl OneDriveClient {
         let ttl = token.expires_in.unwrap_or(3600).clamp(1, 24 * 60 * 60);
         state.access_token = Some(access_token.clone());
         state.expires_at = Some(Instant::now() + Duration::from_secs(ttl));
-        if let Some(refresh_token) = rotated {
-            if refresh_token != current_refresh_token {
-                state.refresh_token = refresh_token;
-                state.refresh_unpersisted = true;
-            }
+        if let Some(refresh_token) = rotated
+            && refresh_token != current_refresh_token
+        {
+            state.refresh_token = refresh_token;
+            state.refresh_unpersisted = true;
         }
         if state.refresh_unpersisted {
             self.persist_rotated(&state)?;
@@ -654,19 +654,16 @@ impl OneDriveClient {
             if status == StatusCode::ACCEPTED {
                 // Best-effort progress check. A mismatch means the session is
                 // out of sync; stop rather than send overlapping ranges.
-                if let Ok(body) = read_limited(response, MAX_RESPONSE_BYTES).await {
-                    if let Ok(progress) = serde_json::from_slice::<UploadProgress>(&body) {
-                        if let Some(next) = progress.next_expected_ranges.first() {
-                            if let Some(start) = range_start(next) {
-                                if start != end as u64 {
-                                    return Err(SeraError::External(format!(
-                                        "OneDrive upload session is out of sync: server expects byte {start}, client sent through {}",
-                                        end - 1
-                                    )));
-                                }
-                            }
-                        }
-                    }
+                if let Ok(body) = read_limited(response, MAX_RESPONSE_BYTES).await
+                    && let Ok(progress) = serde_json::from_slice::<UploadProgress>(&body)
+                    && let Some(next) = progress.next_expected_ranges.first()
+                    && let Some(start) = range_start(next)
+                    && start != end as u64
+                {
+                    return Err(SeraError::External(format!(
+                        "OneDrive upload session is out of sync: server expects byte {start}, client sent through {}",
+                        end - 1
+                    )));
                 }
                 offset = end;
             } else if status == StatusCode::OK || status == StatusCode::CREATED {
@@ -951,13 +948,12 @@ fn finish_upload(
     if let Some(server_sha256) = file
         .and_then(|facet| facet.hashes)
         .and_then(|hashes| hashes.sha256_hash)
+        && !server_sha256.eq_ignore_ascii_case(sha256)
     {
-        if !server_sha256.eq_ignore_ascii_case(sha256) {
-            return Err(SeraError::External(format!(
-                "OneDrive upload verification failed: sha256 mismatch at {}",
-                display_path(folders, requested_name)
-            )));
-        }
+        return Err(SeraError::External(format!(
+            "OneDrive upload verification failed: sha256 mismatch at {}",
+            display_path(folders, requested_name)
+        )));
     }
 
     let name = if name.is_empty() {

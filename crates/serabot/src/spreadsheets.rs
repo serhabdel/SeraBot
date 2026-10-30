@@ -585,13 +585,13 @@ fn analyze_range(
                 "sheet '{name}'!{example}: ambiguous decimal separator interpreted deterministically"
             ));
         }
-        if state.non_numeric > 0 {
-            if let Some(example) = &state.non_numeric_example {
-                warnings.push(format!(
+        if state.non_numeric > 0
+            && let Some(example) = &state.non_numeric_example
+        {
+            warnings.push(format!(
                     "sheet '{name}': column '{}' ({letter}) excludes {} non-numeric value(s) from totals (first at {example})",
                     state.label, state.non_numeric
                 ));
-            }
         }
 
         for ((currency, unit), group) in &state.groups {
@@ -861,10 +861,10 @@ fn detect_signals(text: &str) -> Signals {
 
 fn token_variants(token: &str) -> Vec<String> {
     let mut variants = vec![token.to_string()];
-    if let Some(index) = token.find(|value: char| value.is_alphabetic()) {
-        if index > 0 {
-            variants.push(token[index..].to_string());
-        }
+    if let Some(index) = token.find(|value: char| value.is_alphabetic())
+        && index > 0
+    {
+        variants.push(token[index..].to_string());
     }
     variants
 }
@@ -1483,12 +1483,12 @@ pub fn parse_timesheet_rows(input: &str) -> Result<TimesheetSummary> {
             "timesheet contains no time entries".into(),
         ));
     }
-    if let Some((declared, line_number)) = declared_total {
-        if declared != total {
-            warnings.push(format!(
+    if let Some((declared, line_number)) = declared_total
+        && declared != total
+    {
+        warnings.push(format!(
                 "line {line_number}: declared total {declared} does not match the computed total {total}"
             ));
-        }
     }
 
     Ok(TimesheetSummary {

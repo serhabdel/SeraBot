@@ -832,67 +832,67 @@ pub fn parse_inline(text: &str) -> Vec<InlineSpan> {
 
     while !rest.is_empty() {
         // 1. Bold with inline code: **`code`**
-        if rest.starts_with("**`") {
-            if let Some(end_code) = rest[3..].find('`') {
-                let code = &rest[3..3 + end_code];
-                let after_code = &rest[3 + end_code + 1..];
-                if let Some(stripped) = after_code.strip_prefix("**") {
-                    spans.push(InlineSpan::Bold(vec![InlineSpan::Code(code.to_owned())]));
-                    rest = stripped;
-                    continue;
-                }
+        if rest.starts_with("**`")
+            && let Some(end_code) = rest[3..].find('`')
+        {
+            let code = &rest[3..3 + end_code];
+            let after_code = &rest[3 + end_code + 1..];
+            if let Some(stripped) = after_code.strip_prefix("**") {
+                spans.push(InlineSpan::Bold(vec![InlineSpan::Code(code.to_owned())]));
+                rest = stripped;
+                continue;
             }
         }
 
         // 2. Bold: **...**
-        if rest.starts_with("**") {
-            if let Some(end) = rest[2..].find("**") {
-                let inner = &rest[2..2 + end];
-                let sub_spans = parse_inline(inner);
-                spans.push(InlineSpan::Bold(sub_spans));
-                rest = &rest[2 + end + 2..];
-                continue;
-            }
+        if rest.starts_with("**")
+            && let Some(end) = rest[2..].find("**")
+        {
+            let inner = &rest[2..2 + end];
+            let sub_spans = parse_inline(inner);
+            spans.push(InlineSpan::Bold(sub_spans));
+            rest = &rest[2 + end + 2..];
+            continue;
         }
 
         // 3. Inline Code: `...`
-        if rest.starts_with('`') {
-            if let Some(end) = rest[1..].find('`') {
-                let code = &rest[1..1 + end];
-                spans.push(InlineSpan::Code(code.to_owned()));
-                rest = &rest[1 + end + 1..];
-                continue;
-            }
+        if rest.starts_with('`')
+            && let Some(end) = rest[1..].find('`')
+        {
+            let code = &rest[1..1 + end];
+            spans.push(InlineSpan::Code(code.to_owned()));
+            rest = &rest[1 + end + 1..];
+            continue;
         }
 
         // 4. Link: [label](url)
-        if rest.starts_with('[') {
-            if let Some(close_bracket) = rest.find(']') {
-                if rest[close_bracket..].starts_with("](") {
-                    let after_bracket = &rest[close_bracket + 2..];
-                    if let Some(close_paren) = after_bracket.find(')') {
-                        let label = &rest[1..close_bracket];
-                        let url = &after_bracket[..close_paren];
-                        spans.push(InlineSpan::Link {
-                            label: label.to_owned(),
-                            url: url.to_owned(),
-                        });
-                        rest = &after_bracket[close_paren + 1..];
-                        continue;
-                    }
-                }
+        if rest.starts_with('[')
+            && let Some(close_bracket) = rest.find(']')
+            && rest[close_bracket..].starts_with("](")
+        {
+            let after_bracket = &rest[close_bracket + 2..];
+            if let Some(close_paren) = after_bracket.find(')') {
+                let label = &rest[1..close_bracket];
+                let url = &after_bracket[..close_paren];
+                spans.push(InlineSpan::Link {
+                    label: label.to_owned(),
+                    url: url.to_owned(),
+                });
+                rest = &after_bracket[close_paren + 1..];
+                continue;
             }
         }
 
         // 5. Italic: *...* (where not **)
-        if rest.starts_with('*') && !rest.starts_with("**") {
-            if let Some(end) = rest[1..].find('*') {
-                let inner = &rest[1..1 + end];
-                if !inner.is_empty() && !inner.starts_with('*') && !inner.ends_with('*') {
-                    spans.push(InlineSpan::Italic(inner.to_owned()));
-                    rest = &rest[1 + end + 1..];
-                    continue;
-                }
+        if rest.starts_with('*')
+            && !rest.starts_with("**")
+            && let Some(end) = rest[1..].find('*')
+        {
+            let inner = &rest[1..1 + end];
+            if !inner.is_empty() && !inner.starts_with('*') && !inner.ends_with('*') {
+                spans.push(InlineSpan::Italic(inner.to_owned()));
+                rest = &rest[1 + end + 1..];
+                continue;
             }
         }
 

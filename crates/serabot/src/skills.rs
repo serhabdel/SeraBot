@@ -312,10 +312,10 @@ fn parse_frontmatter(frontmatter: Option<&str>, body: &str, id: &str) -> (String
 fn title_from_body(body: &str) -> Option<String> {
     for line in body.lines() {
         let line = line.trim();
-        if let Some(title) = line.strip_prefix("# ") {
-            if !title.is_empty() {
-                return Some(title.to_owned());
-            }
+        if let Some(title) = line.strip_prefix("# ")
+            && !title.is_empty()
+        {
+            return Some(title.to_owned());
         }
     }
     None

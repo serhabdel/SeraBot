@@ -223,12 +223,12 @@ impl SafeFetcher {
         if host.is_empty() {
             return Err(SeraError::Validation("URL has an empty host".into()));
         }
-        if let Some(allowed) = &self.allowed_hosts {
-            if !allowed.contains(&host) {
-                return Err(SeraError::Forbidden(format!(
-                    "host {host} is not in the configured source allowlist"
-                )));
-            }
+        if let Some(allowed) = &self.allowed_hosts
+            && !allowed.contains(&host)
+        {
+            return Err(SeraError::Forbidden(format!(
+                "host {host} is not in the configured source allowlist"
+            )));
         }
         if host.parse::<IpAddr>().is_ok() {
             return Err(SeraError::Forbidden(

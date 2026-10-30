@@ -294,7 +294,7 @@ pub fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
         // A trailing group of one character cannot hold a whole byte.
         return Err(invalid);
     }
-    if padding > 0 && (data + padding) % 4 != 0 {
+    if padding > 0 && !(data + padding).is_multiple_of(4) {
         return Err(invalid);
     }
     Ok(out)

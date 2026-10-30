@@ -234,12 +234,12 @@ pub fn validate_handoff(h: &Handoff, allowed_skills: &[String]) -> Result<()> {
     if h.memory_ids.len() > MAX_HANDOFF_MEMORIES {
         return Err(SeraError::Validation("too many handoff memory_ids".into()));
     }
-    if let Some(skill) = &h.skill {
-        if skill.is_empty() || !allowed_skills.iter().any(|s| s == skill) {
-            return Err(SeraError::Validation(
-                "handoff skill not allowed for target bot".into(),
-            ));
-        }
+    if let Some(skill) = &h.skill
+        && (skill.is_empty() || !allowed_skills.iter().any(|s| s == skill))
+    {
+        return Err(SeraError::Validation(
+            "handoff skill not allowed for target bot".into(),
+        ));
     }
     Ok(())
 }

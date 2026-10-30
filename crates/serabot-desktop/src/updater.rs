@@ -241,7 +241,7 @@ fn parse_hex_32(raw: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut digest = [0u8; 32];
-    for (index, pair) in raw.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in raw.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         digest[index] = (hex_digit(pair[0])? << 4) | hex_digit(pair[1])?;
     }
     Some(digest)

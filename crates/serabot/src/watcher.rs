@@ -511,10 +511,10 @@ fn parse_html(body: &str, source: &SourceConfig, max_items: usize) -> Result<Vec
             summary = element_text(&element);
         }
         let title_trimmed = title.trim();
-        if !title_trimmed.is_empty() {
-            if let Some(rest) = summary.strip_prefix(title_trimmed).map(str::to_owned) {
-                summary = rest.trim().to_owned();
-            }
+        if !title_trimmed.is_empty()
+            && let Some(rest) = summary.strip_prefix(title_trimmed).map(str::to_owned)
+        {
+            summary = rest.trim().to_owned();
         }
 
         items.push(RawItem {
@@ -673,10 +673,10 @@ fn parse_deadline(text: &str, tz: Tz) -> Option<ParsedDeadline> {
         "%d/%m/%Y %H:%M:%S%.f",
     ];
     for format in DATETIME_FORMATS {
-        if let Ok(naive) = NaiveDateTime::parse_from_str(&source_text, format) {
-            if let Some(local) = resolve_local(naive, tz) {
-                return Some(from_local(local, &source_text));
-            }
+        if let Ok(naive) = NaiveDateTime::parse_from_str(&source_text, format)
+            && let Some(local) = resolve_local(naive, tz)
+        {
+            return Some(from_local(local, &source_text));
         }
     }
 

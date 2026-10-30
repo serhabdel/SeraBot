@@ -588,10 +588,10 @@ fn resolve_chromium_executable(configured: &str) -> Result<String> {
     if !configured.trim().is_empty() {
         return Ok(configured.trim().to_owned());
     }
-    if let Ok(from_env) = std::env::var("CHROME_PATH") {
-        if !from_env.trim().is_empty() {
-            return Ok(from_env.trim().to_owned());
-        }
+    if let Ok(from_env) = std::env::var("CHROME_PATH")
+        && !from_env.trim().is_empty()
+    {
+        return Ok(from_env.trim().to_owned());
     }
     for candidate in [
         "chromium",

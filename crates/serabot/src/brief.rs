@@ -314,16 +314,14 @@ fn source_warnings(
                 None => detail.push_str("no successful run recorded"),
             }
         }
-        if recent_failure {
-            if let Some(value) = last_failure {
-                if !detail.is_empty() {
-                    detail.push_str("; ");
-                }
-                detail.push_str(&format!(
-                    "last run failed at {}",
-                    value.with_timezone(&tz).format("%Y-%m-%d %H:%M")
-                ));
+        if recent_failure && let Some(value) = last_failure {
+            if !detail.is_empty() {
+                detail.push_str("; ");
             }
+            detail.push_str(&format!(
+                "last run failed at {}",
+                value.with_timezone(&tz).format("%Y-%m-%d %H:%M")
+            ));
         }
         warnings.push(format!(
             "{}: {}",

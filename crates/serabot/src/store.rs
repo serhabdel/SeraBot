@@ -84,10 +84,10 @@ impl Store {
     pub fn open(path: impl AsRef<Path>, dimension: usize, busy_timeout_ms: u32) -> Result<Self> {
         init_sqlite_vec();
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let manager = SqliteConnectionManager::file(&path).with_init(move |connection| {
             connection.busy_timeout(Duration::from_millis(busy_timeout_ms as u64))?;
@@ -1415,10 +1415,10 @@ impl Store {
                 "backup destination already exists".into(),
             ));
         }
-        if let Some(parent) = destination.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = destination.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let connection = self.connection()?;
         connection.execute("VACUUM INTO ?1", params![destination.to_string_lossy()])?;
