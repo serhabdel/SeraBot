@@ -1151,6 +1151,107 @@ fn encode_component(value: &str) -> String {
     encoded
 }
 
+/// Upper bound for the owner "test connection" action.
+pub const CONNECTOR_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The single cheap, read-only request that proves a stored API key works.
+#[derive(Debug, Clone, Copy)]
+pub enum ApiKeyProbe<'a> {
+    AgentMail(&'a str),
+    Tavily(&'a str),
+    Firecrawl(&'a str),
+    ElevenLabs(&'a str),
+}
+
+/// Runs one probe under [`CONNECTOR_TEST_TIMEOUT`]. Errors are fixed, short
+/// messages: provider bodies and the key itself never reach the caller.
+pub async fn probe_api_key(
+    probe: ApiKeyProbe<'_>,
+    api_key: &str,
+) -> std::result::Result<(), String> {
+    probe_api_key_within(probe, api_key, CONNECTOR_TEST_TIMEOUT).await
+}
+
+async fn probe_api_key_within(
+    probe: ApiKeyProbe<'_>,
+    api_key: &str,
+    limit: Duration,
+) -> std::result::Result<(), String> {
+    let http = Client::builder()
+        .timeout(limit)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "Could not start the connection test".to_owned())?;
+    let request = probe_request(&http, probe, api_key)?;
+    let response = match tokio::time::timeout(limit, request.send()).await {
+        Err(_) => return Err("Timed out".into()),
+        Ok(Err(error)) => return Err(probe_transport_message(&error)),
+        Ok(Ok(response)) => response,
+    };
+    let status = response.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(probe_status_message(status.as_u16()))
+    }
+}
+
+fn probe_request(
+    http: &Client,
+    probe: ApiKeyProbe<'_>,
+    api_key: &str,
+) -> std::result::Result<reqwest::RequestBuilder, String> {
+    Ok(match probe {
+        ApiKeyProbe::AgentMail(base) => http
+            .get(format!("{}/inboxes?limit=1", probe_base(base)?))
+            .bearer_auth(api_key),
+        ApiKeyProbe::Firecrawl(base) => http
+            .get(format!("{}/v2/team/credit-usage", probe_base(base)?))
+            .bearer_auth(api_key),
+        ApiKeyProbe::ElevenLabs(base) => http
+            .get(format!("{}/v1/user", probe_base(base)?))
+            .header("xi-api-key", api_key),
+        ApiKeyProbe::Tavily(base) => {
+            http.post(format!("{}/search", probe_base(base)?))
+                .json(&json!({
+                    "api_key": api_key,
+                    "query": "connection check",
+                    "max_results": 1,
+                    "search_depth": "basic",
+                }))
+        }
+    })
+}
+
+fn probe_base(base: &str) -> std::result::Result<String, String> {
+    let base = base.trim().trim_end_matches('/');
+    let loopback = base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
+    if base.starts_with("https://") || loopback {
+        Ok(base.to_owned())
+    } else {
+        Err("Connector api_base must be HTTPS".into())
+    }
+}
+
+fn probe_transport_message(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        "Timed out"
+    } else if error.is_connect() {
+        "Could not connect"
+    } else {
+        "Request failed"
+    }
+    .to_owned()
+}
+
+fn probe_status_message(code: u16) -> String {
+    match code {
+        401 | 403 => format!("Key rejected ({code})"),
+        429 => "Rate limited (429)".into(),
+        _ => format!("Provider returned HTTP {code}"),
+    }
+}
+
 fn map_transport(context: &str, error: reqwest::Error) -> SeraError {
     let detail = if error.is_timeout() {
         "timed out"
@@ -2447,5 +2548,113 @@ mod tests {
         assert!(!raw.contains("other-value"));
         assert!(!client.memory.lock().await.refresh_unpersisted);
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn api_key_probes_classify_provider_status_without_bodies() {
+        let agentmail = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/inboxes"))
+            .and(header("authorization", "Bearer synthetic-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"inboxes\":[]}"))
+            .mount(&agentmail)
+            .await;
+        assert!(
+            probe_api_key(ApiKeyProbe::AgentMail(&agentmail.uri()), "synthetic-key")
+                .await
+                .is_ok()
+        );
+
+        let rejected = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/user"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("provider-echo-body"))
+            .mount(&rejected)
+            .await;
+        let message = probe_api_key(ApiKeyProbe::ElevenLabs(&rejected.uri()), "synthetic-key")
+            .await
+            .unwrap_err();
+        assert_eq!(message, "Key rejected (401)");
+        assert!(!message.contains("provider-echo-body"));
+
+        let elevenlabs = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/user"))
+            .and(header("xi-api-key", "synthetic-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&elevenlabs)
+            .await;
+        assert!(
+            probe_api_key(ApiKeyProbe::ElevenLabs(&elevenlabs.uri()), "synthetic-key")
+                .await
+                .is_ok()
+        );
+
+        let tavily = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .and(body_string_contains("connection check"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"results\":[]}"))
+            .mount(&tavily)
+            .await;
+        assert!(
+            probe_api_key(ApiKeyProbe::Tavily(&tavily.uri()), "synthetic-key")
+                .await
+                .is_ok()
+        );
+
+        let firecrawl = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/team/credit-usage"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&firecrawl)
+            .await;
+        assert_eq!(
+            probe_api_key(ApiKeyProbe::Firecrawl(&firecrawl.uri()), "synthetic-key")
+                .await
+                .unwrap_err(),
+            "Rate limited (429)"
+        );
+
+        let broken = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/user"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&broken)
+            .await;
+        assert_eq!(
+            probe_api_key(ApiKeyProbe::ElevenLabs(&broken.uri()), "synthetic-key")
+                .await
+                .unwrap_err(),
+            "Provider returned HTTP 500"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_key_probe_is_bounded_and_refuses_plain_remote_http() {
+        let slow = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/user"))
+            .respond_with(
+                ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(500)),
+            )
+            .mount(&slow)
+            .await;
+        assert_eq!(
+            probe_api_key_within(
+                ApiKeyProbe::ElevenLabs(&slow.uri()),
+                "synthetic-key",
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err(),
+            "Timed out"
+        );
+        assert_eq!(
+            probe_api_key(ApiKeyProbe::Tavily("http://example.com"), "synthetic-key")
+                .await
+                .unwrap_err(),
+            "Connector api_base must be HTTPS"
+        );
     }
 }

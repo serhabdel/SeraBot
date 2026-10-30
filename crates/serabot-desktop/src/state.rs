@@ -1,7 +1,7 @@
 use crate::{
-    ApiError, Approval, BotSummary, Catalog, ConnectorStatus, ConversationSummary, CreatedBot,
-    CreatedConversation, CreatedSkill, LibraryEntry, MemoryEntry, Message, ProviderStatus, Scope,
-    Selection, SkillSummary, Task, Team,
+    ApiError, Approval, BotSummary, Catalog, ConnectorStatus, ConnectorTestResult,
+    ConversationSummary, CreatedBot, CreatedConversation, CreatedSkill, LibraryEntry, MemoryEntry,
+    Message, ProviderStatus, Scope, Selection, SkillSummary, Task, Team,
     worker::{OperationKind, Reply},
 };
 
@@ -36,6 +36,8 @@ pub struct State {
     pub providers_loaded: bool,
     pub connectors: Vec<ConnectorStatus>,
     pub connectors_loaded: bool,
+    /// Latest "Test" result per connector id; cleared on disconnect.
+    pub connector_tests: std::collections::BTreeMap<String, ConnectorTestResult>,
     /// Team of the open room conversation. Conversation-scoped: it is cleared
     /// whenever the conversation changes or the session disconnects.
     pub team: Option<Team>,
@@ -98,6 +100,7 @@ impl Default for State {
             providers_loaded: false,
             connectors: Vec::new(),
             connectors_loaded: false,
+            connector_tests: std::collections::BTreeMap::new(),
             team: None,
             team_loaded: false,
             team_loading: false,
@@ -151,6 +154,7 @@ impl State {
         let providers_loaded = self.providers_loaded;
         let connectors = self.connectors.clone();
         let connectors_loaded = self.connectors_loaded;
+        let connector_tests = self.connector_tests.clone();
         *self = Self {
             scope: Scope {
                 epoch,
@@ -182,6 +186,7 @@ impl State {
             providers_loaded,
             connectors,
             connectors_loaded,
+            connector_tests,
             ..Self::default()
         };
     }
@@ -205,6 +210,7 @@ impl State {
         self.providers_loaded = false;
         self.connectors.clear();
         self.connectors_loaded = false;
+        self.connector_tests.clear();
     }
 
     pub fn can_send(&self) -> bool {
@@ -353,6 +359,9 @@ impl State {
             // Bytes are intercepted by the session before they reach state;
             // this arm only keeps the match exhaustive.
             Reply::Artifact { .. } => {}
+            Reply::ConnectorTested(result) => {
+                self.connector_tests.insert(result.id.clone(), result);
+            }
             Reply::AdminSaved | Reply::BotProfileSaved | Reply::AdminRestarted => {}
         }
         true

@@ -815,7 +815,13 @@ fn message_to_json(message: &LlmMessage) -> Value {
     if let Some(tool_call_id) = &message.tool_call_id {
         value["tool_call_id"] = json!(tool_call_id);
     }
-    if let Some(name) = &message.name {
+    // Only tool results carry `name` on the wire. Assistant, system and user
+    // messages never send it: Mistral rejects `body.messages.N.assistant.name`
+    // with HTTP 422. Stored messages keep their bot identity; only the
+    // outgoing JSON is affected.
+    if message.role == Role::Tool
+        && let Some(name) = &message.name
+    {
         value["name"] = json!(name);
     }
     value
@@ -933,6 +939,35 @@ mod tests {
     use crate::secrets::{SecretStore, SharedSecrets, ensure_identity};
     use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn assistant_and_system_messages_never_send_name() {
+        let assistant = LlmMessage {
+            role: Role::Assistant,
+            content: Some("hello".into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: Some("sera-bot".into()),
+        };
+        let value = message_to_json(&assistant);
+        assert!(value.get("name").is_none());
+
+        let system = LlmMessage {
+            role: Role::System,
+            name: Some("sera-bot".into()),
+            ..LlmMessage::system("rules")
+        };
+        assert!(message_to_json(&system).get("name").is_none());
+
+        let tool = LlmMessage {
+            role: Role::Tool,
+            content: Some("ok".into()),
+            tool_calls: Vec::new(),
+            tool_call_id: Some("call_1".into()),
+            name: Some("rag_search".into()),
+        };
+        assert_eq!(message_to_json(&tool)["name"], json!("rag_search"));
+    }
 
     fn tool() -> ToolSpec {
         ToolSpec {

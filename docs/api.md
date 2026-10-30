@@ -250,11 +250,52 @@ and a `secrets` object. Every secret entry is
 values. Catalogs come from local state; this route does not call providers.
 
 `GET /v1/connectors` lists Google Drive, Google Sheets, Google Calendar, Gmail,
-Outlook, Outlook Calendar, Notion, and AgentMail. OAuth entries report
+Outlook, Outlook Calendar, Notion, AgentMail, Tavily, Firecrawl, and ElevenLabs.
+Every entry carries a console `group` (`Productivity`, `Email`, `Web Research`,
+or `Voice & Media`). OAuth entries report
 `enabled`, `redirect_uri`, and `client_id`/`client_secret`/`refresh_token`
-secret names plus presence booleans. AgentMail reports `enabled`, `api_base`,
-`default_inbox_id`, and its `api_key` secret name and presence. Use
-`serabot secrets set <name>` on the server to supply any missing value.
+secret names plus presence booleans. API-key entries (AgentMail, Tavily,
+Firecrawl, ElevenLabs) report `enabled`, `api_base`, and their `api_key` secret
+name and presence. Use `serabot secrets set <name>` on the server to supply any
+missing value.
+
+### Test a connector
+
+`POST /v1/admin/connectors/{id}/test`  (owner token; no body)
+
+Checks that a connector's stored credentials are usable. It sends at most one
+read-only request per API-key connector, bounded to 10 seconds, and never
+changes configuration:
+
+| Connector | Request |
+| --- | --- |
+| `agentmail` | `GET {api_base}/inboxes?limit=1` |
+| `tavily` | `POST {api_base}/search` with `max_results: 1` (this consumes one search credit) |
+| `firecrawl` | `GET {api_base}/v2/team/credit-usage` |
+| `elevenlabs` | `GET {api_base}/v1/user` |
+
+OAuth connectors (`google_drive`, `google_sheets`, `google_calendar`, `gmail`,
+`outlook`, `outlook_calendar`, `notion`) do not contact the provider. They
+report only whether all required secrets are stored.
+
+Response (`200`):
+
+```json
+{
+  "id": "elevenlabs",
+  "ok": true,
+  "message": "Key accepted",
+  "checked_at": "2026-10-30T10:00:00Z"
+}
+```
+
+`ok` is `false` with one of these fixed messages: `Missing secret: <name>`,
+`Key rejected (401)` or `Key rejected (403)`, `Rate limited (429)`,
+`Provider returned HTTP <status>`, `Timed out`, `Could not connect`,
+`Request failed`, or `Connector api_base must be HTTPS`. Messages never include
+secret values or provider response bodies. An unknown connector id returns
+`404`. Each test is recorded in the audit log as `config.connector_tested`
+with the connector id and result only.
 
 ## Conversation history
 

@@ -724,6 +724,17 @@ pub struct BotProfileUpdate {
     pub avatar: String,
 }
 
+/// Result of `POST /v1/admin/connectors/{id}/test`: a bounded, read-only probe.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ConnectorTestResult {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub message: String,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct AdminAck {
     #[serde(default)]
@@ -2100,6 +2111,21 @@ impl ApiClient {
             }
         }
         self.admin_request(Method::PUT, &["v1", "admin", "connectors", id], update)
+    }
+
+    pub fn admin_test_connector(&self, id: &str) -> Result<ConnectorTestResult, ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Connector id is not valid."));
+        }
+        let mut result: ConnectorTestResult = self.admin_request(
+            Method::POST,
+            &["v1", "admin", "connectors", id, "test"],
+            &serde_json::json!({}),
+        )?;
+        result.id = id.to_owned();
+        result.message.truncate(256);
+        result.message.retain(|c| !c.is_control());
+        Ok(result)
     }
 
     pub fn admin_set_audio(&self, update: &AudioUpdate) -> Result<AdminAck, ApiError> {

@@ -20,8 +20,9 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 
-use crate::admin::{AdminStore, BotProfile, ProviderSecrets};
+use crate::admin::{AdminStore, BotProfile, ProviderSecrets, connector_secret_roles};
 use crate::config::{Config, OAuthConnectorSettings, ProviderConfig, scaffold_specialist_bot};
+use crate::connectors::{ApiKeyProbe, probe_api_key};
 use crate::domain::Task;
 use crate::error::{Result, SeraError};
 use crate::gateway::Decision;
@@ -138,6 +139,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/admin/providers", post(admin_add_provider))
         .route("/v1/admin/providers/{id}", delete(admin_remove_provider))
         .route("/v1/admin/connectors/{id}", put(admin_set_connector))
+        .route("/v1/admin/connectors/{id}/test", post(admin_test_connector))
         .route("/v1/admin/audio", put(admin_set_audio))
         .route("/v1/admin/bots/{id}", put(admin_set_bot_profile))
         .route("/v1/admin/restart", post(admin_restart))
@@ -1520,6 +1522,12 @@ async fn list_connectors(State(state): State<Arc<ApiState>>) -> Result<Json<Valu
             state.config.firecrawl.api_base.as_str(),
             state.config.firecrawl.api_key_secret.as_str(),
         ),
+        (
+            "elevenlabs",
+            state.config.elevenlabs.enabled,
+            state.config.elevenlabs.api_base.as_str(),
+            state.config.elevenlabs.api_key_secret.as_str(),
+        ),
     ] {
         views.push(json!({
             "id": id,
@@ -1532,7 +1540,74 @@ async fn list_connectors(State(state): State<Arc<ApiState>>) -> Result<Json<Valu
             },
         }));
     }
+    for view in &mut views {
+        let group = view["id"].as_str().map(connector_group).unwrap_or("Other");
+        view["group"] = json!(group);
+    }
     Ok(Json(json!({"connectors": views})))
+}
+
+/// Console grouping only; it carries no security meaning.
+fn connector_group(id: &str) -> &'static str {
+    match id {
+        "elevenlabs" => "Voice & Media",
+        "tavily" | "firecrawl" => "Web Research",
+        "agentmail" => "Email",
+        _ => "Productivity",
+    }
+}
+
+fn api_key_probe<'a>(config: &'a Config, id: &str) -> Option<ApiKeyProbe<'a>> {
+    match id {
+        "agentmail" => Some(ApiKeyProbe::AgentMail(
+            &config.connectors.agentmail.api_base,
+        )),
+        "tavily" => Some(ApiKeyProbe::Tavily(&config.tavily.api_base)),
+        "firecrawl" => Some(ApiKeyProbe::Firecrawl(&config.firecrawl.api_base)),
+        "elevenlabs" => Some(ApiKeyProbe::ElevenLabs(&config.elevenlabs.api_base)),
+        _ => None,
+    }
+}
+
+/// Owner "test connection". Makes at most one read-only, time-bounded request
+/// for API-key connectors. OAuth connectors only report whether their secrets
+/// are stored. Messages are fixed strings; no secret or provider body leaves.
+async fn admin_test_connector(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> AdminResult<Json<Value>> {
+    let roles = connector_secret_roles(&state.config, &id).map_err(admin_error)?;
+    let checked_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let missing = roles.iter().find(|(_, name)| !state.secrets.has(name));
+    let (ok, message) = match (missing, api_key_probe(&state.config, &id)) {
+        (Some((_, name)), _) => (false, format!("Missing secret: {name}")),
+        (None, Some(probe)) => {
+            let key = roles
+                .iter()
+                .find(|(role, _)| *role == "api_key")
+                .and_then(|(_, name)| state.secrets.get(name))
+                .unwrap_or_default();
+            match probe_api_key(probe, &key).await {
+                Ok(()) => (true, "Key accepted".to_owned()),
+                Err(message) => (false, message),
+            }
+        }
+        (None, None) => (
+            true,
+            "Client ID, client secret and refresh token are stored. The OAuth token exchange was not run.".to_owned(),
+        ),
+    };
+    audit_config(
+        &state,
+        "config.connector_tested",
+        json!({"connector": id, "ok": ok}),
+    )?;
+    Ok(Json(json!({
+        "id": id,
+        "ok": ok,
+        "message": message,
+        "checked_at": checked_at,
+    })))
 }
 
 fn oauth_connector_view(
@@ -2755,6 +2830,85 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn connector_catalog_lists_elevenlabs_in_voice_group() {
+        let (app, _, _) = app();
+        let response = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/connectors", true, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        let entry = body["connectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|connector| connector["id"] == "elevenlabs")
+            .expect("elevenlabs listed");
+        assert_eq!(entry["kind"], "api_key");
+        assert_eq!(entry["enabled"], false);
+        assert_eq!(entry["group"], "Voice & Media");
+        assert_eq!(entry["secrets"]["api_key"]["name"], "elevenlabs_api_key");
+        assert_eq!(entry["secrets"]["api_key"]["configured"], false);
+    }
+
+    #[tokio::test]
+    async fn connector_test_is_owner_only_and_reports_missing_secrets_without_network() {
+        let (app, _, _) = app();
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/admin/connectors/elevenlabs/test",
+                false,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/admin/connectors/no-such-connector/test",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        for id in ["elevenlabs", "tavily", "firecrawl", "agentmail", "gmail"] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    &app,
+                    "POST",
+                    &format!("/v1/admin/connectors/{id}/test"),
+                    true,
+                    None,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{id}");
+            let body = read_json(response).await;
+            assert_eq!(body["id"], id);
+            assert_eq!(body["ok"], false, "{id} has no stored secrets");
+            assert!(
+                body["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Missing secret: "),
+                "{id}: {body}"
+            );
+            assert!(body["checked_at"].as_str().is_some());
+        }
+    }
+
     async fn read_json(response: Response) -> Value {
         let bytes = http_body_util::BodyExt::collect(response.into_body())
             .await
@@ -3773,7 +3927,7 @@ mod tests {
         )
         .await;
         let list = connectors["connectors"].as_array().unwrap();
-        assert_eq!(list.len(), 10);
+        assert_eq!(list.len(), 11);
         let gmail = list
             .iter()
             .find(|connector| connector["id"] == "gmail")

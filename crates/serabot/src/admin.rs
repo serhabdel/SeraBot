@@ -102,6 +102,7 @@ impl AdminOverlay {
             match id.as_str() {
                 "tavily" => config.tavily.enabled = *enabled,
                 "firecrawl" => config.firecrawl.enabled = *enabled,
+                "elevenlabs" => config.elevenlabs.enabled = *enabled,
                 _ => config.connectors.set_enabled(id, *enabled)?,
             }
         }
@@ -657,6 +658,9 @@ pub fn connector_secret_roles(config: &Config, id: &str) -> Result<Vec<(&'static
     if id == "firecrawl" {
         return Ok(vec![("api_key", config.firecrawl.api_key_secret.clone())]);
     }
+    if id == "elevenlabs" {
+        return Ok(vec![("api_key", config.elevenlabs.api_key_secret.clone())]);
+    }
     Err(SeraError::NotFound(format!("connector {id}")))
 }
 
@@ -828,6 +832,44 @@ mod tests {
         store.snapshot().apply(&mut merged).unwrap();
         assert!(merged.tavily.enabled);
         assert!(merged.firecrawl.enabled);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn elevenlabs_is_owner_manageable_voice_connector() {
+        let root = std::env::temp_dir().join(format!("serabot-admin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = config_with_root(&root);
+        let store = AdminStore::open(&config).unwrap();
+        let empty = SharedSecrets::new(
+            crate::secrets::SecretStore::open_paths(
+                root.join("secrets.age"),
+                root.join("identity.txt"),
+            )
+            .unwrap(),
+        );
+        let roles = store.connector_roles(&config, "elevenlabs").unwrap();
+        assert_eq!(
+            roles,
+            vec![("api_key", config.elevenlabs.api_key_secret.clone())]
+        );
+        assert!(
+            store
+                .set_connector(&config, &empty, "elevenlabs", true, &BTreeMap::new())
+                .is_err(),
+            "elevenlabs must not enable without its secret"
+        );
+        let mut values = BTreeMap::new();
+        values.insert("api_key".to_owned(), "synthetic-key".to_owned());
+        assert!(
+            store
+                .set_connector(&config, &empty, "elevenlabs", true, &values)
+                .is_ok(),
+            "elevenlabs enables once its key is stored"
+        );
+        let mut merged = config.clone();
+        store.snapshot().apply(&mut merged).unwrap();
+        assert!(merged.elevenlabs.enabled);
         std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -1263,20 +1263,7 @@ impl Runtime {
             .map(|spec| spec.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        if !state.messages.iter().any(|message| {
-            message.role == Role::System
-                && message
-                    .content
-                    .as_deref()
-                    .is_some_and(|content| content.starts_with("AVAILABLE TOOLS THIS TURN:"))
-        }) {
-            state.messages.insert(
-                1,
-                LlmMessage::system(format!(
-                    "AVAILABLE TOOLS THIS TURN: {tool_names}. These tools are callable. If one requires owner approval, request the approval instead of saying the tool is unavailable."
-                )),
-            );
-        }
+        upsert_tool_notice(&mut state.messages, &tool_names);
         let temperature = bot.config.temperature;
         self.checked_route(&state.route)?;
 
@@ -1816,10 +1803,72 @@ impl Runtime {
     }
 }
 
+const TOOL_NOTICE_PREFIX: &str = "AVAILABLE TOOLS THIS TURN:";
+
+/// Keeps exactly one authoritative tool-list notice in the conversation.
+/// An existing notice is refreshed in place so stale lists from earlier
+/// turns never survive; otherwise the notice is inserted after the first
+/// system message.
+fn upsert_tool_notice(messages: &mut Vec<LlmMessage>, tool_names: &str) {
+    let content = format!(
+        "{TOOL_NOTICE_PREFIX} {tool_names}. This list is authoritative for the current turn and overrides any earlier assistant statement in the conversation about which tools exist. If the owner asks which tools are available, answer only from this list. These tools are callable. If one requires owner approval, request the approval instead of saying the tool is unavailable."
+    );
+    if let Some(existing) = messages.iter_mut().find(|message| {
+        message.role == Role::System
+            && message
+                .content
+                .as_deref()
+                .is_some_and(|text| text.starts_with(TOOL_NOTICE_PREFIX))
+    }) {
+        existing.content = Some(content);
+    } else {
+        messages.insert(1, LlmMessage::system(content));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::BotConfig;
+
+    #[test]
+    fn tool_notice_is_refreshed_not_duplicated() {
+        let mut messages = vec![
+            LlmMessage::system("rules"),
+            LlmMessage::system(format!("{TOOL_NOTICE_PREFIX} old_tool.")),
+            LlmMessage::user("hi"),
+        ];
+        upsert_tool_notice(&mut messages, "rag_search");
+        let notices = messages
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with(TOOL_NOTICE_PREFIX))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(notices.len(), 1);
+        let text = notices[0].content.as_deref().unwrap();
+        assert!(text.contains("rag_search"));
+        assert!(!text.contains("old_tool"));
+        assert!(text.contains("overrides any earlier assistant statement"));
+    }
+
+    #[test]
+    fn tool_notice_inserted_after_first_system_message_when_absent() {
+        let mut messages = vec![LlmMessage::system("rules"), LlmMessage::user("hi")];
+        upsert_tool_notice(&mut messages, "rag_search");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].role, Role::System);
+        assert!(
+            messages[1]
+                .content
+                .as_deref()
+                .unwrap()
+                .starts_with(TOOL_NOTICE_PREFIX)
+        );
+    }
+
     use crate::gateway::{ApprovalDetails, ToolRegistry};
     use crate::llm::LlmClient;
     use crate::store::Store;

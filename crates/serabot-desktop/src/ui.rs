@@ -443,6 +443,13 @@ pub fn BrandLogo(brand: String, #[props(default = 24)] size: u32) -> Element {
                         path { d: "M13 8l-3 4.5h3.5L11 17l5-5.5h-3.5L14 8z", fill: "#FBBF24" }
                     }
                 },
+                "elevenlabs" => rsx! {
+                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
+                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#111827" }
+                        rect { x: "8", y: "6", width: "2.6", height: "12", rx: "1.3", fill: "#ffffff" }
+                        rect { x: "13.4", y: "6", width: "2.6", height: "12", rx: "1.3", fill: "#ffffff" }
+                    }
+                },
                 "tavily" => rsx! {
                     svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
                         rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#0F766E" }
@@ -4460,6 +4467,7 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
                     ("Microsoft 365", &["outlook", "outlook_calendar"][..]),
                     ("Knowledge & Email", &["notion", "agentmail"][..]),
                     ("Web Research", &["tavily", "firecrawl"][..]),
+                    ("Voice & Media", &["elevenlabs"][..]),
                 ] {
                     {
                         let suite_connectors: Vec<_> = connectors
@@ -4486,6 +4494,7 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
                                                 "agentmail" => "AgentMail",
                                                 "tavily" => "Tavily Search",
                                                 "firecrawl" => "Firecrawl",
+                                                "elevenlabs" => "ElevenLabs",
                                                 _ => &id,
                                             };
                                             let enabled = session
@@ -4494,6 +4503,8 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
                                                 .get(&id)
                                                 .map(|draft| draft.enabled)
                                                 .unwrap_or(connector.enabled);
+                                            let testing = session.read().connector_testing.as_deref() == Some(id.as_str());
+                                            let test_result = session.read().state.connector_tests.get(&id).cloned();
                                             let values = session
                                                 .read()
                                                 .connector_drafts
@@ -4526,7 +4537,7 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
                                                     div { class: "chips",
                                                         for (role, secret) in &connector.secrets {
                                                             if secret.configured || secret.name.as_deref().is_some_and(|n| !n.is_empty()) {
-                                                                span { class: if secret.configured { "chip accent" } else { "chip warn" },
+                                                                span { class: if secret.configured { "chip mono accent" } else { "chip mono warn" },
                                                                     "{role}: {secret.name.clone().unwrap_or_default()}"
                                                                 }
                                                             }
@@ -4565,6 +4576,11 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
                                                             "Connect opens the provider's consent page in your browser. Register the redirect URI above with the client id the server stores, then paste the refresh token here."
                                                         }
                                                     }
+                                                    if let Some(result) = test_result {
+                                                        p { class: if result.ok { "banner ok" } else { "banner err" },
+                                                            "{result.message}"
+                                                        }
+                                                    }
                                                     div { class: "card-actions",
                                                         if let Some(url) = connector_auth_url(&id, connector.redirect_uri.as_deref()) {
                                                             button {
@@ -4599,6 +4615,16 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
                                                                 move |_| session.write().save_connector(id.clone())
                                                             },
                                                             "Save connector"
+                                                        }
+                                                        button {
+                                                            class: "btn ghost sm",
+                                                            title: "Run a read-only check of the saved credentials",
+                                                            disabled: !can_save || testing,
+                                                            onclick: {
+                                                                let id = id.clone();
+                                                                move |_| session.write().test_connector(id.clone())
+                                                            },
+                                                            if testing { "Testing…" } else { "Test" }
                                                         }
                                                     }
                                                 }

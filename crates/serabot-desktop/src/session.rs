@@ -310,6 +310,8 @@ pub struct Session {
     pub selected_bot: Option<String>,
     pub bot_profile: BotProfileDraft,
     pub admin_notice: Option<String>,
+    /// Connector whose Test probe is in flight.
+    pub connector_testing: Option<String>,
     pub admin_error: Option<String>,
     pub restart_pending: bool,
     pub restarting: bool,
@@ -379,6 +381,7 @@ impl Session {
             selected_bot: None,
             bot_profile: BotProfileDraft::default(),
             admin_notice: None,
+            connector_testing: None,
             admin_error: None,
             restart_pending: false,
             restarting: false,
@@ -1129,6 +1132,7 @@ impl Session {
                     if matches!(
                         completion.kind,
                         OperationKind::AdminWrite
+                            | OperationKind::ConnectorTest
                             | OperationKind::AdminProfile
                             | OperationKind::AdminRestart
                     ) =>
@@ -1143,6 +1147,7 @@ impl Session {
                         _ => error.to_string(),
                     };
                     self.admin_error = Some(message);
+                    self.connector_testing = None;
                     self.scheduled = None;
                 }
                 Err(error) => {
@@ -1446,6 +1451,11 @@ impl Session {
                             self.state.library_loading = true;
                             self.schedule(Operation::Library, Duration::ZERO);
                         }
+                        OperationKind::ConnectorTest => {
+                            self.admin_error = None;
+                            self.admin_notice = None;
+                            self.connector_testing = None;
+                        }
                         OperationKind::AdminWrite => {
                             self.provider.api_key.zeroize();
                             for draft in self.connector_drafts.values_mut() {
@@ -1665,6 +1675,17 @@ impl Session {
 
     pub fn can_admin(&self) -> bool {
         self.ready() && self.state.connected
+    }
+
+    pub fn test_connector(&mut self, id: String) {
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.admin_error = None;
+        self.admin_notice = None;
+        self.connector_testing = Some(id.clone());
+        self.start_request(Operation::TestConnector { id });
     }
 
     pub fn toggle_connector(&mut self, id: &str) {

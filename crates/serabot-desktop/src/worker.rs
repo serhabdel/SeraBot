@@ -1,9 +1,9 @@
 use crate::{
     ApiClient, ApiError, Approval, ApprovalDecision, AudioUpdate, BotProfileUpdate, BotSummary,
-    Catalog, ConnectorStatus, ConnectorUpdate, ConversationKind, ConversationPage,
-    ConversationSummary, CreatedBot, CreatedConversation, CreatedSkill, Health, History,
-    LibraryEntry, MemoryEntry, NewProvider, ProviderStatus, Scope, Selection, SkillSummary, Task,
-    Team, TeamMode, Transcription,
+    Catalog, ConnectorStatus, ConnectorTestResult, ConnectorUpdate, ConversationKind,
+    ConversationPage, ConversationSummary, CreatedBot, CreatedConversation, CreatedSkill, Health,
+    History, LibraryEntry, MemoryEntry, NewProvider, ProviderStatus, Scope, Selection,
+    SkillSummary, Task, Team, TeamMode, Transcription,
 };
 use secrecy::SecretString;
 use std::sync::{
@@ -50,6 +50,7 @@ pub enum OperationKind {
     FetchArtifact,
     Transcribe,
     AdminWrite,
+    ConnectorTest,
     AdminProfile,
     AdminRestart,
 }
@@ -133,6 +134,9 @@ pub enum Operation {
         update: ConnectorUpdate,
     },
     AdminSetAudio(AudioUpdate),
+    TestConnector {
+        id: String,
+    },
     AdminSetBotProfile {
         id: String,
         update: BotProfileUpdate,
@@ -175,6 +179,7 @@ impl Operation {
             | Self::AdminRemoveProvider(_)
             | Self::AdminSetConnector { .. }
             | Self::AdminSetAudio(_) => OperationKind::AdminWrite,
+            Self::TestConnector { .. } => OperationKind::ConnectorTest,
             Self::AdminSetBotProfile { .. } => OperationKind::AdminProfile,
             Self::AdminRestart => OperationKind::AdminRestart,
         }
@@ -213,6 +218,7 @@ pub enum Reply {
     },
     Transcribed(Transcription),
     AdminSaved,
+    ConnectorTested(ConnectorTestResult),
     BotProfileSaved,
     AdminRestarted,
 }
@@ -406,6 +412,9 @@ fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
         Operation::AdminSetConnector { id, update } => client
             .admin_set_connector(id, update)
             .map(|_| Reply::AdminSaved),
+        Operation::TestConnector { id } => {
+            client.admin_test_connector(id).map(Reply::ConnectorTested)
+        }
         Operation::AdminSetAudio(update) => {
             client.admin_set_audio(update).map(|_| Reply::AdminSaved)
         }
