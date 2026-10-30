@@ -9,6 +9,17 @@ rust-version.workspace = true
 name = "serabot"
 path = "src/main.rs"
 
+[features]
+default = ["pptx", "docx"]
+# PPTX support (`deck_pptx` writes generated decks, `pptx_ops` round-trips
+# owner-supplied ones). `deckcraft-model` is the document model both consume; it
+# re-exports the colour and geometry crates, so those stay transitive.
+pptx = ["dep:deckcraft-pptx", "dep:deckcraft-model"]
+# DOCX inspect/edit/build (`docx_ops`). `wordcraft-docx` is the reader/writer;
+# `wordcraft-doc` is the document model it reads into and writes from, which
+# the reader/writer crate only partially re-exports.
+docx = ["dep:wordcraft-docx", "dep:wordcraft-doc"]
+
 [dependencies]
 age = { version = "0.11", features = ["armor"] }
 anyhow = "1"
@@ -19,8 +30,16 @@ calamine = "0.24"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.9"
 clap = { version = "4", features = ["derive", "env"] }
+deckcraft-model = { git = "https://github.com/storytold/deckcraft", rev = "29f0f7772c47aa2bfb74fcbb0c4d3b1503300849", optional = true }
+deckcraft-pptx = { git = "https://github.com/storytold/deckcraft", rev = "29f0f7772c47aa2bfb74fcbb0c4d3b1503300849", optional = true }
 fastembed = { version = "4", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
 futures = "0.3"
+# XLSX creation/editing. Pinned to the v0.9.0 revision; the crate's path dependencies
+# (gridcraft-core, gridcraft-model, gridcraft-formula) resolve from the same repository.
+# gridcraft-calc is deliberately absent: SeraBot never evaluates formulas.
+gridcraft-core = { git = "https://github.com/storytold/gridcraft", rev = "a2cc4b42cac6e2c41bae71fba4607300755a0b47" }
+gridcraft-model = { git = "https://github.com/storytold/gridcraft", rev = "a2cc4b42cac6e2c41bae71fba4607300755a0b47" }
+gridcraft-xlsx = { git = "https://github.com/storytold/gridcraft", rev = "a2cc4b42cac6e2c41bae71fba4607300755a0b47" }
 hex = "0.4"
 lopdf = "0.34"
 printpdf = "0.7"
@@ -50,7 +69,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 unicode-normalization = "0.1"
 url = "2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
+# DOCX reader/writer, pinned to the v0.9.0 revision. Both crates resolve from the
+# same repository; `wordcraft-doc` is the document model, `wordcraft-docx` the
+# WordprocessingML reader/writer.
+wordcraft-doc = { git = "https://github.com/storytold/wordcraft", rev = "2e6db0bd88795e80375176c01665cff7dbe2b057", optional = true }
+wordcraft-docx = { git = "https://github.com/storytold/wordcraft", rev = "2e6db0bd88795e80375176c01665cff7dbe2b057", optional = true }
 zeroize = "1"
+# Package inspection for the bounded PPTX and DOCX round trips (part names,
+# declared sizes, VBA parts, `.rels` parts) before either reader inflates
+# anything, plus the post-export link check. Same version and features
+# deckcraft-pptx already resolves, so this adds no new crate.
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 http-body-util = "0.1"

@@ -19,7 +19,7 @@ artifacts.
 | [Connectors](connectors.md) | Configure-later Google, Microsoft, and Notion OAuth; native AgentMail. |
 | [Mobile client](mobile-client.md) | Flutter Android owner console. |
 | [CI and secrets](ci-and-secrets.md) | GitHub Actions without credential leaks. |
-| [Crafting Apps adoption](craft-adoption.md) | Storytold craft repos: adapt PdfCraft patterns only; skip film/audio/video editors. |
+| [Crafting Apps adoption](craft-adoption.md) | Storytold craft repos: take `deckcraft-pptx` for text-only generated decks and bounded import/edit of owner decks; skip the editors, MCP servers, and egui shells. |
 | [ElevenLabs](elevenlabs.md) | Speech, STT, sound effects, and image/video flow tools. |
 | [Owner wake checklist](owner-wake.md) | Morning status: `main` tip, OVH binary for `27b1018`, configure-later, smoke commands. |
 

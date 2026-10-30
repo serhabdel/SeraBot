@@ -10,11 +10,13 @@ use crate::embeddings::Embedder;
 use crate::error::{Result, SeraError};
 use crate::fetch::SafeFetcher;
 use crate::gateway::{Tool, ToolContext, ToolOutput, ToolSpec};
+use crate::maker::ArtifactStore;
 use crate::spreadsheets::{
     WorkbookLimits, analyze_workbook, parse_timesheet_rows, read_timesheet_csv,
 };
 use crate::store::Store;
 use crate::watcher::watch_all;
+use crate::workbooks::{XlsxBuildTool, XlsxEditTool, XlsxInspectTool, XlsxReadTool};
 
 pub struct XlsxAnalyzeTool {
     root: PathBuf,
@@ -627,5 +629,79 @@ pub fn register_memory_tools(
     registry.register(MemorySaveTool::new(store.clone()))?;
     registry.register(MemoryListTool::new(store.clone()))?;
     registry.register(MemoryDeleteTool::new(store))?;
+    Ok(())
+}
+
+/// Register the bounded PDF page tools. They read from the artifact store or
+/// the configured inbox only, and write results back through the artifact
+/// store so an approval binds the produced hash.
+pub fn register_pdf_tools(
+    registry: &mut crate::gateway::ToolRegistry,
+    artifacts: Arc<crate::maker::ArtifactStore>,
+    store: Store,
+    inbox: PathBuf,
+) -> Result<()> {
+    registry.register(crate::pdf_ops::PdfInspectTool::new(
+        artifacts.clone(),
+        inbox.clone(),
+    )?)?;
+    registry.register(crate::pdf_ops::PdfEditTool::new(
+        artifacts.clone(),
+        store.clone(),
+        inbox.clone(),
+    )?)?;
+    registry.register(crate::pdf_ops::PdfMergeTool::new(artifacts, store, inbox)?)?;
+    Ok(())
+}
+
+/// Register the workbook tools. Every artifact goes through the shared `ArtifactStore`, so an
+/// approval binds the artifact hash exactly as it does for decks.
+pub fn register_workbook_tools(
+    registry: &mut crate::gateway::ToolRegistry,
+    artifacts: std::sync::Arc<ArtifactStore>,
+    store: Store,
+) -> Result<()> {
+    registry.register(XlsxBuildTool::new(artifacts.clone(), store.clone()))?;
+    registry.register(XlsxEditTool::new(artifacts.clone(), store))?;
+    registry.register(XlsxInspectTool::new(artifacts.clone()))?;
+    registry.register(XlsxReadTool::new(artifacts))?;
+    Ok(())
+}
+
+/// Register the bounded PPTX round-trip tools. Import reads only the configured
+/// inbox, inspect is read-only, and edit writes a new artifact through the
+/// shared store so `source_artifact` and the audit trail bind the input hash.
+#[cfg(feature = "pptx")]
+pub fn register_pptx_tools(
+    registry: &mut crate::gateway::ToolRegistry,
+    artifacts: std::sync::Arc<ArtifactStore>,
+    store: Store,
+    inbox: PathBuf,
+) -> Result<()> {
+    registry.register(crate::pptx_ops::PptxImportTool::new(
+        artifacts.clone(),
+        store.clone(),
+        inbox,
+    )?)?;
+    registry.register(crate::pptx_ops::PptxInspectTool::new(artifacts.clone()))?;
+    registry.register(crate::pptx_ops::PptxEditTool::new(artifacts, store))?;
+    Ok(())
+}
+
+/// Register the bounded DOCX block tools. They take artifact hashes only, and every result goes
+/// back through the shared `ArtifactStore` so an approval binds the produced hash.
+#[cfg(feature = "docx")]
+pub fn register_docx_tools(
+    registry: &mut crate::gateway::ToolRegistry,
+    artifacts: std::sync::Arc<ArtifactStore>,
+    store: Store,
+) -> Result<()> {
+    registry.register(crate::docx_ops::DocxBuildTool::new(
+        artifacts.clone(),
+        store.clone(),
+    ))?;
+    registry.register(crate::docx_ops::DocxEditTool::new(artifacts.clone(), store))?;
+    registry.register(crate::docx_ops::DocxInspectTool::new(artifacts.clone()))?;
+    registry.register(crate::docx_ops::DocxReadTool::new(artifacts))?;
     Ok(())
 }

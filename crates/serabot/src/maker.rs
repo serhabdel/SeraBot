@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -117,6 +117,104 @@ impl ArtifactStore {
     pub fn is_approved(&self, store: &Store, hash: &str) -> Result<bool> {
         Ok(store.kv_get(&format!("deck_approved:{hash}"))?.as_deref() == Some("1"))
     }
+
+    /// Copy one owner-supplied file from a configured inbox into the store.
+    ///
+    /// This is the single, format-agnostic inbox → artifact path. It enforces
+    /// the inbox boundary (the path must be relative, must canonicalise inside
+    /// `inbox`, and must not be a directory), the caller's extension allowlist,
+    /// and the caller's size cap. `inspect` runs on the bytes before anything is
+    /// written, so a caller can reject a file without leaving an artifact
+    /// behind; only then are the bytes hashed into the store. The artifact
+    /// records English because ingest does not infer a language.
+    pub fn ingest_inbox_file<T>(
+        &self,
+        inbox: &Path,
+        relative: &str,
+        extensions: &[&str],
+        max_bytes: usize,
+        inspect: impl FnOnce(&[u8]) -> Result<T>,
+    ) -> Result<(StoredArtifact, T)> {
+        if relative.is_empty() || relative.len() > 512 {
+            return Err(SeraError::Validation("invalid inbox path".into()));
+        }
+        let raw = Path::new(relative);
+        // Reject absolute paths, Windows drive-relative paths (`C:file`), and
+        // any `..` component before touching the filesystem. The canonicalised
+        // prefix check below is the second line of defence.
+        if raw.is_absolute()
+            || raw.components().any(|component| {
+                matches!(
+                    component,
+                    Component::Prefix(_) | Component::RootDir | Component::ParentDir
+                )
+            })
+        {
+            return Err(SeraError::Forbidden(
+                "inbox paths must be relative to the configured inbox".into(),
+            ));
+        }
+        let root = inbox
+            .canonicalize()
+            .map_err(|_| SeraError::NotFound("the configured inbox is unavailable".into()))?;
+        let candidate = root
+            .join(raw)
+            .canonicalize()
+            .map_err(|_| SeraError::NotFound("file not found in the configured inbox".into()))?;
+        if !candidate.starts_with(&root) {
+            return Err(SeraError::Forbidden(
+                "path escapes the configured inbox".into(),
+            ));
+        }
+        let extension = candidate
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !extensions.iter().any(|allowed| *allowed == extension) {
+            return Err(SeraError::Validation(format!(
+                "unsupported file type; use {}",
+                extensions.join(", ")
+            )));
+        }
+        let metadata = std::fs::metadata(&candidate)?;
+        if !metadata.is_file() {
+            return Err(SeraError::Validation("inbox path is not a file".into()));
+        }
+        if metadata.len() == 0 {
+            return Err(SeraError::Validation("inbox file is empty".into()));
+        }
+        if metadata.len() > max_bytes as u64 {
+            return Err(SeraError::Validation(format!(
+                "inbox file is {} bytes; the limit is {max_bytes} bytes",
+                metadata.len()
+            )));
+        }
+        let bytes = std::fs::read(&candidate)?;
+        if bytes.is_empty() || bytes.len() > max_bytes {
+            return Err(SeraError::Validation(
+                "inbox file changed while it was read".into(),
+            ));
+        }
+        let inspected = inspect(&bytes)?;
+        let filename = candidate
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("file")
+            .to_owned();
+        let stored = self.save(
+            &bytes,
+            &filename,
+            ArtifactMeta {
+                title: filename.clone(),
+                filename: filename.clone(),
+                language: Language::En,
+                source_artifact: None,
+                created_at: Utc::now(),
+            },
+        )?;
+        Ok((stored, inspected))
+    }
 }
 
 fn artifact_bytes_path(root: &Path, hash: &str, filename: &str) -> PathBuf {
@@ -191,9 +289,10 @@ impl Tool for DeckBuildTool {
         ToolSpec {
             name: "deck_build".into(),
             description:
-                "Render a bounded structured deck specification into a deterministic PDF. \
-                Italian is the default. French requires source_artifact to be an Italian artifact \
-                that the owner has explicitly approved."
+                "Render a bounded structured deck specification into a deterministic PDF and a \
+                text-only PPTX (text, shapes, and brand theme colours; no images, links, notes, or \
+                embedded files). Italian is the default. French requires source_artifact to be an \
+                Italian artifact that the owner has explicitly approved."
                     .into(),
             parameters: json!({
                 "type": "object",
@@ -245,16 +344,46 @@ impl Tool for DeckBuildTool {
             Language::En => {}
         }
         let rendered = render_deck(&spec, &self.brand, self.max_pages)?;
+        // Both deliverables are rendered before either is stored, so a spec the
+        // renderer rejects never leaves half a deck on disk.
+        #[cfg(feature = "pptx")]
+        let pptx = crate::deck_pptx::render_deck_pptx(&spec, &self.brand, self.max_pages)?;
+
         let meta = ArtifactMeta {
             title: spec.title.clone(),
             filename: rendered.filename.clone(),
             language: spec.language,
-            source_artifact: source,
+            source_artifact: source.clone(),
             created_at: Utc::now(),
         };
         let stored = self
             .artifacts
             .save(&rendered.pdf, &rendered.filename, meta)?;
+
+        // The PPTX is a second artifact with its own hash, stored through the
+        // same store so approval and audit bind it exactly like the PDF.
+        #[cfg(feature = "pptx")]
+        let pptx_stored = self.artifacts.save(
+            &pptx.bytes,
+            &pptx.filename,
+            ArtifactMeta {
+                title: spec.title.clone(),
+                filename: pptx.filename.clone(),
+                language: spec.language,
+                source_artifact: source,
+                created_at: Utc::now(),
+            },
+        )?;
+
+        #[cfg(feature = "pptx")]
+        let pptx_summary = Some((
+            pptx_stored.hash.clone(),
+            pptx_stored.filename.clone(),
+            pptx.slides,
+        ));
+        #[cfg(not(feature = "pptx"))]
+        let pptx_summary: Option<(String, String, usize)> = None;
+
         self.store.record_audit(
             &context.actor,
             "deck.rendered",
@@ -268,17 +397,23 @@ impl Tool for DeckBuildTool {
                 "language": spec.language.code(),
                 "pages": rendered.pages,
                 "source_artifact": stored.meta.source_artifact,
+                "pptx_artifact_hash": pptx_summary.as_ref().map(|(hash, _, _)| hash.clone()),
+                "pptx_slides": pptx_summary.as_ref().map(|(_, _, slides)| *slides),
             })),
         )?;
         Ok(ToolOutput {
             content: format!(
-                "title: {}\nsubtitle: {}\nauthor: {}\nfooter: {}\nbrand: {}\nfilename: {}\n\n{}",
+                "title: {}\nsubtitle: {}\nauthor: {}\nfooter: {}\nbrand: {}\nfilename: {}\npptx: {}\n\n{}",
                 spec.title,
                 spec.subtitle.as_deref().unwrap_or(""),
                 spec.author.as_deref().unwrap_or(""),
                 spec.footer.as_deref().unwrap_or(""),
                 self.brand.name,
                 stored.filename,
+                pptx_summary
+                    .as_ref()
+                    .map(|(_, filename, _)| filename.as_str())
+                    .unwrap_or(""),
                 rendered.text
             ),
             data: Some(json!({
@@ -286,6 +421,9 @@ impl Tool for DeckBuildTool {
                 "filename": stored.filename,
                 "pages": rendered.pages,
                 "language": spec.language.code(),
+                "pptx_artifact_hash": pptx_summary.as_ref().map(|(hash, _, _)| hash.clone()),
+                "pptx_filename": pptx_summary.as_ref().map(|(_, filename, _)| filename.clone()),
+                "pptx_slides": pptx_summary.as_ref().map(|(_, _, slides)| *slides),
             })),
             artifact_path: Some(format!("artifacts/{}", stored.filename)),
             artifact_hash: Some(stored.hash),
@@ -608,10 +746,37 @@ mod tests {
         let tool = DeckBuildTool::new(Arc::new(brand()), artifacts.clone(), store, 10);
         let args = json!({"spec": deck(Language::It)});
         let output = tool.execute(args, &context()).await.unwrap();
-        let hash = output.artifact_hash.unwrap();
+        let hash = output.artifact_hash.clone().unwrap();
         let stored = artifacts.load(&hash).unwrap();
         assert_eq!(stored.meta.language, Language::It);
         assert!(stored.bytes.starts_with(b"%PDF"));
+
+        #[cfg(feature = "pptx")]
+        {
+            let data = output.data.clone().unwrap();
+            let pptx_hash = data["pptx_artifact_hash"].as_str().unwrap().to_owned();
+            assert_ne!(pptx_hash, hash);
+            let pptx = artifacts.load(&pptx_hash).unwrap();
+            assert_eq!(pptx.meta.language, Language::It);
+            assert!(pptx.filename.ends_with(".pptx"));
+            assert!(pptx.bytes.starts_with(b"PK"));
+            assert_eq!(data["pptx_slides"], 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_spec_stores_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory(384).unwrap();
+        let artifacts = Arc::new(ArtifactStore::new(dir.path()).unwrap());
+        // Cover, section divider, and card page need three pages.
+        let tool = DeckBuildTool::new(Arc::new(brand()), artifacts, store, 1);
+        assert!(
+            tool.execute(json!({"spec": deck(Language::It)}), &context())
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]
@@ -637,6 +802,58 @@ mod tests {
         let store = ArtifactStore::new(tempfile::tempdir().unwrap().path()).unwrap();
         assert!(store.load("../../etc/passwd").is_err());
         assert_eq!(safe_filename("../../x.pdf").unwrap(), "x.pdf");
+    }
+
+    #[test]
+    fn ingest_inbox_file_enforces_the_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let artifacts = ArtifactStore::new(dir.path().join("artifacts")).unwrap();
+        std::fs::write(inbox.join("note.txt"), b"hello").unwrap();
+        std::fs::write(dir.path().join("outside.txt"), b"hello").unwrap();
+
+        let (stored, seen) = artifacts
+            .ingest_inbox_file(&inbox, "note.txt", &["txt"], 16, |bytes| Ok(bytes.len()))
+            .unwrap();
+        assert_eq!(seen, 5);
+        assert_eq!(stored.bytes, b"hello");
+        assert_eq!(stored.filename, "note.txt");
+
+        let absolute = inbox.join("note.txt").to_string_lossy().to_string();
+        for path in [
+            "../outside.txt",
+            "missing.txt",
+            "note.md",
+            absolute.as_str(),
+        ] {
+            assert!(
+                artifacts
+                    .ingest_inbox_file(&inbox, path, &["txt"], 16, |_| Ok(()))
+                    .is_err(),
+                "accepted {path}"
+            );
+        }
+        // The size cap is enforced before the bytes are read.
+        assert!(
+            artifacts
+                .ingest_inbox_file(&inbox, "note.txt", &["txt"], 4, |_| Ok(()))
+                .is_err()
+        );
+        // A rejected inspection stores nothing.
+        assert!(
+            artifacts
+                .ingest_inbox_file(&inbox, "note.txt", &["txt"], 16, |_| -> Result<()> {
+                    Err(SeraError::Validation("rejected".into()))
+                })
+                .is_err()
+        );
+        let stored_artifacts = std::fs::read_dir(dir.path().join("artifacts"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .count();
+        assert_eq!(stored_artifacts, 1);
     }
 
     #[allow(dead_code)]

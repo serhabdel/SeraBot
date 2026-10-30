@@ -9,8 +9,12 @@ pub mod cloud_code;
 pub mod config;
 pub mod connectors;
 pub mod deck;
+#[cfg(feature = "pptx")]
+pub mod deck_pptx;
 pub mod delegate;
 pub mod documents;
+#[cfg(feature = "docx")]
+pub mod docx_ops;
 pub mod domain;
 pub mod elevenlabs;
 pub mod embeddings;
@@ -24,7 +28,10 @@ pub mod memory;
 pub mod model_router;
 pub mod onedrive;
 pub mod orchestration;
+pub mod pdf_ops;
 pub mod policy;
+#[cfg(feature = "pptx")]
+pub mod pptx_ops;
 pub mod providers;
 pub mod render;
 pub mod retrieval;
@@ -42,3 +49,4 @@ pub mod tools;
 pub mod util;
 pub mod watcher;
 pub mod web;
+pub mod workbooks;
