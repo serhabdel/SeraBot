@@ -483,6 +483,12 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.clone(),
     ))?;
     serabot::tools::register_memory_tools(&mut registry, store.clone())?;
+    serabot::tools::register_pdf_tools(
+        &mut registry,
+        artifacts.clone(),
+        store.clone(),
+        config.path(&config.documents.watch_dir),
+    )?;
     let fetcher = SafeFetcher::new(
         config.watcher.user_agent.clone(),
         config.watcher.timeout_secs,

@@ -24,6 +24,7 @@ pub mod memory;
 pub mod model_router;
 pub mod onedrive;
 pub mod orchestration;
+pub mod pdf_ops;
 pub mod policy;
 pub mod providers;
 pub mod render;
