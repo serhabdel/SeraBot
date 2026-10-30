@@ -687,3 +687,21 @@ pub fn register_pptx_tools(
     registry.register(crate::pptx_ops::PptxEditTool::new(artifacts, store))?;
     Ok(())
 }
+
+/// Register the bounded DOCX block tools. They take artifact hashes only, and every result goes
+/// back through the shared `ArtifactStore` so an approval binds the produced hash.
+#[cfg(feature = "docx")]
+pub fn register_docx_tools(
+    registry: &mut crate::gateway::ToolRegistry,
+    artifacts: std::sync::Arc<ArtifactStore>,
+    store: Store,
+) -> Result<()> {
+    registry.register(crate::docx_ops::DocxBuildTool::new(
+        artifacts.clone(),
+        store.clone(),
+    ))?;
+    registry.register(crate::docx_ops::DocxEditTool::new(artifacts.clone(), store))?;
+    registry.register(crate::docx_ops::DocxInspectTool::new(artifacts.clone()))?;
+    registry.register(crate::docx_ops::DocxReadTool::new(artifacts))?;
+    Ok(())
+}
