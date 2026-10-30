@@ -4552,6 +4552,14 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
                                                 .map(|draft| draft.enabled)
                                                 .unwrap_or(connector.enabled);
                                             let testing = session.read().connector_testing.as_deref() == Some(id.as_str());
+                                            let signing_in = session.read().oauth_signing_in.as_deref() == Some(id.as_str());
+                                            let auth_mode = session
+                                                .read()
+                                                .connector_drafts
+                                                .get(&id)
+                                                .and_then(|draft| draft.auth.clone())
+                                                .or_else(|| connector.auth.clone())
+                                                .unwrap_or_default();
                                             let test_result = session.read().state.connector_tests.get(&id).cloned();
                                             let values = session
                                                 .read()
@@ -4587,6 +4595,23 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
                                                             if secret.configured || secret.name.as_deref().is_some_and(|n| !n.is_empty()) {
                                                                 span { class: if secret.configured { "chip mono accent" } else { "chip mono warn" },
                                                                     "{role}: {secret.name.clone().unwrap_or_default()}"
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    if connector.auth_modes.len() > 1 {
+                                                        div { class: "field",
+                                                            label { class: "field-label", "auth mode" }
+                                                            select {
+                                                                class: "input",
+                                                                value: "{auth_mode}",
+                                                                title: "How this connector authenticates",
+                                                                onchange: {
+                                                                    let id = id.clone();
+                                                                    move |event| session.write().set_connector_auth(&id, event.value())
+                                                                },
+                                                                for mode in &connector.auth_modes {
+                                                                    option { value: "{mode}", "{mode}" }
                                                                 }
                                                             }
                                                         }
@@ -4663,6 +4688,25 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
                                                                 move |_| session.write().save_connector(id.clone())
                                                             },
                                                             "Save connector"
+                                                        }
+                                                        if connector.oauth.is_some()
+                                                            && connector.auth_modes.iter().any(|m| m == "oauth")
+                                                        {
+                                                            button {
+                                                                class: "btn ghost sm",
+                                                                title: "Sign in with your ElevenLabs account in your browser (PKCE)",
+                                                                disabled: signing_in || !can_save,
+                                                                onclick: {
+                                                                    let id = id.clone();
+                                                                    let callback_uri = connector
+                                                                        .oauth
+                                                                        .as_ref()
+                                                                        .and_then(|o| o.callback_uri.clone())
+                                                                        .unwrap_or_default();
+                                                                    move |_| session.write().sign_in_connector(id.clone(), callback_uri.clone())
+                                                                },
+                                                                if signing_in { "Signing in…" } else { "Sign in" }
+                                                            }
                                                         }
                                                         button {
                                                             class: "btn ghost sm",

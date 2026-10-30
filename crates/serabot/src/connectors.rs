@@ -1161,6 +1161,9 @@ pub enum ApiKeyProbe<'a> {
     Tavily(&'a str),
     Firecrawl(&'a str),
     ElevenLabs(&'a str),
+    /// Same read-only probe, but with the OAuth bearer token instead of
+    /// `xi-api-key` (the REST API rejects requests carrying both).
+    ElevenLabsOauth(&'a str),
 }
 
 /// Runs one probe under [`CONNECTOR_TEST_TIMEOUT`]. Errors are fixed, short
@@ -1172,11 +1175,35 @@ pub async fn probe_api_key(
     probe_api_key_within(probe, api_key, CONNECTOR_TEST_TIMEOUT).await
 }
 
+/// ElevenLabs issues `sk_` + 48 hex characters (51 total). A key with the
+/// `sk_` prefix but any other shape is rejected by the API with HTTP 400
+/// (`invalid_api_key_length`), so flag it locally with a clear message instead
+/// of the generic "Provider returned HTTP 400". Keys without the prefix are
+/// left to the live probe, which reports them as a plain rejection.
+pub fn elevenlabs_api_key_malformed(key: &str) -> bool {
+    match key.strip_prefix("sk_") {
+        Some(rest) => rest.len() != 48 || !rest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        None => false,
+    }
+}
+
 async fn probe_api_key_within(
     probe: ApiKeyProbe<'_>,
     api_key: &str,
     limit: Duration,
 ) -> std::result::Result<(), String> {
+    if let ApiKeyProbe::ElevenLabs(_) = probe {
+        if elevenlabs_api_key_malformed(api_key) {
+            return Err(
+                "Key rejected (malformed: expected sk_ followed by 48 hex characters)".into(),
+            );
+        }
+    }
+    if let ApiKeyProbe::ElevenLabsOauth(_) = probe {
+        if api_key.trim().is_empty() || api_key.len() > 8_192 {
+            return Err("Token rejected (malformed)".into());
+        }
+    }
     let http = Client::builder()
         .timeout(limit)
         .redirect(reqwest::redirect::Policy::none())
@@ -1211,6 +1238,9 @@ fn probe_request(
         ApiKeyProbe::ElevenLabs(base) => http
             .get(format!("{}/v2/voices?page_size=1", probe_base(base)?))
             .header("xi-api-key", api_key),
+        ApiKeyProbe::ElevenLabsOauth(base) => http
+            .get(format!("{}/v2/voices?page_size=1", probe_base(base)?))
+            .bearer_auth(api_key),
         ApiKeyProbe::Tavily(base) => {
             http.post(format!("{}/search", probe_base(base)?))
                 .json(&json!({
@@ -1246,7 +1276,9 @@ fn probe_transport_message(error: &reqwest::Error) -> String {
 
 fn probe_status_message(code: u16) -> String {
     match code {
-        401 | 403 => format!("Key rejected ({code})"),
+        // The probe requests are fixed and valid, so a 400 means the provider
+        // rejected the credential's shape (e.g. a truncated ElevenLabs key).
+        400 | 401 | 403 => format!("Key rejected ({code})"),
         429 => "Rate limited (429)".into(),
         _ => format!("Provider returned HTTP {code}"),
     }
@@ -2628,6 +2660,53 @@ mod tests {
                 .unwrap_err(),
             "Provider returned HTTP 500"
         );
+    }
+
+    #[tokio::test]
+    async fn elevenlabs_probe_maps_400_to_key_rejected_and_flags_malformed_keys_locally() {
+        let well_formed = format!("sk_{}", "a".repeat(48));
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/voices"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"detail":{"status":"invalid_api_key_length","message":"API key must be exactly 51 characters"}}"#,
+            ))
+            .mount(&server)
+            .await;
+        assert_eq!(
+            probe_api_key(ApiKeyProbe::ElevenLabs(&server.uri()), &well_formed)
+                .await
+                .unwrap_err(),
+            "Key rejected (400)"
+        );
+        // A truncated sk_ key is rejected before any request leaves the host.
+        assert_eq!(
+            probe_api_key(
+                ApiKeyProbe::ElevenLabs("https://api.elevenlabs.io"),
+                "sk_too_short"
+            )
+            .await
+            .unwrap_err(),
+            "Key rejected (malformed: expected sk_ followed by 48 hex characters)"
+        );
+    }
+
+    #[test]
+    fn elevenlabs_api_key_malformed_detects_bad_sk_shapes_only() {
+        assert!(!elevenlabs_api_key_malformed(&format!(
+            "sk_{}",
+            "a".repeat(48)
+        )));
+        assert!(elevenlabs_api_key_malformed("sk_too_short"));
+        assert!(elevenlabs_api_key_malformed(&format!(
+            "sk_{}",
+            "a".repeat(47)
+        )));
+        assert!(elevenlabs_api_key_malformed(&format!(
+            "sk_{}",
+            "g".repeat(48)
+        )));
+        assert!(!elevenlabs_api_key_malformed("no-prefix-at-all"));
     }
 
     #[tokio::test]

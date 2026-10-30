@@ -151,6 +151,14 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/admin/connectors/{id}", put(admin_set_connector))
         .route("/v1/admin/connectors/{id}/test", post(admin_test_connector))
+        .route(
+            "/v1/admin/connectors/{id}/oauth/start",
+            post(admin_connector_oauth_start),
+        )
+        .route(
+            "/v1/admin/connectors/{id}/oauth/complete",
+            post(admin_connector_oauth_complete),
+        )
         .route("/v1/admin/audio", put(admin_set_audio))
         .route("/v1/admin/bots/{id}", put(admin_set_bot_profile))
         .route("/v1/admin/restart", post(admin_restart))
@@ -1550,6 +1558,29 @@ async fn list_connectors(State(state): State<Arc<ApiState>>) -> Result<Json<Valu
                 "api_key": secret_status(&state.secrets, Some(key_secret)),
             },
         }));
+        if id == "elevenlabs" {
+            let view = views.last_mut().expect("just pushed");
+            view["auth"] = json!(match state.config.elevenlabs.auth {
+                crate::config::ElevenLabsAuth::ApiKey => "api_key",
+                crate::config::ElevenLabsAuth::Oauth => "oauth",
+            });
+            view["auth_modes"] = json!(["api_key", "oauth"]);
+            view["secrets"]["access_token"] = secret_status(
+                &state.secrets,
+                Some(state.config.elevenlabs.oauth_access_token_secret.as_str()),
+            );
+            view["secrets"]["refresh_token"] = secret_status(
+                &state.secrets,
+                Some(state.config.elevenlabs.oauth_refresh_token_secret.as_str()),
+            );
+            view["oauth"] = json!({
+                "client_id": state.config.elevenlabs.oauth_client_id,
+                "authorize_url": crate::elevenlabs::ELEVENLABS_AUTHORIZE_URL,
+                "cimd_path": crate::elevenlabs::CIMD_PATH,
+                "callback_uri": crate::elevenlabs::oauth_callback_uri(),
+                "scope": state.config.elevenlabs.oauth_scope,
+            });
+        }
     }
     for view in &mut views {
         let group = view["id"].as_str().map(connector_group).unwrap_or("Other");
@@ -1575,7 +1606,14 @@ fn api_key_probe<'a>(config: &'a Config, id: &str) -> Option<ApiKeyProbe<'a>> {
         )),
         "tavily" => Some(ApiKeyProbe::Tavily(&config.tavily.api_base)),
         "firecrawl" => Some(ApiKeyProbe::Firecrawl(&config.firecrawl.api_base)),
-        "elevenlabs" => Some(ApiKeyProbe::ElevenLabs(&config.elevenlabs.api_base)),
+        "elevenlabs" => Some(match config.elevenlabs.auth {
+            crate::config::ElevenLabsAuth::ApiKey => {
+                ApiKeyProbe::ElevenLabs(&config.elevenlabs.api_base)
+            }
+            crate::config::ElevenLabsAuth::Oauth => {
+                ApiKeyProbe::ElevenLabsOauth(&config.elevenlabs.api_base)
+            }
+        }),
         _ => None,
     }
 }
@@ -1595,7 +1633,7 @@ async fn admin_test_connector(
         (None, Some(probe)) => {
             let key = roles
                 .iter()
-                .find(|(role, _)| *role == "api_key")
+                .find(|(role, _)| *role == "api_key" || *role == "access_token")
                 .and_then(|(_, name)| state.secrets.get(name))
                 .unwrap_or_default();
             match probe_api_key(probe, &key).await {
@@ -1988,11 +2026,96 @@ async fn admin_provider_oauth_complete(
     })))
 }
 
+/// Begin an ElevenLabs OAuth sign-in for the connector. PKCE only: the
+/// browser leg and loopback listener run on the owner's machine (the desktop
+/// console); the server only builds the pinned consent URL. No pending state
+/// is stored server-side — the desktop holds verifier and state.
+async fn admin_connector_oauth_start(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(request): Json<OAuthStartRequest>,
+) -> AdminResult<Json<Value>> {
+    if id != "elevenlabs" {
+        return Err(admin_error(SeraError::NotFound(format!(
+            "connector {id} does not support OAuth sign-in"
+        ))));
+    }
+    let url = crate::elevenlabs::authorize_url(
+        &state.config.elevenlabs.oauth_client_id,
+        &request.redirect_uri,
+        &state.config.elevenlabs.oauth_scope,
+        &request.challenge,
+        &request.state,
+    )
+    .map_err(admin_error)?;
+    audit_config(
+        &state,
+        "config.connector_oauth_started",
+        json!({"connector": id}),
+    )?;
+    Ok(Json(json!({"flow": "pkce", "url": url})))
+}
+
+/// Complete the ElevenLabs sign-in: the server exchanges the code at the
+/// pinned token endpoint and persists both tokens to the age store. Tokens
+/// are never returned to the caller.
+async fn admin_connector_oauth_complete(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(request): Json<OAuthCompleteRequest>,
+) -> AdminResult<Json<Value>> {
+    if id != "elevenlabs" {
+        return Err(admin_error(SeraError::NotFound(format!(
+            "connector {id} does not support OAuth sign-in"
+        ))));
+    }
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| admin_error(SeraError::External(error.to_string())))?;
+    let pair = crate::elevenlabs::exchange_code(
+        &http,
+        &state.config.elevenlabs.oauth_client_id,
+        &request.code,
+        &request.redirect_uri,
+        &request.verifier,
+    )
+    .await
+    .map_err(admin_error)?;
+    let access_name = state.config.elevenlabs.oauth_access_token_secret.clone();
+    let refresh_name = state.config.elevenlabs.oauth_refresh_token_secret.clone();
+    let refresh_value = match &pair.refresh_token {
+        Some(refresh) => refresh.clone(),
+        None => state.secrets.get(&refresh_name).ok_or_else(|| {
+            admin_error(SeraError::External(
+                "ElevenLabs did not return a refresh token".into(),
+            ))
+        })?,
+    };
+    state
+        .secrets
+        .persist(&[
+            (access_name.as_str(), pair.access_token.as_str()),
+            (refresh_name.as_str(), refresh_value.as_str()),
+        ])
+        .map_err(admin_error)?;
+    audit_config(
+        &state,
+        "config.connector_oauth_signed_in",
+        json!({"connector": id, "ok": true}),
+    )?;
+    Ok(Json(json!({"signed_in": true, "restart_required": true})))
+}
+
 #[derive(Deserialize)]
 struct ConnectorRequest {
     enabled: bool,
     #[serde(default)]
     values: BTreeMap<String, String>,
+    /// ElevenLabs only: switch auth mode ("api_key" or "oauth").
+    #[serde(default)]
+    auth: Option<String>,
 }
 
 async fn admin_set_connector(
@@ -2001,6 +2124,23 @@ async fn admin_set_connector(
     Json(request): Json<ConnectorRequest>,
 ) -> AdminResult<Json<Value>> {
     let admin = admin_store(&state)?;
+    if let Some(auth) = &request.auth {
+        if id != "elevenlabs" {
+            return Err(admin_error(SeraError::Validation(
+                "auth mode is only supported for the elevenlabs connector".into(),
+            )));
+        }
+        let mode = match auth.as_str() {
+            "api_key" => crate::config::ElevenLabsAuth::ApiKey,
+            "oauth" => crate::config::ElevenLabsAuth::Oauth,
+            other => {
+                return Err(admin_error(SeraError::Validation(format!(
+                    "unknown elevenlabs auth mode '{other}'"
+                ))));
+            }
+        };
+        admin.set_elevenlabs_auth(mode).map_err(admin_error)?;
+    }
     admin
         .set_connector(
             &state.config,
@@ -2013,7 +2153,7 @@ async fn admin_set_connector(
     audit_config(
         &state,
         "config.connector_saved",
-        json!({"connector": id, "enabled": request.enabled, "credentials": request.values.keys().collect::<Vec<_>>()}),
+        json!({"connector": id, "enabled": request.enabled, "credentials": request.values.keys().collect::<Vec<_>>(), "auth": request.auth}),
     )?;
     Ok(Json(json!({"saved": true, "restart_required": true})))
 }

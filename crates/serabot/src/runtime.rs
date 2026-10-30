@@ -1246,6 +1246,18 @@ impl Runtime {
                 tool_names.push(extra.to_string());
             }
         }
+        let unregistered: Vec<&str> = tool_names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !self.gateway.registry().is_registered(name))
+            .collect();
+        if !unregistered.is_empty() {
+            warn!(
+                bot = %turn.bot,
+                tools = ?unregistered,
+                "bot lists tools that are not registered (disabled connector or stale allowlist); they are absent from this turn's tool notice"
+            );
+        }
         let tool_specs = self
             .gateway
             .registry()

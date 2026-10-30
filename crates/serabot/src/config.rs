@@ -284,6 +284,35 @@ impl Config {
                     "elevenlabs.poll_max_attempts must be greater than zero".into(),
                 ));
             }
+            if self.elevenlabs.auth == ElevenLabsAuth::Oauth {
+                let client_id = self.elevenlabs.oauth_client_id.trim();
+                match reqwest::Url::parse(client_id) {
+                    Ok(url)
+                        if url.scheme() == "https"
+                            && url.host_str().is_some()
+                            && url.username().is_empty()
+                            && url.password().is_none()
+                            && url.query().is_none()
+                            && url.fragment().is_none() => {}
+                    _ => {
+                        return Err(SeraError::Config(
+                            "elevenlabs.oauth_client_id must be a credential-less https URL (CIMD client_id)"
+                                .into(),
+                        ));
+                    }
+                }
+                for name in [
+                    &self.elevenlabs.oauth_access_token_secret,
+                    &self.elevenlabs.oauth_refresh_token_secret,
+                ] {
+                    if !valid_secret_name(name) {
+                        return Err(SeraError::Config(
+                            "elevenlabs OAuth token secret names must be secret-store key names"
+                                .into(),
+                        ));
+                    }
+                }
+            }
         }
         self.browser.validate()?;
         self.connectors.validate()?;
@@ -773,6 +802,17 @@ impl Default for TavilyConfig {
     }
 }
 
+/// How the ElevenLabs connector authenticates. `api_key` sends the
+/// `xi-api-key` header; `oauth` sends `Authorization: Bearer` from an
+/// ElevenLabs OAuth sign-in (the REST API rejects requests that carry both).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElevenLabsAuth {
+    #[default]
+    ApiKey,
+    Oauth,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElevenLabsConfig {
     #[serde(default)]
@@ -781,6 +821,18 @@ pub struct ElevenLabsConfig {
     pub api_base: String,
     #[serde(default = "default_elevenlabs_api_key_secret")]
     pub api_key_secret: String,
+    #[serde(default)]
+    pub auth: ElevenLabsAuth,
+    /// CIMD client_id: the https URL of the client metadata document this
+    /// server publishes publicly (see `web::cimd_document`).
+    #[serde(default = "default_elevenlabs_oauth_client_id")]
+    pub oauth_client_id: String,
+    #[serde(default = "default_elevenlabs_oauth_scope")]
+    pub oauth_scope: String,
+    #[serde(default = "default_elevenlabs_oauth_access_token_secret")]
+    pub oauth_access_token_secret: String,
+    #[serde(default = "default_elevenlabs_oauth_refresh_token_secret")]
+    pub oauth_refresh_token_secret: String,
     #[serde(default = "default_elevenlabs_timeout_secs")]
     pub timeout_secs: u64,
     #[serde(default = "default_elevenlabs_voice_id")]
@@ -807,6 +859,11 @@ impl Default for ElevenLabsConfig {
             enabled: false,
             api_base: default_elevenlabs_api_base(),
             api_key_secret: default_elevenlabs_api_key_secret(),
+            auth: ElevenLabsAuth::default(),
+            oauth_client_id: default_elevenlabs_oauth_client_id(),
+            oauth_scope: default_elevenlabs_oauth_scope(),
+            oauth_access_token_secret: default_elevenlabs_oauth_access_token_secret(),
+            oauth_refresh_token_secret: default_elevenlabs_oauth_refresh_token_secret(),
             timeout_secs: default_elevenlabs_timeout_secs(),
             default_voice_id: default_elevenlabs_voice_id(),
             tts_model: default_elevenlabs_tts_model(),
@@ -1790,6 +1847,18 @@ fn default_elevenlabs_api_base() -> String {
 }
 fn default_elevenlabs_api_key_secret() -> String {
     "elevenlabs_api_key".into()
+}
+fn default_elevenlabs_oauth_client_id() -> String {
+    crate::elevenlabs::cimd_client_id()
+}
+fn default_elevenlabs_oauth_scope() -> String {
+    crate::elevenlabs::DEFAULT_OAUTH_SCOPE.into()
+}
+fn default_elevenlabs_oauth_access_token_secret() -> String {
+    "elevenlabs_access_token".into()
+}
+fn default_elevenlabs_oauth_refresh_token_secret() -> String {
+    "elevenlabs_refresh_token".into()
 }
 fn default_elevenlabs_timeout_secs() -> u64 {
     120

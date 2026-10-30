@@ -99,6 +99,23 @@ where
         .route("/app/latest.apk", get(latest_apk))
         .route("/app/SHA256SUMS", get(sha256sums))
         .route("/healthz", get(healthz))
+        .route(crate::elevenlabs::CIMD_PATH, get(cimd))
+}
+
+/// Public CIMD client metadata document, used as the ElevenLabs OAuth
+/// `client_id` (client_id_metadata_document). Contains no secrets and is
+/// served `no-store` so the authorization server always fetches a fresh copy.
+async fn cimd() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CONTENT_SECURITY_POLICY, CSP),
+        ],
+        Json(crate::elevenlabs::cimd_document()),
+    )
+        .into_response()
 }
 
 async fn landing() -> Response {
@@ -202,5 +219,29 @@ mod tests {
 
         let invalid = render_landing(Some("owner/repo/extra"));
         assert!(invalid.contains(DOWNLOADS_UNCONFIGURED));
+    }
+
+    #[tokio::test]
+    async fn cimd_route_serves_self_consistent_secret_free_json() {
+        let response = cimd().await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let doc: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(doc["client_id"], json!(crate::elevenlabs::cimd_client_id()));
+        assert_eq!(
+            doc["redirect_uris"],
+            json!([crate::elevenlabs::oauth_callback_uri()])
+        );
+        assert!(!bytes.windows(3).any(|w| w == b"sk_"));
     }
 }

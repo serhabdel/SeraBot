@@ -796,6 +796,9 @@ mod tests {
                 api_base: None,
                 default_inbox_id: None,
                 secrets: std::collections::BTreeMap::new(),
+                auth: None,
+                auth_modes: Vec::new(),
+                oauth: None,
             }]),
         );
         assert!(state.providers_loaded);

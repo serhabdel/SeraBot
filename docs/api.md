@@ -256,8 +256,10 @@ or `Voice & Media`). OAuth entries report
 `enabled`, `redirect_uri`, and `client_id`/`client_secret`/`refresh_token`
 secret names plus presence booleans. API-key entries (AgentMail, Tavily,
 Firecrawl, ElevenLabs) report `enabled`, `api_base`, and their `api_key` secret
-name and presence. Use `serabot secrets set <name>` on the server to supply any
-missing value.
+name and presence. The `elevenlabs` entry additionally reports `auth`,
+`auth_modes`, the `access_token`/`refresh_token` secret presence, and an
+`oauth` metadata block (see *Connector OAuth sign-in* below). Use
+`serabot secrets set <name>` on the server to supply any missing value.
 
 ### Test a connector
 
@@ -272,7 +274,7 @@ changes configuration:
 | `agentmail` | `GET {api_base}/inboxes?limit=1` |
 | `tavily` | `POST {api_base}/search` with `max_results: 1` (this consumes one search credit) |
 | `firecrawl` | `GET {api_base}/v2/team/credit-usage` |
-| `elevenlabs` | `GET {api_base}/v1/user` |
+| `elevenlabs` | `GET {api_base}/v2/voices?page_size=1` with `xi-api-key`, or with `Authorization: Bearer` when `auth = "oauth"` (requires auth either way, so it validates the credential) |
 
 OAuth connectors (`google_drive`, `google_sheets`, `google_calendar`, `gmail`,
 `outlook`, `outlook_calendar`, `notion`) do not contact the provider. They
@@ -366,3 +368,30 @@ A provider of another kind answers `422`; an unknown id `404`. Audit entries
 (`config.provider_oauth_signed_in` / `config.provider_oauth_failed`) carry the
 provider id and kind only. `GET /v1/providers` reports sign-in state through
 `secrets.refresh_token.configured` (PKCE) or `secrets.api_key.configured` (device).
+
+## Connector OAuth sign-in (ElevenLabs)
+
+Owner token required. Routes under `/v1/admin/connectors/{id}/oauth/`; only
+`id = "elevenlabs"` is supported (others answer `404`).
+
+- `POST .../oauth/start` — PKCE: body `{"challenge","state","redirect_uri"}`.
+  The redirect URI must be the fixed loopback callback declared in the server's
+  public CIMD document (`http://127.0.0.1:51122/oauth-callback`). Returns
+  `{"flow":"pkce","url":"https://elevenlabs.io/app/oauth/authorize?..."}` with
+  the CIMD `client_id`, the configured scope, and the S256 challenge.
+- `POST .../oauth/complete` — body `{"code","verifier","redirect_uri"}`. The
+  server exchanges the code at the pinned token endpoint
+  (`https://api.us.elevenlabs.io/v1/oauth/token`, public client, no secret),
+  stores the tokens under `elevenlabs_access_token` / `elevenlabs_refresh_token`
+  in the age store (never returned), and answers
+  `{"signed_in":true,"restart_required":true}`.
+
+`PUT /v1/admin/connectors/elevenlabs` accepts `"auth": "api_key" | "oauth"`
+(alongside `enabled`/`values`); the mode is kept in `admin-overrides.json` and
+applies after restarting `serabot.service`. `GET /v1/connectors` reports the
+elevenlabs entry with `auth`, `auth_modes`, the OAuth secret names, and an
+`oauth` block (`client_id`, `authorize_url`, `cimd_path`, `callback_uri`,
+`scope`). The public CIMD document itself is served unauthenticated at
+`GET /.well-known/serabot-oauth-client.json` (`application/json`, `no-store`);
+it contains no secrets. Audit: `config.connector_oauth_started` /
+`config.connector_oauth_signed_in` carry the connector id only.

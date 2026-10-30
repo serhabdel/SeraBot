@@ -143,6 +143,12 @@ pub enum Operation {
         id: String,
         kind: String,
     },
+    /// Browser sign-in for a connector (ElevenLabs CIMD/PKCE). The callback
+    /// URI is fixed by the server's public client metadata document.
+    ConnectorOAuthSignIn {
+        id: String,
+        callback_uri: String,
+    },
     AdminSetBotProfile {
         id: String,
         update: BotProfileUpdate,
@@ -187,6 +193,7 @@ impl Operation {
             | Self::AdminSetAudio(_) => OperationKind::AdminWrite,
             Self::TestConnector { .. } => OperationKind::ConnectorTest,
             Self::OAuthSignIn { .. } => OperationKind::OAuthSignIn,
+            Self::ConnectorOAuthSignIn { .. } => OperationKind::OAuthSignIn,
             Self::AdminSetBotProfile { .. } => OperationKind::AdminProfile,
             Self::AdminRestart => OperationKind::AdminRestart,
         }
@@ -347,6 +354,53 @@ fn oauth_sign_in(client: &ApiClient, id: &str, kind: &str) -> Result<Reply, ApiE
     })
 }
 
+/// Connector sign-in (ElevenLabs): the redirect URI is fixed by the CIMD
+/// document, so the loopback listener binds exactly that port — no fallback.
+fn connector_oauth_sign_in(
+    client: &ApiClient,
+    id: &str,
+    callback_uri: &str,
+) -> Result<Reply, ApiError> {
+    use crate::oauth;
+    let port = callback_uri
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .ok_or(ApiError::Validation(
+            "The server did not report a loopback callback URI.",
+        ))?;
+    let redirect = oauth::redirect_uri(port);
+    if redirect != callback_uri {
+        return Err(ApiError::Validation(
+            "The server's callback URI is not a loopback redirect.",
+        ));
+    }
+    let listener = oauth::bind_loopback_fixed(port).map_err(|_| {
+        ApiError::Validation("Could not listen on 127.0.0.1 for the redirect (port busy?).")
+    })?;
+    let pkce = oauth::new_pkce();
+    let start = client.admin_connector_oauth_start(
+        id,
+        &serde_json::json!({
+            "challenge": pkce.challenge,
+            "state": pkce.state,
+            "redirect_uri": redirect,
+        }),
+    )?;
+    webbrowser::open(&start.url)
+        .map_err(|_| ApiError::Validation("Could not open the browser for sign-in."))?;
+    let code =
+        oauth::wait_for_callback(&listener, &pkce.state, std::time::Duration::from_secs(180))
+            .map_err(|error| ApiError::Rejected(error.to_string()))?;
+    drop(listener);
+    client.admin_connector_oauth_complete(id, &code, &pkce.verifier, &redirect)?;
+    Ok(Reply::OAuthSignedIn {
+        id: id.to_owned(),
+        device_code: None,
+    })
+}
+
 fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
     let client = ApiClient::new(
         job.credentials.endpoint.clone(),
@@ -462,6 +516,9 @@ fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
             .admin_set_connector(id, update)
             .map(|_| Reply::AdminSaved),
         Operation::OAuthSignIn { id, kind } => oauth_sign_in(&client, id, kind),
+        Operation::ConnectorOAuthSignIn { id, callback_uri } => {
+            connector_oauth_sign_in(&client, id, callback_uri)
+        }
         Operation::TestConnector { id } => {
             client.admin_test_connector(id).map(Reply::ConnectorTested)
         }

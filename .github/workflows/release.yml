@@ -67,6 +67,8 @@ jobs:
             serabot-desktop-latest-windows-x64.zip
 
   mobile:
+    # TEMPORARY: mobile (Flutter APK/AAB) build disabled for this release.
+    if: false
     runs-on: ubuntu-latest
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
@@ -139,7 +141,8 @@ jobs:
             apps/serabot_mobile/serabot-mobile-latest.aab
 
   publish:
-    needs: [desktop, mobile]
+    # TEMPORARY: mobile job is disabled above, so publish needs desktop only.
+    needs: [desktop]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
