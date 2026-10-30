@@ -1,0 +1,21 @@
+# Deploy-only sshd instance for SeraBot releases. Runs as its OWN service on
+# port 2222 (deploy/serabot-deploy-sshd.service); the existing sshd on port 22
+# is never modified.
+Port 2222
+ListenAddress 0.0.0.0
+HostKey /etc/ssh/ssh_host_ed25519_key
+
+# Only CA-signed user certs are accepted (CA key in /opt/serabot-deploy).
+TrustedUserCAKeys /opt/serabot-deploy/ca_key.pub
+AuthorizedKeysFile none
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+AllowUsers deploy
+
+# The cert already carries force-command; this is the second line of defense.
+ForceCommand sudo /opt/serabot-deploy/deploy.sh
+
+PidFile /run/serabot-deploy-sshd.pid
+LogLevel VERBOSE

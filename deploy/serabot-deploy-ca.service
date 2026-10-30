@@ -1,0 +1,19 @@
+[Unit]
+Description=SeraBot deploy CA broker (GitHub OIDC -> 10-min SSH certs)
+After=network.target
+
+[Service]
+Type=simple
+User=deployca
+Group=deployca
+ExecStart=/usr/bin/python3 /opt/serabot-deploy/deploy-ca.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/serabot-deploy
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

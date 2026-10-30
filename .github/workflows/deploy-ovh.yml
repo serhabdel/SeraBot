@@ -1,0 +1,134 @@
+name: deploy-ovh
+
+# Server deploy to the OVH VPS. MANUAL ONLY: Run workflow with an existing
+# release tag. Never triggered by push or pull requests.
+#
+# Safety model:
+# - The deploy job runs in the protected `ovh-deploy` environment with the
+#   owner as a required reviewer. Approving the run is the remote-change
+#   authorization; the exact manifest (deploy/deploy.sh) is printed in the
+#   log first.
+# - No SSH key is stored in GitHub. The job gets a GitHub OIDC token
+#   (id-token: write) and exchanges it at the VPS CA broker for a 10-minute
+#   SSH certificate whose only permitted command is the deploy script.
+#   Fork PRs cannot obtain environment secrets or OIDC tokens for this env.
+# - The build job runs on pinned ubuntu-24.04 (the VPS runs Ubuntu 24.04,
+#   glibc 2.39) and fails if the binary requires a newer glibc. The deploy
+#   script re-verifies the release SHA256SUMS and the host glibc before
+#   swapping, and rolls back automatically if the service does not come up.
+# - The deploy touches only /opt/serabot/serabot, /var/lib/serabot/releases
+#   and /var/lib/serabot/backups, and restarts only serabot.service.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to deploy, for example v0.8.0"
+        required: true
+        type: string
+
+permissions:
+  id-token: write   # OIDC token for the VPS-side CA broker
+  contents: write   # attach the server binary to the release
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04  # pinned: VPS is Ubuntu 24.04, glibc 2.39
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Record checked-out commit
+        shell: bash
+        run: echo "SERABOT_BUILD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Validate tag
+        shell: bash
+        run: |
+          if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "tag must look like v0.8.0" >&2
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build server release (glibc-matched)
+        env:
+          SERABOT_RELEASES_REPO: ${{ github.repository }}
+        run: cargo build --release --locked -p serabot
+      - name: Verify glibc ceiling against the VPS
+        shell: bash
+        run: |
+          MAX=$(objdump -T target/release/serabot | grep -o 'GLIBC_2\.[0-9]*' | sort -uV | tail -1)
+          echo "highest required glibc symbol: $MAX (VPS has 2.39)"
+          if [[ "$MAX" > "GLIBC_2.39" ]]; then
+            echo "binary requires newer glibc than the VPS; aborting" >&2
+            exit 1
+          fi
+      - name: Attach server binary to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp target/release/serabot serabot-linux-x64
+          sha256sum serabot-linux-x64
+          gh release upload "${{ inputs.tag }}" serabot-linux-x64 --clobber
+      - name: Refresh release SHA256SUMS with the server binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p sums && cd sums
+          gh release download "${{ inputs.tag }}" --pattern SHA256SUMS
+          echo "$(sha256sum ../serabot-linux-x64 | cut -d' ' -f1)  serabot-linux-x64" >> SHA256SUMS
+          LC_ALL=C sort -o SHA256SUMS SHA256SUMS
+          gh release upload "${{ inputs.tag }}" SHA256SUMS --clobber
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: ovh-deploy  # required reviewer: owner; secrets never leave this env
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Print the exact remote manifest
+        run: cat deploy/deploy.sh
+      - name: Request OIDC token (audience serabot-deploy)
+        shell: bash
+        run: |
+          RESPONSE=$(curl -s -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            -H "Accept: application/json" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=serabot-deploy")
+          echo "$RESPONSE" > /tmp/oidc.json
+          python3 -c 'import json; d=json.load(open("/tmp/oidc.json")); assert "value" in d, d; print("::add-mask::" + d["value"])' > /tmp/mask.txt
+          cat /tmp/mask.txt
+          python3 -c 'import json; open("/tmp/oidc-token","w").write(json.load(open("/tmp/oidc.json"))["value"])'
+      - name: Mint a 10-minute SSH cert from the VPS CA broker
+        shell: bash
+        run: |
+          ssh-keygen -t ed25519 -N "" -f /tmp/deploy_key -q
+          python3 - <<'PY'
+          import json
+          token = open("/tmp/oidc-token").read().strip()
+          pubkey = open("/tmp/deploy_key.pub").read().strip()
+          json.dump({"token": token, "pubkey": pubkey}, open("/tmp/sign-req.json", "w"))
+          PY
+          curl -s --fail -X POST "https://${{ vars.OVH_VPS_IP }}:8788/sign" \
+            -H "Content-Type: application/json" --data @/tmp/sign-req.json > /tmp/sign-resp.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open("/tmp/sign-resp.json"))
+          assert "cert" in d, d
+          open("/tmp/deploy_key-cert.pub", "w").write(d["cert"])
+          PY
+          echo "cert minted for principal deploy (valid 10m, forced command only)"
+      - name: Run the deploy (forced command on the VPS, port 2222)
+        shell: bash
+        run: |
+          ssh -p 2222 -i /tmp/deploy_key -o CertificateFile=/tmp/deploy_key-cert.pub \
+            -o UserKnownHostsFile=deploy/known_hosts.deploy -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=15 \
+            deploy@${{ vars.OVH_VPS_IP }} "deploy ${{ inputs.tag }}"
+      - name: Post-deploy smoke (public, no token)
+        shell: bash
+        run: |
+          curl -s "https://bot.seradyx.tech/healthz"
+          echo
+          curl -s -o /dev/null -w 'CIMD route: %{http_code}\n' \
+            "https://bot.seradyx.tech/.well-known/serabot-oauth-client.json"

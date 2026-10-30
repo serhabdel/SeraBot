@@ -305,3 +305,10 @@ Owner verification (after approval-capable bot, e.g. maker):
 Tests use synthetic fixtures. Do not describe providers, Telegram, OneDrive, or
 the desktop client as live until the owner has verified them against the real
 account. The API alone is live on OVH.
+
+## Automated upgrades
+
+`deploy-ovh.yml` (manual dispatch on a release tag, owner-approved `ovh-deploy`
+environment, OIDC-only auth, no stored SSH key) can replace the manual steps
+above end to end. See [deploy-automation.md](deploy-automation.md); the
+one-time additive VPS setup manifest lives there too.
