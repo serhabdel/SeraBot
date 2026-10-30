@@ -63,6 +63,8 @@ pub const MAX_OPS: usize = 256;
 pub const MAX_LISTED_BLOCKS: usize = 400;
 /// Characters of block text an inspection shows per block.
 pub const MAX_PREVIEW_CHARS: usize = 160;
+/// Hard ceiling for the blocks one `docx_read` call returns.
+pub const MAX_READ_BLOCKS: usize = 50;
 /// Hard ceiling for the blocks one build spec may produce.
 pub const MAX_BUILD_BLOCKS: usize = 2000;
 /// Hard ceiling for a table's columns.
@@ -365,21 +367,31 @@ fn count_images(block: &Block, depth: usize) -> usize {
 }
 
 fn table_text(table: &Table) -> String {
-    let mut rows = Vec::with_capacity(table.rows.len());
-    for row in &table.rows {
-        let mut cells = Vec::with_capacity(row.cells.len());
-        for cell in &row.cells {
-            let text: Vec<String> = cell
-                .blocks
-                .iter()
-                .filter_map(|block| block.as_para().map(|paragraph| paragraph.plain_text()))
-                .filter(|text| !text.is_empty())
-                .collect();
-            cells.push(text.join(" / "));
-        }
-        rows.push(cells.join(" | "));
-    }
-    rows.join(" ;; ")
+    table_cells(table)
+        .into_iter()
+        .map(|cells| cells.join(" | "))
+        .collect::<Vec<_>>()
+        .join(" ;; ")
+}
+
+/// A cell's text: its paragraphs joined, empty paragraphs dropped.
+fn cell_text(cell: &Cell) -> String {
+    let parts: Vec<String> = cell
+        .blocks
+        .iter()
+        .filter_map(|block| block.as_para().map(|paragraph| paragraph.plain_text()))
+        .filter(|text| !text.is_empty())
+        .collect();
+    parts.join(" / ")
+}
+
+/// Every cell's text, row by row.
+fn table_cells(table: &Table) -> Vec<Vec<String>> {
+    table
+        .rows
+        .iter()
+        .map(|row| row.cells.iter().map(cell_text).collect())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -490,6 +502,147 @@ pub fn inspect(bytes: &[u8]) -> Result<DocxInfo> {
         truncated: block_count > MAX_LISTED_BLOCKS,
         images,
         tables,
+        blocks,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Full block text
+// ---------------------------------------------------------------------------
+
+/// One block's complete text, for reading before an edit.
+///
+/// `text` is the whole block unless it is longer than [`MAX_BLOCK_CHARS`], in
+/// which case `text_truncated` is set and `chars` still reports the real
+/// length. A table also carries its cells, so no cell text is lost when the
+/// joined form is clipped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocxBlockText {
+    pub index: usize,
+    pub kind: DocxBlockKind,
+    pub style: Option<String>,
+    /// The block's text, complete up to [`MAX_BLOCK_CHARS`].
+    pub text: String,
+    /// Characters of text in the block, before any clipping.
+    pub chars: usize,
+    pub has_image: bool,
+    pub list_level: Option<u8>,
+    pub rows: Option<usize>,
+    pub cols: Option<usize>,
+    /// Cell texts row by row, for a table block.
+    pub cells: Option<Vec<Vec<String>>>,
+    /// True when `text` (or a cell) holds fewer characters than `chars`.
+    pub text_truncated: bool,
+}
+
+/// The blocks one read returned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocxText {
+    pub block_count: usize,
+    /// First block index included.
+    pub from: usize,
+    /// Last block index included, inclusive.
+    pub to: usize,
+    pub blocks: Vec<DocxBlockText>,
+}
+
+/// Clip text to [`MAX_BLOCK_CHARS`], reporting whether anything was dropped.
+fn clip_to_block(text: &str) -> (String, bool) {
+    if text.chars().count() <= MAX_BLOCK_CHARS {
+        return (text.to_owned(), false);
+    }
+    (text.chars().take(MAX_BLOCK_CHARS).collect(), true)
+}
+
+/// The complete text of an inclusive block range. Never mutates anything.
+///
+/// The range is bounded: more than [`MAX_READ_BLOCKS`] blocks is an error that
+/// names the range, never a silent truncation.
+pub fn read_blocks(bytes: &[u8], from: usize, to: usize) -> Result<DocxText> {
+    let document = load(bytes)?;
+    let block_count = document.body.len();
+    if from > to {
+        return Err(invalid(format!(
+            "from ({from}) must not be greater than to ({to})"
+        )));
+    }
+    if to >= block_count {
+        return Err(invalid(format!(
+            "block {to} is out of range; the document has {block_count} block(s), so a block index is 0..{}",
+            block_count.saturating_sub(1)
+        )));
+    }
+    let requested = to - from + 1;
+    if requested > MAX_READ_BLOCKS {
+        return Err(invalid(format!(
+            "the range {from}..={to} covers {requested} blocks; docx_read returns at most \
+             {MAX_READ_BLOCKS} blocks per call — narrow the range"
+        )));
+    }
+
+    let mut blocks = Vec::with_capacity(requested);
+    for index in from..=to {
+        let block = document
+            .body
+            .get(index)
+            .ok_or_else(|| out_of_range(index, block_count))?;
+        match block.as_ref() {
+            Block::Para(paragraph) => {
+                let full = paragraph.plain_text();
+                let chars = full.chars().count();
+                let (text, text_truncated) = clip_to_block(&full);
+                blocks.push(DocxBlockText {
+                    index,
+                    kind: DocxBlockKind::Paragraph,
+                    style: paragraph.props.style.clone(),
+                    text,
+                    chars,
+                    has_image: block_has_image(block, 0),
+                    list_level: paragraph
+                        .props
+                        .numbering
+                        .as_ref()
+                        .map(|numbering| numbering.level),
+                    rows: None,
+                    cols: None,
+                    cells: None,
+                    text_truncated,
+                });
+            }
+            Block::Table(table) => {
+                let full = table_text(table);
+                let chars = full.chars().count();
+                let (text, mut text_truncated) = clip_to_block(&full);
+                let mut cells = Vec::with_capacity(table.rows.len());
+                for row in &table.rows {
+                    let mut row_cells = Vec::with_capacity(row.cells.len());
+                    for cell in &row.cells {
+                        let (cell_text, clipped) = clip_to_block(&cell_text(cell));
+                        text_truncated = text_truncated || clipped;
+                        row_cells.push(cell_text);
+                    }
+                    cells.push(row_cells);
+                }
+                blocks.push(DocxBlockText {
+                    index,
+                    kind: DocxBlockKind::Table,
+                    style: table.props.style.clone(),
+                    text,
+                    chars,
+                    has_image: block_has_image(block, 0),
+                    list_level: None,
+                    rows: Some(table.rows.len()),
+                    cols: Some(table.cols()),
+                    cells: Some(cells),
+                    text_truncated,
+                });
+            }
+        }
+    }
+    Ok(DocxText {
+        block_count,
+        from,
+        to,
         blocks,
     })
 }
@@ -1293,8 +1446,10 @@ impl Tool for DocxInspectTool {
             description:
                 "Inspect a .docx artifact and return its addressable blocks. A block is a \
                  paragraph or a table, numbered from 0 in document order; each entry carries the \
-                 index, kind, style, a text preview, and whether it holds an image. Packages with \
-                 macros, ActiveX parts, remote references, or a password are rejected."
+                 index, kind, style, a text preview, `chars` (the block's real character count), \
+                 and whether it holds an image. A preview shorter than `chars` means the block was \
+                 cut: call `docx_read` for the full text before editing it. Packages with macros, \
+                 ActiveX parts, remote references, or a password are rejected."
                     .into(),
             parameters: json!({
                 "type": "object",
@@ -1332,6 +1487,156 @@ impl Tool for DocxInspectTool {
     }
 }
 
+pub struct DocxReadTool {
+    artifacts: Arc<ArtifactStore>,
+}
+
+impl DocxReadTool {
+    pub fn new(artifacts: Arc<ArtifactStore>) -> Self {
+        Self { artifacts }
+    }
+}
+
+/// Which blocks a read addresses.
+enum Selection {
+    Single(usize),
+    Range(usize, usize),
+}
+
+fn index_argument(args: &Value, key: &str) -> Result<Option<usize>> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    let number = value
+        .as_u64()
+        .ok_or_else(|| invalid(format!("{key} must be a non-negative integer")))?;
+    let index =
+        usize::try_from(number).map_err(|_| invalid(format!("{key} is too large for an index")))?;
+    Ok(Some(index))
+}
+
+fn read_selection(args: &Value) -> Result<Selection> {
+    let block = index_argument(args, "block")?;
+    let from = index_argument(args, "from")?;
+    let to = index_argument(args, "to")?;
+    match (block, from, to) {
+        (Some(index), None, None) => Ok(Selection::Single(index)),
+        (None, Some(from), Some(to)) => Ok(Selection::Range(from, to)),
+        (None, None, None) => Err(invalid("provide `block`, or `from` and `to`")),
+        (None, Some(_), None) => Err(invalid("`from` needs `to` as well")),
+        (None, None, Some(_)) => Err(invalid("`to` needs `from` as well")),
+        (Some(_), _, _) => Err(invalid(
+            "provide either `block` or `from` and `to`, not both",
+        )),
+    }
+}
+
+/// Human-readable dump of a read range. Tables are shown row by row so the
+/// model can see every cell, not a joined rendering it has to re-split.
+fn block_text_listing(text: &DocxText) -> String {
+    let mut listing = format!(
+        "blocks: {}\nreading: {}..={} ({} block(s))\n\n",
+        text.block_count,
+        text.from,
+        text.to,
+        text.blocks.len()
+    );
+    for block in &text.blocks {
+        let kind = match block.kind {
+            DocxBlockKind::Paragraph => "paragraph",
+            DocxBlockKind::Table => "table",
+        };
+        let style = block.style.as_deref().unwrap_or("-");
+        let mut flags = Vec::new();
+        if block.has_image {
+            flags.push("image".to_owned());
+        }
+        if let Some(level) = block.list_level {
+            flags.push(format!("list level {level}"));
+        }
+        if let (Some(rows), Some(cols)) = (block.rows, block.cols) {
+            flags.push(format!("{rows}x{cols}"));
+        }
+        let flags = if flags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", flags.join(", "))
+        };
+        listing.push_str(&format!(
+            "[{}] {kind} style={style} chars={}{flags}\n",
+            block.index, block.chars
+        ));
+        match &block.cells {
+            Some(cells) => {
+                for (row, row_cells) in cells.iter().enumerate() {
+                    listing.push_str(&format!("  row {row}: {}\n", row_cells.join(" | ")));
+                }
+            }
+            None => {
+                listing.push_str(&block.text);
+                listing.push('\n');
+            }
+        }
+        if block.text_truncated {
+            listing.push_str(&format!(
+                "  (this block holds {} characters; only the first {MAX_BLOCK_CHARS} are shown)\n",
+                block.chars
+            ));
+        }
+    }
+    listing
+}
+
+#[async_trait]
+impl Tool for DocxReadTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "docx_read".into(),
+            description:
+                "Read the complete text of one .docx block, or of an inclusive range of blocks. Use \
+                 this before `docx_edit`'s replace_text, which replaces the whole block: the \
+                 preview `docx_inspect` returns is capped, so editing from it would destroy text \
+                 you never saw. Returns per block the index, kind, style, full text, character \
+                 count, and whether it holds an image; a table also returns its row and column \
+                 counts and every cell's text. Read-only: nothing is written and no artifact is \
+                 produced. At most 50 blocks per call; a wider range is an error, not a truncation."
+                    .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "artifact": {"type": "string", "description": "Artifact hash of the .docx"},
+                    "block": {"type": "integer", "description": "A single zero-based block index"},
+                    "from": {"type": "integer", "description": "First block index of an inclusive range"},
+                    "to": {"type": "integer", "description": "Last block index of an inclusive range"}
+                },
+                "required": ["artifact"],
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+        reject_unknown_keys(&args, &["artifact", "block", "from", "to"])?;
+        let hash = required_artifact(&args)?;
+        let (from, to) = match read_selection(&args)? {
+            Selection::Single(index) => (index, index),
+            Selection::Range(from, to) => (from, to),
+        };
+        let stored = self.artifacts.load(&hash)?;
+        let bytes = stored.bytes;
+        let text = tokio::task::spawn_blocking(move || read_blocks(&bytes, from, to))
+            .await
+            .map_err(|error| SeraError::Internal(format!("DOCX task failed: {error}")))??;
+        let data = serde_json::to_value(&text)?;
+        Ok(ToolOutput {
+            content: block_text_listing(&text),
+            data: Some(data),
+            ..ToolOutput::default()
+        })
+    }
+}
+
 pub struct DocxEditTool {
     artifacts: Arc<ArtifactStore>,
     store: Store,
@@ -1352,8 +1657,9 @@ impl Tool for DocxEditTool {
                 "Apply bounded block operations to a .docx artifact and store the result as a new \
                  artifact that records its source. Operations are replace_text {index, text}, \
                  insert_paragraph {index, text, optional style}, delete_block {index}, and \
-                 apply_style {index, style}. Every index is validated against the document before \
-                 anything is written, and inline images are preserved."
+                 apply_style {index, style}. replace_text replaces the block's ENTIRE text, so call \
+                 docx_read first and supply the full replacement text. Every index is validated \
+                 against the document before anything is written, and inline images are preserved."
                     .into(),
             parameters: json!({
                 "type": "object",
@@ -1650,6 +1956,55 @@ mod tests {
         serde_json::from_value(value).expect("the fixture ops deserialise")
     }
 
+    fn paragraph_block(text: &str) -> DocxBlockSpec {
+        DocxBlockSpec {
+            kind: "paragraph".into(),
+            level: None,
+            text: Some(text.into()),
+            items: Vec::new(),
+            header: Vec::new(),
+            rows: Vec::new(),
+        }
+    }
+
+    fn table_block() -> DocxBlockSpec {
+        DocxBlockSpec {
+            kind: "table".into(),
+            level: None,
+            text: None,
+            items: Vec::new(),
+            header: vec!["Header A".into(), "Header B".into()],
+            rows: vec![vec!["Value 1".into(), "Value 2".into()]],
+        }
+    }
+
+    /// A paragraph well past [`MAX_PREVIEW_CHARS`], with numbered words so a
+    /// single changed word is detectable.
+    fn long_text() -> String {
+        let mut text = String::new();
+        let mut index = 0usize;
+        while text.chars().count() < 2000 {
+            text.push_str(&format!("word{index} "));
+            index += 1;
+        }
+        text
+    }
+
+    /// title, one long paragraph, one short paragraph, one table, and the empty
+    /// paragraph a body keeps after a trailing table.
+    fn long_spec(long: &str) -> DocxSpec {
+        DocxSpec {
+            title: "Long Fixture".into(),
+            subtitle: None,
+            language: None,
+            blocks: vec![
+                paragraph_block(long),
+                paragraph_block("Short paragraph."),
+                table_block(),
+            ],
+        }
+    }
+
     /// A document with one image paragraph and one text paragraph.
     fn document_with_image() -> Document {
         let mut document = Document::new();
@@ -1726,6 +2081,255 @@ mod tests {
         assert_eq!(info.blocks[6].cols, Some(2));
         assert!(info.blocks[6].text.contains("Header A"));
         assert_eq!(info.blocks[7].text, "");
+    }
+
+    #[test]
+    fn read_returns_a_long_block_in_full() {
+        let long = long_text();
+        let bytes = build(&long_spec(&long)).expect("the fixture spec builds");
+
+        // The inspection preview is genuinely partial, and `chars` says by how much.
+        let info = inspect(&bytes).expect("the built document inspects");
+        assert_eq!(info.blocks[1].chars, long.chars().count());
+        assert!(info.blocks[1].chars > MAX_PREVIEW_CHARS);
+        assert!(
+            info.blocks[1].text.chars().count() < info.blocks[1].chars,
+            "the preview must be shorter than the block"
+        );
+
+        let text = read_blocks(&bytes, 1, 1).expect("the long block reads");
+        assert_eq!(text.blocks.len(), 1);
+        assert_eq!(text.blocks[0].index, 1);
+        assert_eq!(text.blocks[0].kind, DocxBlockKind::Paragraph);
+        assert_eq!(text.blocks[0].text, long, "the full text must come back");
+        assert_eq!(text.blocks[0].chars, long.chars().count());
+        assert!(!text.blocks[0].text_truncated);
+    }
+
+    #[test]
+    fn read_returns_a_range_in_order_with_table_cells() {
+        let long = long_text();
+        let bytes = build(&long_spec(&long)).expect("the fixture spec builds");
+        let text = read_blocks(&bytes, 1, 3).expect("the range reads");
+
+        assert_eq!(text.from, 1);
+        assert_eq!(text.to, 3);
+        assert_eq!(text.block_count, 5);
+        assert_eq!(text.blocks.len(), 3);
+        assert_eq!(
+            text.blocks
+                .iter()
+                .map(|block| block.index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(text.blocks[0].text, long);
+        assert_eq!(text.blocks[1].text, "Short paragraph.");
+        assert_eq!(text.blocks[2].kind, DocxBlockKind::Table);
+        assert_eq!(text.blocks[2].rows, Some(2));
+        assert_eq!(text.blocks[2].cols, Some(2));
+        let cells = text.blocks[2].cells.as_ref().expect("a table has cells");
+        assert_eq!(cells[0], vec!["Header A", "Header B"]);
+        assert_eq!(cells[1], vec!["Value 1", "Value 2"]);
+        assert!(text.blocks[2].text.contains("Header A"));
+    }
+
+    #[test]
+    fn read_rejects_a_range_over_the_block_cap_instead_of_truncating() {
+        let many = DocxSpec {
+            title: "Many Blocks".into(),
+            subtitle: None,
+            language: None,
+            blocks: (0..60)
+                .map(|index| paragraph_block(&format!("paragraph {index}")))
+                .collect(),
+        };
+        let bytes = build(&many).expect("the fixture spec builds");
+        // 61 blocks: the title plus 60 paragraphs.
+        assert_eq!(inspect(&bytes).expect("inspect").block_count, 61);
+
+        let error = read_blocks(&bytes, 0, 60).expect_err("a range over the cap is rejected");
+        let message = error.to_string();
+        assert!(message.contains("narrow the range"), "{message}");
+        assert!(message.contains(&MAX_READ_BLOCKS.to_string()), "{message}");
+
+        // Exactly the cap is allowed, and nothing is dropped from it.
+        let text = read_blocks(&bytes, 0, MAX_READ_BLOCKS - 1).expect("a capped range reads");
+        assert_eq!(text.blocks.len(), MAX_READ_BLOCKS);
+        assert_eq!(text.blocks[0].text, "Many Blocks");
+        assert_eq!(
+            text.blocks[MAX_READ_BLOCKS - 1].text,
+            format!("paragraph {}", MAX_READ_BLOCKS - 2)
+        );
+    }
+
+    #[test]
+    fn read_flags_a_block_that_exceeds_the_per_block_cap() {
+        // A table's joined text can pass MAX_BLOCK_CHARS even when every cell is
+        // under it. The read must say so instead of clipping silently, and the
+        // cells must still carry their full text.
+        let cell = "c".repeat(700);
+        let spec = DocxSpec {
+            title: "Wide Table".into(),
+            subtitle: None,
+            language: None,
+            blocks: vec![DocxBlockSpec {
+                kind: "table".into(),
+                level: None,
+                text: None,
+                items: Vec::new(),
+                header: (0..MAX_TABLE_COLUMNS).map(|_| cell.clone()).collect(),
+                rows: Vec::new(),
+            }],
+        };
+        let bytes = build(&spec).expect("the fixture spec builds");
+        let info = inspect(&bytes).expect("the built document inspects");
+        let table_index = info
+            .blocks
+            .iter()
+            .position(|block| block.kind == DocxBlockKind::Table)
+            .expect("the fixture has a table");
+
+        let text = read_blocks(&bytes, table_index, table_index).expect("the table reads");
+        let block = &text.blocks[0];
+        assert!(
+            block.chars > MAX_BLOCK_CHARS,
+            "the joined text is over the cap: {}",
+            block.chars
+        );
+        assert!(block.text_truncated, "clipping must be reported");
+        assert_eq!(block.text.chars().count(), MAX_BLOCK_CHARS);
+        let cells = block.cells.as_ref().expect("a table has cells");
+        assert_eq!(cells[0].len(), MAX_TABLE_COLUMNS);
+        assert!(
+            cells[0].iter().all(|text| text.chars().count() == 700),
+            "every cell keeps its full text"
+        );
+    }
+
+    #[test]
+    fn read_then_replace_keeps_every_other_character() {
+        let long = long_text();
+        let bytes = build(&long_spec(&long)).expect("the fixture spec builds");
+
+        let read = read_blocks(&bytes, 1, 1).expect("the long block reads");
+        let full = read.blocks[0].text.clone();
+        let expected = full.replacen("word7 ", "WORD7 ", 1);
+        assert_ne!(expected, full, "the fixture word must exist");
+        // Same length, so a loss anywhere else would show up as a shorter block.
+        assert_eq!(expected.chars().count(), full.chars().count());
+
+        let mut document = load(&bytes).expect("the built document loads");
+        apply_ops(
+            &mut document,
+            &ops(json!([{"op": "replace_text", "index": 1, "text": expected.clone()}])),
+        )
+        .expect("the replacement applies");
+        let written = save(&document).expect("the edited document writes");
+
+        let again = read_blocks(&written, 1, 1).expect("the edited block reads");
+        assert_eq!(again.blocks[0].text, expected);
+        assert_eq!(again.blocks[0].chars, expected.chars().count());
+
+        // Nothing outside the edited block moved.
+        let before = inspect(&bytes).expect("the source inspects");
+        let after = inspect(&written).expect("the result inspects");
+        assert_eq!(after.block_count, before.block_count);
+        for index in [0usize, 2, 3, 4] {
+            assert_eq!(
+                after.blocks[index].text, before.blocks[index].text,
+                "block {index} must be untouched"
+            );
+            assert_eq!(after.blocks[index].chars, before.blocks[index].chars);
+        }
+    }
+
+    #[test]
+    fn read_rejects_bad_selections() {
+        let bytes = build(&spec()).expect("the fixture spec builds");
+        assert!(read_blocks(&bytes, 3, 2).is_err(), "from > to");
+        assert!(read_blocks(&bytes, 0, 999).is_err(), "out of range");
+        assert!(read_blocks(&bytes, 999, 999).is_err(), "out of range");
+    }
+
+    #[tokio::test]
+    async fn read_tool_is_read_only_and_validates_its_selection() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let artifacts = Arc::new(ArtifactStore::new(directory.path()).expect("an artifact store"));
+        let long = long_text();
+        let built = build(&long_spec(&long)).expect("the fixture spec builds");
+        let hash = artifacts
+            .save(
+                &built,
+                "long.docx",
+                ArtifactMeta {
+                    title: "Long Fixture".into(),
+                    filename: "long.docx".into(),
+                    language: Language::En,
+                    source_artifact: None,
+                    created_at: Utc::now(),
+                },
+            )
+            .expect("the fixture is stored")
+            .hash;
+        let files_before = std::fs::read_dir(directory.path())
+            .expect("the store is readable")
+            .count();
+        let tool = DocxReadTool::new(artifacts.clone());
+
+        let output = tool
+            .execute(json!({"artifact": hash, "block": 1}), &context("docx_read"))
+            .await
+            .expect("the tool reads a block");
+        assert!(output.content.contains(&long), "the full text is returned");
+        assert!(output.artifact_hash.is_none(), "a read writes no artifact");
+        assert!(output.artifact_path.is_none());
+        assert!(output.filename.is_none());
+        assert!(output.destination.is_none());
+        let data = output.data.expect("structured data");
+        assert_eq!(data["blocks"][0]["chars"], json!(long.chars().count()));
+
+        let files_after = std::fs::read_dir(directory.path())
+            .expect("the store is readable")
+            .count();
+        assert_eq!(files_after, files_before, "a read stores nothing");
+
+        // `block` and `from`/`to` are mutually exclusive.
+        assert!(
+            tool.execute(
+                json!({"artifact": hash, "block": 1, "from": 1, "to": 2}),
+                &context("docx_read"),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            tool.execute(json!({"artifact": hash, "from": 1}), &context("docx_read"))
+                .await
+                .is_err()
+        );
+        assert!(
+            tool.execute(json!({"artifact": hash}), &context("docx_read"))
+                .await
+                .is_err()
+        );
+        assert!(
+            tool.execute(
+                json!({"artifact": hash, "block": 1, "colour": "red"}),
+                &context("docx_read"),
+            )
+            .await
+            .is_err()
+        );
+
+        let range = tool
+            .execute(
+                json!({"artifact": hash, "from": 1, "to": 3}),
+                &context("docx_read"),
+            )
+            .await
+            .expect("the tool reads a range");
+        assert!(range.content.contains("row 1: Value 1 | Value 2"));
     }
 
     #[test]

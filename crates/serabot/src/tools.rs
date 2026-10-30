@@ -680,6 +680,7 @@ pub fn register_docx_tools(
         store.clone(),
     ))?;
     registry.register(crate::docx_ops::DocxEditTool::new(artifacts.clone(), store))?;
-    registry.register(crate::docx_ops::DocxInspectTool::new(artifacts))?;
+    registry.register(crate::docx_ops::DocxInspectTool::new(artifacts.clone()))?;
+    registry.register(crate::docx_ops::DocxReadTool::new(artifacts))?;
     Ok(())
 }
