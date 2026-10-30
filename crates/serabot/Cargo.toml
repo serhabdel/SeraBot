@@ -21,6 +21,12 @@ chrono-tz = "0.9"
 clap = { version = "4", features = ["derive", "env"] }
 fastembed = { version = "4", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
 futures = "0.3"
+# XLSX creation/editing. Pinned to the v0.9.0 revision; the crate's path dependencies
+# (gridcraft-core, gridcraft-model, gridcraft-formula) resolve from the same repository.
+# gridcraft-calc is deliberately absent: SeraBot never evaluates formulas.
+gridcraft-core = { git = "https://github.com/storytold/gridcraft", rev = "a2cc4b42cac6e2c41bae71fba4607300755a0b47" }
+gridcraft-model = { git = "https://github.com/storytold/gridcraft", rev = "a2cc4b42cac6e2c41bae71fba4607300755a0b47" }
+gridcraft-xlsx = { git = "https://github.com/storytold/gridcraft", rev = "a2cc4b42cac6e2c41bae71fba4607300755a0b47" }
 hex = "0.4"
 lopdf = "0.34"
 printpdf = "0.7"

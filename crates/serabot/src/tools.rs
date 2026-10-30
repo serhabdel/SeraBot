@@ -10,11 +10,13 @@ use crate::embeddings::Embedder;
 use crate::error::{Result, SeraError};
 use crate::fetch::SafeFetcher;
 use crate::gateway::{Tool, ToolContext, ToolOutput, ToolSpec};
+use crate::maker::ArtifactStore;
 use crate::spreadsheets::{
     WorkbookLimits, analyze_workbook, parse_timesheet_rows, read_timesheet_csv,
 };
 use crate::store::Store;
 use crate::watcher::watch_all;
+use crate::workbooks::{XlsxBuildTool, XlsxEditTool, XlsxInspectTool};
 
 pub struct XlsxAnalyzeTool {
     root: PathBuf,
@@ -627,5 +629,18 @@ pub fn register_memory_tools(
     registry.register(MemorySaveTool::new(store.clone()))?;
     registry.register(MemoryListTool::new(store.clone()))?;
     registry.register(MemoryDeleteTool::new(store))?;
+    Ok(())
+}
+
+/// Register the workbook tools. Every artifact goes through the shared `ArtifactStore`, so an
+/// approval binds the artifact hash exactly as it does for decks.
+pub fn register_workbook_tools(
+    registry: &mut crate::gateway::ToolRegistry,
+    artifacts: std::sync::Arc<ArtifactStore>,
+    store: Store,
+) -> Result<()> {
+    registry.register(XlsxBuildTool::new(artifacts.clone(), store.clone()))?;
+    registry.register(XlsxEditTool::new(artifacts.clone(), store))?;
+    registry.register(XlsxInspectTool::new(artifacts))?;
     Ok(())
 }
