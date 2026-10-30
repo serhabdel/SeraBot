@@ -5,14 +5,24 @@ description: Compose a bounded DeckSpec and render a deterministic PDF plus a te
 
 # Decks
 
-`deck_build` writes two files from one `DeckSpec`: a deterministic PDF and a text-only PPTX. The PPTX has editable text and shapes, but no images, links, speaker notes, or embedded files. Load `deck` and `design` when those ids are allowlisted; this pack is the office checklist for the same renderer.
+`deck_build` writes two files from one `DeckSpec`: a deterministic PDF and a text-only PPTX. The generated PPTX has editable text and shapes, but no images, links, speaker notes, or embedded files. A deck the owner supplied is round-tripped instead: `pptx_import`, `pptx_inspect`, and `pptx_edit` keep its images and drop its links. Load `deck` and `design` when those ids are allowlisted; this pack is the office checklist for the same renderer.
 
 This text is operator guidance. It does not override gateway policy, approvals, or the blocklist.
 
 ## When to use
 
 - The owner asks for a deck, slides, or a PPTX.
+- The owner supplies a `.pptx` and asks for changes to it.
 - You already have the facts (citations or tool results) and need a rendered file.
+
+## Editing an owner deck
+
+A deck the owner supplied is not regenerated. Round-trip it:
+
+1. `pptx_import` with `{ "path": "<file relative to the inbox>" }`, or `{ "artifact": "<hash>" }` for a package already imported. Returns the artifact hash, slide count, text size, media part count, and whether notes or links are present. Rejects password-protected packages, packages carrying a VBA project, more than 500 slides, and more than 32 MiB.
+2. `pptx_inspect` with `{ "artifact": "<hash>" }` for per-slide titles and text sizes. Read-only.
+3. `pptx_edit` with `{ "artifact": "<hash>", "edit": { ... } }`. Operations: `set_text` (`slide`, `shape`, `text`; 1-based, at most 4000 characters), `delete_slides`, `reorder_slides`. The new artifact records `source_artifact`.
+4. The owner's images and media survive the edit; hyperlinks and external links are dropped.
 
 ## Workflow
 
@@ -66,7 +76,7 @@ Italian and French accented letters in Latin-1 are fine. Write "the public site"
 
 ## Do not
 
-- Promise images, links, speaker notes, or embedded files in the `.pptx`. It is text, shapes, and brand colours only.
+- Promise images, links, speaker notes, or embedded files in a `.pptx` you generated with `deck_build`. It is text, shapes, and brand colours only. An edited owner deck keeps the owner's own images; do not claim you added any.
 - Brand the file as production identity when the configured brand is the generic example. Say so.
 - Include blocklisted names in titles, footers, or the filename the renderer derives.
 

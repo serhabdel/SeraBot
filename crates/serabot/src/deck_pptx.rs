@@ -1,13 +1,16 @@
-//! PPTX export for bounded decks.
+//! PPTX export for generated decks.
 //!
-//! Export only. `deckcraft_pptx::import` is never called outside `#[cfg(test)]`:
-//! a deck is written from a validated [`DeckSpec`] and never read back in
-//! production.
+//! Export only. This module never imports a package: a deck is written from a
+//! validated [`DeckSpec`] and never read back in. Importing an owner-supplied
+//! package lives in [`crate::pptx_ops`], which is a separate tool path and is
+//! never reachable from `deck_build`.
 //!
 //! The package holds text, autoshapes, and theme colours derived from
 //! [`Brand`]. It has no images, media parts, hyperlinks, embedded workbooks,
 //! attachments, charts, transitions, or animations, and no font bytes: runs
 //! name the Helvetica family, the only family [`Brand::validate`] accepts.
+//! That text-only guarantee applies to *generated* decks only; an imported deck
+//! edited through `pptx_ops` keeps the owner's images.
 //!
 //! Every string written here has already passed [`crate::deck::validate`],
 //! which runs first and is the same gate the PDF renderer uses.

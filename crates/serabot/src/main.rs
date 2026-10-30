@@ -490,6 +490,13 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         store.clone(),
         config.path(&config.documents.watch_dir),
     )?;
+    #[cfg(feature = "pptx")]
+    serabot::tools::register_pptx_tools(
+        &mut registry,
+        artifacts.clone(),
+        store.clone(),
+        config.path(&config.documents.watch_dir),
+    )?;
     let fetcher = SafeFetcher::new(
         config.watcher.user_agent.clone(),
         config.watcher.timeout_secs,
