@@ -28,6 +28,8 @@ pub mod onedrive;
 pub mod orchestration;
 pub mod pdf_ops;
 pub mod policy;
+#[cfg(feature = "pptx")]
+pub mod pptx_ops;
 pub mod providers;
 pub mod render;
 pub mod retrieval;

@@ -11,10 +11,9 @@ path = "src/main.rs"
 
 [features]
 default = ["pptx"]
-# PPTX export beside the PDF deck (`deck_pptx`). Export only: the crate's
-# importer is used by tests, never by a production path. `deckcraft-model` is
-# the document model the writer consumes; it re-exports the colour and geometry
-# crates, so those stay transitive.
+# PPTX support (`deck_pptx` writes generated decks, `pptx_ops` round-trips
+# owner-supplied ones). `deckcraft-model` is the document model both consume; it
+# re-exports the colour and geometry crates, so those stay transitive.
 pptx = ["dep:deckcraft-pptx", "dep:deckcraft-model"]
 
 [dependencies]
@@ -66,6 +65,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 unicode-normalization = "0.1"
 url = "2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
+# Package inspection for the bounded PPTX round trip (`pptx_ops`): part count,
+# uncompressed size, VBA parts, and the post-export link check. Same version and
+# features deckcraft-pptx already resolves, so this adds no new crate.
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 zeroize = "1"
 
 [dev-dependencies]
@@ -73,5 +76,3 @@ http-body-util = "0.1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"
-# Already in the graph through deckcraft-pptx; used to inspect exported packages.
-zip = { version = "8.6", default-features = false, features = ["deflate"] }

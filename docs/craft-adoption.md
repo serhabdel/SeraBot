@@ -7,7 +7,7 @@ crates.io registry API. No private mirror was needed.
 
 SeraBot is Rust 1.95, MIT, `printpdf` 0.7, `lopdf` 0.34, desktop `eframe` 0.31.
 It takes exactly one thing from this organisation: the `deckcraft-pptx` crate,
-export only.
+used to write generated decks and to round-trip owner-supplied ones.
 
 ## The organisation today
 
@@ -72,28 +72,53 @@ Do not copy, from any of them:
   (krilla MIT OR Apache-2.0; Foxit standard-14 fonts BSD-3-Clause; Adobe CMap
   resources BSD-3-Clause).
 
-## Decision: `deckcraft-pptx`, export only
+## Decision: `deckcraft-pptx`, two bounded paths
 
 `crates/serabot/src/deck_pptx.rs` maps a validated `DeckSpec` plus `Brand` to a
 `deckcraft_model::Presentation` and calls `deckcraft_pptx::export`. The deck
 tool stores the result through `ArtifactStore` beside the PDF, so approval binds
 its hash exactly like the PDF's.
 
-The boundary, enforced by code and tests:
+`crates/serabot/src/pptx_ops.rs` adds the other direction for a package the
+owner supplied: `pptx_import` (inbox path or artifact hash), `pptx_inspect`
+(read-only; it lists each slide's shapes with the 1-based index `set_text`
+takes, so an edit addresses a shape it has seen rather than guessing), and
+`pptx_edit` (artifact hash plus a bounded edit spec). It is the only production
+caller of `deckcraft_pptx::import`, and `deck_build` cannot reach it.
 
-- **Export only.** `deckcraft_pptx::import` appears only under `#[cfg(test)]`,
-  where it round-trips the output to prove the text survives a reader. No
-  production path parses a package.
-- **No font embedding.** Runs name the `Helvetica` family; no font bytes are
-  passed, and `Brand::validate` accepts no other family.
-- **Text, shapes, theme colours.** No images, media parts, hyperlinks, embedded
-  workbooks, attachments, charts, transitions, or animations. The package test
+The split, enforced by code and tests:
+
+- **Generated decks stay text-only.** `deck_build` writes text, autoshapes, and
+  theme colours. No images, media parts, hyperlinks, embedded workbooks,
+  attachments, charts, transitions, animations, or font bytes. The package test
   asserts the absence of `ppt/media/`, `ppt/embeddings/`, `ppt/charts/`,
   `ppt/fonts/`, `<p:pic`, `<a:blip`, `hlinkClick`, `TargetMode="External"`,
   `r:embed`, `r:link`, `oleObject`, and `<p:timing`.
-- **One validation gate.** `deck_pptx` calls `deck::validate` first, with the
-  same page budget as `render::render_deck`. There is no second, weaker path.
-- **No new network, MCP server, or gateway.** The crate is a pure writer.
+- **Edited decks preserve images.** An imported deck's media parts are the
+  owner's content, not model output, so `pptx_edit` writes them back. The round
+  trip is asserted: build a deck with a synthetic PNG, export, import, edit the
+  text, export again, and check the image part is byte-identical and the text
+  changed.
+- **Hyperlinks and external links are dropped.** `pptx_edit` clears every
+  shape, run, note, master, and media link before export, and then refuses to
+  store a package whose `.rels` parts still carry `TargetMode="External"`.
+  Internal relationships (a slide jump, an embedded clip) are unaffected.
+- **Import is bounded and validated.** 32 MiB, 500 slides, 4096 zip parts,
+  128 MiB uncompressed, and 20 000 shapes. Password-protected packages and any
+  package carrying a VBA project (or a macro-enabled content type) are rejected
+  outright. Every edit index is range-checked before anything mutates, and the
+  edit spec is `#[serde(deny_unknown_fields)]`.
+- **One inbox path.** `ArtifactStore::ingest_inbox_file` is the single generic
+  inbox → artifact function: relative path only, canonicalised inside the
+  configured inbox, extension allowlist, size cap, and the caller's inspection
+  runs before anything is stored. No tool accepts a model-chosen absolute path.
+- **No font embedding.** Runs name the `Helvetica` family; no font bytes are
+  passed, and `Brand::validate` accepts no other family.
+- **One validation gate for generated decks.** `deck_pptx` calls
+  `deck::validate` first, with the same page budget as `render::render_deck`.
+  There is no second, weaker path.
+- **No new network, MCP server, or gateway.** The crate is a pure reader and
+  writer; the new tools are ordinary gateway tools with `external_effect: false`.
 
 This supersedes the earlier note that DesignCraft's PPTX export was unusable
 because it was bound to `designcraft-doc`. DeckCraft publishes a standalone
@@ -133,4 +158,5 @@ slide writer, and 0.6.1 is the version we compile.
 - Do not run PDF JavaScript, evaluate spreadsheet formulas, or host audio
   plugins from the agent.
 - Do not stage OCR, Whisper, or Kokoro weights in this repository.
-- Do not call `deckcraft_pptx::import` outside tests.
+- Do not call `deckcraft_pptx::import` outside `pptx_ops`, and never from
+  `deck_build`'s path.

@@ -666,3 +666,23 @@ pub fn register_workbook_tools(
     registry.register(XlsxInspectTool::new(artifacts))?;
     Ok(())
 }
+
+/// Register the bounded PPTX round-trip tools. Import reads only the configured
+/// inbox, inspect is read-only, and edit writes a new artifact through the
+/// shared store so `source_artifact` and the audit trail bind the input hash.
+#[cfg(feature = "pptx")]
+pub fn register_pptx_tools(
+    registry: &mut crate::gateway::ToolRegistry,
+    artifacts: std::sync::Arc<ArtifactStore>,
+    store: Store,
+    inbox: PathBuf,
+) -> Result<()> {
+    registry.register(crate::pptx_ops::PptxImportTool::new(
+        artifacts.clone(),
+        store.clone(),
+        inbox,
+    )?)?;
+    registry.register(crate::pptx_ops::PptxInspectTool::new(artifacts.clone()))?;
+    registry.register(crate::pptx_ops::PptxEditTool::new(artifacts, store))?;
+    Ok(())
+}
