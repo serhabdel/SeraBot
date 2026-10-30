@@ -20,6 +20,7 @@ tools = [
   "firecrawl_map",
   "firecrawl_search",
   "firecrawl_crawl",
+  "tavily_search",
   "elevenlabs_list_voices",
   "elevenlabs_text_to_speech",
   "elevenlabs_sound_effect",
@@ -30,6 +31,7 @@ tools = [
 require_approval = [
   "firecrawl_crawl",
   "firecrawl_search",
+  "tavily_search",
   "elevenlabs_text_to_speech",
   "elevenlabs_sound_effect",
   "elevenlabs_transcribe",

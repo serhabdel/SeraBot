@@ -31,6 +31,8 @@ pub struct Config {
     #[serde(default)]
     pub firecrawl: FirecrawlConfig,
     #[serde(default)]
+    pub tavily: TavilyConfig,
+    #[serde(default)]
     pub elevenlabs: ElevenLabsConfig,
     #[serde(default)]
     pub render: RenderConfig,
@@ -69,6 +71,7 @@ impl Default for Config {
             watcher: WatcherConfig::default(),
             onedrive: OneDriveConfig::default(),
             firecrawl: FirecrawlConfig::default(),
+            tavily: TavilyConfig::default(),
             elevenlabs: ElevenLabsConfig::default(),
             render: RenderConfig::default(),
             runtime: RuntimeConfig::default(),
@@ -737,6 +740,35 @@ impl Default for FirecrawlConfig {
             max_crawl_limit: default_firecrawl_max_crawl_limit(),
             crawl_poll_interval_ms: default_firecrawl_crawl_poll_ms(),
             crawl_max_wait_secs: default_firecrawl_crawl_max_wait_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TavilyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_tavily_api_base")]
+    pub api_base: String,
+    #[serde(default = "default_tavily_key_secret")]
+    pub api_key_secret: String,
+    #[serde(default = "default_tavily_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_tavily_max_results")]
+    pub max_results: u32,
+    #[serde(default = "default_tavily_max_content_chars")]
+    pub max_content_chars: usize,
+}
+
+impl Default for TavilyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_base: default_tavily_api_base(),
+            api_key_secret: default_tavily_key_secret(),
+            timeout_secs: default_tavily_timeout(),
+            max_results: default_tavily_max_results(),
+            max_content_chars: default_tavily_max_content_chars(),
         }
     }
 }
@@ -1668,6 +1700,21 @@ fn default_firecrawl_crawl_poll_ms() -> u64 {
 }
 fn default_firecrawl_crawl_max_wait_secs() -> u64 {
     300
+}
+fn default_tavily_api_base() -> String {
+    "https://api.tavily.com".into()
+}
+fn default_tavily_key_secret() -> String {
+    "tavily_api_key".into()
+}
+fn default_tavily_timeout() -> u64 {
+    60
+}
+fn default_tavily_max_results() -> u32 {
+    10
+}
+fn default_tavily_max_content_chars() -> usize {
+    20_000
 }
 fn default_brand_file() -> String {
     "config/brand.toml".into()

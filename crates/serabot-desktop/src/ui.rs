@@ -655,8 +655,8 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
             let mut quote_lines = Vec::new();
             while i < lines.len() {
                 let q_trim = lines[i].trim();
-                if q_trim.starts_with("> ") {
-                    quote_lines.push(q_trim[2..].trim().to_owned());
+                if let Some(stripped) = q_trim.strip_prefix("> ") {
+                    quote_lines.push(stripped.trim().to_owned());
                     i += 1;
                 } else if q_trim == ">" {
                     quote_lines.push(String::new());
@@ -799,9 +799,9 @@ pub fn parse_inline(text: &str) -> Vec<InlineSpan> {
             if let Some(end_code) = rest[3..].find('`') {
                 let code = &rest[3..3 + end_code];
                 let after_code = &rest[3 + end_code + 1..];
-                if after_code.starts_with("**") {
+                if let Some(stripped) = after_code.strip_prefix("**") {
                     spans.push(InlineSpan::Bold(vec![InlineSpan::Code(code.to_owned())]));
-                    rest = &after_code[2..];
+                    rest = stripped;
                     continue;
                 }
             }
@@ -861,7 +861,7 @@ pub fn parse_inline(text: &str) -> Vec<InlineSpan> {
 
         // Consume normal text up to the next formatting token
         let next_pos = rest[1..]
-            .find(|c| c == '*' || c == '`' || c == '[')
+            .find(['*', '`', '['])
             .map(|idx| idx + 1)
             .unwrap_or(rest.len());
 

@@ -52,10 +52,7 @@ enum OwnerAudioOutcome {
     /// Voice transcription is not available; one line explains how to enable it.
     Unavailable,
     /// The voice note was transcribed; the transcript is the owner's message.
-    Transcribed {
-        transcript: String,
-        saved_path: Option<String>,
-    },
+    Transcribed { transcript: String },
     /// Transcription failed; one line explains what happened.
     Failed(&'static str),
 }
@@ -492,13 +489,7 @@ impl TelegramClient {
                 .unwrap_or("mpeg")
                 .to_ascii_lowercase()
         };
-        let saved_path = match save_telegram_audio_bytes(
-            config,
-            message.message_id,
-            &extension,
-            &bytes,
-            max_bytes,
-        ) {
+        match save_telegram_audio_bytes(config, message.message_id, &extension, &bytes, max_bytes) {
             Ok(report) => {
                 store.record_audit(
                     "owner",
@@ -510,13 +501,11 @@ impl TelegramClient {
                     None,
                     Some(&json!({"bytes": report.bytes})),
                 )?;
-                Some(report.relative_path)
             }
             Err(error) => {
                 warn!(%error, "owner audio could not be stored in the inbox");
-                None
             }
-        };
+        }
         let filename = format!("{}.{extension}", message.message_id);
         match transcribe_audio_bytes(config, &bytes, &filename).await {
             Ok(transcript) => {
@@ -526,7 +515,6 @@ impl TelegramClient {
                 }
                 Ok(OwnerAudioOutcome::Transcribed {
                     transcript: truncate_chars(transcript, MAX_TRANSCRIPT_CHARS),
-                    saved_path,
                 })
             }
             Err(error) => {
@@ -566,18 +554,11 @@ impl TelegramClient {
                     self.send_message(self.owner_chat_id, line).await?;
                     return Ok(());
                 }
-                OwnerAudioOutcome::Transcribed {
-                    transcript,
-                    saved_path,
-                } => {
+                OwnerAudioOutcome::Transcribed { transcript, .. } => {
                     // The transcript is the owner's message in this chat, so the
-                    // normal turn pipeline answers it like any typed message.
+                    // normal turn pipeline answers it like any typed message. No
+                    // status line is sent for a successful transcription.
                     runtime.submit_text(&message.chat.id.to_string(), &transcript, None)?;
-                    self.send_message(
-                        self.owner_chat_id,
-                        &audio_transcribed_message(saved_path.as_deref()),
-                    )
-                    .await?;
                     return Ok(());
                 }
             }
@@ -895,17 +876,6 @@ fn audio_failure_line(error: &SeraError) -> &'static str {
         }
         SeraError::Config(_) | SeraError::Forbidden(_) => AUDIO_UNAVAILABLE_MESSAGE,
         _ => AUDIO_PROVIDER_FAILED_MESSAGE,
-    }
-}
-
-/// Owner-facing line after a successful transcription. The saved original is
-/// mentioned in one short line.
-fn audio_transcribed_message(saved_path: Option<&str>) -> String {
-    match saved_path {
-        Some(path) => format!(
-            "Voice note transcribed — answering now. The original recording is saved as inbox/{path}."
-        ),
-        None => "Voice note transcribed — answering now.".into(),
     }
 }
 
@@ -2107,11 +2077,9 @@ mod tests {
             .await
             .unwrap();
         let messages = sent_messages(&telegram).await;
-        assert_eq!(messages.len(), 1, "{messages:?}");
         assert!(
-            messages[0].contains("inbox/telegram/9.ogg"),
-            "{:?}",
-            messages[0]
+            messages.is_empty(),
+            "a successful transcription sends no status line: {messages:?}"
         );
         // The transcript is the owner's message in the same chat, so the normal
         // turn pipeline answers it.

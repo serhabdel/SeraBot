@@ -19,6 +19,7 @@ tools = [
   "firecrawl_map",
   "firecrawl_search",
   "firecrawl_crawl",
+  "tavily_search",
 ]
-require_approval = ["firecrawl_crawl", "firecrawl_search"]
+require_approval = ["firecrawl_crawl", "firecrawl_search", "tavily_search"]
 enabled = true

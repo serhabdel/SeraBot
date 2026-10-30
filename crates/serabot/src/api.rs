@@ -190,6 +190,7 @@ async fn health(State(state): State<Arc<ApiState>>) -> Response {
             "audio_transcription_model": state.config.audio.transcription_model,
             "audio_understanding_model": state.config.audio.understanding_model,
             "firecrawl_enabled": state.config.firecrawl.enabled,
+            "tavily_enabled": state.config.tavily.enabled,
             "telegram_enabled": state.config.telegram.enabled,
             "catalog_fetch": state.config.llm.catalog_fetch,
             "bot_chat_binding": true,

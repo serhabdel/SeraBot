@@ -58,13 +58,14 @@ set), the server:
    owner message — so it is policy-scanned and blocklist-checked like any other
    incoming message.
 
-The owner is told the result in one line. When audio is off or unconfigured,
-the owner gets one line saying voice notes are off and where to turn them on —
-never a list of tool names or inbox paths.
+The owner is told the result in one line, except for a successful transcription
+which sends nothing — the answer to the transcript is the only reply. When audio
+is off or unconfigured, the owner gets one line saying voice notes are off and
+where to turn them on — never a list of tool names or inbox paths.
 
 | Situation | Owner sees |
 |-----------|-----------|
-| Transcribed | `Voice note transcribed — answering now. The original recording is saved as inbox/telegram/<message_id>.<ext>.` |
+| Transcribed | Nothing extra — the transcript is answered like a typed message. The original recording is still saved to `inbox/telegram/<message_id>.<ext>`. |
 | Provider unavailable | `I couldn't transcribe that voice note — the audio provider is unavailable right now, so please try again or send it as text.` |
 | Too large | `That voice note is too large to transcribe — please send a shorter clip or type your message.` |
 | Unsupported format | `That audio format can't be transcribed — please send a WAV, MP3, OGG, M4A, FLAC, or WebM file.` |

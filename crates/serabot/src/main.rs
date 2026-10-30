@@ -39,6 +39,7 @@ use serabot::skills::{
     SkillCatalog, SkillRuntime, create_skill, read_skill_body_file, register_skill_tools,
 };
 use serabot::store::Store;
+use serabot::tavily::{TavilyClient, TavilyLimits, TavilySearchTool};
 use serabot::telegram::TelegramClient;
 use serabot::tools::{
     DocumentIndexTool, FetchUrlTool, TimesheetTool, WatchNowTool, XlsxAnalyzeTool,
@@ -588,6 +589,31 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         registry.register(FirecrawlMapTool::new(client.clone(), limits.clone()))?;
         registry.register(FirecrawlSearchTool::new(client.clone(), limits.clone()))?;
         registry.register(FirecrawlCrawlTool::new(client, limits))?;
+    }
+    if config.tavily.enabled {
+        let api_key = secrets
+            .require(&config.tavily.api_key_secret)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "{error}; run `serabot secrets set {}` first",
+                    config.tavily.api_key_secret
+                )
+            })?;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.tavily.timeout_secs.max(5)))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .context("build Tavily HTTP client")?;
+        let client = Arc::new(TavilyClient::new(
+            http,
+            config.tavily.api_base.clone(),
+            api_key,
+        )?);
+        registry.register(TavilySearchTool::new(
+            client,
+            TavilyLimits::from_config(&config.tavily),
+        ))?;
     }
     if config.browser.enabled {
         let session = Arc::new(BrowserSession::new(config.browser.clone())?);
