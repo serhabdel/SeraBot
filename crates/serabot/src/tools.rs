@@ -16,7 +16,7 @@ use crate::spreadsheets::{
 };
 use crate::store::Store;
 use crate::watcher::watch_all;
-use crate::workbooks::{XlsxBuildTool, XlsxEditTool, XlsxInspectTool};
+use crate::workbooks::{XlsxBuildTool, XlsxEditTool, XlsxInspectTool, XlsxReadTool};
 
 pub struct XlsxAnalyzeTool {
     root: PathBuf,
@@ -663,6 +663,7 @@ pub fn register_workbook_tools(
 ) -> Result<()> {
     registry.register(XlsxBuildTool::new(artifacts.clone(), store.clone()))?;
     registry.register(XlsxEditTool::new(artifacts.clone(), store))?;
-    registry.register(XlsxInspectTool::new(artifacts))?;
+    registry.register(XlsxInspectTool::new(artifacts.clone()))?;
+    registry.register(XlsxReadTool::new(artifacts))?;
     Ok(())
 }

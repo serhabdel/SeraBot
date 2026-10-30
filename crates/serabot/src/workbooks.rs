@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use gridcraft_core::date::{days_in_month, serial_from_ymd};
+use gridcraft_core::date::{datetime_from_serial, days_in_month, serial_from_ymd};
 use gridcraft_core::{CellRef, DateSystem, RangeRef, Value, letters_to_col};
 use gridcraft_model::{
     Cell, Formula, NumFmt, Preserved, Sheet, Style, StyleId, Workbook as GridWorkbook,
@@ -52,13 +52,26 @@ pub const MAX_PACKAGE_PARTS: usize = 4096;
 
 pub const MAX_TITLE_CHARS: usize = 140;
 pub const MAX_SHEET_NAME_CHARS: usize = 31;
+/// Sheets a *spec* may ask `xlsx_build` to create.
 pub const MAX_SHEETS: usize = 20;
 pub const MAX_COLUMNS: usize = 64;
 pub const MAX_ROWS_PER_SHEET: usize = 5000;
+/// Cells a *spec* may ask `xlsx_build` to create.
 pub const MAX_CELLS: usize = 50_000;
 pub const MAX_TEXT_CHARS: usize = 500;
 pub const MAX_EDITS: usize = 500;
 pub const MAX_WARNINGS: usize = 20;
+
+/// Sheets accepted from a workbook the owner supplies. A real workbook is larger than anything
+/// SeraBot builds, so import, inspect, read and edit use these wider bounds; `xlsx_build` keeps
+/// the spec bounds above.
+pub const MAX_IMPORT_SHEETS: usize = 100;
+/// Cells accepted from a workbook the owner supplies.
+pub const MAX_IMPORT_CELLS: usize = 500_000;
+/// Cells one `xlsx_read` call may cover. A larger range is refused, never truncated.
+pub const MAX_READ_CELLS: usize = 2_000;
+/// Characters of a single value `xlsx_read` returns before it clips and flags it.
+pub const MAX_READ_VALUE_CHARS: usize = 500;
 /// Bound on a formula written into a cell. Long enough for a real expression, short enough that
 /// a model cannot paste a document into one cell.
 pub const MAX_FORMULA_CHARS: usize = 512;
@@ -333,6 +346,55 @@ impl Workbook {
     }
 }
 
+/// What a cell holds, as `xlsx_read` reports it. A formula cell is never evaluated: its text and
+/// the result Excel last cached are reported separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CellKind {
+    Text,
+    Number,
+    /// A number whose cell format is a date or time format, reported as `YYYY-MM-DD[ HH:MM:SS]`.
+    Date,
+    Boolean,
+    /// An Excel error value such as `#DIV/0!`, reported as its text.
+    Error,
+    Formula,
+    /// A cell that is stored (it carries formatting) but holds no value.
+    Blank,
+}
+
+/// One cell of a read range.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CellRecord {
+    /// `A1`-style address within the sheet.
+    pub address: String,
+    pub kind: CellKind,
+    /// The value: a string for text, dates and errors, a number for numbers, a boolean for
+    /// booleans. `None` for a formula cell (see [`CellRecord::cached`]) and for a blank cell.
+    pub value: Option<JsonValue>,
+    /// Formula text without the leading `=`, for a formula cell.
+    pub formula: Option<String>,
+    /// The result Excel last cached for the formula. SeraBot never computes it, so it can be
+    /// absent or stale.
+    pub cached: Option<JsonValue>,
+    /// The value was longer than the per-value limit and was clipped.
+    pub truncated: bool,
+}
+
+/// A bounded read of one worksheet range.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RangeRead {
+    pub sheet: String,
+    /// The range read, in `A1` form; `None` when the sheet is empty.
+    pub range: Option<String>,
+    /// Stored cells in the range, in row-major order.
+    pub cells: Vec<CellRecord>,
+    /// Cells the requested range covers, blank or not. Bounded by [`MAX_READ_CELLS`].
+    pub requested_cells: u64,
+    /// How many values were clipped at [`MAX_READ_VALUE_CHARS`].
+    pub truncated_values: usize,
+}
+
 /// Validate a spec without producing bytes.
 pub fn validate_spec(spec: &WorkbookSpec) -> Result<()> {
     check_line("workbook.title", &spec.title, MAX_TITLE_CHARS)?;
@@ -440,6 +502,305 @@ pub fn import(bytes: &[u8]) -> Result<Workbook> {
     Ok(summarize(&workbook, &report))
 }
 
+/// Read the values of one worksheet range, so a caller can see what is in a cell before editing
+/// it. Read-only: nothing is written and no artifact is produced.
+///
+/// `range` is `Sheet1!A1:D20`, `'My Sheet'!A1:D20`, or a bare sheet name for its whole used
+/// range. The range must sit inside the sheet's used range and cover at most
+/// [`MAX_READ_CELLS`] cells; a larger range is refused rather than truncated.
+pub fn read_range(bytes: &[u8], range: &str) -> Result<RangeRead> {
+    let (workbook, _) = load(bytes)?;
+    read_range_in(&workbook, range)
+}
+
+fn read_range_in(workbook: &GridWorkbook, spec: &str) -> Result<RangeRead> {
+    let (sheet_index, requested) = resolve_read_range(workbook, spec)?;
+    let sheet = workbook.sheet(sheet_index).ok_or_else(missing_sheet)?;
+    let used = sheet.cells.used_range();
+
+    let target = match requested {
+        Some(range) => {
+            let used = used.ok_or_else(|| {
+                SeraError::Validation(format!(
+                    "sheet '{}' is empty; there is no used range to read",
+                    sheet.name
+                ))
+            })?;
+            if !used.contains_range(&range) {
+                return Err(SeraError::Validation(format!(
+                    "range {} is outside the used range {} of sheet '{}'; read inside it",
+                    range.a1(),
+                    used.a1(),
+                    sheet.name
+                )));
+            }
+            range
+        }
+        None => match used {
+            Some(range) => range,
+            None => {
+                return Ok(RangeRead {
+                    sheet: sheet.name.clone(),
+                    range: None,
+                    cells: Vec::new(),
+                    requested_cells: 0,
+                    truncated_values: 0,
+                });
+            }
+        },
+    };
+
+    let requested_cells = target.count();
+    if requested_cells > MAX_READ_CELLS as u64 {
+        return Err(SeraError::Validation(format!(
+            "range {} covers {requested_cells} cells; a read is limited to {MAX_READ_CELLS}. \
+             Read a narrower range.",
+            target.a1()
+        )));
+    }
+
+    let mut cells = Vec::new();
+    let mut truncated_values = 0usize;
+    for (cell_ref, cell) in sheet.cells.iter_range(target) {
+        let record = cell_record(workbook, sheet, cell_ref, cell);
+        if record.truncated {
+            truncated_values = truncated_values.saturating_add(1);
+        }
+        cells.push(record);
+    }
+
+    Ok(RangeRead {
+        sheet: sheet.name.clone(),
+        range: Some(target.a1()),
+        cells,
+        requested_cells,
+        truncated_values,
+    })
+}
+
+/// Build one record for a stored cell. Nothing is evaluated: a formula cell reports its text and
+/// whatever result the file cached.
+fn cell_record(
+    workbook: &GridWorkbook,
+    sheet: &Sheet,
+    cell_ref: CellRef,
+    cell: &Cell,
+) -> CellRecord {
+    let address = cell_ref.a1();
+    if let Some(formula) = cell.formula.as_deref() {
+        let cached = value_json(workbook, sheet, cell_ref, &cell.value);
+        return CellRecord {
+            address,
+            kind: CellKind::Formula,
+            value: None,
+            formula: Some(formula.text.clone()),
+            cached: cached.map(|(_, json)| json),
+            truncated: false,
+        };
+    }
+    match value_json(workbook, sheet, cell_ref, &cell.value) {
+        Some((kind, value)) => {
+            let (value, truncated) = clip_json(value);
+            CellRecord {
+                address,
+                kind,
+                value: Some(value),
+                formula: None,
+                cached: None,
+                truncated,
+            }
+        }
+        None => CellRecord {
+            address,
+            kind: CellKind::Blank,
+            value: None,
+            formula: None,
+            cached: None,
+            truncated: false,
+        },
+    }
+}
+
+/// The kind and JSON value of a scalar cell value, or `None` when the cell is empty.
+fn value_json(
+    workbook: &GridWorkbook,
+    sheet: &Sheet,
+    cell_ref: CellRef,
+    value: &Value,
+) -> Option<(CellKind, JsonValue)> {
+    match value.scalar() {
+        Value::Empty => None,
+        Value::Text(text) => Some((CellKind::Text, JsonValue::String(text.to_string()))),
+        Value::Bool(flag) => Some((CellKind::Boolean, JsonValue::Bool(flag))),
+        Value::Error(error) => Some((
+            CellKind::Error,
+            JsonValue::String(error.as_str().to_string()),
+        )),
+        Value::Number(number) => {
+            let style = sheet.style_id(cell_ref);
+            let format = workbook.styles.get(style).num_fmt.as_str();
+            if number_format_is_date(format) {
+                if let Some(text) = format_serial(workbook.date_system, number) {
+                    return Some((CellKind::Date, JsonValue::String(text)));
+                }
+            }
+            Some((CellKind::Number, json!(number)))
+        }
+        // `scalar()` already unwrapped arrays; this arm keeps the match exhaustive.
+        Value::Array(_) => None,
+    }
+}
+
+/// Whether a number-format code shows a date or time, so a numeric cell should be reported as a
+/// date. Quoted literals, `\`-escapes, `_`/`*` padding and `[...]` sections are skipped first, so
+/// `"$"#,##0_);[Red]\("$"#,##0\)` is not a date.
+fn number_format_is_date(code: &str) -> bool {
+    let mut chars = code.chars();
+    while let Some(character) = chars.next() {
+        match character {
+            '"' => {
+                for inner in chars.by_ref() {
+                    if inner == '"' {
+                        break;
+                    }
+                }
+            }
+            '\\' | '_' | '*' => {
+                chars.next();
+            }
+            '[' => {
+                for inner in chars.by_ref() {
+                    if inner == ']' {
+                        break;
+                    }
+                }
+            }
+            'y' | 'Y' | 'd' | 'D' | 'h' | 'H' | 's' | 'S' | 'm' | 'M' => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// A serial number as `YYYY-MM-DD`, with ` HH:MM:SS` when it carries a time of day.
+fn format_serial(system: DateSystem, serial: f64) -> Option<String> {
+    let moment = datetime_from_serial(system, serial)?;
+    if moment.hour == 0 && moment.minute == 0 && moment.second == 0 && moment.milli == 0 {
+        Some(format!(
+            "{:04}-{:02}-{:02}",
+            moment.year, moment.month, moment.day
+        ))
+    } else {
+        Some(format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            moment.year, moment.month, moment.day, moment.hour, moment.minute, moment.second
+        ))
+    }
+}
+
+/// Clip a value to [`MAX_READ_VALUE_CHARS`], reporting whether it was clipped.
+fn clip_json(value: JsonValue) -> (JsonValue, bool) {
+    match value {
+        JsonValue::String(text) => {
+            if text.chars().count() <= MAX_READ_VALUE_CHARS {
+                (JsonValue::String(text), false)
+            } else {
+                let clipped: String = text.chars().take(MAX_READ_VALUE_CHARS).collect();
+                (JsonValue::String(clipped), true)
+            }
+        }
+        other => (other, false),
+    }
+}
+
+/// Resolve `Sheet1!A1:D20`, `'My Sheet'!A1:D20` or a bare sheet name to a sheet and an optional
+/// range. The workbook decides the split, so a sheet name containing `!` still resolves.
+fn resolve_read_range(workbook: &GridWorkbook, spec: &str) -> Result<(usize, Option<RangeRef>)> {
+    let text = spec.trim();
+    if text.is_empty() {
+        return Err(SeraError::Validation(
+            "range must not be empty; use Sheet1!A1:D20 or a sheet name".into(),
+        ));
+    }
+
+    if let Some(rest) = text.strip_prefix('\'') {
+        let (name, rest) = split_quoted(rest)?;
+        let index = workbook
+            .sheet_index(&name)
+            .ok_or_else(|| unknown_sheet(workbook, &name))?;
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return Ok((index, None));
+        }
+        let rest = rest.strip_prefix('!').ok_or_else(|| {
+            SeraError::Validation(format!(
+                "expected '!' after the quoted sheet name '{}'",
+                name
+            ))
+        })?;
+        let range = parse_read_range(rest)?;
+        return Ok((index, Some(range)));
+    }
+
+    for (position, _) in text.match_indices('!') {
+        let (name, rest) = text.split_at(position);
+        let Some(index) = workbook.sheet_index(name.trim()) else {
+            continue;
+        };
+        let rest = rest.get(1..).unwrap_or("").trim();
+        if rest.is_empty() {
+            return Ok((index, None));
+        }
+        let range = parse_read_range(rest)?;
+        return Ok((index, Some(range)));
+    }
+
+    let index = workbook
+        .sheet_index(text)
+        .ok_or_else(|| unknown_sheet(workbook, text))?;
+    Ok((index, None))
+}
+
+/// Split a quoted sheet name: the text after the opening `'`, with `''` unescaped. Returns the
+/// name and the remaining text.
+fn split_quoted(text: &str) -> Result<(String, &str)> {
+    let mut name = String::new();
+    let mut chars = text.char_indices().peekable();
+    while let Some((index, character)) = chars.next() {
+        if character == '\'' {
+            if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                chars.next();
+                name.push('\'');
+                continue;
+            }
+            let rest = text.get(index + 1..).unwrap_or("");
+            return Ok((name, rest));
+        }
+        name.push(character);
+    }
+    Err(SeraError::Validation(
+        "range has an unterminated quoted sheet name".into(),
+    ))
+}
+
+fn parse_read_range(text: &str) -> Result<RangeRef> {
+    RangeRef::parse(text).ok_or_else(|| {
+        SeraError::Validation(format!("'{text}' is not an A1-style range such as A1:D20"))
+    })
+}
+
+fn unknown_sheet(workbook: &GridWorkbook, name: &str) -> SeraError {
+    let sheets: Vec<&str> = workbook
+        .sheets
+        .iter()
+        .map(|sheet| sheet.name.as_str())
+        .collect();
+    SeraError::Validation(format!(
+        "no sheet named '{name}' in this workbook; sheets are: {}",
+        sheets.join(", ")
+    ))
+}
+
 /// Apply a bounded set of literal cell edits to an imported workbook and re-export it.
 pub fn edit(bytes: &[u8], edits: &[CellEdit]) -> Result<Vec<u8>> {
     let converted: Vec<Edit> = edits
@@ -478,7 +839,7 @@ fn apply(bytes: &[u8], edits: &[Edit]) -> Result<Vec<u8>> {
         edit.apply(&mut workbook, index)?;
     }
     // Edits can add cells, so the bound is checked again before the package is written.
-    check_workbook_limits(&workbook)?;
+    check_import_limits(&workbook)?;
     write_xlsx(&workbook).map_err(write_error)
 }
 
@@ -609,25 +970,26 @@ fn load(bytes: &[u8]) -> Result<(GridWorkbook, ReadReport)> {
             check_preserved(preserved)?;
         }
     }
-    check_workbook_limits(&workbook)?;
+    check_import_limits(&workbook)?;
 
     Ok((workbook, report))
 }
 
-/// The sheet, cell and package bounds, applied to imported workbooks as well as to specs.
-fn check_workbook_limits(workbook: &GridWorkbook) -> Result<()> {
-    if workbook.sheets.len() > MAX_SHEETS {
+/// The sheet and cell bounds for a workbook the owner supplies. Applied on import and again
+/// after an edit, because an edit can add cells.
+fn check_import_limits(workbook: &GridWorkbook) -> Result<()> {
+    if workbook.sheets.len() > MAX_IMPORT_SHEETS {
         return Err(SeraError::Validation(format!(
-            "workbook has {} sheets; SeraBot handles at most {MAX_SHEETS}",
+            "workbook has {} sheets; SeraBot handles at most {MAX_IMPORT_SHEETS}",
             workbook.sheets.len()
         )));
     }
     let cells = workbook.sheets.iter().fold(0usize, |total, sheet| {
         total.saturating_add(sheet.cells.len())
     });
-    if cells > MAX_CELLS {
+    if cells > MAX_IMPORT_CELLS {
         return Err(SeraError::Validation(format!(
-            "workbook stores {cells} cells; SeraBot handles at most {MAX_CELLS}"
+            "workbook stores {cells} cells; SeraBot handles at most {MAX_IMPORT_CELLS}"
         )));
     }
     Ok(())
@@ -1530,6 +1892,137 @@ impl Tool for XlsxInspectTool {
     }
 }
 
+/// Read-only: shows what is in the cells of a range so an edit is not a blind overwrite.
+pub struct XlsxReadTool {
+    artifacts: Arc<ArtifactStore>,
+}
+
+impl XlsxReadTool {
+    pub fn new(artifacts: Arc<ArtifactStore>) -> Self {
+        Self { artifacts }
+    }
+}
+
+#[async_trait]
+impl Tool for XlsxReadTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "xlsx_read".into(),
+            description:
+                "Read the values of one worksheet range of a workbook artifact. Returns, for each \
+                 stored cell, its address, kind (text, number, date, boolean, error, formula, \
+                 blank) and value. A formula cell returns its text and the result Excel last \
+                 cached, labelled separately; nothing is ever evaluated. The range must sit \
+                 inside the sheet's used range and cover at most 2000 cells — a larger range is \
+                 refused, not truncated. Read-only: no artifact is written."
+                    .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "source_artifact": {"type": "string", "description": "Artifact hash of the workbook to read"},
+                    "range": {"type": "string", "description": "Sheet1!A1:D20, 'My Sheet'!A1:D20, or a bare sheet name for its whole used range"}
+                },
+                "required": ["source_artifact", "range"],
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: JsonValue, _context: &ToolContext) -> Result<ToolOutput> {
+        let hash = args
+            .get("source_artifact")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| SeraError::Validation("source_artifact is required".into()))?;
+        let range = args
+            .get("range")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| SeraError::Validation("range is required".into()))?
+            .to_owned();
+        let source = self.artifacts.load(hash)?;
+        if !source.filename.to_ascii_lowercase().ends_with(".xlsx") {
+            return Err(SeraError::Validation(
+                "source_artifact is not an .xlsx workbook".into(),
+            ));
+        }
+        let bytes = source.bytes.clone();
+        let read = tokio::task::spawn_blocking(move || read_range(&bytes, &range))
+            .await
+            .map_err(|error| SeraError::Internal(format!("workbook task failed: {error}")))??;
+        let content = render_read(&read);
+        let data = serde_json::to_value(&read)?;
+        Ok(ToolOutput {
+            content,
+            data: Some(data),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+/// A compact, one-line-per-cell rendering of a read, for the model to read as text.
+fn render_read(read: &RangeRead) -> String {
+    let range = read.range.as_deref().unwrap_or("(empty sheet)");
+    let mut out = format!(
+        "sheet: {}\nrange: {}\ncells: {} stored of {} requested (limit {MAX_READ_CELLS})\n",
+        read.sheet,
+        range,
+        read.cells.len(),
+        read.requested_cells
+    );
+    if read.truncated_values > 0 {
+        out.push_str(&format!(
+            "note: {} value(s) clipped at {MAX_READ_VALUE_CHARS} characters\n",
+            read.truncated_values
+        ));
+    }
+    for cell in &read.cells {
+        out.push_str(&format!(
+            "{}  {:<8} {}\n",
+            cell.address,
+            kind_label(cell.kind),
+            render_cell_value(cell)
+        ));
+    }
+    out
+}
+
+fn kind_label(kind: CellKind) -> &'static str {
+    match kind {
+        CellKind::Text => "text",
+        CellKind::Number => "number",
+        CellKind::Date => "date",
+        CellKind::Boolean => "boolean",
+        CellKind::Error => "error",
+        CellKind::Formula => "formula",
+        CellKind::Blank => "blank",
+    }
+}
+
+fn render_cell_value(cell: &CellRecord) -> String {
+    let mut text = match (&cell.formula, &cell.cached, &cell.value) {
+        (Some(formula), cached, _) => {
+            let cached = cached
+                .as_ref()
+                .map(render_json)
+                .unwrap_or_else(|| "none".to_string());
+            format!("={formula}  cached: {cached}")
+        }
+        (None, _, Some(value)) => render_json(value),
+        (None, _, None) => String::new(),
+    };
+    if cell.truncated {
+        text.push_str(" …(truncated)");
+    }
+    text
+}
+
+fn render_json(value: &JsonValue) -> String {
+    match value {
+        JsonValue::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -1884,6 +2377,193 @@ mod tests {
         assert!(summary.has_formulas);
     }
 
+    /// A workbook with one of every kind of cell a read must report.
+    fn typed_workbook() -> Vec<u8> {
+        let mut workbook = GridWorkbook::new();
+        workbook.sheets.clear();
+        workbook.props.title = "Synthetic Typed".into();
+        let date_style = workbook.styles.intern(Style {
+            num_fmt: NumFmt::new(DATE_NUMBER_FORMAT),
+            ..Style::default()
+        });
+
+        let mut sheet = Sheet::new("Data");
+        sheet.set_value(CellRef::new(0, 0), Value::text("Region"));
+        sheet.set_value(CellRef::new(0, 1), Value::number(1250.5));
+        sheet.set_value(CellRef::new(0, 2), Value::Bool(true));
+        sheet.set_cell(
+            CellRef::new(0, 3),
+            Cell {
+                value: Value::Number(46053.0),
+                formula: None,
+                style: date_style,
+            },
+        );
+        sheet.set_cell(
+            CellRef::new(1, 0),
+            Cell {
+                value: Value::Error(gridcraft_core::CellError::Div0),
+                formula: None,
+                style: StyleId::DEFAULT,
+            },
+        );
+        // A formula with a cached result, as a real file carries it.
+        sheet.set_cell(
+            CellRef::new(1, 1),
+            Cell {
+                value: Value::number(1250.5),
+                formula: Some(Arc::new(Formula {
+                    text: "SUM(B1:B1)".into(),
+                    expr: None,
+                    array: None,
+                })),
+                style: StyleId::DEFAULT,
+            },
+        );
+        // A stored cell with formatting but no value.
+        sheet.set_style(CellRef::new(1, 2), date_style);
+        workbook.sheets.push(Arc::new(sheet));
+
+        write_xlsx(&workbook).expect("the synthetic fixture must be writable")
+    }
+
+    #[test]
+    fn reads_a_range_with_typed_values() {
+        let bytes = typed_workbook();
+        let read = read_range(&bytes, "Data!A1:D2").unwrap();
+        assert_eq!(read.sheet, "Data");
+        assert_eq!(read.range.as_deref(), Some("A1:D2"));
+        assert_eq!(read.requested_cells, 8);
+        assert_eq!(read.truncated_values, 0);
+
+        let kinds: Vec<(String, CellKind)> = read
+            .cells
+            .iter()
+            .map(|cell| (cell.address.clone(), cell.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("A1".to_string(), CellKind::Text),
+                ("B1".to_string(), CellKind::Number),
+                ("C1".to_string(), CellKind::Boolean),
+                ("D1".to_string(), CellKind::Date),
+                ("A2".to_string(), CellKind::Error),
+                ("B2".to_string(), CellKind::Formula),
+                ("C2".to_string(), CellKind::Blank),
+            ]
+        );
+
+        assert_eq!(read.cells[0].value, Some(json!("Region")));
+        assert_eq!(read.cells[1].value, Some(json!(1250.5)));
+        assert_eq!(read.cells[2].value, Some(json!(true)));
+        assert_eq!(read.cells[3].value, Some(json!("2026-01-31")));
+        assert_eq!(read.cells[4].value, Some(json!("#DIV/0!")));
+        assert_eq!(read.cells[6].value, None);
+
+        // A bare sheet name reads the whole used range.
+        let whole = read_range(&bytes, "Data").unwrap();
+        assert_eq!(whole.range.as_deref(), Some("A1:D2"));
+        assert_eq!(whole.cells.len(), read.cells.len());
+    }
+
+    #[test]
+    fn reads_a_formula_cell_as_text_plus_cached_value() {
+        let bytes = typed_workbook();
+        let read = read_range(&bytes, "Data!B2").unwrap();
+        assert_eq!(read.cells.len(), 1);
+        let cell = &read.cells[0];
+        assert_eq!(cell.kind, CellKind::Formula);
+        assert_eq!(cell.formula.as_deref(), Some("SUM(B1:B1)"));
+        assert_eq!(cell.cached, Some(json!(1250.5)));
+        // The formula's own value slot stays empty: text and cached result are separate.
+        assert_eq!(cell.value, None);
+
+        // A formula set by an edit has no cached result at all.
+        let edited = apply_edits(
+            &bytes,
+            &[Edit::SetFormula {
+                sheet: "Data".into(),
+                address: "A3".into(),
+                formula: "=B1*2".into(),
+            }],
+        )
+        .unwrap();
+        let read = read_range(&edited, "Data!A3").unwrap();
+        assert_eq!(read.cells[0].kind, CellKind::Formula);
+        assert_eq!(read.cells[0].formula.as_deref(), Some("B1*2"));
+        assert_eq!(read.cells[0].cached, None);
+    }
+
+    #[test]
+    fn read_cap_rejects_rather_than_truncates() {
+        let mut workbook = GridWorkbook::new();
+        workbook.sheets.clear();
+        let mut sheet = Sheet::new("Wide");
+        for row in 0..=(MAX_READ_CELLS as u32) {
+            sheet.set_value(CellRef::new(row, 0), Value::number(row as f64));
+        }
+        workbook.sheets.push(Arc::new(sheet));
+        let bytes = write_xlsx(&workbook).unwrap();
+
+        let error = read_range(&bytes, "Wide!A1:A2001").unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("2001 cells") && message.contains("narrower range"),
+            "unexpected error: {message}"
+        );
+
+        // Exactly at the cap is fine and is not truncated.
+        let read = read_range(&bytes, "Wide!A1:A2000").unwrap();
+        assert_eq!(read.requested_cells, MAX_READ_CELLS as u64);
+        assert_eq!(read.cells.len(), MAX_READ_CELLS);
+        assert_eq!(read.cells[0].value, Some(json!(0.0)));
+        assert_eq!(read.cells[MAX_READ_CELLS - 1].value, Some(json!(1999.0)));
+    }
+
+    #[test]
+    fn read_rejects_bad_ranges_and_clips_long_values() {
+        let bytes = typed_workbook();
+
+        // Outside the used range, unknown sheet, malformed range.
+        assert!(read_range(&bytes, "Data!A1:F9").is_err());
+        assert!(read_range(&bytes, "Nope!A1").is_err());
+        assert!(read_range(&bytes, "Data!not-a-range").is_err());
+        assert!(read_range(&bytes, "Data!").is_ok());
+        assert!(read_range(&bytes, "").is_err());
+
+        // A quoted sheet name, including one with a space.
+        let mut workbook = GridWorkbook::new();
+        workbook.sheets.clear();
+        let mut sheet = Sheet::new("My Sheet");
+        sheet.set_value(CellRef::new(0, 0), Value::text("x"));
+        workbook.sheets.push(Arc::new(sheet));
+        let quoted = write_xlsx(&workbook).unwrap();
+        let read = read_range(&quoted, "'My Sheet'!A1:A1").unwrap();
+        assert_eq!(read.sheet, "My Sheet");
+        assert_eq!(read.cells[0].value, Some(json!("x")));
+
+        // Values longer than the limit are clipped and flagged, never silently shortened.
+        let mut workbook = GridWorkbook::new();
+        workbook.sheets.clear();
+        let mut sheet = Sheet::new("Long");
+        sheet.set_value(
+            CellRef::new(0, 0),
+            Value::text("y".repeat(MAX_READ_VALUE_CHARS + 50)),
+        );
+        workbook.sheets.push(Arc::new(sheet));
+        let long = write_xlsx(&workbook).unwrap();
+        let read = read_range(&long, "Long!A1").unwrap();
+        assert_eq!(read.truncated_values, 1);
+        assert!(read.cells[0].truncated);
+        let text = read.cells[0]
+            .value
+            .as_ref()
+            .and_then(JsonValue::as_str)
+            .unwrap_or_default();
+        assert_eq!(text.chars().count(), MAX_READ_VALUE_CHARS);
+    }
+
     #[test]
     fn sets_formula_text_without_evaluating_it() {
         let bytes = build(&spec()).unwrap();
@@ -2152,34 +2832,62 @@ mod tests {
     }
 
     #[test]
-    fn rejects_workbooks_over_the_sheet_and_cell_bounds() {
+    fn rejects_workbooks_over_the_import_bounds() {
+        // 100 sheets are accepted; 101 are not.
         let mut workbook = GridWorkbook::new();
         workbook.sheets.clear();
-        for index in 0..=MAX_SHEETS {
+        for index in 0..MAX_IMPORT_SHEETS {
             workbook
                 .sheets
                 .push(Arc::new(Sheet::new(format!("Sheet{}", index + 1))));
         }
-        let bytes = write_xlsx(&workbook).unwrap();
-        let error = import(&bytes).unwrap_err();
+        assert!(check_import_limits(&workbook).is_ok());
+        workbook.sheets.push(Arc::new(Sheet::new("OneTooMany")));
+        let error = check_import_limits(&workbook).unwrap_err();
         assert!(
             error.to_string().contains("sheets"),
             "unexpected error: {error}"
         );
 
+        // 500,000 cells are accepted; 500,001 are not.
         let mut workbook = GridWorkbook::new();
         workbook.sheets.clear();
         let mut sheet = Sheet::new("Big");
-        for row in 0..=(MAX_CELLS as u32 / MAX_COLUMNS as u32) {
+        for row in 0..=MAX_IMPORT_CELLS as u32 / MAX_COLUMNS as u32 {
             for column in 0..MAX_COLUMNS as u32 {
                 sheet.set_value(CellRef::new(row, column), Value::number(1.0));
             }
         }
         workbook.sheets.push(Arc::new(sheet));
-        let bytes = write_xlsx(&workbook).unwrap();
-        let error = import(&bytes).unwrap_err();
+        let error = check_import_limits(&workbook).unwrap_err();
         assert!(
             error.to_string().contains("cells"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn imports_a_workbook_above_the_old_cell_cap() {
+        // 60,000 cells: over the 50,000 `xlsx_build` bound, inside the import bound.
+        let mut workbook = GridWorkbook::new();
+        workbook.sheets.clear();
+        let mut sheet = Sheet::new("Model");
+        for row in 0..1_000u32 {
+            for column in 0..60u32 {
+                sheet.set_value(CellRef::new(row, column), Value::number(row as f64));
+            }
+        }
+        workbook.sheets.push(Arc::new(sheet));
+        let bytes = write_xlsx(&workbook).unwrap();
+
+        let summary = import(&bytes).unwrap();
+        assert_eq!(summary.cell_count(), 60_000);
+        assert_eq!(summary.sheets[0].used_range.as_deref(), Some("A1:BH1000"));
+
+        // The read bound still applies to a single call.
+        let error = read_range(&bytes, "Model!A1:BH1000").unwrap_err();
+        assert!(
+            error.to_string().contains("narrower range"),
             "unexpected error: {error}"
         );
     }
@@ -2315,6 +3023,7 @@ mod tests {
         assert!(registry.is_registered("xlsx_build"));
         assert!(registry.is_registered("xlsx_edit"));
         assert!(registry.is_registered("xlsx_inspect"));
+        assert!(registry.is_registered("xlsx_read"));
 
         let build_tool = registry.get("xlsx_build").unwrap();
         let output = build_tool
@@ -2337,6 +3046,22 @@ mod tests {
             .unwrap();
         assert!(inspected.content.contains("Summary"));
         assert!(inspected.content.contains("has_formulas"));
+
+        // The read tool shows the model what is in the cells, and writes nothing.
+        let read_tool = registry.get("xlsx_read").unwrap();
+        let read = read_tool
+            .execute(
+                json!({"source_artifact": built_hash, "range": "Summary!A1:C2"}),
+                &context("xlsx_read"),
+            )
+            .await
+            .unwrap();
+        assert!(read.artifact_hash.is_none());
+        assert!(read.content.contains("Region"));
+        assert!(read.content.contains("1250.5"));
+        let read_data = read.data.unwrap();
+        assert_eq!(read_data["sheet"], json!("Summary"));
+        assert_eq!(read_data["cells"].as_array().map(Vec::len), Some(6));
 
         let edit_tool = registry.get("xlsx_edit").unwrap();
         let edited = edit_tool
