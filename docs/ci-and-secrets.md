@@ -111,3 +111,14 @@ minted token as a credential and hand it over through a secure channel.
 Never bake owner token values into APKs or release binaries. `GITHUB_TOKEN`
 needs no setup: the workflow declares `permissions: contents: write` and
 creates the release from the tag.
+
+## Server deploy (`deploy-ovh.yml`)
+
+Manual-only (`workflow_dispatch` with a `tag` input). Holds **no secrets**:
+the deploy job uses a GitHub OIDC token (`id-token: write`,
+audience `serabot-deploy`) that the VPS CA broker verifies before minting a
+10-minute SSH cert with a forced command. The `deploy` job runs in the
+protected `ovh-deploy` environment (required reviewer = owner); fork PRs can
+neither read that environment nor obtain its tokens. The only repository
+**variable** is `OVH_VPS_IP` (not a secret). Full design and the one-time
+additive VPS setup manifest: [deploy-automation.md](deploy-automation.md).
