@@ -1,19 +1,23 @@
-//! Bounded XLSX creation, inspection and editing.
+//! Bounded XLSX creation, inspection, editing and round trip.
 //!
-//! The model is deliberately literal. Serde denies unknown fields, so a larger JSON document
-//! cannot smuggle formulas, macros, external links, images, or embedded objects into a
-//! workbook. Every string written is length- and control-character-checked here, mirroring
-//! `deck.rs`.
+//! The model is deliberately literal about *values*: serde denies unknown fields, so a larger
+//! JSON document cannot smuggle macros, external links, or embedded objects into a workbook.
+//! Every string written is length- and control-character-checked here, mirroring `deck.rs`.
 //!
-//! Two invariants shape the module:
+//! Three invariants shape the module:
 //!
-//! * Formulas are never evaluated and never written. `gridcraft-calc` is not a dependency; the
-//!   crate that is (`gridcraft-xlsx`) only reads and writes the file format, and this module
-//!   writes literal values only.
+//! * Formulas are never evaluated. `gridcraft-calc` is not a dependency; the crate that is
+//!   (`gridcraft-xlsx`) only reads and writes the file format. A formula edit stores the text in
+//!   the cell's formula slot and leaves the cached result empty, so Excel recalculates on open
+//!   and SeraBot never computes anything.
+//! * The owner's document survives a round trip. Reading and re-writing keeps cell styles,
+//!   number formats, column widths, row heights, merged cells, charts and floating images,
+//!   because `gridcraft-model` models all of them and the writer emits them again.
 //! * Input is bounded before it reaches the parser. The crate caps decompressed parts at
 //!   512 MB, which is far too generous for a single-operator agent, so the package's own
 //!   central directory is read here first: oversize input, macros, external workbook links,
-//!   images and embedded objects are rejected by name rather than silently stripped.
+//!   and embedded objects are rejected by name rather than silently stripped. Images are
+//!   content, not code, so `xl/media/` is accepted.
 //!
 //! All entry points take byte slices. Files arrive through the inbox or the `ArtifactStore`;
 //! no model-chosen path is ever opened here.
@@ -23,8 +27,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use gridcraft_core::date::{days_in_month, serial_from_ymd};
-use gridcraft_core::{CellRef, DateSystem, Value};
-use gridcraft_model::{Cell, NumFmt, Preserved, Sheet, Style, StyleId, Workbook as GridWorkbook};
+use gridcraft_core::{CellRef, DateSystem, RangeRef, Value, letters_to_col};
+use gridcraft_model::{
+    Cell, Formula, NumFmt, Preserved, Sheet, Style, StyleId, Workbook as GridWorkbook,
+};
 use gridcraft_xlsx::{IoError, ReadReport, read_xlsx, write_xlsx};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -53,9 +59,35 @@ pub const MAX_CELLS: usize = 50_000;
 pub const MAX_TEXT_CHARS: usize = 500;
 pub const MAX_EDITS: usize = 500;
 pub const MAX_WARNINGS: usize = 20;
+/// Bound on a formula written into a cell. Long enough for a real expression, short enough that
+/// a model cannot paste a document into one cell.
+pub const MAX_FORMULA_CHARS: usize = 512;
+/// Bound on a number-format code. Excel's own limit for a custom format is 255 characters.
+pub const MAX_NUMBER_FORMAT_CHARS: usize = 128;
+/// Column width bounds, in characters as the Excel Column Width dialog shows them.
+pub const MIN_COLUMN_WIDTH_CHARS: f64 = 0.5;
+pub const MAX_COLUMN_WIDTH_CHARS: f64 = 255.0;
 
 /// Number format used for literal dates: they are stored as serial numbers, as Excel does.
 pub const DATE_NUMBER_FORMAT: &str = "yyyy-mm-dd";
+
+/// Functions that reach outside the workbook when Excel recalculates. SeraBot writes formula
+/// text but refuses these, because they are remote or executable effects rather than content —
+/// the same reason macros and external links are rejected.
+const REMOTE_FORMULA_FUNCTIONS: &[&str] = &[
+    "WEBSERVICE",
+    "FILTERXML",
+    "RTD",
+    "DDE",
+    "CALL",
+    "EXEC",
+    "REGISTER.ID",
+    "IMPORTDATA",
+    "IMPORTHTML",
+    "IMPORTXML",
+    "IMPORTFEED",
+    "IMPORTRANGE",
+];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -79,7 +111,8 @@ pub struct SheetSpec {
     pub rows: Vec<Vec<CellValue>>,
 }
 
-/// A literal cell value. There is no formula variant on purpose.
+/// A literal cell value. There is no formula variant on purpose: formulas are set through
+/// [`Edit::SetFormula`], which never evaluates them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum CellValue {
@@ -91,7 +124,7 @@ pub enum CellValue {
     Date(String),
 }
 
-/// A bounded cell edit against an imported workbook.
+/// A bounded literal cell edit against an imported workbook.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CellEdit {
@@ -101,10 +134,176 @@ pub struct CellEdit {
     pub value: CellValue,
 }
 
-/// What an imported workbook looks like: sheet names, used ranges and cell counts.
+/// One bounded edit against an imported workbook.
+///
+/// The literal form `{sheet, address, value}` is still accepted for compatibility; the explicit
+/// form adds `op` and is what the tool documents.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(try_from = "RawEdit")]
+pub enum Edit {
+    /// Replace a cell with a literal value.
+    SetValue {
+        sheet: String,
+        address: String,
+        value: CellValue,
+    },
+    /// Store formula text in a cell. The text is written as given and never evaluated; the
+    /// cached result is left empty so Excel recalculates when the owner opens the file.
+    SetFormula {
+        sheet: String,
+        address: String,
+        formula: String,
+    },
+    /// Give a cell a number-format code, keeping the rest of its style.
+    SetNumberFormat {
+        sheet: String,
+        address: String,
+        format: String,
+    },
+    /// Set a column width in characters, as the Column Width dialog shows it.
+    SetColumnWidth {
+        sheet: String,
+        column: String,
+        width: f64,
+    },
+    /// Merge a rectangular range that is not already merged.
+    MergeCells { sheet: String, range: String },
+}
+
+impl Edit {
+    /// The operation name, for messages and audit summaries.
+    pub fn op(&self) -> &'static str {
+        match self {
+            Edit::SetValue { .. } => "set_value",
+            Edit::SetFormula { .. } => "set_formula",
+            Edit::SetNumberFormat { .. } => "set_number_format",
+            Edit::SetColumnWidth { .. } => "set_column_width",
+            Edit::MergeCells { .. } => "merge_cells",
+        }
+    }
+
+    fn apply(&self, workbook: &mut GridWorkbook, index: usize) -> Result<()> {
+        let label = format!("edits[{index}]");
+        match self {
+            Edit::SetValue {
+                sheet,
+                address,
+                value,
+            } => {
+                value.validate(&format!("{label}.value"))?;
+                let sheet_index = resolve_sheet(workbook, sheet, &label)?;
+                let cell = resolve_cell(address, &label)?;
+                // A date keeps the cell's other formatting and only gains the date format.
+                let style = match value {
+                    CellValue::Date(_) => {
+                        let current = workbook
+                            .sheet(sheet_index)
+                            .map_or(StyleId::DEFAULT, |sheet| sheet.style_id(cell));
+                        workbook.styles.derive(current, |style| {
+                            style.num_fmt = NumFmt::new(DATE_NUMBER_FORMAT);
+                        })
+                    }
+                    _ => StyleId::DEFAULT,
+                };
+                let sheet = workbook.sheet_mut(sheet_index).ok_or_else(missing_sheet)?;
+                write_literal(sheet, cell, value, style)
+            }
+            Edit::SetFormula {
+                sheet,
+                address,
+                formula,
+            } => {
+                check_formula(&format!("{label}.formula"), formula)?;
+                let sheet_index = resolve_sheet(workbook, sheet, &label)?;
+                let cell = resolve_cell(address, &label)?;
+                let text = formula
+                    .strip_prefix('=')
+                    .unwrap_or(formula)
+                    .trim()
+                    .to_string();
+                let style = workbook
+                    .sheet(sheet_index)
+                    .map_or(StyleId::DEFAULT, |sheet| sheet.style_id(cell));
+                let sheet = workbook.sheet_mut(sheet_index).ok_or_else(missing_sheet)?;
+                sheet.set_cell(
+                    cell,
+                    Cell {
+                        value: Value::Empty,
+                        // `expr: None` keeps the text verbatim: no parse, no calculation.
+                        formula: Some(Arc::new(Formula {
+                            text,
+                            expr: None,
+                            array: None,
+                        })),
+                        style,
+                    },
+                );
+                Ok(())
+            }
+            Edit::SetNumberFormat {
+                sheet,
+                address,
+                format,
+            } => {
+                check_number_format(&format!("{label}.format"), format)?;
+                let sheet_index = resolve_sheet(workbook, sheet, &label)?;
+                let cell = resolve_cell(address, &label)?;
+                let current = workbook
+                    .sheet(sheet_index)
+                    .map_or(StyleId::DEFAULT, |sheet| sheet.style_id(cell));
+                let style = workbook.styles.derive(current, |style| {
+                    style.num_fmt = NumFmt::new(format);
+                });
+                let sheet = workbook.sheet_mut(sheet_index).ok_or_else(missing_sheet)?;
+                sheet.set_style(cell, style);
+                Ok(())
+            }
+            Edit::SetColumnWidth {
+                sheet,
+                column,
+                width,
+            } => {
+                let column = check_column(&format!("{label}.column"), column)?;
+                let width = column_width_px(&format!("{label}.width"), *width)?;
+                let sheet_index = resolve_sheet(workbook, sheet, &label)?;
+                let sheet = workbook.sheet_mut(sheet_index).ok_or_else(missing_sheet)?;
+                let info = sheet.cols.entry(column).or_default();
+                info.size = Some(width);
+                Ok(())
+            }
+            Edit::MergeCells { sheet, range } => {
+                let range = check_merge_range(&format!("{label}.range"), range)?;
+                let sheet_index = resolve_sheet(workbook, sheet, &label)?;
+                let sheet = workbook.sheet_mut(sheet_index).ok_or_else(missing_sheet)?;
+                if sheet
+                    .merges
+                    .iter()
+                    .any(|existing| existing.intersects(&range))
+                {
+                    return Err(SeraError::Validation(format!(
+                        "{label}.range overlaps a range that is already merged in sheet '{sheet_name}'",
+                        sheet_name = sheet.name
+                    )));
+                }
+                sheet.merges.push(range);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// What an imported workbook looks like: sheet names, used ranges, cell and object counts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Workbook {
     pub sheets: Vec<SheetSummary>,
+    /// Floating pictures across every sheet.
+    pub images: usize,
+    /// Charts across every sheet.
+    pub charts: usize,
+    /// Cells holding a formula. The text is never evaluated.
+    pub formulas: usize,
+    /// Whether any cell holds a formula.
+    pub has_formulas: bool,
     /// Bounded notes from the lenient reader (skipped optional parts, repairs).
     pub warnings: Vec<String>,
 }
@@ -115,6 +314,10 @@ pub struct SheetSummary {
     /// Smallest range containing a stored cell, e.g. `A1:D10`; `None` for an empty sheet.
     pub used_range: Option<String>,
     pub cells: usize,
+    pub formulas: usize,
+    pub images: usize,
+    pub charts: usize,
+    pub merged_ranges: usize,
 }
 
 impl Workbook {
@@ -239,6 +442,26 @@ pub fn import(bytes: &[u8]) -> Result<Workbook> {
 
 /// Apply a bounded set of literal cell edits to an imported workbook and re-export it.
 pub fn edit(bytes: &[u8], edits: &[CellEdit]) -> Result<Vec<u8>> {
+    let converted: Vec<Edit> = edits
+        .iter()
+        .map(|edit| Edit::SetValue {
+            sheet: edit.sheet.clone(),
+            address: edit.address.clone(),
+            value: edit.value.clone(),
+        })
+        .collect();
+    apply(bytes, &converted)
+}
+
+/// Apply a bounded set of edits to an imported workbook and re-export it.
+///
+/// Everything the model does not touch is written back: styles, number formats, column widths,
+/// row heights, merged cells, charts and images.
+pub fn apply_edits(bytes: &[u8], edits: &[Edit]) -> Result<Vec<u8>> {
+    apply(bytes, edits)
+}
+
+fn apply(bytes: &[u8], edits: &[Edit]) -> Result<Vec<u8>> {
     if edits.is_empty() {
         return Err(SeraError::Validation(
             "at least one edit is required".into(),
@@ -251,37 +474,11 @@ pub fn edit(bytes: &[u8], edits: &[CellEdit]) -> Result<Vec<u8>> {
     }
 
     let (mut workbook, _) = load(bytes)?;
-    let needs_date_style = edits
-        .iter()
-        .any(|edit| matches!(edit.value, CellValue::Date(_)));
-    let date_style = needs_date_style.then(|| {
-        workbook.styles.intern(Style {
-            num_fmt: NumFmt::new(DATE_NUMBER_FORMAT),
-            ..Style::default()
-        })
-    });
-
     for (index, edit) in edits.iter().enumerate() {
-        let sheet_index = workbook.sheet_index(&edit.sheet).ok_or_else(|| {
-            SeraError::Validation(format!(
-                "edits[{index}].sheet: no sheet named '{}' in this workbook",
-                edit.sheet
-            ))
-        })?;
-        let cell = CellRef::parse(&edit.address).ok_or_else(|| {
-            SeraError::Validation(format!(
-                "edits[{index}].address: '{}' is not a single A1-style cell address",
-                edit.address
-            ))
-        })?;
-        edit.value.validate(&format!("edits[{index}].value"))?;
-        let style = date_style.unwrap_or(StyleId::DEFAULT);
-        let sheet = workbook.sheet_mut(sheet_index).ok_or_else(|| {
-            SeraError::Internal("workbook sheet index disappeared during edit".into())
-        })?;
-        write_literal(sheet, cell, &edit.value, style)?;
+        edit.apply(&mut workbook, index)?;
     }
-
+    // Edits can add cells, so the bound is checked again before the package is written.
+    check_workbook_limits(&workbook)?;
     write_xlsx(&workbook).map_err(write_error)
 }
 
@@ -408,31 +605,60 @@ fn load(bytes: &[u8]) -> Result<(GridWorkbook, ReadReport)> {
         check_preserved(preserved)?;
     }
     for sheet in &workbook.sheets {
-        if !sheet.images.is_empty() || !sheet.cell_pictures.is_empty() {
-            return Err(SeraError::Validation(format!(
-                "sheet '{}' contains images; SeraBot workbooks hold literal cell values only",
-                sheet.name
-            )));
-        }
         if let Some(preserved) = sheet.preserved.as_deref() {
             check_preserved(preserved)?;
         }
     }
+    check_workbook_limits(&workbook)?;
 
     Ok((workbook, report))
 }
 
+/// The sheet, cell and package bounds, applied to imported workbooks as well as to specs.
+fn check_workbook_limits(workbook: &GridWorkbook) -> Result<()> {
+    if workbook.sheets.len() > MAX_SHEETS {
+        return Err(SeraError::Validation(format!(
+            "workbook has {} sheets; SeraBot handles at most {MAX_SHEETS}",
+            workbook.sheets.len()
+        )));
+    }
+    let cells = workbook.sheets.iter().fold(0usize, |total, sheet| {
+        total.saturating_add(sheet.cells.len())
+    });
+    if cells > MAX_CELLS {
+        return Err(SeraError::Validation(format!(
+            "workbook stores {cells} cells; SeraBot handles at most {MAX_CELLS}"
+        )));
+    }
+    Ok(())
+}
+
 fn summarize(workbook: &GridWorkbook, report: &ReadReport) -> Workbook {
+    let sheets: Vec<SheetSummary> = workbook
+        .sheets
+        .iter()
+        .map(|sheet| SheetSummary {
+            name: sheet.name.clone(),
+            used_range: sheet.cells.used_range().map(|range| range.a1()),
+            cells: sheet.cells.len(),
+            formulas: sheet
+                .cells
+                .iter()
+                .filter(|(_, cell)| cell.formula.is_some())
+                .count(),
+            images: sheet.images.len(),
+            charts: sheet.charts.len(),
+            merged_ranges: sheet.merges.len(),
+        })
+        .collect();
+
+    let formulas: usize = sheets.iter().map(|sheet| sheet.formulas).sum();
     Workbook {
-        sheets: workbook
-            .sheets
-            .iter()
-            .map(|sheet| SheetSummary {
-                name: sheet.name.clone(),
-                used_range: sheet.cells.used_range().map(|range| range.a1()),
-                cells: sheet.cells.len(),
-            })
-            .collect(),
+        images: sheets.iter().map(|sheet| sheet.images).sum(),
+        charts: sheets.iter().map(|sheet| sheet.charts).sum(),
+        formulas,
+        has_formulas: formulas > 0,
+        sheets,
         warnings: report
             .warnings
             .iter()
@@ -531,6 +757,11 @@ fn index_package(bytes: &[u8]) -> Result<PackageIndex> {
     Ok(PackageIndex { names })
 }
 
+/// Reject parts that are executable or remote rather than content.
+///
+/// `xl/media/` is deliberately absent: pictures are the owner's content and are carried through.
+/// `xl/embeddings/` holds OLE payloads and `xl/activeX/`/`xl/ctrlProps/` hold controls, which are
+/// embedded objects, not images.
 fn reject_unsafe_parts(names: &[String]) -> Result<()> {
     for name in names {
         let lowered = name.to_ascii_lowercase();
@@ -546,9 +777,12 @@ fn reject_unsafe_parts(names: &[String]) -> Result<()> {
                     .into(),
             ));
         }
-        if lowered.starts_with("xl/media/") || lowered.starts_with("xl/embeddings/") {
+        if lowered.starts_with("xl/embeddings/")
+            || lowered.starts_with("xl/activex/")
+            || lowered.starts_with("xl/ctrlprops/")
+        {
             return Err(SeraError::Validation(
-                "workbook contains images or embedded objects; SeraBot workbooks hold literal cell values only"
+                "workbook contains embedded objects or controls; SeraBot does not accept OLE payloads"
                     .into(),
             ));
         }
@@ -580,9 +814,16 @@ fn check_preserved(preserved: &Preserved) -> Result<()> {
                 .into(),
         ));
     }
-    if preserved.vml.is_some() {
+    // VML is only kept for form controls and OLE objects (notes are modelled), so its presence
+    // means the sheet carries an embedded object rather than content.
+    if preserved.vml.is_some()
+        || preserved
+            .elements
+            .iter()
+            .any(|element| matches!(element.slot.as_str(), "oleObjects" | "controls"))
+    {
         return Err(SeraError::Validation(
-            "workbook contains embedded objects or form controls; SeraBot workbooks hold literal cell values only"
+            "workbook contains embedded objects or form controls; SeraBot does not accept OLE payloads"
                 .into(),
         ));
     }
@@ -593,6 +834,10 @@ fn truncated_package() -> SeraError {
     SeraError::Validation("workbook package is truncated or malformed".into())
 }
 
+fn missing_sheet() -> SeraError {
+    SeraError::Internal("workbook sheet index disappeared during edit".into())
+}
+
 fn u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
     let slice = bytes.get(offset..offset.checked_add(2)?)?;
     Some(u16::from_le_bytes([slice[0], slice[1]]))
@@ -601,6 +846,158 @@ fn u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
 fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
     let slice = bytes.get(offset..offset.checked_add(4)?)?;
     Some(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
+}
+
+fn resolve_sheet(workbook: &GridWorkbook, name: &str, label: &str) -> Result<usize> {
+    workbook.sheet_index(name).ok_or_else(|| {
+        SeraError::Validation(format!(
+            "{label}.sheet: no sheet named '{name}' in this workbook"
+        ))
+    })
+}
+
+fn resolve_cell(address: &str, label: &str) -> Result<CellRef> {
+    CellRef::parse(address).ok_or_else(|| {
+        SeraError::Validation(format!(
+            "{label}.address: '{address}' is not a single A1-style cell address"
+        ))
+    })
+}
+
+/// A single column letter reference (`C`, `$C`).
+fn check_column(label: &str, column: &str) -> Result<u32> {
+    let trimmed = column.trim();
+    let letters = trimmed.strip_prefix('$').unwrap_or(trimmed);
+    if letters.is_empty() || letters.len() > 3 || !letters.bytes().all(|b| b.is_ascii_alphabetic())
+    {
+        return Err(SeraError::Validation(format!(
+            "{label}: '{column}' is not a single column letter such as C or $C"
+        )));
+    }
+    letters_to_col(letters).ok_or_else(|| {
+        SeraError::Validation(format!(
+            "{label}: '{column}' is outside the spreadsheet grid"
+        ))
+    })
+}
+
+/// Column width in characters (the Column Width dialog value) → the model's pixel width.
+///
+/// This is the inverse of `gridcraft_model::points_to_chars`, which is what the model exposes
+/// for the same conversion in the other direction.
+fn column_width_px(label: &str, width: f64) -> Result<f32> {
+    if !width.is_finite() || !(MIN_COLUMN_WIDTH_CHARS..=MAX_COLUMN_WIDTH_CHARS).contains(&width) {
+        return Err(SeraError::Validation(format!(
+            "{label} must be between {MIN_COLUMN_WIDTH_CHARS} and {MAX_COLUMN_WIDTH_CHARS} characters"
+        )));
+    }
+    let px = if width <= 1.0 {
+        width * 12.0
+    } else {
+        width * 7.0 + 5.0
+    };
+    Ok(px.round() as f32)
+}
+
+fn check_merge_range(label: &str, value: &str) -> Result<RangeRef> {
+    let range = RangeRef::parse(value).ok_or_else(|| {
+        SeraError::Validation(format!(
+            "{label}: '{value}' is not an A1-style range such as B2:D2"
+        ))
+    })?;
+    if range.is_single() {
+        return Err(SeraError::Validation(format!(
+            "{label} must cover at least two cells"
+        )));
+    }
+    if range.height() > MAX_ROWS_PER_SHEET as u32 || range.width() > MAX_COLUMNS as u32 {
+        return Err(SeraError::Validation(format!(
+            "{label} must be at most {MAX_ROWS_PER_SHEET} rows by {MAX_COLUMNS} columns"
+        )));
+    }
+    Ok(range)
+}
+
+fn check_number_format(label: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(SeraError::Validation(format!("{label} must not be empty")));
+    }
+    if value.chars().count() > MAX_NUMBER_FORMAT_CHARS {
+        return Err(SeraError::Validation(format!(
+            "{label} must be at most {MAX_NUMBER_FORMAT_CHARS} characters"
+        )));
+    }
+    if value
+        .chars()
+        .any(|character| character.is_control() || is_bidi_or_zero_width(character))
+    {
+        return Err(SeraError::Validation(format!(
+            "{label} contains control or invisible formatting characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Formula text is stored verbatim, so it is checked here rather than parsed: no control
+/// characters, no external or structured references, and no function that reaches outside the
+/// workbook when Excel recalculates.
+fn check_formula(label: &str, value: &str) -> Result<()> {
+    let body = value.strip_prefix('=').unwrap_or(value);
+    if body.trim().is_empty() {
+        return Err(SeraError::Validation(format!("{label} must not be empty")));
+    }
+    if body.chars().count() > MAX_FORMULA_CHARS {
+        return Err(SeraError::Validation(format!(
+            "{label} must be at most {MAX_FORMULA_CHARS} characters"
+        )));
+    }
+    if body
+        .chars()
+        .any(|character| character.is_control() || is_bidi_or_zero_width(character))
+    {
+        return Err(SeraError::Validation(format!(
+            "{label} contains control or invisible formatting characters"
+        )));
+    }
+    if body.contains('[') || body.contains(']') {
+        return Err(SeraError::Validation(format!(
+            "{label} must not contain '[' or ']': external and structured references are not accepted"
+        )));
+    }
+    for name in REMOTE_FORMULA_FUNCTIONS {
+        if calls_function(body, name) {
+            return Err(SeraError::Validation(format!(
+                "{label} calls {name}(), which reaches outside the workbook; SeraBot does not write remote formulas"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `text` calls `name` as a function (case-insensitive, whole identifier).
+fn calls_function(text: &str, name: &str) -> bool {
+    let upper = text.to_ascii_uppercase();
+    let mut from = 0usize;
+    while let Some(offset) = upper.get(from..).and_then(|rest| rest.find(name)) {
+        let start = from + offset;
+        let end = start + name.len();
+        let boundary_before = upper
+            .as_bytes()
+            .get(start.wrapping_sub(1))
+            .is_none_or(|byte| !is_identifier_byte(*byte));
+        let boundary_after = upper
+            .get(end..)
+            .is_none_or(|rest| rest.trim_start().starts_with('('));
+        if boundary_before && boundary_after {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.'
 }
 
 fn check_line(label: &str, value: &str, max_chars: usize) -> Result<()> {
@@ -660,7 +1057,7 @@ fn check_cell_text(label: &str, value: &str) -> Result<()> {
     }
     if value.starts_with('=') {
         return Err(SeraError::Validation(format!(
-            "{label} looks like a formula; only literal values are accepted"
+            "{label} looks like a formula; set a formula with op 'set_formula' instead"
         )));
     }
     Ok(())
@@ -735,6 +1132,136 @@ fn spec_summary(spec: &WorkbookSpec, stored: &crate::maker::StoredArtifact) -> J
     })
 }
 
+/// The JSON shape an edit arrives in, before it is resolved to one [`Edit`].
+///
+/// Every field is optional so that both the legacy literal form and the `op`-tagged form parse;
+/// [`Edit::try_from`] then enforces exactly which fields the chosen operation takes.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEdit {
+    #[serde(default)]
+    op: Option<String>,
+    sheet: String,
+    #[serde(default)]
+    address: Option<String>,
+    #[serde(default)]
+    value: Option<CellValue>,
+    #[serde(default)]
+    formula: Option<String>,
+    #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    column: Option<String>,
+    #[serde(default)]
+    width: Option<f64>,
+    #[serde(default)]
+    range: Option<String>,
+}
+
+impl TryFrom<RawEdit> for Edit {
+    type Error = String;
+
+    fn try_from(raw: RawEdit) -> std::result::Result<Edit, String> {
+        let op = match raw.op.as_deref() {
+            Some(op) => op.trim().to_ascii_lowercase(),
+            None => infer_op(&raw)?,
+        };
+        match op.as_str() {
+            "set_value" => {
+                check_fields("set_value", &["address", "value"], &raw)?;
+                Ok(Edit::SetValue {
+                    sheet: raw.sheet,
+                    address: require(raw.address, "address", "set_value")?,
+                    value: require(raw.value, "value", "set_value")?,
+                })
+            }
+            "set_formula" => {
+                check_fields("set_formula", &["address", "formula"], &raw)?;
+                Ok(Edit::SetFormula {
+                    sheet: raw.sheet,
+                    address: require(raw.address, "address", "set_formula")?,
+                    formula: require(raw.formula, "formula", "set_formula")?,
+                })
+            }
+            "set_number_format" => {
+                check_fields("set_number_format", &["address", "format"], &raw)?;
+                Ok(Edit::SetNumberFormat {
+                    sheet: raw.sheet,
+                    address: require(raw.address, "address", "set_number_format")?,
+                    format: require(raw.format, "format", "set_number_format")?,
+                })
+            }
+            "set_column_width" => {
+                check_fields("set_column_width", &["column", "width"], &raw)?;
+                Ok(Edit::SetColumnWidth {
+                    sheet: raw.sheet,
+                    column: require(raw.column, "column", "set_column_width")?,
+                    width: require(raw.width, "width", "set_column_width")?,
+                })
+            }
+            "merge_cells" => {
+                check_fields("merge_cells", &["range"], &raw)?;
+                Ok(Edit::MergeCells {
+                    sheet: raw.sheet,
+                    range: require(raw.range, "range", "merge_cells")?,
+                })
+            }
+            other => Err(format!(
+                "unknown op '{other}'; use set_value, set_formula, set_number_format, set_column_width or merge_cells"
+            )),
+        }
+    }
+}
+
+fn require<T>(field: Option<T>, name: &str, op: &str) -> std::result::Result<T, String> {
+    field.ok_or_else(|| format!("{op} needs '{name}'"))
+}
+
+/// Which operation an edit without `op` means, judged by the field it carries.
+fn infer_op(raw: &RawEdit) -> std::result::Result<String, String> {
+    let mut found: Vec<&str> = Vec::new();
+    if raw.value.is_some() {
+        found.push("set_value");
+    }
+    if raw.formula.is_some() {
+        found.push("set_formula");
+    }
+    if raw.format.is_some() {
+        found.push("set_number_format");
+    }
+    if raw.width.is_some() || raw.column.is_some() {
+        found.push("set_column_width");
+    }
+    if raw.range.is_some() {
+        found.push("merge_cells");
+    }
+    match found.as_slice() {
+        [only] => Ok((*only).to_string()),
+        [] => Err(
+            "edit needs an op (set_value, set_formula, set_number_format, set_column_width, merge_cells)"
+                .into(),
+        ),
+        _ => Err("edit mixes several operations; set op to choose one".into()),
+    }
+}
+
+fn check_fields(op: &str, allowed: &[&str], raw: &RawEdit) -> std::result::Result<(), String> {
+    for (name, present) in [
+        ("address", raw.address.is_some()),
+        ("value", raw.value.is_some()),
+        ("formula", raw.formula.is_some()),
+        ("format", raw.format.is_some()),
+        ("column", raw.column.is_some()),
+        ("width", raw.width.is_some()),
+        ("range", raw.range.is_some()),
+    ] {
+        if present && !allowed.contains(&name) {
+            return Err(format!("{op} does not take '{name}'"));
+        }
+    }
+    Ok(())
+}
+
 pub struct XlsxBuildTool {
     artifacts: Arc<ArtifactStore>,
     store: Store,
@@ -753,9 +1280,9 @@ impl Tool for XlsxBuildTool {
             name: "xlsx_build".into(),
             description:
                 "Build a deterministic .xlsx workbook from a bounded spec of literal values. \
-                 Sheets carry a header row and rows of text, number, or date cells. Formulas, \
-                 macros, external links, images, and embedded objects are rejected; nothing is \
-                 ever calculated."
+                 Sheets carry a header row and rows of text, number, or date cells. The spec has \
+                 no formula, macro, or link variant; nothing is ever calculated. Use xlsx_edit \
+                 to add formulas, number formats, widths, or merges to an existing workbook."
                     .into(),
             parameters: json!({
                 "type": "object",
@@ -845,9 +1372,12 @@ impl Tool for XlsxEditTool {
         ToolSpec {
             name: "xlsx_edit".into(),
             description:
-                "Apply bounded literal cell edits to an existing workbook artifact and store the \
-                 result as a new artifact that records its source. Formulas, macros, external \
-                 links, images, and embedded objects are rejected; nothing is ever calculated."
+                "Apply a bounded set of edits to an existing workbook artifact and store the \
+                 result as a new artifact that records its source. Edits set literal values, \
+                 formula text (written as given, never evaluated), number formats, column \
+                 widths, or merged ranges. Styles, number formats, widths, heights, merges, \
+                 charts, and images are preserved; macros, external links, and embedded objects \
+                 are rejected."
                     .into(),
             parameters: json!({
                 "type": "object",
@@ -855,7 +1385,7 @@ impl Tool for XlsxEditTool {
                     "source_artifact": {"type": "string", "description": "Artifact hash of the workbook to edit"},
                     "edits": {
                         "type": "array",
-                        "description": "CellEdit: {sheet, address (A1), value: {type: text|number|date, value}}",
+                        "description": "Bounded edits. {op: set_value, sheet, address, value:{type,value}} | {op: set_formula, sheet, address, formula} | {op: set_number_format, sheet, address, format} | {op: set_column_width, sheet, column, width} | {op: merge_cells, sheet, range}. The literal form {sheet, address, value} is accepted too.",
                         "items": {"type": "object"}
                     },
                     "filename": {"type": "string", "description": "Optional artifact filename ending in .xlsx"}
@@ -872,7 +1402,7 @@ impl Tool for XlsxEditTool {
             .get("source_artifact")
             .and_then(JsonValue::as_str)
             .ok_or_else(|| SeraError::Validation("source_artifact is required".into()))?;
-        let edits: Vec<CellEdit> = serde_json::from_value(
+        let edits: Vec<Edit> = serde_json::from_value(
             args.get("edits")
                 .cloned()
                 .ok_or_else(|| SeraError::Validation("edits is required".into()))?,
@@ -887,7 +1417,8 @@ impl Tool for XlsxEditTool {
         let filename = optional_filename(&args)?.unwrap_or_else(|| source.filename.clone());
         let bytes = source.bytes.clone();
         let edit_count = edits.len();
-        let edited = tokio::task::spawn_blocking(move || edit(&bytes, &edits))
+        let operations: Vec<&str> = edits.iter().map(Edit::op).collect();
+        let edited = tokio::task::spawn_blocking(move || apply_edits(&bytes, &edits))
             .await
             .map_err(|error| SeraError::Internal(format!("workbook task failed: {error}")))??;
 
@@ -915,6 +1446,7 @@ impl Tool for XlsxEditTool {
                 "artifact_hash": stored.hash,
                 "source_artifact": source.hash,
                 "edits": edit_count,
+                "operations": operations,
             })),
         )?;
 
@@ -923,10 +1455,11 @@ impl Tool for XlsxEditTool {
             "filename": stored.filename,
             "source_artifact": source.hash,
             "edits": edit_count,
+            "operations": operations,
         });
         Ok(ToolOutput {
             content: format!(
-                "edited {edit_count} cell(s) from {}\nfilename: {}\nartifact: {}",
+                "applied {edit_count} edit(s) from {}\nfilename: {}\nartifact: {}",
                 source.filename, stored.filename, stored.hash
             ),
             data: Some(data),
@@ -954,8 +1487,10 @@ impl Tool for XlsxInspectTool {
         ToolSpec {
             name: "xlsx_inspect".into(),
             description:
-                "Read-only summary of a workbook artifact: sheet names, used ranges, and cell \
-                 counts. Macros, external links, images, and embedded objects are rejected."
+                "Read-only summary of a workbook artifact: sheet names, used ranges, cell and \
+                 formula counts, image and chart counts, and merged ranges — enough to reason \
+                 about the file without reading every cell. Macros, external links, and embedded \
+                 objects are rejected."
                     .into(),
             parameters: json!({
                 "type": "object",
@@ -999,8 +1534,16 @@ impl Tool for XlsxInspectTool {
 mod tests {
     use std::collections::HashSet;
 
+    use gridcraft_model::{
+        Anchor, Chart, ChartKind, Font, Image, LegendPos, LineInfo, Series, points_to_chars,
+    };
+
     use super::*;
     use crate::gateway::ToolRegistry;
+
+    /// Synthetic image bytes: the PNG signature followed by a marker. Nothing in SeraBot or in
+    /// `gridcraft-xlsx` decodes pictures, so a fixture never needs to be a real image.
+    const SYNTHETIC_PNG: &[u8] = b"\x89PNG\r\n\x1a\nserabot-synthetic-image";
 
     fn spec() -> WorkbookSpec {
         WorkbookSpec {
@@ -1052,6 +1595,111 @@ mod tests {
         workbook.sheet(sheet)?.cells.get(cell)?.value.as_f64()
     }
 
+    /// A workbook that exercises every feature the round trip must preserve.
+    fn rich_workbook() -> Vec<u8> {
+        let mut workbook = GridWorkbook::new();
+        workbook.sheets.clear();
+        workbook.props.title = "Synthetic Rich Workbook".into();
+
+        let heading = workbook.styles.intern(Style {
+            font: Font {
+                bold: true,
+                ..Font::default()
+            },
+            ..Style::default()
+        });
+        let money = workbook.styles.intern(Style {
+            num_fmt: NumFmt::new("#,##0.00"),
+            ..Style::default()
+        });
+
+        let mut sheet = Sheet::new("Summary");
+        for (column, text) in ["Region", "Revenue"].iter().enumerate() {
+            sheet.set_cell(
+                CellRef::new(0, column as u32),
+                Cell {
+                    value: Value::text(*text),
+                    formula: None,
+                    style: heading,
+                },
+            );
+        }
+        sheet.set_cell(
+            CellRef::new(1, 0),
+            Cell {
+                value: Value::text("North"),
+                formula: None,
+                style: StyleId::DEFAULT,
+            },
+        );
+        sheet.set_cell(
+            CellRef::new(1, 1),
+            Cell {
+                value: Value::number(1250.5),
+                formula: None,
+                style: money,
+            },
+        );
+        sheet.cols.insert(
+            0,
+            LineInfo {
+                size: Some(145.0),
+                ..LineInfo::default()
+            },
+        );
+        sheet.rows.insert(
+            0,
+            LineInfo {
+                size: Some(32.0),
+                ..LineInfo::default()
+            },
+        );
+        sheet
+            .merges
+            .push(RangeRef::parse("A4:C4").unwrap_or_else(|| RangeRef::cell(CellRef::new(3, 0))));
+        sheet.charts.push(Chart {
+            id: 1,
+            kind: ChartKind::ColumnClustered,
+            anchor: Anchor {
+                cell: CellRef::new(6, 0),
+                width: 320.0,
+                height: 200.0,
+                ..Anchor::default()
+            },
+            title: Some("Revenue".into()),
+            series: vec![Series {
+                name: Some("Summary!$B$1".into()),
+                categories: Some("Summary!$A$2".into()),
+                values: "Summary!$B$2".into(),
+                ..Series::default()
+            }],
+            legend: LegendPos::Bottom,
+            data_labels: false,
+            gridlines: true,
+            style: 2,
+            x_title: None,
+            y_title: None,
+            source: None,
+            by_rows: false,
+            pivot: None,
+        });
+        sheet.images.push(Image {
+            id: 2,
+            anchor: Anchor {
+                cell: CellRef::new(9, 0),
+                width: 64.0,
+                height: 64.0,
+                ..Anchor::default()
+            },
+            data: SYNTHETIC_PNG.to_vec(),
+            mime: "image/png".into(),
+            alt: "Synthetic mark".into(),
+        });
+        workbook.sheets.push(Arc::new(sheet));
+
+        write_xlsx(&workbook).expect("the synthetic fixture must be writable")
+    }
+
     #[test]
     fn builds_and_reads_back_literal_values() {
         let bytes = build(&spec()).unwrap();
@@ -1072,6 +1720,9 @@ mod tests {
         assert_eq!(summary.sheet_names(), vec!["Summary"]);
         assert_eq!(summary.sheets[0].used_range.as_deref(), Some("A1:C3"));
         assert_eq!(summary.cell_count(), 9);
+        assert_eq!(summary.images, 0);
+        assert_eq!(summary.charts, 0);
+        assert!(!summary.has_formulas);
     }
 
     #[test]
@@ -1132,7 +1783,292 @@ mod tests {
     }
 
     #[test]
-    fn rejects_macro_and_external_link_parts() {
+    fn round_trip_preserves_styles_geometry_merges_charts_and_images() {
+        let bytes = rich_workbook();
+        let edited = apply_edits(
+            &bytes,
+            &[Edit::SetValue {
+                sheet: "Summary".into(),
+                address: "A2".into(),
+                value: CellValue::Text("South".into()),
+            }],
+        )
+        .unwrap();
+
+        let (workbook, _) = load(&edited).unwrap();
+        let sheet = workbook.sheet(0).unwrap();
+
+        // The edit landed and the untouched neighbour kept its value.
+        assert_eq!(cell_text(&workbook, 0, "A2").as_deref(), Some("South"));
+        assert_eq!(cell_number(&workbook, 0, "B2"), Some(1250.5));
+
+        // Cell styles and number formats.
+        let heading = sheet.cells.get(CellRef::new(0, 0)).unwrap().style;
+        assert!(workbook.styles.get(heading).font.bold);
+        let money = sheet.cells.get(CellRef::new(1, 1)).unwrap().style;
+        assert_eq!(workbook.styles.get(money).num_fmt.as_str(), "#,##0.00");
+
+        // Column widths and row heights.
+        assert_eq!(sheet.col_width(0), 145.0);
+        assert_eq!(points_to_chars(145.0), 20.0);
+        assert_eq!(sheet.row_height(0), 32.0);
+
+        // Merged cells.
+        let merges: Vec<String> = sheet.merges.iter().map(RangeRef::a1).collect();
+        assert_eq!(merges, vec!["A4:C4".to_string()]);
+
+        // Charts.
+        assert_eq!(sheet.charts.len(), 1);
+        assert_eq!(sheet.charts[0].kind, ChartKind::ColumnClustered);
+        assert_eq!(sheet.charts[0].title.as_deref(), Some("Revenue"));
+        assert_eq!(sheet.charts[0].series.len(), 1);
+
+        // Images.
+        assert_eq!(sheet.images.len(), 1);
+        assert_eq!(sheet.images[0].alt, "Synthetic mark");
+        assert_eq!(sheet.images[0].mime, "image/png");
+        assert_eq!(sheet.images[0].data, SYNTHETIC_PNG);
+
+        // The package itself carries the drawing, chart and media parts, not just the model.
+        let names = package_names(&edited);
+        for expected in [
+            "xl/drawings/drawing1.xml",
+            "xl/charts/chart1.xml",
+            "xl/media/image1.png",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "missing {expected} in {names:?}"
+            );
+        }
+    }
+
+    /// Part names inside a package, for asserting that a round trip kept them.
+    fn package_names(bytes: &[u8]) -> Vec<String> {
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        (0..archive.len())
+            .filter_map(|index| {
+                archive
+                    .by_index(index)
+                    .ok()
+                    .map(|file| file.name().to_owned())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inspect_reports_images_charts_formulas_and_merges() {
+        let bytes = rich_workbook();
+        let summary = import(&bytes).unwrap();
+        assert_eq!(summary.sheets.len(), 1);
+        assert_eq!(summary.images, 1);
+        assert_eq!(summary.charts, 1);
+        assert_eq!(summary.sheets[0].images, 1);
+        assert_eq!(summary.sheets[0].charts, 1);
+        assert_eq!(summary.sheets[0].merged_ranges, 1);
+        assert_eq!(summary.sheets[0].used_range.as_deref(), Some("A1:B2"));
+        assert!(!summary.has_formulas);
+
+        let with_formula = apply_edits(
+            &bytes,
+            &[Edit::SetFormula {
+                sheet: "Summary".into(),
+                address: "B3".into(),
+                formula: "=SUM(B2:B2)".into(),
+            }],
+        )
+        .unwrap();
+        let summary = import(&with_formula).unwrap();
+        assert_eq!(summary.formulas, 1);
+        assert_eq!(summary.sheets[0].formulas, 1);
+        assert!(summary.has_formulas);
+    }
+
+    #[test]
+    fn sets_formula_text_without_evaluating_it() {
+        let bytes = build(&spec()).unwrap();
+        let edited = apply_edits(
+            &bytes,
+            &[Edit::SetFormula {
+                sheet: "Summary".into(),
+                address: "B4".into(),
+                formula: "=SUM(B2:B3)".into(),
+            }],
+        )
+        .unwrap();
+
+        let (workbook, _) = load(&edited).unwrap();
+        let cell = workbook
+            .sheet(0)
+            .and_then(|sheet| sheet.cells.get(CellRef::new(3, 1)))
+            .cloned()
+            .expect("the formula cell must exist");
+        let formula = cell.formula.expect("the cell must hold a formula");
+        assert_eq!(formula.text, "SUM(B2:B3)");
+        // No cached result: SeraBot never calculates, so Excel recalculates on open.
+        assert!(cell.value.is_empty());
+    }
+
+    #[test]
+    fn sets_number_format_and_column_width() {
+        let bytes = build(&spec()).unwrap();
+        let edited = apply_edits(
+            &bytes,
+            &[
+                Edit::SetNumberFormat {
+                    sheet: "Summary".into(),
+                    address: "B2".into(),
+                    format: "#,##0.00".into(),
+                },
+                Edit::SetColumnWidth {
+                    sheet: "Summary".into(),
+                    column: "B".into(),
+                    width: 20.0,
+                },
+            ],
+        )
+        .unwrap();
+
+        let (workbook, _) = load(&edited).unwrap();
+        let sheet = workbook.sheet(0).unwrap();
+        let style = sheet.cells.get(CellRef::new(1, 1)).unwrap().style;
+        assert_eq!(workbook.styles.get(style).num_fmt.as_str(), "#,##0.00");
+        // 20 characters is the Column Width dialog value the edit asked for.
+        assert_eq!(points_to_chars(f64::from(sheet.col_width(1))), 20.0);
+        // The value itself is untouched by a format change.
+        assert_eq!(cell_number(&workbook, 0, "B2"), Some(1250.5));
+    }
+
+    #[test]
+    fn merges_a_range_and_rejects_overlaps() {
+        let bytes = build(&spec()).unwrap();
+        let merged = apply_edits(
+            &bytes,
+            &[Edit::MergeCells {
+                sheet: "Summary".into(),
+                range: "A5:C5".into(),
+            }],
+        )
+        .unwrap();
+        let (workbook, _) = load(&merged).unwrap();
+        assert_eq!(
+            workbook.sheets[0]
+                .merges
+                .iter()
+                .map(RangeRef::a1)
+                .collect::<Vec<_>>(),
+            vec!["A5:C5".to_string()]
+        );
+
+        let overlap = apply_edits(
+            &merged,
+            &[Edit::MergeCells {
+                sheet: "Summary".into(),
+                range: "B5:C6".into(),
+            }],
+        );
+        assert!(overlap.is_err());
+
+        let single = apply_edits(
+            &merged,
+            &[Edit::MergeCells {
+                sheet: "Summary".into(),
+                range: "B7".into(),
+            }],
+        );
+        assert!(single.is_err());
+
+        let huge = apply_edits(
+            &merged,
+            &[Edit::MergeCells {
+                sheet: "Summary".into(),
+                range: "A1:ZZ9999".into(),
+            }],
+        );
+        assert!(huge.is_err());
+    }
+
+    #[test]
+    fn rejects_unsafe_formula_text() {
+        let bytes = build(&spec()).unwrap();
+        let formula = |text: &str| {
+            apply_edits(
+                &bytes,
+                &[Edit::SetFormula {
+                    sheet: "Summary".into(),
+                    address: "D1".into(),
+                    formula: text.into(),
+                }],
+            )
+        };
+        assert!(formula("").is_err());
+        assert!(formula("   ").is_err());
+        assert!(formula("=[Book1.xlsx]Sheet1!A1").is_err());
+        assert!(formula("=WEBSERVICE(\"https://example.invalid\")").is_err());
+        assert!(formula("=webservice (\"https://example.invalid\")").is_err());
+        assert!(formula("=RTD(\"prog\",,\"topic\")").is_err());
+        assert!(formula("=SUM(A1:A2)\u{202e}").is_err());
+        assert!(formula(&format!("=SUM({})", "A1,".repeat(MAX_FORMULA_CHARS))).is_err());
+        // Ordinary formulas over plain ranges are accepted.
+        assert!(formula("=SUM(B2:B3)").is_ok());
+        assert!(formula("=B2*2").is_ok());
+        // A name that merely contains a forbidden word is not a call.
+        assert!(formula("=CALLED_OFF").is_ok());
+    }
+
+    #[test]
+    fn rejects_bad_number_formats_and_column_widths() {
+        let bytes = build(&spec()).unwrap();
+        let format = |text: &str| {
+            apply_edits(
+                &bytes,
+                &[Edit::SetNumberFormat {
+                    sheet: "Summary".into(),
+                    address: "B2".into(),
+                    format: text.into(),
+                }],
+            )
+        };
+        assert!(format("").is_err());
+        assert!(format("   ").is_err());
+        assert!(format("0.00\u{0007}").is_err());
+        assert!(format(&"0".repeat(MAX_NUMBER_FORMAT_CHARS + 1)).is_err());
+        assert!(format("#,##0.00").is_ok());
+
+        let width = |value: f64| {
+            apply_edits(
+                &bytes,
+                &[Edit::SetColumnWidth {
+                    sheet: "Summary".into(),
+                    column: "B".into(),
+                    width: value,
+                }],
+            )
+        };
+        assert!(width(0.0).is_err());
+        assert!(width(-1.0).is_err());
+        assert!(width(f64::INFINITY).is_err());
+        assert!(width(MAX_COLUMN_WIDTH_CHARS + 1.0).is_err());
+        assert!(width(8.43).is_ok());
+
+        let column = |text: &str| {
+            apply_edits(
+                &bytes,
+                &[Edit::SetColumnWidth {
+                    sheet: "Summary".into(),
+                    column: text.into(),
+                    width: 10.0,
+                }],
+            )
+        };
+        assert!(column("").is_err());
+        assert!(column("B1").is_err());
+        assert!(column("1").is_err());
+        assert!(column("$B").is_ok());
+    }
+
+    #[test]
+    fn rejects_macro_external_link_and_embedded_object_parts() {
         let bytes = build(&spec()).unwrap();
 
         let macro_package = append_stored_part(&bytes, "xl/vbaProject.bin", b"macro");
@@ -1149,8 +2085,103 @@ mod tests {
             "unexpected error: {error}"
         );
 
-        let image = append_stored_part(&bytes, "xl/media/image1.png", b"\x89PNG");
-        assert!(import(&image).is_err());
+        let embedded = append_stored_part(&bytes, "xl/embeddings/oleObject1.bin", b"ole");
+        let error = import(&embedded).unwrap_err();
+        assert!(
+            error.to_string().contains("embedded objects"),
+            "unexpected error: {error}"
+        );
+
+        let activex = append_stored_part(&bytes, "xl/activeX/activeX1.bin", b"ctl");
+        assert!(import(&activex).is_err());
+    }
+
+    #[test]
+    fn accepts_image_parts() {
+        let bytes = build(&spec()).unwrap();
+        // An unreferenced media part is content, not code: it must not be rejected.
+        let image = append_stored_part(&bytes, "xl/media/image1.png", SYNTHETIC_PNG);
+        assert!(import(&image).is_ok());
+    }
+
+    #[test]
+    fn accepts_legacy_and_op_tagged_edit_json() {
+        let legacy: Edit = serde_json::from_str(
+            r#"{"sheet":"Summary","address":"B2","value":{"type":"number","value":42}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            legacy,
+            Edit::SetValue {
+                sheet: "Summary".into(),
+                address: "B2".into(),
+                value: CellValue::Number(42.0),
+            }
+        );
+
+        let tagged: Edit = serde_json::from_str(
+            r#"{"op":"set_formula","sheet":"Summary","address":"B2","formula":"=B1*2"}"#,
+        )
+        .unwrap();
+        assert_eq!(tagged.op(), "set_formula");
+
+        let merge: Edit =
+            serde_json::from_str(r#"{"op":"merge_cells","sheet":"Summary","range":"A1:C1"}"#)
+                .unwrap();
+        assert_eq!(merge.op(), "merge_cells");
+
+        // Mixed or unknown shapes are refused with a reason.
+        assert!(
+            serde_json::from_str::<Edit>(
+                r#"{"sheet":"Summary","address":"B2","value":{"type":"number","value":1},"format":"0"}"#
+            )
+            .is_err()
+        );
+        assert!(serde_json::from_str::<Edit>(r#"{"op":"set_value","sheet":"Summary"}"#).is_err());
+        assert!(
+            serde_json::from_str::<Edit>(
+                r#"{"op":"set_value","sheet":"Summary","address":"A1","value":{"type":"number","value":1},"range":"A1:B1"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<Edit>(r#"{"op":"nope","sheet":"Summary","range":"A1:B1"}"#)
+                .is_err()
+        );
+        assert!(serde_json::from_str::<Edit>(r#"{"sheet":"Summary"}"#).is_err());
+    }
+
+    #[test]
+    fn rejects_workbooks_over_the_sheet_and_cell_bounds() {
+        let mut workbook = GridWorkbook::new();
+        workbook.sheets.clear();
+        for index in 0..=MAX_SHEETS {
+            workbook
+                .sheets
+                .push(Arc::new(Sheet::new(format!("Sheet{}", index + 1))));
+        }
+        let bytes = write_xlsx(&workbook).unwrap();
+        let error = import(&bytes).unwrap_err();
+        assert!(
+            error.to_string().contains("sheets"),
+            "unexpected error: {error}"
+        );
+
+        let mut workbook = GridWorkbook::new();
+        workbook.sheets.clear();
+        let mut sheet = Sheet::new("Big");
+        for row in 0..=(MAX_CELLS as u32 / MAX_COLUMNS as u32) {
+            for column in 0..MAX_COLUMNS as u32 {
+                sheet.set_value(CellRef::new(row, column), Value::number(1.0));
+            }
+        }
+        workbook.sheets.push(Arc::new(sheet));
+        let bytes = write_xlsx(&workbook).unwrap();
+        let error = import(&bytes).unwrap_err();
+        assert!(
+            error.to_string().contains("cells"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -1305,17 +2336,24 @@ mod tests {
             .await
             .unwrap();
         assert!(inspected.content.contains("Summary"));
+        assert!(inspected.content.contains("has_formulas"));
 
         let edit_tool = registry.get("xlsx_edit").unwrap();
         let edited = edit_tool
             .execute(
                 json!({
                     "source_artifact": built_hash,
-                    "edits": [{
-                        "sheet": "Summary",
-                        "address": "B2",
-                        "value": {"type": "number", "value": 42.0}
-                    }]
+                    "edits": [
+                        {
+                            "sheet": "Summary",
+                            "address": "B2",
+                            "value": {"type": "number", "value": 42.0}
+                        },
+                        {"op": "set_formula", "sheet": "Summary", "address": "B4", "formula": "=SUM(B2:B3)"},
+                        {"op": "set_number_format", "sheet": "Summary", "address": "B2", "format": "#,##0.00"},
+                        {"op": "set_column_width", "sheet": "Summary", "column": "B", "width": 18.0},
+                        {"op": "merge_cells", "sheet": "Summary", "range": "A5:C5"}
+                    ]
                 }),
                 &context("xlsx_edit"),
             )
@@ -1331,6 +2369,14 @@ mod tests {
 
         let (workbook, _) = load(&stored.bytes).unwrap();
         assert_eq!(cell_number(&workbook, 0, "B2"), Some(42.0));
+        let sheet = workbook.sheet(0).unwrap();
+        assert!(sheet.cells.get(CellRef::new(3, 1)).is_some_and(|cell| {
+            cell.formula
+                .as_ref()
+                .is_some_and(|f| f.text == "SUM(B2:B3)")
+        }));
+        assert_eq!(sheet.merges.len(), 1);
+        assert_eq!(points_to_chars(f64::from(sheet.col_width(1))), 18.0);
     }
 
     #[tokio::test]
@@ -1344,7 +2390,7 @@ mod tests {
     }
 
     /// Appends a stored (uncompressed) entry to a zip package, so tests can build a package
-    /// that carries a macro, a link, or an image without any extra dependency.
+    /// that carries a macro, a link, or an embedded object without any extra dependency.
     fn append_stored_part(original: &[u8], name: &str, data: &[u8]) -> Vec<u8> {
         let eocd = (0..original.len().saturating_sub(3))
             .rev()
