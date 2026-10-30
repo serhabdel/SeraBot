@@ -178,14 +178,14 @@ pub fn analyze_transcript(text: &str) -> TranscriptAnalysis {
                     last_action = None;
                     continue;
                 }
-                if let Some(due) = &tagged.due {
-                    if !looks_like_date(due) {
-                        push_question(
-                            &mut analysis,
-                            &mut seen_questions,
-                            format!("Unrecognized due date '{due}' for action '{}'", tagged.text),
-                        );
-                    }
+                if let Some(due) = &tagged.due
+                    && !looks_like_date(due)
+                {
+                    push_question(
+                        &mut analysis,
+                        &mut seen_questions,
+                        format!("Unrecognized due date '{due}' for action '{}'", tagged.text),
+                    );
                 }
                 let action = ActionItem {
                     text: tagged.text,
@@ -438,10 +438,10 @@ fn strip_numbering(line: &str) -> &str {
         return line;
     }
     let rest = &line[digits..];
-    if let Some(rest) = rest.strip_prefix('.').or_else(|| rest.strip_prefix(')')) {
-        if let Some(rest) = rest.strip_prefix(' ') {
-            return rest.trim_start();
-        }
+    if let Some(rest) = rest.strip_prefix('.').or_else(|| rest.strip_prefix(')'))
+        && let Some(rest) = rest.strip_prefix(' ')
+    {
+        return rest.trim_start();
     }
     line
 }
@@ -588,48 +588,46 @@ fn extract_tags(content: &str) -> TaggedText {
 
     while index < chars.len() {
         let boundary = index == 0 || !chars[index - 1].is_alphanumeric();
-        if boundary {
-            if let Some((kind, length)) = match_tag(&chars, index) {
-                let before: String = chars[cursor..index].iter().collect();
-                pieces.push(clean_tag_piece(&before));
+        if boundary && let Some((kind, length)) = match_tag(&chars, index) {
+            let before: String = chars[cursor..index].iter().collect();
+            pieces.push(clean_tag_piece(&before));
 
-                let mut value_start = index + length;
-                while value_start < chars.len() && chars[value_start].is_whitespace() {
-                    value_start += 1;
-                }
-                let mut value_end = value_start;
-                while value_end < chars.len() {
-                    let at_boundary =
-                        value_end == value_start || !chars[value_end - 1].is_alphanumeric();
-                    if at_boundary && match_tag(&chars, value_end).is_some() {
-                        break;
-                    }
-                    value_end += 1;
-                }
-                let value: String = chars[value_start..value_end].iter().collect();
-                let value = clean_tag_piece(&value);
-                if !value.is_empty() {
-                    match kind {
-                        TagKind::Owner => {
-                            if owner.is_none() {
-                                owner = Some(shorten(&value, 60));
-                            } else {
-                                pieces.push(value);
-                            }
-                        }
-                        TagKind::Due => {
-                            if due.is_none() {
-                                due = Some(shorten(&value, 60));
-                            } else {
-                                pieces.push(value);
-                            }
-                        }
-                    }
-                }
-                cursor = value_end;
-                index = value_end;
-                continue;
+            let mut value_start = index + length;
+            while value_start < chars.len() && chars[value_start].is_whitespace() {
+                value_start += 1;
             }
+            let mut value_end = value_start;
+            while value_end < chars.len() {
+                let at_boundary =
+                    value_end == value_start || !chars[value_end - 1].is_alphanumeric();
+                if at_boundary && match_tag(&chars, value_end).is_some() {
+                    break;
+                }
+                value_end += 1;
+            }
+            let value: String = chars[value_start..value_end].iter().collect();
+            let value = clean_tag_piece(&value);
+            if !value.is_empty() {
+                match kind {
+                    TagKind::Owner => {
+                        if owner.is_none() {
+                            owner = Some(shorten(&value, 60));
+                        } else {
+                            pieces.push(value);
+                        }
+                    }
+                    TagKind::Due => {
+                        if due.is_none() {
+                            due = Some(shorten(&value, 60));
+                        } else {
+                            pieces.push(value);
+                        }
+                    }
+                }
+            }
+            cursor = value_end;
+            index = value_end;
+            continue;
         }
         index += 1;
     }

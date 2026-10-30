@@ -804,10 +804,10 @@ impl Session {
         if conversation.id == "windows-owner" {
             return "Owner".into();
         }
-        if let Some(bot) = conversation.id.strip_prefix("dir:") {
-            if self.state.listed_bots.iter().any(|item| item.id == bot) {
-                return self.bot_display_name(bot);
-            }
+        if let Some(bot) = conversation.id.strip_prefix("dir:")
+            && self.state.listed_bots.iter().any(|item| item.id == bot)
+        {
+            return self.bot_display_name(bot);
         }
         let kind = conversation.normalized_kind();
         let slug = conversation
@@ -831,10 +831,10 @@ impl Session {
         if conversation.id == "windows-owner" {
             return "Your direct chat".into();
         }
-        if let Some(bot) = conversation.id.strip_prefix("dir:") {
-            if let Some(found) = self.state.listed_bots.iter().find(|item| item.id == bot) {
-                return format!("Bot · {}", found.role);
-            }
+        if let Some(bot) = conversation.id.strip_prefix("dir:")
+            && let Some(found) = self.state.listed_bots.iter().find(|item| item.id == bot)
+        {
+            return format!("Bot · {}", found.role);
         }
         if conversation.id.chars().all(|c| c.is_ascii_digit()) {
             return "Direct chat".into();
@@ -975,10 +975,10 @@ impl Session {
             return;
         }
         if let Some((when, _)) = &self.scheduled {
-            if Instant::now() >= *when {
-                if let Some((_, operation)) = self.scheduled.take() {
-                    self.start_request(operation);
-                }
+            if Instant::now() >= *when
+                && let Some((_, operation)) = self.scheduled.take()
+            {
+                self.start_request(operation);
             }
             return;
         }
@@ -1318,17 +1318,16 @@ impl Session {
                             self.schedule(Operation::ListBots, Duration::ZERO);
                         }
                         OperationKind::ListBots => {
-                            if let Some(id) = self.selected_bot.clone() {
-                                if let Some(bot) =
+                            if let Some(id) = self.selected_bot.clone()
+                                && let Some(bot) =
                                     self.state.listed_bots.iter().find(|bot| bot.id == id)
-                                {
-                                    if self.bot_profile.display_name.trim().is_empty() {
-                                        self.bot_profile.display_name = self.bot_display_name(&id);
-                                    }
-                                    if self.bot_profile.avatar.trim().is_empty() {
-                                        self.bot_profile.avatar =
-                                            bot.avatar.clone().unwrap_or_default();
-                                    }
+                            {
+                                if self.bot_profile.display_name.trim().is_empty() {
+                                    self.bot_profile.display_name = self.bot_display_name(&id);
+                                }
+                                if self.bot_profile.avatar.trim().is_empty() {
+                                    self.bot_profile.avatar =
+                                        bot.avatar.clone().unwrap_or_default();
                                 }
                             }
                             if self.section == Section::Fleet && !self.state.skills_loaded {
@@ -1910,15 +1909,15 @@ impl Session {
         if let Some(enabled) = self.state.audio_enabled {
             self.audio.enabled = enabled;
         }
-        if let Some(model) = &self.state.audio_transcription_model {
-            if !model.is_empty() {
-                self.audio.transcription_model = model.clone();
-            }
+        if let Some(model) = &self.state.audio_transcription_model
+            && !model.is_empty()
+        {
+            self.audio.transcription_model = model.clone();
         }
-        if let Some(model) = &self.state.audio_understanding_model {
-            if !model.is_empty() {
-                self.audio.understanding_model = model.clone();
-            }
+        if let Some(model) = &self.state.audio_understanding_model
+            && !model.is_empty()
+        {
+            self.audio.understanding_model = model.clone();
         }
     }
 

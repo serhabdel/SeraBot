@@ -507,12 +507,13 @@ pub fn valid_conversation_parent(
             }
         }
         ConversationKind::Direct | ConversationKind::Room => {
-            if let Some(parent) = parent.filter(|parent| !parent.is_empty()) {
-                if !scoped_parent(parent, "sec") && !scoped_parent(parent, "grp") {
-                    return Err(ApiError::Validation(
-                        "Direct and room nodes sit under a section (sec:) or group (grp:).",
-                    ));
-                }
+            if let Some(parent) = parent.filter(|parent| !parent.is_empty())
+                && !scoped_parent(parent, "sec")
+                && !scoped_parent(parent, "grp")
+            {
+                return Err(ApiError::Validation(
+                    "Direct and room nodes sit under a section (sec:) or group (grp:).",
+                ));
             }
         }
     }
@@ -1469,12 +1470,12 @@ impl ApiClient {
             ));
         }
         let body = body.map(str::trim).filter(|text| !text.is_empty());
-        if let Some(body) = body {
-            if !valid_skill_body(body) {
-                return Err(ApiError::Validation(
-                    "Body must be markdown of at most 96,000 bytes, without control characters.",
-                ));
-            }
+        if let Some(body) = body
+            && !valid_skill_body(body)
+        {
+            return Err(ApiError::Validation(
+                "Body must be markdown of at most 96,000 bytes, without control characters.",
+            ));
         }
         #[derive(Serialize)]
         struct Body<'a> {
@@ -1610,10 +1611,10 @@ impl ApiClient {
         for conversation in &page.conversations {
             check_conversation_summary(conversation)?;
         }
-        if let Some(next) = &page.next_cursor {
-            if !valid_cursor(next) {
-                return Err(ApiError::InvalidResponse);
-            }
+        if let Some(next) = &page.next_cursor
+            && !valid_cursor(next)
+        {
+            return Err(ApiError::InvalidResponse);
         }
         Ok(page)
     }
@@ -1981,17 +1982,14 @@ impl ApiClient {
             // Keep a safe server-authored message for the owner-facing errors
             // (for example "audio is not configured"). Other statuses stay
             // numeric so the session keeps its token and back-off paths.
-            if matches!(status.as_u16(), 400 | 404 | 409 | 422 | 503) {
-                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
-                    if let Some(message) = value.get("error").and_then(|value| value.as_str()) {
-                        if !message.is_empty()
-                            && message.len() <= 512
-                            && !message.chars().any(char::is_control)
-                        {
-                            return Err(ApiError::Rejected(message.to_owned()));
-                        }
-                    }
-                }
+            if matches!(status.as_u16(), 400 | 404 | 409 | 422 | 503)
+                && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body)
+                && let Some(message) = value.get("error").and_then(|value| value.as_str())
+                && !message.is_empty()
+                && message.len() <= 512
+                && !message.chars().any(char::is_control)
+            {
+                return Err(ApiError::Rejected(message.to_owned()));
             }
             return Err(ApiError::Http(status.as_u16()));
         }
@@ -2077,15 +2075,13 @@ impl ApiClient {
             if !matches!(status.as_u16(), 404 | 409 | 422) {
                 return Err(ApiError::Http(status.as_u16()));
             }
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if let Some(message) = value.get("error").and_then(|value| value.as_str()) {
-                    if !message.is_empty()
-                        && message.len() <= 512
-                        && !message.chars().any(char::is_control)
-                    {
-                        return Err(ApiError::Rejected(message.to_owned()));
-                    }
-                }
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && let Some(message) = value.get("error").and_then(|value| value.as_str())
+                && !message.is_empty()
+                && message.len() <= 512
+                && !message.chars().any(char::is_control)
+            {
+                return Err(ApiError::Rejected(message.to_owned()));
             }
             return Err(ApiError::Http(status.as_u16()));
         }

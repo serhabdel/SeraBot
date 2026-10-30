@@ -135,10 +135,10 @@ pub async fn ingest_file(
     let sha256 = sha256_hex(&bytes);
 
     let existing = find_by_sha(store, &sha256)?;
-    if let Some(document) = &existing {
-        if document.status != "failed" {
-            return duplicate_result(store, &document.id, sha256);
-        }
+    if let Some(document) = &existing
+        && document.status != "failed"
+    {
+        return duplicate_result(store, &document.id, sha256);
     }
 
     let pages = extract_pages(kind, bytes).await?;
@@ -158,13 +158,13 @@ pub async fn ingest_file(
     // A failed attempt may have left chunks/vectors behind. Re-check the state
     // right before replacing it so a concurrent successful ingestion is never
     // purged by this one.
-    if existing.is_some() {
-        if let Some(current) = find_by_sha(store, &sha256)? {
-            if current.status != "failed" {
-                return duplicate_result(store, &current.id, sha256);
-            }
-            purge_document(store, &current.id)?;
+    if existing.is_some()
+        && let Some(current) = find_by_sha(store, &sha256)?
+    {
+        if current.status != "failed" {
+            return duplicate_result(store, &current.id, sha256);
         }
+        purge_document(store, &current.id)?;
     }
 
     let source_path = tokio::fs::canonicalize(path)

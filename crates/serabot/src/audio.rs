@@ -284,10 +284,11 @@ impl MistralAudioClient {
                     .mime_str(mime)
                     .map_err(|error| SeraError::External(error.to_string()))?,
             );
-        if let Some(language) = language {
-            if !language.is_empty() && language.len() <= 16 {
-                form = form.text("language", language.to_owned());
-            }
+        if let Some(language) = language
+            && !language.is_empty()
+            && language.len() <= 16
+        {
+            form = form.text("language", language.to_owned());
         }
         let url = self.destination_transcribe();
         let response = self
@@ -486,10 +487,10 @@ fn parse_transcription_response(bytes: &[u8]) -> Result<String> {
     if let Some(segments) = value.get("segments").and_then(Value::as_array) {
         let mut parts = Vec::new();
         for segment in segments {
-            if let Some(text) = segment.get("text").and_then(Value::as_str) {
-                if !text.trim().is_empty() {
-                    parts.push(text.trim());
-                }
+            if let Some(text) = segment.get("text").and_then(Value::as_str)
+                && !text.trim().is_empty()
+            {
+                parts.push(text.trim());
             }
         }
         if !parts.is_empty() {

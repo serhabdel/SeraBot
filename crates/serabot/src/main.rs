@@ -506,14 +506,14 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     )?;
     let mut source_hosts = std::collections::BTreeSet::new();
     for source in serabot::config::load_sources(&config)? {
-        if let Ok(url) = url::Url::parse(&source.url) {
-            if let Some(host) = url.host_str() {
-                source_hosts.insert(host.to_ascii_lowercase());
-                if let Some(stripped) = host.strip_prefix("www.") {
-                    source_hosts.insert(stripped.to_ascii_lowercase());
-                } else {
-                    source_hosts.insert(format!("www.{}", host.to_ascii_lowercase()));
-                }
+        if let Ok(url) = url::Url::parse(&source.url)
+            && let Some(host) = url.host_str()
+        {
+            source_hosts.insert(host.to_ascii_lowercase());
+            if let Some(stripped) = host.strip_prefix("www.") {
+                source_hosts.insert(stripped.to_ascii_lowercase());
+            } else {
+                source_hosts.insert(format!("www.{}", host.to_ascii_lowercase()));
             }
         }
     }
@@ -914,38 +914,37 @@ fn open_provider_client(
         token_url,
         client_id_fallback,
     } = plan
+        && !profile.refresh_token_secret.trim().is_empty()
     {
-        if !profile.refresh_token_secret.trim().is_empty() {
-            let refresh_token = secrets.require(&profile.refresh_token_secret)?.to_owned();
-            let client_id = if profile.oauth_client_id_secret.trim().is_empty() {
-                client_id_fallback.unwrap_or("").to_owned()
-            } else {
-                secrets.require(&profile.oauth_client_id_secret)?.to_owned()
-            };
-            let client_secret = if profile.oauth_client_secret_secret.trim().is_empty() {
-                String::new()
-            } else {
-                secrets
-                    .require(&profile.oauth_client_secret_secret)?
-                    .to_owned()
-            };
-            if style == OAuthStyle::RefreshToken && client_secret.is_empty() {
-                anyhow::bail!("oauth client secret is required to refresh this provider");
-            }
-            client = client.with_oauth(OAuthMaterial {
-                style,
-                refresh_token,
-                token_url: token_url.to_owned(),
-                client_id,
-                client_secret,
-            })?;
-            if style == OAuthStyle::RefreshToken {
-                client = client.with_refresh_persistence(
-                    secrets.clone(),
-                    profile.refresh_token_secret.clone(),
-                    profile.api_key_secret.clone(),
-                )?;
-            }
+        let refresh_token = secrets.require(&profile.refresh_token_secret)?.to_owned();
+        let client_id = if profile.oauth_client_id_secret.trim().is_empty() {
+            client_id_fallback.unwrap_or("").to_owned()
+        } else {
+            secrets.require(&profile.oauth_client_id_secret)?.to_owned()
+        };
+        let client_secret = if profile.oauth_client_secret_secret.trim().is_empty() {
+            String::new()
+        } else {
+            secrets
+                .require(&profile.oauth_client_secret_secret)?
+                .to_owned()
+        };
+        if style == OAuthStyle::RefreshToken && client_secret.is_empty() {
+            anyhow::bail!("oauth client secret is required to refresh this provider");
+        }
+        client = client.with_oauth(OAuthMaterial {
+            style,
+            refresh_token,
+            token_url: token_url.to_owned(),
+            client_id,
+            client_secret,
+        })?;
+        if style == OAuthStyle::RefreshToken {
+            client = client.with_refresh_persistence(
+                secrets.clone(),
+                profile.refresh_token_secret.clone(),
+                profile.api_key_secret.clone(),
+            )?;
         }
     }
     if serabot::providers::canonical_kind(&profile.kind)? == "google-antigravity" {

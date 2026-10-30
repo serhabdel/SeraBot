@@ -379,19 +379,17 @@ async fn conversation_messages(
                 .name
                 .as_deref()
                 .filter(|name| crate::orchestration::safe_bot_label(name))
+                && state.runtime.scan_owner_output(name).is_ok()
             {
-                if state.runtime.scan_owner_output(name).is_ok() {
-                    body["name"] = json!(name);
-                }
+                body["name"] = json!(name);
             }
             if let Some(bot) = message
                 .bot
                 .as_deref()
                 .filter(|bot| crate::orchestration::safe_bot_label(bot))
+                && state.runtime.scan_owner_output(bot).is_ok()
             {
-                if state.runtime.scan_owner_output(bot).is_ok() {
-                    body["bot"] = json!(bot);
-                }
+                body["bot"] = json!(bot);
             }
             body
         })

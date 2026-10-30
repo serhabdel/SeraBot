@@ -369,15 +369,15 @@ impl ModelRouter {
         bot_name: &str,
         bot_models: &BTreeMap<String, String>,
     ) -> Result<ModelSelection> {
-        if let Some(model) = bot_model {
-            if let Some(selection) = self.find_approved_model(model, Some("default")) {
-                return Ok(selection);
-            }
+        if let Some(model) = bot_model
+            && let Some(selection) = self.find_approved_model(model, Some("default"))
+        {
+            return Ok(selection);
         }
-        if let Some(model) = bot_models.get(bot_name) {
-            if let Some(selection) = self.find_approved_model(model, Some("default")) {
-                return Ok(selection);
-            }
+        if let Some(model) = bot_models.get(bot_name)
+            && let Some(selection) = self.find_approved_model(model, Some("default"))
+        {
+            return Ok(selection);
         }
         if let Some(selection) = self.find_approved_model(&self.default_model, Some("default")) {
             return Ok(selection);
@@ -409,14 +409,14 @@ impl ModelRouter {
         if models.is_empty() {
             return self.autoselect(bot_model, bot_name, bot_models);
         }
-        if let Some(model) = bot_model {
-            if models.iter().any(|m| m == model) {
-                if let Some(selection) = self.find_approved_model(model, Some("default")) {
-                    return Ok(selection);
-                }
-                if let Some(selection) = self.find_approved_model(model, None) {
-                    return Ok(selection);
-                }
+        if let Some(model) = bot_model
+            && models.iter().any(|m| m == model)
+        {
+            if let Some(selection) = self.find_approved_model(model, Some("default")) {
+                return Ok(selection);
+            }
+            if let Some(selection) = self.find_approved_model(model, None) {
+                return Ok(selection);
             }
         }
         for model in models {
@@ -449,15 +449,14 @@ impl ModelRouter {
         model: &str,
         prefer_provider: Option<&str>,
     ) -> Option<ModelSelection> {
-        if let Some(id) = prefer_provider {
-            if let Some(provider) = self.providers.get(id) {
-                if provider.is_routable(model) {
-                    return Some(ModelSelection {
-                        provider: id.to_owned(),
-                        model: model.to_owned(),
-                    });
-                }
-            }
+        if let Some(id) = prefer_provider
+            && let Some(provider) = self.providers.get(id)
+            && provider.is_routable(model)
+        {
+            return Some(ModelSelection {
+                provider: id.to_owned(),
+                model: model.to_owned(),
+            });
         }
         for (id, provider) in &self.providers {
             if provider.is_routable(model) {

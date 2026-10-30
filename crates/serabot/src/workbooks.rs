@@ -639,10 +639,10 @@ fn value_json(
         Value::Number(number) => {
             let style = sheet.style_id(cell_ref);
             let format = workbook.styles.get(style).num_fmt.as_str();
-            if number_format_is_date(format) {
-                if let Some(text) = format_serial(workbook.date_system, number) {
-                    return Some((CellKind::Date, JsonValue::String(text)));
-                }
+            if number_format_is_date(format)
+                && let Some(text) = format_serial(workbook.date_system, number)
+            {
+                return Some((CellKind::Date, JsonValue::String(text)));
             }
             Some((CellKind::Number, json!(number)))
         }

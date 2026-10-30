@@ -333,15 +333,14 @@ async fn token_request(
         .get("refresh_token")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    if let Some(refresh) = &refresh {
-        if refresh.is_empty()
+    if let Some(refresh) = &refresh
+        && (refresh.is_empty()
             || refresh.len() > MAX_TOKEN_RESPONSE_BYTES
-            || !refresh.bytes().all(|b| b.is_ascii_graphic())
-        {
-            return Err(SeraError::External(
-                "ElevenLabs OAuth token response was rejected".into(),
-            ));
-        }
+            || !refresh.bytes().all(|b| b.is_ascii_graphic()))
+    {
+        return Err(SeraError::External(
+            "ElevenLabs OAuth token response was rejected".into(),
+        ));
     }
     let expires_in = value.get("expires_in").and_then(|item| {
         item.as_u64()
@@ -571,16 +570,16 @@ impl ElevenLabsClient {
             .send()
             .await
             .map_err(|error| SeraError::External(format!("ElevenLabs request failed: {error}")))?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            if let ClientAuth::Oauth(session) = &self.auth {
-                session.invalidate().await;
-                return build(self.auth_headers().await?)?
-                    .send()
-                    .await
-                    .map_err(|error| {
-                        SeraError::External(format!("ElevenLabs request failed: {error}"))
-                    });
-            }
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && let ClientAuth::Oauth(session) = &self.auth
+        {
+            session.invalidate().await;
+            return build(self.auth_headers().await?)?
+                .send()
+                .await
+                .map_err(|error| {
+                    SeraError::External(format!("ElevenLabs request failed: {error}"))
+                });
         }
         Ok(response)
     }

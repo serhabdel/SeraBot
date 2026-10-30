@@ -428,14 +428,14 @@ impl OAuthClient {
                 parts.kind.section()
             )));
         }
-        if let Some(refresh) = &parts.refresh_token {
-            if !plausible_secret(refresh) {
-                return Err(SeraError::Config(format!(
-                    "connectors.{} secret `{}` is invalid",
-                    parts.kind.section(),
-                    parts.refresh_secret_name
-                )));
-            }
+        if let Some(refresh) = &parts.refresh_token
+            && !plausible_secret(refresh)
+        {
+            return Err(SeraError::Config(format!(
+                "connectors.{} secret `{}` is invalid",
+                parts.kind.section(),
+                parts.refresh_secret_name
+            )));
         }
         if !parts.redirect_uri.is_empty() {
             crate::config::validate_oauth_redirect_uri(&parts.redirect_uri)?;
@@ -976,12 +976,12 @@ async fn read_token_response(
         .get("refresh_token")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    if let Some(refresh) = &refresh {
-        if !plausible_secret(refresh) {
-            return Err(SeraError::External(
-                "oauth token response was rejected".into(),
-            ));
-        }
+    if let Some(refresh) = &refresh
+        && !plausible_secret(refresh)
+    {
+        return Err(SeraError::External(
+            "oauth token response was rejected".into(),
+        ));
     }
     let expires_in = value.get("expires_in").and_then(|item| {
         item.as_u64()
@@ -1192,17 +1192,15 @@ async fn probe_api_key_within(
     api_key: &str,
     limit: Duration,
 ) -> std::result::Result<(), String> {
-    if let ApiKeyProbe::ElevenLabs(_) = probe {
-        if elevenlabs_api_key_malformed(api_key) {
-            return Err(
-                "Key rejected (malformed: expected sk_ followed by 48 hex characters)".into(),
-            );
-        }
+    if let ApiKeyProbe::ElevenLabs(_) = probe
+        && elevenlabs_api_key_malformed(api_key)
+    {
+        return Err("Key rejected (malformed: expected sk_ followed by 48 hex characters)".into());
     }
-    if let ApiKeyProbe::ElevenLabsOauth(_) = probe {
-        if api_key.trim().is_empty() || api_key.len() > 8_192 {
-            return Err("Token rejected (malformed)".into());
-        }
+    if let ApiKeyProbe::ElevenLabsOauth(_) = probe
+        && (api_key.trim().is_empty() || api_key.len() > 8_192)
+    {
+        return Err("Token rejected (malformed)".into());
     }
     let http = Client::builder()
         .timeout(limit)

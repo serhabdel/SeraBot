@@ -113,12 +113,12 @@ impl Brand {
             }
         }
 
-        if let Some(font) = &self.font_family {
-            if !font.trim().eq_ignore_ascii_case("helvetica") {
-                return Err(SeraError::Validation(
-                    "brand.font_family: only the built-in Helvetica family is supported".into(),
-                ));
-            }
+        if let Some(font) = &self.font_family
+            && !font.trim().eq_ignore_ascii_case("helvetica")
+        {
+            return Err(SeraError::Validation(
+                "brand.font_family: only the built-in Helvetica family is supported".into(),
+            ));
         }
 
         Ok(())
