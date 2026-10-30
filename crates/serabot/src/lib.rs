@@ -13,6 +13,8 @@ pub mod deck;
 pub mod deck_pptx;
 pub mod delegate;
 pub mod documents;
+#[cfg(feature = "docx")]
+pub mod docx_ops;
 pub mod domain;
 pub mod elevenlabs;
 pub mod embeddings;

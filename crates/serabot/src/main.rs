@@ -478,6 +478,8 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     )?)?;
     registry.register(TimesheetTool)?;
     serabot::tools::register_workbook_tools(&mut registry, artifacts.clone(), store.clone())?;
+    #[cfg(feature = "docx")]
+    serabot::tools::register_docx_tools(&mut registry, artifacts.clone(), store.clone())?;
     registry.register(DocumentIndexTool::new(
         store.clone(),
         embedder.clone(),

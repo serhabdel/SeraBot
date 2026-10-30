@@ -10,12 +10,16 @@ name = "serabot"
 path = "src/main.rs"
 
 [features]
-default = ["pptx"]
+default = ["pptx", "docx"]
 # PPTX export beside the PDF deck (`deck_pptx`). Export only: the crate's
 # importer is used by tests, never by a production path. `deckcraft-model` is
 # the document model the writer consumes; it re-exports the colour and geometry
 # crates, so those stay transitive.
 pptx = ["dep:deckcraft-pptx", "dep:deckcraft-model"]
+# DOCX inspect/edit/build (`docx_ops`). `wordcraft-docx` is the reader/writer;
+# `wordcraft-doc` is the document model it reads into and writes from, which
+# the reader/writer crate only partially re-exports.
+docx = ["dep:wordcraft-docx", "dep:wordcraft-doc"]
 
 [dependencies]
 age = { version = "0.11", features = ["armor"] }
@@ -66,12 +70,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 unicode-normalization = "0.1"
 url = "2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
+# DOCX reader/writer, pinned to the v0.9.0 revision. Both crates resolve from the
+# same repository; `wordcraft-doc` is the document model, `wordcraft-docx` the
+# WordprocessingML reader/writer.
+wordcraft-doc = { git = "https://github.com/storytold/wordcraft", rev = "2e6db0bd88795e80375176c01665cff7dbe2b057", optional = true }
+wordcraft-docx = { git = "https://github.com/storytold/wordcraft", rev = "2e6db0bd88795e80375176c01665cff7dbe2b057", optional = true }
 zeroize = "1"
+# Package inspection for the DOCX tools (part names, declared sizes, `.rels`
+# parts) before the reader inflates anything, and for tests that inspect
+# exported packages.
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"
-# Already in the graph through deckcraft-pptx; used to inspect exported packages.
-zip = { version = "8.6", default-features = false, features = ["deflate"] }
