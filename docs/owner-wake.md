@@ -55,7 +55,7 @@ Still on `main` since `795b139` (code through `4464558`):
 Still on `main` from the earlier wake note (code through `795b139`):
 
 - On-demand skills and `skill-creator`, including `POST /v1/skills` ([skills.md](skills.md)).
-- Crafting Apps notes: adapt PdfCraft patterns only ([craft-adoption.md](craft-adoption.md)).
+- Crafting Apps notes: `deckcraft-pptx` export only, no vendoring ([craft-adoption.md](craft-adoption.md)).
 - Orchestrator handoffs, delegate, and the conversation tree ([orchestration.md](orchestration.md)).
 - Owner APIs for bots, conversations, and skills ([api.md](api.md)).
 - Desktop and mobile Fleet panels ([desktop-client.md](desktop-client.md), [mobile-client.md](mobile-client.md)).

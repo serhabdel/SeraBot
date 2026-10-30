@@ -9,6 +9,8 @@ pub mod cloud_code;
 pub mod config;
 pub mod connectors;
 pub mod deck;
+#[cfg(feature = "pptx")]
+pub mod deck_pptx;
 pub mod delegate;
 pub mod documents;
 pub mod domain;

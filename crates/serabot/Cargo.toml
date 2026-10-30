@@ -9,6 +9,14 @@ rust-version.workspace = true
 name = "serabot"
 path = "src/main.rs"
 
+[features]
+default = ["pptx"]
+# PPTX export beside the PDF deck (`deck_pptx`). Export only: the crate's
+# importer is used by tests, never by a production path. `deckcraft-model` is
+# the document model the writer consumes; it re-exports the colour and geometry
+# crates, so those stay transitive.
+pptx = ["dep:deckcraft-pptx", "dep:deckcraft-model"]
+
 [dependencies]
 age = { version = "0.11", features = ["armor"] }
 anyhow = "1"
@@ -19,6 +27,8 @@ calamine = "0.24"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.9"
 clap = { version = "4", features = ["derive", "env"] }
+deckcraft-model = { version = "0.6.1", optional = true }
+deckcraft-pptx = { version = "0.6.1", optional = true }
 fastembed = { version = "4", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
 futures = "0.3"
 hex = "0.4"
@@ -57,3 +67,5 @@ http-body-util = "0.1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"
+# Already in the graph through deckcraft-pptx; used to inspect exported packages.
+zip = { version = "8.6", default-features = false, features = ["deflate"] }

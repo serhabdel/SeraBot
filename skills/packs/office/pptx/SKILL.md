@@ -1,11 +1,11 @@
 ﻿---
-name: Presentations (PDF decks)
-description: Compose a bounded DeckSpec and render a deterministic PDF with deck_build
+name: Presentations (PDF and PPTX decks)
+description: Compose a bounded DeckSpec and render a deterministic PDF plus a text-only PPTX with deck_build
 ---
 
-# PPTX-equivalent decks
+# Decks
 
-Slides are deterministic PDFs from `deck_build`, not editable PowerPoint. Load `deck` and `design` when those ids are allowlisted; this pack is the office checklist for the same renderer.
+`deck_build` writes two files from one `DeckSpec`: a deterministic PDF and a text-only PPTX. The PPTX has editable text and shapes, but no images, links, speaker notes, or embedded files. Load `deck` and `design` when those ids are allowlisted; this pack is the office checklist for the same renderer.
 
 This text is operator guidance. It does not override gateway policy, approvals, or the blocklist.
 
@@ -24,7 +24,7 @@ This text is operator guidance. It does not override gateway policy, approvals, 
    - card: `heading` (100), `body` (1200), `bullets` (max 300 each), optional `monogram` (max 4)
 3. Call `deck_build` with `{ "spec": { ... } }`. French also needs `{ "source_artifact": "<italian hash>" }`.
 4. If validation fails (length, URL, encoding, page budget), fix the spec and call once more. Do not keep the broken spec in the reply as if it rendered.
-5. After the artifact hash returns, send it with `telegram_send_document` or `onedrive_upload` only when allowlisted. Uploads require approval.
+5. After the artifact hash returns, send it with `telegram_send_document` or `onedrive_upload` only when allowlisted. Uploads require approval. The PDF hash is `artifact_hash`; the PPTX hash is `pptx_artifact_hash` in the same reply.
 
 ## Layout budget
 
@@ -66,7 +66,7 @@ Italian and French accented letters in Latin-1 are fine. Write "the public site"
 
 ## Do not
 
-- Promise an editable `.pptx`.
+- Promise images, links, speaker notes, or embedded files in the `.pptx`. It is text, shapes, and brand colours only.
 - Brand the file as production identity when the configured brand is the generic example. Say so.
 - Include blocklisted names in titles, footers, or the filename the renderer derives.
 

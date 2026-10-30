@@ -191,9 +191,10 @@ impl Tool for DeckBuildTool {
         ToolSpec {
             name: "deck_build".into(),
             description:
-                "Render a bounded structured deck specification into a deterministic PDF. \
-                Italian is the default. French requires source_artifact to be an Italian artifact \
-                that the owner has explicitly approved."
+                "Render a bounded structured deck specification into a deterministic PDF and a \
+                text-only PPTX (text, shapes, and brand theme colours; no images, links, notes, or \
+                embedded files). Italian is the default. French requires source_artifact to be an \
+                Italian artifact that the owner has explicitly approved."
                     .into(),
             parameters: json!({
                 "type": "object",
@@ -245,16 +246,46 @@ impl Tool for DeckBuildTool {
             Language::En => {}
         }
         let rendered = render_deck(&spec, &self.brand, self.max_pages)?;
+        // Both deliverables are rendered before either is stored, so a spec the
+        // renderer rejects never leaves half a deck on disk.
+        #[cfg(feature = "pptx")]
+        let pptx = crate::deck_pptx::render_deck_pptx(&spec, &self.brand, self.max_pages)?;
+
         let meta = ArtifactMeta {
             title: spec.title.clone(),
             filename: rendered.filename.clone(),
             language: spec.language,
-            source_artifact: source,
+            source_artifact: source.clone(),
             created_at: Utc::now(),
         };
         let stored = self
             .artifacts
             .save(&rendered.pdf, &rendered.filename, meta)?;
+
+        // The PPTX is a second artifact with its own hash, stored through the
+        // same store so approval and audit bind it exactly like the PDF.
+        #[cfg(feature = "pptx")]
+        let pptx_stored = self.artifacts.save(
+            &pptx.bytes,
+            &pptx.filename,
+            ArtifactMeta {
+                title: spec.title.clone(),
+                filename: pptx.filename.clone(),
+                language: spec.language,
+                source_artifact: source,
+                created_at: Utc::now(),
+            },
+        )?;
+
+        #[cfg(feature = "pptx")]
+        let pptx_summary = Some((
+            pptx_stored.hash.clone(),
+            pptx_stored.filename.clone(),
+            pptx.slides,
+        ));
+        #[cfg(not(feature = "pptx"))]
+        let pptx_summary: Option<(String, String, usize)> = None;
+
         self.store.record_audit(
             &context.actor,
             "deck.rendered",
@@ -268,17 +299,23 @@ impl Tool for DeckBuildTool {
                 "language": spec.language.code(),
                 "pages": rendered.pages,
                 "source_artifact": stored.meta.source_artifact,
+                "pptx_artifact_hash": pptx_summary.as_ref().map(|(hash, _, _)| hash.clone()),
+                "pptx_slides": pptx_summary.as_ref().map(|(_, _, slides)| *slides),
             })),
         )?;
         Ok(ToolOutput {
             content: format!(
-                "title: {}\nsubtitle: {}\nauthor: {}\nfooter: {}\nbrand: {}\nfilename: {}\n\n{}",
+                "title: {}\nsubtitle: {}\nauthor: {}\nfooter: {}\nbrand: {}\nfilename: {}\npptx: {}\n\n{}",
                 spec.title,
                 spec.subtitle.as_deref().unwrap_or(""),
                 spec.author.as_deref().unwrap_or(""),
                 spec.footer.as_deref().unwrap_or(""),
                 self.brand.name,
                 stored.filename,
+                pptx_summary
+                    .as_ref()
+                    .map(|(_, filename, _)| filename.as_str())
+                    .unwrap_or(""),
                 rendered.text
             ),
             data: Some(json!({
@@ -286,6 +323,9 @@ impl Tool for DeckBuildTool {
                 "filename": stored.filename,
                 "pages": rendered.pages,
                 "language": spec.language.code(),
+                "pptx_artifact_hash": pptx_summary.as_ref().map(|(hash, _, _)| hash.clone()),
+                "pptx_filename": pptx_summary.as_ref().map(|(_, filename, _)| filename.clone()),
+                "pptx_slides": pptx_summary.as_ref().map(|(_, _, slides)| *slides),
             })),
             artifact_path: Some(format!("artifacts/{}", stored.filename)),
             artifact_hash: Some(stored.hash),
@@ -608,10 +648,37 @@ mod tests {
         let tool = DeckBuildTool::new(Arc::new(brand()), artifacts.clone(), store, 10);
         let args = json!({"spec": deck(Language::It)});
         let output = tool.execute(args, &context()).await.unwrap();
-        let hash = output.artifact_hash.unwrap();
+        let hash = output.artifact_hash.clone().unwrap();
         let stored = artifacts.load(&hash).unwrap();
         assert_eq!(stored.meta.language, Language::It);
         assert!(stored.bytes.starts_with(b"%PDF"));
+
+        #[cfg(feature = "pptx")]
+        {
+            let data = output.data.clone().unwrap();
+            let pptx_hash = data["pptx_artifact_hash"].as_str().unwrap().to_owned();
+            assert_ne!(pptx_hash, hash);
+            let pptx = artifacts.load(&pptx_hash).unwrap();
+            assert_eq!(pptx.meta.language, Language::It);
+            assert!(pptx.filename.ends_with(".pptx"));
+            assert!(pptx.bytes.starts_with(b"PK"));
+            assert_eq!(data["pptx_slides"], 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_spec_stores_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory(384).unwrap();
+        let artifacts = Arc::new(ArtifactStore::new(dir.path()).unwrap());
+        // Cover, section divider, and card page need three pages.
+        let tool = DeckBuildTool::new(Arc::new(brand()), artifacts, store, 1);
+        assert!(
+            tool.execute(json!({"spec": deck(Language::It)}), &context())
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]

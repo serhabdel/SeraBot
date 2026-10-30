@@ -789,7 +789,7 @@ fn draw_footer(
     Ok(())
 }
 
-fn part_label(language: Language) -> &'static str {
+pub(crate) fn part_label(language: Language) -> &'static str {
     match language {
         Language::It => "PARTE",
         Language::Fr => "PARTIE",
@@ -797,7 +797,7 @@ fn part_label(language: Language) -> &'static str {
     }
 }
 
-fn section_label(language: Language) -> &'static str {
+pub(crate) fn section_label(language: Language) -> &'static str {
     match language {
         Language::It => "SEZIONE",
         Language::Fr => "SECTION",
@@ -904,7 +904,7 @@ fn deck_filename(spec: &DeckSpec) -> String {
     format!("{}-{}.pdf", slugify(&spec.title), spec.language.code())
 }
 
-fn slugify(value: &str) -> String {
+pub(crate) fn slugify(value: &str) -> String {
     let mut raw = String::new();
     for character in value.nfd() {
         if is_combining_mark(character) {
