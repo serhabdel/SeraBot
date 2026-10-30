@@ -38,6 +38,8 @@ pub struct State {
     pub connectors_loaded: bool,
     /// Latest "Test" result per connector id; cleared on disconnect.
     pub connector_tests: std::collections::BTreeMap<String, ConnectorTestResult>,
+    /// Provider id and device code of the last finished sign-in step.
+    pub oauth_result: Option<(String, Option<String>)>,
     /// Team of the open room conversation. Conversation-scoped: it is cleared
     /// whenever the conversation changes or the session disconnects.
     pub team: Option<Team>,
@@ -101,6 +103,7 @@ impl Default for State {
             connectors: Vec::new(),
             connectors_loaded: false,
             connector_tests: std::collections::BTreeMap::new(),
+            oauth_result: None,
             team: None,
             team_loaded: false,
             team_loading: false,
@@ -359,6 +362,9 @@ impl State {
             // Bytes are intercepted by the session before they reach state;
             // this arm only keeps the match exhaustive.
             Reply::Artifact { .. } => {}
+            Reply::OAuthSignedIn { id, device_code } => {
+                self.oauth_result = Some((id, device_code));
+            }
             Reply::ConnectorTested(result) => {
                 self.connector_tests.insert(result.id.clone(), result);
             }
@@ -768,6 +774,7 @@ mod tests {
                 routing_classes: Vec::new(),
                 data_egress_approved: true,
                 catalog_fetch: false,
+                auth: "api_key".into(),
                 catalog_verified: false,
                 managed: false,
                 secrets: std::collections::BTreeMap::from([(

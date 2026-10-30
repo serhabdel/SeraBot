@@ -46,7 +46,23 @@ type ProviderRow = (
     Vec<String>,
     String,
     Vec<(String, String, bool)>,
+    bool,
+    bool,
 );
+
+/// Whether an OAuth provider holds its sign-in material. PKCE providers keep a
+/// refresh token; device-flow providers keep the minted key.
+fn provider_signed_in(
+    kind: &str,
+    secrets: &BTreeMap<String, serabot_desktop::SecretStatus>,
+) -> bool {
+    let configured = |role: &str| secrets.get(role).is_some_and(|secret| secret.configured);
+    if kind == "muse-code" {
+        configured("api_key")
+    } else {
+        configured("refresh_token")
+    }
+}
 
 /// The provider kinds the server understands.
 const PROVIDER_KINDS: [&str; 15] = [
@@ -4006,9 +4022,7 @@ fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Eleme
                         if preset.auth == "oauth" {
                             div { class: "banner info", style: "margin: 8px 0; display: flex; flex-direction: column; gap: 6px;",
                                 strong { "OAuth PKCE Authentication" }
-                                p { class: "tiny", "To authenticate via browser, run this command in terminal/PowerShell:" }
-                                code { class: "tiny", style: "background: rgba(0,0,0,0.35); padding: 4px 8px; border-radius: 4px; user-select: all;", "serabot providers login {preset.kind}" }
-                                p { class: "tiny", "Or paste your access token or refresh token directly below." }
+                                p { class: "tiny", "Connect saves the provider. Then press Sign in on its card: your browser opens, you approve, and the tokens go straight to the server's encrypted store." }
                             }
                         }
                         div { class: "chips",
@@ -4066,8 +4080,7 @@ fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Eleme
                             label { class: "field-label", "Sign-in" }
                             div { class: "banner info", style: "display: flex; flex-direction: column; gap: 6px;",
                                 strong { "This provider uses OAuth, not an API key." }
-                                p { class: "tiny", "Save the provider first, then sign in once with the browser flow. Tokens are stored in the server's encrypted secret store as {secret_name} and its refresh token." }
-                                code { class: "tiny", style: "user-select: all;", "serabot providers login {kind}" }
+                                p { class: "tiny", "Save the provider, then press Sign in on its card. Your browser opens, you approve, and the tokens are stored in the server's encrypted store ({secret_name}). Nothing is typed or pasted here." }
                             }
                         }
                     } else {
@@ -4157,6 +4170,8 @@ fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element 
                         )
                     })
                     .collect(),
+                provider.auth == "oauth",
+                provider_signed_in(&provider.kind, &provider.secrets),
             )
         })
         .collect();
@@ -4199,9 +4214,14 @@ fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element 
                     }
                 }
                 div { class: "card-grid",
-                    for (provider_id, provider_kind, managed, catalog_verified, catalog_fetch, egress, models, routing, secrets) in provider_rows {
+                    for (provider_id, provider_kind, managed, catalog_verified, catalog_fetch, egress, models, routing, secrets, is_oauth, signed_in) in provider_rows {
                         {
-                            let is_connected = secrets.iter().any(|(_, _, configured)| *configured) || provider_id == "ollama";
+                            let is_connected = if is_oauth {
+                                signed_in
+                            } else {
+                                secrets.iter().any(|(_, _, configured)| *configured) || provider_id == "ollama"
+                            };
+                            let signing_in = session.read().oauth_signing_in.as_deref() == Some(provider_id.as_str());
                             rsx! {
                                 div { class: "card", key: "{provider_id}",
                                     div { class: "card-head",
@@ -4215,7 +4235,9 @@ fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element 
                                         div { style: "display: flex; align-items: center; gap: 6px;",
                                             span {
                                                 class: if is_connected { "status-pill connected" } else { "status-pill disconnected" },
-                                                if is_connected { "Connected" } else { "Not connected" }
+                                                if is_oauth {
+                                                    if is_connected { "Signed in" } else { "Not signed in" }
+                                                } else if is_connected { "Connected" } else { "Not connected" }
                                             }
                                             if managed {
                                                 span { class: "chip accent", "managed" }
@@ -4248,6 +4270,21 @@ fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element 
                                                 span { class: if configured { "chip accent" } else { "chip warn" },
                                                     "{role}: {secret_name}"
                                                 }
+                                            }
+                                        }
+                                    }
+                                    if is_oauth {
+                                        div { class: "card-actions",
+                                            button {
+                                                class: if is_connected { "btn ghost sm" } else { "btn primary sm" },
+                                                title: "Sign in through your browser. Tokens are stored on the server and never shown here.",
+                                                disabled: !can_save || signing_in,
+                                                onclick: {
+                                                    let id = provider_id.clone();
+                                                    let kind = provider_kind.clone();
+                                                    move |_| session.write().sign_in_provider(id.clone(), kind.clone())
+                                                },
+                                                if signing_in { "Waiting for browser…" } else if is_connected { "Sign in again" } else { "Sign in" }
                                             }
                                         }
                                     }

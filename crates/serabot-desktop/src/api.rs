@@ -665,6 +665,9 @@ pub struct ProviderStatus {
     pub catalog_verified: bool,
     #[serde(default)]
     pub managed: bool,
+    /// `oauth` for providers that sign in through a browser, else `api_key`.
+    #[serde(default)]
+    pub auth: String,
     #[serde(default)]
     pub secrets: BTreeMap<String, SecretStatus>,
 }
@@ -722,6 +725,16 @@ pub struct BotProfileUpdate {
     pub description: String,
     #[serde(default)]
     pub avatar: String,
+}
+
+/// First leg of `POST /v1/admin/providers/{id}/oauth/start`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct OAuthStart {
+    pub flow: String,
+    pub url: String,
+    /// One-time code the owner types on the provider page (device flow only).
+    #[serde(default)]
+    pub code: Option<String>,
 }
 
 /// Result of `POST /v1/admin/connectors/{id}/test`: a bounded, read-only probe.
@@ -2111,6 +2124,57 @@ impl ApiClient {
             }
         }
         self.admin_request(Method::PUT, &["v1", "admin", "connectors", id], update)
+    }
+
+    pub fn admin_oauth_start(
+        &self,
+        id: &str,
+        body: &serde_json::Value,
+    ) -> Result<OAuthStart, ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Provider id is not valid."));
+        }
+        let start: OAuthStart = self.admin_request(
+            Method::POST,
+            &["v1", "admin", "providers", id, "oauth", "start"],
+            body,
+        )?;
+        // The URL comes from the server: open only a plain https page, and
+        // keep the one-time code to printable text.
+        let page = Url::parse(&start.url).map_err(|_| ApiError::InvalidResponse)?;
+        if page.scheme() != "https"
+            || page.host_str().is_none()
+            || !page.username().is_empty()
+            || page.password().is_some()
+            || !matches!(start.flow.as_str(), "pkce" | "device")
+            || start.code.as_deref().is_some_and(|code| {
+                code.is_empty() || code.len() > 32 || code.chars().any(char::is_control)
+            })
+        {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(start)
+    }
+
+    pub fn admin_oauth_complete(
+        &self,
+        id: &str,
+        code: &str,
+        verifier: &str,
+        redirect_uri: &str,
+    ) -> Result<AdminAck, ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Provider id is not valid."));
+        }
+        self.admin_request(
+            Method::POST,
+            &["v1", "admin", "providers", id, "oauth", "complete"],
+            &serde_json::json!({
+                "code": code,
+                "verifier": verifier,
+                "redirect_uri": redirect_uri,
+            }),
+        )
     }
 
     pub fn admin_test_connector(&self, id: &str) -> Result<ConnectorTestResult, ApiError> {

@@ -342,3 +342,27 @@ The client should stay well inside the rate limit. The bundled desktop client
 uses at least 3 seconds between requests and alternates task/history polling
 about every 5 seconds (roughly 12–20 reads per minute). On `429`, wait for the
 `Retry-After` window.
+
+## Provider OAuth sign-in
+
+Owner token required. Both routes live under `/v1/admin/providers/{id}/oauth/`.
+Tokens are stored in the server's encrypted store and are never returned.
+
+- `POST .../oauth/start` — `google-antigravity` (PKCE): body
+  `{"challenge","state","redirect_uri"}` where `redirect_uri` is the console's
+  loopback listener (`http://127.0.0.1:<port>/oauth-callback`). Returns
+  `{"flow":"pkce","url":"https://accounts.google.com/..."}`. `muse-code` (device
+  flow): no body. The server polls in the background (bounded to 15 minutes, one
+  per provider) and returns `{"flow":"device","url","code"}`; the owner enters
+  the code on the page and the key is stored when approved.
+- `POST .../oauth/complete` — PKCE only: body `{"code","verifier","redirect_uri"}`.
+  The server exchanges the code with the OAuth client secret already in its
+  store (`antigravity_oauth_client_secret` by default), stores the access and
+  refresh tokens under the provider's secret names, records the discovered Cloud
+  Code project on an owner-managed provider that has none, and returns
+  `{"signed_in":true,"project_saved":bool,"restart_required":true}`.
+
+A provider of another kind answers `422`; an unknown id `404`. Audit entries
+(`config.provider_oauth_signed_in` / `config.provider_oauth_failed`) carry the
+provider id and kind only. `GET /v1/providers` reports sign-in state through
+`secrets.refresh_token.configured` (PKCE) or `secrets.api_key.configured` (device).

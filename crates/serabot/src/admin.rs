@@ -539,6 +539,19 @@ impl AdminStore {
             .clone()
     }
 
+    /// Record the Cloud Code project discovered at sign-in on an owner-managed
+    /// provider that has none yet. Returns whether anything changed.
+    pub fn set_provider_project_if_empty(&self, id: &str, project_id: &str) -> Result<bool> {
+        self.mutate(|overlay| match overlay.providers.get_mut(id) {
+            Some(profile) if profile.project_id.trim().is_empty() => {
+                crate::cloud_code::validate_project_id(&profile.kind, project_id)?;
+                profile.project_id = project_id.to_owned();
+                Ok(true)
+            }
+            _ => Ok(false),
+        })
+    }
+
     fn save_provider(&self, id: &str, profile: ProviderConfig) -> Result<()> {
         self.mutate(|overlay| {
             overlay.providers.insert(id.to_owned(), profile);

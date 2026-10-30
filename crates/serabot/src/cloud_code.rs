@@ -481,6 +481,74 @@ pub fn build_cloud_code_envelope(
     Ok(envelope)
 }
 
+/// Finish a PKCE sign-in whose browser leg ran on the owner's machine: the
+/// console holds the verifier and loopback listener, this side holds the client
+/// secret. Tokens go back to the caller only as `SecretString`.
+pub async fn complete_antigravity_login(
+    client_secret: &str,
+    code: &str,
+    redirect_uri: &str,
+    verifier: &str,
+) -> Result<AntigravityLogin> {
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| SeraError::External("oauth login could not start".into()))?;
+    let bases: Vec<String> = CLOUD_CODE_HOSTS
+        .iter()
+        .map(|host| format!("https://{host}"))
+        .collect();
+    complete_antigravity_login_at(
+        &http,
+        client_secret,
+        "https://oauth2.googleapis.com/token",
+        &bases,
+        Duration::from_secs(2),
+        code,
+        redirect_uri,
+        verifier,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn complete_antigravity_login_at(
+    http: &reqwest::Client,
+    client_secret: &str,
+    token_url: &str,
+    bases: &[String],
+    pause: Duration,
+    code: &str,
+    redirect_uri: &str,
+    verifier: &str,
+) -> Result<AntigravityLogin> {
+    if !credential_ok(client_secret) {
+        return Err(SeraError::Config("oauth client secret is missing".into()));
+    }
+    if !credential_ok(code) || code.len() > 2_048 || !pkce_token_ok(verifier) {
+        return Err(SeraError::Validation(
+            "sign-in code or verifier is not valid".into(),
+        ));
+    }
+    let token_url = pin_token_url(token_url)?;
+    let (access_token, refresh_token) = exchange_code(
+        http,
+        &token_url,
+        client_secret,
+        code,
+        redirect_uri,
+        verifier,
+    )
+    .await?;
+    let project_id = discover_project(http, access_token.expose_secret(), bases, pause).await;
+    Ok(AntigravityLogin {
+        access_token,
+        refresh_token,
+        project_id,
+    })
+}
+
 async fn login_antigravity_at<F>(
     http: &reqwest::Client,
     client_secret: &str,
@@ -1715,6 +1783,75 @@ mod tests {
         assert!(!rendered.contains("access-synthetic"));
         assert!(!rendered.contains("refresh-synthetic"));
         assert!(!rendered.contains(client_secret));
+    }
+
+    #[tokio::test]
+    async fn complete_login_exchanges_a_client_supplied_code_without_echoing_it() {
+        let token_server = MockServer::start().await;
+        let api_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("code=synthetic-auth-code"))
+            .and(body_string_contains(
+                "code_verifier=synthetic-verifier-synthetic-verifier-0123456789",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-synthetic",
+                "refresh_token": "refresh-synthetic"
+            })))
+            .expect(1)
+            .mount(&token_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1internal:loadCodeAssist"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "cloudaicompanionProject": "proj-synthetic"
+            })))
+            .mount(&api_server)
+            .await;
+        let http = reqwest::Client::new();
+        let login = complete_antigravity_login_at(
+            &http,
+            "synthetic-client-secret",
+            &format!("{}/token", token_server.uri()),
+            &[api_server.uri()],
+            Duration::from_millis(1),
+            "synthetic-auth-code",
+            "http://127.0.0.1:51121/oauth-callback",
+            "synthetic-verifier-synthetic-verifier-0123456789",
+        )
+        .await
+        .unwrap();
+        assert_eq!(login.refresh_token.expose_secret(), "refresh-synthetic");
+        assert_eq!(login.project_id.as_deref(), Some("proj-synthetic"));
+        assert!(!format!("{login:?}").contains("access-synthetic"));
+    }
+
+    #[tokio::test]
+    async fn complete_login_rejects_bad_redirect_and_verifier_before_any_request() {
+        let http = reqwest::Client::new();
+        for (redirect, verifier) in [
+            (
+                "https://evil.example/oauth-callback",
+                "synthetic-verifier-synthetic-verifier-0123456789",
+            ),
+            ("http://127.0.0.1:51121/oauth-callback", "short"),
+        ] {
+            let error = complete_antigravity_login_at(
+                &http,
+                "synthetic-client-secret",
+                "http://127.0.0.1:9/token",
+                &[],
+                Duration::from_millis(1),
+                "synthetic-auth-code",
+                redirect,
+                verifier,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(!error.contains("synthetic-client-secret"));
+        }
     }
 
     #[tokio::test]

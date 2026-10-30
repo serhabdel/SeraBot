@@ -89,6 +89,8 @@ pub struct ApiState {
     rate: Arc<Mutex<VecDeque<Instant>>>,
     rate_limit: usize,
     admin: Option<AdminStore>,
+    /// Providers with a device sign-in still running in the background.
+    oauth_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl ApiState {
@@ -108,6 +110,7 @@ impl ApiState {
             rate: Arc::new(Mutex::new(VecDeque::new())),
             rate_limit: config.server.rate_limit_per_minute.max(1) as usize,
             admin: AdminStore::open(&config).ok(),
+            oauth_inflight: Arc::default(),
             config,
         }
     }
@@ -138,6 +141,14 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/providers", get(list_providers))
         .route("/v1/admin/providers", post(admin_add_provider))
         .route("/v1/admin/providers/{id}", delete(admin_remove_provider))
+        .route(
+            "/v1/admin/providers/{id}/oauth/start",
+            post(admin_provider_oauth_start),
+        )
+        .route(
+            "/v1/admin/providers/{id}/oauth/complete",
+            post(admin_provider_oauth_complete),
+        )
         .route("/v1/admin/connectors/{id}", put(admin_set_connector))
         .route("/v1/admin/connectors/{id}/test", post(admin_test_connector))
         .route("/v1/admin/audio", put(admin_set_audio))
@@ -1766,6 +1777,215 @@ async fn admin_remove_provider(
     admin.remove_provider(&id).map_err(admin_error)?;
     audit_config(&state, "config.provider_removed", json!({"provider": id}))?;
     Ok(Json(json!({"removed": id, "restart_required": true})))
+}
+
+#[derive(Deserialize, Default)]
+struct OAuthStartRequest {
+    #[serde(default)]
+    challenge: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    redirect_uri: String,
+}
+
+#[derive(Deserialize)]
+struct OAuthCompleteRequest {
+    code: String,
+    verifier: String,
+    redirect_uri: String,
+}
+
+fn oauth_profile(state: &ApiState, admin: &AdminStore, id: &str) -> Result<ProviderConfig> {
+    admin
+        .snapshot()
+        .providers
+        .get(id)
+        .or_else(|| state.config.llm.providers.get(id))
+        .cloned()
+        .ok_or_else(|| SeraError::NotFound(format!("provider {id}")))
+}
+
+fn oauth_secret_name(configured: &str, default: &str) -> String {
+    if configured.trim().is_empty() {
+        default.to_owned()
+    } else {
+        configured.to_owned()
+    }
+}
+
+fn release_oauth(state: &ApiState, id: &str) {
+    state
+        .oauth_inflight
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(id);
+}
+
+/// Begin a provider sign-in. PKCE providers get their authorization URL; the
+/// browser leg and loopback listener run on the owner's machine. Device
+/// providers start a bounded background poll and return the code to enter.
+async fn admin_provider_oauth_start(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    body: Option<Json<OAuthStartRequest>>,
+) -> AdminResult<Json<Value>> {
+    let admin = admin_store(&state)?;
+    let profile = oauth_profile(&state, admin, &id).map_err(admin_error)?;
+    let request = body.map(|Json(body)| body).unwrap_or_default();
+    match crate::providers::canonical_kind(&profile.kind)
+        .map_err(admin_error)?
+        .as_str()
+    {
+        "google-antigravity" => {
+            let url = crate::cloud_code::authorize_url(
+                &request.redirect_uri,
+                &request.challenge,
+                &request.state,
+            )
+            .map_err(|_| admin_error(SeraError::Validation("invalid sign-in request".into())))?;
+            Ok(Json(json!({"flow": "pkce", "url": url})))
+        }
+        "muse-code" => {
+            let api_name = oauth_secret_name(&profile.api_key_secret, "muse_code_api_key");
+            let identity_name =
+                oauth_secret_name(&profile.refresh_token_secret, "muse_code_identity");
+            let first = state
+                .oauth_inflight
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(id.clone());
+            if !first {
+                return Err(admin_error(SeraError::InvalidState(
+                    "a sign-in for this provider is already running".into(),
+                )));
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel::<(String, String)>();
+            let task_state = state.clone();
+            let task_id = id.clone();
+            tokio::spawn(async move {
+                use secrecy::ExposeSecret;
+                let outcome = async {
+                    let http = reqwest::Client::builder()
+                        .timeout(Duration::from_secs(30))
+                        .redirect(reqwest::redirect::Policy::none())
+                        .build()
+                        .map_err(|_| SeraError::External("sign-in could not start".into()))?;
+                    let mut tx = Some(tx);
+                    tokio::time::timeout(
+                        Duration::from_secs(900),
+                        crate::providers::login_muse_code(&http, |url, code| {
+                            if let Some(tx) = tx.take() {
+                                let _ = tx.send((url.to_owned(), code.to_owned()));
+                            }
+                        }),
+                    )
+                    .await
+                    .map_err(|_| SeraError::External("sign-in timed out".into()))?
+                }
+                .await;
+                let event = match outcome {
+                    Ok(credentials) => match task_state.secrets.persist(&[
+                        (api_name.as_str(), credentials.api_key.expose_secret()),
+                        (
+                            identity_name.as_str(),
+                            credentials.identity_token.expose_secret(),
+                        ),
+                    ]) {
+                        Ok(()) => "config.provider_oauth_signed_in",
+                        Err(_) => "config.provider_oauth_failed",
+                    },
+                    Err(_) => "config.provider_oauth_failed",
+                };
+                let _ = audit_config(
+                    &task_state,
+                    event,
+                    json!({"provider": task_id, "kind": "muse-code"}),
+                );
+                release_oauth(&task_state, &task_id);
+            });
+            match tokio::time::timeout(Duration::from_secs(15), rx).await {
+                Ok(Ok((url, code))) => {
+                    Ok(Json(json!({"flow": "device", "url": url, "code": code})))
+                }
+                _ => {
+                    release_oauth(&state, &id);
+                    Err(admin_error(SeraError::Validation(
+                        "sign-in could not be started".into(),
+                    )))
+                }
+            }
+        }
+        _ => Err(admin_error(SeraError::Validation(
+            "this provider does not use OAuth sign-in".into(),
+        ))),
+    }
+}
+
+/// Finish a PKCE sign-in with the code the console caught on its loopback
+/// listener. Tokens are stored server-side and never returned.
+async fn admin_provider_oauth_complete(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(request): Json<OAuthCompleteRequest>,
+) -> AdminResult<Json<Value>> {
+    use secrecy::ExposeSecret;
+    let admin = admin_store(&state)?;
+    let profile = oauth_profile(&state, admin, &id).map_err(admin_error)?;
+    if crate::providers::canonical_kind(&profile.kind).map_err(admin_error)? != "google-antigravity"
+    {
+        return Err(admin_error(SeraError::Validation(
+            "this provider does not use a browser code sign-in".into(),
+        )));
+    }
+    let access_name = oauth_secret_name(&profile.api_key_secret, "antigravity_access_token");
+    let refresh_name =
+        oauth_secret_name(&profile.refresh_token_secret, "antigravity_refresh_token");
+    let client_name = oauth_secret_name(
+        &profile.oauth_client_secret_secret,
+        "antigravity_oauth_client_secret",
+    );
+    let client_secret = state.secrets.get(&client_name).ok_or_else(|| {
+        admin_error(SeraError::Validation(format!(
+            "store the OAuth client secret as {client_name} first"
+        )))
+    })?;
+    let login = crate::cloud_code::complete_antigravity_login(
+        &client_secret,
+        &request.code,
+        &request.redirect_uri,
+        &request.verifier,
+    )
+    .await
+    .map_err(|error| match error {
+        SeraError::Validation(_) | SeraError::Config(_) => admin_error(error),
+        _ => admin_error(SeraError::Validation(
+            "Google sign-in could not be completed. Start it again.".into(),
+        )),
+    })?;
+    state
+        .secrets
+        .persist(&[
+            (access_name.as_str(), login.access_token.expose_secret()),
+            (refresh_name.as_str(), login.refresh_token.expose_secret()),
+        ])
+        .map_err(admin_error)?;
+    let project_saved = match login.project_id.as_deref() {
+        Some(project) => admin
+            .set_provider_project_if_empty(&id, project)
+            .unwrap_or(false),
+        None => false,
+    };
+    audit_config(
+        &state,
+        "config.provider_oauth_signed_in",
+        json!({"provider": id, "kind": "google-antigravity", "project_discovered": login.project_id.is_some()}),
+    )?;
+    Ok(Json(json!({
+        "signed_in": true,
+        "project_saved": project_saved,
+        "restart_required": true
+    })))
 }
 
 #[derive(Deserialize)]
@@ -3819,6 +4039,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unconfirmed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn provider_oauth_endpoints_are_owner_gated_and_validate_before_any_network_call() {
+        let (app, _config, _) = app();
+        let unauthorized = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/admin/providers/aux/oauth/start",
+                false,
+                Some(json!({})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let unknown = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/admin/providers/nope/oauth/start",
+                true,
+                Some(json!({})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        let saved = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/admin/providers",
+                true,
+                Some(json!({
+                    "id": "aux",
+                    "kind": "openai-compatible",
+                    "base_url": "https://api.example.com/v1",
+                    "models": ["aux-model"],
+                    "api_key_secret": "llm_api_key"
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::CREATED);
+        for path in ["start", "complete"] {
+            let wrong_kind = app
+                .clone()
+                .oneshot(request(
+                    &app,
+                    "POST",
+                    &format!("/v1/admin/providers/aux/oauth/{path}"),
+                    true,
+                    Some(json!({
+                        "code": "synthetic-auth-code",
+                        "verifier": "synthetic-verifier-synthetic-verifier-0123456789",
+                        "redirect_uri": "http://127.0.0.1:51121/oauth-callback"
+                    })),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(wrong_kind.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = read_json(wrong_kind).await;
+            assert!(body["error"].as_str().unwrap().contains("does not use"));
+        }
     }
 
     #[tokio::test]

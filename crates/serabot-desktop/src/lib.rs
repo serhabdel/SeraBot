@@ -5,6 +5,7 @@ mod api;
 pub mod audio_capture;
 pub mod creds;
 pub mod events;
+pub mod oauth;
 pub mod provider_presets;
 pub mod session;
 pub mod state;

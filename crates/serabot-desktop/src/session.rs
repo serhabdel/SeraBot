@@ -312,6 +312,8 @@ pub struct Session {
     pub admin_notice: Option<String>,
     /// Connector whose Test probe is in flight.
     pub connector_testing: Option<String>,
+    /// Provider whose browser sign-in is waiting for the redirect.
+    pub oauth_signing_in: Option<String>,
     pub admin_error: Option<String>,
     pub restart_pending: bool,
     pub restarting: bool,
@@ -382,6 +384,7 @@ impl Session {
             bot_profile: BotProfileDraft::default(),
             admin_notice: None,
             connector_testing: None,
+            oauth_signing_in: None,
             admin_error: None,
             restart_pending: false,
             restarting: false,
@@ -1133,6 +1136,7 @@ impl Session {
                         completion.kind,
                         OperationKind::AdminWrite
                             | OperationKind::ConnectorTest
+                            | OperationKind::OAuthSignIn
                             | OperationKind::AdminProfile
                             | OperationKind::AdminRestart
                     ) =>
@@ -1148,6 +1152,7 @@ impl Session {
                     };
                     self.admin_error = Some(message);
                     self.connector_testing = None;
+                    self.oauth_signing_in = None;
                     self.scheduled = None;
                 }
                 Err(error) => {
@@ -1451,6 +1456,26 @@ impl Session {
                             self.state.library_loading = true;
                             self.schedule(Operation::Library, Duration::ZERO);
                         }
+                        OperationKind::OAuthSignIn => {
+                            self.admin_error = None;
+                            self.oauth_signing_in = None;
+                            match self.state.oauth_result.take() {
+                                Some((_, Some(code))) => {
+                                    self.admin_notice = Some(format!(
+                                        "Finish in your browser: enter code {code}. Then press Refresh."
+                                    ));
+                                }
+                                Some(_) => {
+                                    self.admin_notice = Some(
+                                        "Signed in. Restart the server to apply the change.".into(),
+                                    );
+                                    self.restart_pending = true;
+                                }
+                                None => {}
+                            }
+                            self.state.providers_loaded = false;
+                            self.schedule(Operation::Catalog, Duration::ZERO);
+                        }
                         OperationKind::ConnectorTest => {
                             self.admin_error = None;
                             self.admin_notice = None;
@@ -1679,6 +1704,18 @@ impl Session {
 
     pub fn can_admin(&self) -> bool {
         self.ready() && self.state.connected
+    }
+
+    pub fn sign_in_provider(&mut self, id: String, kind: String) {
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.admin_error = None;
+        self.admin_notice =
+            Some("Complete the sign-in in your browser. The console waits up to 3 minutes.".into());
+        self.oauth_signing_in = Some(id.clone());
+        self.start_request(Operation::OAuthSignIn { id, kind });
     }
 
     pub fn test_connector(&mut self, id: String) {

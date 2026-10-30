@@ -51,6 +51,7 @@ pub enum OperationKind {
     Transcribe,
     AdminWrite,
     ConnectorTest,
+    OAuthSignIn,
     AdminProfile,
     AdminRestart,
 }
@@ -137,6 +138,11 @@ pub enum Operation {
     TestConnector {
         id: String,
     },
+    /// Browser sign-in for an OAuth provider. `kind` picks PKCE or device flow.
+    OAuthSignIn {
+        id: String,
+        kind: String,
+    },
     AdminSetBotProfile {
         id: String,
         update: BotProfileUpdate,
@@ -180,6 +186,7 @@ impl Operation {
             | Self::AdminSetConnector { .. }
             | Self::AdminSetAudio(_) => OperationKind::AdminWrite,
             Self::TestConnector { .. } => OperationKind::ConnectorTest,
+            Self::OAuthSignIn { .. } => OperationKind::OAuthSignIn,
             Self::AdminSetBotProfile { .. } => OperationKind::AdminProfile,
             Self::AdminRestart => OperationKind::AdminRestart,
         }
@@ -219,6 +226,11 @@ pub enum Reply {
     Transcribed(Transcription),
     AdminSaved,
     ConnectorTested(ConnectorTestResult),
+    /// Sign-in finished (PKCE) or started (device, with the code to enter).
+    OAuthSignedIn {
+        id: String,
+        device_code: Option<String>,
+    },
     BotProfileSaved,
     AdminRestarted,
 }
@@ -296,6 +308,43 @@ impl Drop for Worker {
     fn drop(&mut self) {
         self.epoch.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+fn oauth_sign_in(client: &ApiClient, id: &str, kind: &str) -> Result<Reply, ApiError> {
+    use crate::oauth;
+    if kind == "muse-code" {
+        // Device flow: the server polls in the background. The console only
+        // opens the verification page and shows the code to type there.
+        let start = client.admin_oauth_start(id, &serde_json::json!({}))?;
+        let _ = webbrowser::open(&start.url);
+        return Ok(Reply::OAuthSignedIn {
+            id: id.to_owned(),
+            device_code: start.code,
+        });
+    }
+    let (listener, port) = oauth::bind_loopback()
+        .map_err(|_| ApiError::Validation("Could not listen on 127.0.0.1 for the redirect."))?;
+    let pkce = oauth::new_pkce();
+    let redirect = oauth::redirect_uri(port);
+    let start = client.admin_oauth_start(
+        id,
+        &serde_json::json!({
+            "challenge": pkce.challenge,
+            "state": pkce.state,
+            "redirect_uri": redirect,
+        }),
+    )?;
+    webbrowser::open(&start.url)
+        .map_err(|_| ApiError::Validation("Could not open the browser for sign-in."))?;
+    let code =
+        oauth::wait_for_callback(&listener, &pkce.state, std::time::Duration::from_secs(180))
+            .map_err(|error| ApiError::Rejected(error.to_string()))?;
+    drop(listener);
+    client.admin_oauth_complete(id, &code, &pkce.verifier, &redirect)?;
+    Ok(Reply::OAuthSignedIn {
+        id: id.to_owned(),
+        device_code: None,
+    })
 }
 
 fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
@@ -412,6 +461,7 @@ fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
         Operation::AdminSetConnector { id, update } => client
             .admin_set_connector(id, update)
             .map(|_| Reply::AdminSaved),
+        Operation::OAuthSignIn { id, kind } => oauth_sign_in(&client, id, kind),
         Operation::TestConnector { id } => {
             client.admin_test_connector(id).map(Reply::ConnectorTested)
         }
