@@ -687,6 +687,28 @@ pub struct ConnectorStatus {
     pub default_inbox_id: Option<String>,
     #[serde(default)]
     pub secrets: BTreeMap<String, SecretStatus>,
+    /// Current auth mode ("api_key" / "oauth"), when the connector has one.
+    #[serde(default)]
+    pub auth: Option<String>,
+    #[serde(default)]
+    pub auth_modes: Vec<String>,
+    /// OAuth sign-in details when the server offers them.
+    #[serde(default)]
+    pub oauth: Option<ConnectorOauth>,
+}
+
+/// OAuth sign-in metadata for a connector (ElevenLabs CIMD flow).
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ConnectorOauth {
+    pub client_id: String,
+    #[serde(default)]
+    pub authorize_url: Option<String>,
+    #[serde(default)]
+    pub cimd_path: Option<String>,
+    #[serde(default)]
+    pub callback_uri: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -707,6 +729,9 @@ pub struct ConnectorUpdate {
     pub enabled: bool,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub values: BTreeMap<String, String>,
+    /// ElevenLabs only: "api_key" or "oauth".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -2126,19 +2151,12 @@ impl ApiClient {
         self.admin_request(Method::PUT, &["v1", "admin", "connectors", id], update)
     }
 
-    pub fn admin_oauth_start(
+    fn checked_oauth_start(
         &self,
-        id: &str,
+        path: &[&str],
         body: &serde_json::Value,
     ) -> Result<OAuthStart, ApiError> {
-        if !valid_id(id) {
-            return Err(ApiError::Validation("Provider id is not valid."));
-        }
-        let start: OAuthStart = self.admin_request(
-            Method::POST,
-            &["v1", "admin", "providers", id, "oauth", "start"],
-            body,
-        )?;
+        let start: OAuthStart = self.admin_request(Method::POST, path, body)?;
         // The URL comes from the server: open only a plain https page, and
         // keep the one-time code to printable text.
         let page = Url::parse(&start.url).map_err(|_| ApiError::InvalidResponse)?;
@@ -2156,6 +2174,35 @@ impl ApiClient {
         Ok(start)
     }
 
+    fn checked_oauth_complete(
+        &self,
+        path: &[&str],
+        code: &str,
+        verifier: &str,
+        redirect_uri: &str,
+    ) -> Result<AdminAck, ApiError> {
+        self.admin_request(
+            Method::POST,
+            path,
+            &serde_json::json!({
+                "code": code,
+                "verifier": verifier,
+                "redirect_uri": redirect_uri,
+            }),
+        )
+    }
+
+    pub fn admin_oauth_start(
+        &self,
+        id: &str,
+        body: &serde_json::Value,
+    ) -> Result<OAuthStart, ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Provider id is not valid."));
+        }
+        self.checked_oauth_start(&["v1", "admin", "providers", id, "oauth", "start"], body)
+    }
+
     pub fn admin_oauth_complete(
         &self,
         id: &str,
@@ -2166,14 +2213,40 @@ impl ApiClient {
         if !valid_id(id) {
             return Err(ApiError::Validation("Provider id is not valid."));
         }
-        self.admin_request(
-            Method::POST,
+        self.checked_oauth_complete(
             &["v1", "admin", "providers", id, "oauth", "complete"],
-            &serde_json::json!({
-                "code": code,
-                "verifier": verifier,
-                "redirect_uri": redirect_uri,
-            }),
+            code,
+            verifier,
+            redirect_uri,
+        )
+    }
+
+    pub fn admin_connector_oauth_start(
+        &self,
+        id: &str,
+        body: &serde_json::Value,
+    ) -> Result<OAuthStart, ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Connector id is not valid."));
+        }
+        self.checked_oauth_start(&["v1", "admin", "connectors", id, "oauth", "start"], body)
+    }
+
+    pub fn admin_connector_oauth_complete(
+        &self,
+        id: &str,
+        code: &str,
+        verifier: &str,
+        redirect_uri: &str,
+    ) -> Result<AdminAck, ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Connector id is not valid."));
+        }
+        self.checked_oauth_complete(
+            &["v1", "admin", "connectors", id, "oauth", "complete"],
+            code,
+            verifier,
+            redirect_uri,
         )
     }
 

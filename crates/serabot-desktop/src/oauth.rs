@@ -91,6 +91,13 @@ pub fn bind_loopback() -> Result<(TcpListener, u16), OAuthError> {
     Ok((listener, port))
 }
 
+/// Bind exactly `port` on loopback, with no fallback. Used when the redirect
+/// URI is fixed in a publicly served client metadata document (CIMD), so the
+/// consent response must arrive on that exact port.
+pub fn bind_loopback_fixed(port: u16) -> Result<TcpListener, OAuthError> {
+    TcpListener::bind(("127.0.0.1", port)).map_err(|_| OAuthError::Listen)
+}
+
 pub fn redirect_uri(port: u16) -> String {
     format!("http://127.0.0.1:{port}{CALLBACK_PATH}")
 }

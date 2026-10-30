@@ -1,6 +1,9 @@
 //! Native ElevenLabs client and gateway tools (TTS, STT, sound effects, image/video flows).
 //!
-//! Outbound calls use the configured HTTPS API base and the age-stored API key.
+//! Outbound calls use the configured HTTPS API base and authenticate with
+//! either the age-stored API key (`xi-api-key` header) or an OAuth bearer
+//! token from an ElevenLabs sign-in. The REST API rejects requests that carry
+//! both headers, so exactly one mode is used per client.
 //! Media generation tools require owner approval via the gateway.
 
 use std::path::Path;
@@ -8,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::Utc;
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+use chrono::{Duration as ChronoDuration, Utc};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::multipart::{Form, Part};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -23,6 +26,7 @@ use crate::gateway::{ApprovalDetails, Tool, ToolContext, ToolOutput, ToolRegistr
 use crate::llm::validate_base_url;
 use crate::maker::{ArtifactMeta, ArtifactStore};
 use crate::policy::Policy;
+use crate::secrets::SharedSecrets;
 use crate::util::truncate_chars;
 
 const MAX_FLOW_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
@@ -30,11 +34,399 @@ const MAX_SOUND_PROMPT_CHARS: usize = 500;
 const MAX_IMAGE_PROMPT_CHARS: usize = 4_000;
 const MAX_VIDEO_PROMPT_CHARS: usize = 4_000;
 
+// --- OAuth sign-in (CIMD public client, PKCE S256, fixed loopback redirect) ---
+//
+// Endpoints are pinned to the documented ElevenLabs authorization server
+// (global/US region). Loopback URLs are accepted only in tests.
+pub const ELEVENLABS_AUTHORIZE_URL: &str = "https://elevenlabs.io/app/oauth/authorize";
+pub const ELEVENLABS_TOKEN_URL: &str = "https://api.us.elevenlabs.io/v1/oauth/token";
+/// Public host that serves this server's client metadata document.
+pub const PUBLIC_HOST: &str = "bot.seradyx.tech";
+pub const CIMD_PATH: &str = "/.well-known/serabot-oauth-client.json";
+/// Fixed loopback port so the CIMD document can declare exactly one redirect.
+pub const OAUTH_CALLBACK_PORT: u16 = 51122;
+pub const OAUTH_CALLBACK_PATH: &str = "/oauth-callback";
+/// Product-scoped scopes covering the connector's tools.
+pub const DEFAULT_OAUTH_SCOPE: &str =
+    "text_to_speech speech_history_read flows image_video_generation voice_generation convai_read";
+const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// The CIMD client_id: the https URL of the metadata document served publicly.
+pub fn cimd_client_id() -> String {
+    format!("https://{PUBLIC_HOST}{CIMD_PATH}")
+}
+
+pub fn oauth_callback_uri() -> String {
+    format!("http://127.0.0.1:{OAUTH_CALLBACK_PORT}{OAUTH_CALLBACK_PATH}")
+}
+
+/// RFC 7591-style client metadata document fetched by the authorization
+/// server when `client_id` is this document's URL (CIMD). Contains no secrets.
+pub fn cimd_document() -> Value {
+    json!({
+        "client_id": cimd_client_id(),
+        "client_name": "SeraBot",
+        "client_uri": format!("https://{PUBLIC_HOST}/"),
+        "redirect_uris": [oauth_callback_uri()],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "subject_type": "public",
+        "scope": DEFAULT_OAUTH_SCOPE,
+    })
+}
+
+fn pin_oauth_endpoint(candidate: &str, official: &str) -> Result<reqwest::Url> {
+    let value = candidate.trim().trim_end_matches('/');
+    let official = official.trim_end_matches('/');
+    if value == official {
+        return reqwest::Url::parse(value)
+            .map_err(|_| SeraError::Config("invalid OAuth endpoint".into()));
+    }
+    // Tests may point at a local mock authorization server.
+    if cfg!(test) {
+        let url = reqwest::Url::parse(value)
+            .map_err(|_| SeraError::Config("invalid OAuth endpoint".into()))?;
+        let host = url.host_str().unwrap_or("");
+        let loopback = url.scheme() == "http"
+            && (host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost"))
+            && url.port().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none();
+        if loopback {
+            return Ok(url);
+        }
+    }
+    Err(SeraError::Config(
+        "ElevenLabs OAuth endpoint must be the documented https URL".into(),
+    ))
+}
+
+fn pkce_token_ok(value: &str) -> bool {
+    (43..=128).contains(&value.len())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'~'
+        })
+}
+
+fn state_ok(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+/// The loopback redirect is fixed by the CIMD document, so only the exact
+/// callback URI is accepted.
+fn validate_callback_redirect(uri: &str) -> Result<()> {
+    if uri == oauth_callback_uri() {
+        return Ok(());
+    }
+    Err(SeraError::Validation(
+        "ElevenLabs OAuth redirect_uri must be the fixed loopback callback".into(),
+    ))
+}
+
+/// Build the ElevenLabs consent URL. `client_id` is the CIMD URL of our
+/// public client metadata document.
+pub fn authorize_url(
+    client_id: &str,
+    redirect_uri: &str,
+    scope: &str,
+    challenge: &str,
+    state: &str,
+) -> Result<String> {
+    let id = reqwest::Url::parse(client_id.trim()).map_err(|_| {
+        SeraError::Config("elevenlabs.oauth_client_id must be a valid https URL".into())
+    })?;
+    if id.scheme() != "https"
+        || id.host_str().is_none()
+        || !id.username().is_empty()
+        || id.password().is_some()
+    {
+        return Err(SeraError::Config(
+            "elevenlabs.oauth_client_id must be a credential-less https URL".into(),
+        ));
+    }
+    validate_callback_redirect(redirect_uri)?;
+    if !pkce_token_ok(challenge) || !state_ok(state) {
+        return Err(SeraError::Validation(
+            "invalid PKCE challenge or state".into(),
+        ));
+    }
+    let mut url = pin_oauth_endpoint(ELEVENLABS_AUTHORIZE_URL, ELEVENLABS_AUTHORIZE_URL)?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("client_id", id.as_str());
+        query.append_pair("response_type", "code");
+        query.append_pair("redirect_uri", redirect_uri);
+        query.append_pair("scope", scope.trim());
+        query.append_pair("code_challenge", challenge);
+        query.append_pair("code_challenge_method", "S256");
+        query.append_pair("state", state);
+    }
+    // Defense in depth: the final URL must stay on the documented authorize
+    // endpoint (host/path; the query is the PKCE material we just added).
+    let host = url.host_str().unwrap_or("");
+    let pinned =
+        url.scheme() == "https" && host == "elevenlabs.io" && url.path() == "/app/oauth/authorize";
+    #[cfg(test)]
+    let loopback =
+        url.scheme() == "http" && (host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost"));
+    #[cfg(not(test))]
+    let loopback = false;
+    if !pinned && !loopback {
+        return Err(SeraError::Config(
+            "ElevenLabs authorize URL left the pinned endpoint".into(),
+        ));
+    }
+    Ok(url.to_string())
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenPair {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_in: Option<u64>,
+}
+
+/// Exchange an authorization code at the pinned token endpoint
+/// (public client, `token_endpoint_auth_method: none`).
+pub async fn exchange_code(
+    http: &reqwest::Client,
+    client_id: &str,
+    code: &str,
+    redirect_uri: &str,
+    verifier: &str,
+) -> Result<TokenPair> {
+    exchange_code_at(
+        http,
+        ELEVENLABS_TOKEN_URL,
+        client_id,
+        code,
+        redirect_uri,
+        verifier,
+    )
+    .await
+}
+
+/// `exchange_code` against an explicit token URL (loopback allowed in tests).
+pub async fn exchange_code_at(
+    http: &reqwest::Client,
+    token_url: &str,
+    client_id: &str,
+    code: &str,
+    redirect_uri: &str,
+    verifier: &str,
+) -> Result<TokenPair> {
+    validate_callback_redirect(redirect_uri)?;
+    if !state_ok(code) {
+        return Err(SeraError::Validation("invalid authorization code".into()));
+    }
+    if !pkce_token_ok(verifier) {
+        return Err(SeraError::Validation("invalid PKCE verifier".into()));
+    }
+    let url = pin_oauth_endpoint(token_url, ELEVENLABS_TOKEN_URL)?;
+    token_request(
+        http,
+        url,
+        &[
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id.trim()),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("code_verifier", verifier),
+        ],
+    )
+    .await
+}
+
+/// Refresh grant; returns a new access token and, when the server rotates,
+/// a new refresh token.
+pub async fn refresh_grant(
+    http: &reqwest::Client,
+    client_id: &str,
+    refresh_token: &str,
+) -> Result<TokenPair> {
+    refresh_grant_at(http, ELEVENLABS_TOKEN_URL, client_id, refresh_token).await
+}
+
+/// `refresh_grant` against an explicit token URL (loopback allowed in tests).
+pub async fn refresh_grant_at(
+    http: &reqwest::Client,
+    token_url: &str,
+    client_id: &str,
+    refresh_token: &str,
+) -> Result<TokenPair> {
+    if refresh_token.is_empty() || refresh_token.len() > MAX_TOKEN_RESPONSE_BYTES {
+        return Err(SeraError::Validation("invalid refresh token".into()));
+    }
+    let url = pin_oauth_endpoint(token_url, ELEVENLABS_TOKEN_URL)?;
+    token_request(
+        http,
+        url,
+        &[
+            ("grant_type", "refresh_token"),
+            ("client_id", client_id.trim()),
+            ("refresh_token", refresh_token),
+        ],
+    )
+    .await
+}
+
+async fn token_request(
+    http: &reqwest::Client,
+    url: reqwest::Url,
+    form: &[(&str, &str)],
+) -> Result<TokenPair> {
+    let response = http.post(url).form(form).send().await.map_err(|error| {
+        SeraError::External(format!("ElevenLabs OAuth token request failed: {error}"))
+    })?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| {
+            SeraError::External(format!("ElevenLabs OAuth token read failed: {error}"))
+        })?
+        .to_vec();
+    if bytes.len() > MAX_TOKEN_RESPONSE_BYTES {
+        return Err(SeraError::External(
+            "ElevenLabs OAuth token response exceeded size limit".into(),
+        ));
+    }
+    // The request form carried the code/verifier/refresh token; only the
+    // response's short `error` code may surface, never the form or tokens.
+    let parsed: Option<Value> = serde_json::from_slice(&bytes).ok();
+    if !status.is_success() {
+        let code = parsed
+            .as_ref()
+            .and_then(|value| value.get("error").and_then(Value::as_str))
+            .unwrap_or("request_failed");
+        return Err(SeraError::External(format!(
+            "ElevenLabs OAuth token request rejected (HTTP {}): {}",
+            status.as_u16(),
+            code.chars().take(200).collect::<String>()
+        )));
+    }
+    let value = parsed.ok_or_else(|| {
+        SeraError::External("ElevenLabs OAuth token response was not JSON".into())
+    })?;
+    if let Some(error) = value.get("error").and_then(Value::as_str) {
+        return Err(SeraError::External(format!(
+            "ElevenLabs OAuth token request rejected: {}",
+            error.chars().take(200).collect::<String>()
+        )));
+    }
+    let access = value
+        .get("access_token")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if access.is_empty()
+        || access.len() > MAX_TOKEN_RESPONSE_BYTES
+        || !access.bytes().all(|b| b.is_ascii_graphic())
+    {
+        return Err(SeraError::External(
+            "ElevenLabs OAuth token response was rejected".into(),
+        ));
+    }
+    let refresh = value
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(refresh) = &refresh {
+        if refresh.is_empty()
+            || refresh.len() > MAX_TOKEN_RESPONSE_BYTES
+            || !refresh.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(SeraError::External(
+                "ElevenLabs OAuth token response was rejected".into(),
+            ));
+        }
+    }
+    let expires_in = value.get("expires_in").and_then(|item| {
+        item.as_u64()
+            .or_else(|| item.as_str().and_then(|text| text.parse().ok()))
+            .filter(|seconds| *seconds <= 86_400 * 7)
+    });
+    Ok(TokenPair {
+        access_token: access.to_owned(),
+        refresh_token: refresh,
+        expires_in,
+    })
+}
+
+#[derive(Clone)]
+enum ClientAuth {
+    ApiKey(SecretString),
+    Oauth(Arc<OauthSession>),
+}
+
+struct OauthSession {
+    tokens: tokio::sync::Mutex<OauthTokens>,
+    client_id: String,
+    token_url: String,
+    refresh_secret_name: String,
+    secrets: Option<SharedSecrets>,
+    http: reqwest::Client,
+}
+
+struct OauthTokens {
+    access_token: SecretString,
+    expires_at: Option<chrono::DateTime<Utc>>,
+    refresh_token: SecretString,
+}
+
+impl OauthSession {
+    /// Current access token, refreshing first when missing or near expiry
+    /// (30 s skew). A rotated refresh token is persisted to the age store;
+    /// a failed write fails the call so the rotation is never lost.
+    async fn current_access_token(&self) -> Result<SecretString> {
+        let mut guard = self.tokens.lock().await;
+        let stale = match guard.expires_at {
+            Some(at) => at <= Utc::now() + ChronoDuration::seconds(30),
+            None => true,
+        };
+        if stale {
+            let pair = refresh_grant_at(
+                &self.http,
+                &self.token_url,
+                &self.client_id,
+                guard.refresh_token.expose_secret(),
+            )
+            .await
+            .map_err(|error| {
+                SeraError::External(format!("ElevenLabs token refresh failed: {error}"))
+            })?;
+            if let Some(refresh) = &pair.refresh_token {
+                if let Some(secrets) = &self.secrets {
+                    secrets
+                        .persist(&[(self.refresh_secret_name.as_str(), refresh.as_str())])
+                        .map_err(|error| {
+                            SeraError::External(format!(
+                                "rotated ElevenLabs refresh token was not persisted: {error}"
+                            ))
+                        })?;
+                }
+                guard.refresh_token = SecretString::new(refresh.clone());
+            }
+            guard.expires_at = pair.expires_in.map(|seconds| {
+                Utc::now() + ChronoDuration::seconds(seconds.min(86_400 * 7) as i64)
+            });
+            guard.access_token = SecretString::new(pair.access_token);
+        }
+        Ok(guard.access_token.clone())
+    }
+
+    async fn invalidate(&self) {
+        self.tokens.lock().await.expires_at = None;
+    }
+}
+
 #[derive(Clone)]
 pub struct ElevenLabsClient {
     http: reqwest::Client,
     base_url: String,
-    api_key: SecretString,
+    auth: ClientAuth,
 }
 
 impl std::fmt::Debug for ElevenLabsClient {
@@ -51,11 +443,89 @@ impl ElevenLabsClient {
         api_key: impl Into<String>,
         timeout_secs: u64,
     ) -> Result<Self> {
-        let base_url = validate_base_url(&base_url.into())?;
         let api_key = api_key.into();
         if api_key.trim().is_empty() {
             return Err(SeraError::Config("ElevenLabs credential is missing".into()));
         }
+        Self::with_auth(
+            base_url,
+            ClientAuth::ApiKey(SecretString::new(api_key)),
+            timeout_secs,
+        )
+    }
+
+    /// OAuth mode: the stored access token may already be expired, so the
+    /// first request refreshes it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_oauth(
+        base_url: impl Into<String>,
+        access_token: impl Into<String>,
+        refresh_token: impl Into<String>,
+        client_id: impl Into<String>,
+        refresh_secret_name: impl Into<String>,
+        secrets: Option<SharedSecrets>,
+        timeout_secs: u64,
+    ) -> Result<Self> {
+        let access_token = access_token.into();
+        let refresh_token = refresh_token.into();
+        if access_token.trim().is_empty() || refresh_token.trim().is_empty() {
+            return Err(SeraError::Config(
+                "ElevenLabs OAuth tokens are missing".into(),
+            ));
+        }
+        Self::new_oauth_at(
+            base_url,
+            access_token,
+            refresh_token,
+            client_id,
+            ELEVENLABS_TOKEN_URL,
+            refresh_secret_name,
+            secrets,
+            timeout_secs,
+        )
+    }
+
+    /// `new_oauth` against an explicit token URL (loopback in tests).
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    fn new_oauth_at(
+        base_url: impl Into<String>,
+        access_token: impl Into<String>,
+        refresh_token: impl Into<String>,
+        client_id: impl Into<String>,
+        token_url: &str,
+        refresh_secret_name: impl Into<String>,
+        secrets: Option<SharedSecrets>,
+        timeout_secs: u64,
+    ) -> Result<Self> {
+        let access_token = access_token.into();
+        let refresh_token = refresh_token.into();
+        if access_token.trim().is_empty() || refresh_token.trim().is_empty() {
+            return Err(SeraError::Config(
+                "ElevenLabs OAuth tokens are missing".into(),
+            ));
+        }
+        let session = OauthSession {
+            tokens: tokio::sync::Mutex::new(OauthTokens {
+                access_token: SecretString::new(access_token),
+                expires_at: None,
+                refresh_token: SecretString::new(refresh_token),
+            }),
+            client_id: client_id.into(),
+            token_url: token_url.to_owned(),
+            refresh_secret_name: refresh_secret_name.into(),
+            secrets,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|error| SeraError::External(error.to_string()))?,
+        };
+        Self::with_auth(base_url, ClientAuth::Oauth(Arc::new(session)), timeout_secs)
+    }
+
+    fn with_auth(base_url: impl Into<String>, auth: ClientAuth, timeout_secs: u64) -> Result<Self> {
+        let base_url = validate_base_url(&base_url.into())?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs.max(1)))
             .redirect(reqwest::redirect::Policy::none())
@@ -64,36 +534,72 @@ impl ElevenLabsClient {
         Ok(Self {
             http,
             base_url,
-            api_key: SecretString::new(api_key),
+            auth,
         })
     }
 
-    fn auth_headers(&self) -> Result<HeaderMap> {
+    async fn auth_headers(&self) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "xi-api-key",
-            HeaderValue::from_str(self.api_key.expose_secret())
-                .map_err(|_| SeraError::Config("invalid ElevenLabs API key".into()))?,
-        );
+        match &self.auth {
+            ClientAuth::ApiKey(key) => {
+                headers.insert(
+                    "xi-api-key",
+                    HeaderValue::from_str(key.expose_secret())
+                        .map_err(|_| SeraError::Config("invalid ElevenLabs API key".into()))?,
+                );
+            }
+            ClientAuth::Oauth(session) => {
+                let token = session.current_access_token().await?;
+                headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {}", token.expose_secret()))
+                        .map_err(|_| SeraError::Config("invalid ElevenLabs access token".into()))?,
+                );
+            }
+        }
         Ok(headers)
+    }
+
+    /// Send a request with the current credential. On a 401 in OAuth mode the
+    /// access token is refreshed once and the request retried once. The REST
+    /// API rejects requests carrying both auth headers, so only one is set.
+    async fn send(
+        &self,
+        build: impl Fn(HeaderMap) -> Result<reqwest::RequestBuilder> + Clone,
+    ) -> Result<reqwest::Response> {
+        let response = build(self.auth_headers().await?)?
+            .send()
+            .await
+            .map_err(|error| SeraError::External(format!("ElevenLabs request failed: {error}")))?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let ClientAuth::Oauth(session) = &self.auth {
+                session.invalidate().await;
+                return build(self.auth_headers().await?)?
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        SeraError::External(format!("ElevenLabs request failed: {error}"))
+                    });
+            }
+        }
+        Ok(response)
     }
 
     pub async fn list_voices(&self, page_size: u32, search: Option<&str>) -> Result<Value> {
         let page_size = page_size.clamp(1, 100);
-        let mut request = self
-            .http
-            .get(format!("{}/v2/voices", self.base_url))
-            .query(&[("page_size", page_size.to_string())]);
-        if let Some(search) = search.filter(|value| !value.is_empty()) {
-            request = request.query(&[("search", search)]);
-        }
-        let response = request
-            .headers(self.auth_headers()?)
-            .send()
-            .await
-            .map_err(|error| {
-                SeraError::External(format!("ElevenLabs voices request failed: {error}"))
-            })?;
+        let response = self
+            .send(|headers| {
+                let mut request = self
+                    .http
+                    .get(format!("{}/v2/voices", self.base_url))
+                    .query(&[("page_size", page_size.to_string())])
+                    .headers(headers);
+                if let Some(search) = search.filter(|value| !value.is_empty()) {
+                    request = request.query(&[("search", search)]);
+                }
+                Ok(request)
+            })
+            .await?;
         read_json_response(response, "voices").await
     }
 
@@ -112,16 +618,15 @@ impl ElevenLabsClient {
             "model_id": model_id,
         });
         let response = self
-            .http
-            .post(format!("{}/v1/text-to-speech/{voice_id}", self.base_url))
-            .query(&[("output_format", output_format)])
-            .headers(self.auth_headers()?)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| {
-                SeraError::External(format!("ElevenLabs TTS request failed: {error}"))
-            })?;
+            .send(|headers| {
+                Ok(self
+                    .http
+                    .post(format!("{}/v1/text-to-speech/{voice_id}", self.base_url))
+                    .query(&[("output_format", output_format)])
+                    .headers(headers)
+                    .json(&body))
+            })
+            .await?;
         read_bytes_response(response, "text-to-speech").await
     }
 
@@ -137,16 +642,15 @@ impl ElevenLabsClient {
             body["duration_seconds"] = json!(duration);
         }
         let response = self
-            .http
-            .post(format!("{}/v1/sound-generation", self.base_url))
-            .query(&[("output_format", output_format)])
-            .headers(self.auth_headers()?)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| {
-                SeraError::External(format!("ElevenLabs sound effect request failed: {error}"))
-            })?;
+            .send(|headers| {
+                Ok(self
+                    .http
+                    .post(format!("{}/v1/sound-generation", self.base_url))
+                    .query(&[("output_format", output_format)])
+                    .headers(headers)
+                    .json(&body))
+            })
+            .await?;
         read_bytes_response(response, "sound-generation").await
     }
 
@@ -163,26 +667,25 @@ impl ElevenLabsClient {
                 "invalid transcription input size".into(),
             ));
         }
-        let part = Part::bytes(bytes.to_vec())
-            .file_name(filename.to_owned())
-            .mime_str(mime_for_filename(filename))
-            .map_err(|error| SeraError::External(error.to_string()))?;
-        let mut form = Form::new()
-            .part("file", part)
-            .text("model_id", model_id.to_owned());
-        if let Some(code) = language_code.filter(|value| !value.is_empty()) {
-            form = form.text("language_code", code.to_owned());
-        }
         let response = self
-            .http
-            .post(format!("{}/v1/speech-to-text", self.base_url))
-            .headers(self.auth_headers()?)
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|error| {
-                SeraError::External(format!("ElevenLabs STT request failed: {error}"))
-            })?;
+            .send(|headers| {
+                let part = Part::bytes(bytes.to_vec())
+                    .file_name(filename.to_owned())
+                    .mime_str(mime_for_filename(filename))
+                    .map_err(|error| SeraError::External(error.to_string()))?;
+                let mut form = Form::new()
+                    .part("file", part)
+                    .text("model_id", model_id.to_owned());
+                if let Some(code) = language_code.filter(|value| !value.is_empty()) {
+                    form = form.text("language_code", code.to_owned());
+                }
+                Ok(self
+                    .http
+                    .post(format!("{}/v1/speech-to-text", self.base_url))
+                    .headers(headers)
+                    .multipart(form))
+            })
+            .await?;
         read_json_response(response, "speech-to-text").await
     }
 
@@ -230,15 +733,14 @@ impl ElevenLabsClient {
 
     async fn post_flow(&self, path: &str, body: &Value) -> Result<FlowCreateResponse> {
         let response = self
-            .http
-            .post(format!("{}{path}", self.base_url))
-            .headers(self.auth_headers()?)
-            .json(body)
-            .send()
-            .await
-            .map_err(|error| {
-                SeraError::External(format!("ElevenLabs flow create failed: {error}"))
-            })?;
+            .send(|headers| {
+                Ok(self
+                    .http
+                    .post(format!("{}{path}", self.base_url))
+                    .headers(headers)
+                    .json(body))
+            })
+            .await?;
         let value = read_json_response(response, "flow create").await?;
         let id = value
             .get("id")
@@ -255,14 +757,13 @@ impl ElevenLabsClient {
 
     async fn get_flow(&self, path: &str) -> Result<Value> {
         let response = self
-            .http
-            .get(format!("{}{path}", self.base_url))
-            .headers(self.auth_headers()?)
-            .send()
-            .await
-            .map_err(|error| {
-                SeraError::External(format!("ElevenLabs flow status failed: {error}"))
-            })?;
+            .send(|headers| {
+                Ok(self
+                    .http
+                    .get(format!("{}{path}", self.base_url))
+                    .headers(headers))
+            })
+            .await?;
         read_json_response(response, "flow status").await
     }
 
@@ -505,6 +1006,13 @@ fn sanitize_provider_error(body: &[u8]) -> String {
         .as_ref()
         .and_then(|value| value.pointer("/detail/0/msg"))
         .and_then(Value::as_str)
+        .or_else(|| {
+            // ElevenLabs auth errors use an object: {"detail":{"message":"..."}}
+            parsed
+                .as_ref()
+                .and_then(|value| value.pointer("/detail/message"))
+                .and_then(Value::as_str)
+        })
         .or_else(|| {
             parsed
                 .as_ref()
@@ -1102,11 +1610,183 @@ impl Tool for ElevenLabsGenerateVideoTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path, path_regex};
+    use wiremock::matchers::{body_string_contains, header, method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn mock_client(server: &MockServer) -> ElevenLabsClient {
         ElevenLabsClient::new(server.uri(), "synthetic-key", 10).unwrap()
+    }
+
+    #[test]
+    fn cimd_document_is_self_consistent_and_secret_free() {
+        let doc = cimd_document();
+        assert_eq!(doc["client_id"], json!(cimd_client_id()));
+        assert_eq!(doc["redirect_uris"], json!([oauth_callback_uri()]));
+        assert_eq!(doc["token_endpoint_auth_method"], json!("none"));
+        assert_eq!(
+            doc["grant_types"],
+            json!(["authorization_code", "refresh_token"])
+        );
+        let url = reqwest::Url::parse(doc["client_id"].as_str().unwrap()).unwrap();
+        assert_eq!(url.scheme(), "https");
+        assert!(url.username().is_empty());
+        assert!(!serde_json::to_string(&doc).unwrap().contains("sk_"));
+    }
+
+    #[test]
+    fn authorize_url_is_pinned_to_elevenlabs_and_carries_pkce() {
+        let challenge = "a".repeat(43);
+        let url = authorize_url(
+            &cimd_client_id(),
+            &oauth_callback_uri(),
+            DEFAULT_OAUTH_SCOPE,
+            &challenge,
+            "state-1",
+        )
+        .unwrap();
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        assert_eq!(parsed.host_str(), Some("elevenlabs.io"));
+        assert_eq!(parsed.path(), "/app/oauth/authorize");
+        let query: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(query["response_type"], "code");
+        assert_eq!(query["code_challenge_method"], "S256");
+        assert_eq!(query["code_challenge"], challenge);
+        assert_eq!(query["redirect_uri"], oauth_callback_uri());
+        assert_eq!(query["client_id"], cimd_client_id());
+        // Only the fixed loopback callback declared in the CIMD document is accepted.
+        assert!(
+            authorize_url(
+                &cimd_client_id(),
+                "http://127.0.0.1:51121/oauth-callback",
+                DEFAULT_OAUTH_SCOPE,
+                &challenge,
+                "state-1"
+            )
+            .is_err()
+        );
+        // client_id must be a credential-less https URL.
+        assert!(
+            authorize_url(
+                "http://evil.example/client.json",
+                &oauth_callback_uri(),
+                DEFAULT_OAUTH_SCOPE,
+                &challenge,
+                "state-1"
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_code_posts_pkce_form_and_never_leaks_grant_material() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("grant_type=authorization_code"))
+            .and(body_string_contains("code_verifier="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-secret-value",
+                "refresh_token": "refresh-secret-value",
+                "expires_in": 3600,
+            })))
+            .mount(&server)
+            .await;
+        let pair = exchange_code_at(
+            &reqwest::Client::new(),
+            &format!("{}/token", server.uri()),
+            &cimd_client_id(),
+            "code-1",
+            &oauth_callback_uri(),
+            &"v".repeat(43),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pair.access_token, "access-secret-value");
+        assert_eq!(pair.refresh_token.as_deref(), Some("refresh-secret-value"));
+        assert_eq!(pair.expires_in, Some(3600));
+
+        let error_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})),
+            )
+            .mount(&error_server)
+            .await;
+        let error = exchange_code_at(
+            &reqwest::Client::new(),
+            &format!("{}/token", error_server.uri()),
+            &cimd_client_id(),
+            "code-2-secret",
+            &oauth_callback_uri(),
+            &"v".repeat(43),
+        )
+        .await
+        .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("invalid_grant"));
+        assert!(!text.contains("code-2-secret"));
+        assert!(!text.contains("vvvv"));
+    }
+
+    #[tokio::test]
+    async fn oauth_client_refreshes_stale_token_and_sends_bearer_only() {
+        let as_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "fresh-access",
+                "refresh_token": "rotated-refresh",
+                "expires_in": 3600,
+            })))
+            .mount(&as_server)
+            .await;
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/voices"))
+            .and(header("authorization", "Bearer fresh-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"voices": []})))
+            .mount(&api)
+            .await;
+        let client = ElevenLabsClient::new_oauth_at(
+            api.uri(),
+            "stale-access",
+            "old-refresh",
+            cimd_client_id(),
+            &format!("{}/token", as_server.uri()),
+            "elevenlabs_refresh_token",
+            None,
+            10,
+        )
+        .unwrap();
+        let value = client.list_voices(1, None).await.unwrap();
+        assert_eq!(value["voices"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn api_key_client_still_sends_xi_api_key_only() {
+        let api = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/voices"))
+            .and(header("xi-api-key", "synthetic-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"voices": []})))
+            .mount(&api)
+            .await;
+        mock_client(&api).list_voices(1, None).await.unwrap();
+    }
+
+    #[test]
+    fn sanitize_extracts_object_detail_message() {
+        let body = br#"{"detail":{"status":"invalid_api_key_length","message":"API key must be exactly 51 characters, got 43."}}"#;
+        assert_eq!(
+            sanitize_provider_error(body),
+            "API key must be exactly 51 characters, got 43."
+        );
+        let array = br#"{"detail":[{"msg":"bad request"}]}"#;
+        assert_eq!(sanitize_provider_error(array), "bad request");
+        let plain = br#"{"message":"top level"}"#;
+        assert_eq!(sanitize_provider_error(plain), "top level");
     }
 
     #[tokio::test]

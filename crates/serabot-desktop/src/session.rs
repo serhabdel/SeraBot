@@ -234,6 +234,8 @@ pub struct ConnectorDraft {
     pub enabled: bool,
     pub values: BTreeMap<String, String>,
     pub saving: bool,
+    /// ElevenLabs only: "api_key" or "oauth" (sent on Save connector).
+    pub auth: Option<String>,
 }
 
 impl Drop for ConnectorDraft {
@@ -1811,6 +1813,7 @@ impl Session {
             return;
         };
         let enabled = draft.enabled;
+        let auth = draft.auth.clone();
         let values = draft
             .values
             .iter()
@@ -1829,8 +1832,31 @@ impl Session {
         }
         self.start_request(Operation::AdminSetConnector {
             id,
-            update: ConnectorUpdate { enabled, values },
+            update: ConnectorUpdate {
+                enabled,
+                values,
+                auth,
+            },
         });
+    }
+
+    pub fn set_connector_auth(&mut self, id: &str, auth: String) {
+        let draft = self.connector_drafts.entry(id.to_owned()).or_default();
+        draft.auth = Some(auth);
+    }
+
+    /// Browser sign-in for a connector with OAuth support (ElevenLabs).
+    /// `callback_uri` is the fixed loopback redirect from the server catalog.
+    pub fn sign_in_connector(&mut self, id: String, callback_uri: String) {
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.admin_error = None;
+        self.admin_notice =
+            Some("Complete the sign-in in your browser. The console waits up to 3 minutes.".into());
+        self.oauth_signing_in = Some(id.clone());
+        self.start_request(Operation::ConnectorOAuthSignIn { id, callback_uri });
     }
 
     pub fn save_audio(&mut self) {
@@ -1873,6 +1899,9 @@ impl Session {
                 .entry(connector.id.clone())
                 .or_default();
             draft.enabled = connector.enabled;
+            if draft.auth.is_none() {
+                draft.auth = connector.auth.clone();
+            }
         }
         self.connector_drafts.retain(|id, _| seen.contains(id));
     }

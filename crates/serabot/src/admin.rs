@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::audio::resolve_audio_provider;
-use crate::config::{Config, OAuthConnectorSettings, ProviderConfig};
+use crate::config::{Config, ElevenLabsAuth, OAuthConnectorSettings, ProviderConfig};
 use crate::error::{Result, SeraError};
 use crate::providers::{canonical_kind, check_profile};
 use crate::secrets::SharedSecrets;
@@ -40,6 +40,9 @@ pub struct AdminOverlay {
     pub audio: Option<AudioOverlay>,
     #[serde(default)]
     pub bots: BTreeMap<String, BotProfile>,
+    /// ElevenLabs auth mode chosen in the console (api_key or oauth sign-in).
+    #[serde(default)]
+    pub elevenlabs_auth: Option<ElevenLabsAuth>,
 }
 
 /// Owner-facing identity for a bot. The bot file stays authoritative for
@@ -105,6 +108,9 @@ impl AdminOverlay {
                 "elevenlabs" => config.elevenlabs.enabled = *enabled,
                 _ => config.connectors.set_enabled(id, *enabled)?,
             }
+        }
+        if let Some(auth) = self.elevenlabs_auth {
+            config.elevenlabs.auth = auth;
         }
         if let Some(audio) = &self.audio {
             if audio.enabled
@@ -443,7 +449,10 @@ impl AdminStore {
         enabled: bool,
         values: &BTreeMap<String, String>,
     ) -> Result<()> {
-        let roles = connector_secret_roles(base, id)?;
+        // Merge the overlay first so a same-request auth-mode switch is seen.
+        let mut merged = base.clone();
+        self.snapshot().apply(&mut merged)?;
+        let roles = connector_secret_roles(&merged, id)?;
         for key in values.keys() {
             if !roles.iter().any(|(role, _)| role == key) {
                 return Err(SeraError::Validation(format!(
@@ -459,6 +468,15 @@ impl AdminStore {
                 return Err(SeraError::Validation(format!(
                     "{role} is empty, too long, or contains control characters"
                 )));
+            }
+            if id == "elevenlabs"
+                && *role == "api_key"
+                && crate::connectors::elevenlabs_api_key_malformed(value)
+            {
+                return Err(SeraError::Validation(
+                    "elevenlabs api_key is malformed: expected sk_ followed by 48 hex characters"
+                        .into(),
+                ));
             }
             if !crate::config::valid_secret_name(name) {
                 return Err(SeraError::Config(format!(
@@ -479,6 +497,14 @@ impl AdminStore {
 
         self.mutate(|overlay| {
             overlay.connectors.insert(id.to_owned(), enabled);
+            Ok(())
+        })
+    }
+
+    /// Switch the ElevenLabs connector between API-key and OAuth sign-in.
+    pub fn set_elevenlabs_auth(&self, auth: ElevenLabsAuth) -> Result<()> {
+        self.mutate(|overlay| {
+            overlay.elevenlabs_auth = Some(auth);
             Ok(())
         })
     }
@@ -672,7 +698,20 @@ pub fn connector_secret_roles(config: &Config, id: &str) -> Result<Vec<(&'static
         return Ok(vec![("api_key", config.firecrawl.api_key_secret.clone())]);
     }
     if id == "elevenlabs" {
-        return Ok(vec![("api_key", config.elevenlabs.api_key_secret.clone())]);
+        return Ok(if config.elevenlabs.auth == ElevenLabsAuth::Oauth {
+            vec![
+                (
+                    "access_token",
+                    config.elevenlabs.oauth_access_token_secret.clone(),
+                ),
+                (
+                    "refresh_token",
+                    config.elevenlabs.oauth_refresh_token_secret.clone(),
+                ),
+            ]
+        } else {
+            vec![("api_key", config.elevenlabs.api_key_secret.clone())]
+        });
     }
     Err(SeraError::NotFound(format!("connector {id}")))
 }
@@ -872,8 +911,16 @@ mod tests {
                 .is_err(),
             "elevenlabs must not enable without its secret"
         );
+        let mut bad = BTreeMap::new();
+        bad.insert("api_key".to_owned(), "sk_truncated".to_owned());
+        assert!(
+            store
+                .set_connector(&config, &empty, "elevenlabs", true, &bad)
+                .is_err(),
+            "a malformed sk_ key is rejected at write time"
+        );
         let mut values = BTreeMap::new();
-        values.insert("api_key".to_owned(), "synthetic-key".to_owned());
+        values.insert("api_key".to_owned(), format!("sk_{}", "a".repeat(48)));
         assert!(
             store
                 .set_connector(&config, &empty, "elevenlabs", true, &values)

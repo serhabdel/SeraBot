@@ -11,7 +11,7 @@ use serabot::audio::{
     AudioTranscribeTool, AudioUnderstandTool, MistralAudioClient, resolve_audio_provider,
 };
 use serabot::browser::{BrowserSession, register_browser_tools};
-use serabot::config::{Config, load_bots};
+use serabot::config::{Config, ElevenLabsAuth, load_bots};
 use serabot::connectors::register_connector_tools;
 use serabot::deck::Brand;
 use serabot::documents::index_directory;
@@ -526,19 +526,51 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         registry.register(AudioUnderstandTool::new(audio_client, config.clone()))?;
     }
     if config.elevenlabs.enabled {
-        let api_key = secrets
-            .require(&config.elevenlabs.api_key_secret)
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "{error}; run `serabot secrets set {}` before enabling ElevenLabs",
-                    config.elevenlabs.api_key_secret
-                )
-            })?;
-        let elevenlabs = Arc::new(ElevenLabsClient::new(
-            &config.elevenlabs.api_base,
-            api_key,
-            config.elevenlabs.timeout_secs,
-        )?);
+        let elevenlabs = match config.elevenlabs.auth {
+            ElevenLabsAuth::ApiKey => {
+                let api_key =
+                    secrets
+                        .require(&config.elevenlabs.api_key_secret)
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "{error}; run `serabot secrets set {}` before enabling ElevenLabs",
+                                config.elevenlabs.api_key_secret
+                            )
+                        })?;
+                Arc::new(ElevenLabsClient::new(
+                    &config.elevenlabs.api_base,
+                    api_key,
+                    config.elevenlabs.timeout_secs,
+                )?)
+            }
+            ElevenLabsAuth::Oauth => {
+                let access_token = secrets
+                    .require(&config.elevenlabs.oauth_access_token_secret)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "{error}; sign in with ElevenLabs in the console first ({})",
+                            config.elevenlabs.oauth_access_token_secret
+                        )
+                    })?;
+                let refresh_token = secrets
+                    .require(&config.elevenlabs.oauth_refresh_token_secret)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "{error}; sign in with ElevenLabs in the console first ({})",
+                            config.elevenlabs.oauth_refresh_token_secret
+                        )
+                    })?;
+                Arc::new(ElevenLabsClient::new_oauth(
+                    &config.elevenlabs.api_base,
+                    access_token,
+                    refresh_token,
+                    &config.elevenlabs.oauth_client_id,
+                    &config.elevenlabs.oauth_refresh_token_secret,
+                    Some(secrets.clone()),
+                    config.elevenlabs.timeout_secs,
+                )?)
+            }
+        };
         register_elevenlabs_tools(
             &mut registry,
             elevenlabs,
