@@ -128,6 +128,10 @@ pub fn router(state: ApiState) -> Router {
             "/v1/conversations/{id}",
             patch(rename_conversation).delete(archive_conversation),
         )
+        .route(
+            "/v1/conversations/{id}/unarchive",
+            post(unarchive_conversation),
+        )
         .route("/v1/memories", get(list_memories).post(add_memory))
         .route("/v1/memories/{id}", delete(delete_memory))
         .route("/v1/providers", get(list_providers))
@@ -148,6 +152,7 @@ pub fn router(state: ApiState) -> Router {
             "/v1/conversations/{id}/team",
             get(conversation_team).put(set_conversation_team),
         )
+        .route("/v1/conversations/{id}/library", get(conversation_library))
         .route("/v1/tasks/{id}", get(task))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}/decide", post(decide_approval))
@@ -370,6 +375,8 @@ async fn conversation_messages(
             body
         })
         .collect::<Vec<_>>();
+    // Opening the thread is the owner reading it.
+    state.store.mark_conversation_read(&id)?;
     Ok(Json(json!({"messages": messages})))
 }
 
@@ -416,6 +423,7 @@ fn team_view(
     conversation_id: &str,
     members: &[String],
     mode: &str,
+    rules: &str,
 ) -> Result<Value> {
     let bots = crate::config::list_configured_bots(&state.config)?;
     let members = members
@@ -426,6 +434,7 @@ fn team_view(
         "conversation_id": conversation_id,
         "mode": mode,
         "members": members,
+        "rules": rules,
         "max_members": crate::teams::MAX_TEAM_MEMBERS,
     }))
 }
@@ -433,15 +442,16 @@ fn team_view(
 async fn conversation_team(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> Response {
     let body = (|| -> Result<Value> {
         team_conversation(&state, &id)?;
-        let (members, mode) = match state.store.get_conversation_team(&id)? {
-            Some(team) => (team.members, team.mode),
+        let (members, mode, rules) = match state.store.get_conversation_team(&id)? {
+            Some(team) => (team.members, team.mode, team.rules),
             // No team yet is an empty shape, never a 404.
             None => (
                 Vec::new(),
                 crate::teams::TeamMode::Selected.as_str().to_owned(),
+                String::new(),
             ),
         };
-        let body = team_view(&state, &id, &members, &mode)?;
+        let body = team_view(&state, &id, &members, &mode, &rules)?;
         state.runtime.scan_owner_output(&body.to_string())?;
         Ok(body)
     })();
@@ -457,6 +467,8 @@ struct SetTeamRequest {
     members: Vec<String>,
     #[serde(default = "default_team_mode")]
     mode: String,
+    #[serde(default)]
+    rules: String,
 }
 
 fn default_team_mode() -> String {
@@ -472,6 +484,23 @@ async fn set_conversation_team(
         team_conversation(&state, &id)?;
         let mode = crate::teams::TeamMode::from_name(&request.mode)?;
         crate::teams::validate_members(&request.members)?;
+        if request.rules.chars().count() > 4000 {
+            return Err(SeraError::Validation(
+                "team rules must be at most 4000 characters".into(),
+            ));
+        }
+        if request
+            .rules
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+        {
+            return Err(SeraError::Validation(
+                "team rules must not contain control characters".into(),
+            ));
+        }
+        // Rules reach every later model request in the room, so they are
+        // scanned before they are stored, not only on the way out.
+        state.runtime.scan_owner_output(&request.rules)?;
         let bots = crate::config::list_configured_bots(&state.config)?;
         for member in &request.members {
             let entry = bots.iter().find(|candidate| candidate.id == *member);
@@ -492,11 +521,12 @@ async fn set_conversation_team(
         }
         state
             .store
-            .set_conversation_team(&id, &request.members, mode.as_str())?;
+            .set_conversation_team(&id, &request.members, mode.as_str(), &request.rules)?;
         let details = json!({
             "conversation_id": id,
             "members": request.members,
             "mode": mode.as_str(),
+            "rules": request.rules,
         });
         state.store.record_audit(
             "owner",
@@ -511,7 +541,7 @@ async fn set_conversation_team(
         state
             .store
             .append_event(crate::teams::AUDIT_MEMBER_SET, &details)?;
-        let body = team_view(&state, &id, &request.members, mode.as_str())?;
+        let body = team_view(&state, &id, &request.members, mode.as_str(), &request.rules)?;
         state.runtime.scan_owner_output(&body.to_string())?;
         Ok(body)
     })();
@@ -519,6 +549,34 @@ async fn set_conversation_team(
         Ok(body) => Json(body).into_response(),
         Err(error) => team_error(error),
     }
+}
+
+async fn conversation_library(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    validate_conversation_id(&id)?;
+    state
+        .store
+        .get_conversation(&id)?
+        .ok_or_else(|| SeraError::NotFound(format!("conversation {id}")))?;
+    let entries = state
+        .store
+        .list_conversation_artifacts(&id)?
+        .into_iter()
+        .map(|entry| {
+            let meta = state.artifacts.meta(&entry.hash).ok();
+            json!({
+                "action_id": entry.action_id,
+                "tool": entry.tool,
+                "hash": entry.hash,
+                "filename": meta.as_ref().map(|meta| meta.filename.clone()),
+                "title": meta.as_ref().map(|meta| meta.title.clone()),
+                "created_at": entry.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({"artifacts": entries})))
 }
 
 /// Raw owner audio, transcribed with the configured audio provider.
@@ -1075,6 +1133,7 @@ fn conversation_view(record: &StoredConversation) -> Result<Value> {
         "updated_at": record.updated_at,
         "last_message_at": record.last_message_at,
         "archived_at": record.archived_at,
+        "unread_count": record.unread_count,
         "accepts_turns": kind.accepts_turns(),
     }))
 }
@@ -1168,6 +1227,27 @@ async fn archive_conversation(
         Some(&json!({"id": id})),
     )?;
     Ok(Json(json!({"id": id, "archived": true})))
+}
+
+async fn unarchive_conversation(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    validate_conversation_id(&id)?;
+    if !state.store.unarchive_conversation(&id)? {
+        return Err(SeraError::NotFound(format!("conversation {id}")));
+    }
+    state.store.record_audit(
+        "owner",
+        "conversation.unarchived",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({"id": id})),
+    )?;
+    Ok(Json(json!({"id": id, "archived": false})))
 }
 
 #[derive(Debug, Deserialize)]
@@ -3272,6 +3352,101 @@ mod tests {
         )
         .await;
         assert!(with_archived.to_string().contains("dir:analyst"));
+
+        let restored = read_json(
+            app.clone()
+                .oneshot(request(
+                    &app,
+                    "POST",
+                    "/v1/conversations/dir:analyst/unarchive",
+                    true,
+                    None,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(restored["archived"], false);
+
+        let visible = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/conversations", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(visible.to_string().contains("dir:analyst"));
+
+        let missing_restore = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/conversations/dir:missing/unarchive",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing_restore.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn library_lists_no_rows_for_a_fresh_conversation_and_404s_unknown_ones() {
+        let (app, _, _) = app();
+        let created = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/conversations",
+                true,
+                Some(json!({"kind": "room", "slug": "review"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+
+        let empty = read_json(
+            app.clone()
+                .oneshot(request(
+                    &app,
+                    "GET",
+                    "/v1/conversations/room:review/library",
+                    true,
+                    None,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(empty["artifacts"], json!([]));
+
+        let missing = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/conversations/room:ghost/library",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let unauthenticated = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/conversations/room:review/library",
+                false,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -3824,6 +3999,62 @@ mod tests {
         let body = read_json(response).await;
         assert_eq!(body["mode"], "all");
         assert_eq!(body["members"].as_array().unwrap().len(), 2);
+
+        // Group instructions round-trip, newlines included.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PUT",
+                "/v1/conversations/room:review/team",
+                true,
+                Some(json!({
+                    "members": ["analyst"],
+                    "mode": "selected",
+                    "rules": "Line one.\nLine two.",
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        assert_eq!(body["rules"], "Line one.\nLine two.");
+        let stored = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/conversations/room:review/team",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(read_json(stored).await["rules"], "Line one.\nLine two.");
+
+        let over = "x".repeat(4001);
+        for (rules, needle) in [(over.as_str(), "4000"), ("bad \u{7} char", "control")] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    &app,
+                    "PUT",
+                    "/v1/conversations/room:review/team",
+                    true,
+                    Some(json!({"members": ["analyst"], "mode": "selected", "rules": rules})),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let message = read_json(response).await["error"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                message.contains(needle),
+                "{message} should mention {needle}"
+            );
+        }
 
         // Unknown conversation, non-room conversation, unauthenticated call.
         let missing = app

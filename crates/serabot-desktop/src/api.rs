@@ -458,9 +458,9 @@ impl ConversationKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Section => "Section",
-            Self::Group => "Group",
-            Self::Direct => "Direct",
-            Self::Room => "Room",
+            Self::Group => "Folder",
+            Self::Direct => "Chat",
+            Self::Room => "Group chat",
         }
     }
 
@@ -600,6 +600,8 @@ pub struct ConversationSummary {
     pub last_message_at: Option<String>,
     #[serde(default)]
     pub archived_at: Option<String>,
+    #[serde(default)]
+    pub unread_count: i64,
     pub accepts_turns: bool,
 }
 
@@ -1017,6 +1019,22 @@ pub struct Team {
     pub mode: TeamMode,
     #[serde(default)]
     pub members: Vec<TeamMember>,
+    /// Group instructions written by the owner; injected into room turns.
+    #[serde(default)]
+    pub rules: String,
+}
+
+/// One artifact row from `GET /v1/conversations/{id}/library`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct LibraryEntry {
+    pub action_id: String,
+    pub tool: String,
+    pub hash: String,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    pub created_at: String,
 }
 
 /// Transcript of one recorded audio note. The text is model output: untrusted
@@ -1595,6 +1613,25 @@ impl ApiClient {
         Ok(())
     }
 
+    /// Restore an archived conversation to the rail.
+    pub fn unarchive_conversation(&self, id: &str) -> Result<(), ApiError> {
+        check_id(id)?;
+        #[derive(Deserialize)]
+        struct Body {
+            archived: bool,
+        }
+        let body: Body = self.request::<Body, ()>(
+            Method::POST,
+            &["v1", "conversations", id, "unarchive"],
+            &[],
+            None,
+        )?;
+        if body.archived {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(())
+    }
+
     pub fn list_memories(&self, query: Option<&str>) -> Result<Vec<MemoryEntry>, ApiError> {
         let mut params = vec![("limit", "200")];
         if let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) {
@@ -1781,21 +1818,71 @@ impl ApiClient {
         conversation: &str,
         members: &[String],
         mode: TeamMode,
+        rules: &str,
     ) -> Result<Team, ApiError> {
         check_id(conversation)?;
         check_room(conversation)?;
         validate_team_members(members)?;
+        if rules.chars().count() > 4_000
+            || rules
+                .chars()
+                .any(|c| c != '\n' && c != '\r' && c != '\t' && c.is_control())
+        {
+            return Err(ApiError::Validation(
+                "Group instructions must be at most 4,000 characters, without control characters.",
+            ));
+        }
         #[derive(Serialize)]
         struct Body<'a> {
             members: &'a [String],
             mode: TeamMode,
+            rules: &'a str,
         }
         self.request(
             Method::PUT,
             &["v1", "conversations", conversation, "team"],
             &[],
-            Some(&Body { members, mode }),
+            Some(&Body {
+                members,
+                mode,
+                rules,
+            }),
         )
+    }
+
+    /// The artifact library of any conversation: files the gateway produced
+    /// inside its turns, newest first.
+    pub fn library(&self, conversation: &str) -> Result<Vec<LibraryEntry>, ApiError> {
+        check_id(conversation)?;
+        #[derive(Deserialize)]
+        struct Envelope {
+            artifacts: Vec<LibraryEntry>,
+        }
+        let response: Envelope =
+            self.get(&["v1", "conversations", conversation, "library"], &[])?;
+        if response.artifacts.len() > 100 {
+            return Err(ApiError::InvalidResponse);
+        }
+        for entry in &response.artifacts {
+            let hash_ok =
+                entry.hash.len() == 64 && entry.hash.bytes().all(|byte| byte.is_ascii_hexdigit());
+            if !hash_ok
+                || !bounded_text(&entry.tool, 128)
+                || !bounded_text(&entry.created_at, 64)
+                || entry
+                    .filename
+                    .as_deref()
+                    .is_some_and(|name| !bounded_text(name, 256))
+                || entry
+                    .title
+                    .as_deref()
+                    .is_some_and(|title| !bounded_text(title, 256))
+                || !valid_id(&entry.action_id)
+            {
+                return Err(ApiError::InvalidResponse);
+            }
+        }
+        Ok(response.artifacts)
     }
 
     /// Transcribe one recorded audio note. The body is the raw recording; the
@@ -1860,6 +1947,49 @@ impl ApiClient {
             return Err(ApiError::Http(status.as_u16()));
         }
         serde_json::from_slice(&body).map_err(|_| ApiError::InvalidResponse)
+    }
+
+    /// Download one artifact by content hash. Returns the server filename and
+    /// the raw bytes (server cap: 100 MiB).
+    pub fn artifact(&self, hash: &str) -> Result<(String, Vec<u8>), ApiError> {
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ApiError::Validation("Invalid artifact hash."));
+        }
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .map_err(|_| ApiError::InvalidResponse)?
+            .clear()
+            .extend(["v1", "artifacts", hash]);
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(self.token.expose_secret())
+            .send()
+            .map_err(|_| ApiError::Transport)?;
+        let status = response.status();
+        let filename = response
+            .headers()
+            .get("content-disposition")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split("filename=\"").nth(1))
+            .and_then(|value| value.split('"').next())
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && name.chars().count() <= 256)
+            .map(str::to_owned);
+        const MAX_ARTIFACT: u64 = 100 * 1024 * 1024;
+        let mut bytes = Zeroizing::new(Vec::new());
+        response
+            .take(MAX_ARTIFACT + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ApiError::Transport)?;
+        if bytes.len() as u64 > MAX_ARTIFACT {
+            return Err(ApiError::TooLarge);
+        }
+        if !status.is_success() {
+            return Err(ApiError::Http(status.as_u16()));
+        }
+        let filename = filename.unwrap_or_else(|| format!("{hash}.pdf"));
+        Ok((filename, bytes.to_vec()))
     }
 
     /// Admin writes carry a safe server-authored message on rejection so the
@@ -2081,6 +2211,7 @@ fn check_conversation_summary(conversation: &ConversationSummary) -> Result<(), 
             .archived_at
             .as_deref()
             .is_some_and(|stamp| !bounded_text(stamp, 64))
+        || conversation.unread_count < 0
     {
         return Err(ApiError::InvalidResponse);
     }
@@ -2299,6 +2430,7 @@ mod tests {
             updated_at: "2026-10-29T10:00:00.000Z".into(),
             last_message_at: None,
             archived_at: None,
+            unread_count: 0,
             accepts_turns,
         }
     }
@@ -2403,6 +2535,32 @@ mod tests {
         assert_eq!(offline.mode, TeamMode::All);
         assert!(!offline.members[0].live);
         assert!(offline.members[0].enabled);
+        assert_eq!(offline.rules, "");
+
+        let with_rules: Team = serde_json::from_str(
+            r#"{"conversation_id":"room:review",
+                "mode":"all","rules":"Cite sources.",
+                "members":[{"bot":"maker","role":"specialist","enabled":true,"live":false}]}"#,
+        )
+        .unwrap();
+        assert_eq!(with_rules.rules, "Cite sources.");
+    }
+
+    #[test]
+    fn library_reads_the_server_shape() {
+        #[derive(Deserialize)]
+        struct Env {
+            artifacts: Vec<LibraryEntry>,
+        }
+        let parsed: Env = serde_json::from_str(
+            r#"{"artifacts":[{"action_id":"act-1","tool":"deck_render",
+                "hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "filename":"deck.pdf","title":"Q3 Deck","created_at":"2026-10-29T10:00:00.000Z"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.artifacts.len(), 1);
+        assert_eq!(parsed.artifacts[0].tool, "deck_render");
+        assert_eq!(parsed.artifacts[0].filename.as_deref(), Some("deck.pdf"));
     }
 
     #[test]

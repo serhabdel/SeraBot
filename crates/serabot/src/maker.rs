@@ -64,6 +64,14 @@ impl ArtifactStore {
         })
     }
 
+    /// Metadata only, without loading the artifact bytes — for listings.
+    pub fn meta(&self, hash: &str) -> Result<ArtifactMeta> {
+        validate_hash(hash)?;
+        let meta_raw = std::fs::read(self.root.join(format!("{hash}.json")))
+            .map_err(|_| SeraError::NotFound(format!("artifact metadata {hash}")))?;
+        Ok(serde_json::from_slice(&meta_raw)?)
+    }
+
     pub fn load(&self, hash: &str) -> Result<StoredArtifact> {
         validate_hash(hash)?;
         let meta_raw = std::fs::read(self.root.join(format!("{hash}.json")))

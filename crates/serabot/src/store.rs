@@ -19,6 +19,7 @@ const MIGRATION_2: &str = include_str!("../migrations/0002_conversations.sql");
 const MIGRATION_3: &str = include_str!("../migrations/0003_device_tokens.sql");
 const MIGRATION_4: &str = include_str!("../migrations/0004_conversation_meta.sql");
 const MIGRATION_5: &str = include_str!("../migrations/0005_conversation_teams.sql");
+const MIGRATION_6: &str = include_str!("../migrations/0006_console_redesign.sql");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceToken {
@@ -44,6 +45,7 @@ pub struct ConversationTeam {
     pub conversation_id: String,
     pub members: Vec<String>,
     pub mode: String,
+    pub rules: String,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -171,6 +173,11 @@ impl Store {
         if version < 5 {
             connection.execute_batch(MIGRATION_5)?;
             connection.pragma_update(None, "user_version", 5)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 6 {
+            connection.execute_batch(MIGRATION_6)?;
+            connection.pragma_update(None, "user_version", 6)?;
         }
         let stored_dimension: Option<String> = connection
             .query_row(
@@ -423,7 +430,10 @@ impl Store {
             .query_row(
                 "SELECT c.id, c.kind, c.parent_id, c.title, c.created_at, c.updated_at,
                         c.archived_at,
-                        (SELECT MAX(m.created_at) FROM messages m WHERE m.conversation_id = c.id)
+                        (SELECT MAX(m.created_at) FROM messages m WHERE m.conversation_id = c.id),
+                        (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id
+                           AND m.role = 'assistant'
+                           AND (c.last_read_at IS NULL OR m.created_at > c.last_read_at))
                  FROM conversations c WHERE c.id = ?1",
                 params![id],
                 conversation_from_row,
@@ -442,7 +452,10 @@ impl Store {
         let mut statement = connection.prepare(
             "SELECT c.id, c.kind, c.parent_id, c.title, c.created_at, c.updated_at,
                     c.archived_at,
-                    (SELECT MAX(m.created_at) FROM messages m WHERE m.conversation_id = c.id)
+                    (SELECT MAX(m.created_at) FROM messages m WHERE m.conversation_id = c.id),
+                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id
+                       AND m.role = 'assistant'
+                       AND (c.last_read_at IS NULL OR m.created_at > c.last_read_at))
              FROM conversations c
              WHERE (?2 = 1 OR c.archived_at IS NULL)
                AND (?3 IS NULL OR c.updated_at < ?3 OR (c.updated_at = ?3 AND c.id < ?4))
@@ -473,12 +486,32 @@ impl Store {
         Ok(changed == 1)
     }
 
+    /// The owner opened the conversation: assistant messages up to now count as read.
+    /// Returns false when the id is unknown.
+    pub fn mark_conversation_read(&self, id: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE conversations SET last_read_at = ?2 WHERE id = ?1",
+            params![id, now_string()],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Soft archive: messages are kept. Returns false when the id is unknown.
     pub fn archive_conversation(&self, id: &str) -> Result<bool> {
         let connection = self.connection()?;
         let changed = connection.execute(
             "UPDATE conversations SET archived_at = COALESCE(archived_at, ?2), updated_at = ?2
              WHERE id = ?1",
+            params![id, now_string()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn unarchive_conversation(&self, id: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE conversations SET archived_at = NULL, updated_at = ?2 WHERE id = ?1",
             params![id, now_string()],
         )?;
         Ok(changed == 1)
@@ -516,16 +549,24 @@ impl Store {
     /// Team attached to a room conversation, if the owner set one.
     pub fn get_conversation_team(&self, conversation_id: &str) -> Result<Option<ConversationTeam>> {
         let connection = self.connection()?;
-        let row: Option<(String, String, String, String)> = connection
+        let row: Option<(String, String, String, String, String)> = connection
             .query_row(
-                "SELECT conversation_id, members, mode, updated_at
+                "SELECT conversation_id, members, mode, rules, updated_at
                  FROM conversation_teams WHERE conversation_id = ?1",
                 params![conversation_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()
             .map_err(SeraError::from)?;
-        let Some((conversation_id, members, mode, updated_at)) = row else {
+        let Some((conversation_id, members, mode, rules, updated_at)) = row else {
             return Ok(None);
         };
         let members: Vec<String> = serde_json::from_str(&members)
@@ -534,6 +575,7 @@ impl Store {
             conversation_id,
             members,
             mode,
+            rules,
             updated_at: parse_datetime(&updated_at),
         }))
     }
@@ -543,17 +585,20 @@ impl Store {
         conversation_id: &str,
         members: &[String],
         mode: &str,
+        rules: &str,
     ) -> Result<()> {
         let connection = self.connection()?;
         connection.execute(
-            "INSERT INTO conversation_teams(conversation_id, members, mode, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO conversation_teams(conversation_id, members, mode, rules, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(conversation_id) DO UPDATE SET
-                 members=excluded.members, mode=excluded.mode, updated_at=excluded.updated_at",
+                 members=excluded.members, mode=excluded.mode, rules=excluded.rules,
+                 updated_at=excluded.updated_at",
             params![
                 conversation_id,
                 serde_json::to_string(members)?,
                 mode,
+                rules,
                 now_string()
             ],
         )?;
@@ -621,6 +666,35 @@ impl Store {
         let mut messages = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         messages.reverse();
         Ok(messages)
+    }
+
+    /// Artifacts produced inside a conversation, newest first. Joins gateway
+    /// actions to their turn; the hash may be recorded at approval time or in
+    /// the execution outcome, so both are checked.
+    pub fn list_conversation_artifacts(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<StoredConversationArtifact>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT a.id, a.tool, a.created_at,
+                    COALESCE(a.artifact_hash, json_extract(a.outcome_json, '$.artifact_hash'))
+             FROM actions a
+             JOIN turns t ON t.id = a.turn_id
+             WHERE t.conversation_id = ?1
+               AND COALESCE(a.artifact_hash, json_extract(a.outcome_json, '$.artifact_hash')) IS NOT NULL
+             ORDER BY a.created_at DESC, a.rowid DESC
+             LIMIT 100",
+        )?;
+        let rows = statement.query_map(params![conversation_id], |row| {
+            Ok(StoredConversationArtifact {
+                action_id: row.get(0)?,
+                tool: row.get(1)?,
+                created_at: parse_datetime(&row.get::<_, String>(2)?),
+                hash: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn list_visible_messages(
@@ -1362,6 +1436,15 @@ pub struct StoredConversation {
     pub updated_at: DateTime<Utc>,
     pub archived_at: Option<DateTime<Utc>>,
     pub last_message_at: Option<DateTime<Utc>>,
+    pub unread_count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredConversationArtifact {
+    pub action_id: String,
+    pub tool: String,
+    pub created_at: DateTime<Utc>,
+    pub hash: String,
 }
 
 fn map_conversation_write(error: rusqlite::Error) -> SeraError {
@@ -1405,6 +1488,7 @@ fn conversation_from_row(row: &Row<'_>) -> rusqlite::Result<StoredConversation> 
             .get::<_, Option<String>>(7)?
             .as_deref()
             .map(parse_datetime),
+        unread_count: row.get(8)?,
     })
 }
 
@@ -1576,6 +1660,126 @@ mod tests {
     }
 
     #[test]
+    fn unread_counts_assistant_messages_until_marked_read() {
+        let store = store();
+        store.ensure_conversation_accepts_turns("dir:main").unwrap();
+        store
+            .append_message("dir:main", None, Role::Assistant, "first")
+            .unwrap();
+        store
+            .append_message("dir:main", None, Role::Assistant, "second")
+            .unwrap();
+        store
+            .append_message("dir:main", None, Role::User, "owner reply")
+            .unwrap();
+        let record = store.get_conversation("dir:main").unwrap().unwrap();
+        assert_eq!(record.unread_count, 2);
+
+        assert!(store.mark_conversation_read("dir:main").unwrap());
+        let record = store.get_conversation("dir:main").unwrap().unwrap();
+        assert_eq!(record.unread_count, 0);
+
+        store
+            .append_message("dir:main", None, Role::Assistant, "third")
+            .unwrap();
+        let listed = store.list_conversations(10, None, false).unwrap();
+        let record = listed.iter().find(|entry| entry.id == "dir:main").unwrap();
+        assert_eq!(record.unread_count, 1);
+        assert!(!store.mark_conversation_read("absent").unwrap());
+    }
+
+    #[test]
+    fn team_rules_round_trip_and_default_empty() {
+        let store = store();
+        store
+            .create_conversation("room:review", "room", None)
+            .unwrap();
+        assert!(
+            store
+                .get_conversation_team("room:review")
+                .unwrap()
+                .is_none()
+        );
+        store
+            .set_conversation_team(
+                "room:review",
+                &["analyst".into()],
+                "selected",
+                "Always cite sources.",
+            )
+            .unwrap();
+        let team = store.get_conversation_team("room:review").unwrap().unwrap();
+        assert_eq!(team.rules, "Always cite sources.");
+        assert_eq!(team.members, vec!["analyst".to_owned()]);
+    }
+
+    #[test]
+    fn conversation_library_joins_actions_to_turns() {
+        let store = store();
+        store.ensure_conversation_accepts_turns("dir:main").unwrap();
+        let task = store
+            .enqueue_task("turn", "main", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        let turn = store
+            .create_turn(&task.id, "main", "dir:main", &serde_json::json!({}))
+            .unwrap();
+        store
+            .create_action(
+                "deck_generate",
+                Some(&task.id),
+                Some(&turn.id),
+                "{}",
+                "hash-args",
+                None,
+                Some("abc123"),
+                "v1",
+            )
+            .unwrap();
+        store
+            .create_action(
+                "tavily_search",
+                Some(&task.id),
+                Some(&turn.id),
+                "{}",
+                "hash-search",
+                None,
+                None,
+                "v1",
+            )
+            .unwrap();
+        let action = store
+            .create_action(
+                "deck_render",
+                Some(&task.id),
+                Some(&turn.id),
+                "{}",
+                "hash-render",
+                None,
+                None,
+                "v1",
+            )
+            .unwrap();
+        store
+            .update_action(
+                &action.id,
+                "executed",
+                Some(&serde_json::json!({"artifact_hash": "def456"})),
+            )
+            .unwrap();
+        let artifacts = store.list_conversation_artifacts("dir:main").unwrap();
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0].hash, "def456");
+        assert_eq!(artifacts[0].tool, "deck_render");
+        assert_eq!(artifacts[1].hash, "abc123");
+        assert!(
+            store
+                .list_conversation_artifacts("dir:other")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn visible_history_keeps_specialist_names() {
         let store = store();
         store
@@ -1626,7 +1830,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -1677,7 +1881,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(

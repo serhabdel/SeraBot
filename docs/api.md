@@ -178,8 +178,11 @@ rejected. Direct and room conversations do. Duplicate ids conflict.
 Lists conversations ordered by activity (`updated_at` descending). Archived
 conversations are hidden unless `include_archived=true`. Each entry is `id`,
 `kind`, `parent_id`, `title`, `created_at`, `updated_at`, `last_message_at`,
-`archived_at`, and `accepts_turns`. `next_cursor` is `null` on the final page;
-pass it back verbatim (it is an opaque `timestamp|id` pair, not a secret).
+`archived_at`, `unread_count`, and `accepts_turns`. `unread_count` counts
+assistant messages newer than the conversation's `last_read_at`; reading that
+conversation's messages updates `last_read_at`. `next_cursor` is `null` on the
+final page; pass it back verbatim (it is an opaque `timestamp|id` pair, not a
+secret).
 
 `PATCH /v1/conversations/{id}` sets a title:
 
@@ -192,6 +195,32 @@ content policy.
 
 `DELETE /v1/conversations/{id}` soft-archives: the row and every message stay,
 `archived_at` is set, and the conversation leaves default lists.
+
+`POST /v1/conversations/{id}/unarchive` clears `archived_at` and returns
+`{"id": "...", "archived": false}`. Unknown ids are 404. Both archive moves are
+audited.
+
+## Group members and library
+
+`GET /v1/conversations/{id}/team` returns `{"members": [...], "mode":
+"selected|all", "rules": "..."}` for a `room:` conversation, or `{"members": [],
+"mode": "selected", "rules": ""}` when none is set. Other kinds are rejected.
+
+`PUT /v1/conversations/{id}/team` accepts
+`{"members": ["analyst", "maker"], "mode": "selected", "rules": "..."}`. Members
+are 1–5 enabled bots; `rules` is optional owner-written group instruction text,
+at most 4,000 characters, scanned by the content policy. Non-empty rules are
+appended to the system prompt of every turn in that room, for the orchestrator
+and for members alike, as bounded owner data — operating rules, approvals, and
+the content policy still win. The write is audited with the member list, mode,
+and rules.
+
+`GET /v1/conversations/{id}/library` lists artifacts produced inside one
+conversation, newest first (at most 100). Each entry is `action_id`, `tool`,
+`hash`, `created_at`, and `filename`/`title` when the artifact sidecar has them.
+Rows come from gateway actions joined to the conversation's turns, so nothing is
+produced outside the approval path. Download the bytes through
+`GET /v1/artifacts/{hash}`.
 
 ## Memory
 

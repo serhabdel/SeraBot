@@ -1649,10 +1649,10 @@ impl Runtime {
         objective: &str,
         context: &TeamContext,
     ) -> Result<String> {
-        let members = self
-            .store
-            .get_conversation_team(conversation_id)?
-            .map(|team| team.members)
+        let team = self.store.get_conversation_team(conversation_id)?;
+        let members = team
+            .as_ref()
+            .map(|team| team.members.clone())
             .unwrap_or_default();
         let mut prompt = String::new();
         prompt.push_str(&bot.prompt);
@@ -1661,6 +1661,9 @@ impl Runtime {
             &members,
             context.round,
         ));
+        if let Some(team) = &team {
+            prompt.push_str(&crate::teams::group_rules_clause(&team.rules));
+        }
         prompt.push_str("\nOBJECTIVE\n");
         prompt.push_str(objective);
         prompt.push('\n');
@@ -1753,13 +1756,21 @@ impl Runtime {
         if ask_mode {
             prompt.push_str("- Call rag_search before answering. Cite every factual claim as [doc:<document_id> p.<page>] using only returned evidence. If evidence is insufficient, abstain.\n");
         }
+        let team = self
+            .store
+            .get_conversation_team(conversation_id)
+            .ok()
+            .flatten();
         if bot.config.name == ORCHESTRATOR_BOT {
-            if let Ok(Some(team)) = self.store.get_conversation_team(conversation_id) {
+            if let Some(team) = &team {
                 prompt.push_str(&crate::teams::orchestrator_team_clause(
                     &team.members,
                     &team.mode,
                 ));
             }
+        }
+        if let Some(team) = &team {
+            prompt.push_str(&crate::teams::group_rules_clause(&team.rules));
         }
         prompt.push_str(&format!(
             "- Current UTC date: {}.\n",
@@ -2698,6 +2709,7 @@ mod tests {
                 "room:review",
                 &["analyst".into(), "maker".into()],
                 "selected",
+                "",
             )
             .unwrap();
         runtime
@@ -2781,7 +2793,12 @@ mod tests {
             .create_conversation("room:review", "room", None)
             .unwrap();
         store
-            .set_conversation_team("room:review", &["analyst".into(), "maker".into()], "all")
+            .set_conversation_team(
+                "room:review",
+                &["analyst".into(), "maker".into()],
+                "all",
+                "",
+            )
             .unwrap();
         let task = runtime
             .submit_text("room:review", "synthetic", None)
@@ -2839,6 +2856,7 @@ mod tests {
                 "room:review",
                 &["analyst".into(), "maker".into()],
                 "selected",
+                "",
             )
             .unwrap();
         let selection = runtime

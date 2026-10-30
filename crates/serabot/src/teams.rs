@@ -202,6 +202,19 @@ pub fn orchestrator_team_clause(members: &[String], mode: &str) -> String {
     text
 }
 
+/// Owner-written group instructions. They join every turn in the room, for the
+/// orchestrator and for members alike: bounded text, never a policy override.
+pub fn group_rules_clause(rules: &str) -> String {
+    let trimmed = rules.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let bounded: String = trimmed.chars().take(4000).collect();
+    format!(
+        "\n\nGROUP INSTRUCTIONS (owner-written for this group; operating rules and approvals still apply)\n{bounded}\n"
+    )
+}
+
 /// Room-turn budget read back from the audit ledger.
 fn room_turn_messages(store: &Store, root_task_id: &str) -> Result<i64> {
     store.count_team_events(root_task_id)
@@ -746,13 +759,25 @@ mod tests {
 
     const ROOM: &str = "room:review";
 
+    #[test]
+    fn group_rules_clause_is_omitted_when_empty_and_bounded_when_long() {
+        assert!(group_rules_clause("").is_empty());
+        assert!(group_rules_clause("   \n  ").is_empty());
+        let clause = group_rules_clause("  Always cite sources.  ");
+        assert!(clause.contains("GROUP INSTRUCTIONS"));
+        assert!(clause.contains("Always cite sources."));
+        assert!(!clause.contains("  Always"), "the rule text is trimmed");
+        let long = group_rules_clause(&"x".repeat(9000));
+        assert!(long.matches('x').count() <= 4000);
+    }
+
     /// A room with a two-member team and the orchestrator task that opened the
     /// room turn.
     fn store() -> (Store, String) {
         let store = Store::open_in_memory(384).unwrap();
         store.create_conversation(ROOM, "room", None).unwrap();
         store
-            .set_conversation_team(ROOM, &["analyst".into(), "maker".into()], "selected")
+            .set_conversation_team(ROOM, &["analyst".into(), "maker".into()], "selected", "")
             .unwrap();
         let root = store
             .enqueue_task(

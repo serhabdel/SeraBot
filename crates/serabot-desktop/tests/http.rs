@@ -567,6 +567,49 @@ fn admin_rejections_keep_auth_status_and_surface_safe_messages() {
 }
 
 #[test]
+fn unarchive_and_library_use_their_routes_and_validate_responses() {
+    let hash = "0".repeat(64);
+    let (client, handle) = server(vec![
+        (200, r#"{"id":"dir:analyst","archived":false}"#.into()),
+        (
+            200,
+            format!(
+                r#"{{"artifacts":[{{"action_id":"act-1","tool":"deck_build","hash":"{hash}","filename":"deck.pdf","title":"Deck","created_at":"2026-10-29T10:00:00.000Z"}}]}}"#
+            ),
+        ),
+    ]);
+    client.unarchive_conversation("dir:analyst").unwrap();
+    let library = client.library("room:review").unwrap();
+    assert_eq!(library.len(), 1);
+    assert_eq!(library[0].filename.as_deref(), Some("deck.pdf"));
+    assert_eq!(library[0].tool, "deck_build");
+    let requests = handle.join().unwrap();
+    assert!(
+        requests[0].starts_with("POST /v1/conversations/dir:analyst/unarchive "),
+        "{}",
+        requests[0]
+    );
+    assert!(
+        requests[1].starts_with("GET /v1/conversations/room:review/library "),
+        "{}",
+        requests[1]
+    );
+}
+
+#[test]
+fn a_library_response_with_an_unshaped_hash_is_rejected() {
+    let (client, handle) = server(vec![(
+        200,
+        r#"{"artifacts":[{"action_id":"act-1","tool":"deck_build","hash":"not-a-hash","filename":null,"title":null,"created_at":"2026-10-29T10:00:00.000Z"}]}"#.into(),
+    )]);
+    assert_eq!(
+        client.library("room:review").unwrap_err(),
+        ApiError::InvalidResponse
+    );
+    handle.join().unwrap();
+}
+
+#[test]
 fn dropped_submit_response_is_unknown_and_never_resent() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = validate_endpoint(&format!("http://{}", listener.local_addr().unwrap())).unwrap();

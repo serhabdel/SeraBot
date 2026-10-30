@@ -2,8 +2,8 @@ use crate::{
     ApiClient, ApiError, Approval, ApprovalDecision, AudioUpdate, BotProfileUpdate, BotSummary,
     Catalog, ConnectorStatus, ConnectorUpdate, ConversationKind, ConversationPage,
     ConversationSummary, CreatedBot, CreatedConversation, CreatedSkill, Health, History,
-    MemoryEntry, NewProvider, ProviderStatus, Scope, Selection, SkillSummary, Task, Team, TeamMode,
-    Transcription,
+    LibraryEntry, MemoryEntry, NewProvider, ProviderStatus, Scope, Selection, SkillSummary, Task,
+    Team, TeamMode, Transcription,
 };
 use secrecy::SecretString;
 use std::sync::{
@@ -35,8 +35,10 @@ pub enum OperationKind {
     ListSkills,
     ListBots,
     ListConversations,
+    ListArchived,
     RenameConversation,
     ArchiveConversation,
+    UnarchiveConversation,
     ListMemories,
     AddMemory,
     DeleteMemory,
@@ -44,6 +46,8 @@ pub enum OperationKind {
     Connectors,
     Team,
     TeamWrite,
+    Library,
+    FetchArtifact,
     Transcribe,
     AdminWrite,
     AdminProfile,
@@ -84,11 +88,15 @@ pub enum Operation {
     ListConversations {
         include_archived: bool,
     },
+    ListArchived,
     RenameConversation {
         id: String,
         title: Zeroizing<String>,
     },
     ArchiveConversation {
+        id: String,
+    },
+    UnarchiveConversation {
         id: String,
     },
     ListMemories {
@@ -108,6 +116,11 @@ pub enum Operation {
     SetTeam {
         members: Vec<String>,
         mode: TeamMode,
+        rules: String,
+    },
+    Library,
+    FetchArtifact {
+        hash: String,
     },
     TranscribeAudio {
         filename: String,
@@ -144,8 +157,10 @@ impl Operation {
             Self::ListSkills => OperationKind::ListSkills,
             Self::ListBots => OperationKind::ListBots,
             Self::ListConversations { .. } => OperationKind::ListConversations,
+            Self::ListArchived => OperationKind::ListArchived,
             Self::RenameConversation { .. } => OperationKind::RenameConversation,
             Self::ArchiveConversation { .. } => OperationKind::ArchiveConversation,
+            Self::UnarchiveConversation { .. } => OperationKind::UnarchiveConversation,
             Self::ListMemories { .. } => OperationKind::ListMemories,
             Self::AddMemory { .. } => OperationKind::AddMemory,
             Self::DeleteMemory { .. } => OperationKind::DeleteMemory,
@@ -153,6 +168,8 @@ impl Operation {
             Self::Connectors => OperationKind::Connectors,
             Self::GetTeam => OperationKind::Team,
             Self::SetTeam { .. } => OperationKind::TeamWrite,
+            Self::Library => OperationKind::Library,
+            Self::FetchArtifact { .. } => OperationKind::FetchArtifact,
             Self::TranscribeAudio { .. } => OperationKind::Transcribe,
             Self::AdminSaveProvider(_)
             | Self::AdminRemoveProvider(_)
@@ -178,14 +195,22 @@ pub enum Reply {
     Skills(Vec<SkillSummary>),
     Bots(Vec<BotSummary>),
     Conversations(ConversationPage),
+    ArchivedConversations(ConversationPage),
     RenamedConversation(ConversationSummary),
     ArchivedConversation(String),
+    UnarchivedConversation(String),
     Memories(Vec<MemoryEntry>),
     AddedMemory(MemoryEntry),
     DeletedMemory(String),
     Providers(Vec<ProviderStatus>),
     Connectors(Vec<ConnectorStatus>),
     Team(Team),
+    Library(Vec<LibraryEntry>),
+    Artifact {
+        hash: String,
+        filename: String,
+        bytes: Vec<u8>,
+    },
     Transcribed(Transcription),
     AdminSaved,
     BotProfileSaved,
@@ -324,12 +349,18 @@ fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
         Operation::ListConversations { include_archived } => client
             .list_conversations(100, None, *include_archived)
             .map(Reply::Conversations),
+        Operation::ListArchived => client
+            .list_conversations(100, None, true)
+            .map(Reply::ArchivedConversations),
         Operation::RenameConversation { id, title } => client
             .rename_conversation(id, title)
             .map(Reply::RenamedConversation),
         Operation::ArchiveConversation { id } => client
             .archive_conversation(id)
             .map(|_| Reply::ArchivedConversation(id.clone())),
+        Operation::UnarchiveConversation { id } => client
+            .unarchive_conversation(id)
+            .map(|_| Reply::UnarchivedConversation(id.clone())),
         Operation::ListMemories { query } => {
             client.list_memories(query.as_deref()).map(Reply::Memories)
         }
@@ -346,9 +377,23 @@ fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
         Operation::Providers => client.providers().map(Reply::Providers),
         Operation::Connectors => client.connectors().map(Reply::Connectors),
         Operation::GetTeam => client.get_team(conversation).map(Reply::Team),
-        Operation::SetTeam { members, mode } => client
-            .set_team(conversation, members, *mode)
+        Operation::SetTeam {
+            members,
+            mode,
+            rules,
+        } => client
+            .set_team(conversation, members, *mode, rules)
             .map(Reply::Team),
+        Operation::Library => client.library(conversation).map(Reply::Library),
+        Operation::FetchArtifact { hash } => {
+            client
+                .artifact(hash)
+                .map(|(filename, bytes)| Reply::Artifact {
+                    hash: hash.clone(),
+                    filename,
+                    bytes,
+                })
+        }
         Operation::TranscribeAudio { filename, bytes } => client
             .transcribe_audio(filename, bytes)
             .map(Reply::Transcribed),

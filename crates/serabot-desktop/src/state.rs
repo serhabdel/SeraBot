@@ -1,7 +1,7 @@
 use crate::{
     ApiError, Approval, BotSummary, Catalog, ConnectorStatus, ConversationSummary, CreatedBot,
-    CreatedConversation, CreatedSkill, MemoryEntry, Message, ProviderStatus, Scope, Selection,
-    SkillSummary, Task, Team,
+    CreatedConversation, CreatedSkill, LibraryEntry, MemoryEntry, Message, ProviderStatus, Scope,
+    Selection, SkillSummary, Task, Team,
     worker::{OperationKind, Reply},
 };
 
@@ -27,6 +27,9 @@ pub struct State {
     pub approvals_loaded: bool,
     pub conversations: Vec<ConversationSummary>,
     pub conversations_loaded: bool,
+    /// Archived threads, loaded only when the rail expands the group.
+    pub archived: Vec<ConversationSummary>,
+    pub archived_loaded: bool,
     pub memories: Vec<MemoryEntry>,
     pub memories_loaded: bool,
     pub providers: Vec<ProviderStatus>,
@@ -39,6 +42,11 @@ pub struct State {
     pub team_loaded: bool,
     pub team_loading: bool,
     pub team_error: Option<String>,
+    /// Artifact library of the open conversation, conversation-scoped.
+    pub library: Vec<LibraryEntry>,
+    pub library_loaded: bool,
+    pub library_loading: bool,
+    pub library_error: Option<String>,
     /// Last transcript of a recorded note. Untrusted model output: it is a
     /// draft for the owner, never a sent message.
     pub transcript: Option<String>,
@@ -82,6 +90,8 @@ impl Default for State {
             approvals_loaded: false,
             conversations: Vec::new(),
             conversations_loaded: false,
+            archived: Vec::new(),
+            archived_loaded: false,
             memories: Vec::new(),
             memories_loaded: false,
             providers: Vec::new(),
@@ -92,6 +102,10 @@ impl Default for State {
             team_loaded: false,
             team_loading: false,
             team_error: None,
+            library: Vec::new(),
+            library_loaded: false,
+            library_loading: false,
+            library_error: None,
             transcript: None,
             transcript_error: None,
             transcript_loading: false,
@@ -183,6 +197,8 @@ impl State {
         self.bots_loaded = false;
         self.conversations.clear();
         self.conversations_loaded = false;
+        self.archived.clear();
+        self.archived_loaded = false;
         self.memories.clear();
         self.memories_loaded = false;
         self.providers.clear();
@@ -229,6 +245,15 @@ impl State {
             Reply::History(history) => {
                 self.messages = history.messages;
                 self.history_loaded = true;
+                // Fetching the transcript marks the thread read on the server;
+                // the badge clears locally at the same moment.
+                if let Some(conversation) = self
+                    .conversations
+                    .iter_mut()
+                    .find(|conversation| conversation.id == self.scope.conversation)
+                {
+                    conversation.unread_count = 0;
+                }
             }
             Reply::Selection(selection) => {
                 self.draft = selection.clone();
@@ -257,6 +282,14 @@ impl State {
                 self.conversations = page.conversations;
                 self.conversations_loaded = true;
             }
+            Reply::ArchivedConversations(page) => {
+                self.archived = page
+                    .conversations
+                    .into_iter()
+                    .filter(|conversation| conversation.archived_at.is_some())
+                    .collect();
+                self.archived_loaded = true;
+            }
             Reply::RenamedConversation(conversation) => {
                 match self
                     .conversations
@@ -270,6 +303,9 @@ impl State {
             Reply::ArchivedConversation(id) => {
                 self.conversations
                     .retain(|conversation| conversation.id != id);
+            }
+            Reply::UnarchivedConversation(id) => {
+                self.archived.retain(|conversation| conversation.id != id);
             }
             Reply::Memories(memories) => {
                 self.memories = memories;
@@ -304,10 +340,19 @@ impl State {
                 self.team_loading = false;
                 self.team_error = None;
             }
+            Reply::Library(entries) => {
+                self.library = entries;
+                self.library_loaded = true;
+                self.library_loading = false;
+                self.library_error = None;
+            }
             Reply::Transcribed(transcription) => {
                 self.transcript = Some(transcription.text);
                 self.transcript_error = None;
             }
+            // Bytes are intercepted by the session before they reach state;
+            // this arm only keeps the match exhaustive.
+            Reply::Artifact { .. } => {}
             Reply::AdminSaved | Reply::BotProfileSaved | Reply::AdminRestarted => {}
         }
         true
@@ -327,6 +372,7 @@ impl State {
                 | OperationKind::CreateSkill
                 | OperationKind::RenameConversation
                 | OperationKind::ArchiveConversation
+                | OperationKind::UnarchiveConversation
                 | OperationKind::AddMemory
                 | OperationKind::TeamWrite
         );
@@ -340,6 +386,7 @@ impl State {
                 OperationKind::CreateSkill => "skill create",
                 OperationKind::RenameConversation => "rename",
                 OperationKind::ArchiveConversation => "archive",
+                OperationKind::UnarchiveConversation => "unarchive",
                 OperationKind::AddMemory => "memory write",
                 OperationKind::TeamWrite => "team update",
                 _ => "model change",
@@ -364,8 +411,8 @@ mod tests {
     use super::*;
     use crate::{
         BotSummary, Catalog, ConnectorStatus, ConversationPage, ConversationSummary, CreatedBot,
-        CreatedConversation, CreatedSkill, Health, MemoryEntry, Message, ProviderStatus, Role,
-        SecretStatus, Selection, SkillSummary, Task, TaskStatus, Team, TeamMember, TeamMode,
+        CreatedConversation, CreatedSkill, Health, History, MemoryEntry, Message, ProviderStatus,
+        Role, SecretStatus, Selection, SkillSummary, Task, TaskStatus, Team, TeamMember, TeamMode,
     };
 
     fn catalog() -> Catalog {
@@ -589,8 +636,78 @@ mod tests {
             updated_at: "2026-10-29T10:05:00.000Z".into(),
             last_message_at: None,
             archived_at: None,
+            unread_count: 0,
             accepts_turns: matches!(kind, "direct" | "room"),
         }
+    }
+
+    #[test]
+    fn opening_a_thread_clears_only_that_threads_unread_badge() {
+        let mut state = State::default();
+        let mut opened = summary("dir:analyst", "direct", "Analyst");
+        opened.unread_count = 3;
+        let mut other = summary("room:review", "room", "Review");
+        other.unread_count = 2;
+        state.receive(
+            &state.scope.clone(),
+            Reply::Conversations(ConversationPage {
+                conversations: vec![opened, other],
+                next_cursor: None,
+            }),
+        );
+        state.new_scope("dir:analyst".into(), true);
+        let scope = state.scope.clone();
+        state.receive(
+            &scope,
+            Reply::History(History {
+                messages: Vec::new(),
+            }),
+        );
+        let opened = state
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == "dir:analyst")
+            .unwrap();
+        assert_eq!(opened.unread_count, 0);
+        let other = state
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == "room:review")
+            .unwrap();
+        assert_eq!(other.unread_count, 2);
+    }
+
+    #[test]
+    fn archived_keeps_only_archived_rows_and_unarchive_drops_the_row() {
+        let mut state = State::default();
+        let scope = state.scope.clone();
+        let mut archived = summary("dir:analyst", "direct", "Analyst");
+        archived.archived_at = Some("2026-10-29T11:00:00.000Z".into());
+        state.receive(
+            &scope,
+            Reply::ArchivedConversations(ConversationPage {
+                conversations: vec![archived, summary("room:review", "room", "Review")],
+                next_cursor: None,
+            }),
+        );
+        assert!(state.archived_loaded);
+        assert_eq!(state.archived.len(), 1);
+        assert_eq!(state.archived[0].id, "dir:analyst");
+        state.receive(&scope, Reply::UnarchivedConversation("dir:analyst".into()));
+        assert!(state.archived.is_empty());
+        assert!(state.fail(
+            &scope,
+            OperationKind::UnarchiveConversation,
+            ApiError::Transport
+        ));
+        assert!(state.unknown_outcome);
+        assert!(
+            state
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Unknown unarchive outcome")
+        );
     }
 
     #[test]
@@ -692,6 +809,7 @@ mod tests {
                 enabled: true,
                 live: true,
             }],
+            rules: String::new(),
         };
         state.receive(&scope, Reply::Team(team.clone()));
         assert!(state.team_loaded);

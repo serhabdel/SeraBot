@@ -58,6 +58,17 @@ Every component consumes tokens; raw colors are not allowed in component rules.
 | `--ok` | `#30d158` | `#008009` | success |
 | `--warn` | `#ffd60a` | `#b25000` | needs attention |
 
+Glass and ambient tokens (see §3.3):
+
+| Token | Dark | Light | Use |
+| --- | --- | --- | --- |
+| `--glass` | `rgba(22,22,26,.72)` | `rgba(255,255,255,.72)` | panel material |
+| `--glass-edge` | `rgba(255,255,255,.12)` | `rgba(0,0,0,.1)` | glass border |
+| `--glass-highlight` | `rgba(255,255,255,.07)` | `rgba(255,255,255,.6)` | inset lit top edge |
+| `--card-bg` | `rgba(22,22,26,.6)` | `rgba(255,255,255,.66)` | cards, composer, bubbles |
+| `--glow-1/2/3` | accent / accent-2 / ok washes | same, lighter | ambient field behind glass |
+| `--on-accent` | `#ffffff` | `#ffffff` | text on filled accent (unread badge) |
+
 Radii: `--r-xs 6px`, `--r-sm 10px`, `--r-md 14px`, `--r-lg 18px`, `--r-xl 24px`,
 `--r-pill 999px`.
 
@@ -81,20 +92,28 @@ secondary), 14px (body), 17px (title), 22px (display), 28px (hero). Titles use
 Message text renders at 14.5px with `line-height: 1.62` and preserves
 whitespace.
 
-### 3.3 Materials and depth
+### 3.3 Materials and depth — liquid glass
 
-- The sidebar and the header are **glass**: `backdrop-filter: blur(28px)
-  saturate(180%)`, a translucent `--glass` fill, and a bottom/right
-  `--hairline` border. They float above the scrolling content.
-- Cards are `--surface` with a `--hairline` border and `--shadow-1`. Hover
-  raises elevation to `--shadow-2` over `--dur-2`.
-- The composer is a floating capsule: `--r-xl` radius, `--surface` fill,
-  `--shadow-2`, inset hairline, and it sits above the message list with a
-  gradient scrim behind it so text scrolls under it.
+The console is liquid glass in both variants: an ambient colour field sits
+behind the whole shell and every panel is translucent material that blurs it.
+
+- `.app-shell` paints three radial glows (`--glow-1` top-left accent, `--glow-2`
+  bottom-right secondary accent, `--glow-3` a small ok-green wash) over `--bg`.
+  Panels blur this layer, so the glass has something to refract.
+- `.glass` (sidebar, topbar) and the inspector are `--glass` fills with
+  `backdrop-filter: blur(32px) saturate(190%)`, a `--glass-edge` border and an
+  inset `--glass-highlight` top edge — the lit rim that reads as depth.
+- Cards, the composer, and the owner's message bubbles use `--card-bg` with a
+  lighter blur (`20px`/`26px`/`16px`), `--glass-edge` borders and the same inset
+  highlight. Menus, sheets and toasts are full glass with `--shadow-2`.
 - Focus is always visible: `:focus-visible` gets a 2px `--accent` ring with a
   2px offset. Never remove the ring.
-- The light theme is a true light theme — white surfaces, `#f5f5f7` canvas,
-  dark text — not the current warm paper theme.
+- The light theme is a true light theme — white canvas, `rgba(255,255,255,.72)`
+  glass, dark text — and the dark theme keeps its near-black canvas. Both define
+  the same glass tokens (`--glass`, `--glass-edge`, `--glass-highlight`,
+  `--card-bg`, `--glow-*`, `--on-accent`); component rules never hard-code a
+  colour, so one pass themes both variants.
+- Motion respects `prefers-reduced-motion`.
 
 ### 3.4 Components
 
@@ -143,17 +162,26 @@ Three panes, macOS-style:
 └────────────┴──────────────────────────┴───────────────────────┘
 ```
 
-- **Sidebar** — glass, 260px, fixed. Top: brand mark, "New chat" primary
-  button, search field. Middle: nav list (Chat, Fleet, Memory, Approvals,
-  Providers, Connectors, Settings). Bottom: connection status chip and the
-  owner chip. On widths < 1100px the inspector collapses into a sheet; below
-  920px the sidebar becomes an overlay drawer.
-- **Topbar** — glass, sticky. Left: conversation title + kind badge + team
-  avatar stack. Right: model selector, appearance toggle, refresh.
+- **Sidebar** — glass, 260px, fixed. Top: brand mark, the "+" menu, "New chat"
+  primary button, search field. Middle: the thread list only — Bots, then
+  sections with their children, then **Groups** (room conversations) and
+  **Chats** (direct conversations), then a lazily loaded **Archived** group.
+  Rows show an unread pill counting assistant messages newer than
+  `last_read_at`; opening a thread clears it locally and server-side. There is
+  no section nav list: the bottom owner chip opens the **owner menu** (Profile
+  and settings, Bots, Memory, Approvals, Providers, Connectors, theme switch,
+  Disconnect) so the rail stays a chat list. On widths < 1100px the inspector
+  collapses into a sheet; below 920px the sidebar becomes an overlay drawer.
+- **Topbar** — glass, sticky. Left: conversation title + kind badge + member
+  avatar stack ("Group members"). Right: model selector, refresh, inspector
+  toggle, connection chip.
 - **Chat column** — max content width 760px, centered. Message list scrolls;
   composer pinned at the bottom.
-- **Inspector** — contextual: bot profile, conversation settings, team
-  management, provider details, connector details.
+- **Inspector** — tabbed for a chat: **Details**, **Library** (artifacts
+  produced inside this conversation, each with a Download action that writes to
+  the user's Downloads folder off the UI thread), and **Members** for group
+  chats (member list plus the group instructions editor). Other sections keep
+  their contextual card.
 
 ### 3.7 Chat ergonomics (Grok-like)
 
@@ -163,26 +191,40 @@ Three panes, macOS-style:
 - Each assistant message shows the bot that produced it (avatar, display name,
   role, live state). A message from a peer bot inside a group is visually
   distinct: hairline accent-left border in the bot's own hue.
-- **The "+" button** in the chat column opens a menu with: New direct chat,
-  New group, New section, New bot. It is present in the composer row and in
-  the sidebar head.
+- **The "+" button** in the chat column opens a menu with: New chat, New
+  folder, New section, New bot, New group chat. It is present in the composer
+  row and in the sidebar head.
 - Hovering a thread in the sidebar reveals inline actions (new message, rename,
-  archive) without a context menu.
-- Empty chat shows the roster of available bots and the team's roster for a
-  group, with a one-tap "add to team" action.
+  archive); archived threads get unarchive instead.
+- Empty chat shows the roster of available bots and the members for a group,
+  with a one-tap "add to group" action.
 - Long messages are never truncated; the chat column scrolls.
 - Keyboard: `Enter` sends, `Shift+Enter` newline, `Cmd/Ctrl+K` focuses search,
   `Esc` closes the topmost sheet or menu.
 
-### 3.8 Group / team UX
+### 3.8 Group chat UX
 
-- A group is created from the "+" menu: name, optional parent section, and an
-  initial team chosen from enabled bots (multi-select, 1–5).
-- The group header shows the team as an avatar stack; clicking it opens the
-  **Team sheet**: a list of members with role, live state, model, and a remove
-  action; an "Add bot" picker listing all enabled bots with search; the
-  current team is saved on change.
-- The composer in a group shows a "Talking to: <team>" chip row that can be
+Owner vocabulary: **Section**, **Chat** (one bot), **Group chat** (several
+bots). The internal kinds stay `section`, `direct`, `group` (a folder), `room`
+(a group chat); only the labels change. The rail groups the roots as *Groups*
+and *Chats*, the "+" menu offers *New chat* and *New group chat*, and the word
+"team" never reaches the owner.
+
+- A group chat is created from the "+" menu: name, optional parent section, and
+  an initial member list chosen from enabled bots (multi-select, 1–5).
+- The header shows the members as an avatar stack; clicking it opens the
+  **Group members sheet**: members with role and live state, an "Add bot"
+  picker with search, the `selected`/`all` mode, and the group instructions
+  editor. Membership changes save on click.
+- The chat inspector has three tabs: **Details**, **Library** (files produced in
+  this conversation, downloadable), and **Members** — the same member list plus
+  the instructions editor.
+- **Group instructions** are owner text (≤ 4,000 characters, no control
+  characters except newlines and tabs) scanned by the content policy before it
+  is stored. Non-empty instructions are appended to the system prompt of every
+  turn in that room — orchestrator and members alike — labelled as owner data,
+  never policy: operating rules, approvals, and the blocklist still win.
+- The composer in a group shows a "Talking to: <members>" chip row that can be
   collapsed.
 - The transcript distinguishes owner, orchestrator, and peer bot messages.
 
@@ -194,20 +236,25 @@ A conversation of kind `room:` may carry a **team**: an ordered list of 1–5 bo
 ids that participate in that room. `main` is always implicitly the orchestrator
 and is never listed as a team member.
 
-Persistence (new migration `0005_conversation_teams.sql`):
+Persistence (migration `0005_conversation_teams.sql`, extended by
+`0006_console_redesign.sql`):
 
 ```sql
 CREATE TABLE IF NOT EXISTS conversation_teams (
     conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
     members TEXT NOT NULL,
     mode TEXT NOT NULL DEFAULT 'selected',
+    rules TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
 );
 ```
 
 `members` is a JSON array of bot ids, e.g. `["analyst","maker"]`. `mode` is
 `selected` (the orchestrator chooses which members answer) or `all` (every
-member answers every owner message in the room).
+member answers every owner message in the room). `rules` is the group
+instruction text described in §3.8. Migration `0006` also adds
+`conversations.last_read_at`, which backs the unread count and is stamped when
+the console reads a thread.
 
 ### 4.2 HTTP API
 
@@ -215,19 +262,34 @@ member answers every owner message in the room).
 GET /v1/conversations/{id}/team
   200 {"conversation_id":"room:review",
        "mode":"selected",
+       "rules":"Always cite sources.",
        "members":[{"bot":"analyst","role":"specialist","enabled":true,"live":true}],
        "max_members":5}
 
 PUT /v1/conversations/{id}/team
-  body {"members":["analyst","maker","watcher"],"mode":"selected"}
+  body {"members":["analyst","maker","watcher"],"mode":"selected","rules":"..."}
   200 same shape as GET
+
+GET /v1/conversations/{id}/library
+  200 {"artifacts":[{"action_id":"act-1","tool":"deck_build","hash":"<64 hex>",
+                     "filename":"deck.pdf","title":"Deck","created_at":"..."}]}
+
+POST /v1/conversations/{id}/unarchive
+  200 {"id":"dir:analyst","archived":false}
 ```
 
 Rules: owner token required; the conversation must exist and must be of kind
 `room:` (any other kind → `400`); 1–5 unique members; every member must be an
 enabled, loaded bot other than `main`; a disabled or unknown bot → `400` with
-the offending id named; `mode` must be `selected` or `all`. Writes are audited
-as `team.member_set` with the canonical member list and mode.
+the offending id named; `mode` must be `selected` or `all`; `rules` is optional,
+at most 4,000 characters, no control characters other than tab and newlines, and
+is content-scanned before it is written. Writes are audited as
+`team.member_set` with the canonical member list, mode and rules.
+
+The library joins gateway `actions` to the conversation's turns and reads only
+each artifact's JSON sidecar for its filename and title — bytes are fetched
+separately through `GET /v1/artifacts/{hash}`, and an artifact with no sidecar
+still lists by hash.
 
 ### 4.3 Turn behaviour in a room with a team
 

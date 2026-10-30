@@ -12,7 +12,7 @@ use serabot_desktop::{
     TeamMember, TeamMode,
     audio_capture::MicRecorder,
     parse_skill_list, provider_presets,
-    session::{Section, Session, Theme},
+    session::{Section, Session, Theme, humanize_label},
     teams,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -167,17 +167,6 @@ fn stamp(raw: &str) -> String {
     raw.chars().take(16).collect::<String>().replace('T', " ")
 }
 
-const NAV: [(Section, &str, &str); 8] = [
-    (Section::Chat, "Chat", "chat"),
-    (Section::Fleet, "Fleet", "robot"),
-    (Section::Memory, "Memory", "bolt"),
-    (Section::Approvals, "Approvals", "shield"),
-    (Section::Providers, "Providers", "grid"),
-    (Section::Connectors, "Connectors", "external"),
-    (Section::Settings, "Settings", "settings"),
-    (Section::Conversations, "Threads", "list"),
-];
-
 /// Overlay surfaces that sit above the shell.
 #[derive(Clone, Copy, PartialEq)]
 enum Overlay {
@@ -188,6 +177,14 @@ enum Overlay {
     /// The guided "Add provider" sheet.
     AddProvider,
     Team,
+}
+
+/// The chat inspector panes: details, the artifact library, and group members.
+#[derive(Clone, Copy, PartialEq)]
+enum InspectorTab {
+    Details,
+    Library,
+    Members,
 }
 
 #[derive(Clone)]
@@ -336,7 +333,9 @@ fn Icon(name: String, #[props(default = 20)] size: u32) -> Element {
         "check" => "M5 13l4 4 10-10",
         "x" => "M6 6l12 12M18 6L6 18",
         "chevron-down" => "M6 9l6 6 6-6",
+        "chevron-up" => "M6 15l6-6 6 6",
         "chevron-right" => "M9 6l6 6-6 6",
+        "undo" => "M9 14l-5-5 5-5M4 9h11a5 5 0 0 1 0 10h-2",
         "dots" => "M6 12h.01M12 12h.01M18 12h.01",
         "sparkles" => {
             "M12 3l1.6 4.4L18 9l-4.4 1.6L12 15l-1.6-4.4L6 9l4.4-1.6L12 3zM18 15l.8 2.2L21 18l-2.2.8L18 21l-.8-2.2L15 18l2.2-.8L18 15z"
@@ -1162,7 +1161,7 @@ fn NewMenu(
                         overlay.set(Overlay::NewConversation);
                     },
                     Icon { name: "chat", size: 16 }
-                    "New direct chat"
+                    "New chat"
                 }
                 button {
                     class: "menu-item",
@@ -1172,7 +1171,7 @@ fn NewMenu(
                         overlay.set(Overlay::NewConversation);
                     },
                     Icon { name: "users", size: 16 }
-                    "New group"
+                    "New folder"
                 }
                 button {
                     class: "menu-item",
@@ -1205,7 +1204,7 @@ fn NewMenu(
                         overlay.set(Overlay::NewConversation);
                     },
                     Icon { name: "shield", size: 16 }
-                    "New team"
+                    "New group chat"
                 }
             }
         }
@@ -1221,8 +1220,6 @@ fn Sidebar(
 ) -> Element {
     let mut overlay = overlay;
     let mut toast = toast;
-    let section = session.read().section;
-    let theme = session.read().theme;
     let connected = session.read().state.connected;
     let mut search = use_signal(String::new);
     let mut collapsed = use_signal(HashSet::<String>::new);
@@ -1263,6 +1260,11 @@ fn Sidebar(
             if !is_collapsed {
                 for bot in bot_rows {
                     let id = format!("dir:{}", bot.id);
+                    let unread = conversations
+                        .iter()
+                        .find(|conversation| conversation.id == id)
+                        .map(|conversation| conversation.unread_count)
+                        .unwrap_or(0);
                     items.push(RailItem::Bot {
                         active: id == current,
                         id,
@@ -1271,6 +1273,7 @@ fn Sidebar(
                         avatar: state.bot_avatar(&bot.id),
                         enabled: bot.enabled,
                         live: bot.live,
+                        unread,
                     });
                 }
             }
@@ -1298,6 +1301,8 @@ fn Sidebar(
                         subtitle,
                         depth: 1,
                         active: child.id == current,
+                        unread: child.unread_count,
+                        archived: false,
                     });
                 }
                 if child.normalized_kind() == "group" {
@@ -1314,6 +1319,8 @@ fn Sidebar(
                                 subtitle,
                                 depth: 2,
                                 active: grand.id == current,
+                                unread: grand.unread_count,
+                                archived: false,
                             });
                         }
                     }
@@ -1363,9 +1370,9 @@ fn Sidebar(
                 continue;
             }
             let (key, title, added) = if is_room {
-                ("group:rooms", "Rooms", &mut rooms_added)
+                ("group:rooms", "Groups", &mut rooms_added)
             } else {
-                ("group:directs", "Direct chats", &mut directs_added)
+                ("group:directs", "Chats", &mut directs_added)
             };
             if !*added {
                 *added = true;
@@ -1385,7 +1392,33 @@ fn Sidebar(
                     subtitle,
                     depth: 0,
                     active: conversation.id == current,
+                    unread: conversation.unread_count,
+                    archived: false,
                 });
+            }
+        }
+
+        if needle.is_empty() {
+            let archived = &state.state.archived;
+            let is_collapsed = collapsed().contains("group:archived");
+            items.push(RailItem::Header {
+                key: "group:archived".to_owned(),
+                title: "Archived".into(),
+                count: archived.len(),
+                collapsed: is_collapsed,
+            });
+            if !is_collapsed {
+                for conversation in archived {
+                    items.push(RailItem::Thread {
+                        id: conversation.id.clone(),
+                        label: state.conversation_label(conversation),
+                        subtitle: state.conversation_subtitle(conversation),
+                        depth: 0,
+                        active: false,
+                        unread: 0,
+                        archived: true,
+                    });
+                }
             }
         }
         items
@@ -1416,16 +1449,6 @@ fn Sidebar(
                     oninput: move |event| search.set(event.value()),
                 }
             }
-            nav { class: "nav-list",
-                for (target, label, icon) in NAV {
-                    button {
-                        class: if section == target { "nav-item active" } else { "nav-item" },
-                        onclick: move |_| session.write().open_section(target),
-                        Icon { name: icon.to_string(), size: 16 }
-                        span { "{label}" }
-                    }
-                }
-            }
             div { class: "thread-list",
                 if !loaded {
                     div { class: "skeleton", " " }
@@ -1441,10 +1464,15 @@ fn Sidebar(
                                     class: "thread-group",
                                     onclick: move |_| {
                                         let mut set = collapsed.write();
-                                        if set.contains(&toggle) {
+                                        let opening = set.contains(&toggle);
+                                        if opening {
                                             set.remove(&toggle);
                                         } else {
                                             set.insert(toggle.clone());
+                                        }
+                                        // The first open of Archived fetches it.
+                                        if opening && toggle == "group:archived" {
+                                            session.write().load_archived();
                                         }
                                     },
                                     Icon { name: if closed { "chevron-right" } else { "chevron-down" }, size: 14 }
@@ -1453,7 +1481,7 @@ fn Sidebar(
                                 }
                             }
                         },
-                        RailItem::Bot { id, label, role, avatar, active, enabled, live } => rsx! {
+                        RailItem::Bot { id, label, role, avatar, active, enabled, live, unread } => rsx! {
                             div { key: "{id}", class: if active { "thread active" } else { "thread" },
                                 button {
                                     class: "thread-main thread-bot",
@@ -1469,6 +1497,9 @@ fn Sidebar(
                                         span { class: "thread-title", "{label}" }
                                         span { class: "thread-meta", if enabled { "{role}" } else { "{role} · disabled" } }
                                     }
+                                    if unread > 0 {
+                                        span { class: "unread-badge", "{unread}" }
+                                    }
                                 }
                                 span {
                                     class: if live { "thread-dot live" } else { "thread-dot off" },
@@ -1476,7 +1507,7 @@ fn Sidebar(
                                 }
                             }
                         },
-                        RailItem::Thread { id, label, subtitle, depth, active } => {
+                        RailItem::Thread { id, label, subtitle, depth, active, unread, archived } => {
                             let editing = renaming().as_ref().map(|(edit, _)| edit == &id).unwrap_or(false);
                             rsx! {
                                 div {
@@ -1544,38 +1575,56 @@ fn Sidebar(
                                             },
                                             span { class: "thread-title", "{label}" }
                                             span { class: "thread-meta", "{subtitle}" }
+                                            if !archived && unread > 0 {
+                                                span { class: "unread-badge", "{unread}" }
+                                            }
                                         }
                                         div { class: "thread-actions",
-                                            button {
-                                                class: "btn icon",
-                                                title: "New message",
-                                                onclick: {
-                                                    let id = id.clone();
-                                                    move |_| session.write().open_conversation(id.clone())
-                                                },
-                                                Icon { name: "chat", size: 15 }
-                                            }
-                                            button {
-                                                class: "btn icon",
-                                                title: "Rename",
-                                                onclick: {
-                                                    let id = id.clone();
-                                                    let label = label.clone();
-                                                    move |_| renaming.set(Some((id.clone(), label.clone())))
-                                                },
-                                                Icon { name: "edit", size: 15 }
-                                            }
-                                            button {
-                                                class: "btn icon",
-                                                title: "Archive",
-                                                onclick: {
-                                                    let id = id.clone();
-                                                    move |_| {
-                                                        session.write().archive_conversation(id.clone());
-                                                        toast.set(Some(("Archived.".into(), false)));
-                                                    }
-                                                },
-                                                Icon { name: "trash", size: 15 }
+                                            if archived {
+                                                button {
+                                                    class: "btn icon",
+                                                    title: "Unarchive",
+                                                    onclick: {
+                                                        let id = id.clone();
+                                                        move |_| {
+                                                            session.write().unarchive_conversation(id.clone());
+                                                            toast.set(Some(("Restored.".into(), false)));
+                                                        }
+                                                    },
+                                                    Icon { name: "undo", size: 15 }
+                                                }
+                                            } else {
+                                                button {
+                                                    class: "btn icon",
+                                                    title: "New message",
+                                                    onclick: {
+                                                        let id = id.clone();
+                                                        move |_| session.write().open_conversation(id.clone())
+                                                    },
+                                                    Icon { name: "chat", size: 15 }
+                                                }
+                                                button {
+                                                    class: "btn icon",
+                                                    title: "Rename",
+                                                    onclick: {
+                                                        let id = id.clone();
+                                                        let label = label.clone();
+                                                        move |_| renaming.set(Some((id.clone(), label.clone())))
+                                                    },
+                                                    Icon { name: "edit", size: 15 }
+                                                }
+                                                button {
+                                                    class: "btn icon",
+                                                    title: "Archive",
+                                                    onclick: {
+                                                        let id = id.clone();
+                                                        move |_| {
+                                                            session.write().archive_conversation(id.clone());
+                                                            toast.set(Some(("Archived.".into(), false)));
+                                                        }
+                                                    },
+                                                    Icon { name: "trash", size: 15 }
+                                                }
                                             }
                                         }
                                     }
@@ -1590,19 +1639,7 @@ fn Sidebar(
                     class: if connected { "chip ok" } else { "chip danger" },
                     if connected { "Connected" } else { "Offline" }
                 }
-                button {
-                    class: "icon-btn",
-                    title: if theme == Theme::Dark { "Light theme" } else { "Dark theme" },
-                    onclick: move |_| {
-                        let next = session.read().theme.toggled();
-                        session.write().set_theme(next);
-                    },
-                    Icon { name: if theme == Theme::Dark { "sun" } else { "moon" }, size: 16 }
-                }
-                div { class: "user-chip",
-                    span { class: "avatar sm user", "Y" }
-                    span { "Owner" }
-                }
+                UserMenu { session, toast }
             }
         }
     }
@@ -1623,6 +1660,7 @@ enum RailItem {
         active: bool,
         enabled: bool,
         live: bool,
+        unread: i64,
     },
     Thread {
         id: String,
@@ -1630,7 +1668,113 @@ enum RailItem {
         subtitle: String,
         depth: u8,
         active: bool,
+        unread: i64,
+        archived: bool,
     },
+}
+
+/// The owner menu behind the sidebar's user chip: sections, theme and
+/// disconnect live here so the rail stays a pure chat list.
+#[component]
+fn UserMenu(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> Element {
+    let mut session = session;
+    let mut toast = toast;
+    let mut open = use_signal(|| false);
+    let theme = session.read().theme;
+    rsx! {
+        div { class: "menu-wrap grow",
+            button {
+                class: "user-chip menu-trigger",
+                onclick: move |_| open.set(!open()),
+                span { class: "avatar sm user", "Y" }
+                span { class: "user-chip-name", "Owner" }
+                Icon { name: if open() { "chevron-down" } else { "chevron-up" }, size: 14 }
+            }
+            div {
+                class: if open() { "menu open top right" } else { "menu top right" },
+                onkeydown: move |event: KeyboardEvent| {
+                    if event.key() == Key::Escape {
+                        open.set(false);
+                    }
+                },
+                div { class: "menu-label", "Owner" }
+                button {
+                    class: "menu-item",
+                    onclick: move |_| {
+                        open.set(false);
+                        session.write().open_section(Section::Settings);
+                    },
+                    Icon { name: "settings", size: 16 }
+                    "Profile and settings"
+                }
+                button {
+                    class: "menu-item",
+                    onclick: move |_| {
+                        open.set(false);
+                        session.write().open_section(Section::Fleet);
+                    },
+                    Icon { name: "robot", size: 16 }
+                    "Bots"
+                }
+                button {
+                    class: "menu-item",
+                    onclick: move |_| {
+                        open.set(false);
+                        session.write().open_section(Section::Memory);
+                    },
+                    Icon { name: "bolt", size: 16 }
+                    "Memory"
+                }
+                button {
+                    class: "menu-item",
+                    onclick: move |_| {
+                        open.set(false);
+                        session.write().open_section(Section::Approvals);
+                    },
+                    Icon { name: "shield", size: 16 }
+                    "Approvals"
+                }
+                button {
+                    class: "menu-item",
+                    onclick: move |_| {
+                        open.set(false);
+                        session.write().open_section(Section::Providers);
+                    },
+                    Icon { name: "grid", size: 16 }
+                    "Providers"
+                }
+                button {
+                    class: "menu-item",
+                    onclick: move |_| {
+                        open.set(false);
+                        session.write().open_section(Section::Connectors);
+                    },
+                    Icon { name: "external", size: 16 }
+                    "Connectors"
+                }
+                div { class: "menu-sep" }
+                button {
+                    class: "menu-item",
+                    onclick: move |_| {
+                        let next = theme.toggled();
+                        session.write().set_theme(next);
+                    },
+                    Icon { name: if theme == Theme::Dark { "sun" } else { "moon" }, size: 16 }
+                    if theme == Theme::Dark { "Switch to light" } else { "Switch to dark" }
+                }
+                button {
+                    class: "menu-item danger",
+                    onclick: move |_| {
+                        open.set(false);
+                        session.write().disconnect();
+                        toast.set(Some(("Disconnected.".into(), false)));
+                    },
+                    Icon { name: "x", size: 16 }
+                    "Disconnect"
+                }
+            }
+        }
+    }
 }
 
 #[component]
@@ -1713,7 +1857,7 @@ fn Topbar(
                 }
                 button {
                     class: "avatar-stack",
-                    title: "Team",
+                    title: "Group members",
                     onclick: move |_| {
                         session.write().refresh_team();
                         overlay.set(Overlay::Team);
@@ -2101,11 +2245,11 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                             }
                             p { class: "empty-text",
                                 if !accepts {
-                                    "Sections and groups organize the tree. Open a direct thread or a room to talk."
+                                    "Sections and folders organize the rail. Open a chat or a group to talk."
                                 } else if is_one_to_one {
                                     "A one-to-one conversation. Replies come from {active_name}, not the orchestrator."
                                 } else {
-                                    "Ask the orchestrator, or open a room with your specialists."
+                                    "Ask the orchestrator, or open a group with your specialists."
                                 }
                             }
                             div { class: "roster",
@@ -2133,12 +2277,12 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                                             button {
                                                 class: "btn ghost sm",
                                                 disabled: !bot_enabled || in_team.contains(&bot_id),
-                                                title: if in_team.contains(&bot_id) { "Already in the team" } else { "Add to the team" },
+                                                title: if in_team.contains(&bot_id) { "Already in the group" } else { "Add to the group" },
                                                 onclick: {
                                                     let bot_id = bot_id.clone();
                                                     move |_| session.write().add_team_member(bot_id.clone())
                                                 },
-                                                "add to team"
+                                                "add to group"
                                             }
                                         }
                                     }
@@ -2213,7 +2357,7 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                                     span { class: "chip muted", "Talking to" }
                                     button {
                                         class: "icon-btn",
-                                        title: if team_collapsed() { "Show the team" } else { "Hide the team" },
+                                        title: if team_collapsed() { "Show members" } else { "Hide members" },
                                         onclick: move |_| team_collapsed.set(!team_collapsed()),
                                         Icon { name: if team_collapsed() { "chevron-right" } else { "chevron-down" }, size: 14 }
                                     }
@@ -2497,6 +2641,154 @@ fn Inspector(session: Signal<Session>, overlay: Signal<Overlay>, open: Signal<bo
         .iter()
         .find(|(id, _, _, _, _, _, _)| Some(id.clone()) == selected_bot)
         .cloned();
+    let is_room = teams::is_room(&conversation);
+    let mut tab = use_signal(|| InspectorTab::Details);
+    let library = session.read().state.library.clone();
+    let library_loaded = session.read().state.library_loaded;
+    let library_loading = session.read().state.library_loading;
+    let library_error = session.read().state.library_error.clone();
+    let downloading = session.read().downloading;
+    let rules_draft = session.read().team_rules_draft.clone();
+    let (team_members, team_loaded, team_loading) = {
+        let state = session.read();
+        let members = state
+            .state
+            .team
+            .as_ref()
+            .map(teams::member_ids)
+            .unwrap_or_default();
+        (members, state.state.team_loaded, state.state.team_loading)
+    };
+    let details_view = rsx! {
+        div { class: "card",
+            div { class: "card-head",
+                h3 { class: "card-title", "{title}" }
+                if let Some(kind) = kind.clone() {
+                    span { class: "chip muted", "{kind}" }
+                }
+            }
+            p { class: "card-sub", "{conversation}" }
+            div { class: "chips",
+                span {
+                    class: if accepts { "chip ok" } else { "chip warn" },
+                    if accepts { "accepts turns" } else { "read only" }
+                }
+            }
+        }
+    };
+    let library_view = rsx! {
+        div { class: "card",
+            div { class: "card-head",
+                h3 { class: "card-title", "Library" }
+                if library_loading || downloading {
+                    span { class: "spinner", title: "Working" }
+                }
+            }
+            if let Some(error) = library_error.clone() {
+                p { class: "hint", "{error}" }
+            }
+            if !library_loaded {
+                p { class: "hint", "The library loads with the transcript." }
+            } else if library.is_empty() {
+                p { class: "hint", "No files yet. Approved decks and documents appear here." }
+            } else {
+                div { class: "roster",
+                    for entry in library.clone() {
+                        div { key: "{entry.action_id}", class: "roster-row",
+                            div { class: "thread-copy",
+                                span { class: "thread-title",
+                                    "{entry.title.clone().or(entry.filename.clone()).unwrap_or_else(|| entry.hash.clone())}"
+                                }
+                                span { class: "thread-meta",
+                                    "{humanize_label(&entry.tool)} · {stamp(&entry.created_at)}"
+                                }
+                            }
+                            button {
+                                class: "btn icon",
+                                title: "Download to Downloads",
+                                disabled: downloading,
+                                onclick: {
+                                    let hash = entry.hash.clone();
+                                    move |_| session.write().download_artifact(hash.clone())
+                                },
+                                Icon { name: "download", size: 15 }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    let members_view = rsx! {
+        div { class: "card",
+            div { class: "card-head",
+                h3 { class: "card-title", "Members" }
+                button {
+                    class: "btn ghost sm",
+                    onclick: move |_| {
+                        session.write().refresh_team();
+                        overlay.set(Overlay::Team);
+                    },
+                    "Manage"
+                }
+            }
+            if is_room && !team_loaded && !team_loading {
+                button {
+                    class: "btn ghost sm",
+                    onclick: move |_| session.write().refresh_team(),
+                    "Load members"
+                }
+            } else if team_members.is_empty() {
+                p { class: "hint", "No members yet. Every enabled bot answers when no members are set." }
+            } else {
+                div { class: "roster",
+                    for id in team_members.clone() {
+                        {
+                            let found = roster.iter().find(|(bot, ..)| bot == &id).cloned();
+                            match found {
+                                Some((_, name, avatar, role, enabled, live, model)) => rsx! {
+                                    div { key: "{id}", class: "roster-row",
+                                        span { class: "avatar sm bot", style: avatar_style(&id), "{avatar}" }
+                                        span { class: "thread-title", "{name}" }
+                                        span { class: "thread-meta", "{role}" }
+                                        span {
+                                            class: if enabled && live { "chip ok" } else { "chip warn" },
+                                            if enabled && live { "live" } else { "offline" }
+                                        }
+                                        if let Some(model) = model {
+                                            span { class: "tiny", "{human_model(&model)}" }
+                                        }
+                                    }
+                                },
+                                None => rsx! {},
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if is_room {
+            div { class: "card",
+                div { class: "card-head",
+                    h3 { class: "card-title", "Group instructions" }
+                }
+                p { class: "hint", "Standing rules every member reads before answering in this group." }
+                textarea {
+                    class: "textarea",
+                    value: "{rules_draft}",
+                    placeholder: "For example: answer in English, cite sources, keep updates short…",
+                    oninput: move |event| session.write().team_rules_draft = event.value(),
+                }
+                div { class: "row",
+                    button {
+                        class: "btn primary sm",
+                        onclick: move |_| session.write().save_team_rules(),
+                        "Save instructions"
+                    }
+                }
+            }
+        }
+    };
     rsx! {
         aside { class: if open() { "inspector open" } else { "inspector" },
             div { class: "inspector-head",
@@ -2510,50 +2802,30 @@ fn Inspector(session: Signal<Session>, overlay: Signal<Overlay>, open: Signal<bo
             }
             div { class: "inspector-body",
                 if section == Section::Chat {
-                    div { class: "card",
-                        div { class: "card-head",
-                            h3 { class: "card-title", "{title}" }
-                            if let Some(kind) = kind.clone() {
-                                span { class: "chip muted", "{kind}" }
-                            }
+                    div { class: "inspector-tabs",
+                        button {
+                            class: if tab() == InspectorTab::Details { "tab active" } else { "tab" },
+                            onclick: move |_| tab.set(InspectorTab::Details),
+                            "Details"
                         }
-                        p { class: "card-sub", "{conversation}" }
-                        div { class: "chips",
-                            span {
-                                class: if accepts { "chip ok" } else { "chip warn" },
-                                if accepts { "accepts turns" } else { "read only" }
-                            }
+                        button {
+                            class: if tab() == InspectorTab::Library { "tab active" } else { "tab" },
+                            onclick: move |_| tab.set(InspectorTab::Library),
+                            "Library"
                         }
-                    }
-                    div { class: "card",
-                        div { class: "card-head",
-                            h3 { class: "card-title", "Roster" }
+                        if is_room {
                             button {
-                                class: "btn ghost sm",
-                                onclick: move |_| {
-                                    session.write().refresh_team();
-                                    overlay.set(Overlay::Team);
-                                },
-                                "Manage"
-                            }
-                        }
-                        div { class: "roster",
-                            for (id, name, avatar, role, enabled, live, model) in roster.clone() {
-                                div { key: "{id}", class: "roster-row",
-                                    span { class: "avatar sm bot", style: avatar_style(&id), "{avatar}" }
-                                    span { class: "thread-title", "{name}" }
-                                    span { class: "thread-meta", "{role}" }
-                                    span {
-                                        class: if enabled && live { "chip ok" } else { "chip warn" },
-                                        if enabled && live { "live" } else { "offline" }
-                                    }
-                                    if let Some(model) = model {
-                                        span { class: "tiny", "{human_model(&model)}" }
-                                    }
-                                }
+                                class: if tab() == InspectorTab::Members { "tab active" } else { "tab" },
+                                onclick: move |_| tab.set(InspectorTab::Members),
+                                "Members"
                             }
                         }
                     }
+                    {match tab() {
+                        InspectorTab::Details => details_view,
+                        InspectorTab::Library => library_view,
+                        InspectorTab::Members => members_view,
+                    }}
                 } else if section == Section::Fleet && selected_bot.is_some() {
                     div { class: "card",
                         if let Some((id, name, avatar, role, enabled, live, model)) = fleet_bot {
@@ -2656,6 +2928,7 @@ fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
     let draft_team = Team {
         conversation_id: String::new(),
         mode: TeamMode::Selected,
+        rules: String::new(),
         members: picked()
             .iter()
             .map(|bot| TeamMember {
@@ -2773,8 +3046,8 @@ fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
                 }
                 if kind == ConversationKind::Room {
                     div { class: "field",
-                        label { class: "field-label", "Initial team" }
-                        span { class: "hint", "{picked_count} of 5 bots picked. The room is created first, then its team is written in the same step." }
+                        label { class: "field-label", "Members" }
+                        span { class: "hint", "{picked_count} of 5 bots picked. The group is created first, then its members are written in the same step." }
                         div { class: "roster",
                             for (bot_id, bot_name, bot_avatar, bot_role) in members {
                                 div { key: "{bot_id}", class: "roster-row",
@@ -2783,7 +3056,7 @@ fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
                                     span { class: "thread-meta", "{bot_role}" }
                                     button {
                                         class: "team-chip remove",
-                                        title: "Remove from team",
+                                        title: "Remove from group",
                                         onclick: {
                                             let id = bot_id.clone();
                                             let team = draft_team.clone();
@@ -2830,14 +3103,14 @@ fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
                                 }
                             }
                             if candidates_empty {
-                                p { class: "hint", "No other enabled bot can join this team." }
+                                p { class: "hint", "No other enabled bot can join this group." }
                             }
                         }
                     }
                 } else if kind == ConversationKind::Group {
                     div { class: "field",
-                        label { class: "field-label", "Team" }
-                        span { class: "hint", "Only rooms carry a team. Create a room instead, then pick its members in the Team sheet." }
+                        label { class: "field-label", "Members" }
+                        span { class: "hint", "Only group chats have members. Create a group chat instead, then pick its members." }
                     }
                 }
             }
@@ -2883,6 +3156,7 @@ fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
     let mut bot_query = use_signal(String::new);
     let conversation = session.read().conversation.clone();
     let is_room = teams::is_room(&conversation);
+    let rules_draft = session.read().team_rules_draft.clone();
     let (members, available, mode, loading, error) = {
         let state = session.read();
         let team = state.state.team.clone();
@@ -2951,14 +3225,14 @@ fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                 }
             },
             div { class: "sheet-head",
-                h2 { class: "sheet-title", "Team" }
+                h2 { class: "sheet-title", "Group members" }
                 div { class: "row",
                     if loading {
-                        span { class: "spinner", title: "Loading the team" }
+                        span { class: "spinner", title: "Loading members" }
                     }
                     button {
                         class: "icon-btn",
-                        title: "Refresh the team",
+                        title: "Refresh members",
                         onclick: move |_| session.write().refresh_team(),
                         Icon { name: "refresh", size: 16 }
                     }
@@ -2971,13 +3245,13 @@ fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                 }
             }
             div { class: "sheet-body",
-                p { class: "hint", "Room: {conversation}" }
+                p { class: "hint", "Group: {conversation}" }
                 if let Some(error) = error {
                     div { class: "banner err", span { "{error}" } }
                 }
                 if !is_room {
                     div { class: "banner warn",
-                        span { "Teams are only available for rooms (room: conversations)." }
+                        span { "Members are only available in group chats (room: conversations)." }
                     }
                 }
                 if is_room {
@@ -3015,7 +3289,7 @@ fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                                     }
                                     button {
                                         class: "team-chip remove",
-                                        title: "Remove from team",
+                                        title: "Remove from group",
                                         onclick: {
                                             let id = id.clone();
                                             move |_| session.write().remove_team_member(id.clone())
@@ -3025,7 +3299,7 @@ fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                                 }
                             }
                         }
-                        span { class: "hint", "The team holds up to five enabled bots. The orchestrator is always implied." }
+                        span { class: "hint", "A group holds up to five enabled bots. The orchestrator is always implied." }
                     }
                     div { class: "field",
                         label { class: "field-label", "Add bot" }
@@ -3050,8 +3324,25 @@ fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                                 }
                             }
                             if candidates_empty {
-                                p { class: "hint", "No other enabled bot can join this team." }
+                                p { class: "hint", "No other enabled bot can join this group." }
                             }
+                        }
+                    }
+                    div { class: "field",
+                        label { class: "field-label", "Group instructions" }
+                        textarea {
+                            class: "textarea",
+                            value: "{rules_draft}",
+                            placeholder: "Standing rules every member reads before answering here…",
+                            oninput: move |event| session.write().team_rules_draft = event.value(),
+                        }
+                        div { class: "row",
+                            button {
+                                class: "btn primary sm",
+                                onclick: move |_| session.write().save_team_rules(),
+                                "Save instructions"
+                            }
+                            span { class: "hint", "Saved with the current members and mode." }
                         }
                     }
                 }

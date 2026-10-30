@@ -18,7 +18,7 @@ use crate::{
     teams, updater, valid_bot_description, valid_bot_id, valid_conversation_parent, valid_id,
     valid_new_skill_id, valid_skill_body, valid_skill_description, valid_slug, valid_text,
     valid_token, validate_team_members, validate_tool_list,
-    worker::{Credentials, Job, Operation, OperationKind, Worker},
+    worker::{Credentials, Job, Operation, OperationKind, Reply, Worker},
 };
 use secrecy::ExposeSecret;
 use std::{
@@ -315,9 +315,15 @@ pub struct Session {
     pub restarting: bool,
     pub rename: Option<RenameDraft>,
     pub archive_confirm: Option<String>,
+    /// Editable copy of the open room's group instructions; synced from the
+    /// server team and written back with the next team save.
+    pub team_rules_draft: String,
     pub update: UpdateUi,
     pub status: StatusUi,
     pub toast: Option<String>,
+    /// Artifact download in flight (worker) or file write in flight (thread).
+    pub downloading: bool,
+    download_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     pending: Option<OperationKind>,
     /// The team to write on a room that is being created right now.
     pending_team: Option<Vec<String>>,
@@ -378,9 +384,12 @@ impl Session {
             restarting: false,
             rename: None,
             archive_confirm: None,
+            team_rules_draft: String::new(),
             update: UpdateUi::default(),
             status: StatusUi::default(),
             toast: None,
+            downloading: false,
+            download_rx: None,
             pending: None,
             pending_team: None,
             pending_room_refresh: false,
@@ -634,6 +643,22 @@ impl Session {
         }
     }
 
+    /// Drain the artifact file write, if one is running.
+    fn poll_download(&mut self) {
+        let Some(receiver) = &self.download_rx else {
+            return;
+        };
+        let Ok(result) = receiver.try_recv() else {
+            return;
+        };
+        self.download_rx = None;
+        self.downloading = false;
+        match result {
+            Ok(path) => self.toast = Some(format!("Saved to {path}")),
+            Err(error) => self.toast = Some(format!("Download failed: {error}")),
+        }
+    }
+
     pub fn open_conversation(&mut self, id: String) {
         if !valid_id(&id) {
             return;
@@ -808,8 +833,8 @@ impl Session {
         }
         match conversation.normalized_kind() {
             "section" => "Section".into(),
-            "group" => "Group".into(),
-            "room" => "Room".into(),
+            "group" => "Folder".into(),
+            "room" => "Group chat".into(),
             _ => "Direct chat".into(),
         }
     }
@@ -923,6 +948,7 @@ impl Session {
         self.flush_events();
         self.poll_updates();
         self.poll_status();
+        self.poll_download();
         if let Some(at) = self.reconnect_at {
             if Instant::now() >= at {
                 self.reconnect_at = None;
@@ -1160,6 +1186,18 @@ impl Session {
                             self.state.transcript_loading = false;
                             self.state.error = None;
                         }
+                        OperationKind::Library => {
+                            // Older servers have no library route; the tab shows
+                            // its own message instead of a global banner.
+                            self.state.library_error = Some(message.clone());
+                            self.state.library_loading = false;
+                            self.state.error = None;
+                        }
+                        OperationKind::FetchArtifact => {
+                            self.toast = Some(format!("Download failed: {message}"));
+                            self.downloading = false;
+                            self.state.error = None;
+                        }
                         _ => {}
                     }
                     if !self.state.connected {
@@ -1171,6 +1209,29 @@ impl Session {
                     }
                 }
                 Ok(reply) => {
+                    if let Reply::Artifact {
+                        filename, bytes, ..
+                    } = reply
+                    {
+                        // Bytes stay off the state: they go straight to a
+                        // file-write thread and never touch the UI state.
+                        self.downloading = true;
+                        let (sender, receiver) = std::sync::mpsc::channel();
+                        self.download_rx = Some(receiver);
+                        if std::thread::Builder::new()
+                            .name("serabot-download".into())
+                            .spawn(move || {
+                                let result = save_download(&filename, &bytes);
+                                let _ = sender.send(result);
+                            })
+                            .is_err()
+                        {
+                            self.download_rx = None;
+                            self.downloading = false;
+                            self.toast = Some("Could not start the download.".into());
+                        }
+                        continue;
+                    }
                     if !self.state.receive(&completion.scope, reply) {
                         continue;
                     }
@@ -1314,6 +1375,15 @@ impl Session {
                                 );
                             }
                         }
+                        OperationKind::UnarchiveConversation => {
+                            self.schedule(
+                                Operation::ListConversations {
+                                    include_archived: false,
+                                },
+                                Duration::ZERO,
+                            );
+                            self.schedule(Operation::ListArchived, Duration::ZERO);
+                        }
                         OperationKind::AddMemory | OperationKind::DeleteMemory => {
                             if completion.kind == OperationKind::AddMemory {
                                 self.memory.content.zeroize();
@@ -1349,6 +1419,9 @@ impl Session {
                             self.schedule(Operation::GetTeam, Duration::ZERO);
                         }
                         OperationKind::Team => {
+                            if let Some(team) = &self.state.team {
+                                self.team_rules_draft = team.rules.clone();
+                            }
                             // A freshly created room is reloaded once its team
                             // has been written, so the chat opens on the room.
                             if self.pending_room_refresh {
@@ -1366,6 +1439,12 @@ impl Session {
                                 }
                                 self.composer.push_str(&text);
                             }
+                        }
+                        OperationKind::History => {
+                            // The transcript is in; the artifact library of this
+                            // conversation loads right behind it.
+                            self.state.library_loading = true;
+                            self.schedule(Operation::Library, Duration::ZERO);
                         }
                         OperationKind::AdminWrite => {
                             self.provider.api_key.zeroize();
@@ -1762,6 +1841,32 @@ impl Session {
         });
     }
 
+    /// Load archived threads for the rail's Archived group. One fetch; the
+    /// list is owner-scoped and refreshed on demand.
+    pub fn load_archived(&mut self) {
+        if self.state.archived_loaded {
+            return;
+        }
+        self.start_request(Operation::ListArchived);
+    }
+
+    /// Download one library artifact into the Downloads folder. The write runs
+    /// off the UI thread; the result lands in `toast` via `poll_download`.
+    pub fn download_artifact(&mut self, hash: String) {
+        if self.downloading {
+            self.toast = Some("A download is already running.".into());
+            return;
+        }
+        if !self.ready() {
+            self.toast = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.start_request(Operation::FetchArtifact { hash });
+        if self.pending.is_none() {
+            self.toast = Some("Could not start the download.".into());
+        }
+    }
+
     pub fn load_memories(&mut self) {
         let query = self.memory.query.trim();
         self.start_request(Operation::ListMemories {
@@ -1927,6 +2032,7 @@ impl Session {
             Operation::SetTeam {
                 members,
                 mode: TeamMode::Selected,
+                rules: String::new(),
             },
             Duration::ZERO,
         );
@@ -1947,6 +2053,10 @@ impl Session {
     pub fn archive_conversation(&mut self, id: String) {
         self.archive_confirm = Some(id.clone());
         self.start_request(Operation::ArchiveConversation { id });
+    }
+
+    pub fn unarchive_conversation(&mut self, id: String) {
+        self.start_request(Operation::UnarchiveConversation { id });
     }
 
     pub fn add_memory(&mut self) {
@@ -2015,9 +2125,14 @@ impl Session {
             .as_ref()
             .map(|team| team.mode)
             .unwrap_or(TeamMode::Selected);
+        let rules = self.team_rules_draft.clone();
         self.state.team_error = None;
         self.state.team_loading = true;
-        self.start_request(Operation::SetTeam { members, mode });
+        self.start_request(Operation::SetTeam {
+            members,
+            mode,
+            rules,
+        });
         if self.pending.is_none() {
             self.state.team_loading = false;
         }
@@ -2044,9 +2159,51 @@ impl Session {
             self.state.team_error = Some("Wait for the current request to finish.".into());
             return;
         }
+        let rules = self.team_rules_draft.clone();
         self.state.team_error = None;
         self.state.team_loading = true;
-        self.start_request(Operation::SetTeam { members, mode });
+        self.start_request(Operation::SetTeam {
+            members,
+            mode,
+            rules,
+        });
+        if self.pending.is_none() {
+            self.state.team_loading = false;
+        }
+    }
+
+    /// Save the group instructions of the open room. Members and mode are
+    /// written along unchanged; the server stores one team document.
+    pub fn save_team_rules(&mut self) {
+        if !self.team_allowed() {
+            return;
+        }
+        let Some(team) = self.state.team.clone() else {
+            self.state.team_error = Some("Load the group before saving instructions.".into());
+            return;
+        };
+        let rules = self.team_rules_draft.trim().to_owned();
+        if rules.chars().count() > 4_000
+            || rules
+                .chars()
+                .any(|c| c != '\n' && c != '\r' && c != '\t' && c.is_control())
+        {
+            self.state.team_error = Some(
+                "Instructions must be at most 4,000 characters, without control characters.".into(),
+            );
+            return;
+        }
+        if !self.ready() {
+            self.state.team_error = Some("Wait for the current request to finish.".into());
+            return;
+        }
+        self.state.team_error = None;
+        self.state.team_loading = true;
+        self.start_request(Operation::SetTeam {
+            members: teams::member_ids(&team),
+            mode: team.mode,
+            rules,
+        });
         if self.pending.is_none() {
             self.state.team_loading = false;
         }
@@ -2128,7 +2285,28 @@ impl Drop for Session {
     }
 }
 
-fn humanize_label(raw: &str) -> String {
+fn save_download(filename: &str, bytes: &[u8]) -> Result<String, String> {
+    let sanitized: String = filename
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            other => other,
+        })
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        return Err("The server sent an unusable filename.".into());
+    }
+    let home = std::env::var("USERPROFILE").map_err(|_| "No home directory is set.".to_string())?;
+    let dir = std::path::Path::new(&home).join("Downloads");
+    std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let path = dir.join(&sanitized);
+    std::fs::write(&path, bytes).map_err(|err| err.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+pub fn humanize_label(raw: &str) -> String {
     let words = raw
         .split(['-', '_', ':', '.', ' '])
         .filter(|word| !word.is_empty())

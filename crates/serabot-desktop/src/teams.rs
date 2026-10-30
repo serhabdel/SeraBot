@@ -98,6 +98,7 @@ mod tests {
             conversation_id: "room:review".into(),
             mode: TeamMode::Selected,
             members: vec![team_member("analyst", true), team_member("maker", false)],
+            rules: String::new(),
         }
     }
 
@@ -153,6 +154,7 @@ mod tests {
             conversation_id: "room:solo".into(),
             mode: TeamMode::All,
             members: vec![team_member("analyst", true)],
+            rules: String::new(),
         };
         assert_eq!(without_member(&solo, "analyst"), None);
     }
