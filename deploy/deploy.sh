@@ -55,8 +55,9 @@ cp -a /opt/serabot/serabot "$BACKUP"
 sqlite3 /var/lib/serabot/serabot.db ".backup '${DBBACKUP}'"
 
 echo "== swap + restart only serabot =="
-cp "$STAGED" /opt/serabot/serabot
-chmod 0755 /opt/serabot/serabot
+# install(1) unlinks the destination first; cp(1) fails with ETXTBSY while
+# the old binary is still running.
+install -m 0755 "$STAGED" /opt/serabot/serabot
 systemctl restart serabot
 sleep 4
 
@@ -79,7 +80,7 @@ if verify; then
 fi
 
 echo "== VERIFY FAILED: rolling back =="
-cp -a "$BACKUP" /opt/serabot/serabot
+install -m 0755 "$BACKUP" /opt/serabot/serabot
 systemctl restart serabot
 sleep 4
 systemctl is-active serabot
