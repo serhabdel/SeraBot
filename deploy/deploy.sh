@@ -31,13 +31,12 @@ systemctl is-active serabot
 df -h /
 ldd --version | head -1
 
-echo "== download release assets and verify SHA256SUMS =="
+echo "== download release binary + checksum asset and verify =="
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 curl -fsSL "${ASSET_URL}/serabot-linux-x64" -o "$TMP/serabot-linux-x64"
-curl -fsSL "${ASSET_URL}/SHA256SUMS" -o "$TMP/SHA256SUMS"
-(cd "$TMP" && sha256sum -c SHA256SUMS --ignore-missing --quiet)
-EXPECTED=$(grep 'serabot-linux-x64$' "$TMP/SHA256SUMS" | cut -d' ' -f1)
+curl -fsSL "${ASSET_URL}/serabot-linux-x64.sha256" -o "$TMP/expected.sha256"
+EXPECTED=$(tr -d '[:space:]' < "$TMP/expected.sha256")
 ACTUAL=$(sha256sum "$TMP/serabot-linux-x64" | cut -d' ' -f1)
 [ "$EXPECTED" = "$ACTUAL" ] || { echo "SHA mismatch"; exit 1; }
 

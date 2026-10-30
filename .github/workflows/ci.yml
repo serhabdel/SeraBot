@@ -74,3 +74,8 @@ jobs:
           git push origin "refs/tags/${tag}"
           gh workflow run release.yml --ref main -f tag="${tag}"
           echo "Created ${tag} and dispatched release.yml."
+          # Chain the server deploy: dispatch deploy-ovh from the TAG ref so the
+          # VPS CA broker's OIDC check (ref=refs/tags/v*) holds. The deploy job
+          # still waits in the ovh-deploy environment for the owner's approval.
+          gh workflow run deploy-ovh.yml --ref "${tag}" -f tag="${tag}"
+          echo "Dispatched deploy-ovh.yml for ${tag} (ovh-deploy approval required)."

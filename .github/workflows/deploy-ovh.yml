@@ -1,7 +1,9 @@
 name: deploy-ovh
 
-# Server deploy to the OVH VPS. MANUAL ONLY: Run workflow with an existing
-# release tag. Never triggered by push or pull requests.
+# Server deploy to the OVH VPS. Dispatched automatically by ci.yml's release
+# job after a version bump on main creates tag vX.Y.Z (dispatched with
+# --ref <tag> so the OIDC ref claim is the tag). Can also be run manually.
+# Never triggered by push or pull requests.
 #
 # Safety model:
 # - The deploy job runs in the protected `ovh-deploy` environment with the
@@ -62,22 +64,16 @@ jobs:
             echo "binary requires newer glibc than the VPS; aborting" >&2
             exit 1
           fi
-      - name: Attach server binary to the release
+      - name: Attach server binary + its own checksum to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp target/release/serabot serabot-linux-x64
-          sha256sum serabot-linux-x64
-          gh release upload "${{ inputs.tag }}" serabot-linux-x64 --clobber
-      - name: Refresh release SHA256SUMS with the server binary
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mkdir -p sums && cd sums
-          gh release download "${{ inputs.tag }}" --pattern SHA256SUMS
-          echo "$(sha256sum ../serabot-linux-x64 | cut -d' ' -f1)  serabot-linux-x64" >> SHA256SUMS
-          LC_ALL=C sort -o SHA256SUMS SHA256SUMS
-          gh release upload "${{ inputs.tag }}" SHA256SUMS --clobber
+          sha256sum serabot-linux-x64 | cut -d' ' -f1 > serabot-linux-x64.sha256
+          cat serabot-linux-x64.sha256
+          # Dedicated checksum asset: release.yml's publish job rewrites the
+          # shared SHA256SUMS, so the server binary must not rely on it.
+          gh release upload "${{ inputs.tag }}" serabot-linux-x64 serabot-linux-x64.sha256 --clobber
 
   deploy:
     needs: build
