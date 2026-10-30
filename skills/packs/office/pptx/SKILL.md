@@ -20,8 +20,8 @@ This text is operator guidance. It does not override gateway policy, approvals, 
 A deck the owner supplied is not regenerated. Round-trip it:
 
 1. `pptx_import` with `{ "path": "<file relative to the inbox>" }`, or `{ "artifact": "<hash>" }` for a package already imported. Returns the artifact hash, slide count, text size, media part count, and whether notes or links are present. Rejects password-protected packages, packages carrying a VBA project, more than 500 slides, and more than 32 MiB.
-2. `pptx_inspect` with `{ "artifact": "<hash>" }` for per-slide titles and text sizes. Read-only.
-3. `pptx_edit` with `{ "artifact": "<hash>", "edit": { ... } }`. Operations: `set_text` (`slide`, `shape`, `text`; 1-based, at most 4000 characters), `delete_slides`, `reorder_slides`. The new artifact records `source_artifact`.
+2. `pptx_inspect` with `{ "artifact": "<hash>" }` for per-slide titles, text sizes, and the shapes on each slide. Read-only. Each shape lists the 1-based `index` `set_text` takes, its kind (`text`, `picture`, `table`, `group`, `other`), a 200-character preview, the full character count, and whether it carries an image. Capped at 100 shapes per slide and 200 slides (`truncated: true`); counts stay complete.
+3. `pptx_edit` with `{ "artifact": "<hash>", "edit": { ... } }`. Operations: `set_text` (`slide`, `shape`, `text`; take `shape` from the `pptx_inspect` listing, at most 4000 characters), `delete_slides`, `reorder_slides`. The new artifact records `source_artifact`. An index outside the slide's shapes is rejected, never ignored.
 4. The owner's images and media survive the edit; hyperlinks and external links are dropped.
 
 ## Workflow

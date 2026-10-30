@@ -81,9 +81,10 @@ its hash exactly like the PDF's.
 
 `crates/serabot/src/pptx_ops.rs` adds the other direction for a package the
 owner supplied: `pptx_import` (inbox path or artifact hash), `pptx_inspect`
-(read-only), and `pptx_edit` (artifact hash plus a bounded edit spec). It is the
-only production caller of `deckcraft_pptx::import`, and `deck_build` cannot
-reach it.
+(read-only; it lists each slide's shapes with the 1-based index `set_text`
+takes, so an edit addresses a shape it has seen rather than guessing), and
+`pptx_edit` (artifact hash plus a bounded edit spec). It is the only production
+caller of `deckcraft_pptx::import`, and `deck_build` cannot reach it.
 
 The split, enforced by code and tests:
 

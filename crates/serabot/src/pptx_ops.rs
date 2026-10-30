@@ -29,7 +29,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use deckcraft_model::text::{Paragraph, Run, TextBody};
-use deckcraft_model::{Presentation, Shape, ShapeId, ShapeKind, Slide, SlideId, walk};
+use deckcraft_model::{Fill, Presentation, Shape, ShapeId, ShapeKind, Slide, SlideId, walk};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zip::ZipArchive;
@@ -63,6 +63,14 @@ const MAX_XML_PART_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TITLE_CHARS: usize = 200;
 /// Shape trees nest this deep before the walk stops (the model uses the same).
 const MAX_SHAPE_DEPTH: usize = 64;
+/// Shapes listed per slide by `pptx_inspect`. `shapes` still reports the full
+/// count, and `set_text` still accepts any index in `1..=shapes`; the cap only
+/// bounds the listing.
+const MAX_LISTED_SHAPES: usize = 100;
+/// Slides listed by `pptx_inspect`. `slide_count` still reports the full count.
+const MAX_LISTED_SLIDES: usize = 200;
+/// Shape text previews are capped; `chars` reports the full count.
+const MAX_PREVIEW_CHARS: usize = 200;
 
 fn invalid(message: impl Into<String>) -> SeraError {
     SeraError::Validation(message.into())
@@ -221,6 +229,47 @@ fn open(bytes: &[u8]) -> Result<Presentation> {
 // Inspection
 // ---------------------------------------------------------------------------
 
+/// What a listed shape is, from the point of view of `set_text`.
+///
+/// [`PptxShapeKind::Text`] is exactly the set `set_text` can address: an
+/// autoshape or a text box. A table is listed, but its cells are not editable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PptxShapeKind {
+    Text,
+    Picture,
+    Table,
+    Group,
+    Other,
+}
+
+impl std::fmt::Display for PptxShapeKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::Text => "text",
+            Self::Picture => "picture",
+            Self::Table => "table",
+            Self::Group => "group",
+            Self::Other => "other",
+        };
+        formatter.write_str(label)
+    }
+}
+
+/// One shape on a slide, addressed exactly the way `set_text` addresses it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PptxShapeInfo {
+    /// 1-based depth-first index; pass this value as `set_text.shape`.
+    pub index: usize,
+    pub kind: PptxShapeKind,
+    /// Text preview, at most 200 characters.
+    pub text: String,
+    /// Full character count of the shape's text; 0 when it has none.
+    pub chars: usize,
+    /// True when the shape is a picture or is filled with one.
+    pub has_image: bool,
+}
+
 /// One slide as reported by [`inspect`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PptxSlideInfo {
@@ -231,10 +280,16 @@ pub struct PptxSlideInfo {
     pub title: String,
     /// Characters of slide text (shapes and table cells); notes are excluded.
     pub text_chars: usize,
+    /// The full shape count. `shape_list` is capped, this is not.
     pub shapes: usize,
     pub pictures: usize,
     pub has_notes: bool,
     pub has_links: bool,
+    /// The shapes on this slide in the order `set_text` addresses them, capped
+    /// at 100 entries. `set_text` accepts any index in `1..=shapes`.
+    pub shape_list: Vec<PptxShapeInfo>,
+    /// True when `shape_list` was capped.
+    pub truncated: bool,
 }
 
 /// Bounded structural summary of a package.
@@ -250,6 +305,56 @@ pub struct PptxInfo {
     pub linked_media: usize,
     pub has_notes: bool,
     pub has_links: bool,
+    /// True when the slide list or any per-slide shape list was capped. The
+    /// counts above are always complete.
+    pub truncated: bool,
+}
+
+/// The addressing `set_text` accepts: 1-based depth-first order over the
+/// slide's shape tree.
+///
+/// `inspect` lists shapes through this same function, so a listed index is by
+/// construction the index an edit takes. There is no second traversal to drift.
+fn ordered_shapes(slide: &Slide) -> Vec<&Shape> {
+    let mut shapes = Vec::new();
+    walk(&slide.shapes, &mut |shape, _| shapes.push(shape));
+    shapes
+}
+
+fn shape_kind(shape: &Shape) -> PptxShapeKind {
+    match &shape.kind {
+        ShapeKind::Shape => PptxShapeKind::Text,
+        ShapeKind::Picture { .. } => PptxShapeKind::Picture,
+        ShapeKind::Table(_) => PptxShapeKind::Table,
+        ShapeKind::Group { .. } => PptxShapeKind::Group,
+        _ => PptxShapeKind::Other,
+    }
+}
+
+fn carries_image(shape: &Shape) -> bool {
+    matches!(&shape.kind, ShapeKind::Picture { .. })
+        || matches!(&shape.fill, Some(Fill::Picture(_)))
+}
+
+/// A one-line, control-character-free preview of a shape's text.
+fn preview(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_chars(&flat, MAX_PREVIEW_CHARS)
+}
+
+fn shape_info(index: usize, shape: &Shape) -> PptxShapeInfo {
+    PptxShapeInfo {
+        index,
+        kind: shape_kind(shape),
+        text: shape
+            .text
+            .as_ref()
+            .map(TextBody::text)
+            .map(|text| preview(&text))
+            .unwrap_or_default(),
+        chars: shape.text.as_ref().map(TextBody::char_len).unwrap_or(0),
+        has_image: carries_image(shape),
+    }
 }
 
 struct SlideFacts {
@@ -267,15 +372,14 @@ fn body_links(body: &TextBody) -> usize {
         .count()
 }
 
-fn slide_facts(slide: &Slide) -> SlideFacts {
+fn slide_facts(shapes: &[&Shape]) -> SlideFacts {
     let mut facts = SlideFacts {
         text_chars: 0,
-        shapes: 0,
+        shapes: shapes.len(),
         pictures: 0,
         links: 0,
     };
-    walk(&slide.shapes, &mut |shape, _| {
-        facts.shapes += 1;
+    for shape in shapes {
         if matches!(&shape.kind, ShapeKind::Picture { .. }) {
             facts.pictures += 1;
         }
@@ -294,7 +398,7 @@ fn slide_facts(slide: &Slide) -> SlideFacts {
                 }
             }
         }
-    });
+    }
     facts
 }
 
@@ -326,30 +430,47 @@ fn slide_title(slide: &Slide) -> String {
 fn inspect(presentation: &Presentation) -> PptxInfo {
     let mut info = PptxInfo {
         slide_count: presentation.slides.len(),
-        slides: Vec::with_capacity(presentation.slides.len()),
+        slides: Vec::with_capacity(presentation.slides.len().min(MAX_LISTED_SLIDES)),
         text_chars: 0,
         shapes: 0,
         media_parts: 0,
         linked_media: 0,
         has_notes: false,
         has_links: false,
+        truncated: false,
     };
     for (index, slide) in presentation.slides.iter().enumerate() {
-        let facts = slide_facts(slide);
+        let ordered = ordered_shapes(slide);
+        let facts = slide_facts(&ordered);
         let has_notes = !slide.notes.is_empty();
         let has_links = facts.links > 0;
         info.text_chars += facts.text_chars;
         info.shapes += facts.shapes;
         info.has_notes |= has_notes;
         info.has_links |= has_links;
+        if index >= MAX_LISTED_SLIDES {
+            info.truncated = true;
+            continue;
+        }
+        let listed = ordered.len().min(MAX_LISTED_SHAPES);
+        let shape_list = ordered
+            .iter()
+            .take(listed)
+            .enumerate()
+            .map(|(position, shape)| shape_info(position + 1, shape))
+            .collect();
+        let truncated = ordered.len() > listed;
+        info.truncated |= truncated;
         info.slides.push(PptxSlideInfo {
             slide: index + 1,
             title: slide_title(slide),
             text_chars: facts.text_chars,
-            shapes: facts.shapes,
+            shapes: ordered.len(),
             pictures: facts.pictures,
             has_notes,
             has_links,
+            shape_list,
+            truncated,
         });
     }
     for media in &presentation.media {
@@ -369,11 +490,18 @@ fn summarize(bytes: &[u8]) -> Result<PptxInfo> {
     Ok(inspect(&presentation))
 }
 
-/// Human-readable summary, with the per-slide listing capped so a 500-slide
-/// package cannot flood the model's context. The complete list stays in the
-/// tool's structured data.
+/// Human-readable summary.
+///
+/// This is the text the model actually reads, so it carries the shape indices
+/// `pptx_edit` consumes. The listing is capped three ways — slides, shapes per
+/// slide, and total shape lines — so a large package cannot flood the context.
+/// The complete listing stays in the tool's structured data, and the counts in
+/// the header are always complete.
 fn info_content(info: &PptxInfo) -> String {
-    const MAX_LISTED_SLIDES: usize = 60;
+    const MAX_CONTENT_SLIDES: usize = 60;
+    const MAX_CONTENT_SHAPES: usize = 40;
+    const MAX_CONTENT_SHAPE_LINES: usize = 300;
+
     let mut out = format!(
         "slides: {}\ntext characters: {}\nshapes: {}\nmedia parts: {}\nlinked media: {}\nnotes: {}\nlinks: {}\n",
         info.slide_count,
@@ -384,7 +512,13 @@ fn info_content(info: &PptxInfo) -> String {
         info.has_notes,
         info.has_links
     );
-    for slide in info.slides.iter().take(MAX_LISTED_SLIDES) {
+    if info.truncated {
+        out.push_str(
+            "truncated: true (the listing below is partial; the counts above are complete)\n",
+        );
+    }
+    let mut lines = 0usize;
+    for slide in info.slides.iter().take(MAX_CONTENT_SLIDES) {
         out.push_str(&format!(
             "slide {}: {} ({} chars, {} shapes, {} pictures, notes: {}, links: {})\n",
             slide.slide,
@@ -395,11 +529,37 @@ fn info_content(info: &PptxInfo) -> String {
             slide.has_notes,
             slide.has_links
         ));
+        let mut printed = 0usize;
+        for shape in slide.shape_list.iter().take(MAX_CONTENT_SHAPES) {
+            if lines >= MAX_CONTENT_SHAPE_LINES {
+                out.push_str("  ... shape listing stopped at the reply budget\n");
+                return out;
+            }
+            out.push_str(&format!(
+                "  shape {}: {} ({} chars)",
+                shape.index, shape.kind, shape.chars
+            ));
+            if shape.has_image {
+                out.push_str(" [image]");
+            }
+            if !shape.text.is_empty() {
+                out.push_str(&format!(" \"{}\"", shape.text));
+            }
+            out.push('\n');
+            printed += 1;
+            lines += 1;
+        }
+        if printed < slide.shapes {
+            out.push_str(&format!(
+                "  ... {} more shape(s) not listed\n",
+                slide.shapes - printed
+            ));
+        }
     }
-    if info.slides.len() > MAX_LISTED_SLIDES {
+    if info.slides.len() > MAX_CONTENT_SLIDES {
         out.push_str(&format!(
-            "... {} more slide(s)\n",
-            info.slides.len() - MAX_LISTED_SLIDES
+            "... {} more slide(s) not listed\n",
+            info.slides.len() - MAX_CONTENT_SLIDES
         ));
     }
     out
@@ -431,7 +591,8 @@ pub struct PptxEdit {
 pub struct SetText {
     /// 1-based slide number.
     pub slide: u32,
-    /// 1-based shape index in depth-first order on that slide.
+    /// 1-based shape index in depth-first order on that slide. This is the
+    /// `index` `pptx_inspect` lists for the shape.
     pub shape: u32,
     /// Replacement text, at most [`MAX_TEXT_CHARS`] characters.
     pub text: String,
@@ -488,6 +649,10 @@ struct TextTarget {
 
 /// Resolve one `set_text` operation, checking the index and that the shape can
 /// hold text. Nothing is mutated.
+///
+/// The index is resolved through [`ordered_shapes`], the same function
+/// `inspect` lists shapes with, so a listed index always addresses the shape it
+/// was listed for.
 fn text_target(presentation: &Presentation, operation: &SetText) -> Result<TextTarget> {
     let total = presentation.slides.len();
     check_slide(operation.slide, total)?;
@@ -496,34 +661,28 @@ fn text_target(presentation: &Presentation, operation: &SetText) -> Result<TextT
         .slides
         .get(index)
         .ok_or_else(|| invalid(format!("slide {} is out of range", operation.slide)))?;
-    let mut ids = Vec::new();
-    walk(&slide.shapes, &mut |shape, _| ids.push(shape.id));
+    let ordered = ordered_shapes(slide);
     let position = operation
         .shape
         .checked_sub(1)
         .ok_or_else(|| invalid("shape 0 is out of range"))? as usize;
-    let count = ids.len();
-    let id = *ids.get(position).ok_or_else(|| {
+    let count = ordered.len();
+    let shape = *ordered.get(position).ok_or_else(|| {
         invalid(format!(
             "shape {} is outside 1..={count} on slide {}",
             operation.shape, operation.slide
         ))
     })?;
-    let shape = slide.shape(id).ok_or_else(|| {
-        invalid(format!(
-            "shape {} is missing from its slide",
-            operation.shape
-        ))
-    })?;
-    if shape.text.is_none() && !matches!(&shape.kind, ShapeKind::Shape) {
+    let kind = shape_kind(shape);
+    if kind != PptxShapeKind::Text {
         return Err(invalid(format!(
-            "shape {} on slide {} has no text body and is not a text shape",
+            "shape {} on slide {} is a {kind} and has no text body; set_text only addresses text shapes",
             operation.shape, operation.slide
         )));
     }
     Ok(TextTarget {
         slide: index,
-        shape: id,
+        shape: shape.id,
         text: operation.text.clone(),
     })
 }
@@ -975,8 +1134,12 @@ impl Tool for PptxInspectTool {
             name: "pptx_inspect".into(),
             description:
                 "Read-only summary of a stored .pptx: slide count, per-slide title text and text \
-                 character count, image/media part count, and whether notes or links are present. \
-                 It never renders or extracts the package."
+                 character count, image/media part count, whether notes or links are present, and \
+                 the shapes on each slide with the 1-based index that pptx_edit set_text takes. Each \
+                 listed shape reports its kind (text, picture, table, group, other), a 200-character \
+                 text preview, its full character count, and whether it carries an image. The listing \
+                 is capped at 100 shapes per slide and 200 slides with a truncated flag; the counts \
+                 are always complete. It never renders or extracts the package."
                     .into(),
             parameters: json!({
                 "type": "object",
@@ -1035,8 +1198,10 @@ impl Tool for PptxEditTool {
                 "Apply a bounded edit to a stored .pptx and store the result as a new artifact whose \
                  source_artifact is the input. Operations: set_text (replace one shape's text), \
                  delete_slides, and reorder_slides. Slide and shape indices are 1-based and refer to \
-                 the input deck; every index is validated before anything is written. Images and \
-                 other media parts are preserved; hyperlinks and external links are dropped."
+                 the input deck; take `shape` from the index pptx_inspect lists for that slide. Every \
+                 index is validated before anything is written, and an index outside the slide's \
+                 shapes is rejected. Images and other media parts are preserved; hyperlinks and \
+                 external links are dropped."
                     .into(),
             parameters: json!({
                 "type": "object",
@@ -1053,7 +1218,7 @@ impl Tool for PptxEditTool {
                                     "type": "object",
                                     "properties": {
                                         "slide": {"type": "integer", "description": "1-based slide number"},
-                                        "shape": {"type": "integer", "description": "1-based shape index in depth-first order"},
+                                        "shape": {"type": "integer", "description": "1-based shape index, taken from pptx_inspect"},
                                         "text": {"type": "string", "description": "Replacement text, max 4000 characters"}
                                     },
                                     "required": ["slide", "shape", "text"],
@@ -1260,8 +1425,14 @@ mod tests {
         presentation.slides.push(Arc::new(picture_slide));
 
         let mut third = defaults::new_slide(&mut presentation, blank).unwrap();
-        let shape = text_shape(&mut presentation, "Third", "Third slide");
-        third.shapes.push(shape);
+        for (name, text) in [
+            ("Third", "Third slide"),
+            ("Alpha", "Alpha body"),
+            ("Beta", "Beta body"),
+        ] {
+            let shape = text_shape(&mut presentation, name, text);
+            third.shapes.push(shape);
+        }
         presentation.slides.push(Arc::new(third));
 
         presentation
@@ -1347,6 +1518,197 @@ mod tests {
             .map(|body| body.text())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The text of every shape on one slide (1-based), in shape order.
+    fn texts_on(presentation: &Presentation, slide: usize) -> Vec<String> {
+        slide
+            .checked_sub(1)
+            .and_then(|index| presentation.slides.get(index))
+            .map(|slide| {
+                slide
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| shape.text.as_ref())
+                    .map(|body| body.text())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    async fn inspect_data(harness: &Harness, source: &str) -> serde_json::Value {
+        PptxInspectTool::new(harness.artifacts.clone())
+            .execute(json!({"artifact": source}), &context())
+            .await
+            .unwrap()
+            .data
+            .unwrap()
+    }
+
+    fn stored_count(harness: &Harness) -> usize {
+        std::fs::read_dir(harness.dir.path().join("artifacts"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .count()
+    }
+
+    /// The defect this guards: `inspect` must publish the addressing `set_text`
+    /// consumes, so an edit is never a guess.
+    #[tokio::test]
+    async fn inspect_indices_address_the_shapes_edit_changes() {
+        let harness = harness();
+        let source = imported(&harness, "deck.pptx", &exported()).await;
+
+        let report = PptxInspectTool::new(harness.artifacts.clone())
+            .execute(json!({"artifact": source}), &context())
+            .await
+            .unwrap();
+        let content = report.content.clone();
+        let data = report.data.unwrap();
+
+        let slide = &data["slides"][2];
+        assert_eq!(slide["slide"], 3);
+        assert_eq!(slide["shapes"], 3);
+        assert_eq!(slide["truncated"], false);
+        let listed = slide["shape_list"].as_array().unwrap();
+        assert_eq!(listed.len(), 3);
+
+        // Find the shape by its text, exactly as a model would, and take the
+        // index the listing reports for it.
+        let target = listed
+            .iter()
+            .find(|shape| shape["text"] == "Beta body")
+            .expect("Beta body is listed");
+        assert_eq!(target["kind"], "text");
+        assert_eq!(target["chars"], 9);
+        assert_eq!(target["has_image"], false);
+        let index = target["index"].as_u64().unwrap();
+        assert_eq!(index, 3, "depth-first order: Third, Alpha, Beta");
+
+        // The content string the model reads carries the same index and text.
+        assert!(
+            content.contains("shape 3: text (9 chars) \"Beta body\""),
+            "{content}"
+        );
+
+        let edit = PptxEditTool::new(harness.artifacts.clone(), harness.store.clone());
+        let edited = edit
+            .execute(
+                json!({
+                    "artifact": source,
+                    "edit": {"set_text": [{"slide": 3, "shape": index, "text": "Beta body edited"}]}
+                }),
+                &context(),
+            )
+            .await
+            .unwrap();
+
+        let stored = harness
+            .artifacts
+            .load(edited.artifact_hash.as_ref().unwrap())
+            .unwrap();
+        let reopened = deckcraft_pptx::import(&stored.bytes).unwrap();
+        assert_eq!(
+            texts_on(&reopened, 3),
+            vec!["Third slide", "Alpha body", "Beta body edited"],
+            "only the addressed shape changed"
+        );
+        // Nothing on the other slides moved.
+        assert_eq!(
+            texts_on(&reopened, 1).first().map(String::as_str),
+            Some("Original title")
+        );
+        assert_eq!(texts_on(&reopened, 2), vec!["North report"]);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_shape_index_beyond_the_slide() {
+        let harness = harness();
+        let source = imported(&harness, "deck.pptx", &exported()).await;
+        let data = inspect_data(&harness, &source).await;
+        let count = data["slides"][2]["shapes"].as_u64().unwrap();
+        assert_eq!(count, 3);
+
+        let edit = PptxEditTool::new(harness.artifacts.clone(), harness.store.clone());
+        for shape in [0u64, count + 1, count + 99] {
+            let error = edit
+                .execute(
+                    json!({
+                        "artifact": source,
+                        "edit": {"set_text": [{"slide": 3, "shape": shape, "text": "x"}]}
+                    }),
+                    &context(),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("shape"), "shape {shape}: {error}");
+        }
+        // A rejected edit stores nothing.
+        assert_eq!(stored_count(&harness), 1);
+    }
+
+    /// The listing is capped; the addressing is not. A shape past the cap is
+    /// still addressable by its real index, and the flag says the list is short.
+    #[tokio::test]
+    async fn a_capped_shape_list_still_addresses_every_shape() {
+        let mut presentation = defaults::new_presentation(None);
+        let blank = defaults::layout_of_kind(&presentation, LayoutType::Blank).unwrap();
+        let mut slide = defaults::new_slide(&mut presentation, blank).unwrap();
+        for index in 1..=MAX_LISTED_SHAPES + 1 {
+            let shape = text_shape(
+                &mut presentation,
+                &format!("S{index}"),
+                &format!("Shape {index}"),
+            );
+            slide.shapes.push(shape);
+        }
+        presentation.slides.push(Arc::new(slide));
+        let bytes = deckcraft_pptx::export(&presentation).unwrap();
+
+        let harness = harness();
+        let source = imported(&harness, "big.pptx", &bytes).await;
+        let data = inspect_data(&harness, &source).await;
+        let slide_info = &data["slides"][1];
+        assert_eq!(slide_info["shapes"], MAX_LISTED_SHAPES + 1);
+        assert_eq!(
+            slide_info["shape_list"].as_array().unwrap().len(),
+            MAX_LISTED_SHAPES
+        );
+        assert_eq!(slide_info["truncated"], true);
+        assert_eq!(data["truncated"], true);
+
+        let report = PptxInspectTool::new(harness.artifacts.clone())
+            .execute(json!({"artifact": source}), &context())
+            .await
+            .unwrap();
+        assert!(
+            report.content.contains("more shape(s) not listed"),
+            "{}",
+            report.content
+        );
+
+        let edit = PptxEditTool::new(harness.artifacts.clone(), harness.store.clone());
+        let edited = edit
+            .execute(
+                json!({
+                    "artifact": source,
+                    "edit": {"set_text": [{"slide": 2, "shape": MAX_LISTED_SHAPES + 1, "text": "Last shape edited"}]}
+                }),
+                &context(),
+            )
+            .await
+            .unwrap();
+        let stored = harness
+            .artifacts
+            .load(edited.artifact_hash.as_ref().unwrap())
+            .unwrap();
+        let reopened = deckcraft_pptx::import(&stored.bytes).unwrap();
+        let texts = texts_on(&reopened, 2);
+        assert_eq!(texts.len(), MAX_LISTED_SHAPES + 1);
+        assert_eq!(texts.last().map(String::as_str), Some("Last shape edited"));
+        assert_eq!(texts.first().map(String::as_str), Some("Shape 1"));
     }
 
     #[tokio::test]
