@@ -88,7 +88,8 @@ pub fn render_deck_pptx(spec: &DeckSpec, brand: &Brand, max_pages: usize) -> Res
         .ok_or_else(|| SeraError::Internal("deckcraft presentation has no layout".into()))?;
 
     for (index, plan) in plans.iter().enumerate() {
-        let mut slide = defaults::new_slide(&mut presentation, layout);
+        let mut slide = defaults::new_slide(&mut presentation, layout)
+            .ok_or_else(|| SeraError::Internal("deckcraft could not add a slide".into()))?;
         slide.name = format!("Slide {}", index + 1);
         // Every page is drawn from scratch on the blank layout, so inherited
         // master placeholder prompts must not leak into the package.
@@ -353,7 +354,7 @@ fn text_body(paragraphs: Vec<Paragraph>, style: TextStyle) -> TextBody {
             anchor: Some(style.anchor),
             wrap: Some(true),
             autofit: Some(AutoFit::Shrink {
-                font_scale: 1.0,
+                font_scale: Some(1.0),
                 line_reduction: 0.0,
             }),
             ..Default::default()

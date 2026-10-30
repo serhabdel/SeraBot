@@ -477,6 +477,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.path(&config.documents.watch_dir),
     )?)?;
     registry.register(TimesheetTool)?;
+    serabot::tools::register_workbook_tools(&mut registry, artifacts.clone(), store.clone())?;
     registry.register(DocumentIndexTool::new(
         store.clone(),
         embedder.clone(),

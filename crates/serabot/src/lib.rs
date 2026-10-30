@@ -45,3 +45,4 @@ pub mod tools;
 pub mod util;
 pub mod watcher;
 pub mod web;
+pub mod workbooks;
