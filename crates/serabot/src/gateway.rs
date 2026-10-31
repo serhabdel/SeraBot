@@ -24,6 +24,12 @@ pub struct ToolSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolContext {
+    /// The acting user's id — the authoritative scope for every user-owned
+    /// row this context touches (phase 2). Never model-controlled.
+    pub user_id: String,
+    /// Audit actor string, kept for the audit ledger's backward-compatible
+    /// readers; it mirrors `user_id` ("system" appears only for maintenance
+    /// paths that have no acting user).
     pub actor: String,
     pub bot: String,
     pub task_id: Option<Id>,
@@ -251,6 +257,7 @@ impl Gateway {
             None => ApprovalDetails::default(),
         };
         if self.store.matching_grant(
+            &context.user_id,
             &spec.name,
             hash,
             details.destination.as_deref(),
@@ -294,6 +301,7 @@ impl Gateway {
             details.summary = format!("{}\nPayload withheld by content policy", details.summary);
         }
         let action = self.store.create_action(
+            &context.user_id,
             &spec.name,
             context.task_id.as_deref(),
             context.turn_id.as_deref(),
@@ -304,6 +312,7 @@ impl Gateway {
             self.policy.version(),
         )?;
         let approval = self.store.create_approval(
+            &context.user_id,
             &action.id,
             &spec.name,
             &truncate_chars(&details.summary, 1000),
@@ -362,7 +371,7 @@ impl Gateway {
         action_id: &str,
         context: &ToolContext,
     ) -> Result<ToolOutcome> {
-        let action = self.store.get_action(action_id)?;
+        let action = self.store.get_action(&context.user_id, action_id)?;
         if action.status != "approved" {
             return Err(SeraError::InvalidState(format!(
                 "action {action_id} is not approved (status: {})",
@@ -370,7 +379,8 @@ impl Gateway {
             )));
         }
         if action.policy_version != self.policy.version() {
-            self.store.update_action(action_id, "invalidated", None)?;
+            self.store
+                .update_action(&context.user_id, action_id, "invalidated", None)?;
             self.store.record_audit(
                 &context.actor,
                 "approval.invalidated_by_policy",
@@ -385,7 +395,7 @@ impl Gateway {
         }
         if !self
             .store
-            .transition_action(action_id, "approved", "dispatching")?
+            .transition_action(&context.user_id, action_id, "approved", "dispatching")?
         {
             return Err(SeraError::InvalidState(
                 "approval was already consumed".into(),
@@ -393,7 +403,8 @@ impl Gateway {
         }
         let args: Value = serde_json::from_str(&action.canonical_args)?;
         if canonical_hash(&args)? != action.canonical_hash {
-            self.store.update_action(action_id, "invalidated", None)?;
+            self.store
+                .update_action(&context.user_id, action_id, "invalidated", None)?;
             return Err(SeraError::InvalidState(
                 "approved action arguments changed".into(),
             ));
@@ -414,6 +425,7 @@ impl Gateway {
             .ok_or_else(|| SeraError::NotFound(format!("tool {}", action.tool)))?;
         if !context.allowed_tools.contains(&action.tool) {
             self.store.update_action(
+                &context.user_id,
                 action_id,
                 "failed",
                 Some(&serde_json::json!({"error": "tool no longer allowlisted"})),
@@ -429,6 +441,7 @@ impl Gateway {
         match output {
             Ok(value) => {
                 self.store.update_action(
+                    &context.user_id,
                     action_id,
                     "executed",
                     Some(&serde_json::json!({
@@ -450,6 +463,7 @@ impl Gateway {
             }
             Err(error) => {
                 self.store.update_action(
+                    &context.user_id,
                     action_id,
                     if is_ambiguous(&error) {
                         "outcome_unknown"
@@ -542,9 +556,23 @@ impl Gateway {
         }
     }
 
-    pub fn decide(&self, approval_id: &str, decision: Decision) -> Result<DecisionResult> {
-        let approval = self.store.get_approval(approval_id)?;
-        let action = self.store.get_action(&approval.action_id)?;
+    /// Apply an approval decision for the acting user.
+    ///
+    /// The decision resolves within the acting user's rows (phase 2): reads
+    /// and writes are scoped by `acting_user_id`, so a user can only decide
+    /// approvals recorded under their own id — another user's approval is
+    /// indistinguishable from an unknown one. Phase 5 completes the
+    /// decide-scope rules; the scoped reads already give the spec's target
+    /// semantics (members approve their own actions) without weakening
+    /// anything.
+    pub fn decide(
+        &self,
+        acting_user_id: &str,
+        approval_id: &str,
+        decision: Decision,
+    ) -> Result<DecisionResult> {
+        let approval = self.store.get_approval(acting_user_id, approval_id)?;
+        let action = self.store.get_action(acting_user_id, &approval.action_id)?;
         if approval.state != ApprovalState::Pending.as_str() {
             return Err(SeraError::InvalidState(format!(
                 "approval is {}",
@@ -553,6 +581,7 @@ impl Gateway {
         }
         if action.policy_version != self.policy.version() {
             self.store.transition_approval(
+                acting_user_id,
                 approval_id,
                 ApprovalState::Invalidated.as_str(),
                 None,
@@ -563,6 +592,7 @@ impl Gateway {
         match decision {
             Decision::Deny => {
                 if !self.store.transition_approval(
+                    acting_user_id,
                     approval_id,
                     ApprovalState::Denied.as_str(),
                     None,
@@ -570,9 +600,10 @@ impl Gateway {
                 )? {
                     return Err(SeraError::InvalidState("approval already decided".into()));
                 }
-                self.store.update_action(&action.id, "denied", None)?;
+                self.store
+                    .update_action(acting_user_id, &action.id, "denied", None)?;
                 self.store.record_audit(
-                    &self.actor,
+                    acting_user_id,
                     "approval.denied",
                     Some(&action.tool),
                     None,
@@ -582,8 +613,8 @@ impl Gateway {
                     None,
                 )?;
                 Ok(DecisionResult {
-                    approval: self.store.get_approval(approval_id)?,
-                    action: self.store.get_action(&action.id)?,
+                    approval: self.store.get_approval(acting_user_id, approval_id)?,
+                    action: self.store.get_action(acting_user_id, &action.id)?,
                     resume_task: false,
                 })
             }
@@ -594,6 +625,7 @@ impl Gateway {
                     ApprovalState::ApprovedAlways
                 };
                 if !self.store.transition_approval(
+                    acting_user_id,
                     approval_id,
                     state.as_str(),
                     Some("exact_payload"),
@@ -603,6 +635,7 @@ impl Gateway {
                 }
                 if decision == Decision::Always {
                     self.store.insert_grant(
+                        acting_user_id,
                         &action.tool,
                         &action.canonical_hash,
                         action.destination.as_deref(),
@@ -610,10 +643,14 @@ impl Gateway {
                         approval_id,
                     )?;
                 }
-                self.store
-                    .transition_action(&action.id, "pending_approval", "approved")?;
+                self.store.transition_action(
+                    acting_user_id,
+                    &action.id,
+                    "pending_approval",
+                    "approved",
+                )?;
                 self.store.record_audit(
-                    &self.actor,
+                    acting_user_id,
                     "approval.approved",
                     Some(&action.tool),
                     None,
@@ -626,8 +663,8 @@ impl Gateway {
                     })),
                 )?;
                 Ok(DecisionResult {
-                    approval: self.store.get_approval(approval_id)?,
-                    action: self.store.get_action(&action.id)?,
+                    approval: self.store.get_approval(acting_user_id, approval_id)?,
+                    action: self.store.get_action(acting_user_id, &action.id)?,
                     resume_task: true,
                 })
             }
@@ -713,14 +750,16 @@ mod tests {
             })
             .unwrap();
         let gateway = Gateway::new(
-            store,
+            store.clone(),
             Arc::new(Policy::from_text("TopSecret")),
             registry,
             1,
             false,
         );
+        let admin = gateway.store().admin_user_id().unwrap();
         let context = ToolContext {
-            actor: "owner".into(),
+            user_id: admin.clone(),
+            actor: admin,
             bot: "maker".into(),
             task_id: Some("task-1".into()),
             turn_id: None,
@@ -757,7 +796,9 @@ mod tests {
         else {
             panic!("expected approval");
         };
-        gateway.decide(&approval_id, Decision::Once).unwrap();
+        gateway
+            .decide(&context.user_id, &approval_id, Decision::Once)
+            .unwrap();
         gateway
             .execute_approved(&action_id, &context)
             .await
@@ -786,7 +827,9 @@ mod tests {
         else {
             panic!("expected approval");
         };
-        gateway.decide(&approval_id, Decision::Always).unwrap();
+        gateway
+            .decide(&context.user_id, &approval_id, Decision::Always)
+            .unwrap();
         gateway
             .execute_approved(&action_id, &context)
             .await
@@ -815,7 +858,9 @@ mod tests {
         else {
             panic!("expected approval");
         };
-        gateway.decide(&approval_id, Decision::Deny).unwrap();
+        gateway
+            .decide(&context.user_id, &approval_id, Decision::Deny)
+            .unwrap();
         assert!(
             gateway
                 .execute_approved(&action_id, &context)
@@ -835,14 +880,16 @@ mod tests {
             })
             .unwrap();
         let gateway = Gateway::new(
-            store,
+            store.clone(),
             Arc::new(Policy::from_text("TopSecret")),
             registry,
             1,
             false,
         );
+        let admin = store.admin_user_id().unwrap();
         let context = ToolContext {
-            actor: "owner".into(),
+            user_id: admin.clone(),
+            actor: admin,
             bot: "maker".into(),
             task_id: None,
             turn_id: None,
@@ -861,7 +908,9 @@ mod tests {
         else {
             panic!("expected approval");
         };
-        gateway.decide(&approval_id, Decision::Once).unwrap();
+        gateway
+            .decide(&context.user_id, &approval_id, Decision::Once)
+            .unwrap();
         let output = gateway.execute_approved(&action_id, &context).await;
         assert!(output.is_ok());
     }
@@ -893,14 +942,16 @@ mod tests {
         let mut registry = ToolRegistry::default();
         registry.register(FakeLeak).unwrap();
         let gateway = Gateway::new(
-            store,
+            store.clone(),
             Arc::new(Policy::from_text("TopSecret")),
             registry,
             1,
             false,
         );
+        let admin = store.admin_user_id().unwrap();
         let context = ToolContext {
-            actor: "owner".into(),
+            user_id: admin.clone(),
+            actor: admin,
             bot: "main".into(),
             task_id: None,
             turn_id: None,
@@ -926,5 +977,97 @@ mod tests {
                 .await,
             Err(SeraError::Forbidden(_))
         ));
+    }
+
+    /// Cross-user isolation at the gateway: a second user's tool context
+    /// never matches another user's standing grant, cannot execute another
+    /// user's approved action, and cannot decide another user's approval.
+    #[tokio::test]
+    async fn approvals_grants_and_actions_never_cross_users() {
+        let (gateway, calls, admin_context) = setup();
+        let member = gateway
+            .store()
+            .create_user("microsoft:gateway-member", "g@example.example", "G")
+            .unwrap();
+        let member_context = ToolContext {
+            user_id: member.id.clone(),
+            actor: member.id.clone(),
+            bot: admin_context.bot.clone(),
+            task_id: None,
+            turn_id: None,
+            conversation_id: None,
+            allowed_tools: admin_context.allowed_tools.clone(),
+            require_approval: HashSet::new(),
+        };
+
+        // The admin requests an approval and approves it "always": the
+        // grant is recorded under the admin.
+        let ToolOutcome::PendingApproval {
+            approval_id,
+            action_id,
+            ..
+        } = gateway
+            .execute(
+                "upload",
+                serde_json::json!({"dest": "folder"}),
+                &admin_context,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected approval");
+        };
+        gateway
+            .decide(&admin_context.user_id, &approval_id, Decision::Always)
+            .unwrap();
+
+        // The member's identical call does not match the admin's grant...
+        let member_outcome = gateway
+            .execute(
+                "upload",
+                serde_json::json!({"dest": "folder"}),
+                &member_context,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(member_outcome, ToolOutcome::PendingApproval { .. }),
+            "the admin's standing grant must not cover the member"
+        );
+        // ...the member cannot decide the admin's pending approval...
+        let ToolOutcome::PendingApproval {
+            approval_id: member_approval,
+            ..
+        } = member_outcome
+        else {
+            unreachable!("checked above");
+        };
+        assert!(
+            gateway
+                .decide(&member.id, &approval_id, Decision::Once)
+                .is_err(),
+            "the member must not be able to decide the admin's approval"
+        );
+        // ...and the member cannot execute the admin's approved action.
+        assert!(
+            gateway
+                .execute_approved(&action_id, &member_context)
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // The admin's own action still executes under the admin.
+        gateway
+            .execute_approved(&action_id, &admin_context)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // The member's own approval remains pending for them.
+        let pending = gateway
+            .store()
+            .list_pending_approvals(&member.id, 10)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, member_approval);
     }
 }

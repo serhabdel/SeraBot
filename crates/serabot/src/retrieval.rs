@@ -3,6 +3,10 @@
 //! Citation-facing types ([`RetrievedChunk`], [`Retriever`],
 //! [`NoopRetriever`], [`evidence_block`]) are kept stable. [`SqliteRetriever`]
 //! adds an exact, page-aware KNN implementation backed by sqlite-vec.
+//!
+//! Every retrieval is scoped to the acting user (phase 2): results join back
+//! to that user's documents only, so one user's corpus never surfaces in
+//! another user's search.
 
 use std::sync::Arc;
 
@@ -30,20 +34,27 @@ pub struct RetrievedChunk {
 
 #[async_trait]
 pub trait Retriever: Send + Sync {
-    async fn retrieve(&self, query: &str, k: usize) -> Result<Vec<RetrievedChunk>>;
+    /// Search the acting user's corpus.
+    async fn retrieve(&self, user_id: &str, query: &str, k: usize) -> Result<Vec<RetrievedChunk>>;
 }
 
 pub struct NoopRetriever;
 
 #[async_trait]
 impl Retriever for NoopRetriever {
-    async fn retrieve(&self, _query: &str, _k: usize) -> Result<Vec<RetrievedChunk>> {
+    async fn retrieve(
+        &self,
+        _user_id: &str,
+        _query: &str,
+        _k: usize,
+    ) -> Result<Vec<RetrievedChunk>> {
         Ok(Vec::new())
     }
 }
 
 /// Exact KNN retriever over `chunk_vectors`, joined back to chunks and
-/// documents so every result carries real page provenance.
+/// documents so every result carries real page provenance — and filtered to
+/// the acting user's documents.
 #[derive(Clone)]
 pub struct SqliteRetriever {
     store: Store,
@@ -68,7 +79,7 @@ impl SqliteRetriever {
 
 #[async_trait]
 impl Retriever for SqliteRetriever {
-    async fn retrieve(&self, query: &str, k: usize) -> Result<Vec<RetrievedChunk>> {
+    async fn retrieve(&self, user_id: &str, query: &str, k: usize) -> Result<Vec<RetrievedChunk>> {
         let query = query.trim();
         if query.is_empty() {
             return Err(SeraError::Validation(
@@ -123,10 +134,11 @@ impl Retriever for SqliteRetriever {
              ) AS knn
              JOIN chunks c ON c.id = knn.chunk_id
              JOIN documents d ON d.id = c.document_id
-             WHERE d.status = 'ready' AND c.page >= 1 AND length(trim(c.text)) > 0
+             WHERE d.status = 'ready' AND d.user_id = ?3
+               AND c.page >= 1 AND length(trim(c.text)) > 0
              ORDER BY knn.distance ASC, c.id ASC",
         )?;
-        let rows = statement.query_map(params![blob, limit as i64], |row| {
+        let rows = statement.query_map(params![blob, limit as i64, user_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -184,16 +196,16 @@ mod tests {
 
     const NOW: &str = "2026-01-01T00:00:00.000Z";
 
-    async fn seed(store: &Store) {
+    async fn seed(store: &Store, user_id: &str) {
         let embedder = DeterministicTestEmbedder::new(384);
         let texts = vec!["alpha evidence".to_owned(), "omega evidence".to_owned()];
         let vectors = embedder.embed(texts.clone()).await.expect("test vectors");
         let connection = store.connection().expect("connection");
         connection
             .execute(
-                "INSERT INTO documents(id, source_path, sha256, title, mime, pages, status, error, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ready', NULL, ?7, ?7)",
-                params!["doc-a", "/tmp/a.txt", "sha-a", "Alpha", "text/plain", 2, NOW],
+                "INSERT INTO documents(id, source_path, sha256, title, mime, pages, status, error, created_at, updated_at, user_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ready', NULL, ?7, ?7, ?8)",
+                params!["doc-a", "/tmp/a.txt", "sha-a", "Alpha", "text/plain", 2, NOW, user_id],
             )
             .expect("document");
         for (index, (text, vector)) in texts.iter().zip(vectors.iter()).enumerate() {
@@ -215,9 +227,9 @@ mod tests {
         // A failed document must never surface, even if its vector is nearest.
         connection
             .execute(
-                "INSERT INTO documents(id, source_path, sha256, title, mime, pages, status, error, created_at, updated_at)
-                 VALUES ('doc-failed', '/tmp/f.txt', 'sha-f', 'Failed', 'text/plain', 1, 'failed', 'boom', ?1, ?1)",
-                params![NOW],
+                "INSERT INTO documents(id, source_path, sha256, title, mime, pages, status, error, created_at, updated_at, user_id)
+                 VALUES ('doc-failed', '/tmp/f.txt', 'sha-f', 'Failed', 'text/plain', 1, 'failed', 'boom', ?1, ?1, ?2)",
+                params![NOW, user_id],
             )
             .expect("failed document");
         connection
@@ -238,10 +250,14 @@ mod tests {
     #[tokio::test]
     async fn returns_exact_provenance_with_monotonic_scores_and_filters_failed_documents() {
         let store = Store::open_in_memory(384).expect("store");
-        seed(&store).await;
+        let admin = store.admin_user_id().unwrap();
+        seed(&store, &admin).await;
         let retriever =
             SqliteRetriever::new(store, Arc::new(DeterministicTestEmbedder::new(384)), 8);
-        let chunks = retriever.retrieve("alpha", 8).await.expect("retrieval");
+        let chunks = retriever
+            .retrieve(&admin, "alpha", 8)
+            .await
+            .expect("retrieval");
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].chunk_id, "chunk-0");
         assert_eq!(chunks[0].document_id, "doc-a");
@@ -255,11 +271,12 @@ mod tests {
     #[tokio::test]
     async fn empty_index_returns_no_evidence() {
         let store = Store::open_in_memory(384).expect("store");
+        let admin = store.admin_user_id().unwrap();
         let retriever =
             SqliteRetriever::new(store, Arc::new(DeterministicTestEmbedder::new(384)), 8);
         assert!(
             retriever
-                .retrieve("alpha", 8)
+                .retrieve(&admin, "alpha", 8)
                 .await
                 .expect("retrieval")
                 .is_empty()
@@ -269,14 +286,48 @@ mod tests {
     #[tokio::test]
     async fn rejects_empty_and_oversized_queries() {
         let store = Store::open_in_memory(384).expect("store");
+        let admin = store.admin_user_id().unwrap();
         let retriever =
             SqliteRetriever::new(store, Arc::new(DeterministicTestEmbedder::new(384)), 8);
-        assert!(retriever.retrieve("   ", 8).await.is_err());
+        assert!(retriever.retrieve(&admin, "   ", 8).await.is_err());
         assert!(
             retriever
-                .retrieve(&"x".repeat(MAX_QUERY_CHARS + 1), 8)
+                .retrieve(&admin, &"x".repeat(MAX_QUERY_CHARS + 1), 8)
                 .await
                 .is_err()
+        );
+    }
+
+    /// A second user never retrieves another user's documents: the join is
+    /// on the acting user's document rows, so a foreign corpus is invisible
+    /// even when its vectors are the nearest neighbours.
+    #[tokio::test]
+    async fn retrieval_never_crosses_users() {
+        let store = Store::open_in_memory(384).expect("store");
+        let admin = store.admin_user_id().unwrap();
+        let member = store
+            .create_user("microsoft:retrieval-member", "r@example.example", "R")
+            .unwrap();
+        seed(&store, &admin).await;
+        let retriever =
+            SqliteRetriever::new(store, Arc::new(DeterministicTestEmbedder::new(384)), 8);
+        // The member's search returns nothing, even though the admin's
+        // vectors are the exact nearest matches for the query.
+        assert!(
+            retriever
+                .retrieve(&member.id, "alpha", 8)
+                .await
+                .expect("member retrieval")
+                .is_empty()
+        );
+        // And the admin still sees their own corpus.
+        assert_eq!(
+            retriever
+                .retrieve(&admin, "alpha", 8)
+                .await
+                .expect("admin retrieval")
+                .len(),
+            2
         );
     }
 

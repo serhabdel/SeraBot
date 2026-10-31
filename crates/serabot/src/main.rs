@@ -312,14 +312,15 @@ async fn main() -> anyhow::Result<()> {
                 config.database.busy_timeout_ms,
             )?;
             let embedder = FastEmbedder::from_config(&config)?;
-            let ingest = ingest_file(&store, &embedder, &path, &config.documents).await?;
+            let admin = store.admin_user_id()?;
+            let ingest = ingest_file(&store, &admin, &embedder, &path, &config.documents).await?;
             let retriever = SqliteRetriever::new(
                 store.clone(),
                 Arc::new(embedder),
                 config.documents.retrieval_k,
             );
             let chunks = retriever
-                .retrieve(&query, config.documents.retrieval_k)
+                .retrieve(&admin, &query, config.documents.retrieval_k)
                 .await?;
             println!(
                 "rag ok: document={} pages={} chunks={} retrieved={}",
@@ -414,6 +415,10 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.embeddings.dimension,
         config.database.busy_timeout_ms,
     )?;
+    // The operator's account id (kv['admin_user_id']) is the owner of the
+    // server-level single-operator surfaces that remain in this phase: the
+    // configured document inbox, the scheduled routines, and the selftests.
+    let admin_user_id = store.admin_user_id()?;
     if store.reconcile_dispatching_actions()? > 0 {
         tracing::warn!("reconciled actions with unknown external outcomes");
     }
@@ -801,6 +806,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         let directory = config.path(&config.documents.watch_dir);
         let documents = config.documents.clone();
         let embedder = embedder.clone();
+        let admin_index = admin_user_id.clone();
         let shutdown_index = shutdown.clone();
         services.push(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -808,7 +814,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
                 tokio::select! {
                     _ = shutdown_index.cancelled() => break,
                     _ = interval.tick() => {
-                        match index_directory(&store, embedder.as_ref(), &directory, &documents).await {
+                        match index_directory(&store, &admin_index, embedder.as_ref(), &directory, &documents).await {
                             Ok(report) => {
                                 if !report.ingested.is_empty() || !report.failures.is_empty() {
                                     tracing::info!(
@@ -833,9 +839,15 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             .timezone
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid schedule.timezone"))?;
-        ensure_daily_routine(&store, "morning_brief", &config.schedule.brief_time, tz)?;
+        ensure_daily_routine(
+            &store,
+            &admin_user_id,
+            "morning_brief",
+            &config.schedule.brief_time,
+            tz,
+        )?;
         for (index, time) in config.schedule.watch_times.iter().enumerate() {
-            ensure_daily_routine(&store, &format!("watch_{index}"), time, tz)?;
+            ensure_daily_routine(&store, &admin_user_id, &format!("watch_{index}"), time, tz)?;
         }
         let store = store.clone();
         let shutdown_schedule = shutdown.clone();
@@ -850,11 +862,18 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
                 tokio::select! {
                     _ = shutdown_schedule.cancelled() => break,
                     _ = interval.tick() => {
+                        // The scheduler claims routines across users (the
+                        // service is shared) and enqueues each occurrence
+                        // under the routine's owning user.
                         let due = due_routines(&store, chrono::Utc::now(), tz)?;
                         for routine in due {
                             let kind = if routine.name == "morning_brief" { "brief" } else { "watch" };
-                            let payload = ScheduledPayload { conversation_id: "owner".into() };
+                            let payload = ScheduledPayload {
+                                conversation_id: "owner".into(),
+                                user_id: routine.user_id.clone(),
+                            };
                             store.enqueue_task(
+                                &routine.user_id,
                                 kind,
                                 "watcher",
                                 &serde_json::to_value(&payload)?,

@@ -1817,6 +1817,7 @@ mod tests {
             )
             .unwrap();
         let context = ToolContext {
+            user_id: crate::store::ADMIN_USER_ID.to_owned(),
             actor: "owner".into(),
             bot: "maker".into(),
             task_id: None,
@@ -1853,6 +1854,7 @@ mod tests {
         let store = Store::open_in_memory(384).unwrap();
         let tool = PdfInspectTool::new(artifacts, directory.path()).unwrap();
         let context = ToolContext {
+            user_id: crate::store::ADMIN_USER_ID.to_owned(),
             actor: "owner".into(),
             bot: "maker".into(),
             task_id: None,

@@ -3,6 +3,11 @@
 //! The brief is deterministic plain text derived only from SQLite rows: no
 //! model call, no network, no invented times. Date-only deadlines are printed
 //! as dates, while explicit date-times are shown in the configured timezone.
+//!
+//! Every row the brief reads belongs to the acting user (phase 2 scoping):
+//! deadlines, opportunities and source-run warnings are filtered by `user_id`
+//! before the text is built, so one user's brief never mentions another
+//! user's watch results.
 
 use chrono::{
     DateTime, Duration, MappedLocalTime, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat,
@@ -52,21 +57,24 @@ pub struct BriefReport {
     pub empty: bool,
 }
 
-/// Build the daily brief. `lookback_hours` bounds which new/changed
-/// opportunities are considered; deadlines are always evaluated relative to
-/// `now`.
+/// Build the daily brief for the acting user. `lookback_hours` bounds which
+/// new/changed opportunities are considered; deadlines are always evaluated
+/// relative to `now`.
 pub fn build_brief(
     store: &Store,
+    user_id: &str,
     now: DateTime<Utc>,
     tz: Tz,
     lookback_hours: u64,
 ) -> Result<String> {
-    Ok(build_brief_report(store, now, tz, lookback_hours)?.text)
+    Ok(build_brief_report(store, user_id, now, tz, lookback_hours)?.text)
 }
 
-/// Build the daily brief text together with its emptiness flag.
+/// Build the daily brief text for the acting user together with its
+/// emptiness flag.
 pub fn build_brief_report(
     store: &Store,
+    user_id: &str,
     now: DateTime<Utc>,
     tz: Tz,
     lookback_hours: u64,
@@ -90,11 +98,12 @@ pub fn build_brief_report(
                     o.title, o.source
              FROM deadlines d
              JOIN opportunities o ON o.id = d.opportunity_id
-             WHERE d.status <> 'superseded' AND o.status <> 'withdrawn'
+             WHERE d.user_id = ?1 AND o.user_id = ?1
+               AND d.status <> 'superseded' AND o.status <> 'withdrawn'
              ORDER BY d.due_date ASC, d.due_time ASC
              LIMIT 500",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map(params![user_id], |row| {
             Ok(DeadlineRow {
                 due_date: row.get(0)?,
                 due_time: row.get(1)?,
@@ -123,11 +132,11 @@ pub fn build_brief_report(
         let mut statement = connection.prepare(
             "SELECT title, source, url, revision
              FROM opportunities
-             WHERE status <> 'withdrawn' AND last_seen >= ?1
+             WHERE user_id = ?2 AND status <> 'withdrawn' AND last_seen >= ?1
              ORDER BY last_seen DESC, title ASC
              LIMIT 200",
         )?;
-        let rows = statement.query_map(params![cutoff], |row| {
+        let rows = statement.query_map(params![cutoff, user_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -146,7 +155,7 @@ pub fn build_brief_report(
         }
     }
 
-    let warnings = source_warnings(&connection, now, tz)?;
+    let warnings = source_warnings(&connection, user_id, now, tz)?;
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -288,6 +297,7 @@ fn opportunity_line(item: &OpportunityItem) -> String {
 
 fn source_warnings(
     connection: &rusqlite::Connection,
+    user_id: &str,
     now: DateTime<Utc>,
     tz: Tz,
 ) -> Result<Vec<String>> {
@@ -297,10 +307,11 @@ fn source_warnings(
                 MAX(CASE WHEN ok = 1 THEN COALESCE(finished_at, started_at) END),
                 MAX(CASE WHEN ok = 0 THEN started_at END)
          FROM source_runs
+         WHERE user_id = ?1
          GROUP BY source
          ORDER BY source ASC",
     )?;
-    let rows = statement.query_map([], |row| {
+    let rows = statement.query_map(params![user_id], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, Option<String>>(1)?,
@@ -418,12 +429,18 @@ mod tests {
         Store::open_in_memory(384).unwrap()
     }
 
+    /// The acting user for the brief.
+    fn admin(store: &Store) -> String {
+        store.admin_user_id().unwrap()
+    }
+
     fn rome() -> Tz {
         "Europe/Rome".parse().unwrap()
     }
 
     fn insert_opportunity(
         store: &Store,
+        user_id: &str,
         source: &str,
         title: &str,
         revision: i64,
@@ -435,8 +452,8 @@ mod tests {
             .execute(
                 "INSERT INTO opportunities(
                     id, source, external_id, title, summary, url, status,
-                    evidence, revision, first_seen, last_seen
-                 ) VALUES (?1, ?2, ?3, ?4, '', ?5, 'open', '', ?6, ?7, ?7)",
+                    evidence, revision, first_seen, last_seen, user_id
+                 ) VALUES (?1, ?2, ?3, ?4, '', ?5, 'open', '', ?6, ?7, ?7, ?8)",
                 params![
                     id,
                     source,
@@ -444,7 +461,8 @@ mod tests {
                     title,
                     format!("https://example.com/{title}"),
                     revision,
-                    utc_string(last_seen)
+                    utc_string(last_seen),
+                    user_id
                 ],
             )
             .unwrap();
@@ -453,6 +471,7 @@ mod tests {
 
     fn insert_deadline(
         store: &Store,
+        user_id: &str,
         opportunity_id: &str,
         due_date: &str,
         due_time: Option<&str>,
@@ -464,8 +483,8 @@ mod tests {
             .execute(
                 "INSERT INTO deadlines(
                     id, opportunity_id, due_date, due_time, timezone, precision,
-                    source_text, status, observed_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'test', 'upcoming', ?7)",
+                    source_text, status, observed_at, user_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'test', 'upcoming', ?7, ?8)",
                 params![
                     new_id(),
                     opportunity_id,
@@ -473,7 +492,8 @@ mod tests {
                     due_time,
                     timezone,
                     precision,
-                    utc_string(Utc::now())
+                    utc_string(Utc::now()),
+                    user_id
                 ],
             )
             .unwrap();
@@ -481,6 +501,7 @@ mod tests {
 
     fn insert_source_run(
         store: &Store,
+        user_id: &str,
         source: &str,
         ok: bool,
         started_at: DateTime<Utc>,
@@ -489,15 +510,16 @@ mod tests {
         let connection = store.connection().unwrap();
         connection
             .execute(
-                "INSERT INTO source_runs(id, source, started_at, finished_at, ok, error, items_seen)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+                "INSERT INTO source_runs(id, source, started_at, finished_at, ok, error, items_seen, user_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
                 params![
                     new_id(),
                     source,
                     utc_string(started_at),
                     finished_at.map(utc_string),
                     ok as i64,
-                    if ok { None } else { Some("boom") }
+                    if ok { None } else { Some("boom") },
+                    user_id
                 ],
             )
             .unwrap();
@@ -507,10 +529,17 @@ mod tests {
     fn groups_deadlines_and_keeps_date_only_precision() {
         let store = store();
         let now = Utc.with_ymd_and_hms(2026, 10, 28, 10, 0, 0).unwrap();
-        let opportunity =
-            insert_opportunity(&store, "portal", "Tender A", 1, now - Duration::hours(1));
+        let opportunity = insert_opportunity(
+            &store,
+            &admin(&store),
+            "portal",
+            "Tender A",
+            1,
+            now - Duration::hours(1),
+        );
         insert_deadline(
             &store,
+            &admin(&store),
             &opportunity,
             "2026-10-27",
             None,
@@ -519,6 +548,7 @@ mod tests {
         );
         insert_deadline(
             &store,
+            &admin(&store),
             &opportunity,
             "2026-10-30",
             None,
@@ -526,7 +556,7 @@ mod tests {
             "date",
         );
 
-        let brief = build_brief(&store, now, rome(), 24).unwrap();
+        let brief = build_brief(&store, &admin(&store), now, rome(), 24).unwrap();
         assert!(brief.contains("Overdue (1)"), "{brief}");
         assert!(brief.contains("- 2026-10-27  Tender A [portal]"), "{brief}");
         assert!(brief.contains("Due soon (next 7 days) (1)"), "{brief}");
@@ -543,10 +573,17 @@ mod tests {
     fn converts_explicit_utc_datetimes_to_configured_timezone() {
         let store = store();
         let now = Utc.with_ymd_and_hms(2026, 7, 15, 9, 0, 0).unwrap();
-        let opportunity =
-            insert_opportunity(&store, "portal", "Tender B", 1, now - Duration::hours(1));
+        let opportunity = insert_opportunity(
+            &store,
+            &admin(&store),
+            "portal",
+            "Tender B",
+            1,
+            now - Duration::hours(1),
+        );
         insert_deadline(
             &store,
+            &admin(&store),
             &opportunity,
             "2026-07-15",
             Some("14:30"),
@@ -554,7 +591,7 @@ mod tests {
             "datetime",
         );
 
-        let brief = build_brief(&store, now, rome(), 24).unwrap();
+        let brief = build_brief(&store, &admin(&store), now, rome(), 24).unwrap();
         // July in Rome is CEST (UTC+2).
         assert!(brief.contains("2026-07-15 16:30"), "{brief}");
         assert!(!brief.contains("14:30"), "{brief}");
@@ -566,6 +603,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 10, 28, 10, 0, 0).unwrap();
         insert_opportunity(
             &store,
+            &admin(&store),
             "portal",
             "Newer new",
             1,
@@ -573,6 +611,7 @@ mod tests {
         );
         insert_opportunity(
             &store,
+            &admin(&store),
             "portal",
             "Older new",
             1,
@@ -580,13 +619,14 @@ mod tests {
         );
         insert_opportunity(
             &store,
+            &admin(&store),
             "portal",
             "Changed item",
             3,
             now - Duration::minutes(5),
         );
 
-        let brief = build_brief(&store, now, rome(), 24).unwrap();
+        let brief = build_brief(&store, &admin(&store), now, rome(), 24).unwrap();
         assert!(brief.contains("Changed (1)"), "{brief}");
         assert!(brief.contains("New (2)"), "{brief}");
         let changed_at = brief.find("Changed (1)").unwrap();
@@ -598,8 +638,15 @@ mod tests {
         assert!(!brief.contains("Old item"), "{brief}");
 
         // Items older than the lookback window are excluded.
-        insert_opportunity(&store, "portal", "Old item", 1, now - Duration::hours(48));
-        let brief = build_brief(&store, now, rome(), 24).unwrap();
+        insert_opportunity(
+            &store,
+            &admin(&store),
+            "portal",
+            "Old item",
+            1,
+            now - Duration::hours(48),
+        );
+        let brief = build_brief(&store, &admin(&store), now, rome(), 24).unwrap();
         assert!(!brief.contains("Old item"), "{brief}");
     }
 
@@ -609,6 +656,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 10, 28, 10, 0, 0).unwrap();
         insert_source_run(
             &old_store,
+            &admin(&old_store),
             "stale",
             true,
             now - Duration::hours(72),
@@ -616,13 +664,14 @@ mod tests {
         );
         insert_source_run(
             &old_store,
+            &admin(&old_store),
             "failing",
             false,
             now - Duration::hours(1),
             Some(now - Duration::hours(1)),
         );
 
-        let brief = build_brief(&old_store, now, rome(), 24).unwrap();
+        let brief = build_brief(&old_store, &admin(&old_store), now, rome(), 24).unwrap();
         assert!(brief.contains("Source warnings (2)"), "{brief}");
         assert!(brief.contains("stale: no successful run since"), "{brief}");
         assert!(
@@ -634,13 +683,64 @@ mod tests {
         let fresh_store = store();
         insert_source_run(
             &fresh_store,
+            &admin(&fresh_store),
             "healthy",
             true,
             now - Duration::hours(1),
             Some(now - Duration::hours(1)),
         );
-        let brief = build_brief(&fresh_store, now, rome(), 24).unwrap();
+        let brief = build_brief(&fresh_store, &admin(&fresh_store), now, rome(), 24).unwrap();
         assert!(!brief.contains("Source warnings"), "{brief}");
         assert!(brief.contains("No new items"), "{brief}");
+    }
+
+    /// A member's brief never mentions the admin's opportunities, deadlines
+    /// or source warnings, and vice versa: the text is built only from the
+    /// acting user's rows.
+    #[test]
+    fn briefs_never_cross_users() {
+        let store = store();
+        let admin = admin(&store);
+        let member = store
+            .create_user("microsoft:brief-member", "b@example.example", "B")
+            .unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 10, 28, 10, 0, 0).unwrap();
+        let opportunity = insert_opportunity(
+            &store,
+            &admin,
+            "portal",
+            "Admin Tender",
+            1,
+            now - Duration::hours(1),
+        );
+        insert_deadline(
+            &store,
+            &admin,
+            &opportunity,
+            "2026-10-29",
+            None,
+            Some("Europe/Rome"),
+            "date",
+        );
+        insert_source_run(
+            &store,
+            &admin,
+            "stale-admin",
+            true,
+            now - Duration::hours(72),
+            Some(now - Duration::hours(72)),
+        );
+
+        // The member's brief is completely empty.
+        let member_brief = build_brief(&store, &member.id, now, rome(), 24).unwrap();
+        assert!(member_brief.contains("No new items"), "{member_brief}");
+        assert!(!member_brief.contains("Admin Tender"), "{member_brief}");
+        assert!(!member_brief.contains("stale-admin"), "{member_brief}");
+
+        // The admin's brief carries only their own rows.
+        let admin_brief = build_brief(&store, &admin, now, rome(), 24).unwrap();
+        assert!(admin_brief.contains("Admin Tender"), "{admin_brief}");
+        assert!(admin_brief.contains("stale-admin"), "{admin_brief}");
+        assert!(admin_brief.contains("Due soon"), "{admin_brief}");
     }
 }

@@ -935,6 +935,7 @@ mod tests {
         catalog.validate_bot_skills(&bots).unwrap();
         let runtime = SkillRuntime::new(Arc::new(catalog), &bots);
         let context = ToolContext {
+            user_id: crate::store::ADMIN_USER_ID.to_owned(),
             actor: "owner".into(),
             bot: "main".into(),
             task_id: None,

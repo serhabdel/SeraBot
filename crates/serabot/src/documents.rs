@@ -4,6 +4,11 @@
 //! `lopdf`), plain text and markdown. OCR is intentionally deferred: scanned or
 //! image-only PDFs are rejected with an actionable error instead of silently
 //! producing an empty document.
+//!
+//! Every document row belongs to the acting user (phase 2 scoping): ingestion
+//! takes the user id and writes it on the document, lookups filter on it, and
+//! chunks are reachable only through their user-scoped document. One user's
+//! corpus is invisible to every other user.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -100,17 +105,20 @@ struct ExistingDocument {
     status: String,
 }
 
-/// Ingest one document.
+/// Ingest one document for the acting user.
 ///
 /// The file is read once, bounded by `documents.max_bytes`, and hashed with
-/// SHA-256. A document with the same hash that is already indexed is returned
-/// as a duplicate without re-embedding. A previously failed document with the
-/// same hash is replaced, which gives the operator a safe retry path.
+/// SHA-256. A document with the same hash that the acting user already
+/// indexed is returned as a duplicate without re-embedding. A previously
+/// failed document of the acting user with the same hash is replaced, which
+/// gives the operator a safe retry path. Another user's document with the
+/// same hash is invisible here: lookups filter by user.
 ///
 /// Database writes happen in short transactions. No transaction or pooled
 /// connection is held while the embedder is running.
 pub async fn ingest_file(
     store: &Store,
+    user_id: &str,
     embedder: &dyn Embedder,
     path: &Path,
     config: &DocumentsConfig,
@@ -134,11 +142,11 @@ pub async fn ingest_file(
     let bytes = read_bounded(path, config.max_bytes).await?;
     let sha256 = sha256_hex(&bytes);
 
-    let existing = find_by_sha(store, &sha256)?;
+    let existing = find_by_sha(store, user_id, &sha256)?;
     if let Some(document) = &existing
         && document.status != "failed"
     {
-        return duplicate_result(store, &document.id, sha256);
+        return duplicate_result(store, user_id, &document.id, sha256);
     }
 
     let pages = extract_pages(kind, bytes).await?;
@@ -159,12 +167,12 @@ pub async fn ingest_file(
     // right before replacing it so a concurrent successful ingestion is never
     // purged by this one.
     if existing.is_some()
-        && let Some(current) = find_by_sha(store, &sha256)?
+        && let Some(current) = find_by_sha(store, user_id, &sha256)?
     {
         if current.status != "failed" {
-            return duplicate_result(store, &current.id, sha256);
+            return duplicate_result(store, user_id, &current.id, sha256);
         }
-        purge_document(store, &current.id)?;
+        purge_document(store, user_id, &current.id)?;
     }
 
     let source_path = tokio::fs::canonicalize(path)
@@ -177,8 +185,8 @@ pub async fn ingest_file(
     let insert = {
         let connection = store.connection()?;
         connection.execute(
-            "INSERT INTO documents(id, source_path, sha256, title, mime, pages, status, error, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'indexing', NULL, ?7, ?7)",
+            "INSERT INTO documents(id, source_path, sha256, title, mime, pages, status, error, created_at, updated_at, user_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'indexing', NULL, ?7, ?7, ?8)",
             params![
                 document_id,
                 source_path.to_string_lossy(),
@@ -187,21 +195,24 @@ pub async fn ingest_file(
                 kind.mime(),
                 page_count as i64,
                 now,
+                user_id,
             ],
         )
     };
     if let Err(error) = insert {
         if is_constraint_violation(&error) {
-            // Another ingestion won the race for this hash.
-            if let Some(document) = find_by_sha(store, &sha256)? {
-                return duplicate_result(store, &document.id, sha256);
+            // Another ingestion of this user's corpus won the race for this hash.
+            if let Some(document) = find_by_sha(store, user_id, &sha256)? {
+                return duplicate_result(store, user_id, &document.id, sha256);
             }
         }
         return Err(SeraError::Database(error));
     }
 
-    if let Err(error) = index_document(store, embedder, &document_id, planned, page_count).await {
-        mark_failed(store, &document_id, &error);
+    if let Err(error) =
+        index_document(store, user_id, embedder, &document_id, planned, page_count).await
+    {
+        mark_failed(store, user_id, &document_id, &error);
         return Err(error);
     }
 
@@ -239,12 +250,14 @@ pub fn indexable_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Ingest every supported, non-hidden file directly inside `dir`.
+/// Ingest every supported, non-hidden file directly inside `dir` for the
+/// acting user.
 ///
 /// This never recurses and never follows symlinks. Individual file failures are
 /// reported instead of aborting the whole directory scan.
 pub async fn index_directory(
     store: &Store,
+    user_id: &str,
     embedder: &dyn Embedder,
     dir: &Path,
     config: &DocumentsConfig,
@@ -252,7 +265,7 @@ pub async fn index_directory(
     let files = indexable_files(dir)?;
     let mut report = DirectoryIndexReport::default();
     for path in files {
-        match ingest_file(store, embedder, &path, config).await {
+        match ingest_file(store, user_id, embedder, &path, config).await {
             Ok(result) => report.ingested.push(result),
             Err(error) => report.failures.push(DirectoryFailure {
                 path,
@@ -469,6 +482,7 @@ fn chunk_ranges(text: &str, chunk_chars: usize, overlap: usize) -> Vec<(usize, u
 
 async fn index_document(
     store: &Store,
+    user_id: &str,
     embedder: &dyn Embedder,
     document_id: &str,
     chunks: Vec<PlannedChunk>,
@@ -559,8 +573,8 @@ async fn index_document(
     // 3. Only a fully indexed document is visible to retrieval.
     let connection = store.connection()?;
     let changed = connection.execute(
-        "UPDATE documents SET status='ready', error=NULL, pages=?1, updated_at=?2 WHERE id=?3",
-        params![pages as i64, now_string(), document_id],
+        "UPDATE documents SET status='ready', error=NULL, pages=?1, updated_at=?2 WHERE id=?3 AND user_id=?4",
+        params![pages as i64, now_string(), document_id, user_id],
     )?;
     if changed != 1 {
         return Err(SeraError::Internal(
@@ -570,12 +584,13 @@ async fn index_document(
     Ok(())
 }
 
-fn find_by_sha(store: &Store, sha256: &str) -> Result<Option<ExistingDocument>> {
+/// The acting user's document with this content hash, if any.
+fn find_by_sha(store: &Store, user_id: &str, sha256: &str) -> Result<Option<ExistingDocument>> {
     let connection = store.connection()?;
     Ok(connection
         .query_row(
-            "SELECT id, status FROM documents WHERE sha256 = ?1",
-            params![sha256],
+            "SELECT id, status FROM documents WHERE sha256 = ?1 AND user_id = ?2",
+            params![sha256, user_id],
             |row| {
                 Ok(ExistingDocument {
                     id: row.get(0)?,
@@ -586,13 +601,18 @@ fn find_by_sha(store: &Store, sha256: &str) -> Result<Option<ExistingDocument>> 
         .optional()?)
 }
 
-fn duplicate_result(store: &Store, document_id: &str, sha256: String) -> Result<IngestResult> {
+fn duplicate_result(
+    store: &Store,
+    user_id: &str,
+    document_id: &str,
+    sha256: String,
+) -> Result<IngestResult> {
     let connection = store.connection()?;
     let (pages, chunks): (i64, i64) = connection.query_row(
         "SELECT COALESCE(d.pages, 0),
                 (SELECT COUNT(*) FROM chunks c WHERE c.document_id = d.id)
-         FROM documents d WHERE d.id = ?1",
-        params![document_id],
+         FROM documents d WHERE d.id = ?1 AND d.user_id = ?2",
+        params![document_id, user_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     Ok(IngestResult {
@@ -604,9 +624,22 @@ fn duplicate_result(store: &Store, document_id: &str, sha256: String) -> Result<
     })
 }
 
-fn purge_document(store: &Store, document_id: &str) -> Result<()> {
+/// Purge the acting user's failed document together with its chunks and
+/// vectors. Chunks and vectors carry no user column: they are reachable only
+/// through this user-scoped document row.
+fn purge_document(store: &Store, user_id: &str, document_id: &str) -> Result<()> {
     let connection = store.connection()?;
     let transaction = connection.unchecked_transaction()?;
+    let owned = transaction
+        .query_row(
+            "SELECT 1 FROM documents WHERE id = ?1 AND user_id = ?2",
+            params![document_id, user_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if owned.is_none() {
+        return Err(SeraError::NotFound(format!("document {document_id}")));
+    }
     transaction.execute(
         "DELETE FROM chunk_vectors WHERE chunk_id IN (SELECT id FROM chunks WHERE document_id = ?1)",
         params![document_id],
@@ -620,12 +653,12 @@ fn purge_document(store: &Store, document_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn mark_failed(store: &Store, document_id: &str, error: &SeraError) {
+fn mark_failed(store: &Store, user_id: &str, document_id: &str, error: &SeraError) {
     let message = truncate_chars(&error.to_string(), MAX_ERROR_CHARS);
     let result = store.connection().and_then(|connection| {
         connection.execute(
-            "UPDATE documents SET status='failed', error=?1, updated_at=?2 WHERE id=?3",
-            params![message, now_string(), document_id],
+            "UPDATE documents SET status='failed', error=?1, updated_at=?2 WHERE id=?3 AND user_id=?4",
+            params![message, now_string(), document_id, user_id],
         )?;
         Ok(())
     });
@@ -811,9 +844,10 @@ mod tests {
         .expect("write PDF");
 
         let store = Store::open_in_memory(384).expect("store");
+        let admin = store.admin_user_id().unwrap();
         let embedder = DeterministicTestEmbedder::new(384);
 
-        let first = ingest_file(&store, &embedder, &path, &test_config())
+        let first = ingest_file(&store, &admin, &embedder, &path, &test_config())
             .await
             .expect("first ingestion");
         assert!(!first.duplicate);
@@ -822,7 +856,7 @@ mod tests {
         assert_eq!(first.sha256.len(), 64);
         assert_eq!(vector_count(&store), 2);
 
-        let second = ingest_file(&store, &embedder, &path, &test_config())
+        let second = ingest_file(&store, &admin, &embedder, &path, &test_config())
             .await
             .expect("duplicate ingestion");
         assert!(second.duplicate);
@@ -858,8 +892,9 @@ mod tests {
         .expect("write PDF");
 
         let store = Store::open_in_memory(384).expect("store");
+        let admin = store.admin_user_id().unwrap();
         let embedder = DeterministicTestEmbedder::new(384);
-        let ingested = ingest_file(&store, &embedder, &path, &test_config())
+        let ingested = ingest_file(&store, &admin, &embedder, &path, &test_config())
             .await
             .expect("ingestion");
 
@@ -868,7 +903,10 @@ mod tests {
             Arc::new(DeterministicTestEmbedder::new(384)),
             8,
         );
-        let chunks = retriever.retrieve("alpha", 4).await.expect("retrieval");
+        let chunks = retriever
+            .retrieve(&admin, "alpha", 4)
+            .await
+            .expect("retrieval");
         assert!(!chunks.is_empty());
         let hit = chunks
             .iter()
@@ -890,12 +928,13 @@ mod tests {
     async fn rejects_scanned_malformed_encrypted_and_oversized_documents() {
         let directory = tempdir().expect("tempdir");
         let store = Store::open_in_memory(384).expect("store");
+        let admin = store.admin_user_id().unwrap();
         let embedder = DeterministicTestEmbedder::new(384);
         let config = test_config();
 
         let scanned = directory.path().join("scanned.pdf");
         std::fs::write(&scanned, make_blank_pdf()).expect("blank PDF");
-        let error = ingest_file(&store, &embedder, &scanned, &config)
+        let error = ingest_file(&store, &admin, &embedder, &scanned, &config)
             .await
             .expect_err("scanned PDF rejected");
         assert!(error.to_string().contains("no extractable text"));
@@ -903,7 +942,7 @@ mod tests {
         let malformed = directory.path().join("malformed.pdf");
         std::fs::write(&malformed, b"%PDF-1.7\nthis is not a real PDF").expect("malformed PDF");
         assert!(
-            ingest_file(&store, &embedder, &malformed, &config)
+            ingest_file(&store, &admin, &embedder, &malformed, &config)
                 .await
                 .is_err()
         );
@@ -911,7 +950,7 @@ mod tests {
         let encrypted = directory.path().join("encrypted.pdf");
         std::fs::write(&encrypted, mark_encrypted(make_pdf(&["secret alpha text"])))
             .expect("encrypted PDF");
-        let error = ingest_file(&store, &embedder, &encrypted, &config)
+        let error = ingest_file(&store, &admin, &embedder, &encrypted, &config)
             .await
             .expect_err("encrypted PDF rejected");
         assert!(error.to_string().to_lowercase().contains("encrypted"));
@@ -921,7 +960,7 @@ mod tests {
         let mut small = config.clone();
         small.max_bytes = 64;
         assert!(
-            ingest_file(&store, &embedder, &oversized, &small)
+            ingest_file(&store, &admin, &embedder, &oversized, &small)
                 .await
                 .is_err()
         );
@@ -934,7 +973,8 @@ mod tests {
         std::fs::write(&path, "alpha content that cannot be embedded").expect("write");
 
         let store = Store::open_in_memory(384).expect("store");
-        let error = ingest_file(&store, &FailingEmbedder, &path, &test_config())
+        let admin = store.admin_user_id().unwrap();
+        let error = ingest_file(&store, &admin, &FailingEmbedder, &path, &test_config())
             .await
             .expect_err("embedding failure propagates");
         assert!(error.to_string().contains("synthetic embedding failure"));
@@ -978,13 +1018,14 @@ mod tests {
         std::fs::write(&path, &content).expect("write markdown");
 
         let store = Store::open_in_memory(384).expect("store");
+        let admin = store.admin_user_id().unwrap();
         let embedder = DeterministicTestEmbedder::new(384);
         let config = DocumentsConfig {
             chunk_chars: 40,
             chunk_overlap: 7,
             ..DocumentsConfig::default()
         };
-        let result = ingest_file(&store, &embedder, &path, &config)
+        let result = ingest_file(&store, &admin, &embedder, &path, &config)
             .await
             .expect("markdown ingestion");
         assert_eq!(result.pages, 1);
@@ -1017,8 +1058,9 @@ mod tests {
             .expect("write nested");
 
         let store = Store::open_in_memory(384).expect("store");
+        let admin = store.admin_user_id().unwrap();
         let embedder = DeterministicTestEmbedder::new(384);
-        let report = index_directory(&store, &embedder, directory.path(), &test_config())
+        let report = index_directory(&store, &admin, &embedder, directory.path(), &test_config())
             .await
             .expect("directory ingestion");
         assert_eq!(report.ingested.len(), 2);

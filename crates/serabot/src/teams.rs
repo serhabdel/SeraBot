@@ -232,8 +232,10 @@ fn room_turn_messages(store: &Store, root_task_id: &str) -> Result<i64> {
     store.count_team_events(root_task_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn refuse_bound(
     store: &Store,
+    user_id: &str,
     actor: &str,
     tool: &str,
     context: &ToolContext,
@@ -257,7 +259,7 @@ fn refuse_bound(
         None,
         Some(&details),
     );
-    let _ = store.append_event(AUDIT_BOUND_REFUSED, &details);
+    let _ = store.append_event(user_id, AUDIT_BOUND_REFUSED, &details);
     SeraError::Validation(format!(
         "room turn limit reached: at most {limit} {bound} per room turn"
     ))
@@ -298,7 +300,8 @@ fn member_turn_payload(
     }))
 }
 
-/// Queue one member turn under a caller-allocated task id.
+/// Queue one member turn under a caller-allocated task id, for the acting
+/// user.
 ///
 /// Team turns are audited before they are queued, so a failed audit never
 /// leaves an untracked member turn behind. The audit row needs the child task
@@ -306,6 +309,7 @@ fn member_turn_payload(
 /// insert is repeated here with the id supplied by the caller.
 pub(crate) fn enqueue_turn_task_with_id(
     store: &Store,
+    user_id: &str,
     id: &str,
     bot: &str,
     payload: &Value,
@@ -314,14 +318,15 @@ pub(crate) fn enqueue_turn_task_with_id(
     let connection = store.connection()?;
     connection.execute(
         "INSERT INTO tasks(id, kind, bot, payload_json, status, priority, attempts, max_attempts,
-                run_after, lease_until, worker_id, fencing_token, uncertain, last_error, created_at, updated_at)
-         VALUES (?1, 'turn', ?2, ?3, 'queued', 0, 0, 5, ?4, NULL, NULL, 0, 0, NULL, ?5, ?5)",
+                run_after, lease_until, worker_id, fencing_token, uncertain, last_error, created_at, updated_at, user_id)
+         VALUES (?1, 'turn', ?2, ?3, 'queued', 0, 0, 5, ?4, NULL, NULL, 0, 0, NULL, ?5, ?5, ?6)",
         params![
             id,
             bot,
             serde_json::to_string(payload)?,
             stamp,
-            stamp
+            stamp,
+            user_id
         ],
     )?;
     Ok(())
@@ -343,7 +348,7 @@ impl TeamAskTool {
         }
     }
 
-    fn room_team(&self, conversation_id: &str) -> Result<ConversationTeam> {
+    fn room_team(&self, user_id: &str, conversation_id: &str) -> Result<ConversationTeam> {
         let scope = parse_conversation_scope(conversation_id)?;
         if scope.kind != ConversationKind::Room {
             return Err(SeraError::Validation(
@@ -351,7 +356,7 @@ impl TeamAskTool {
             ));
         }
         self.store
-            .get_conversation_team(conversation_id)?
+            .get_conversation_team(user_id, conversation_id)?
             .ok_or_else(|| {
                 SeraError::Validation("this room has no team; set one before asking".into())
             })
@@ -407,8 +412,8 @@ impl Tool for TeamAskTool {
             .as_deref()
             .ok_or_else(|| SeraError::InvalidState("team_ask requires a conversation id".into()))?;
         self.store
-            .ensure_conversation_accepts_turns(conversation_id)?;
-        let team = self.room_team(conversation_id)?;
+            .ensure_conversation_accepts_turns(&context.user_id, conversation_id)?;
+        let team = self.room_team(&context.user_id, conversation_id)?;
         if team.mode != TeamMode::Selected.as_str() {
             return Err(SeraError::Validation(
                 "team_ask is not used when the room mode is all".into(),
@@ -483,6 +488,7 @@ impl Tool for TeamAskTool {
         if already + to_bots.len() as i64 > MAX_TEAM_MESSAGES_PER_TURN {
             return Err(refuse_bound(
                 &self.store,
+                &context.user_id,
                 &context.actor,
                 TEAM_ASK_TOOL,
                 context,
@@ -534,8 +540,11 @@ impl Tool for TeamAskTool {
                 None,
                 Some(&details),
             )?;
-            self.store.append_event(AUDIT_ASKED, &details)?;
-            if let Err(error) = enqueue_turn_task_with_id(&self.store, &child, to_bot, &payload) {
+            self.store
+                .append_event(&context.user_id, AUDIT_ASKED, &details)?;
+            if let Err(error) =
+                enqueue_turn_task_with_id(&self.store, &context.user_id, &child, to_bot, &payload)
+            {
                 warn!(bot = %to_bot, %error, "audited team ask was not queued");
                 return Err(error);
             }
@@ -614,7 +623,7 @@ impl Tool for TeamReplyTool {
         let conversation_id = context.conversation_id.as_deref().ok_or_else(|| {
             SeraError::InvalidState("team_reply requires a conversation id".into())
         })?;
-        let turn = self.store.get_turn(turn_id)?;
+        let turn = self.store.get_turn(&context.user_id, turn_id)?;
         let frame = TeamContext::from_turn_state(&turn.state)?.ok_or_else(|| {
             SeraError::Forbidden(
                 "team_reply is only available to bots taking part in a team turn".into(),
@@ -622,7 +631,7 @@ impl Tool for TeamReplyTool {
         })?;
         let team = self
             .store
-            .get_conversation_team(conversation_id)?
+            .get_conversation_team(&context.user_id, conversation_id)?
             .ok_or_else(|| SeraError::Validation("this room has no team".into()))?;
 
         let to_bot = args
@@ -659,6 +668,7 @@ impl Tool for TeamReplyTool {
         if round > MAX_PEER_REPLY_ROUNDS {
             return Err(refuse_bound(
                 &self.store,
+                &context.user_id,
                 &context.actor,
                 TEAM_REPLY_TOOL,
                 context,
@@ -674,6 +684,7 @@ impl Tool for TeamReplyTool {
         if replies >= MAX_PEER_REPLIES_PER_BOT {
             return Err(refuse_bound(
                 &self.store,
+                &context.user_id,
                 &context.actor,
                 TEAM_REPLY_TOOL,
                 context,
@@ -687,6 +698,7 @@ impl Tool for TeamReplyTool {
         if already + 1 > MAX_TEAM_MESSAGES_PER_TURN {
             return Err(refuse_bound(
                 &self.store,
+                &context.user_id,
                 &context.actor,
                 TEAM_REPLY_TOOL,
                 context,
@@ -733,14 +745,18 @@ impl Tool for TeamReplyTool {
             None,
             Some(&details),
         )?;
-        self.store.append_event(AUDIT_REPLIED, &details)?;
-        if let Err(error) = enqueue_turn_task_with_id(&self.store, &child, &to_bot, &payload) {
+        self.store
+            .append_event(&context.user_id, AUDIT_REPLIED, &details)?;
+        if let Err(error) =
+            enqueue_turn_task_with_id(&self.store, &context.user_id, &child, &to_bot, &payload)
+        {
             warn!(bot = %to_bot, %error, "audited peer reply was not queued");
             return Err(error);
         }
         // The peer message belongs to the room transcript: the target bot and
         // the owner both read it as a labelled assistant message.
         self.store.append_message_named(
+            &context.user_id,
             conversation_id,
             Some(turn_id),
             Role::Assistant,
@@ -771,6 +787,11 @@ mod tests {
 
     const ROOM: &str = "room:review";
 
+    /// The bootstrap admin's id â€” the acting user for the team fixtures.
+    fn admin(store: &Store) -> String {
+        store.admin_user_id().unwrap()
+    }
+
     #[test]
     fn group_rules_clause_is_omitted_when_empty_and_bounded_when_long() {
         assert!(group_rules_clause("").is_empty());
@@ -787,12 +808,22 @@ mod tests {
     /// room turn.
     fn store() -> (Store, String) {
         let store = Store::open_in_memory(384).unwrap();
-        store.create_conversation(ROOM, "room", None).unwrap();
+        let admin = admin(&store);
         store
-            .set_conversation_team(ROOM, &["analyst".into(), "maker".into()], "selected", "")
+            .create_conversation(&admin, ROOM, "room", None)
+            .unwrap();
+        store
+            .set_conversation_team(
+                &admin,
+                ROOM,
+                &["analyst".into(), "maker".into()],
+                "selected",
+                "",
+            )
             .unwrap();
         let root = store
             .enqueue_task(
+                &admin,
                 "turn",
                 ORCHESTRATOR_BOT,
                 &json!({"conversation_id": ROOM, "text": "synthetic", "bot": ORCHESTRATOR_BOT}),
@@ -854,8 +885,11 @@ mod tests {
     }
 
     fn context(bot_name: &str, task_id: &str, turn_id: &str) -> ToolContext {
+        // The turn tasks in these fixtures belong to the bootstrap admin.
+        let store = Store::open_in_memory(384).unwrap();
         ToolContext {
-            actor: "owner".into(),
+            user_id: admin(&store),
+            actor: admin(&store),
             bot: bot_name.into(),
             task_id: Some(task_id.into()),
             turn_id: Some(turn_id.into()),
@@ -906,7 +940,7 @@ mod tests {
         let (store, root) = store();
         let tool = TeamAskTool::new(store.clone(), bots(), router());
         let turn = store
-            .create_turn(&root, ORCHESTRATOR_BOT, ROOM, &json!({}))
+            .create_turn(&admin(&store), &root, ORCHESTRATOR_BOT, ROOM, &json!({}))
             .unwrap();
         let context = context(ORCHESTRATOR_BOT, &root, &turn.id);
         let output = tool
@@ -948,7 +982,12 @@ mod tests {
         );
         // The member turn is queued and counted against the room turn.
         assert_eq!(store.count_team_events(&root).unwrap(), 1);
-        assert_eq!(store.count_pending_team_tasks(&root).unwrap(), 1);
+        assert_eq!(
+            store
+                .count_pending_team_tasks(&admin(&store), &root)
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -956,7 +995,7 @@ mod tests {
         let (store, root) = store();
         let tool = TeamAskTool::new(store.clone(), bots(), router());
         let turn = store
-            .create_turn(&root, ORCHESTRATOR_BOT, ROOM, &json!({}))
+            .create_turn(&admin(&store), &root, ORCHESTRATOR_BOT, ROOM, &json!({}))
             .unwrap();
         let context = context(ORCHESTRATOR_BOT, &root, &turn.id);
         // The event stream write fails, so the team ask is not audited.
@@ -980,8 +1019,13 @@ mod tests {
             "{error}"
         );
         // No member turn was queued: the audit came first and failed.
-        assert_eq!(store.count_pending_team_tasks(&root).unwrap(), 0);
-        assert_eq!(store.pending_task_count().unwrap(), 1);
+        assert_eq!(
+            store
+                .count_pending_team_tasks(&admin(&store), &root)
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.pending_task_count(&admin(&store)).unwrap(), 1);
     }
 
     #[tokio::test]
@@ -993,7 +1037,7 @@ mod tests {
             seed(&store, AUDIT_ASKED, &root, ORCHESTRATOR_BOT);
         }
         let turn = store
-            .create_turn(&root, ORCHESTRATOR_BOT, ROOM, &json!({}))
+            .create_turn(&admin(&store), &root, ORCHESTRATOR_BOT, ROOM, &json!({}))
             .unwrap();
         let context = context(ORCHESTRATOR_BOT, &root, &turn.id);
         tool.execute(
@@ -1038,8 +1082,10 @@ mod tests {
         seed(&store, AUDIT_REPLIED, &root, "analyst");
         seed(&store, AUDIT_REPLIED, &root, "analyst");
         let tool = TeamReplyTool::new(store.clone(), bots(), router(), Arc::new(Policy::empty()));
+        let admin = admin(&store);
         let task = store
             .enqueue_task(
+                &admin,
                 "turn",
                 "analyst",
                 &json!({"conversation_id": ROOM, "text": "synthetic", "bot": "analyst"}),
@@ -1049,6 +1095,7 @@ mod tests {
             .unwrap();
         let turn = store
             .create_turn(
+                &admin,
                 &task.id,
                 "analyst",
                 ROOM,
@@ -1072,8 +1119,10 @@ mod tests {
     async fn peer_reply_rounds_stop_at_three() {
         let (store, root) = store();
         let tool = TeamReplyTool::new(store.clone(), bots(), router(), Arc::new(Policy::empty()));
+        let admin = admin(&store);
         let task = store
             .enqueue_task(
+                &admin,
                 "turn",
                 "maker",
                 &json!({"conversation_id": ROOM, "text": "synthetic", "bot": "maker"}),
@@ -1083,6 +1132,7 @@ mod tests {
             .unwrap();
         let turn = store
             .create_turn(
+                &admin,
                 &task.id,
                 "maker",
                 ROOM,
@@ -1103,8 +1153,10 @@ mod tests {
     async fn team_reply_requires_a_team_turn_and_a_team_member() {
         let (store, root) = store();
         let tool = TeamReplyTool::new(store.clone(), bots(), router(), Arc::new(Policy::empty()));
+        let admin = admin(&store);
         let task = store
             .enqueue_task(
+                &admin,
                 "turn",
                 "analyst",
                 &json!({"conversation_id": ROOM, "text": "synthetic", "bot": "analyst"}),
@@ -1114,7 +1166,7 @@ mod tests {
             .unwrap();
         // A turn without a team frame cannot reply.
         let plain = store
-            .create_turn(&task.id, "analyst", ROOM, &json!({}))
+            .create_turn(&admin, &task.id, "analyst", ROOM, &json!({}))
             .unwrap();
         let error = tool
             .execute(
@@ -1127,6 +1179,7 @@ mod tests {
         // A team turn cannot address a bot outside the room team.
         let team_turn = store
             .create_turn(
+                &admin,
                 &task.id,
                 "analyst",
                 ROOM,

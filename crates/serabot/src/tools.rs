@@ -245,7 +245,7 @@ impl Tool for WatchNowTool {
         }
     }
 
-    async fn execute(&self, args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
         let mut sources = crate::config::load_sources(&self.config)?;
         if let Some(name) = args.get("source").and_then(Value::as_str) {
             sources.retain(|source| source.name == name);
@@ -253,7 +253,14 @@ impl Tool for WatchNowTool {
                 return Err(SeraError::NotFound(format!("source {name}")));
             }
         }
-        let reports = watch_all(&self.store, &self.fetcher, &sources, &self.config).await?;
+        let reports = watch_all(
+            &self.store,
+            &context.user_id,
+            &self.fetcher,
+            &sources,
+            &self.config,
+        )
+        .await?;
         let data = serde_json::to_value(&reports)?;
         Ok(ToolOutput {
             content: serde_json::to_string_pretty(&reports)?,
@@ -345,7 +352,7 @@ impl Tool for DocumentIndexTool {
         }
     }
 
-    async fn execute(&self, args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
         let path = args
             .get("path")
             .and_then(Value::as_str)
@@ -355,6 +362,7 @@ impl Tool for DocumentIndexTool {
         if metadata.is_dir() {
             let report = index_directory(
                 &self.store,
+                &context.user_id,
                 self.embedder.as_ref(),
                 &path,
                 &self.config.documents,
@@ -375,6 +383,7 @@ impl Tool for DocumentIndexTool {
         }
         let result = ingest_file(
             &self.store,
+            &context.user_id,
             self.embedder.as_ref(),
             &path,
             &self.config.documents,
@@ -456,7 +465,7 @@ impl Tool for MemorySaveTool {
             .unwrap_or("general");
         let kind = normalize_memory_category(category);
         let source = format!("chat:{}", context.bot);
-        let memory = crate::memory::add(&self.store, kind, content, &source)?;
+        let memory = crate::memory::add(&self.store, &context.user_id, kind, content, &source)?;
         self.store.record_audit(
             &context.actor,
             "memory.created",
@@ -520,7 +529,7 @@ impl Tool for MemoryListTool {
         }
     }
 
-    async fn execute(&self, args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
         let limit = args
             .get("limit")
             .and_then(Value::as_u64)
@@ -531,7 +540,7 @@ impl Tool for MemoryListTool {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let memories = crate::memory::list(&self.store, limit)?;
+        let memories = crate::memory::list(&self.store, &context.user_id, limit)?;
         let filtered = if let Some(q) = query {
             let q_lower = q.to_lowercase();
             memories
@@ -596,7 +605,7 @@ impl Tool for MemoryDeleteTool {
             .get("id")
             .and_then(Value::as_str)
             .ok_or_else(|| SeraError::Validation("id is required".into()))?;
-        let deleted = crate::memory::delete(&self.store, id)?;
+        let deleted = crate::memory::delete(&self.store, &context.user_id, id)?;
         self.store.record_audit(
             &context.actor,
             "memory.deleted",

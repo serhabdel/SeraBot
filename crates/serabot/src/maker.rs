@@ -93,7 +93,10 @@ impl ArtifactStore {
         })
     }
 
-    pub fn approve(&self, store: &Store, hash: &str) -> Result<()> {
+    /// Approve the Italian artifact's content for the acting user. The
+    /// approval marker is content-addressed in `kv` (untouched this phase);
+    /// the audit row records the acting user's id.
+    pub fn approve(&self, store: &Store, user_id: &str, hash: &str) -> Result<()> {
         let artifact = self.load(hash)?;
         if artifact.meta.language != Language::It {
             return Err(SeraError::Validation(
@@ -102,7 +105,7 @@ impl ArtifactStore {
         }
         store.kv_set(&format!("deck_approved:{hash}"), "1")?;
         store.record_audit(
-            "owner",
+            user_id,
             "deck.italian_content_approved",
             None,
             None,
@@ -728,6 +731,7 @@ mod tests {
 
     fn context() -> ToolContext {
         ToolContext {
+            user_id: crate::store::ADMIN_USER_ID.to_owned(),
             actor: "owner".into(),
             bot: "maker".into(),
             task_id: None,
@@ -793,7 +797,9 @@ mod tests {
             .unwrap();
         let args = json!({"spec": deck(Language::Fr), "source_artifact": italian});
         assert!(tool.execute(args.clone(), &context()).await.is_err());
-        artifacts.approve(&store, &italian).unwrap();
+        artifacts
+            .approve(&store, &store.admin_user_id().unwrap(), &italian)
+            .unwrap();
         assert!(tool.execute(args, &context()).await.is_ok());
     }
 

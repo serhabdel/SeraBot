@@ -66,6 +66,11 @@ pub struct ResumePayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduledPayload {
     pub conversation_id: String,
+    /// Owning user carried on the payload (phase 2): the task row's
+    /// `user_id` remains authoritative — the worker always processes under
+    /// the task row's owner.
+    #[serde(default)]
+    pub user_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -118,9 +123,12 @@ pub struct ApprovalNotice {
 
 #[async_trait]
 pub trait Notifier: Send + Sync {
-    async fn send_text(&self, conversation_id: &str, text: &str) -> Result<()>;
+    /// Deliver one text message to the acting user's conversation. The
+    /// user id scopes the delivery (event rows, per-user transports).
+    async fn send_text(&self, user_id: &str, conversation_id: &str, text: &str) -> Result<()>;
     async fn approval_requested(
         &self,
+        user_id: &str,
         conversation_id: &str,
         notice: &ApprovalNotice,
     ) -> Result<()>;
@@ -130,12 +138,13 @@ pub struct NullNotifier;
 
 #[async_trait]
 impl Notifier for NullNotifier {
-    async fn send_text(&self, _conversation_id: &str, _text: &str) -> Result<()> {
+    async fn send_text(&self, _user_id: &str, _conversation_id: &str, _text: &str) -> Result<()> {
         Ok(())
     }
 
     async fn approval_requested(
         &self,
+        _user_id: &str,
         _conversation_id: &str,
         _notice: &ApprovalNotice,
     ) -> Result<()> {
@@ -156,10 +165,10 @@ impl CompositeNotifier {
 
 #[async_trait]
 impl Notifier for CompositeNotifier {
-    async fn send_text(&self, conversation_id: &str, text: &str) -> Result<()> {
+    async fn send_text(&self, user_id: &str, conversation_id: &str, text: &str) -> Result<()> {
         let mut first_error = None;
         for target in &self.targets {
-            if let Err(error) = target.send_text(conversation_id, text).await {
+            if let Err(error) = target.send_text(user_id, conversation_id, text).await {
                 first_error.get_or_insert(error);
             }
         }
@@ -168,12 +177,16 @@ impl Notifier for CompositeNotifier {
 
     async fn approval_requested(
         &self,
+        user_id: &str,
         conversation_id: &str,
         notice: &ApprovalNotice,
     ) -> Result<()> {
         let mut first_error = None;
         for target in &self.targets {
-            if let Err(error) = target.approval_requested(conversation_id, notice).await {
+            if let Err(error) = target
+                .approval_requested(user_id, conversation_id, notice)
+                .await
+            {
                 first_error.get_or_insert(error);
             }
         }
@@ -216,7 +229,7 @@ impl Tool for RagSearchTool {
         }
     }
 
-    async fn execute(&self, args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
         let query = args
             .get("query")
             .and_then(Value::as_str)
@@ -231,7 +244,7 @@ impl Tool for RagSearchTool {
             .map(|value| value as usize)
             .unwrap_or(6)
             .clamp(1, self.max_k);
-        let chunks = self.retriever.retrieve(query, k).await?;
+        let chunks = self.retriever.retrieve(&context.user_id, query, k).await?;
         if chunks.is_empty() {
             return Ok(ToolOutput {
                 content: "No indexed evidence matched this query.".into(),
@@ -341,13 +354,13 @@ impl Runtime {
         self.gateway.scan_egress(text)
     }
 
-    pub async fn refresh_model_catalogs(&self) -> Result<()> {
+    pub async fn refresh_model_catalogs(&self, user_id: &str) -> Result<()> {
         for report in self.router.refresh_catalogs().await? {
             if !report.fetched {
                 continue;
             }
             self.store.record_audit(
-                "owner",
+                user_id,
                 "model.catalog_refreshed",
                 None,
                 None,
@@ -397,8 +410,35 @@ impl Runtime {
             .or_else(|| self.config.llm.bot_models.get(&bot.config.name).cloned())
     }
 
-    pub fn model_selection(&self, conversation_id: &str, bot: &str) -> Result<ModelSelection> {
+    /// Guard a conversation-scoped action for the acting user: a
+    /// conversation that exists must belong to them (another user's
+    /// conversation is indistinguishable from an unknown one); a
+    /// not-yet-created id is allowed (lazy creation happens under the
+    /// acting user).
+    fn guard_conversation_scope(&self, user_id: &str, conversation_id: &str) -> Result<()> {
+        if self
+            .store
+            .get_conversation(user_id, conversation_id)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if self.store.conversation_exists(conversation_id)? {
+            return Err(SeraError::NotFound(format!(
+                "conversation {conversation_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn model_selection(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        bot: &str,
+    ) -> Result<ModelSelection> {
         validate_conversation_id(conversation_id)?;
+        self.guard_conversation_scope(user_id, conversation_id)?;
         let bot = self
             .bots
             .get(bot)
@@ -422,10 +462,12 @@ impl Runtime {
 
     pub fn effective_model_selection(
         &self,
+        user_id: &str,
         conversation_id: &str,
         bot: &str,
     ) -> Result<ModelSelection> {
         validate_conversation_id(conversation_id)?;
+        self.guard_conversation_scope(user_id, conversation_id)?;
         let bot = self
             .bots
             .get(bot)
@@ -449,10 +491,12 @@ impl Runtime {
 
     pub fn select_model(
         &self,
+        user_id: &str,
         conversation_id: &str,
         selection: ModelSelection,
     ) -> Result<ModelSelection> {
         validate_conversation_id(conversation_id)?;
+        self.guard_conversation_scope(user_id, conversation_id)?;
         let stored = if selection.is_auto_mode() {
             if !self.router.autoselect_available() {
                 return Err(SeraError::Forbidden(
@@ -468,7 +512,7 @@ impl Runtime {
         let value = serde_json::to_string(&stored)?;
         self.gateway.scan_egress(&value)?;
         self.store.record_audit(
-            "owner",
+            user_id,
             "model.selected",
             None,
             None,
@@ -494,15 +538,18 @@ impl Runtime {
         Ok(route)
     }
 
+    /// Queue the acting user's message. The conversation must not belong to
+    /// another user (lazy creation happens under the acting user).
     pub fn submit_text(
         &self,
+        user_id: &str,
         conversation_id: &str,
         text: &str,
         bot_override: Option<&str>,
     ) -> Result<Task> {
         validate_conversation_id(conversation_id)?;
         self.store
-            .ensure_conversation_accepts_turns(conversation_id)?;
+            .ensure_conversation_accepts_turns(user_id, conversation_id)?;
         let text = text.trim();
         if text.is_empty() {
             return Err(SeraError::Validation("message is empty".into()));
@@ -512,15 +559,18 @@ impl Runtime {
         }
         if text == "/brief" || text.starts_with("/brief ") {
             let task = self.store.enqueue_task(
+                user_id,
                 "brief",
                 "watcher",
                 &serde_json::to_value(ScheduledPayload {
                     conversation_id: conversation_id.to_owned(),
+                    user_id: user_id.to_owned(),
                 })?,
                 5,
                 Utc::now(),
             )?;
             self.store.append_event(
+                user_id,
                 "task.queued",
                 &json!({"task_id": task.id, "kind": "brief", "bot": "watcher"}),
             )?;
@@ -528,15 +578,18 @@ impl Runtime {
         }
         if text == "/watch" || text.starts_with("/watch ") {
             let task = self.store.enqueue_task(
+                user_id,
                 "watch",
                 "watcher",
                 &serde_json::to_value(ScheduledPayload {
                     conversation_id: conversation_id.to_owned(),
+                    user_id: user_id.to_owned(),
                 })?,
                 5,
                 Utc::now(),
             )?;
             self.store.append_event(
+                user_id,
                 "task.queued",
                 &json!({"task_id": task.id, "kind": "watch", "bot": "watcher"}),
             )?;
@@ -604,7 +657,7 @@ impl Runtime {
         if !self.bots.contains_key(&bot) {
             return Err(SeraError::NotFound(format!("bot {bot}")));
         }
-        let selection = self.effective_model_selection(conversation_id, &bot)?;
+        let selection = self.effective_model_selection(user_id, conversation_id, &bot)?;
         let route = self.router.pin(&selection)?;
         let owner_text = text.clone();
         // In rooms, `@mention` tokens are parsed from the owner text and
@@ -629,6 +682,7 @@ impl Runtime {
             mentions: mentions.clone(),
         };
         let task = self.store.enqueue_task(
+            user_id,
             "turn",
             &bot,
             &serde_json::to_value(payload)?,
@@ -636,6 +690,7 @@ impl Runtime {
             Utc::now(),
         )?;
         self.store.append_event(
+            user_id,
             "task.queued",
             &json!({"task_id": task.id, "kind": "turn", "bot": bot}),
         )?;
@@ -645,7 +700,7 @@ impl Runtime {
         // mentions naming non-members are ignored (never routed).
         if !ask_mode
             && bot == ORCHESTRATOR_BOT
-            && let Some(team) = self.store.get_conversation_team(conversation_id)?
+            && let Some(team) = self.store.get_conversation_team(user_id, conversation_id)?
             && team.mode == TeamMode::All.as_str()
         {
             let mut members = team.members.clone();
@@ -663,7 +718,7 @@ impl Runtime {
                     "kept": kept,
                 });
                 if let Err(error) = self.store.record_audit(
-                    "system",
+                    user_id,
                     "team.mention_filtered",
                     None,
                     Some(&task.id),
@@ -676,16 +731,17 @@ impl Runtime {
                 }
                 members = kept;
             }
-            self.enqueue_team_fanout(conversation_id, &owner_text, &task.id, &members);
+            self.enqueue_team_fanout(user_id, conversation_id, &owner_text, &task.id, &members);
         }
         Ok(task)
     }
 
     /// Queue one turn per room team member for the owner message that opened
-    /// this room turn. Members that cannot be routed are skipped: the owner's
-    /// own message never fails because of the team.
+    /// this room turn, under the acting user. Members that cannot be routed
+    /// are skipped: the owner's own message never fails because of the team.
     fn enqueue_team_fanout(
         &self,
+        user_id: &str,
         conversation_id: &str,
         text: &str,
         root_task_id: &str,
@@ -707,7 +763,7 @@ impl Runtime {
                 round: 0,
             };
             let payload = (|| -> Result<serde_json::Value> {
-                let selection = self.effective_model_selection(conversation_id, member)?;
+                let selection = self.effective_model_selection(user_id, conversation_id, member)?;
                 let route = self.router.pin(&selection)?;
                 Ok(serde_json::to_value(TurnPayload {
                     conversation_id: conversation_id.to_owned(),
@@ -743,7 +799,7 @@ impl Runtime {
             if let Err(error) = self
                 .store
                 .record_audit(
-                    "system",
+                    user_id,
                     AUDIT_ASKED,
                     None,
                     Some(root_task_id),
@@ -752,27 +808,34 @@ impl Runtime {
                     Some(self.gateway.policy().version()),
                     Some(&details),
                 )
-                .and_then(|_| self.store.append_event(AUDIT_ASKED, &details))
+                .and_then(|_| self.store.append_event(user_id, AUDIT_ASKED, &details))
             {
                 warn!(bot = %member, %error, "room team ask was not audited; member turn was not queued");
                 continue;
             }
-            if let Err(error) = enqueue_turn_task_with_id(&self.store, &child, member, &payload) {
+            if let Err(error) =
+                enqueue_turn_task_with_id(&self.store, user_id, &child, member, &payload)
+            {
                 warn!(bot = %member, %error, "audited room team ask was not queued");
             }
         }
     }
 
+    /// Apply the acting user's approval decision and queue the resume turn.
+    /// The decision resolves within the acting user's rows (see
+    /// [`Gateway::decide`]); the resume task is enqueued under the same
+    /// user.
     pub async fn handle_approval(
         &self,
+        user_id: &str,
         approval_id: &str,
         decision: Decision,
     ) -> Result<DecisionResult> {
-        let result = self.gateway.decide(approval_id, decision)?;
+        let result = self.gateway.decide(user_id, approval_id, decision)?;
         let Some(turn_id) = result.action.turn_id.clone() else {
             return Ok(result);
         };
-        let turn = self.store.get_turn(&turn_id)?;
+        let turn = self.store.get_turn(user_id, &turn_id)?;
         let decision_label = match decision {
             Decision::Deny => "denied",
             Decision::Once | Decision::Always => "approved",
@@ -783,6 +846,7 @@ impl Runtime {
             decision: decision_label.into(),
         };
         self.store.enqueue_task(
+            user_id,
             "resume",
             &turn.bot,
             &serde_json::to_value(payload)?,
@@ -791,9 +855,10 @@ impl Runtime {
         )?;
         if let Some(task_id) = result.action.task_id.as_deref() {
             self.store
-                .cancel_task(task_id, "superseded by approval decision")?;
+                .cancel_task(user_id, task_id, "superseded by approval decision")?;
         }
         self.store.append_event(
+            user_id,
             "approval.decided",
             &json!({
                 "approval_id": approval_id,
@@ -861,6 +926,8 @@ impl Runtime {
     }
 
     async fn process_task(&self, task: Task) -> Result<()> {
+        // The worker executes every task under its owning user (phase 2).
+        let user = task.user_id.clone();
         let outcome = match task.kind.as_str() {
             "turn" => self.run_turn(&task).await,
             "resume" => self.resume_turn(&task).await,
@@ -872,13 +939,16 @@ impl Runtime {
         };
         match outcome {
             Ok(TurnOutcome::Completed) => {
-                if !self.store.complete_task(&task.id, task.fencing_token)? {
+                if !self
+                    .store
+                    .complete_task(&user, &task.id, task.fencing_token)?
+                {
                     warn!(task = %task.id, "task completion rejected by fencing token");
                 }
             }
             Ok(TurnOutcome::Suspended) => {
                 self.store.record_audit(
-                    "system",
+                    &user,
                     "task.suspended_for_approval",
                     None,
                     Some(&task.id),
@@ -891,7 +961,7 @@ impl Runtime {
             Err(error) => {
                 error!(task = %task.id, %error, "task failed");
                 self.store.record_audit(
-                    "system",
+                    &user,
                     "task.failed",
                     None,
                     Some(&task.id),
@@ -910,10 +980,15 @@ impl Runtime {
                         | SeraError::InvalidState(_)
                 );
                 if permanent {
-                    self.store
-                        .fail_task_final(&task.id, task.fencing_token, &error.to_string())?;
+                    self.store.fail_task_final(
+                        &user,
+                        &task.id,
+                        task.fencing_token,
+                        &error.to_string(),
+                    )?;
                 } else {
                     self.store.fail_task(
+                        &user,
                         &task.id,
                         task.fencing_token,
                         &error.to_string(),
@@ -926,12 +1001,14 @@ impl Runtime {
                     let _ = self
                         .notifier
                         .send_text(
+                            &user,
                             &payload.conversation_id,
                             "This request failed. The details are available in the audit log.",
                         )
                         .await;
                 }
                 self.store.append_event(
+                    &user,
                     "task.failed",
                     &json!({"task_id": task.id, "error": error.to_string()}),
                 )?;
@@ -943,16 +1020,19 @@ impl Runtime {
     async fn run_brief(&self, task: &Task) -> Result<TurnOutcome> {
         let payload: ScheduledPayload = serde_json::from_value(task.payload.clone())
             .map_err(|error| SeraError::Validation(format!("invalid brief payload: {error}")))?;
+        // The task row's owner is authoritative; the payload's copy is
+        // metadata recorded for observability.
+        let user = task.user_id.clone();
         let tz: chrono_tz::Tz = self
             .config
             .schedule
             .timezone
             .parse()
             .map_err(|_| SeraError::Config("invalid schedule timezone".into()))?;
-        let report = crate::brief::build_brief_report(&self.store, Utc::now(), tz, 24)?;
+        let report = crate::brief::build_brief_report(&self.store, &user, Utc::now(), tz, 24)?;
         let text = if self.gateway.scan_egress(&report.text).is_err() {
             self.store.record_audit(
-                "system",
+                &user,
                 "brief.blocked_by_policy",
                 None,
                 Some(&task.id),
@@ -973,7 +1053,7 @@ impl Runtime {
                 "conversation_id": payload.conversation_id,
             });
             self.store.record_audit(
-                "system",
+                &user,
                 "brief.silent_run",
                 None,
                 Some(&task.id),
@@ -982,13 +1062,15 @@ impl Runtime {
                 Some(self.gateway.policy().version()),
                 Some(&details),
             )?;
-            self.store.append_event("brief.silent_run", &details)?;
+            self.store
+                .append_event(&user, "brief.silent_run", &details)?;
             return Ok(TurnOutcome::Completed);
         }
         self.notifier
-            .send_text(&payload.conversation_id, &text)
+            .send_text(&user, &payload.conversation_id, &text)
             .await?;
         self.store.append_event(
+            &user,
             "brief.delivered",
             &json!({"task_id": task.id, "conversation_id": payload.conversation_id}),
         )?;
@@ -998,10 +1080,12 @@ impl Runtime {
     async fn run_watch(&self, task: &Task) -> Result<TurnOutcome> {
         let payload: ScheduledPayload = serde_json::from_value(task.payload.clone())
             .map_err(|error| SeraError::Validation(format!("invalid watch payload: {error}")))?;
+        let user = task.user_id.clone();
         let sources = crate::config::load_sources(&self.config)?;
         if sources.iter().all(|source| !source.enabled) {
             self.notifier
                 .send_text(
+                    &user,
                     &payload.conversation_id,
                     "No monitoring sources are enabled.",
                 )
@@ -1014,7 +1098,7 @@ impl Runtime {
             self.config.watcher.max_response_bytes,
         )?;
         let reports =
-            crate::watcher::watch_all(&self.store, &fetcher, &sources, &self.config).await?;
+            crate::watcher::watch_all(&self.store, &user, &fetcher, &sources, &self.config).await?;
         let mut failures = 0;
         for report in &reports {
             if !report.ok {
@@ -1032,7 +1116,7 @@ impl Runtime {
                 "failed": failures,
             });
             self.store.record_audit(
-                "system",
+                &user,
                 "watch.silent_run",
                 None,
                 Some(&task.id),
@@ -1041,7 +1125,8 @@ impl Runtime {
                 Some(self.gateway.policy().version()),
                 Some(&details),
             )?;
-            self.store.append_event("watch.silent_run", &details)?;
+            self.store
+                .append_event(&user, "watch.silent_run", &details)?;
             return Ok(TurnOutcome::Completed);
         }
         let mut text = String::from("Source watch\n");
@@ -1059,9 +1144,10 @@ impl Runtime {
                 .to_string();
         }
         self.notifier
-            .send_text(&payload.conversation_id, &text)
+            .send_text(&user, &payload.conversation_id, &text)
             .await?;
         self.store.append_event(
+            &user,
             "watch.completed",
             &json!({
                 "task_id": task.id,
@@ -1076,8 +1162,11 @@ impl Runtime {
         let payload: TurnPayload = serde_json::from_value(task.payload.clone())
             .map_err(|error| SeraError::Validation(format!("invalid turn payload: {error}")))?;
         validate_conversation_id(&payload.conversation_id)?;
+        // The worker processes the turn under the task's owning user (phase
+        // 2): every read and write below is scoped to it.
+        let user = task.user_id.clone();
         self.store
-            .ensure_conversation_accepts_turns(&payload.conversation_id)?;
+            .ensure_conversation_accepts_turns(&user, &payload.conversation_id)?;
         self.checked_route(&payload.route)?;
         let bot = self
             .bots
@@ -1089,7 +1178,7 @@ impl Runtime {
                 payload.bot
             )));
         }
-        if let Some(existing) = self.store.get_turn_by_task(&task.id)? {
+        if let Some(existing) = self.store.get_turn_by_task(&user, &task.id)? {
             if existing.status == "sending_response" {
                 return Err(SeraError::External(
                     "response delivery has an unknown outcome; not resending automatically".into(),
@@ -1104,7 +1193,7 @@ impl Runtime {
                 ));
             }
             if let Some(pending) = &state.pending {
-                let action = self.store.get_action(&pending.action_id)?;
+                let action = self.store.get_action(&user, &pending.action_id)?;
                 if action.status == "outcome_unknown" {
                     return Err(SeraError::External(
                         "a previous external action has an unknown outcome; reconcile it before resuming".into(),
@@ -1119,17 +1208,25 @@ impl Runtime {
         let history = if payload.handoff.is_some() {
             Vec::new()
         } else {
-            self.store
-                .history_for_llm(&payload.conversation_id, self.config.runtime.history_limit)?
+            self.store.history_for_llm(
+                &user,
+                &payload.conversation_id,
+                self.config.runtime.history_limit,
+            )?
         };
         let history_messages = history.len();
-        let turn =
-            self.store
-                .create_turn(&task.id, &payload.bot, &payload.conversation_id, &json!({}))?;
+        let turn = self.store.create_turn(
+            &user,
+            &task.id,
+            &payload.bot,
+            &payload.conversation_id,
+            &json!({}),
+        )?;
         // A handoff or team turn reposts an objective the room already holds as
         // the owner's message; only an owner turn appends it again.
         if payload.handoff.is_none() && payload.team.is_none() {
             self.store.append_message(
+                &user,
                 &payload.conversation_id,
                 Some(&turn.id),
                 Role::User,
@@ -1151,11 +1248,12 @@ impl Runtime {
             history_messages,
         };
         let system = if let Some(ref handoff) = payload.handoff {
-            self.handoff_system_prompt(bot, &payload.text, handoff)?
+            self.handoff_system_prompt(&user, bot, &payload.text, handoff)?
         } else if let Some(team) = &payload.team {
-            self.team_system_prompt(&payload.conversation_id, bot, &payload.text, team)?
+            self.team_system_prompt(&user, &payload.conversation_id, bot, &payload.text, team)?
         } else {
             self.system_prompt(
+                &user,
                 &payload.conversation_id,
                 bot,
                 payload.ask_mode,
@@ -1166,7 +1264,7 @@ impl Runtime {
         state.messages.extend(history);
         state.messages.push(LlmMessage::user(payload.text.clone()));
         self.store
-            .update_turn(&turn.id, "active", &serde_json::to_value(&state)?)?;
+            .update_turn(&user, &turn.id, "active", &serde_json::to_value(&state)?)?;
         self.advance(task, &turn, state, &payload.conversation_id)
             .await
     }
@@ -1174,7 +1272,10 @@ impl Runtime {
     async fn resume_turn(&self, task: &Task) -> Result<TurnOutcome> {
         let payload: ResumePayload = serde_json::from_value(task.payload.clone())
             .map_err(|error| SeraError::Validation(format!("invalid resume payload: {error}")))?;
-        let turn = self.store.get_turn(&payload.turn_id)?;
+        // The resume task is enqueued under the approval owner's user (see
+        // `handle_approval`), so the whole resume runs in that scope.
+        let user = task.user_id.clone();
+        let turn = self.store.get_turn(&user, &payload.turn_id)?;
         let mut state: TurnState = serde_json::from_value(turn.state.clone())
             .map_err(|_| SeraError::InvalidState("stored turn state is invalid".into()))?;
         self.checked_route(&state.route)?;
@@ -1239,13 +1340,14 @@ impl Runtime {
             return self.suspend_for_approval(task, &turn, state, next).await;
         }
         self.store
-            .update_turn(&turn.id, "active", &serde_json::to_value(&state)?)?;
+            .update_turn(&user, &turn.id, "active", &serde_json::to_value(&state)?)?;
         self.advance(task, &turn, state, &turn.conversation_id)
             .await
     }
 
     fn record_assistant(
         &self,
+        user_id: &str,
         conversation_id: &str,
         turn: &Turn,
         text: &str,
@@ -1253,6 +1355,7 @@ impl Runtime {
     ) -> Result<()> {
         let name = assistant_speaker(conversation_id, &turn.bot, handoff);
         self.store.append_message_named(
+            user_id,
             conversation_id,
             Some(&turn.id),
             Role::Assistant,
@@ -1262,23 +1365,27 @@ impl Runtime {
         Ok(())
     }
 
-    /// Post one final assistant reply on every finish path. A handoff turn
-    /// keeps the specialist name in every conversation and records
-    /// `handoff.completed`, including when a limit stops the turn. Other turns
-    /// are labeled only in rooms (see `assistant_speaker`).
+    /// Post one final assistant reply on every finish path, under the task's
+    /// owning user. A handoff turn keeps the specialist name in every
+    /// conversation and records `handoff.completed`, including when a limit
+    /// stops the turn. Other turns are labeled only in rooms (see
+    /// `assistant_speaker`).
     async fn finish_reply(
         &self,
+        user_id: &str,
         conversation_id: &str,
         task: &Task,
         turn: &Turn,
         state: &TurnState,
         text: &str,
     ) -> Result<()> {
-        self.notifier.send_text(conversation_id, text).await?;
+        self.notifier
+            .send_text(user_id, conversation_id, text)
+            .await?;
         if let Some(handoff) = &state.handoff {
-            self.record_assistant(conversation_id, turn, text, true)?;
+            self.record_assistant(user_id, conversation_id, turn, text, true)?;
             self.store.record_audit(
-                "system",
+                user_id,
                 "handoff.completed",
                 None,
                 Some(&task.id),
@@ -1292,17 +1399,23 @@ impl Runtime {
                 })),
             )?;
         } else {
-            self.record_assistant(conversation_id, turn, text, false)?;
+            self.record_assistant(user_id, conversation_id, turn, text, false)?;
         }
         if let Some(team) = &state.team {
-            self.record_team_completion(task, turn, team)?;
+            self.record_team_completion(user_id, task, turn, team)?;
         }
         Ok(())
     }
 
     /// `team.round_completed` closes one member contribution; `team.turn_completed`
     /// closes the room turn once no team task of it is still pending.
-    fn record_team_completion(&self, task: &Task, turn: &Turn, team: &TeamContext) -> Result<()> {
+    fn record_team_completion(
+        &self,
+        user_id: &str,
+        task: &Task,
+        turn: &Turn,
+        team: &TeamContext,
+    ) -> Result<()> {
         let details = json!({
             "root_task_id": team.root_task_id,
             "root_turn_id": team.root_turn_id,
@@ -1311,7 +1424,7 @@ impl Runtime {
             "round": team.round,
         });
         self.store.record_audit(
-            "system",
+            user_id,
             AUDIT_ROUND_COMPLETED,
             None,
             Some(&task.id),
@@ -1320,15 +1433,20 @@ impl Runtime {
             Some(self.gateway.policy().version()),
             Some(&details),
         )?;
-        self.store.append_event(AUDIT_ROUND_COMPLETED, &details)?;
-        if self.store.count_pending_team_tasks(&team.root_task_id)? <= 1 {
+        self.store
+            .append_event(user_id, AUDIT_ROUND_COMPLETED, &details)?;
+        if self
+            .store
+            .count_pending_team_tasks(user_id, &team.root_task_id)?
+            <= 1
+        {
             let closing = json!({
                 "root_task_id": team.root_task_id,
                 "bot": turn.bot,
                 "round": team.round,
             });
             self.store.record_audit(
-                "system",
+                user_id,
                 AUDIT_TURN_COMPLETED,
                 None,
                 Some(&task.id),
@@ -1337,7 +1455,8 @@ impl Runtime {
                 Some(self.gateway.policy().version()),
                 Some(&closing),
             )?;
-            self.store.append_event(AUDIT_TURN_COMPLETED, &closing)?;
+            self.store
+                .append_event(user_id, AUDIT_TURN_COMPLETED, &closing)?;
         }
         Ok(())
     }
@@ -1353,6 +1472,7 @@ impl Runtime {
             .bots
             .get(&turn.bot)
             .ok_or_else(|| SeraError::NotFound(format!("bot {}", turn.bot)))?;
+        let user = task.user_id.clone();
         let context = self.tool_context(task, turn, bot, &state)?;
         let mut tool_names = bot.config.tools.clone();
         for extra in [TEAM_ASK_TOOL, TEAM_REPLY_TOOL] {
@@ -1413,7 +1533,7 @@ impl Runtime {
                 .complete(route, &state.messages, &tool_specs, temperature)
                 .await?;
             self.store.record_audit(
-                "system",
+                &user,
                 "model.used",
                 None,
                 Some(&task.id),
@@ -1437,7 +1557,7 @@ impl Runtime {
                     let report = validate_citations(&text, &state.evidence);
                     if !report.valid {
                         self.store.record_audit(
-                            "system",
+                            &user,
                             "ask.citations_rejected",
                             None,
                             Some(&task.id),
@@ -1457,15 +1577,21 @@ impl Runtime {
                         "I cannot share that output because it violates the content policy.".into();
                 }
                 self.store.update_turn(
+                    &user,
                     &turn.id,
                     "sending_response",
                     &serde_json::to_value(&state)?,
                 )?;
-                self.finish_reply(conversation_id, task, turn, &state, &text)
+                self.finish_reply(&user, conversation_id, task, turn, &state, &text)
                     .await?;
-                self.store
-                    .update_turn(&turn.id, "completed", &serde_json::to_value(&state)?)?;
+                self.store.update_turn(
+                    &user,
+                    &turn.id,
+                    "completed",
+                    &serde_json::to_value(&state)?,
+                )?;
                 self.store.append_event(
+                    &user,
                     "turn.completed",
                     &json!({"turn_id": turn.id, "task_id": task.id}),
                 )?;
@@ -1476,10 +1602,14 @@ impl Runtime {
             let requested = state.tool_calls + tool_calls.len();
             if requested > self.config.runtime.max_tool_calls_per_turn {
                 let text = "I stopped because this turn exceeded the tool-call limit.".to_string();
-                self.finish_reply(conversation_id, task, turn, &state, &text)
+                self.finish_reply(&user, conversation_id, task, turn, &state, &text)
                     .await?;
-                self.store
-                    .update_turn(&turn.id, "stopped", &serde_json::to_value(&state)?)?;
+                self.store.update_turn(
+                    &user,
+                    &turn.id,
+                    "stopped",
+                    &serde_json::to_value(&state)?,
+                )?;
                 return Ok(TurnOutcome::Completed);
             }
             state
@@ -1494,11 +1624,18 @@ impl Runtime {
             if state.handoff_queued {
                 let label = state.handoff_to_bot.as_deref().unwrap_or("specialist");
                 let text = format!("Queued handoff to {label}.");
-                self.notifier.send_text(conversation_id, &text).await?;
-                self.record_assistant(conversation_id, turn, &text, false)?;
-                self.store
-                    .update_turn(&turn.id, "completed", &serde_json::to_value(&state)?)?;
+                self.notifier
+                    .send_text(&user, conversation_id, &text)
+                    .await?;
+                self.record_assistant(&user, conversation_id, turn, &text, false)?;
+                self.store.update_turn(
+                    &user,
+                    &turn.id,
+                    "completed",
+                    &serde_json::to_value(&state)?,
+                )?;
                 self.store.append_event(
+                    &user,
                     "turn.completed",
                     &json!({"turn_id": turn.id, "task_id": task.id, "handoff_queued": true}),
                 )?;
@@ -1506,24 +1643,31 @@ impl Runtime {
             }
             if state.team_asked {
                 let text = "Asked the room team to answer.".to_string();
-                self.notifier.send_text(conversation_id, &text).await?;
-                self.record_assistant(conversation_id, turn, &text, false)?;
-                self.store
-                    .update_turn(&turn.id, "completed", &serde_json::to_value(&state)?)?;
+                self.notifier
+                    .send_text(&user, conversation_id, &text)
+                    .await?;
+                self.record_assistant(&user, conversation_id, turn, &text, false)?;
+                self.store.update_turn(
+                    &user,
+                    &turn.id,
+                    "completed",
+                    &serde_json::to_value(&state)?,
+                )?;
                 self.store.append_event(
+                    &user,
                     "turn.completed",
                     &json!({"turn_id": turn.id, "task_id": task.id, "team_asked": true}),
                 )?;
                 return Ok(TurnOutcome::Completed);
             }
             self.store
-                .update_turn(&turn.id, "active", &serde_json::to_value(&state)?)?;
+                .update_turn(&user, &turn.id, "active", &serde_json::to_value(&state)?)?;
         }
         let text = "I stopped because the turn reached its tool-iteration limit.".to_string();
-        self.finish_reply(conversation_id, task, turn, &state, &text)
+        self.finish_reply(&user, conversation_id, task, turn, &state, &text)
             .await?;
         self.store
-            .update_turn(&turn.id, "stopped", &serde_json::to_value(&state)?)?;
+            .update_turn(&user, &turn.id, "stopped", &serde_json::to_value(&state)?)?;
         Ok(TurnOutcome::Completed)
     }
 
@@ -1681,21 +1825,24 @@ impl Runtime {
         mut state: TurnState,
         pending: PendingTool,
     ) -> Result<TurnOutcome> {
-        let approval = self.store.get_approval(&pending.approval_id)?;
-        let action = self.store.get_action(&pending.action_id)?;
+        let user = task.user_id.clone();
+        let approval = self.store.get_approval(&user, &pending.approval_id)?;
+        let action = self.store.get_action(&user, &pending.action_id)?;
         let notice = ApprovalNotice {
             approval: approval.clone(),
             action: action.clone(),
         };
         state.pending = Some(pending);
         self.store.update_turn(
+            &user,
             &turn.id,
             "awaiting_approval",
             &serde_json::to_value(&state)?,
         )?;
         self.store
-            .await_approval_task(&task.id, task.fencing_token)?;
+            .await_approval_task(&user, &task.id, task.fencing_token)?;
         self.store.append_event(
+            &user,
             "approval.requested",
             &json!({
                 "approval_id": approval.id,
@@ -1704,11 +1851,14 @@ impl Runtime {
             }),
         )?;
         self.notifier
-            .approval_requested(&turn.conversation_id, &notice)
+            .approval_requested(&user, &turn.conversation_id, &notice)
             .await?;
         Ok(TurnOutcome::Suspended)
     }
 
+    /// The tool context for one turn: the task's owning user is the
+    /// authoritative actor for every user-owned row the tools touch, and the
+    /// audit actor mirrors it.
     fn tool_context(
         &self,
         task: &Task,
@@ -1716,6 +1866,7 @@ impl Runtime {
         bot: &LoadedBot,
         state: &TurnState,
     ) -> Result<ToolContext> {
+        let user = task.user_id.clone();
         let mut allowed_tools = bot.config.tools.iter().cloned().collect::<HashSet<_>>();
         if bot.config.role != BotRole::Orchestrator {
             allowed_tools.remove(DELEGATE_TOOL);
@@ -1734,7 +1885,7 @@ impl Runtime {
             )
             && self
                 .store
-                .get_conversation_team(&turn.conversation_id)?
+                .get_conversation_team(&user, &turn.conversation_id)?
                 .is_some_and(|team| team.mode == TeamMode::Selected.as_str())
         {
             allowed_tools.insert(TEAM_ASK_TOOL.to_string());
@@ -1745,7 +1896,8 @@ impl Runtime {
             }
         }
         Ok(ToolContext {
-            actor: "owner".into(),
+            user_id: user.clone(),
+            actor: user,
             bot: bot.config.name.clone(),
             task_id: Some(task.id.clone()),
             turn_id: Some(turn.id.clone()),
@@ -1755,15 +1907,17 @@ impl Runtime {
         })
     }
 
-    /// Participant prompt for a bot taking part in a room team turn.
+    /// Participant prompt for a bot taking part in the acting user's room
+    /// team turn.
     fn team_system_prompt(
         &self,
+        user_id: &str,
         conversation_id: &str,
         bot: &LoadedBot,
         objective: &str,
         context: &TeamContext,
     ) -> Result<String> {
-        let team = self.store.get_conversation_team(conversation_id)?;
+        let team = self.store.get_conversation_team(user_id, conversation_id)?;
         let members = team
             .as_ref()
             .map(|team| team.members.clone())
@@ -1785,7 +1939,7 @@ impl Runtime {
             "\nCurrent UTC date: {}.\n",
             Utc::now().format("%Y-%m-%d")
         ));
-        if let Ok(memories) = crate::memory::list(&self.store, 20)
+        if let Ok(memories) = crate::memory::list(&self.store, user_id, 20)
             && !memories.is_empty()
         {
             prompt.push_str("\nOWNER-APPROVED FACTS (reviewable, not policy):\n");
@@ -1803,6 +1957,7 @@ impl Runtime {
 
     fn handoff_system_prompt(
         &self,
+        user_id: &str,
         bot: &LoadedBot,
         objective: &str,
         handoff: &HandoffContext,
@@ -1826,7 +1981,7 @@ impl Runtime {
         if !handoff.memory_ids.is_empty() {
             prompt.push_str("\nATTACHED MEMORIES\n");
             for memory_id in &handoff.memory_ids {
-                let memory = memory::get(&self.store, memory_id)?;
+                let memory = memory::get(&self.store, user_id, memory_id)?;
                 prompt.push_str("- [");
                 prompt.push_str(&memory.id);
                 prompt.push_str("] ");
@@ -1838,7 +1993,7 @@ impl Runtime {
             "\nCurrent UTC date: {}.\n",
             Utc::now().format("%Y-%m-%d")
         ));
-        if let Ok(memories) = crate::memory::list(&self.store, 20)
+        if let Ok(memories) = crate::memory::list(&self.store, user_id, 20)
             && !memories.is_empty()
         {
             prompt.push_str("\nOWNER-APPROVED FACTS (reviewable, not policy):\n");
@@ -1854,8 +2009,12 @@ impl Runtime {
         Ok(prompt)
     }
 
+    /// The system prompt for the acting user's conversation, including the
+    /// user's own memories (phase 2: the injection list is the acting user's
+    /// 20 most recent rows, never another user's).
     fn system_prompt(
         &self,
+        user_id: &str,
         conversation_id: &str,
         bot: &LoadedBot,
         ask_mode: bool,
@@ -1878,7 +2037,7 @@ impl Runtime {
         }
         let team = self
             .store
-            .get_conversation_team(conversation_id)
+            .get_conversation_team(user_id, conversation_id)
             .ok()
             .flatten();
         if bot.config.name == ORCHESTRATOR_BOT
@@ -1908,7 +2067,7 @@ impl Runtime {
             "- Current UTC date: {}.\n",
             Utc::now().format("%Y-%m-%d")
         ));
-        if let Ok(memories) = crate::memory::list(&self.store, 20)
+        if let Ok(memories) = crate::memory::list(&self.store, user_id, 20)
             && !memories.is_empty()
         {
             prompt.push_str("\nOWNER-APPROVED FACTS (reviewable, not policy):\n");
@@ -2076,6 +2235,12 @@ mod tests {
         );
     }
 
+    /// The bootstrap admin's id â€” the acting user for the single-operator
+    /// flows the runtime tests exercise.
+    fn admin(store: &Store) -> String {
+        store.admin_user_id().unwrap()
+    }
+
     use crate::gateway::{ApprovalDetails, ToolRegistry};
     use crate::llm::LlmClient;
     use crate::store::Store;
@@ -2116,13 +2281,19 @@ mod tests {
 
     #[async_trait]
     impl Notifier for Capture {
-        async fn send_text(&self, _conversation_id: &str, text: &str) -> Result<()> {
+        async fn send_text(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            text: &str,
+        ) -> Result<()> {
             self.texts.lock().unwrap().push(text.to_owned());
             Ok(())
         }
 
         async fn approval_requested(
             &self,
+            _user_id: &str,
             _conversation_id: &str,
             notice: &ApprovalNotice,
         ) -> Result<()> {
@@ -2284,7 +2455,10 @@ mod tests {
         config.llm.models.push("alternative".into());
         let runtime = restart(&runtime, config.clone(), vec![bot()]);
         assert_eq!(
-            runtime.model_selection("owner", "main").unwrap().model,
+            runtime
+                .model_selection(&admin(&store), "owner", "main")
+                .unwrap()
+                .model,
             "configured"
         );
         let mut loaded_bot = bot();
@@ -2292,7 +2466,10 @@ mod tests {
         config.llm.data_egress_approved = false;
         let runtime = restart(&runtime, config, vec![loaded_bot]);
         assert_eq!(
-            runtime.model_selection("owner", "main").unwrap().model,
+            runtime
+                .model_selection(&admin(&store), "owner", "main")
+                .unwrap()
+                .model,
             "loaded"
         );
         assert_eq!(
@@ -2302,6 +2479,7 @@ mod tests {
         assert!(
             runtime
                 .select_model(
+                    &admin(&store),
                     "owner",
                     ModelSelection {
                         provider: "default".into(),
@@ -2310,10 +2488,22 @@ mod tests {
                 )
                 .is_err()
         );
-        assert!(runtime.submit_text("owner", "synthetic", None).is_err());
+        assert!(
+            runtime
+                .submit_text(&admin(&store), "owner", "synthetic", None)
+                .is_err()
+        );
         assert!(store.kv_get("model_selection:owner").unwrap().is_none());
-        assert!(runtime.submit_text("owner", "/brief", None).is_ok());
-        assert!(runtime.submit_text("owner", "/watch", None).is_ok());
+        assert!(
+            runtime
+                .submit_text(&admin(&store), "owner", "/brief", None)
+                .is_ok()
+        );
+        assert!(
+            runtime
+                .submit_text(&admin(&store), "owner", "/watch", None)
+                .is_ok()
+        );
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
@@ -2332,7 +2522,9 @@ mod tests {
             .expect(1)
             .mount(&first)
             .await;
-        let task = runtime.submit_text("owner", "synthetic", None).unwrap();
+        let task = runtime
+            .submit_text(&admin(&store), "owner", "synthetic", None)
+            .unwrap();
         assert_eq!(
             runtime.run_turn(&task).await.unwrap(),
             TurnOutcome::Suspended
@@ -2341,12 +2533,18 @@ mod tests {
         config.llm.base_url = second.uri();
         let changed = restart(&runtime, config, vec![bot()]);
         assert!(changed.run_turn(&task).await.is_err());
-        let approval = store.list_pending_approvals(1).unwrap().remove(0);
+        let approval = store
+            .list_pending_approvals(&admin(&store), 1)
+            .unwrap()
+            .remove(0);
         runtime
-            .handle_approval(&approval.id, Decision::Once)
+            .handle_approval(&admin(&store), &approval.id, Decision::Once)
             .await
             .unwrap();
-        let turn = store.get_turn_by_task(&task.id).unwrap().unwrap();
+        let turn = store
+            .get_turn_by_task(&admin(&store), &task.id)
+            .unwrap()
+            .unwrap();
         let mut resume = task.clone();
         resume.kind = "resume".into();
         resume.payload =
@@ -2366,20 +2564,26 @@ mod tests {
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         );
         runtime
-            .select_model("owner", ModelSelection::auto_mode())
+            .select_model(&admin(&store), "owner", ModelSelection::auto_mode())
             .unwrap();
         assert_eq!(
-            runtime.model_selection("owner", "main").unwrap(),
+            runtime
+                .model_selection(&admin(&store), "owner", "main")
+                .unwrap(),
             ModelSelection::auto_mode()
         );
         assert_eq!(
-            runtime.effective_model_selection("owner", "main").unwrap(),
+            runtime
+                .effective_model_selection(&admin(&store), "owner", "main")
+                .unwrap(),
             ModelSelection {
                 provider: "default".into(),
                 model: "test".into(),
             }
         );
-        let task = runtime.submit_text("owner", "synthetic", None).unwrap();
+        let task = runtime
+            .submit_text(&admin(&store), "owner", "synthetic", None)
+            .unwrap();
         let payload: TurnPayload = serde_json::from_value(task.payload.clone()).unwrap();
         assert_eq!(
             payload.route.unwrap().selection,
@@ -2402,22 +2606,43 @@ mod tests {
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         );
         runtime.router.add_default_model("alternative").unwrap();
-        let initial = runtime.model_selection("one", "main").unwrap();
-        let task = runtime.submit_text("one", "synthetic", None).unwrap();
+        let initial = runtime
+            .model_selection(&admin(&store), "one", "main")
+            .unwrap();
+        let task = runtime
+            .submit_text(&admin(&store), "one", "synthetic", None)
+            .unwrap();
         let alternative = ModelSelection {
             provider: "default".into(),
             model: "alternative".into(),
         };
-        runtime.select_model("one", alternative.clone()).unwrap();
-        assert_eq!(runtime.model_selection("one", "main").unwrap(), alternative);
-        assert_eq!(runtime.model_selection("two", "main").unwrap(), initial);
+        runtime
+            .select_model(&admin(&store), "one", alternative.clone())
+            .unwrap();
+        assert_eq!(
+            runtime
+                .model_selection(&admin(&store), "one", "main")
+                .unwrap(),
+            alternative
+        );
+        assert_eq!(
+            runtime
+                .model_selection(&admin(&store), "two", "main")
+                .unwrap(),
+            initial
+        );
         let persisted: ModelSelection =
             serde_json::from_str(&store.kv_get("model_selection:one").unwrap().unwrap()).unwrap();
         assert_eq!(persisted, alternative);
         let mut config = (*runtime.config).clone();
         config.llm.models.push("alternative".into());
         let runtime = restart(&runtime, config, vec![bot()]);
-        assert_eq!(runtime.model_selection("one", "main").unwrap(), alternative);
+        assert_eq!(
+            runtime
+                .model_selection(&admin(&store), "one", "main")
+                .unwrap(),
+            alternative
+        );
         let payload: TurnPayload = serde_json::from_value(task.payload.clone()).unwrap();
         assert_eq!(payload.route.unwrap().selection, initial);
         Mock::given(method("POST"))
@@ -2433,8 +2658,12 @@ mod tests {
             .await;
         runtime.run_turn(&task).await.unwrap();
         for id in ["", "../owner", "with space", "é", &"a".repeat(129)] {
-            assert!(runtime.model_selection(id, "main").is_err());
-            assert!(runtime.select_model(id, alternative.clone()).is_err());
+            assert!(runtime.model_selection(&admin(&store), id, "main").is_err());
+            assert!(
+                runtime
+                    .select_model(&admin(&store), id, alternative.clone())
+                    .is_err()
+            );
         }
     }
 
@@ -2459,7 +2688,11 @@ mod tests {
             provider: "default".into(),
             model: "restricted".into(),
         };
-        assert!(runtime.select_model("owner", selection.clone()).is_err());
+        assert!(
+            runtime
+                .select_model(&admin(&store), "owner", selection.clone())
+                .is_err()
+        );
         assert!(store.kv_get("model_selection:owner").unwrap().is_none());
         store
             .kv_set(
@@ -2467,7 +2700,11 @@ mod tests {
                 &serde_json::to_string(&selection).unwrap(),
             )
             .unwrap();
-        assert!(runtime.model_selection("owner", "main").is_err());
+        assert!(
+            runtime
+                .model_selection(&admin(&store), "owner", "main")
+                .is_err()
+        );
         let mut message = LlmMessage::user("safe");
         message.name = Some("restricted".into());
         assert!(runtime.scan_model_messages(&[message]).is_err());
@@ -2484,6 +2721,7 @@ mod tests {
         );
         let task = store
             .enqueue_task(
+                &admin(&store),
                 "turn",
                 "main",
                 &json!({"conversation_id":"owner","text":"synthetic","bot":"main"}),
@@ -2508,14 +2746,16 @@ mod tests {
         let notifier = Arc::new(Capture::default());
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (runtime, store) = setup(&server.uri(), notifier.clone(), calls);
-        runtime.submit_text("owner", "salut", None).unwrap();
+        runtime
+            .submit_text(&admin(&store), "owner", "salut", None)
+            .unwrap();
         let task = store.claim_task("test", 30).unwrap().unwrap();
         runtime.process_task(task).await.unwrap();
         assert_eq!(
             notifier.texts.lock().unwrap().as_slice(),
             ["bonjour".to_string()]
         );
-        assert_eq!(store.pending_task_count().unwrap(), 0);
+        assert_eq!(store.pending_task_count(&admin(&store)).unwrap(), 0);
     }
 
     #[tokio::test]
@@ -2548,14 +2788,17 @@ mod tests {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (mut runtime, store) = setup(&server.uri(), notifier.clone(), calls.clone());
         runtime.router.add_default_model("alternative").unwrap();
-        runtime.submit_text("owner", "deliver it", None).unwrap();
+        runtime
+            .submit_text(&admin(&store), "owner", "deliver it", None)
+            .unwrap();
         let task = store.claim_task("test", 30).unwrap().unwrap();
         runtime.process_task(task).await.unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-        let approvals = store.list_pending_approvals(10).unwrap();
+        let approvals = store.list_pending_approvals(&admin(&store), 10).unwrap();
         assert_eq!(approvals.len(), 1);
         runtime
             .select_model(
+                &admin(&store),
                 "owner",
                 ModelSelection {
                     provider: "default".into(),
@@ -2564,7 +2807,7 @@ mod tests {
             )
             .unwrap();
         runtime
-            .handle_approval(&approvals[0].id, Decision::Once)
+            .handle_approval(&admin(&store), &approvals[0].id, Decision::Once)
             .await
             .unwrap();
         let resume = store.claim_task("test", 30).unwrap().unwrap();
@@ -2579,7 +2822,12 @@ mod tests {
                 .iter()
                 .any(|text| text == "delivered")
         );
-        assert!(store.list_pending_approvals(10).unwrap().is_empty());
+        assert!(
+            store
+                .list_pending_approvals(&admin(&store), 10)
+                .unwrap()
+                .is_empty()
+        );
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2);
         for request in requests {
@@ -2743,10 +2991,12 @@ mod tests {
             .await;
         let notifier = Arc::new(Capture::default());
         let (runtime, store) = setup_orchestration(&server.uri(), notifier.clone());
-        runtime.submit_text("owner", "review cash", None).unwrap();
+        runtime
+            .submit_text(&admin(&store), "owner", "review cash", None)
+            .unwrap();
         let parent = store.claim_task("worker", 30).unwrap().unwrap();
         runtime.process_task(parent.clone()).await.unwrap();
-        assert_eq!(store.pending_task_count().unwrap(), 1);
+        assert_eq!(store.pending_task_count(&admin(&store)).unwrap(), 1);
         assert!(
             notifier
                 .texts
@@ -2758,7 +3008,7 @@ mod tests {
         let child = store.claim_task("worker", 30).unwrap().unwrap();
         assert_eq!(child.bot, "analyst");
         runtime.process_task(child).await.unwrap();
-        let messages = store.list_messages("owner", 20).unwrap();
+        let messages = store.list_messages(&admin(&store), "owner", 20).unwrap();
         let specialist = messages
             .iter()
             .find(|message| message.name.as_deref() == Some("analyst"))
@@ -2798,7 +3048,7 @@ mod tests {
         let notifier = Arc::new(Capture::default());
         let (runtime, store) = setup_orchestration(&server.uri(), notifier);
         runtime
-            .submit_text("room:review", "review the notes", None)
+            .submit_text(&admin(&store), "room:review", "review the notes", None)
             .unwrap();
         let parent = store.claim_task("worker", 30).unwrap().unwrap();
         assert_eq!(parent.bot, "main");
@@ -2807,7 +3057,9 @@ mod tests {
         assert_eq!(child.bot, "analyst");
         runtime.process_task(child).await.unwrap();
 
-        let messages = store.list_visible_messages("room:review", 20).unwrap();
+        let messages = store
+            .list_visible_messages(&admin(&store), "room:review", 20)
+            .unwrap();
         let speakers = messages
             .iter()
             .map(|message| {
@@ -2842,14 +3094,14 @@ mod tests {
         let (runtime, store) =
             setup_orchestration("http://127.0.0.1:9", Arc::new(Capture::default()));
         let direct = runtime
-            .submit_text("dir:analyst", "synthetic", None)
+            .submit_text(&admin(&store), "dir:analyst", "synthetic", None)
             .unwrap();
         assert_eq!(direct.bot, "analyst");
         let unknown = runtime
-            .submit_text("dir:unknown", "synthetic", None)
+            .submit_text(&admin(&store), "dir:unknown", "synthetic", None)
             .unwrap();
         assert_eq!(unknown.bot, "main");
-        assert_eq!(store.pending_task_count().unwrap(), 2);
+        assert_eq!(store.pending_task_count(&admin(&store)).unwrap(), 2);
     }
 
     #[tokio::test]
@@ -2857,12 +3109,12 @@ mod tests {
         let server = MockServer::start().await;
         let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
         let task = runtime
-            .submit_text("room:review", "synthetic", Some("analyst"))
+            .submit_text(&admin(&store), "room:review", "synthetic", Some("analyst"))
             .unwrap();
         assert_eq!(task.bot, "main");
-        assert_eq!(store.pending_task_count().unwrap(), 1);
+        assert_eq!(store.pending_task_count(&admin(&store)).unwrap(), 1);
         let direct = runtime
-            .submit_text("dir:analyst", "synthetic", Some("analyst"))
+            .submit_text(&admin(&store), "dir:analyst", "synthetic", Some("analyst"))
             .unwrap();
         assert_eq!(direct.bot, "analyst");
         assert!(server.received_requests().await.unwrap().is_empty());
@@ -2916,14 +3168,18 @@ mod tests {
             .await;
         let notifier = Arc::new(Capture::default());
         let (runtime, store) = setup_orchestration(&server.uri(), notifier);
-        runtime.submit_text("owner", "review notes", None).unwrap();
+        runtime
+            .submit_text(&admin(&store), "owner", "review notes", None)
+            .unwrap();
         let parent = store.claim_task("worker", 30).unwrap().unwrap();
         runtime.process_task(parent).await.unwrap();
         let child = store.claim_task("worker", 30).unwrap().unwrap();
         assert_eq!(child.bot, "analyst");
         runtime.process_task(child).await.unwrap();
 
-        let messages = store.list_visible_messages("owner", 20).unwrap();
+        let messages = store
+            .list_visible_messages(&admin(&store), "owner", 20)
+            .unwrap();
         let stopped = messages
             .iter()
             .find(|message| message.content.contains("tool-call limit"))
@@ -2975,10 +3231,11 @@ mod tests {
         let notifier = Arc::new(Capture::default());
         let (runtime, store) = setup_orchestration(&server.uri(), notifier);
         store
-            .create_conversation("room:review", "room", None)
+            .create_conversation(&admin(&store), "room:review", "room", None)
             .unwrap();
         store
             .set_conversation_team(
+                &admin(&store),
                 "room:review",
                 &["analyst".into(), "maker".into()],
                 "selected",
@@ -2986,12 +3243,12 @@ mod tests {
             )
             .unwrap();
         runtime
-            .submit_text("room:review", "review the notes", None)
+            .submit_text(&admin(&store), "room:review", "review the notes", None)
             .unwrap();
         let main_task = store.claim_task("worker", 30).unwrap().unwrap();
         assert_eq!(main_task.bot, "main");
         runtime.process_task(main_task).await.unwrap();
-        assert_eq!(store.pending_task_count().unwrap(), 2);
+        assert_eq!(store.pending_task_count(&admin(&store)).unwrap(), 2);
 
         let analyst = store.claim_task("worker", 30).unwrap().unwrap();
         assert_eq!(analyst.bot, "analyst");
@@ -3009,7 +3266,9 @@ mod tests {
         assert_eq!(maker.bot, "maker");
         runtime.process_task(maker).await.unwrap();
 
-        let messages = store.list_visible_messages("room:review", 20).unwrap();
+        let messages = store
+            .list_visible_messages(&admin(&store), "room:review", 20)
+            .unwrap();
         let speakers = messages
             .iter()
             .map(|message| {
@@ -3063,10 +3322,11 @@ mod tests {
         let server = MockServer::start().await;
         let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
         store
-            .create_conversation("room:review", "room", None)
+            .create_conversation(&admin(&store), "room:review", "room", None)
             .unwrap();
         store
             .set_conversation_team(
+                &admin(&store),
                 "room:review",
                 &["analyst".into(), "maker".into()],
                 "all",
@@ -3074,10 +3334,10 @@ mod tests {
             )
             .unwrap();
         let task = runtime
-            .submit_text("room:review", "synthetic", None)
+            .submit_text(&admin(&store), "room:review", "synthetic", None)
             .unwrap();
         assert_eq!(task.bot, "main");
-        assert_eq!(store.pending_task_count().unwrap(), 3);
+        assert_eq!(store.pending_task_count(&admin(&store)).unwrap(), 3);
         let mut bots = Vec::new();
         for _ in 0..3 {
             bots.push(store.claim_task("worker", 30).unwrap().unwrap().bot);
@@ -3122,10 +3382,11 @@ mod tests {
             .await;
         let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
         store
-            .create_conversation("room:review", "room", None)
+            .create_conversation(&admin(&store), "room:review", "room", None)
             .unwrap();
         store
             .set_conversation_team(
+                &admin(&store),
                 "room:review",
                 &["analyst".into(), "maker".into()],
                 "selected",
@@ -3133,11 +3394,12 @@ mod tests {
             )
             .unwrap();
         let selection = runtime
-            .effective_model_selection("room:review", "analyst")
+            .effective_model_selection(&admin(&store), "room:review", "analyst")
             .unwrap();
         let route = runtime.router.pin(&selection).unwrap();
         let task = store
             .enqueue_task(
+                &admin(&store),
                 "turn",
                 "analyst",
                 &json!({
@@ -3159,8 +3421,10 @@ mod tests {
 
         assert_eq!(store.count_peer_replies("root-task", "analyst").unwrap(), 2);
         assert_eq!(store.count_team_events("root-task").unwrap(), 2);
-        assert_eq!(store.pending_task_count().unwrap(), 2);
-        let messages = store.list_messages("room:review", 20).unwrap();
+        assert_eq!(store.pending_task_count(&admin(&store)).unwrap(), 2);
+        let messages = store
+            .list_messages(&admin(&store), "room:review", 20)
+            .unwrap();
         let peer: Vec<_> = messages
             .iter()
             .filter(|message| message.content.starts_with("(to maker)"))
@@ -3239,10 +3503,11 @@ mod tests {
         let server = MockServer::start().await;
         let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
         store
-            .create_conversation("room:review", "room", None)
+            .create_conversation(&admin(&store), "room:review", "room", None)
             .unwrap();
         store
             .set_conversation_team(
+                &admin(&store),
                 "room:review",
                 &["analyst".into(), "maker".into()],
                 "all",
@@ -3250,14 +3515,20 @@ mod tests {
             )
             .unwrap();
         let task = runtime
-            .submit_text("room:review", "@analyst please review @nobody", None)
+            .submit_text(
+                &admin(&store),
+                "room:review",
+                "@analyst please review @nobody",
+                None,
+            )
             .unwrap();
         assert_eq!(task.bot, "main");
         let payload: TurnPayload =
-            serde_json::from_value(store.get_task(&task.id).unwrap().payload).unwrap();
+            serde_json::from_value(store.get_task(&admin(&store), &task.id).unwrap().payload)
+                .unwrap();
         assert_eq!(payload.mentions, vec!["analyst".to_string()]);
         // Fan-out is restricted to mentioned ∩ members: main + analyst only.
-        assert_eq!(store.pending_task_count().unwrap(), 2);
+        assert_eq!(store.pending_task_count(&admin(&store)).unwrap(), 2);
         let mut bots = Vec::new();
         for _ in 0..2 {
             bots.push(store.claim_task("worker", 30).unwrap().unwrap().bot);
@@ -3282,10 +3553,11 @@ mod tests {
         let server = MockServer::start().await;
         let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
         store
-            .create_conversation("room:review", "room", None)
+            .create_conversation(&admin(&store), "room:review", "room", None)
             .unwrap();
         store
             .set_conversation_team(
+                &admin(&store),
                 "room:review",
                 &["analyst".into(), "maker".into()],
                 "all",
@@ -3293,12 +3565,13 @@ mod tests {
             )
             .unwrap();
         let task = runtime
-            .submit_text("room:review", "synthetic", None)
+            .submit_text(&admin(&store), "room:review", "synthetic", None)
             .unwrap();
         let payload: TurnPayload =
-            serde_json::from_value(store.get_task(&task.id).unwrap().payload).unwrap();
+            serde_json::from_value(store.get_task(&admin(&store), &task.id).unwrap().payload)
+                .unwrap();
         assert!(payload.mentions.is_empty());
-        assert_eq!(store.pending_task_count().unwrap(), 3);
+        assert_eq!(store.pending_task_count(&admin(&store)).unwrap(), 3);
         assert!(
             !store
                 .list_audit(50)
@@ -3319,10 +3592,11 @@ mod tests {
             .await;
         let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
         store
-            .create_conversation("room:review", "room", None)
+            .create_conversation(&admin(&store), "room:review", "room", None)
             .unwrap();
         store
             .set_conversation_team(
+                &admin(&store),
                 "room:review",
                 &["analyst".into(), "maker".into()],
                 "selected",
@@ -3330,10 +3604,16 @@ mod tests {
             )
             .unwrap();
         let task = runtime
-            .submit_text("room:review", "@maker check this @nobody", None)
+            .submit_text(
+                &admin(&store),
+                "room:review",
+                "@maker check this @nobody",
+                None,
+            )
             .unwrap();
         let payload: TurnPayload =
-            serde_json::from_value(store.get_task(&task.id).unwrap().payload).unwrap();
+            serde_json::from_value(store.get_task(&admin(&store), &task.id).unwrap().payload)
+                .unwrap();
         assert_eq!(payload.mentions, vec!["maker".to_string()]);
         let claimed = store.claim_task("worker", 30).unwrap().unwrap();
         assert_eq!(claimed.id, task.id);
@@ -3387,6 +3667,7 @@ mod tests {
         );
         let task = store
             .enqueue_task(
+                &admin(&store),
                 "brief",
                 "watcher",
                 &json!({"conversation_id": "owner"}),
@@ -3406,7 +3687,7 @@ mod tests {
         );
         assert!(
             store
-                .events_after(0, 100)
+                .events_after(&admin(&store), 0, 100)
                 .unwrap()
                 .iter()
                 .any(|event| event.kind == "brief.silent_run")
@@ -3426,6 +3707,7 @@ mod tests {
         );
         let task = store
             .enqueue_task(
+                &admin(&store),
                 "brief",
                 "watcher",
                 &json!({"conversation_id": "owner"}),
@@ -3473,6 +3755,7 @@ mod tests {
         );
         let task = store
             .enqueue_task(
+                &admin(&store),
                 "watch",
                 "watcher",
                 &json!({"conversation_id": "owner"}),

@@ -175,6 +175,10 @@ pub struct Task {
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Owning user. Every task is enqueued on behalf of exactly one account
+    /// and the worker executes it under this id (phase 2 scoping).
+    #[serde(default)]
+    pub user_id: Id,
 }
 
 impl Task {

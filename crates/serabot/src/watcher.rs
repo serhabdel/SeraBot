@@ -1,9 +1,13 @@
 //! Source monitoring and opportunity extraction.
 //!
 //! Each watched source is fetched through [`SafeFetcher`], parsed into a small
-//! bounded set of items, and upserted into `opportunities` / `deadlines` using
-//! a stable SHA-256 key. A run is always recorded in `source_runs`, including
-//! failures, so the morning brief can warn about broken sources.
+//! bounded set of items, and upserted into the acting user's `opportunities`
+//! and `deadlines` using a stable SHA-256 key. A run is always recorded in
+//! that user's `source_runs`, including failures, so the morning brief can
+//! warn about broken sources.
+//!
+//! Every row belongs to the acting user (phase 2 scoping): the watch runs of
+//! one user never see or touch another user's opportunities.
 //!
 //! `last_seen` is bumped only for new or changed items. That keeps the brief's
 //! "changed" window meaningful: merely re-observing identical content does not
@@ -97,10 +101,12 @@ struct ParsedDeadline {
     source_text: String,
 }
 
-/// Watch every enabled source in order. A failure of one source is recorded
-/// in its [`WatchReport`] and never stops the remaining sources.
+/// Watch every enabled source in order for the acting user. A failure of one
+/// source is recorded in its [`WatchReport`] and never stops the remaining
+/// sources.
 pub async fn watch_all(
     store: &Store,
+    user_id: &str,
     fetcher: &SafeFetcher,
     sources: &[SourceConfig],
     config: &Config,
@@ -109,6 +115,7 @@ pub async fn watch_all(
     for source in sources.iter().filter(|source| source.enabled) {
         match watch_source(
             store,
+            user_id,
             fetcher,
             source,
             &config.schedule.timezone,
@@ -131,13 +138,15 @@ pub async fn watch_all(
     Ok(reports)
 }
 
-/// Fetch, parse and persist a single source.
+/// Fetch, parse and persist a single source for the acting user.
 ///
-/// Source-level fetch/parse failures are recorded with `ok = 0` in
-/// `source_runs` and reported via [`WatchReport::ok`] / `failed`; only database
-/// failures (or an invalid configured timezone) are returned as `Err`.
+/// Source-level fetch/parse failures are recorded with `ok = 0` in the acting
+/// user's `source_runs` and reported via [`WatchReport::ok`] / `failed`; only
+/// database failures (or an invalid configured timezone) are returned as
+/// `Err`.
 pub async fn watch_source(
     store: &Store,
+    user_id: &str,
     fetcher: &SafeFetcher,
     source: &SourceConfig,
     timezone: &str,
@@ -152,9 +161,9 @@ pub async fn watch_source(
     {
         let connection = store.connection()?;
         connection.execute(
-            "INSERT INTO source_runs(id, source, started_at, ok, items_seen)
-             VALUES (?1, ?2, ?3, 0, 0)",
-            params![run_id, source.name, utc_string(started_at)],
+            "INSERT INTO source_runs(id, source, started_at, ok, items_seen, user_id)
+             VALUES (?1, ?2, ?3, 0, 0, ?4)",
+            params![run_id, source.name, utc_string(started_at), user_id],
         )?;
     }
 
@@ -167,7 +176,7 @@ pub async fn watch_source(
         Ok(page) => page,
         Err(error) => {
             let message = format!("fetch failed: {error}");
-            finish_source_run(store, &run_id, false, 0, Some(&message))?;
+            finish_source_run(store, user_id, &run_id, false, 0, Some(&message))?;
             report.failed = 1;
             report.warn(message);
             return Ok(report);
@@ -176,7 +185,7 @@ pub async fn watch_source(
 
     if !(200..300).contains(&page.status) {
         let message = format!("unexpected HTTP status {}", page.status);
-        finish_source_run(store, &run_id, false, 0, Some(&message))?;
+        finish_source_run(store, user_id, &run_id, false, 0, Some(&message))?;
         report.failed = 1;
         report.warn(message);
         return Ok(report);
@@ -194,7 +203,7 @@ pub async fn watch_source(
         Ok(items) => items,
         Err(error) => {
             let message = format!("parse failed: {error}");
-            finish_source_run(store, &run_id, false, 0, Some(&message))?;
+            finish_source_run(store, user_id, &run_id, false, 0, Some(&message))?;
             report.failed = 1;
             report.warn(message);
             return Ok(report);
@@ -206,7 +215,7 @@ pub async fn watch_source(
         Ok(url) => url,
         Err(error) => {
             let message = format!("invalid final URL {}: {error}", page.final_url);
-            finish_source_run(store, &run_id, false, 0, Some(&message))?;
+            finish_source_run(store, user_id, &run_id, false, 0, Some(&message))?;
             report.failed = 1;
             report.warn(message);
             return Ok(report);
@@ -215,16 +224,27 @@ pub async fn watch_source(
 
     let mut seen = HashSet::new();
     for item in raw_items.into_iter().take(max_items) {
-        ingest_item(store, source, tz, &base, item, &mut seen, &mut report)?;
+        ingest_item(
+            store,
+            user_id,
+            source,
+            tz,
+            &base,
+            item,
+            &mut seen,
+            &mut report,
+        )?;
     }
 
-    finish_source_run(store, &run_id, true, report.items_seen, None)?;
+    finish_source_run(store, user_id, &run_id, true, report.items_seen, None)?;
     report.ok = true;
     Ok(report)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ingest_item(
     store: &Store,
+    user_id: &str,
     source: &SourceConfig,
     tz: Tz,
     base: &Url,
@@ -282,8 +302,8 @@ fn ingest_item(
     let existing: Option<ExistingOpportunity> = connection
         .query_row(
             "SELECT id, title, summary, url, status
-             FROM opportunities WHERE source = ?1 AND external_id = ?2",
-            params![source.name, external_id],
+             FROM opportunities WHERE source = ?1 AND external_id = ?2 AND user_id = ?3",
+            params![source.name, external_id, user_id],
             |row| {
                 Ok(ExistingOpportunity {
                     id: row.get(0)?,
@@ -310,8 +330,8 @@ fn ingest_item(
         connection.execute(
             "INSERT INTO opportunities(
                 id, source, external_id, title, summary, url, status, evidence,
-                revision, first_seen, last_seen
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?9)",
+                revision, first_seen, last_seen, user_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?9, ?10)",
             params![
                 opportunity_id,
                 source.name,
@@ -321,11 +341,19 @@ fn ingest_item(
                 link,
                 status,
                 evidence,
-                observed_at
+                observed_at,
+                user_id
             ],
         )?;
         if let Some(deadline) = &parsed_deadline {
-            insert_deadline(&connection, &opportunity_id, deadline, tz, &observed_at)?;
+            insert_deadline(
+                &connection,
+                user_id,
+                &opportunity_id,
+                deadline,
+                tz,
+                &observed_at,
+            )?;
         }
         report.new += 1;
         return Ok(());
@@ -379,7 +407,14 @@ fn ingest_item(
     } else if deadline_changed {
         supersede_deadlines(&connection, &existing.id)?;
         if let Some(deadline) = &parsed_deadline {
-            insert_deadline(&connection, &existing.id, deadline, tz, &observed_at)?;
+            insert_deadline(
+                &connection,
+                user_id,
+                &existing.id,
+                deadline,
+                tz,
+                &observed_at,
+            )?;
         }
     }
 
@@ -411,6 +446,7 @@ fn active_deadline(
 
 fn insert_deadline(
     connection: &rusqlite::Connection,
+    user_id: &str,
     opportunity_id: &str,
     deadline: &ParsedDeadline,
     tz: Tz,
@@ -419,8 +455,8 @@ fn insert_deadline(
     connection.execute(
         "INSERT INTO deadlines(
             id, opportunity_id, due_date, due_time, timezone, precision,
-            source_text, status, observed_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'upcoming', ?8)",
+            source_text, status, observed_at, user_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'upcoming', ?8, ?9)",
         params![
             new_id(),
             opportunity_id,
@@ -429,7 +465,8 @@ fn insert_deadline(
             tz.name(),
             deadline.precision,
             deadline.source_text,
-            observed_at
+            observed_at,
+            user_id
         ],
     )?;
     Ok(())
@@ -446,6 +483,7 @@ fn supersede_deadlines(connection: &rusqlite::Connection, opportunity_id: &str) 
 
 fn finish_source_run(
     store: &Store,
+    user_id: &str,
     run_id: &str,
     ok: bool,
     items_seen: usize,
@@ -455,13 +493,14 @@ fn finish_source_run(
     connection.execute(
         "UPDATE source_runs
          SET finished_at = ?1, ok = ?2, items_seen = ?3, error = ?4
-         WHERE id = ?5",
+         WHERE id = ?5 AND user_id = ?6",
         params![
             utc_string(utc_now()),
             ok as i64,
             items_seen as i64,
             error.map(|value| truncate_chars(value, MAX_ERROR_CHARS)),
-            run_id
+            run_id,
+            user_id
         ],
     )?;
     Ok(())
@@ -850,6 +889,11 @@ mod tests {
         Store::open_in_memory(384).unwrap()
     }
 
+    /// The acting user for the watch runs.
+    fn admin(store: &Store) -> String {
+        store.admin_user_id().unwrap()
+    }
+
     fn fetcher() -> SafeFetcher {
         SafeFetcher::new("SeraBot-test/0.1", 5, 2 * 1024 * 1024)
             .unwrap()
@@ -889,9 +933,16 @@ mod tests {
         let store = store();
         let source = source("portal", server_url(&server, "/tenders"), "html");
 
-        let report = watch_source(&store, &fetcher(), &source, "Europe/Rome", 10)
-            .await
-            .unwrap();
+        let report = watch_source(
+            &store,
+            &admin(&store),
+            &fetcher(),
+            &source,
+            "Europe/Rome",
+            10,
+        )
+        .await
+        .unwrap();
         assert!(report.ok);
         assert_eq!(report.new, 2);
         assert_eq!(report.changed, 0);
@@ -955,12 +1006,26 @@ mod tests {
         let store = store();
         let source = source("portal", server_url(&server, "/tenders"), "html");
 
-        watch_source(&store, &fetcher(), &source, "Europe/Rome", 10)
-            .await
-            .unwrap();
-        let second = watch_source(&store, &fetcher(), &source, "Europe/Rome", 10)
-            .await
-            .unwrap();
+        watch_source(
+            &store,
+            &admin(&store),
+            &fetcher(),
+            &source,
+            "Europe/Rome",
+            10,
+        )
+        .await
+        .unwrap();
+        let second = watch_source(
+            &store,
+            &admin(&store),
+            &fetcher(),
+            &source,
+            "Europe/Rome",
+            10,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(second.new, 0);
         assert_eq!(second.changed, 0);
@@ -996,14 +1061,28 @@ mod tests {
         .await;
         let store = store();
         let mut source = source("portal", server_url(&server, "/v1"), "html");
-        watch_source(&store, &fetcher(), &source, "Europe/Rome", 10)
-            .await
-            .unwrap();
+        watch_source(
+            &store,
+            &admin(&store),
+            &fetcher(),
+            &source,
+            "Europe/Rome",
+            10,
+        )
+        .await
+        .unwrap();
 
         source.url = server_url(&server, "/v2");
-        let report = watch_source(&store, &fetcher(), &source, "Europe/Rome", 10)
-            .await
-            .unwrap();
+        let report = watch_source(
+            &store,
+            &admin(&store),
+            &fetcher(),
+            &source,
+            "Europe/Rome",
+            10,
+        )
+        .await
+        .unwrap();
         assert_eq!(report.new, 0);
         assert_eq!(report.changed, 1);
 
@@ -1049,9 +1128,16 @@ mod tests {
         let store = store();
         let source = source("portal", server_url(&server, "/tenders"), "html");
 
-        let report = watch_source(&store, &fetcher(), &source, "Europe/Rome", 10)
-            .await
-            .unwrap();
+        let report = watch_source(
+            &store,
+            &admin(&store),
+            &fetcher(),
+            &source,
+            "Europe/Rome",
+            10,
+        )
+        .await
+        .unwrap();
         assert_eq!(report.new, 1);
         assert_eq!(report.failed, 0);
         assert!(
@@ -1083,9 +1169,16 @@ mod tests {
         let store = store();
         let source = source("feed", server_url(&server, "/feed"), "rss");
 
-        let report = watch_source(&store, &fetcher(), &source, "Europe/Rome", 10)
-            .await
-            .unwrap();
+        let report = watch_source(
+            &store,
+            &admin(&store),
+            &fetcher(),
+            &source,
+            "Europe/Rome",
+            10,
+        )
+        .await
+        .unwrap();
         assert!(report.ok);
         assert_eq!(report.new, 2);
         assert_eq!(report.failed, 0);
@@ -1123,9 +1216,16 @@ mod tests {
         let store = store();
         let source = source("portal", server_url(&server, "/broken"), "html");
 
-        let report = watch_source(&store, &fetcher(), &source, "Europe/Rome", 10)
-            .await
-            .unwrap();
+        let report = watch_source(
+            &store,
+            &admin(&store),
+            &fetcher(),
+            &source,
+            "Europe/Rome",
+            10,
+        )
+        .await
+        .unwrap();
         assert!(!report.ok);
         assert_eq!(report.failed, 1);
         assert!(!report.warnings.is_empty());
@@ -1159,5 +1259,67 @@ mod tests {
         let english = parse_deadline("28 October 2026", tz).unwrap();
         assert_eq!(english.due_date, "2026-10-28");
         assert!(english.due_time.is_none());
+    }
+
+    /// Two users watching the same source keep separate opportunity rows:
+    /// the second user's run sees the items as new, never as the first
+    /// user's changed rows, and neither run touches the other's data.
+    #[tokio::test]
+    async fn watching_the_same_source_never_crosses_users() {
+        let server = MockServer::start().await;
+        mount_html(
+            &server,
+            "/tenders",
+            r#"<article><h2>Tender A</h2><a href="/tender/a">Details</a>
+               <time>2026-10-28</time><p>Summary A.</p></article>"#,
+        )
+        .await;
+        let store = store();
+        let admin = admin(&store);
+        let member = store
+            .create_user("microsoft:watch-member", "w@example.example", "W")
+            .unwrap();
+        let source = source("portal", server_url(&server, "/tenders"), "html");
+
+        let first = watch_source(&store, &admin, &fetcher(), &source, "Europe/Rome", 10)
+            .await
+            .unwrap();
+        assert_eq!(first.new, 1);
+
+        let second = watch_source(&store, &member.id, &fetcher(), &source, "Europe/Rome", 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.new, 1,
+            "the member sees the item as their own new row"
+        );
+
+        let connection = store.connection().unwrap();
+        let owners: Vec<(String, i64)> = {
+            let mut statement = connection
+                .prepare("SELECT user_id, COUNT(*) FROM opportunities GROUP BY user_id")
+                .unwrap();
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            rows.collect::<std::result::Result<_, _>>().unwrap()
+        };
+        assert_eq!(owners.len(), 2, "each user owns their own opportunity row");
+        assert!(
+            owners
+                .iter()
+                .any(|(user, count)| user == &admin && *count == 1)
+        );
+        assert!(
+            owners
+                .iter()
+                .any(|(user, count)| user == &member.id && *count == 1)
+        );
+
+        // And the source runs are per user.
+        let runs: i64 = connection
+            .query_row("SELECT COUNT(*) FROM source_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(runs, 2);
     }
 }

@@ -50,17 +50,17 @@ never merge without the owner's OK.
 
 ## Phase 2 — store scoping
 
-- [ ] T2.1 Migration `0009_user_scoping.sql`: `user_id` on all user-owned
+- [x] T2.1 Migration `0009_user_scoping.sql`: `user_id` on all user-owned
       tables (backfill → NOT NULL → indexes). Verify with a v7 fixture.
-- [ ] T2.2 `store.rs`: scoped signatures for every user-owned read/write;
+- [x] T2.2 `store.rs`: scoped signatures for every user-owned read/write;
       no unscoped variants outside migrations.
-- [ ] T2.3 Call sites thread the acting user: `runtime.rs`, `gateway.rs`,
+- [x] T2.3 Call sites thread the acting user: `runtime.rs`, `gateway.rs`,
       `api.rs`, `tools.rs`, `memory.rs`, `watcher.rs`, `brief.rs`,
       `scheduler.rs`, `analyst.rs`, `documents.rs`, `retrieval.rs`;
       `audit_log.actor` = user id.
-- [ ] T2.4 Isolation suite: two users; cross-user reads return empty/fail
+- [x] T2.4 Isolation suite: two users; cross-user reads return empty/fail
       closed on every path (store, API, tools).
-- [ ] T2.5 Phase gate + commit + push.
+- [x] T2.5 Phase gate + commit + push.
 
 ## Phase 3 — per-user fleet, skills, memory
 

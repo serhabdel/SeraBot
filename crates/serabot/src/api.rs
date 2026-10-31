@@ -54,8 +54,9 @@ impl ApiNotifier {
 
 #[async_trait::async_trait]
 impl Notifier for ApiNotifier {
-    async fn send_text(&self, conversation_id: &str, text: &str) -> Result<()> {
+    async fn send_text(&self, user_id: &str, conversation_id: &str, text: &str) -> Result<()> {
         self.store.append_event(
+            user_id,
             "message",
             &json!({"conversation_id": conversation_id, "text": text}),
         )?;
@@ -64,10 +65,12 @@ impl Notifier for ApiNotifier {
 
     async fn approval_requested(
         &self,
+        user_id: &str,
         conversation_id: &str,
         notice: &ApprovalNotice,
     ) -> Result<()> {
         self.store.append_event(
+            user_id,
             "approval",
             &json!({
                 "conversation_id": conversation_id,
@@ -283,16 +286,19 @@ trait Tap: Sized {
 }
 impl<T> Tap for T {}
 
-async fn status(State(state): State<Arc<ApiState>>) -> Response {
-    let pending = state.store.pending_task_count().unwrap_or(-1);
+async fn status(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Response {
+    let pending = state.store.pending_task_count(&user.id).unwrap_or(-1);
     let approvals = state
         .store
-        .list_pending_approvals(50)
+        .list_pending_approvals(&user.id, 50)
         .map(|items| items.len())
         .unwrap_or(0);
     let approval_items = state
         .store
-        .list_pending_approvals(50)
+        .list_pending_approvals(&user.id, 50)
         .unwrap_or_default()
         .into_iter()
         .map(|approval| {
@@ -329,6 +335,7 @@ struct UsageQuery {
 /// is clamped to 1..=90; `bot` and `conversation_id` are optional filters.
 async fn usage(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Query(query): Query<UsageQuery>,
 ) -> Result<Json<Value>> {
     let days = query.days.unwrap_or(7).clamp(1, 90);
@@ -342,6 +349,7 @@ async fn usage(
     }
     let since = Utc::now() - chrono::Duration::days(days);
     let rollup = state.store.usage_rollup(
+        &user.id,
         since,
         query.bot.as_deref(),
         query.conversation_id.as_deref(),
@@ -366,10 +374,12 @@ struct MessageRequest {
 
 async fn send_message(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Json(request): Json<MessageRequest>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&request.conversation_id)?;
     let task = state.runtime.submit_text(
+        &user.id,
         &request.conversation_id,
         &request.text,
         request.bot.as_deref(),
@@ -386,15 +396,19 @@ struct ModelQuery {
 
 async fn models(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Query(query): Query<ModelQuery>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&query.conversation_id)?;
-    state.runtime.refresh_model_catalogs().await?;
+    state.runtime.refresh_model_catalogs(&user.id).await?;
     let bot = query.bot.as_deref().unwrap_or("main");
-    let selection = state.runtime.model_selection(&query.conversation_id, bot)?;
-    let effective_selection = state
+    let selection = state
         .runtime
-        .effective_model_selection(&query.conversation_id, bot)?;
+        .model_selection(&user.id, &query.conversation_id, bot)?;
+    let effective_selection =
+        state
+            .runtime
+            .effective_model_selection(&user.id, &query.conversation_id, bot)?;
     Ok(Json(json!({
         "providers": state.runtime.model_catalog()?,
         "entries": state.runtime.model_catalog_entries()?,
@@ -413,11 +427,12 @@ struct SelectModelRequest {
 
 async fn select_model(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<SelectModelRequest>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
-    state.runtime.refresh_model_catalogs().await?;
+    state.runtime.refresh_model_catalogs(&user.id).await?;
     let selection = if request.provider == crate::model_router::AUTO_PROVIDER {
         ModelSelection::auto_mode()
     } else {
@@ -426,7 +441,7 @@ async fn select_model(
             model: request.model,
         }
     };
-    let selection = state.runtime.select_model(&id, selection)?;
+    let selection = state.runtime.select_model(&user.id, &id, selection)?;
     Ok(Json(json!({"selection": selection})))
 }
 
@@ -438,13 +453,14 @@ struct HistoryQuery {
 
 async fn conversation_messages(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
     let messages = state
         .store
-        .list_visible_messages(&id, query.limit.unwrap_or(100).clamp(1, 200))?
+        .list_visible_messages(&user.id, &id, query.limit.unwrap_or(100).clamp(1, 200))?
         .into_iter()
         .map(|message| {
             let content = if state.runtime.scan_owner_output(&message.content).is_ok() {
@@ -477,8 +493,8 @@ async fn conversation_messages(
             body
         })
         .collect::<Vec<_>>();
-    // Opening the thread is the owner reading it.
-    state.store.mark_conversation_read(&id)?;
+    // Opening the thread is the acting user reading it.
+    state.store.mark_conversation_read(&user.id, &id)?;
     Ok(Json(json!({"messages": messages})))
 }
 
@@ -495,12 +511,17 @@ fn team_error(error: SeraError) -> Response {
     }
 }
 
-/// A conversation that may carry a team: it must exist and be a `room:`.
-fn team_conversation(state: &ApiState, id: &str) -> Result<StoredConversation> {
+/// A conversation that may carry a team: it must exist for the acting user
+/// and be a `room:`.
+fn team_conversation(
+    state: &ApiState,
+    acting: &ActingUser,
+    id: &str,
+) -> Result<StoredConversation> {
     validate_conversation_id(id)?;
     let record = state
         .store
-        .get_conversation(id)?
+        .get_conversation(&acting.id, id)?
         .ok_or_else(|| SeraError::NotFound(format!("conversation {id}")))?;
     if crate::store::parse_stored_conversation_kind(&record.kind)? != ConversationKind::Room {
         return Err(SeraError::Validation(
@@ -541,10 +562,14 @@ fn team_view(
     }))
 }
 
-async fn conversation_team(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> Response {
+async fn conversation_team(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Response {
     let body = (|| -> Result<Value> {
-        team_conversation(&state, &id)?;
-        let (members, mode, rules) = match state.store.get_conversation_team(&id)? {
+        team_conversation(&state, &user, &id)?;
+        let (members, mode, rules) = match state.store.get_conversation_team(&user.id, &id)? {
             Some(team) => (team.members, team.mode, team.rules),
             // No team yet is an empty shape, never a 404.
             None => (
@@ -579,11 +604,12 @@ fn default_team_mode() -> String {
 
 async fn set_conversation_team(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<SetTeamRequest>,
 ) -> Response {
     let body = (|| -> Result<Value> {
-        team_conversation(&state, &id)?;
+        team_conversation(&state, &user, &id)?;
         let mode = crate::teams::TeamMode::from_name(&request.mode)?;
         crate::teams::validate_members(&request.members)?;
         if request.rules.chars().count() > 4000 {
@@ -621,9 +647,13 @@ async fn set_conversation_team(
                 return Err(SeraError::Validation(format!("bot {member} is not loaded")));
             }
         }
-        state
-            .store
-            .set_conversation_team(&id, &request.members, mode.as_str(), &request.rules)?;
+        state.store.set_conversation_team(
+            &user.id,
+            &id,
+            &request.members,
+            mode.as_str(),
+            &request.rules,
+        )?;
         let details = json!({
             "conversation_id": id,
             "members": request.members,
@@ -631,7 +661,7 @@ async fn set_conversation_team(
             "rules": request.rules,
         });
         state.store.record_audit(
-            "owner",
+            &user.id,
             crate::teams::AUDIT_MEMBER_SET,
             None,
             None,
@@ -642,7 +672,7 @@ async fn set_conversation_team(
         )?;
         state
             .store
-            .append_event(crate::teams::AUDIT_MEMBER_SET, &details)?;
+            .append_event(&user.id, crate::teams::AUDIT_MEMBER_SET, &details)?;
         let body = team_view(&state, &id, &request.members, mode.as_str(), &request.rules)?;
         state.runtime.scan_owner_output(&body.to_string())?;
         Ok(body)
@@ -655,16 +685,17 @@ async fn set_conversation_team(
 
 async fn conversation_library(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
     state
         .store
-        .get_conversation(&id)?
+        .get_conversation(&user.id, &id)?
         .ok_or_else(|| SeraError::NotFound(format!("conversation {id}")))?;
     let entries = state
         .store
-        .list_conversation_artifacts(&id)?
+        .list_conversation_artifacts(&user.id, &id)?
         .into_iter()
         .map(|entry| {
             let meta = state.artifacts.meta(&entry.hash).ok();
@@ -793,15 +824,22 @@ fn task_view(task: &Task) -> Value {
     })
 }
 
-async fn task(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> Result<Json<Value>> {
-    let task = state.store.get_task(&id)?;
+async fn task(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    let task = state.store.get_task(&user.id, &id)?;
     Ok(Json(json!({"task": task_view(&task)})))
 }
 
-async fn list_approvals(State(state): State<Arc<ApiState>>) -> Result<Json<Value>> {
+async fn list_approvals(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
     let approvals = state
         .store
-        .list_pending_approvals(100)?
+        .list_pending_approvals(&user.id, 100)?
         .into_iter()
         .map(|approval| {
             json!({
@@ -825,6 +863,7 @@ struct DecideRequest {
 
 async fn decide_approval(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<DecideRequest>,
 ) -> Result<Json<Value>> {
@@ -845,7 +884,10 @@ async fn decide_approval(
             ));
         }
     };
-    let result = state.runtime.handle_approval(&id, decision).await?;
+    let result = state
+        .runtime
+        .handle_approval(&user.id, &id, decision)
+        .await?;
     Ok(Json(json!({
         "approval_id": result.approval.id,
         "approval_state": result.approval.state,
@@ -865,37 +907,42 @@ struct EventQuery {
 
 async fn events(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     headers: HeaderMap,
     Query(query): Query<EventQuery>,
 ) -> Sse<impl futures::Stream<Item = std::result::Result<SseEvent, Infallible>>> {
     let last = resume_cursor(&headers, query.after);
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let store = state.store.clone();
-    let stream = futures::stream::unfold((last, store), move |(last, store)| async move {
-        loop {
-            tokio::time::sleep(Duration::from_millis(180)).await;
-            match store.events_after(last, limit) {
-                Ok(events) if !events.is_empty() => {
-                    let next = events.last().map(|event| event.id).unwrap_or(last);
-                    let items = events
-                        .into_iter()
-                        .map(|event| {
-                            Ok(SseEvent::default()
-                                .id(event.id.to_string())
-                                .event(event.kind)
-                                .data(event.payload.to_string()))
-                        })
-                        .collect::<Vec<_>>();
-                    return Some((futures::stream::iter(items), (next, store)));
-                }
-                Ok(_) => continue,
-                Err(error) => {
-                    warn!(%error, "event stream query failed");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+    let user_id = user.id;
+    let stream = futures::stream::unfold(
+        (last, store, user_id),
+        move |(last, store, user_id)| async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(180)).await;
+                match store.events_after(&user_id, last, limit) {
+                    Ok(events) if !events.is_empty() => {
+                        let next = events.last().map(|event| event.id).unwrap_or(last);
+                        let items = events
+                            .into_iter()
+                            .map(|event| {
+                                Ok(SseEvent::default()
+                                    .id(event.id.to_string())
+                                    .event(event.kind)
+                                    .data(event.payload.to_string()))
+                            })
+                            .collect::<Vec<_>>();
+                        return Some((futures::stream::iter(items), (next, store, user_id)));
+                    }
+                    Ok(_) => continue,
+                    Err(error) => {
+                        warn!(%error, "event stream query failed");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
                 }
             }
-        }
-    })
+        },
+    )
     .flatten();
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
@@ -921,10 +968,18 @@ struct AuditQuery {
 
 async fn audit(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Query(query): Query<AuditQuery>,
 ) -> Result<Json<Value>> {
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
-    let entries = state.store.list_audit(limit)?;
+    // Members see only their own rows; the admin keeps the cross-user audit
+    // view (spec: the admin sees everything in audit — audit rows only,
+    // never another user's data).
+    let entries = if user.is_admin() {
+        state.store.list_audit(limit)?
+    } else {
+        state.store.list_audit_for_user(&user.id, limit)?
+    };
     Ok(Json(json!({"audit": entries})))
 }
 
@@ -950,9 +1005,10 @@ async fn artifact(
 
 async fn approve_artifact(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(hash): Path<String>,
 ) -> Result<Json<Value>> {
-    state.artifacts.approve(&state.store, &hash)?;
+    state.artifacts.approve(&state.store, &user.id, &hash)?;
     Ok(Json(json!({
         "artifact_hash": hash,
         "content_approved": true,
@@ -973,6 +1029,7 @@ struct CreateBotRequest {
 
 async fn create_bot(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Json(request): Json<CreateBotRequest>,
 ) -> Result<Json<Value>> {
     if state.runtime.bot_loaded(&request.id) {
@@ -988,7 +1045,7 @@ async fn create_bot(
         state.runtime.policy(),
     )?;
     if let Err(error) = state.store.record_audit(
-        "owner",
+        &user.id,
         "bot.scaffolded",
         None,
         None,
@@ -1085,6 +1142,7 @@ const MAX_INSTRUCTIONS_BYTES: usize = 32 * 1024;
 /// secret values; the response passes the egress scan.
 async fn bot_detail(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
     if !safe_bot_label(&id) {
@@ -1124,8 +1182,8 @@ async fn bot_detail(
         Some(text) => (None, text.len()),
         None => (None, 0),
     };
-    let memory_count = state.store.count_memories()?;
-    let artifact_count = state.store.count_bot_artifacts(&id)?;
+    let memory_count = state.store.count_memories(&user.id)?;
+    let artifact_count = state.store.count_bot_artifacts(&user.id, &id)?;
     let body = json!({
         "id": entry.id,
         "display_name": profile.as_ref().map(|p| p.display_name.clone()).filter(|name| !name.is_empty()),
@@ -1168,6 +1226,7 @@ async fn list_skills(State(state): State<Arc<ApiState>>) -> Result<Json<Value>> 
 
 async fn create_skill_pack(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Json(request): Json<CreateSkillRequest>,
 ) -> Result<Json<Value>> {
     state.runtime.scan_owner_output(&request.id)?;
@@ -1183,7 +1242,7 @@ async fn create_skill_pack(
         state.runtime.policy(),
     )?;
     if let Err(error) = state.store.record_audit(
-        "owner",
+        &user.id,
         "skill.created",
         None,
         None,
@@ -1223,6 +1282,7 @@ struct CreateConversationRequest {
 
 async fn create_conversation(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Json(request): Json<CreateConversationRequest>,
 ) -> Result<Json<Value>> {
     let kind = ConversationKind::from_name(&request.kind)?;
@@ -1254,15 +1314,19 @@ async fn create_conversation(
             Some(title)
         }
     };
-    state
-        .store
-        .create_conversation_titled(&id, kind.as_str(), parent_id, title.as_deref())?;
+    state.store.create_conversation_titled(
+        &user.id,
+        &id,
+        kind.as_str(),
+        parent_id,
+        title.as_deref(),
+    )?;
     let record = state
         .store
-        .get_conversation(&id)?
+        .get_conversation(&user.id, &id)?
         .ok_or_else(|| SeraError::Internal("conversation missing after insert".into()))?;
     state.store.record_audit(
-        "owner",
+        &user.id,
         "conversation.created",
         None,
         None,
@@ -1293,6 +1357,7 @@ struct ConversationListQuery {
 
 async fn list_conversations(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Query(query): Query<ConversationListQuery>,
 ) -> Result<Json<Value>> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
@@ -1301,6 +1366,7 @@ async fn list_conversations(
         Some(value) => Some(parse_conversation_cursor(value)?),
     };
     let records = state.store.list_conversations(
+        &user.id,
         limit,
         cursor.as_ref().map(|(at, id)| (*at, id.as_str())),
         query.include_archived.unwrap_or(false),
@@ -1381,17 +1447,18 @@ struct RenameConversationRequest {
 
 async fn rename_conversation(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<RenameConversationRequest>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
     let title = normalize_conversation_title(&request.title)?;
     state.runtime.scan_owner_output(&title)?;
-    if !state.store.rename_conversation(&id, &title)? {
+    if !state.store.rename_conversation(&user.id, &id, &title)? {
         return Err(SeraError::NotFound(format!("conversation {id}")));
     }
     state.store.record_audit(
-        "owner",
+        &user.id,
         "conversation.renamed",
         None,
         None,
@@ -1402,21 +1469,22 @@ async fn rename_conversation(
     )?;
     let record = state
         .store
-        .get_conversation(&id)?
+        .get_conversation(&user.id, &id)?
         .ok_or_else(|| SeraError::NotFound(format!("conversation {id}")))?;
     Ok(Json(json!({"conversation": conversation_view(&record)?})))
 }
 
 async fn archive_conversation(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
-    if !state.store.archive_conversation(&id)? {
+    if !state.store.archive_conversation(&user.id, &id)? {
         return Err(SeraError::NotFound(format!("conversation {id}")));
     }
     state.store.record_audit(
-        "owner",
+        &user.id,
         "conversation.archived",
         None,
         None,
@@ -1430,14 +1498,15 @@ async fn archive_conversation(
 
 async fn unarchive_conversation(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
-    if !state.store.unarchive_conversation(&id)? {
+    if !state.store.unarchive_conversation(&user.id, &id)? {
         return Err(SeraError::NotFound(format!("conversation {id}")));
     }
     state.store.record_audit(
-        "owner",
+        &user.id,
         "conversation.unarchived",
         None,
         None,
@@ -1460,6 +1529,7 @@ struct MemoryListQuery {
 
 async fn list_memories(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Query(query): Query<MemoryListQuery>,
 ) -> Result<Json<Value>> {
     let limit = query.limit.unwrap_or(100).clamp(1, memory::MAX_LIST_LIMIT);
@@ -1471,7 +1541,7 @@ async fn list_memories(
     {
         Some(needle) => {
             let needle = needle.to_lowercase();
-            let mut matches = memory::list(&state.store, memory::MAX_LIST_LIMIT)?
+            let mut matches = memory::list(&state.store, &user.id, memory::MAX_LIST_LIMIT)?
                 .into_iter()
                 .filter(|memory| {
                     memory.content.to_lowercase().contains(&needle)
@@ -1482,7 +1552,7 @@ async fn list_memories(
             matches.truncate(limit);
             matches
         }
-        None => memory::list(&state.store, limit)?,
+        None => memory::list(&state.store, &user.id, limit)?,
     };
     let body = json!({"memories": memories});
     state.runtime.scan_owner_output(&body.to_string())?;
@@ -1500,6 +1570,7 @@ struct AddMemoryRequest {
 
 async fn add_memory(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Json(request): Json<AddMemoryRequest>,
 ) -> Result<Json<Value>> {
     state.runtime.scan_owner_output(&request.content)?;
@@ -1509,9 +1580,15 @@ async fn add_memory(
         .map(str::trim)
         .filter(|source| !source.is_empty())
         .unwrap_or("operator:desktop");
-    let memory = memory::add(&state.store, &request.kind, &request.content, source)?;
+    let memory = memory::add(
+        &state.store,
+        &user.id,
+        &request.kind,
+        &request.content,
+        source,
+    )?;
     state.store.record_audit(
-        "owner",
+        &user.id,
         "memory.created",
         None,
         None,
@@ -1529,6 +1606,7 @@ async fn add_memory(
 
 async fn delete_memory(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
     if id.is_empty()
@@ -1539,11 +1617,11 @@ async fn delete_memory(
     {
         return Err(SeraError::Validation("invalid memory id".into()));
     }
-    if !memory::delete(&state.store, &id)? {
+    if !memory::delete(&state.store, &user.id, &id)? {
         return Err(SeraError::NotFound(format!("memory {id}")));
     }
     state.store.record_audit(
-        "owner",
+        &user.id,
         "memory.deleted",
         None,
         None,
@@ -1801,8 +1879,10 @@ fn api_key_probe<'a>(config: &'a Config, id: &str) -> Option<ApiKeyProbe<'a>> {
 /// are stored. Messages are fixed strings; no secret or provider body leaves.
 async fn admin_test_connector(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     let roles = connector_secret_roles(&state.config, &id).map_err(admin_error)?;
     let checked_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let missing = roles.iter().find(|(_, name)| !state.secrets.has(name));
@@ -1826,6 +1906,7 @@ async fn admin_test_connector(
     };
     audit_config(
         &state,
+        &user.id,
         "config.connector_tested",
         json!({"connector": id, "ok": ok}),
     )?;
@@ -1889,11 +1970,11 @@ fn admin_store(state: &ApiState) -> AdminResult<&AdminStore> {
         .ok_or_else(|| admin_error(SeraError::Internal("administration is unavailable".into())))
 }
 
-fn audit_config(state: &ApiState, event: &str, details: Value) -> AdminResult<()> {
+fn audit_config(state: &ApiState, actor: &str, event: &str, details: Value) -> AdminResult<()> {
     state
         .store
         .record_audit(
-            "owner",
+            actor,
             event,
             None,
             None,
@@ -1941,8 +2022,10 @@ struct AddProviderRequest {
 
 async fn admin_add_provider(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Json(request): Json<AddProviderRequest>,
 ) -> AdminResult<(StatusCode, Json<Value>)> {
+    require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
     let profile = ProviderConfig {
         base_url: request.base_url,
@@ -1976,6 +2059,7 @@ async fn admin_add_provider(
         .map_err(admin_error)?;
     audit_config(
         &state,
+        &user.id,
         "config.provider_saved",
         json!({"provider": request.id, "kind": kind, "catalog_fetch": catalog_fetch}),
     )?;
@@ -1987,11 +2071,18 @@ async fn admin_add_provider(
 
 async fn admin_remove_provider(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
     admin.remove_provider(&id).map_err(admin_error)?;
-    audit_config(&state, "config.provider_removed", json!({"provider": id}))?;
+    audit_config(
+        &state,
+        &user.id,
+        "config.provider_removed",
+        json!({"provider": id}),
+    )?;
     Ok(Json(json!({"removed": id, "restart_required": true})))
 }
 
@@ -2043,9 +2134,11 @@ fn release_oauth(state: &ApiState, id: &str) {
 /// providers start a bounded background poll and return the code to enter.
 async fn admin_provider_oauth_start(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     body: Option<Json<OAuthStartRequest>>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
     let profile = oauth_profile(&state, admin, &id).map_err(admin_error)?;
     let request = body.map(|Json(body)| body).unwrap_or_default();
@@ -2079,6 +2172,7 @@ async fn admin_provider_oauth_start(
             let (tx, rx) = tokio::sync::oneshot::channel::<(String, String)>();
             let task_state = state.clone();
             let task_id = id.clone();
+            let task_user_id = user.id.clone();
             tokio::spawn(async move {
                 use secrecy::ExposeSecret;
                 let outcome = async {
@@ -2115,6 +2209,7 @@ async fn admin_provider_oauth_start(
                 };
                 let _ = audit_config(
                     &task_state,
+                    &task_user_id,
                     event,
                     json!({"provider": task_id, "kind": "muse-code"}),
                 );
@@ -2142,9 +2237,11 @@ async fn admin_provider_oauth_start(
 /// listener. Tokens are stored server-side and never returned.
 async fn admin_provider_oauth_complete(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<OAuthCompleteRequest>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     use secrecy::ExposeSecret;
     let admin = admin_store(&state)?;
     let profile = oauth_profile(&state, admin, &id).map_err(admin_error)?;
@@ -2194,6 +2291,7 @@ async fn admin_provider_oauth_complete(
     };
     audit_config(
         &state,
+        &user.id,
         "config.provider_oauth_signed_in",
         json!({"provider": id, "kind": "google-antigravity", "project_discovered": login.project_id.is_some()}),
     )?;
@@ -2210,9 +2308,11 @@ async fn admin_provider_oauth_complete(
 /// is stored server-side — the desktop holds verifier and state.
 async fn admin_connector_oauth_start(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<OAuthStartRequest>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     if id != "elevenlabs" {
         return Err(admin_error(SeraError::NotFound(format!(
             "connector {id} does not support OAuth sign-in"
@@ -2228,6 +2328,7 @@ async fn admin_connector_oauth_start(
     .map_err(admin_error)?;
     audit_config(
         &state,
+        &user.id,
         "config.connector_oauth_started",
         json!({"connector": id}),
     )?;
@@ -2239,9 +2340,11 @@ async fn admin_connector_oauth_start(
 /// are never returned to the caller.
 async fn admin_connector_oauth_complete(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<OAuthCompleteRequest>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     if id != "elevenlabs" {
         return Err(admin_error(SeraError::NotFound(format!(
             "connector {id} does not support OAuth sign-in"
@@ -2280,6 +2383,7 @@ async fn admin_connector_oauth_complete(
         .map_err(admin_error)?;
     audit_config(
         &state,
+        &user.id,
         "config.connector_oauth_signed_in",
         json!({"connector": id, "ok": true}),
     )?;
@@ -2298,9 +2402,11 @@ struct ConnectorRequest {
 
 async fn admin_set_connector(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<ConnectorRequest>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
     if let Some(auth) = &request.auth {
         if id != "elevenlabs" {
@@ -2330,6 +2436,7 @@ async fn admin_set_connector(
         .map_err(admin_error)?;
     audit_config(
         &state,
+        &user.id,
         "config.connector_saved",
         json!({"connector": id, "enabled": request.enabled, "credentials": request.values.keys().collect::<Vec<_>>(), "auth": request.auth}),
     )?;
@@ -2347,8 +2454,10 @@ struct AudioRequest {
 
 async fn admin_set_audio(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Json(request): Json<AudioRequest>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
     admin
         .set_audio(
@@ -2361,6 +2470,7 @@ async fn admin_set_audio(
         .map_err(admin_error)?;
     audit_config(
         &state,
+        &user.id,
         "config.audio_saved",
         json!({"enabled": request.enabled}),
     )?;
@@ -2378,9 +2488,11 @@ struct BotProfileRequest {
 
 async fn admin_set_bot_profile(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<BotProfileRequest>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
     if !state.runtime.bot_loaded(&id) {
         let configured = crate::config::list_configured_bots(&state.config).map_err(admin_error)?;
@@ -2404,7 +2516,12 @@ async fn admin_set_bot_profile(
             },
         )
         .map_err(admin_error)?;
-    audit_config(&state, "config.bot_profile_saved", json!({"bot": id}))?;
+    audit_config(
+        &state,
+        &user.id,
+        "config.bot_profile_saved",
+        json!({"bot": id}),
+    )?;
     Ok(Json(json!({"saved": true, "restart_required": false})))
 }
 
@@ -2519,9 +2636,11 @@ fn validate_require_approval_list(list: &[String], tools: &[String]) -> Result<V
 /// `admin_set_bot_profile`. Takes effect after restart.
 async fn admin_update_bot_config(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<BotConfigRequest>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
     let configured = crate::config::list_configured_bots(&state.config).map_err(admin_error)?;
     let Some(entry) = configured.iter().find(|bot| bot.id == id) else {
@@ -2574,7 +2693,12 @@ async fn admin_update_bot_config(
             },
         )
         .map_err(admin_error)?;
-    audit_config(&state, "config.bot_config_saved", json!({"bot": id}))?;
+    audit_config(
+        &state,
+        &user.id,
+        "config.bot_config_saved",
+        json!({"bot": id}),
+    )?;
     Ok(Json(json!({"saved": true, "restart_required": true})))
 }
 
@@ -2586,20 +2710,22 @@ struct RestartRequest {
 
 async fn admin_restart(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Json(request): Json<RestartRequest>,
 ) -> AdminResult<(StatusCode, Json<Value>)> {
+    require_admin(&user).map_err(admin_error)?;
     if !request.confirm {
         return Err(admin_error(SeraError::Validation(
             "restart requires explicit confirmation".into(),
         )));
     }
-    let pending = state.store.pending_task_count().map_err(admin_error)?;
+    let pending = state.store.pending_task_count_all().map_err(admin_error)?;
     if pending > 0 {
         return Err(admin_error(SeraError::InvalidState(format!(
             "{pending} task(s) are still in flight; wait for them to finish"
         ))));
     }
-    audit_config(&state, "config.restart_requested", Value::Null)?;
+    audit_config(&state, &user.id, "config.restart_requested", Value::Null)?;
     tokio::spawn(async {
         tokio::time::sleep(Duration::from_millis(400)).await;
         tracing::warn!("restart requested by the owner console; exiting for systemd");
@@ -3133,6 +3259,12 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    /// The bootstrap admin's id â€” the acting user behind the config token
+    /// the tests use.
+    fn admin(store: &Store) -> String {
+        store.admin_user_id().unwrap()
+    }
+
     fn app() -> (Router, Arc<Config>, Store) {
         app_with_policy(true, Policy::empty())
     }
@@ -3530,7 +3662,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(store.pending_task_count().unwrap(), 1);
+        assert_eq!(store.pending_task_count(&admin(&store)).unwrap(), 1);
     }
 
     #[tokio::test]
@@ -3603,7 +3735,7 @@ mod tests {
             .to_bytes();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         let original = store
-            .get_task(value["task"]["id"].as_str().unwrap())
+            .get_task(&admin(&store), value["task"]["id"].as_str().unwrap())
             .unwrap();
         let selection = json!({"provider":"default", "model":"test-alternative"});
         let response = app
@@ -3619,7 +3751,10 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            store.get_task(&original.id).unwrap().payload,
+            store
+                .get_task(&admin(&store), &original.id)
+                .unwrap()
+                .payload,
             original.payload
         );
         assert!(store.kv_get("model_selection:owner").unwrap().is_some());
@@ -3677,6 +3812,7 @@ mod tests {
         let (app, _, store) = app_with_policy(true, Policy::from_text("synthetic blocked phrase"));
         store
             .append_message(
+                &admin(&store),
                 "owner",
                 None,
                 crate::domain::Role::User,
@@ -3797,13 +3933,26 @@ mod tests {
     async fn history_returns_only_visible_messages_from_requested_conversation() {
         let (app, _, store) = app();
         store
-            .append_message("owner", None, crate::domain::Role::User, "hello")
-            .unwrap();
-        store
-            .append_message("owner", None, crate::domain::Role::Assistant, "bonjour")
+            .append_message(
+                &admin(&store),
+                "owner",
+                None,
+                crate::domain::Role::User,
+                "hello",
+            )
             .unwrap();
         store
             .append_message(
+                &admin(&store),
+                "owner",
+                None,
+                crate::domain::Role::Assistant,
+                "bonjour",
+            )
+            .unwrap();
+        store
+            .append_message(
+                &admin(&store),
                 "owner",
                 None,
                 crate::domain::Role::System,
@@ -3812,6 +3961,7 @@ mod tests {
             .unwrap();
         store
             .append_message(
+                &admin(&store),
                 "other",
                 None,
                 crate::domain::Role::User,
@@ -3850,6 +4000,7 @@ mod tests {
         let (app, _, store) = app();
         store
             .append_message_named(
+                &admin(&store),
                 "room:review",
                 None,
                 crate::domain::Role::Assistant,
@@ -3859,6 +4010,7 @@ mod tests {
             .unwrap();
         store
             .append_message_named(
+                &admin(&store),
                 "room:review",
                 None,
                 crate::domain::Role::Assistant,
@@ -4501,10 +4653,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(direct_turn.status(), StatusCode::OK);
-        assert_eq!(store.pending_task_count().unwrap(), 1);
+        assert_eq!(store.pending_task_count(&admin(&store)).unwrap(), 1);
         assert_eq!(
             store
-                .get_conversation("dir:analyst")
+                .get_conversation(&admin(&store), "dir:analyst")
                 .unwrap()
                 .unwrap()
                 .parent_id
@@ -5147,6 +5299,7 @@ mod tests {
 
         let task = store
             .enqueue_task(
+                &admin(&store),
                 "turn",
                 "main",
                 &json!({"conversation_id": "owner"}),
@@ -5322,7 +5475,7 @@ mod tests {
         assert!(!text.contains("prompts/notes.txt"));
         assert!(!text.contains("synthetic-test-key"));
 
-        crate::memory::add(&store, "fact", "synthetic fact", "test").unwrap();
+        crate::memory::add(&store, &admin(&store), "fact", "synthetic fact", "test").unwrap();
         let body = read_json(
             app.clone()
                 .oneshot(request(&app, "GET", "/v1/bots/notes", true, None))
@@ -5567,7 +5720,7 @@ mod tests {
     async fn legacy_conversations_list_as_turn_capable_threads() {
         let (app, _, store) = app();
         store
-            .ensure_conversation_accepts_turns("windows-owner")
+            .ensure_conversation_accepts_turns(&admin(&store), "windows-owner")
             .unwrap();
         let response = app
             .clone()
@@ -5703,7 +5856,7 @@ mod tests {
         assert_eq!(details["mode"], "selected");
         assert!(
             store
-                .events_after(0, 100)
+                .events_after(&admin(&store), 0, 100)
                 .unwrap()
                 .iter()
                 .any(|event| event.kind == "team.member_set")

@@ -400,6 +400,16 @@ impl TelegramClient {
             .flatten()
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
+        // Single-operator behaviour (phase 2): messages from the configured
+        // owner pair act as the admin user, resolved from the database â€” never
+        // a hardcoded id. Per-user linking arrives in phase 4.
+        let admin = match store.admin_user_id() {
+            Ok(admin) => admin,
+            Err(error) => {
+                error!(%error, "cannot resolve the admin user; Telegram polling not started");
+                return;
+            }
+        };
         info!("Telegram polling started");
         if let Err(error) = self.register_commands().await {
             warn!(%error, "Telegram command menu registration failed");
@@ -422,7 +432,7 @@ impl TelegramClient {
                             }
                         }
                         if let Err(error) = self
-                            .handle_update(&runtime, &store, artifacts.as_deref(), update)
+                            .handle_update(&runtime, &store, &admin, artifacts.as_deref(), update)
                             .await
                         {
                             warn!(%error, "Telegram update failed");
@@ -450,6 +460,7 @@ impl TelegramClient {
         &self,
         runtime: &Runtime,
         store: &Store,
+        admin: &str,
         message: &TelegramMessage,
     ) -> Result<OwnerAudioOutcome> {
         let config = runtime.config();
@@ -492,7 +503,7 @@ impl TelegramClient {
         match save_telegram_audio_bytes(config, message.message_id, &extension, &bytes, max_bytes) {
             Ok(report) => {
                 store.record_audit(
-                    "owner",
+                    admin,
                     "audio.telegram_intake",
                     Some(&report.relative_path),
                     None,
@@ -529,6 +540,7 @@ impl TelegramClient {
         &self,
         runtime: &Runtime,
         store: &Store,
+        admin: &str,
         artifacts: Option<&ArtifactStore>,
         update: Update,
     ) -> Result<()> {
@@ -543,7 +555,10 @@ impl TelegramClient {
                 warn!("ignored Telegram message from non-owner");
                 return Ok(());
             }
-            match self.handle_owner_audio(runtime, store, &message).await? {
+            match self
+                .handle_owner_audio(runtime, store, admin, &message)
+                .await?
+            {
                 OwnerAudioOutcome::NotAudio => {}
                 OwnerAudioOutcome::Unavailable => {
                     self.send_message(self.owner_chat_id, AUDIO_UNAVAILABLE_MESSAGE)
@@ -558,7 +573,7 @@ impl TelegramClient {
                     // The transcript is the owner's message in this chat, so the
                     // normal turn pipeline answers it like any typed message. No
                     // status line is sent for a successful transcription.
-                    runtime.submit_text(&message.chat.id.to_string(), &transcript, None)?;
+                    runtime.submit_text(admin, &message.chat.id.to_string(), &transcript, None)?;
                     return Ok(());
                 }
             }
@@ -575,9 +590,10 @@ impl TelegramClient {
                 return Ok(());
             }
             if is_model_command(text) {
-                runtime.refresh_model_catalogs().await?;
+                runtime.refresh_model_catalogs(admin).await?;
             }
-            if let Some(reply) = model_command(runtime, &message.chat.id.to_string(), text)? {
+            if let Some(reply) = model_command(runtime, admin, &message.chat.id.to_string(), text)?
+            {
                 self.send_message(self.owner_chat_id, &reply).await?;
                 return Ok(());
             }
@@ -591,8 +607,8 @@ impl TelegramClient {
                     .await?;
                 }
                 "/status" => {
-                    let pending = store.pending_task_count()?;
-                    let approvals = store.list_pending_approvals(20)?;
+                    let pending = store.pending_task_count(admin)?;
+                    let approvals = store.list_pending_approvals(admin, 20)?;
                     let mut reply = format!(
                         "Pending tasks: {pending}\nPending approvals: {}\n",
                         approvals.len()
@@ -608,22 +624,22 @@ impl TelegramClient {
                     self.send_message(self.owner_chat_id, &reply).await?;
                 }
                 "/approvals" => {
-                    let approvals = store.list_pending_approvals(20)?;
+                    let approvals = store.list_pending_approvals(admin, 20)?;
                     if approvals.is_empty() {
                         self.send_message(self.owner_chat_id, "No pending approvals.")
                             .await?;
                     } else {
                         for approval in approvals {
-                            let action = store.get_action(&approval.action_id)?;
+                            let action = store.get_action(admin, &approval.action_id)?;
                             let notice = ApprovalNotice { approval, action };
                             self.send_approval(&notice).await?;
                         }
                     }
                 }
                 "/revoke" => {
-                    let count = store.revoke_grants()?;
+                    let count = store.revoke_grants(admin)?;
                     store.record_audit(
-                        "owner",
+                        admin,
                         "approval.grants_revoked",
                         None,
                         None,
@@ -669,7 +685,7 @@ impl TelegramClient {
                             .await?;
                         return Ok(());
                     };
-                    artifacts.approve(store, hash)?;
+                    artifacts.approve(store, admin, hash)?;
                     self.send_message(
                         self.owner_chat_id,
                         "Italian deck approved for French generation.",
@@ -683,9 +699,9 @@ impl TelegramClient {
                             .await?;
                         return Ok(());
                     }
-                    let memory = memory::add(store, "fact", content, "owner")?;
+                    let memory = memory::add(store, admin, "fact", content, "owner")?;
                     store.record_audit(
-                        "owner",
+                        admin,
                         "memory.added",
                         None,
                         None,
@@ -698,7 +714,7 @@ impl TelegramClient {
                         .await?;
                 }
                 "/memories" => {
-                    let memories = memory::list(store, 20)?;
+                    let memories = memory::list(store, admin, 20)?;
                     if memories.is_empty() {
                         self.send_message(self.owner_chat_id, "No stored facts.")
                             .await?;
@@ -716,9 +732,9 @@ impl TelegramClient {
                 }
                 _ if text.starts_with("/forget") => {
                     let id = text.trim_start_matches("/forget").trim();
-                    let deleted = memory::delete(store, id)?;
+                    let deleted = memory::delete(store, admin, id)?;
                     store.record_audit(
-                        "owner",
+                        admin,
                         "memory.deleted",
                         None,
                         None,
@@ -738,7 +754,7 @@ impl TelegramClient {
                     .await?;
                 }
                 _ => {
-                    runtime.submit_text(&message.chat.id.to_string(), text, None)?;
+                    runtime.submit_text(admin, &message.chat.id.to_string(), text, None)?;
                 }
             }
             return Ok(());
@@ -760,7 +776,7 @@ impl TelegramClient {
                 let _ = self.answer_callback(&callback.id, "Invalid action.").await;
                 return Ok(());
             };
-            match runtime.handle_approval(approval_id, decision).await {
+            match runtime.handle_approval(admin, approval_id, decision).await {
                 Ok(result) => {
                     let label = match result.approval.state.as_str() {
                         "denied" => "Denied",
@@ -782,12 +798,13 @@ impl TelegramClient {
 
 #[async_trait]
 impl Notifier for TelegramClient {
-    async fn send_text(&self, _conversation_id: &str, text: &str) -> Result<()> {
+    async fn send_text(&self, _user_id: &str, _conversation_id: &str, text: &str) -> Result<()> {
         self.send_message(self.owner_chat_id, text).await
     }
 
     async fn approval_requested(
         &self,
+        _user_id: &str,
         _conversation_id: &str,
         notice: &ApprovalNotice,
     ) -> Result<()> {
@@ -914,7 +931,12 @@ fn provider_catalog_reply(runtime: &Runtime) -> Result<String> {
     Ok(reply)
 }
 
-fn model_command(runtime: &Runtime, conversation_id: &str, text: &str) -> Result<Option<String>> {
+fn model_command(
+    runtime: &Runtime,
+    user_id: &str,
+    conversation_id: &str,
+    text: &str,
+) -> Result<Option<String>> {
     let parts: Vec<_> = text.split_whitespace().collect();
     let reply = match parts.as_slice() {
         ["/providers"] | ["/providors"] => provider_catalog_reply(runtime)?,
@@ -945,9 +967,10 @@ fn model_command(runtime: &Runtime, conversation_id: &str, text: &str) -> Result
             reply
         }
         ["/model"] => {
-            let selection = runtime.model_selection(conversation_id, "main")?;
+            let selection = runtime.model_selection(user_id, conversation_id, "main")?;
             if selection.is_auto_mode() {
-                let effective = runtime.effective_model_selection(conversation_id, "main")?;
+                let effective =
+                    runtime.effective_model_selection(user_id, conversation_id, "main")?;
                 format!(
                     "Current selection: auto (resolves to {} / {})\nUse /models to list configured choices.",
                     effective.provider, effective.model
@@ -960,11 +983,13 @@ fn model_command(runtime: &Runtime, conversation_id: &str, text: &str) -> Result
             }
         }
         ["/model", "auto"] => match runtime.select_model(
+            user_id,
             conversation_id,
             crate::model_router::ModelSelection::auto_mode(),
         ) {
             Ok(_) => {
-                let effective = runtime.effective_model_selection(conversation_id, "main")?;
+                let effective =
+                    runtime.effective_model_selection(user_id, conversation_id, "main")?;
                 format!(
                     "Selected auto for future turns (currently {} / {}). Existing history will be sent to the resolved provider. Running turns are unchanged.",
                     effective.provider, effective.model
@@ -977,6 +1002,7 @@ fn model_command(runtime: &Runtime, conversation_id: &str, text: &str) -> Result
         },
         ["/model", provider, model] => {
             match runtime.select_model(
+                user_id,
                 conversation_id,
                 crate::model_router::ModelSelection {
                     provider: (*provider).to_owned(),
@@ -1629,72 +1655,102 @@ mod tests {
     #[test]
     fn model_commands_list_select_and_keep_conversations_separate() {
         let (runtime, store) = model_runtime();
-        let listing = model_command(&runtime, "20", "/models").unwrap().unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let listing = model_command(&runtime, &admin, "20", "/models")
+            .unwrap()
+            .unwrap();
         assert!(listing.contains("default / test"));
         assert!(listing.contains("default / alternative"));
-        let grouped = model_command(&runtime, "20", "/providers")
+        let grouped = model_command(&runtime, &admin, "20", "/providers")
             .unwrap()
             .unwrap();
         assert!(grouped.contains("default (approved)"));
         assert!(grouped.contains("  - test"));
         assert!(grouped.contains("  - alternative"));
-        let typo = model_command(&runtime, "20", "/providors")
+        let typo = model_command(&runtime, &admin, "20", "/providors")
             .unwrap()
             .unwrap();
         assert!(typo.contains("default (approved)"));
         assert!(!listing.contains("synthetic-key"));
         assert!(!listing.contains("example.com"));
-        let reply = model_command(&runtime, "20", "/model default alternative")
+        let reply = model_command(&runtime, &admin, "20", "/model default alternative")
             .unwrap()
             .unwrap();
         assert!(reply.contains("alternative"));
         assert_eq!(
-            runtime.model_selection("20", "main").unwrap().model,
+            runtime.model_selection(&admin, "20", "main").unwrap().model,
             "alternative"
         );
-        assert_eq!(runtime.model_selection("21", "main").unwrap().model, "test");
-        assert_eq!(store.pending_task_count().unwrap(), 0);
+        assert_eq!(
+            runtime.model_selection(&admin, "21", "main").unwrap().model,
+            "test"
+        );
+        assert_eq!(store.pending_task_count(&admin).unwrap(), 0);
     }
 
     #[test]
     fn malformed_model_commands_do_not_change_selection_or_capture_other_commands() {
-        let (runtime, _) = model_runtime();
+        let (runtime, store) = model_runtime();
+        let admin = store.admin_user_id().unwrap();
         for command in [
             "/model missing unknown",
             "/model default",
             "/model default alternative extra",
         ] {
-            assert!(model_command(&runtime, "20", command).unwrap().is_some());
-            assert_eq!(runtime.model_selection("20", "main").unwrap().model, "test");
+            assert!(
+                model_command(&runtime, &admin, "20", command)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                runtime.model_selection(&admin, "20", "main").unwrap().model,
+                "test"
+            );
         }
         assert!(
-            model_command(&runtime, "20", "/model@ExampleBot default alternative")
-                .unwrap()
-                .unwrap()
-                .contains("without an @username")
+            model_command(
+                &runtime,
+                &admin,
+                "20",
+                "/model@ExampleBot default alternative"
+            )
+            .unwrap()
+            .unwrap()
+            .contains("without an @username")
         );
-        assert_eq!(runtime.model_selection("20", "main").unwrap().model, "test");
+        assert_eq!(
+            runtime.model_selection(&admin, "20", "main").unwrap().model,
+            "test"
+        );
         assert!(
-            model_command(&runtime, "20", "/modeling")
+            model_command(&runtime, &admin, "20", "/modeling")
                 .unwrap()
                 .is_none()
         );
-        assert!(model_command(&runtime, "20", "hello").unwrap().is_none());
+        assert!(
+            model_command(&runtime, &admin, "20", "hello")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn unauthorized_model_command_cannot_change_selection() {
         let (runtime, store) = model_runtime();
+        let admin = store.admin_user_id().unwrap();
         let client = TelegramClient::new("123:abc", 10, 20).unwrap();
         let update: Update = serde_json::from_value(json!({
             "update_id": 991,
             "message": {"message_id": 1, "chat": {"id":20}, "from":{"id":99}, "text":"/model default alternative"}
         })).unwrap();
         client
-            .handle_update(&runtime, &store, None, update)
+            .handle_update(&runtime, &store, &admin, None, update)
             .await
             .unwrap();
-        assert_eq!(runtime.model_selection("20", "main").unwrap().model, "test");
+        assert_eq!(
+            runtime.model_selection(&admin, "20", "main").unwrap().model,
+            "test"
+        );
     }
 
     #[test]
@@ -2004,11 +2060,12 @@ mod tests {
     async fn voice_note_without_audio_gets_one_friendly_line() {
         let telegram = telegram_voice_server().await;
         let (runtime, store) = runtime_with_config(default_test_config());
+        let admin = store.admin_user_id().unwrap();
         let client = TelegramClient::new("123:abc", 10, 20)
             .unwrap()
             .with_base_url(telegram.uri());
         client
-            .handle_update(&runtime, &store, None, voice_update(501, 7))
+            .handle_update(&runtime, &store, &admin, None, voice_update(501, 7))
             .await
             .unwrap();
         let messages = sent_messages(&telegram).await;
@@ -2036,11 +2093,12 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let config = audio_test_config(&dir, &provider.uri(), Some(AUDIO_TEST_KEY));
         let (runtime, store) = runtime_with_config(config);
+        let admin = store.admin_user_id().unwrap();
         let client = TelegramClient::new("123:abc", 10, 20)
             .unwrap()
             .with_base_url(telegram.uri());
         client
-            .handle_update(&runtime, &store, None, voice_update(502, 8))
+            .handle_update(&runtime, &store, &admin, None, voice_update(502, 8))
             .await
             .unwrap();
         assert_eq!(provider.received_requests().await.unwrap().len(), 1);
@@ -2051,7 +2109,7 @@ mod tests {
         assert!(!text.contains("audio_transcribe"), "{text}");
         assert!(!text.contains("audio_understand"), "{text}");
         assert!(!text.contains("inbox"), "{text}");
-        assert_eq!(store.pending_task_count().unwrap(), 0);
+        assert_eq!(store.pending_task_count(&admin).unwrap(), 0);
     }
 
     #[tokio::test]
@@ -2066,11 +2124,12 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let config = audio_test_config(&dir, &provider.uri(), Some(AUDIO_TEST_KEY));
         let (runtime, store) = runtime_with_config(config);
+        let admin = store.admin_user_id().unwrap();
         let client = TelegramClient::new("123:abc", 10, 20)
             .unwrap()
             .with_base_url(telegram.uri());
         client
-            .handle_update(&runtime, &store, None, voice_update(503, 9))
+            .handle_update(&runtime, &store, &admin, None, voice_update(503, 9))
             .await
             .unwrap();
         let messages = sent_messages(&telegram).await;
