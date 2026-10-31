@@ -73,8 +73,10 @@
     color: var(--text);
     font-weight: 600;
     text-decoration: none;
+    transition: border-color 140ms ease, background-color 140ms ease, transform 100ms ease-out;
   }
   a.button:hover, a.button:focus-visible { border-color: var(--accent); }
+  a.button:active { transform: scale(0.97); }
   .meta { color: var(--muted); font-size: 14px; }
   .meta a { color: var(--accent); }
   code {

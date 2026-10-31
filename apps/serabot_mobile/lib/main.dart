@@ -34,6 +34,7 @@ class _SeraBotMobileAppState extends State<SeraBotMobileApp> {
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF1B4332)),
         useMaterial3: true,
+        materialTapTargetSize: MaterialTapTargetSize.padded,
       ),
       home: _connected
           ? HomeScreen(

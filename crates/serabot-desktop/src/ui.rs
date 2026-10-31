@@ -2214,7 +2214,7 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
     use_effect(move || {
         let _ = session.read().state.messages.len();
         let _ = dioxus::document::eval(
-            "const el=document.getElementById('messages'); if(el){el.scrollTop=el.scrollHeight;}",
+            "const el=document.getElementById('messages'); if(el && el.scrollHeight - el.scrollTop - el.clientHeight < 80){el.scrollTop=el.scrollHeight;}",
         );
     });
     let empty = messages.is_empty();
