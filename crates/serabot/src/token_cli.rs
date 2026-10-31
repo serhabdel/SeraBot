@@ -25,7 +25,7 @@ pub fn mint(store: &Store, label: &str, days: Option<u32>) -> Result<String> {
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     let token = hex::encode(bytes);
     let expires_at = days.map(|days| Utc::now() + Duration::days(i64::from(days)));
-    store.insert_device_token(&new_id(), label, &sha256_hex(&token), expires_at)?;
+    store.insert_device_token(&new_id(), label, &sha256_hex(&token), None, expires_at)?;
     Ok(token)
 }
 

@@ -42,6 +42,11 @@ gridcraft-model = { git = "https://github.com/storytold/gridcraft", rev = "a2cc4
 gridcraft-xlsx = { git = "https://github.com/storytold/gridcraft", rev = "a2cc4b42cac6e2c41bae71fba4607300755a0b47" }
 hex = "0.4"
 lopdf = "0.34"
+# OIDC code flow + JWKS verification for multi-user sign-in (Microsoft in v1).
+# No built-in HTTP client feature: discovery, the token exchange, and JWKS
+# fetches go through this crate's own reqwest client via the pluggable
+# oauth2 HTTP adapter, so no second reqwest/hyper stack enters the tree.
+openidconnect = { version = "3", default-features = false }
 printpdf = "0.7"
 rand = "0.8"
 regex = "1"
@@ -82,6 +87,9 @@ zeroize = "1"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+# Signs synthetic provider id_tokens in the wiremock OIDC tests. Never used
+# outside tests: production verifies id_tokens with the openidconnect crate.
+jsonwebtoken = "9"
 http-body-util = "0.1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

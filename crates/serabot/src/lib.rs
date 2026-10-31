@@ -3,6 +3,7 @@ pub mod analyst;
 pub mod api;
 pub mod ask;
 pub mod audio;
+pub mod auth;
 pub mod brief;
 pub mod browser;
 pub mod cloud_code;

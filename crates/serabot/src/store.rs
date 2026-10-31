@@ -5,6 +5,7 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
+use rand::RngCore;
 use rusqlite::{OptionalExtension, Row, params};
 use serde::Serialize;
 use serde_json::Value;
@@ -14,6 +15,7 @@ use crate::domain::{
     utc_now,
 };
 use crate::error::{Result, SeraError};
+use crate::util::sha256_hex;
 
 const MIGRATION_1: &str = include_str!("../migrations/0001_core.sql");
 const MIGRATION_2: &str = include_str!("../migrations/0002_conversations.sql");
@@ -22,11 +24,111 @@ const MIGRATION_4: &str = include_str!("../migrations/0004_conversation_meta.sql
 const MIGRATION_5: &str = include_str!("../migrations/0005_conversation_teams.sql");
 const MIGRATION_6: &str = include_str!("../migrations/0006_console_redesign.sql");
 const MIGRATION_7: &str = include_str!("../migrations/0007_conversation_read_rowid.sql");
+const MIGRATION_8: &str = include_str!("../migrations/0008_users_and_sessions.sql");
+
+/// Fixed admin id written by migration 0008 and mirrored in
+/// `kv['admin_user_id']`. Code resolves the admin through the kv entry (the
+/// database is the source of truth); this constant documents the value and
+/// lets tests and migrations agree without copying the literal around.
+pub const ADMIN_USER_ID: &str = "00000000-0000-7000-8000-000000000001";
+
+/// The acting user's role. The admin sees audit records and manages users,
+/// invites, and server configuration; members act only within their own
+/// scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UserRole {
+    Admin,
+    Member,
+}
+
+impl UserRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::Member => "member",
+        }
+    }
+}
+
+impl std::str::FromStr for UserRole {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "admin" => Ok(Self::Admin),
+            "member" => Ok(Self::Member),
+            other => Err(format!("unknown user role: {other}")),
+        }
+    }
+}
+
+/// An account's availability. Disabled users fail closed: their sessions stop
+/// authorizing and they cannot sign in until re-enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UserStatus {
+    Active,
+    Disabled,
+}
+
+impl UserStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+impl std::str::FromStr for UserStatus {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "active" => Ok(Self::Active),
+            "disabled" => Ok(Self::Disabled),
+            other => Err(format!("unknown user status: {other}")),
+        }
+    }
+}
+
+/// One account row. `provider_subject` is namespaced per provider
+/// (`microsoft:<sub>`, later `google:<sub>`, `github:<sub>`) so adding a
+/// provider is configuration, never a schema change.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct User {
+    pub id: String,
+    pub provider_subject: String,
+    pub email: String,
+    pub display_name: String,
+    pub role: UserRole,
+    pub status: UserStatus,
+    pub created_at: DateTime<Utc>,
+}
+
+impl User {
+    pub fn is_admin(&self) -> bool {
+        self.role == UserRole::Admin
+    }
+}
+
+/// Result of completing a sign-in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginOutcome {
+    pub user: User,
+    /// True when this sign-in created the users row and consumed an invite;
+    /// an existing subject signing in again needs no invite.
+    pub created: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceToken {
     pub id: String,
     pub label: String,
+    /// Owning user; the migration backfills existing rows to the admin and
+    /// new operator CLI tokens default to the admin as well.
+    pub user_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
@@ -220,6 +322,11 @@ impl Store {
             connection.execute_batch(MIGRATION_7)?;
             connection.pragma_update(None, "user_version", 7)?;
         }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 8 {
+            connection.execute_batch(MIGRATION_8)?;
+            connection.pragma_update(None, "user_version", 8)?;
+        }
         let stored_dimension: Option<String> = connection
             .query_row(
                 "SELECT value FROM kv WHERE key = 'embedding_dimension'",
@@ -279,21 +386,32 @@ impl Store {
         Ok(())
     }
 
+    /// Insert a device token row. Only the SHA-256 hash is ever stored; the
+    /// caller keeps the plaintext. `user_id: None` means the operator CLI
+    /// minted the token, so it belongs to the admin account.
     pub fn insert_device_token(
         &self,
         id: &str,
         label: &str,
         token_hash: &str,
+        user_id: Option<&str>,
         expires_at: Option<DateTime<Utc>>,
     ) -> Result<()> {
+        // Resolve before taking a pooled connection: `admin_user_id` needs
+        // one itself, and the in-memory pool holds a single connection.
+        let user_id = match user_id {
+            Some(user_id) => user_id.to_owned(),
+            None => self.admin_user_id()?,
+        };
         let connection = self.connection()?;
         connection.execute(
-            "INSERT INTO device_tokens(id, label, token_hash, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO device_tokens(id, label, token_hash, user_id, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 id,
                 label,
                 token_hash,
+                user_id,
                 now_string(),
                 expires_at.map(to_string)
             ],
@@ -305,7 +423,7 @@ impl Store {
         let connection = self.connection()?;
         Ok(connection
             .query_row(
-                "SELECT id, label, created_at, last_used_at, expires_at, revoked_at
+                "SELECT id, label, user_id, created_at, last_used_at, expires_at, revoked_at
                  FROM device_tokens WHERE token_hash = ?1",
                 params![token_hash],
                 device_token_from_row,
@@ -316,7 +434,7 @@ impl Store {
     pub fn list_device_tokens(&self) -> Result<Vec<DeviceToken>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, label, created_at, last_used_at, expires_at, revoked_at
+            "SELECT id, label, user_id, created_at, last_used_at, expires_at, revoked_at
              FROM device_tokens ORDER BY created_at DESC, id",
         )?;
         let rows = statement.query_map([], device_token_from_row)?;
@@ -350,6 +468,365 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    // ---- Users, invites, and sessions (multi-user phase 1) ----
+
+    /// The bootstrap admin id recorded by migration 0008. The kv entry is the
+    /// source of truth so a restored database keeps working without config.
+    pub fn admin_user_id(&self) -> Result<String> {
+        self.kv_get("admin_user_id")?
+            .ok_or_else(|| SeraError::Internal("admin user is missing; run migrations".into()))
+    }
+
+    /// The bootstrap admin account, or `None` before migration 0008.
+    pub fn admin_user(&self) -> Result<Option<User>> {
+        let id = match self.kv_get("admin_user_id")? {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        self.get_user(&id)
+    }
+
+    pub fn get_user(&self, id: &str) -> Result<Option<User>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT id, provider_subject, email, display_name, role, status, created_at
+                 FROM users WHERE id = ?1",
+                params![id],
+                user_from_row,
+            )
+            .optional()?)
+    }
+
+    pub fn get_user_by_subject(&self, provider_subject: &str) -> Result<Option<User>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT id, provider_subject, email, display_name, role, status, created_at
+                 FROM users WHERE provider_subject = ?1",
+                params![provider_subject],
+                user_from_row,
+            )
+            .optional()?)
+    }
+
+    /// All accounts, oldest first. Bounded: the deployment is a small trusted
+    /// circle, and the cap turns runaway growth into an explicit error.
+    pub fn list_users(&self) -> Result<Vec<User>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, provider_subject, email, display_name, role, status, created_at
+             FROM users ORDER BY created_at ASC, id LIMIT 500",
+        )?;
+        let rows = statement.query_map([], user_from_row)?;
+        let mut users = Vec::new();
+        for row in rows {
+            users.push(row?);
+        }
+        Ok(users)
+    }
+
+    pub fn user_count(&self) -> Result<usize> {
+        let connection = self.connection()?;
+        let count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// Insert a member account. The invite must already be consumed: the only
+    /// authenticated creation path is [`Store::complete_login`], which keeps
+    /// invite redemption and row creation one transaction.
+    pub fn create_user(
+        &self,
+        provider_subject: &str,
+        email: &str,
+        display_name: &str,
+    ) -> Result<User> {
+        validate_user_fields(provider_subject, email, display_name)?;
+        let user = User {
+            id: new_id(),
+            provider_subject: provider_subject.to_owned(),
+            email: email.to_owned(),
+            display_name: display_name.to_owned(),
+            role: UserRole::Member,
+            status: UserStatus::Active,
+            created_at: utc_now(),
+        };
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO users(id, provider_subject, email, display_name, role, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                user.id,
+                user.provider_subject,
+                user.email,
+                user.display_name,
+                user.role.as_str(),
+                user.status.as_str(),
+                to_string(user.created_at),
+            ],
+        )?;
+        Ok(user)
+    }
+
+    /// Enable or disable an account. Returns false only when the id is
+    /// unknown. A disabled user's existing sessions stop authorizing
+    /// immediately (`session_user` checks the status), and they cannot sign
+    /// in again until re-enabled.
+    pub fn set_user_status(&self, id: &str, status: UserStatus) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE users SET status = ?2 WHERE id = ?1",
+            params![id, status.as_str()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Store an invitation. The raw code is passed once and only its SHA-256
+    /// hash is stored; the caller shows the raw code to the invitee exactly
+    /// once. `uses` is bounded so a leaked code cannot mint an unbounded
+    /// number of accounts.
+    pub fn mint_invite(
+        &self,
+        code: &str,
+        uses: u32,
+        expires_at: DateTime<Utc>,
+        created_by: &str,
+    ) -> Result<()> {
+        let code = code.trim();
+        if code.is_empty() || code.len() > 256 || code.chars().any(char::is_control) {
+            return Err(SeraError::Validation(
+                "invite code must be 1-256 characters without control characters".into(),
+            ));
+        }
+        if uses == 0 || uses > 100 {
+            return Err(SeraError::Validation(
+                "invite uses must be between 1 and 100".into(),
+            ));
+        }
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO invites(code_hash, uses_left, expires_at, created_by, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                sha256_hex(code),
+                uses as i64,
+                to_string(expires_at),
+                created_by,
+                now_string()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Whether an invite can still be redeemed right now. Checked at
+    /// `login_start` so a stale code never reaches the identity provider;
+    /// the authoritative consumption happens in [`Store::complete_login`].
+    pub fn invite_is_redeemable(&self, code_hash: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let found = connection
+            .query_row(
+                "SELECT 1 FROM invites
+                 WHERE code_hash = ?1 AND uses_left > 0 AND expires_at > ?2",
+                params![code_hash, now_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Consume one use of an invite, transactionally. Fails closed when the
+    /// invite is unknown, exhausted, or expired; concurrent consumers race on
+    /// the conditional update, so exactly one of them wins.
+    pub fn consume_invite(&self, code_hash: &str) -> Result<()> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE invites SET uses_left = uses_left - 1
+             WHERE code_hash = ?1 AND uses_left > 0 AND expires_at > ?2",
+            params![code_hash, now_string()],
+        )?;
+        if changed == 0 {
+            return Err(SeraError::InvalidState(
+                "invitation is unknown, expired, or exhausted".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Upsert the account for a verified OIDC subject, atomically.
+    ///
+    /// Existing subject: the profile fields the provider reported are
+    /// refreshed and no invite is touched. New subject: the user cap is
+    /// checked, one invite use is consumed, and the row is created inside a
+    /// single transaction — a concurrent double-spend of the same invite
+    /// fails closed for the loser, and the cap cannot be raced past.
+    pub fn complete_login(
+        &self,
+        provider_subject: &str,
+        email: &str,
+        display_name: &str,
+        invite_code_hash: Option<&str>,
+        max_users: usize,
+    ) -> Result<LoginOutcome> {
+        validate_user_fields(provider_subject, email, display_name)?;
+        if max_users == 0 {
+            return Err(SeraError::InvalidState(
+                "the user limit is zero; sign-in is closed".into(),
+            ));
+        }
+        let connection = self.connection()?;
+        let transaction = connection.unchecked_transaction()?;
+        if let Some(existing) = transaction
+            .query_row(
+                "SELECT id, provider_subject, email, display_name, role, status, created_at
+                 FROM users WHERE provider_subject = ?1",
+                params![provider_subject],
+                user_from_row,
+            )
+            .optional()?
+        {
+            transaction.execute(
+                "UPDATE users SET email = ?2, display_name = ?3 WHERE id = ?1",
+                params![existing.id, email, display_name],
+            )?;
+            transaction.commit()?;
+            return Ok(LoginOutcome {
+                user: User {
+                    email: email.to_owned(),
+                    display_name: display_name.to_owned(),
+                    ..existing
+                },
+                created: false,
+            });
+        }
+        let count: i64 =
+            transaction.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
+        if count.max(0) as usize >= max_users {
+            return Err(SeraError::InvalidState(format!(
+                "the user limit ({max_users}) is reached; ask the admin to raise it"
+            )));
+        }
+        let Some(invite_code_hash) = invite_code_hash else {
+            return Err(SeraError::Forbidden(
+                "an invitation is required to create an account".into(),
+            ));
+        };
+        let changed = transaction.execute(
+            "UPDATE invites SET uses_left = uses_left - 1
+             WHERE code_hash = ?1 AND uses_left > 0 AND expires_at > ?2",
+            params![invite_code_hash, now_string()],
+        )?;
+        if changed == 0 {
+            return Err(SeraError::InvalidState(
+                "invitation is unknown, expired, or exhausted".into(),
+            ));
+        }
+        let user = User {
+            id: new_id(),
+            provider_subject: provider_subject.to_owned(),
+            email: email.to_owned(),
+            display_name: display_name.to_owned(),
+            role: UserRole::Member,
+            status: UserStatus::Active,
+            created_at: utc_now(),
+        };
+        transaction.execute(
+            "INSERT INTO users(id, provider_subject, email, display_name, role, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                user.id,
+                user.provider_subject,
+                user.email,
+                user.display_name,
+                user.role.as_str(),
+                user.status.as_str(),
+                to_string(user.created_at),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(LoginOutcome {
+            user,
+            created: true,
+        })
+    }
+
+    /// Session token length in bytes; the hex token the caller sees is twice
+    /// this. Same shape as the operator CLI device tokens.
+    pub const SESSION_TOKEN_BYTES: usize = 32;
+    /// Sessions are bounded to five years so a stray long TTL cannot mint a
+    /// effectively permanent credential.
+    pub const MAX_SESSION_TTL: chrono::Duration = chrono::Duration::days(5 * 365);
+    /// Label stored on session rows so `serabot token list` can tell them
+    /// apart from operator CLI tokens.
+    pub const SESSION_LABEL: &str = "session";
+
+    /// Mint an opaque session for `user_id` and return the raw token exactly
+    /// once. Only the SHA-256 hash is stored; nothing else in the process
+    /// keeps the plaintext. Fails closed for unknown or disabled users.
+    pub fn mint_session(&self, user_id: &str, ttl: chrono::Duration) -> Result<String> {
+        let user = self
+            .get_user(user_id)?
+            .ok_or_else(|| SeraError::NotFound(format!("user {user_id}")))?;
+        if user.status != UserStatus::Active {
+            return Err(SeraError::InvalidState(
+                "this account is disabled; session was not issued".into(),
+            ));
+        }
+        if ttl <= chrono::Duration::zero() || ttl > Self::MAX_SESSION_TTL {
+            return Err(SeraError::Validation(
+                "session ttl must be positive and at most five years".into(),
+            ));
+        }
+        let mut bytes = [0u8; Self::SESSION_TOKEN_BYTES];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let token = hex::encode(bytes);
+        let expires_at = utc_now() + ttl;
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO device_tokens(id, label, token_hash, user_id, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                new_id(),
+                Self::SESSION_LABEL,
+                sha256_hex(&token),
+                user_id,
+                now_string(),
+                to_string(expires_at)
+            ],
+        )?;
+        Ok(token)
+    }
+
+    /// Resolve a session token hash to its active user. Fails closed: no
+    /// row, a revoked or expired session, or a disabled account all yield
+    /// `None` — never another user.
+    pub fn session_user(&self, token_hash: &str) -> Result<Option<User>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT u.id, u.provider_subject, u.email, u.display_name, u.role, u.status, u.created_at
+                 FROM device_tokens d JOIN users u ON u.id = d.user_id
+                 WHERE d.token_hash = ?1
+                   AND d.revoked_at IS NULL
+                   AND (d.expires_at IS NULL OR d.expires_at > ?2)
+                   AND u.status = 'active'",
+                params![token_hash, now_string()],
+                user_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Revoke a session by token hash. Returns false only when the hash is
+    /// unknown; revoking twice stays idempotent.
+    pub fn revoke_session(&self, token_hash: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE device_tokens SET revoked_at = COALESCE(revoked_at, ?2) WHERE token_hash = ?1",
+            params![token_hash, now_string()],
+        )?;
+        Ok(changed > 0)
     }
 
     pub fn insert_message(&self, message: &StoredMessage) -> Result<()> {
@@ -1734,20 +2211,99 @@ fn device_token_from_row(row: &Row<'_>) -> rusqlite::Result<DeviceToken> {
     Ok(DeviceToken {
         id: row.get(0)?,
         label: row.get(1)?,
-        created_at: parse_datetime(&row.get::<_, String>(2)?),
+        user_id: row.get(2)?,
+        created_at: parse_datetime(&row.get::<_, String>(3)?),
         last_used_at: row
-            .get::<_, Option<String>>(3)?
-            .as_deref()
-            .map(parse_datetime),
-        expires_at: row
             .get::<_, Option<String>>(4)?
             .as_deref()
             .map(parse_datetime),
-        revoked_at: row
+        expires_at: row
             .get::<_, Option<String>>(5)?
             .as_deref()
             .map(parse_datetime),
+        revoked_at: row
+            .get::<_, Option<String>>(6)?
+            .as_deref()
+            .map(parse_datetime),
     })
+}
+
+fn user_from_row(row: &Row<'_>) -> rusqlite::Result<User> {
+    let role: &str = &row.get::<_, String>(4)?;
+    let status: &str = &row.get::<_, String>(5)?;
+    Ok(User {
+        id: row.get(0)?,
+        provider_subject: row.get(1)?,
+        email: row.get(2)?,
+        display_name: row.get(3)?,
+        role: parse_user_role(role)?,
+        status: parse_user_status(status)?,
+        created_at: parse_datetime(&row.get::<_, String>(6)?),
+    })
+}
+
+/// Roles and statuses are written only through the checked enums above and
+/// the schema CHECK constraints, so an unparseable value is a corrupt row:
+/// fail the read loudly instead of guessing a default (a wrong guess here
+/// either escalates privilege or locks the owner out).
+fn enum_field<T: Copy>(label: &str, value: &str, known: &[(&str, T)]) -> rusqlite::Result<T> {
+    known
+        .iter()
+        .find(|(name, _)| *name == value)
+        .map(|(_, value)| *value)
+        .ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                value.len(),
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::other(format!(
+                    "corrupt users.{label} value: '{value}'"
+                ))),
+            )
+        })
+}
+
+fn parse_user_role(value: &str) -> rusqlite::Result<UserRole> {
+    enum_field(
+        "role",
+        value,
+        &[("admin", UserRole::Admin), ("member", UserRole::Member)],
+    )
+}
+
+fn parse_user_status(value: &str) -> rusqlite::Result<UserStatus> {
+    enum_field(
+        "status",
+        value,
+        &[
+            ("active", UserStatus::Active),
+            ("disabled", UserStatus::Disabled),
+        ],
+    )
+}
+
+/// Hard bounds on identity fields. Provider-reported values are untrusted
+/// input: callers sanitize before calling, and the store still refuses
+/// anything oversized rather than storing it silently truncated.
+fn validate_user_fields(provider_subject: &str, email: &str, display_name: &str) -> Result<()> {
+    if provider_subject.is_empty()
+        || provider_subject.len() > 200
+        || provider_subject.chars().any(char::is_control)
+    {
+        return Err(SeraError::Validation(
+            "provider subject must be 1-200 characters without control characters".into(),
+        ));
+    }
+    if email.len() > 320 || email.chars().any(char::is_control) {
+        return Err(SeraError::Validation(
+            "email must be at most 320 characters without control characters".into(),
+        ));
+    }
+    if display_name.len() > 200 || display_name.chars().any(char::is_control) {
+        return Err(SeraError::Validation(
+            "display name must be at most 200 characters without control characters".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn truncate(value: &str, max: usize) -> String {
@@ -2224,7 +2780,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -2242,6 +2798,20 @@ mod tests {
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='device_tokens'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        connection
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='users'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        connection
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='invites'",
                 [],
                 |row| row.get::<_, String>(0),
             )
@@ -2275,7 +2845,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -2284,6 +2854,427 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        // The identity batch arrived too: the bootstrap admin exists.
+        let admin = store.admin_user().unwrap().unwrap();
+        assert_eq!(admin.id, ADMIN_USER_ID);
+        assert_eq!(admin.role, UserRole::Admin);
+    }
+
+    /// A database at `user_version = 7` (the last single-operator schema)
+    /// carries over: the admin user appears, `kv['admin_user_id']` is set,
+    /// and pre-existing device tokens resolve to the admin.
+    #[test]
+    fn migrates_a_version_seven_database_with_admin_backfill() {
+        let path = std::env::temp_dir().join(format!("serabot-store-v7-{}.db", new_id()));
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            let migrations = [
+                MIGRATION_1,
+                MIGRATION_2,
+                MIGRATION_3,
+                MIGRATION_4,
+                MIGRATION_5,
+                MIGRATION_6,
+                MIGRATION_7,
+            ];
+            for (index, migration) in migrations.iter().enumerate() {
+                connection.execute_batch(migration).unwrap();
+                connection
+                    .pragma_update(None, "user_version", index as i64 + 1)
+                    .unwrap();
+            }
+            // Pre-migration operator state: a CLI device token and a
+            // conversation, with no user anywhere.
+            connection
+                .execute(
+                    "INSERT INTO device_tokens(id, label, token_hash, created_at)
+                     VALUES ('tok-legacy', 'desktop', 'legacy-hash', '2026-01-01T00:00:00.000Z')",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO conversations(id, kind, created_at, updated_at)
+                     VALUES ('dir:main', 'direct', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+                    [],
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path, 384, 5000).unwrap();
+        let version: i64 = store
+            .connection()
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 8);
+
+        let admin = store.admin_user().unwrap().unwrap();
+        assert_eq!(admin.id, ADMIN_USER_ID);
+        assert_eq!(admin.provider_subject, "local:admin");
+        assert_eq!(admin.role, UserRole::Admin);
+        assert_eq!(admin.status, UserStatus::Active);
+        assert_eq!(admin.email, "");
+        assert_eq!(admin.display_name, "Admin");
+        // created_at is a real RFC3339 millisecond timestamp, not utc_now()
+        // fallback drift.
+        assert!(admin.created_at > Utc::now() - chrono::Duration::hours(1));
+        assert_eq!(
+            store.kv_get("admin_user_id").unwrap().as_deref(),
+            Some(ADMIN_USER_ID)
+        );
+
+        // Existing data survives untouched and now belongs to the admin.
+        let token = store.device_token_by_hash("legacy-hash").unwrap().unwrap();
+        assert_eq!(token.id, "tok-legacy");
+        assert_eq!(token.user_id.as_deref(), Some(ADMIN_USER_ID));
+        let legacy = store.get_conversation("dir:main").unwrap();
+        assert!(legacy.is_some());
+
+        // The admin can no longer be created again by sign-in: the subject is
+        // taken, so an attacker cannot claim `local:admin` through OIDC.
+        let attempt = store
+            .complete_login(
+                "local:admin",
+                "attacker@example.example",
+                "Attacker",
+                None,
+                10,
+            )
+            .unwrap();
+        assert!(!attempt.created);
+        assert_eq!(attempt.user.id, ADMIN_USER_ID);
+        assert_eq!(attempt.user.role, UserRole::Admin, "role is never upserted");
+    }
+
+    #[test]
+    fn users_round_trip_and_admin_is_unique() {
+        let store = store();
+        let admin = store.admin_user().unwrap().unwrap();
+        assert_eq!(admin.role, UserRole::Admin);
+        assert_eq!(store.user_count().unwrap(), 1);
+
+        let created = store
+            .create_user("microsoft:abc123", "member@example.example", "Member One")
+            .unwrap();
+        assert_eq!(created.role, UserRole::Member);
+        assert_eq!(created.status, UserStatus::Active);
+        assert_ne!(created.id, admin.id);
+
+        assert_eq!(
+            store
+                .get_user_by_subject("microsoft:abc123")
+                .unwrap()
+                .unwrap()
+                .id,
+            created.id
+        );
+        assert!(store.get_user("missing-user").unwrap().is_none());
+        assert!(
+            store
+                .get_user_by_subject("microsoft:nobody")
+                .unwrap()
+                .is_none()
+        );
+
+        let listed = store.list_users().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            listed[0].id, admin.id,
+            "oldest first: admin bootstrapped first"
+        );
+
+        // Duplicate subjects are rejected by the UNIQUE constraint.
+        assert!(
+            store
+                .create_user("microsoft:abc123", "clone@example.example", "Clone")
+                .is_err()
+        );
+
+        // Oversized identity fields fail closed.
+        assert!(
+            store
+                .create_user(
+                    &format!("microsoft:{}", "x".repeat(400)),
+                    "big@example.example",
+                    "Big"
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .create_user("microsoft:ok", &"e".repeat(400), "Email Too Long")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn disabled_users_cannot_authenticate_and_can_be_reenabled() {
+        let store = store();
+        let user = store
+            .create_user("microsoft:disable-me", "off@example.example", "Off")
+            .unwrap();
+        let token = store
+            .mint_session(&user.id, chrono::Duration::hours(1))
+            .unwrap();
+        let hash = sha256_hex(&token);
+        assert!(store.session_user(&hash).unwrap().is_some());
+
+        assert!(
+            store
+                .set_user_status(&user.id, UserStatus::Disabled)
+                .unwrap()
+        );
+        assert_eq!(
+            store.get_user(&user.id).unwrap().unwrap().status,
+            UserStatus::Disabled
+        );
+        // The minted session immediately stops authorizing.
+        assert!(store.session_user(&hash).unwrap().is_none());
+        // And no new session can be minted while disabled.
+        assert!(
+            store
+                .mint_session(&user.id, chrono::Duration::hours(1))
+                .is_err()
+        );
+        // `complete_login` still resolves the disabled account (so the OIDC
+        // callback audits the attempt); session issuance — the assertion
+        // above — is the gate that fails closed.
+        assert!(
+            store
+                .complete_login(
+                    "microsoft:disable-me",
+                    "off@example.example",
+                    "Off",
+                    None,
+                    10
+                )
+                .is_ok()
+        );
+
+        assert!(store.set_user_status(&user.id, UserStatus::Active).unwrap());
+        assert!(store.session_user(&hash).unwrap().is_some());
+        assert!(
+            !store
+                .set_user_status("missing-user", UserStatus::Active)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn invites_enforce_ttl_uses_and_transactional_consumption() {
+        let store = store();
+        let admin_id = store.admin_user_id().unwrap();
+
+        let code = "invite-code-with-entropy-0123456789";
+        store
+            .mint_invite(code, 2, utc_now() + chrono::Duration::hours(48), &admin_id)
+            .unwrap();
+        let hash = sha256_hex(code);
+        assert!(store.invite_is_redeemable(&hash).unwrap());
+        assert!(
+            !store
+                .invite_is_redeemable(&sha256_hex("unknown-code"))
+                .unwrap()
+        );
+
+        store.consume_invite(&hash).unwrap();
+        assert!(store.invite_is_redeemable(&hash).unwrap(), "one use left");
+        store.consume_invite(&hash).unwrap();
+        assert!(
+            !store.invite_is_redeemable(&hash).unwrap(),
+            "uses exhausted"
+        );
+        assert!(store.consume_invite(&hash).is_err());
+
+        // Expired invites are not redeemable and fail consumption.
+        let expired = "expired-invite-code-0123456789abcdef";
+        store
+            .mint_invite(
+                expired,
+                5,
+                utc_now() - chrono::Duration::seconds(1),
+                &admin_id,
+            )
+            .unwrap();
+        let expired_hash = sha256_hex(expired);
+        assert!(!store.invite_is_redeemable(&expired_hash).unwrap());
+        assert!(store.consume_invite(&expired_hash).is_err());
+
+        // Bounds: zero uses and absurd codes are rejected.
+        assert!(
+            store
+                .mint_invite(
+                    "zero-uses",
+                    0,
+                    utc_now() + chrono::Duration::hours(1),
+                    &admin_id
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .mint_invite("", 1, utc_now() + chrono::Duration::hours(1), &admin_id)
+                .is_err()
+        );
+        assert!(
+            store
+                .mint_invite(
+                    &"x".repeat(300),
+                    1,
+                    utc_now() + chrono::Duration::hours(1),
+                    &admin_id
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn complete_login_creates_with_invite_and_reuses_existing_subject() {
+        let store = store();
+        let admin_id = store.admin_user_id().unwrap();
+        let code = "first-login-invite-0123456789abcdef";
+        store
+            .mint_invite(code, 1, utc_now() + chrono::Duration::hours(48), &admin_id)
+            .unwrap();
+        let invite_hash = sha256_hex(code);
+
+        // No invite: creating a new subject fails closed.
+        assert!(
+            store
+                .complete_login("microsoft:new-user", "new@example.example", "New", None, 10)
+                .is_err()
+        );
+
+        // With the invite: the user is created and the invite is consumed.
+        let outcome = store
+            .complete_login(
+                "microsoft:new-user",
+                "new@example.example",
+                "New",
+                Some(&invite_hash),
+                10,
+            )
+            .unwrap();
+        assert!(outcome.created);
+        assert_eq!(outcome.user.role, UserRole::Member);
+        assert!(!store.invite_is_redeemable(&invite_hash).unwrap());
+
+        // The same subject signing in again needs no new invite and refreshes
+        // the profile fields.
+        let again = store
+            .complete_login(
+                "microsoft:new-user",
+                "renamed@example.example",
+                "Renamed",
+                None,
+                10,
+            )
+            .unwrap();
+        assert!(!again.created);
+        assert_eq!(again.user.id, outcome.user.id);
+        assert_eq!(again.user.email, "renamed@example.example");
+        assert_eq!(again.user.display_name, "Renamed");
+
+        // Exhausted invite cannot create a second account.
+        let other = store
+            .complete_login(
+                "microsoft:second-user",
+                "second@example.example",
+                "Second",
+                Some(&invite_hash),
+                10,
+            )
+            .unwrap_err();
+        assert!(other.to_string().contains("invitation"));
+
+        // The user cap is enforced, invite or not.
+        let cap_code = "cap-invite-0123456789abcdef";
+        store
+            .mint_invite(
+                cap_code,
+                10,
+                utc_now() + chrono::Duration::hours(48),
+                &admin_id,
+            )
+            .unwrap();
+        let error = store
+            .complete_login(
+                "microsoft:third-user",
+                "third@example.example",
+                "Third",
+                Some(&sha256_hex(cap_code)),
+                2, // admin + new-user already exist
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("limit"));
+    }
+
+    #[test]
+    fn sessions_store_hashes_only_and_revoke_expires() {
+        let store = store();
+        let user = store
+            .create_user("microsoft:session-user", "s@example.example", "S")
+            .unwrap();
+
+        let token = store
+            .mint_session(&user.id, chrono::Duration::hours(2))
+            .unwrap();
+        assert_eq!(token.len(), Store::SESSION_TOKEN_BYTES * 2);
+        assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        // The stored hash is not the token, and the token appears nowhere.
+        let hash = sha256_hex(&token);
+        let record = store.device_token_by_hash(&hash).unwrap().unwrap();
+        assert_eq!(record.user_id.as_deref(), Some(user.id.as_str()));
+        assert_eq!(record.label, Store::SESSION_LABEL);
+        assert!(record.expires_at.is_some());
+        assert!(record.active_at(utc_now()));
+
+        let resolved = store.session_user(&hash).unwrap().unwrap();
+        assert_eq!(resolved.id, user.id);
+
+        // Unknown users and bogus ttls fail closed.
+        assert!(
+            store
+                .mint_session("missing-user", chrono::Duration::hours(1))
+                .is_err()
+        );
+        assert!(
+            store
+                .mint_session(&user.id, chrono::Duration::zero())
+                .is_err()
+        );
+        assert!(
+            store
+                .mint_session(&user.id, Store::MAX_SESSION_TTL * 2)
+                .is_err()
+        );
+
+        // Revocation kills the session and is idempotent.
+        assert!(store.revoke_session(&hash).unwrap());
+        assert!(store.session_user(&hash).unwrap().is_none());
+        assert!(
+            store.revoke_session(&hash).unwrap(),
+            "revoking twice stays true"
+        );
+        assert!(!store.revoke_session(&sha256_hex("never-minted")).unwrap());
+
+        // Expiry: a session with a past TTL never resolves.
+        let expired_token = store
+            .mint_session(&user.id, chrono::Duration::hours(1))
+            .unwrap();
+        let expired_hash = sha256_hex(&expired_token);
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE device_tokens SET expires_at = ?1 WHERE token_hash = ?2",
+                params![
+                    to_string(utc_now() - chrono::Duration::seconds(1)),
+                    expired_hash
+                ],
+            )
+            .unwrap();
+        assert!(store.session_user(&expired_hash).unwrap().is_none());
     }
 
     #[test]
@@ -2291,7 +3282,7 @@ mod tests {
         let store = store();
         let expires = utc_now() + chrono::Duration::days(30);
         store
-            .insert_device_token("tok-1", "desktop-win", "hash-only", Some(expires))
+            .insert_device_token("tok-1", "desktop-win", "hash-only", None, Some(expires))
             .unwrap();
         let found = store.device_token_by_hash("hash-only").unwrap().unwrap();
         assert_eq!(found.id, "tok-1");
@@ -2323,6 +3314,7 @@ mod tests {
                 "tok-2",
                 "old-laptop",
                 "expired-hash",
+                None,
                 Some(utc_now() - chrono::Duration::seconds(1)),
             )
             .unwrap();

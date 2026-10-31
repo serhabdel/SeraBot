@@ -12,40 +12,40 @@ never merge without the owner's OK.
 
 ## Phase 1 — identity foundations
 
-- [ ] T1.1 Migration `0008_users_and_sessions.sql`: `users`, `invites`,
+- [x] T1.1 Migration `0008_users_and_sessions.sql`: `users`, `invites`,
       `device_tokens.user_id`; deterministic admin bootstrap (fixed id,
       `kv['admin_user_id']`, token backfill). Register `MIGRATION_8`.
       - Acceptance: a DB at `user_version=7` migrates; admin user exists;
         all existing device tokens resolve to the admin.
       - Verify: `cargo-win test store` (new migration fixture test).
-- [ ] T1.2 `store.rs`: `User`, invite mint/consume (transactional),
+- [x] T1.2 `store.rs`: `User`, invite mint/consume (transactional),
       session mint/resolve/revoke (hash-only storage, constant-time
       compare), user disable/enable.
       - Acceptance: state machines incl. expired invite, exhausted invite,
         revoked session; inline tests green.
-- [ ] T1.3 `config.rs`: `[auth]` + `[users]` sections, fail-fast validation;
+- [x] T1.3 `config.rs`: `[auth]` + `[users]` sections, fail-fast validation;
       synthetic examples in example configs only.
       - Acceptance: invalid base_url/tenant/providers rejected at load;
         defaults documented in struct docs.
-- [ ] T1.4 New `auth.rs` (add `openidconnect`): provider registry
+- [x] T1.4 New `auth.rs` (add `openidconnect`): provider registry
       (microsoft), PKCE + state + nonce, JWKS-verified id_token, namespaced
       subject, invite redemption at start, session issue at callback;
       overridable endpoints for tests; secrets never logged.
       - Acceptance: happy path + each failure path (bad state, expired
         invite, unknown provider, auth disabled) unit-tested against a
         wiremock IdP with a `jsonwebtoken`-signed synthetic token.
-- [ ] T1.5 `api.rs`: authorize middleware yields `(User, role)`; existing
+- [x] T1.5 `api.rs`: authorize middleware yields `(User, role)`; existing
       tokens keep working as admin; add `GET /v1/auth/providers` (public),
       `POST /v1/auth/login/start`, `GET /v1/auth/callback` (token shown
       once), `POST /v1/auth/logout`, `POST /v1/auth/invites` + user
       list/enable/disable (admin-only).
       - Acceptance: member session ⇒ 403 on admin endpoints; 401
         unauthenticated; providers list shows google/github disabled.
-- [ ] T1.6 `web.rs`: public `/login` page; Microsoft enabled, Google and
+- [x] T1.6 `web.rs`: public `/login` page; Microsoft enabled, Google and
       GitHub visibly disabled.
       - Acceptance: page renders without JS frameworks; matches landing
         style; covered by an axum oneshot test.
-- [ ] T1.7 Phase gate: check + full workspace test green; clippy clean on
+- [x] T1.7 Phase gate: check + full workspace test green; clippy clean on
       WSL; commit; push.
 
 ## Phase 2 — store scoping

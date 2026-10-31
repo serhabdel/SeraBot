@@ -22,6 +22,13 @@ pub struct Config {
     pub telegram: TelegramConfig,
     #[serde(default)]
     pub api: ApiConfig,
+    /// Multi-user OIDC sign-in. Disabled by default; the single-operator
+    /// token flow keeps working unchanged while it is off.
+    #[serde(default)]
+    pub auth: AuthConfig,
+    /// Per-user quotas and limits.
+    #[serde(default)]
+    pub users: UsersConfig,
     #[serde(default)]
     pub policy: PolicyConfig,
     #[serde(default)]
@@ -72,6 +79,8 @@ impl Default for Config {
             embeddings: EmbeddingsConfig::default(),
             telegram: TelegramConfig::default(),
             api: ApiConfig::default(),
+            auth: AuthConfig::default(),
+            users: UsersConfig::default(),
             policy: PolicyConfig::default(),
             watcher: WatcherConfig::default(),
             onedrive: OneDriveConfig::default(),
@@ -151,6 +160,8 @@ impl Config {
                 "api.token_hash must be a 64-character hex SHA-256 hash".into(),
             ));
         }
+        self.auth.validate()?;
+        self.users.validate()?;
         if !self.server.bind.starts_with("127.")
             && !self.server.bind.starts_with("localhost")
             && !self.server.bind.starts_with("[::1]")
@@ -657,6 +668,194 @@ impl Default for ApiConfig {
             token_hash: String::new(),
             approval_expiry_hours: default_approval_expiry(),
         }
+    }
+}
+
+/// Provider ids this build knows. Only `microsoft` can be enabled in v1;
+/// `google` and `github` are rendered by the clients as coming soon.
+pub const KNOWN_AUTH_PROVIDERS: [&str; 3] = ["microsoft", "google", "github"];
+/// The subset of `KNOWN_AUTH_PROVIDERS` that can actually serve sign-in in
+/// v1. Enabling another provider is additive configuration later; for now
+/// listing it is allowed and it is reported disabled.
+pub const ENABLED_AUTH_PROVIDERS: [&str; 1] = ["microsoft"];
+
+/// Multi-user sign-in settings. Defaults keep everything off: while
+/// `enabled = false` the server behaves exactly like the single-operator
+/// deployment and every auth endpoint fails closed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthConfig {
+    #[serde(default = "default_auth_enabled")]
+    pub enabled: bool,
+    /// Provider ids the deployment lists. Unknown ids are rejected at load;
+    /// `google`/`github` are accepted but reported disabled in v1.
+    #[serde(default = "default_auth_providers")]
+    pub providers: Vec<String>,
+    /// Microsoft tenant: `consumers`, `organizations`, a tenant id, or a
+    /// domain. Shared with the OneDrive registration.
+    #[serde(default = "default_auth_tenant")]
+    pub tenant: String,
+    /// Age-store key holding the public client id. The value is never
+    /// logged and never leaves the process.
+    #[serde(default = "default_auth_client_id_secret")]
+    pub client_id_secret: String,
+    /// Public base URL of this server (https). The OIDC redirect lands on
+    /// `{base_url}/v1/auth/callback`, so this is the URL behind the reverse
+    /// proxy, not the loopback bind.
+    #[serde(default)]
+    pub base_url: String,
+    /// Session lifetime for browser sign-ins (default 720h = 30 days).
+    #[serde(default = "default_auth_session_ttl")]
+    pub session_ttl_hours: u64,
+    /// Default invite lifetime (default 48h).
+    #[serde(default = "default_auth_invite_ttl")]
+    pub invite_ttl_hours: u64,
+    /// Maximum number of accounts, invitations included. The product
+    /// boundary is a small trusted circle (≤ ~10); the cap bounds runaway
+    /// growth with an explicit error.
+    #[serde(default = "default_auth_max_users")]
+    pub max_users: usize,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_auth_enabled(),
+            providers: default_auth_providers(),
+            tenant: default_auth_tenant(),
+            client_id_secret: default_auth_client_id_secret(),
+            base_url: String::new(),
+            session_ttl_hours: default_auth_session_ttl(),
+            invite_ttl_hours: default_auth_invite_ttl(),
+            max_users: default_auth_max_users(),
+        }
+    }
+}
+
+impl AuthConfig {
+    /// The providers that can actually serve sign-ins right now: the
+    /// configured list intersected with what this build implements.
+    pub fn effective_providers(&self) -> Vec<&'static str> {
+        ENABLED_AUTH_PROVIDERS
+            .into_iter()
+            .filter(|id| {
+                self.providers
+                    .iter()
+                    .any(|configured| configured.eq_ignore_ascii_case(id))
+            })
+            .collect()
+    }
+
+    fn validate(&self) -> Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for provider in &self.providers {
+            let id = provider.trim();
+            if id.is_empty() || !seen.insert(id.to_ascii_lowercase()) {
+                return Err(SeraError::Config(
+                    "auth.providers entries must be unique and non-empty".into(),
+                ));
+            }
+            if !KNOWN_AUTH_PROVIDERS.contains(&id) {
+                return Err(SeraError::Config(format!(
+                    "auth.providers contains unknown provider '{id}'; known providers are microsoft, google, github"
+                )));
+            }
+        }
+        let tenant = self.tenant.trim();
+        if tenant.is_empty()
+            || tenant.len() > 128
+            || tenant == "."
+            || tenant == ".."
+            || !tenant
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+        {
+            return Err(SeraError::Config(
+                "auth.tenant must be a tenant id or domain name".into(),
+            ));
+        }
+        if !valid_secret_name(&self.client_id_secret) {
+            return Err(SeraError::Config(
+                "auth.client_id_secret must be a secret-store key name".into(),
+            ));
+        }
+        // base_url is validated even while disabled so a typo cannot hide
+        // until someone flips auth on.
+        if !self.base_url.is_empty() {
+            let url = reqwest::Url::parse(self.base_url.trim())
+                .map_err(|_| SeraError::Config("auth.base_url must be a valid URL".into()))?;
+            if url.scheme() != "https" {
+                return Err(SeraError::Config(
+                    "auth.base_url must use https; the OIDC redirect is public".into(),
+                ));
+            }
+            if url.host_str().is_none_or(str::is_empty)
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(SeraError::Config(
+                    "auth.base_url must be a bare URL: host only, no path, credentials, query, or fragment"
+                        .into(),
+                ));
+            }
+        }
+        if self.session_ttl_hours == 0 || self.session_ttl_hours > 24 * 365 {
+            return Err(SeraError::Config(
+                "auth.session_ttl_hours must be between 1 and 8760".into(),
+            ));
+        }
+        if self.invite_ttl_hours == 0 || self.invite_ttl_hours > 24 * 30 {
+            return Err(SeraError::Config(
+                "auth.invite_ttl_hours must be between 1 and 720".into(),
+            ));
+        }
+        if self.max_users == 0 || self.max_users > 50 {
+            return Err(SeraError::Config(
+                "auth.max_users must be between 1 and 50".into(),
+            ));
+        }
+        if self.enabled && self.effective_providers().is_empty() {
+            return Err(SeraError::Config(
+                "auth.providers must include 'microsoft' when auth is enabled; google and github are not enableable yet"
+                    .into(),
+            ));
+        }
+        if self.enabled && self.base_url.trim().is_empty() {
+            return Err(SeraError::Config(
+                "auth.base_url is required when auth is enabled; it is the public https URL the OIDC redirect returns to"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Per-user quota settings. Enforced from phase 5; validated now so a bad
+/// value cannot hide until the quota turns on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsersConfig {
+    /// Daily task budget per user (default 500). Enforced at enqueue.
+    #[serde(default = "default_users_task_quota")]
+    pub tasks_per_user_per_day: u64,
+}
+
+impl Default for UsersConfig {
+    fn default() -> Self {
+        Self {
+            tasks_per_user_per_day: default_users_task_quota(),
+        }
+    }
+}
+
+impl UsersConfig {
+    fn validate(&self) -> Result<()> {
+        if self.tasks_per_user_per_day == 0 || self.tasks_per_user_per_day > 10_000 {
+            return Err(SeraError::Config(
+                "users.tasks_per_user_per_day must be between 1 and 10000".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1782,6 +1981,30 @@ fn default_api_enabled() -> bool {
 fn default_approval_expiry() -> i64 {
     24
 }
+fn default_auth_enabled() -> bool {
+    false
+}
+fn default_auth_providers() -> Vec<String> {
+    vec!["microsoft".into()]
+}
+fn default_auth_tenant() -> String {
+    "consumers".into()
+}
+fn default_auth_client_id_secret() -> String {
+    "auth_client_id".into()
+}
+fn default_auth_session_ttl() -> u64 {
+    720
+}
+fn default_auth_invite_ttl() -> u64 {
+    48
+}
+fn default_auth_max_users() -> usize {
+    10
+}
+fn default_users_task_quota() -> u64 {
+    500
+}
 fn default_blocklist_file() -> String {
     "private/blocklist.txt".into()
 }
@@ -2193,5 +2416,128 @@ enabled = false
         assert!(redirect.validate().is_err());
         redirect.google_calendar.redirect_uri = "http://127.0.0.1:8765/callback".into();
         assert!(redirect.validate().is_ok());
+    }
+
+    /// A config whose non-auth sections pass validation, so `validate()`
+    /// exercises — and can pass — the auth/users checks. The raw default
+    /// leaves `[api] enabled = true` with an empty `token_hash`, which is
+    /// invalid by design (the API demands a configured token).
+    fn valid_config() -> Config {
+        let mut config = Config::default();
+        config.api.enabled = false;
+        config
+    }
+
+    #[test]
+    fn auth_defaults_to_disabled_with_documented_values() {
+        let config = AuthConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.providers, vec!["microsoft".to_string()]);
+        assert_eq!(config.tenant, "consumers");
+        assert_eq!(config.client_id_secret, "auth_client_id");
+        assert_eq!(config.session_ttl_hours, 720);
+        assert_eq!(config.invite_ttl_hours, 48);
+        assert_eq!(config.max_users, 10);
+        assert_eq!(UsersConfig::default().tasks_per_user_per_day, 500);
+        valid_config().validate().unwrap();
+    }
+
+    #[test]
+    fn auth_rejects_unknown_providers_and_bad_values() {
+        let mut config = valid_config();
+        config.auth.providers = vec!["microsoft".into(), "saml".into()];
+        assert!(config.validate().is_err());
+
+        let mut config = valid_config();
+        config.auth.providers = vec!["microsoft".into(), "microsoft".into()];
+        assert!(config.validate().is_err(), "duplicates are rejected");
+
+        let mut config = valid_config();
+        config.auth.tenant = "../escape".into();
+        assert!(config.validate().is_err());
+
+        let mut config = valid_config();
+        config.auth.client_id_secret = "not a secret name".into();
+        assert!(config.validate().is_err());
+
+        let mut config = valid_config();
+        config.auth.session_ttl_hours = 0;
+        assert!(config.validate().is_err());
+        config.auth.session_ttl_hours = 720;
+        config.auth.invite_ttl_hours = 24 * 31;
+        assert!(config.validate().is_err());
+        config.auth.invite_ttl_hours = 48;
+        config.auth.max_users = 0;
+        assert!(config.validate().is_err());
+        config.auth.max_users = 10;
+        config.users.tasks_per_user_per_day = 0;
+        assert!(config.validate().is_err());
+        config.users.tasks_per_user_per_day = 500;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn auth_requires_https_base_url_and_microsoft_when_enabled() {
+        let mut config = valid_config();
+        config.auth.enabled = true;
+        assert!(
+            config.validate().is_err(),
+            "enabled auth requires a base_url"
+        );
+
+        config.auth.base_url = "http://bot.example.example".into();
+        assert!(config.validate().is_err(), "base_url must be https");
+
+        config.auth.base_url = "https://user:pw@example.example/?x=1".into();
+        assert!(
+            config.validate().is_err(),
+            "no credentials, query, fragment"
+        );
+
+        config.auth.base_url = "https://bot.example.example".into();
+        config.validate().unwrap();
+
+        // google/github may be listed but cannot enable sign-in on their own.
+        config.auth.providers = vec!["google".into(), "github".into()];
+        assert!(
+            config.validate().is_err(),
+            "enabled auth must include microsoft"
+        );
+        assert!(config.auth.effective_providers().is_empty());
+
+        config.auth.providers = vec!["microsoft".into(), "google".into(), "github".into()];
+        config.validate().unwrap();
+        assert_eq!(config.auth.effective_providers(), vec!["microsoft"]);
+
+        // While disabled, an invalid base_url still fails fast.
+        let mut config = valid_config();
+        config.auth.base_url = "ftp://example.example".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn auth_section_parses_from_toml() {
+        let raw = r#"
+[api]
+enabled = false
+
+[auth]
+enabled = false
+providers = ["microsoft", "github"]
+tenant = "consumers"
+client_id_secret = "auth_client_id"
+base_url = "https://bot.example.example"
+session_ttl_hours = 720
+invite_ttl_hours = 48
+max_users = 10
+
+[users]
+tasks_per_user_per_day = 500
+"#;
+        let config: Config = toml::from_str(raw).unwrap();
+        assert_eq!(config.auth.providers.len(), 2);
+        assert_eq!(config.auth.base_url, "https://bot.example.example");
+        assert_eq!(config.users.tasks_per_user_per_day, 500);
+        config.validate().unwrap();
     }
 }

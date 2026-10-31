@@ -768,7 +768,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             config.clone(),
             artifacts.clone(),
             secrets.clone(),
-        );
+        )?;
         let app = serabot::api::router(state);
         let listener = tokio::net::TcpListener::bind(&config.server.bind)
             .await

@@ -24,6 +24,25 @@ enabled = false
 token_hash = ""
 approval_expiry_hours = 24
 
+# Multi-user sign-in (OIDC; invitation-only, Microsoft in v1).
+# Store the app registration's public client id with:
+#   serabot secrets set auth_client_id
+[auth]
+enabled = false
+providers = ["microsoft"]         # google + github ship shown-but-disabled
+tenant = "consumers"
+client_id_secret = "auth_client_id"
+# Public https base URL the OIDC redirect returns to (behind the reverse
+# proxy, not the loopback bind). Required when enabled.
+base_url = "https://bot.example.example"
+session_ttl_hours = 720
+invite_ttl_hours = 48
+max_users = 10
+
+[users]
+# Daily task budget per user (enforced from phase 5).
+tasks_per_user_per_day = 500
+
 [telegram]
 enabled = false
 bot_token_secret = "telegram_bot_token"

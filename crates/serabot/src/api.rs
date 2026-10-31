@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Extension, Path, Query, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -23,6 +23,7 @@ use tracing::warn;
 use crate::admin::{
     AdminStore, BotConfigOverlay, BotProfile, ProviderSecrets, connector_secret_roles,
 };
+use crate::auth::{self, AuthService};
 use crate::config::{Config, OAuthConnectorSettings, ProviderConfig, scaffold_specialist_bot};
 use crate::connectors::{ApiKeyProbe, probe_api_key};
 use crate::domain::Task;
@@ -37,7 +38,7 @@ use crate::orchestration::{
 use crate::runtime::{ApprovalNotice, Notifier, Runtime};
 use crate::secrets::SharedSecrets;
 use crate::skills::{SkillCatalog, create_skill, discard_created_skill};
-use crate::store::{Store, StoredConversation};
+use crate::store::{Store, StoredConversation, User, UserRole, UserStatus};
 use crate::util::{constant_time_eq, sha256_hex, truncate_chars};
 
 #[derive(Clone)]
@@ -93,19 +94,34 @@ pub struct ApiState {
     rate: Arc<Mutex<VecDeque<Instant>>>,
     rate_limit: usize,
     admin: Option<AdminStore>,
+    /// The OIDC sign-in service; `None` while `[auth] enabled = false`, so
+    /// every sign-in endpoint fails closed.
+    auth: Option<Arc<AuthService>>,
     /// Providers with a device sign-in still running in the background.
     oauth_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl ApiState {
+    /// Fails fast when sign-in is enabled but misconfigured: a missing auth
+    /// client id, a bad redirect, or an unusable provider must stop startup
+    /// rather than surface at sign-in time.
     pub fn new(
         runtime: Runtime,
         store: Store,
         config: Arc<Config>,
         artifacts: Arc<ArtifactStore>,
         secrets: SharedSecrets,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let auth = if config.auth.enabled {
+            Some(Arc::new(AuthService::new(
+                &config,
+                store.clone(),
+                &secrets,
+            )?))
+        } else {
+            None
+        };
+        Ok(Self {
             runtime,
             store,
             artifacts,
@@ -114,9 +130,10 @@ impl ApiState {
             rate: Arc::new(Mutex::new(VecDeque::new())),
             rate_limit: config.server.rate_limit_per_minute.max(1) as usize,
             admin: AdminStore::open(&config).ok(),
+            auth,
             oauth_inflight: Arc::default(),
             config,
-        }
+        })
     }
 }
 
@@ -188,6 +205,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/audit", get(audit))
         .route("/v1/artifacts/{hash}", get(artifact))
         .route("/v1/artifacts/{hash}/approve", post(approve_artifact))
+        .route("/v1/auth/logout", post(auth_logout))
+        .route("/v1/auth/invites", post(auth_invites))
+        .route("/v1/users", get(list_users))
+        .route("/v1/users/{id}/disable", post(disable_user))
+        .route("/v1/users/{id}/enable", post(enable_user))
         .layer(RequestBodyLimitLayer::new(
             shared.config.server.body_limit_bytes,
         ));
@@ -203,11 +225,24 @@ pub fn router(state: ApiState) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(
             crate::audio::DEFAULT_TELEGRAM_AUDIO_MAX_BYTES as usize,
         ));
+    // Sign-in entry points are public: the caller by definition has no
+    // session token yet. They share the JSON body limit and the per-minute
+    // rate limit, but not the bearer-token middleware.
+    let public_auth = Router::new()
+        .route("/v1/auth/providers", get(auth_providers))
+        .route("/v1/auth/login/start", post(auth_login_start))
+        .route("/v1/auth/callback", get(auth_callback))
+        .route("/login/microsoft", get(auth_login_microsoft))
+        .layer(RequestBodyLimitLayer::new(
+            shared.config.server.body_limit_bytes,
+        ))
+        .layer(middleware::from_fn_with_state(shared.clone(), rate_limit));
     let protected = protected
         .merge(audio)
         .layer(middleware::from_fn_with_state(shared.clone(), authorize))
         .layer(middleware::from_fn_with_state(shared.clone(), rate_limit));
     crate::web::router()
+        .merge(public_auth)
         .merge(protected)
         .layer(TraceLayer::new_for_http())
         .with_state(shared)
@@ -2581,10 +2616,47 @@ fn secret_status(secrets: &SharedSecrets, name: Option<&str>) -> Value {
     }
 }
 
+/// The identity behind an authenticated request, threaded into handlers
+/// through request extensions. Carries only ids and the role — never a raw
+/// token (the `token_hash` field is the sha256 the server stores).
+#[derive(Clone, Debug)]
+pub struct ActingUser {
+    pub id: String,
+    pub role: UserRole,
+    /// The device-token row id when the bearer token is a session; `None`
+    /// for the static config token, which has no revocable session row.
+    pub session_id: Option<String>,
+    pub token_hash: String,
+}
+
+impl ActingUser {
+    pub fn is_admin(&self) -> bool {
+        self.role == UserRole::Admin
+    }
+}
+
+/// Gate a handler on the admin role. Members receive an explicit 403.
+fn require_admin(user: &ActingUser) -> Result<()> {
+    if user.role != UserRole::Admin {
+        return Err(SeraError::Forbidden(
+            "this endpoint requires the admin role".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the user behind a bearer token, or fail closed.
+///
+/// The static config token is the operator's own credential and maps to the
+/// bootstrap admin. Device tokens map to the owning user recorded on the
+/// row (existing operator tokens were backfilled to the admin by migration
+/// 0008). Unknown owners, disabled accounts, and revoked or expired tokens
+/// all reject identically, so a rejected caller learns nothing about which
+/// check failed.
 async fn authorize(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     if !state.config.api.enabled {
@@ -2608,14 +2680,32 @@ async fn authorize(
     }
     let candidate = sha256_hex(token);
     if constant_time_eq(&candidate, &state.token_hash) {
+        let Some(admin) = active_user(&state, None) else {
+            return unauthorized();
+        };
+        request.extensions_mut().insert(ActingUser {
+            id: admin.id,
+            role: admin.role,
+            session_id: None,
+            token_hash: candidate,
+        });
         return next.run(request).await;
     }
     let now = chrono::Utc::now();
     match state.store.device_token_by_hash(&candidate) {
         Ok(Some(record)) if record.active_at(now) => {
+            let Some(user) = active_user(&state, record.user_id.as_deref()) else {
+                return unauthorized();
+            };
             if let Err(error) = state.store.touch_device_token(&record.id, now) {
                 warn!(%error, "device token last-used update failed");
             }
+            request.extensions_mut().insert(ActingUser {
+                id: user.id,
+                role: user.role,
+                session_id: Some(record.id),
+                token_hash: candidate,
+            });
             next.run(request).await
         }
         Ok(_) => unauthorized(),
@@ -2626,10 +2716,334 @@ async fn authorize(
     }
 }
 
+/// The active user behind a token, or `None` when the owner is missing or
+/// disabled. A `None` owner id maps to the bootstrap admin (pre-migration
+/// rows were backfilled, but the lookup stays explicit either way).
+fn active_user(state: &ApiState, user_id: Option<&str>) -> Option<User> {
+    let user = match user_id {
+        Some(id) => state.store.get_user(id).ok()??,
+        None => state.store.admin_user().ok()??,
+    };
+    (user.status == UserStatus::Active).then_some(user)
+}
+
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         Json(json!({"error": "unauthorized"})),
+    )
+        .into_response()
+}
+
+// ---- Auth endpoints (public entry, protected sessions) ----
+
+/// The providers list rendered by web, desktop, and mobile clients. Public
+/// and derived from config; `google`/`github` always report disabled in v1.
+async fn auth_providers(State(state): State<Arc<ApiState>>) -> Json<Value> {
+    let providers: Vec<Value> = auth::provider_report(&state.config.auth)
+        .into_iter()
+        .map(|provider| json!({"id": provider.id, "enabled": provider.enabled}))
+        .collect();
+    Json(json!({"providers": providers}))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginStartRequest {
+    provider: String,
+    #[serde(default)]
+    invite_code: Option<String>,
+}
+
+/// Start a browser sign-in. Public by definition (no session yet); the
+/// invite code, when presented, is validated but consumed only at the
+/// callback — inside the transaction that creates the account.
+async fn auth_login_start(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<LoginStartRequest>,
+) -> Result<Json<Value>> {
+    let service = auth_service(&state)?;
+    if request.provider.len() > 64 {
+        return Err(SeraError::Validation(
+            "provider must be a known provider id".into(),
+        ));
+    }
+    let invite = request
+        .invite_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|code| !code.is_empty());
+    let url = service.login_start(&request.provider, invite).await?;
+    Ok(Json(json!({"url": url})))
+}
+
+/// The `/login` page's Microsoft button target: start the flow and hand the
+/// browser to the provider. Failures render the same minimal error page as
+/// the callback (fail closed, no provider detail).
+async fn auth_login_microsoft(State(state): State<Arc<ApiState>>) -> Response {
+    let Some(service) = state.auth.as_ref() else {
+        return auth_error_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Sign-in is not enabled on this deployment.",
+        );
+    };
+    match service.login_start("microsoft", None).await {
+        Ok(url) => (
+            StatusCode::FOUND,
+            [
+                (header::LOCATION, url.as_str()),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(%error, "web login start failed");
+            auth_error_page(
+                StatusCode::BAD_REQUEST,
+                "Sign-in could not be started. Check that sign-in is configured, then try again.",
+            )
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CallbackParams {
+    state: String,
+    code: String,
+}
+
+/// The OIDC redirect target. Completes the sign-in and shows the new
+/// session token exactly once, with a paste-into-your-client hint; the
+/// token is never stored in the clear and never shown again.
+async fn auth_callback(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<CallbackParams>,
+) -> Response {
+    let Some(service) = state.auth.as_ref() else {
+        return auth_error_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Sign-in is not enabled on this deployment.",
+        );
+    };
+    match service.callback(&params.state, &params.code).await {
+        Ok((_user, token)) => html_response(StatusCode::OK, session_token_page(&token)),
+        Err(error) => {
+            warn!(%error, "auth callback failed");
+            auth_error_page(
+                StatusCode::BAD_REQUEST,
+                "Sign-in could not be completed. The link may have expired or been used; start again from the client.",
+            )
+        }
+    }
+}
+
+/// Revoke the caller's own session. The static config token has no session
+/// row, so it cannot be revoked here — rotating it is a config change.
+async fn auth_logout(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    if user.session_id.is_none() {
+        return Err(SeraError::InvalidState(
+            "this token is the server configuration token and cannot be revoked here".into(),
+        ));
+    }
+    state.store.revoke_session(&user.token_hash)?;
+    audit_auth(&state, &user.id, "auth.logout", json!({}))?;
+    Ok(Json(json!({"revoked": true})))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MintInviteRequest {
+    uses: u32,
+}
+
+/// Mint an invitation (admin only). The raw code is returned exactly once;
+/// the server keeps only its SHA-256 hash.
+async fn auth_invites(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Json(request): Json<MintInviteRequest>,
+) -> Result<Json<Value>> {
+    require_admin(&user)?;
+    let service = auth_service(&state)?;
+    if request.uses == 0 || request.uses > 100 {
+        return Err(SeraError::Validation(
+            "uses must be between 1 and 100".into(),
+        ));
+    }
+    let code = service.mint_invite(request.uses, &user.id)?;
+    audit_auth(
+        &state,
+        &user.id,
+        "auth.invite_minted",
+        json!({"uses": request.uses}),
+    )?;
+    Ok(Json(json!({"code": code})))
+}
+
+/// List accounts (admin only). Member sessions get 403 and never see the
+/// user directory.
+async fn list_users(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    require_admin(&user)?;
+    let users = state.store.list_users()?;
+    let users: Vec<Value> = users.iter().map(user_view).collect();
+    Ok(Json(json!({"users": users})))
+}
+
+fn user_view(user: &User) -> Value {
+    json!({
+        "id": user.id,
+        "provider_subject": user.provider_subject,
+        "email": user.email,
+        "display_name": user.display_name,
+        "role": user.role.as_str(),
+        "status": user.status.as_str(),
+        "created_at": user.created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+    })
+}
+
+async fn disable_user(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    change_user_status(&state, &user, &id, UserStatus::Disabled)
+}
+
+async fn enable_user(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    change_user_status(&state, &user, &id, UserStatus::Active)
+}
+
+/// Enable or disable an account (admin only). A disabled user's sessions
+/// stop authorizing immediately. The admin account itself cannot be
+/// disabled: it owns recovery, and locking it out would strand the
+/// deployment with no admin path at all.
+fn change_user_status(
+    state: &ApiState,
+    acting: &ActingUser,
+    id: &str,
+    status: UserStatus,
+) -> Result<Json<Value>> {
+    require_admin(acting)?;
+    crate::util::validate_id(id)?;
+    let target = state
+        .store
+        .get_user(id)?
+        .ok_or_else(|| SeraError::NotFound(format!("user {id}")))?;
+    if status == UserStatus::Disabled && target.role == UserRole::Admin {
+        return Err(SeraError::Validation(
+            "the admin account cannot be disabled".into(),
+        ));
+    }
+    state.store.set_user_status(id, status)?;
+    audit_auth(
+        state,
+        &acting.id,
+        if status == UserStatus::Disabled {
+            "auth.user_disabled"
+        } else {
+            "auth.user_enabled"
+        },
+        json!({"user_id": id, "status": status.as_str()}),
+    )?;
+    Ok(Json(json!({"id": id, "status": status.as_str()})))
+}
+
+/// The auth service, or an explicit fail-closed error while sign-in is off.
+fn auth_service(state: &ApiState) -> Result<&AuthService> {
+    state
+        .auth
+        .as_deref()
+        .ok_or_else(|| SeraError::Forbidden("sign-in is disabled".into()))
+}
+
+/// Record an auth audit event under the acting user's id.
+fn audit_auth(state: &ApiState, actor: &str, event: &str, details: Value) -> Result<()> {
+    state
+        .store
+        .record_audit(actor, event, None, None, None, None, None, Some(&details))?;
+    Ok(())
+}
+
+/// Minimal page shell matching the landing aesthetic: inline CSS only, no
+/// scripts, no external origins. `body` is server-controlled text only —
+/// never provider- or user-supplied content.
+fn auth_page(title: &str, body: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>{title}</title>
+<style>
+  :root {{ color-scheme: dark light; --bg: #101418; --panel: #171d23; --border: #2b343d; --text: #e6edf3; --muted: #9aa7b4; --accent: #4d9fff; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin: 0; min-height: 100vh; background: var(--bg); color: var(--text); font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; display: flex; justify-content: center; padding: 40px 20px; }}
+  main {{ width: 100%; max-width: 640px; }}
+  .eyebrow {{ margin: 0 0 8px; color: var(--muted); font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; }}
+  h1 {{ margin: 0 0 12px; font-size: 40px; line-height: 1.1; letter-spacing: -0.02em; }}
+  p {{ margin: 0 0 12px; }}
+  .lede {{ color: var(--muted); }}
+  section {{ margin-top: 20px; padding: 20px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; }}
+  code {{ display: block; margin: 12px 0; padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: #0d1116; font-size: 13px; word-break: break-all; user-select: all; }}
+  .meta {{ color: var(--muted); font-size: 14px; }}
+</style>
+</head>
+<body>
+<main>
+<header>
+<p class="eyebrow">SeraBot</p>
+<h1>{title}</h1>
+</header>
+<section>
+{body}
+</section>
+</main>
+</body>
+</html>
+"#
+    )
+}
+
+/// The one-time session token page shown after the OIDC callback.
+fn session_token_page(token: &str) -> String {
+    auth_page(
+        "Signed in",
+        &format!(
+            "<p class=\"lede\">Your session token is below. It is shown <strong>once</strong> and cannot be requested again.</p>\n<code>{token}</code>\n<p class=\"meta\">Paste it into your desktop or mobile client's sign-in field. Treat it like a password; the server stores only its hash.</p>"
+        ),
+    )
+}
+
+/// A plain, link-free error page for failed sign-ins.
+fn auth_error_page(status: StatusCode, message: &str) -> Response {
+    html_response(
+        status,
+        auth_page("Sign-in", &format!("<p class=\"lede\">{message}</p>")),
+    )
+}
+
+fn html_response(status: StatusCode, page: String) -> Response {
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CONTENT_SECURITY_POLICY, crate::web::CSP),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        page,
     )
         .into_response()
 }
@@ -2773,6 +3187,19 @@ mod tests {
         base_dir: std::path::PathBuf,
         bots: Vec<LoadedBot>,
     ) -> (Router, Arc<Config>, Store) {
+        app_with_auth_stack(egress_approved, policy, base_dir, bots, None)
+    }
+
+    /// Full app stack, optionally with sign-in enabled. The auth service is
+    /// built against the same store as the API and pointed at `auth_issuer`
+    /// (a loopback mock identity provider in tests).
+    fn app_with_auth_stack(
+        egress_approved: bool,
+        policy: Policy,
+        base_dir: std::path::PathBuf,
+        bots: Vec<LoadedBot>,
+        auth_issuer: Option<&str>,
+    ) -> (Router, Arc<Config>, Store) {
         let mut config = Config::default();
         config.api.enabled = true;
         config.api.token_hash = sha256_hex("test-token-that-is-long-enough-123");
@@ -2780,6 +3207,12 @@ mod tests {
         config.llm.model = "test".into();
         config.llm.base_url = "https://example.com/v1".into();
         config.llm.models = vec!["test-alternative".into()];
+        if auth_issuer.is_some() {
+            config.auth.enabled = true;
+            config.auth.providers = vec!["microsoft".into()];
+            config.auth.base_url = "https://bot.example.example".into();
+            config.auth.max_users = 10;
+        }
         config.base_dir = base_dir;
         let directory = std::env::temp_dir().join(format!("serabot-api-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -2817,19 +3250,53 @@ mod tests {
             )
             .unwrap(),
         );
-        let state = ApiState::new(
-            runtime,
-            store.clone(),
-            config.clone(),
-            artifacts,
-            SharedSecrets::new(crate::secrets::SecretStore::from_map(
-                std::collections::BTreeMap::from([(
-                    config.llm.api_key_secret.clone(),
-                    "synthetic-test-key".to_string(),
-                )]),
-            )),
-        );
+        let mut secrets = std::collections::BTreeMap::from([(
+            config.llm.api_key_secret.clone(),
+            "synthetic-test-key".to_string(),
+        )]);
+        if auth_issuer.is_some() {
+            secrets.insert(
+                config.auth.client_id_secret.clone(),
+                crate::auth::test_idp::TEST_CLIENT_ID.to_string(),
+            );
+        }
+        let secrets = SharedSecrets::new(crate::secrets::SecretStore::from_map(secrets));
+        let auth = match auth_issuer {
+            Some(issuer) => {
+                let mut service = AuthService::new(&config, store.clone(), &secrets).unwrap();
+                service.set_issuer_url(issuer).unwrap();
+                Some(service)
+            }
+            None => None,
+        };
+        let mut state =
+            ApiState::new(runtime, store.clone(), config.clone(), artifacts, secrets).unwrap();
+        if let Some(service) = auth {
+            state.auth = Some(Arc::new(service));
+        }
         (router(state), config, store)
+    }
+
+    /// An app with sign-in enabled and the auth service pointed at a
+    /// synthetic mock identity provider, for exercising the auth endpoints.
+    async fn auth_app() -> (Router, Arc<Config>, Store, crate::auth::test_idp::MockIdp) {
+        let idp = crate::auth::test_idp::mock_idp().await;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::env::current_dir().unwrap());
+        let (app, config, store) = app_with_auth_stack(
+            true,
+            Policy::empty(),
+            root,
+            vec![test_bot(
+                "main",
+                crate::orchestration::BotRole::Orchestrator,
+            )],
+            Some(&idp.issuer),
+        );
+        (app, config, store, idp)
     }
 
     fn request(
@@ -3588,6 +4055,14 @@ mod tests {
             .unwrap()
             .to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn read_body(response: Response) -> String {
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
     }
 
     fn temp_base() -> std::path::PathBuf {
@@ -5512,5 +5987,525 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // ---- Auth endpoints ----
+
+    /// A member account plus a session token minted directly in the store,
+    /// for exercising role gates without the OIDC flow.
+    fn member_with_session(store: &Store) -> (User, String) {
+        let user = store
+            .create_user("microsoft:api-member", "member@example.example", "Member")
+            .unwrap();
+        let token = store
+            .mint_session(&user.id, chrono::Duration::hours(1))
+            .unwrap();
+        (user, token)
+    }
+
+    #[tokio::test]
+    async fn providers_endpoint_is_public_and_matches_the_config() {
+        // Default config: sign-in off, every provider reports disabled.
+        let (app, _, _) = app();
+        let response = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/auth/providers", false, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        let providers = body["providers"].as_array().unwrap().clone();
+        assert_eq!(providers.len(), 3);
+        for row in &providers {
+            assert_eq!(row["enabled"], json!(false), "auth disabled ⇒ all off");
+        }
+        assert_eq!(providers[0]["id"], json!("microsoft"));
+        assert_eq!(providers[1]["id"], json!("google"));
+        assert_eq!(providers[2]["id"], json!("github"));
+
+        // Auth enabled: microsoft on, the others visibly disabled.
+        let (app, _, _, _) = auth_app().await;
+        let response = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/auth/providers", false, None))
+            .await
+            .unwrap();
+        let body = read_json(response).await;
+        let providers = body["providers"].as_array().unwrap().clone();
+        assert_eq!(
+            providers,
+            vec![
+                json!({"id": "microsoft", "enabled": true}),
+                json!({"id": "google", "enabled": false}),
+                json!({"id": "github", "enabled": false}),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn login_start_and_callback_fail_closed_when_auth_is_disabled() {
+        let (app, _, _) = app();
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/auth/login/start",
+                false,
+                Some(json!({"provider": "microsoft"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/auth/callback?state=s&code=c",
+                false,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let page = read_body(response).await;
+        assert!(page.contains("Sign-in is not enabled"));
+        assert!(!page.contains("<script"));
+    }
+
+    #[tokio::test]
+    async fn login_start_returns_the_authorize_url_and_rejects_bad_providers() {
+        let (app, _, store, _) = auth_app().await;
+        let admin = store.admin_user_id().unwrap();
+        store
+            .mint_invite(
+                "api-invite-code-0123456789",
+                1,
+                Utc::now() + chrono::Duration::hours(1),
+                &admin,
+            )
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/auth/login/start",
+                false,
+                Some(json!({"provider": "microsoft", "invite_code": "api-invite-code-0123456789"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        let url = body["url"].as_str().unwrap();
+        assert!(url.contains("/authorize?"), "{url}");
+        assert!(url.contains("code_challenge_method=S256"), "{url}");
+
+        // Unknown provider and spent invites fail closed.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/auth/login/start",
+                false,
+                Some(json!({"provider": "google"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/auth/login/start",
+                false,
+                Some(json!({"provider": "microsoft", "invite_code": "not-a-real-invite"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn callback_shows_the_session_token_exactly_once() {
+        let (app, _, store, idp) = auth_app().await;
+        let admin = store.admin_user_id().unwrap();
+        store
+            .mint_invite(
+                "callback-invite-0123456789",
+                1,
+                Utc::now() + chrono::Duration::hours(1),
+                &admin,
+            )
+            .unwrap();
+        let start = read_json(
+            app.clone()
+                .oneshot(
+                    request(
+                        &app,
+                        "POST",
+                        "/v1/auth/login/start",
+                        false,
+                        Some(json!({"provider": "microsoft", "invite_code": "callback-invite-0123456789"})),
+                    ),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let authorize_url = start["url"].as_str().unwrap().to_owned();
+        let (state, nonce) = crate::auth::test_idp::url_params(&authorize_url);
+        let code = "api-callback-code";
+        let id_token =
+            crate::auth::test_idp::synthetic_id_token(&idp.issuer, &nonce, "subject-api");
+        crate::auth::test_idp::stub_token(&idp.server, code, &id_token).await;
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                &format!("/v1/auth/callback?state={state}&code={code}"),
+                false,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("content-security-policy")
+                .and_then(|v| v.to_str().ok()),
+            Some(crate::web::CSP)
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        let page = read_body(response).await;
+        assert!(!page.contains("<script"));
+        assert!(page.contains("shown"), "the one-time hint must be present");
+        assert!(page.contains("Paste it into your"));
+
+        // The page carries the raw token exactly once; only its hash is
+        // stored, and the hash resolves to the newly created member.
+        let token = page
+            .split("<code>")
+            .nth(1)
+            .and_then(|rest| rest.split("</code>").next())
+            .unwrap()
+            .to_owned();
+        assert_eq!(token.len(), Store::SESSION_TOKEN_BYTES * 2);
+        assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            page.matches(&token).count(),
+            1,
+            "the session token must appear exactly once"
+        );
+        let account = store
+            .get_user_by_subject("microsoft:subject-api")
+            .unwrap()
+            .unwrap();
+        let resolved = store.session_user(&sha256_hex(&token)).unwrap().unwrap();
+        assert_eq!(resolved.id, account.id);
+
+        // An unknown state renders the error page, not a stack trace.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/auth/callback?state=bogus&code=whatever",
+                false,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let page = read_body(response).await;
+        assert!(page.contains("could not be completed"));
+        assert!(!page.contains("<script"));
+    }
+
+    #[tokio::test]
+    async fn member_sessions_are_rejected_on_admin_endpoints() {
+        let (app, _, store, _) = auth_app().await;
+        let (_, member_token) = member_with_session(&store);
+
+        // Unauthenticated: 401 everywhere.
+        for (method, uri, body) in [
+            ("GET", "/v1/users", None),
+            ("POST", "/v1/auth/invites", Some(json!({"uses": 1}))),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(&app, method, uri, false, body))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+        }
+
+        // Member: 403 on admin endpoints, 200 on ordinary ones.
+        for (method, uri, body) in [
+            ("GET", "/v1/users", None),
+            ("POST", "/v1/auth/invites", Some(json!({"uses": 1}))),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request_with_token(method, uri, &member_token, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+        let response = app
+            .clone()
+            .oneshot(request_with_token("GET", "/v1/health", &member_token, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The operator's static config token is the admin.
+        let response = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/users", true, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        let users = body["users"].as_array().unwrap();
+        assert_eq!(users.len(), 2, "bootstrap admin + member");
+        assert!(users.iter().any(|user| user["role"] == json!("admin")));
+    }
+
+    #[tokio::test]
+    async fn invites_are_minted_once_and_stored_hashed() {
+        let (app, _, store, _) = auth_app().await;
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/auth/invites",
+                true,
+                Some(json!({"uses": 3})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        let code = body["code"].as_str().unwrap().to_owned();
+        assert!(!code.is_empty());
+        assert!(store.invite_is_redeemable(&sha256_hex(&code)).unwrap());
+
+        // Bounds are enforced.
+        for uses in [0, 101] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    &app,
+                    "POST",
+                    "/v1/auth/invites",
+                    true,
+                    Some(json!({"uses": uses})),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{uses}"
+            );
+        }
+
+        // The audit row names the actor and uses, never the code.
+        let rows: Vec<(String, String)> = store
+            .connection()
+            .unwrap()
+            .prepare("SELECT actor, details_json FROM audit_log WHERE event = 'auth.invite_minted'")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, store.admin_user_id().unwrap());
+        assert!(!rows[0].1.contains(&code));
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_sessions_but_not_the_config_token() {
+        let (app, _, store, _) = auth_app().await;
+        let (_, member_token) = member_with_session(&store);
+
+        let response = app
+            .clone()
+            .oneshot(request_with_token(
+                "POST",
+                "/v1/auth/logout",
+                &member_token,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // The revoked session no longer authorizes.
+        let response = app
+            .clone()
+            .oneshot(request_with_token("GET", "/v1/health", &member_token, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // The static config token has no session row: fail closed.
+        let response = app
+            .clone()
+            .oneshot(request(&app, "POST", "/v1/auth/logout", true, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn admin_can_disable_and_enable_members() {
+        let (app, _, store, _) = auth_app().await;
+        let (member, member_token) = member_with_session(&store);
+
+        // Disabling a member stops their sessions immediately.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                &format!("/v1/users/{}/disable", member.id),
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(request_with_token("GET", "/v1/health", &member_token, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // The directory reflects the status.
+        let response = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/users", true, None))
+            .await
+            .unwrap();
+        let body = read_json(response).await;
+        let users = body["users"].as_array().unwrap().clone();
+        let entry = users
+            .iter()
+            .find(|user| user["id"] == json!(member.id))
+            .unwrap();
+        assert_eq!(entry["status"], json!("disabled"));
+
+        // Re-enabling restores access.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                &format!("/v1/users/{}/enable", member.id),
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(request_with_token("GET", "/v1/health", &member_token, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Unknown users and the admin account itself are rejected.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/users/no-such-user/disable",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let admin_id = store.admin_user_id().unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                &format!("/v1/users/{admin_id}/disable"),
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Members cannot flip statuses at all.
+        let response = app
+            .clone()
+            .oneshot(request_with_token(
+                "POST",
+                &format!("/v1/users/{}/disable", member.id),
+                &member_token,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn login_page_link_starts_the_microsoft_flow() {
+        let (app, _, _, idp) = auth_app().await;
+        let response = app
+            .clone()
+            .oneshot(request(&app, "GET", "/login/microsoft", false, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_owned();
+        assert!(
+            location.starts_with(&format!("{}/authorize", idp.issuer)),
+            "{location}"
+        );
     }
 }
