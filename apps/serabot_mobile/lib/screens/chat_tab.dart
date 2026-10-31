@@ -34,7 +34,7 @@ class _ChatTabState extends State<ChatTab> {
     super.initState();
     _loadedConversation = widget.session.conversationId;
     widget.session.addListener(_onSessionChanged);
-    _pollTimer = Timer.periodic(const Duration(seconds: 3), (_) => _poll());
+    _pollTimer = Timer.periodic(const Duration(seconds: 2), (_) => _poll());
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _refreshAll();
     });

@@ -24,7 +24,7 @@ class _ApprovalsTabState extends State<ApprovalsTab> {
   @override
   void initState() {
     super.initState();
-    _timer = Timer.periodic(const Duration(seconds: 5), (_) => _load(silent: true));
+    _timer = Timer.periodic(const Duration(seconds: 3), (_) => _load(silent: true));
     _load();
   }
 
