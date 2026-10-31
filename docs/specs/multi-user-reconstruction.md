@@ -19,7 +19,8 @@ There is no open sign-up. Each user gets:
 - the ability to **create their own bots** from the existing scaffold;
 - **UID-scoped** conversations, memory, skills, documents, and schedules;
 - **their own connectors**, starting with OneDrive (their Microsoft account,
-  their drive), with credentials no other user can reach;
+  their drive), and **their own AI provider credentials** (API keys and
+  OAuth logins), with credentials no other user can reach;
 - **approval authority over their own tool calls**, with the admin retaining
   visibility.
 
@@ -70,6 +71,12 @@ scanning, WAL store) changes.
 - New dependency: the `openidconnect` crate. Flow: authorization code + PKCE
   → id_token verified via the provider's JWKS → extract stable subject
   (`sub`) and email → upsert `users` row.
+- **Provider registry, not a hardwired IdP.** `users.provider_subject` is
+  namespaced (`microsoft:<sub>`, later `google:<sub>`, `github:<sub>`), so
+  adding Google and GitHub later is configuration plus a client-id secret —
+  no schema change. `GET /v1/auth/providers` reports which providers are
+  enabled; web, desktop, and mobile render the others as visible but
+  disabled ("coming soon"). v1 ships Microsoft enabled only.
 - **Sessions stay opaque and server-side** (no JWT sessions): the existing
   bearer-token + SHA-256-hash pattern is kept. `device_tokens` grows a
   `user_id` and becomes the sessions table. Every API request resolves to a
@@ -78,14 +85,16 @@ scanning, WAL store) changes.
   TTL, max uses) via an admin API. A user can only reach the OIDC flow with a
   valid invite. First sign-in creates the `users` row.
 - **Bootstrap**: on migration, the operator's user is created (`role=admin`)
-  and all existing rows backfill to that user id. The admin account is linked
-  to the existing Telegram pair and API token.
+  and all existing rows backfill to that user id. The admin account is
+  linked to the existing Telegram pair; the existing API token and device
+  tokens keep working unchanged as the admin's sessions (nothing to
+  re-issue).
 - Config sketch (synthetic):
 
   ```toml
   [auth]
   enabled = true
-  provider = "microsoft"            # only v1 target
+  providers = ["microsoft"]         # google + github ship shown-but-disabled
   tenant = "consumers"
   client_id_secret = "auth_client_id"   # in the age store, like onedrive_client_id
   base_url = "https://bot.example.example"  # public base URL for the redirect
@@ -167,9 +176,21 @@ scanning, WAL store) changes.
   `reqwest::Client`. Rotation writes back through the user-credential store.
   The old global `onedrive_refresh_token` flow remains for the admin account
   only (backward compatible).
-- Other connectors (Google, Notion, AgentMail, ElevenLabs) keep their global
-  single-operator form in v1; per-user expansion follows the same pattern
-  once OneDrive proves it.
+- **AI providers are user-owned too.** LLM API keys and OAuth-based provider
+  logins (Antigravity, Muse Code, ElevenLabs OAuth) move into the same
+  `user_credentials` store. Migration is lossless: on upgrade the operator's
+  existing age-store values are imported into the operator's own credential
+  rows, and rotation writes back there (the flows' persist target moves from
+  `SharedSecrets` to the user store). The age store keeps only server-level
+  secrets: the Telegram bot token and auth client ids; provider *endpoints*
+  stay in config. Model routing resolves per user: `ModelRouter` is built
+  from the acting user's credentials against the admin-defined model
+  catalog; a user without a provider's credentials simply cannot route to
+  that provider (fail closed, explicit error). Members add API keys or run
+  OAuth logins from their console.
+- Other connectors (Google, Notion, AgentMail) keep their global
+  single-operator form in v1; per-user expansion follows the OneDrive
+  pattern once it proves out.
 
 ### Gateway and approvals — per-user authority
 
@@ -196,9 +217,16 @@ scanning, WAL store) changes.
   flow; after the callback the page shows the new session token once for
   pasting into the desktop/mobile clients (same UX as `serabot token` today).
   No new frontend framework.
-- **Telegram stays admin-only in v1**: the single owner pair keeps working
-  exactly as today for the operator. Per-user Telegram linking (invite-code
-  `/start` binding) is an open question, not in scope.
+- **Telegram is per-user linkable, configured from the desktop app.** The
+  server keeps one bot token (age store, admin-managed, unchanged). A
+  member opens settings → Telegram in the desktop app, requests a linking
+  code, and sends `/start <code>` to the bot; the binding
+  (`user_telegram`: user_id, telegram_user_id, telegram_chat_id, linked_at,
+  revoked_at) routes that chat's messages to the member's user scope —
+  their bots, memory, and approvals. The desktop app shows binding status
+  and unlink. The operator's existing owner pair becomes simply the
+  admin's binding (migrated, not re-linked). Unbound chats stay ignored,
+  as today.
 
 ### Security model (isolation)
 
@@ -331,9 +359,14 @@ Synthetic fixtures only; no live provider is ever contacted from tests
    backfills to that account (nothing is lost, nothing re-keyed).
 3. Members approve their own tool actions; the admin sees everything in audit
    but is not in the approval path for members.
-4. LLM providers stay shared/admin-managed in v1 (no BYO model keys).
-5. Telegram remains admin-only in v1; members use the desktop/mobile
-   consoles (per-user Telegram linking is a possible later phase).
+4. AI provider credentials (LLM API keys and OAuth logins: Antigravity,
+   Muse Code, ElevenLabs OAuth) become **user-owned**: the operator's
+   existing tokens migrate into the operator's user-credential store with
+   nothing lost, members bring their own keys/logins, and credential
+   resolution is strictly per user (fail closed — no silent fallback to
+   another user's key).
+5. Telegram is linkable per user from the desktop app (linking-code flow);
+   the single server bot token stays admin-managed in the age store.
 6. Bot fleets become per-user DB copies seeded from today's default fleet;
    the shipped `skills/` catalog stays server-managed; user-created skills
    are per-user DB rows.
@@ -341,6 +374,10 @@ Synthetic fixtures only; no live provider is ever contacted from tests
    OneDrive consent is a second, connector-specific flow — whether it reuses
    the same registration is an open question (below).
 8. The server keeps the restart-to-apply model (no hot reload) in v1.
+9. The sign-in screen shows three providers — Microsoft enabled, Google
+   and GitHub visible but disabled ("coming soon") — on web, desktop, and
+   mobile; enabling them later is additive configuration, no schema
+   change.
 
 ## Success criteria
 
@@ -357,18 +394,24 @@ Synthetic fixtures only; no live provider is ever contacted from tests
 5. No new services on the host; idle memory increase within ~50 MB; the
    full build/test gate is green.
 6. `AGENTS.md` product boundary rewritten and merged together with phase 1.
+7. The operator's existing AI-provider credentials (API keys and OAuth
+   tokens) keep working after migration, now stored as the admin user's
+   credentials; token rotation writes back to the user store (wiremock +
+   migration fixtures).
+8. A member links Telegram from the desktop app and chats with their own
+   bots; the admin's existing Telegram pair and API/device tokens keep
+   working without re-linking or re-issuing.
 
 ## Open questions
 
-1. **Telegram for members** — keep consoles-only (assumed) or add invite-code
-   `/start` linking so members can chat from Telegram?
-2. **App registration** — one Azure app for both sign-in and OneDrive consent
+1. **App registration** — one Azure app for both sign-in and OneDrive consent
    (incremental consent) or two registrations?
-3. **Member LLM usage** — shared admin keys with per-user quotas (assumed),
-   or per-user BYO provider keys (adds user-tier LLM credentials)?
-4. **Data deletion** — admin-disable user keeps data (assumed); do we also
+2. **Provider sharing** — credentials resolve strictly per user (assumed);
+   should the admin also be able to *grant* a member access to an
+   admin-owned provider, or is BYO the only path?
+3. **Data deletion** — admin-disable user keeps data (assumed); do we also
    need full delete/export of a user's rows?
-5. **Deployment** — the OVH VPS is at 97% disk; enlargement/cleanup is a
+4. **Deployment** — the OVH VPS is at 97% disk; enlargement/cleanup is a
    prerequisite for shipping. Owner decision required.
 
 ## Phasing (detail comes in the plan, not this spec)
@@ -379,7 +422,9 @@ Synthetic fixtures only; no live provider is ever contacted from tests
 - **Phase 2**: store scoping — `user_id` across the data model, scoped
   access layer, isolation suite.
 - **Phase 3**: per-user fleet/skills/memory (DB-backed bots, seeded defaults).
-- **Phase 4**: user secrets — envelope encryption + per-user OneDrive.
+- **Phase 4**: user secrets — envelope encryption + lossless credential
+  migration (OneDrive + AI providers) + per-user model routing.
 - **Phase 5**: per-user gateway authority, quotas, per-session rate limits.
-- **Phase 6**: console login flow, docs updates, deployment manifest (OVH
-  remains untouched until the owner approves it explicitly).
+- **Phase 6**: console login flow (Microsoft enabled, Google/GitHub shown
+  disabled), desktop Telegram linking, docs updates, deployment manifest
+  (OVH remains untouched until the owner approves it explicitly).
