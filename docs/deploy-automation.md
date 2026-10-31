@@ -62,6 +62,7 @@ NEW  /opt/serabot-deploy/ca_key + ca_key.pub     0600/0644 deployca (ssh-keygen 
 NEW  /opt/serabot-deploy/pending-tag, pending-sha     writable by deployca
 NEW  /etc/systemd/system/serabot-deploy-ca.service    (deploy/serabot-deploy-ca.service)
 NEW  /etc/systemd/system/serabot-deploy-sshd.service  (deploy/serabot-deploy-sshd.service)
+NEW  /etc/sudoers.d/serabot-deploy                0440 root:root  (deploy runs only deploy.sh)
 RUN  systemctl daemon-reload && systemctl enable --now serabot-deploy-ca serabot-deploy-sshd
 RUN  ufw allow 2222/tcp   # deploy sshd
 RUN  ufw allow 8788/tcp   # CA broker (JWT is the only auth; rate-limited)
@@ -79,9 +80,17 @@ sudo useradd -r -M -s /usr/sbin/nologin deployca
 sudo install -d -m 0755 /opt/serabot-deploy
 sudo install -m 0644 deploy/deploy-ca.py deploy/deploy.sh deploy/sshd_config.deploy /opt/serabot-deploy/
 sudo chmod 0755 /opt/serabot-deploy/deploy.sh
-sudo -u deployca ssh-keygen -t ed25519 -N "" -f /opt/serabot-deploy/ca_key -q
+# The directory is root-owned, so generate the CA key as root and hand it to
+# deployca; `sudo -u deployca ssh-keygen` cannot create files there.
+sudo ssh-keygen -t ed25519 -N "" -f /opt/serabot-deploy/ca_key -q
 sudo chown deployca:deployca /opt/serabot-deploy/ca_key /opt/serabot-deploy/ca_key.pub
+sudo chmod 0600 /opt/serabot-deploy/ca_key
 sudo install -m 0644 deploy/serabot-deploy-ca.service deploy/serabot-deploy-sshd.service /etc/systemd/system/
+# The forced command is `sudo /opt/serabot-deploy/deploy.sh`; without this rule
+# the deploy user cannot run it and every deploy fails at the forced command.
+printf 'deploy ALL=(root) NOPASSWD: /opt/serabot-deploy/deploy.sh\n' | sudo tee /etc/sudoers.d/serabot-deploy
+sudo chmod 0440 /etc/sudoers.d/serabot-deploy
+sudo visudo -c
 sudo touch /opt/serabot-deploy/pending-tag /opt/serabot-deploy/pending-sha
 sudo chown deployca:deployca /opt/serabot-deploy/pending-tag /opt/serabot-deploy/pending-sha
 sudo systemctl daemon-reload
@@ -90,6 +99,17 @@ sudo ufw allow 2222/tcp
 sudo ufw allow 8788/tcp
 ssh-keyscan -p 2222 <VPS_IP>   # pin into deploy/known_hosts.deploy
 ```
+
+### Known limitation: the CA broker speaks plain HTTP
+
+`deploy-ca.py` binds `0.0.0.0:8788` with `ThreadingHTTPServer`, so the OIDC
+token crosses the network in cleartext and the workflow must call
+`http://<VPS_IP>:8788/sign`. The token is audience-scoped (`serabot-deploy`),
+single-use and short-lived, and the certificate it mints lives 10 minutes and
+carries a forced command — so the blast radius of interception is a forced
+redeploy of a legitimate release, not arbitrary access. Hardening this means
+terminating TLS on 8788 with a certificate the runner pins via `--cacert`;
+that is a deliberate follow-up, not an oversight.
 
 ## Deploy a release
 

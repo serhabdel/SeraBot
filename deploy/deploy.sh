@@ -51,7 +51,15 @@ install -m 0755 "$TMP/serabot-linux-x64" "$STAGED"
 
 echo "== backups =="
 cp -a /opt/serabot/serabot "$BACKUP"
-sqlite3 /var/lib/serabot/serabot.db ".backup '${DBBACKUP}'"
+# Use Python's sqlite3 module rather than the sqlite3 CLI: the CLI is not
+# installed on the VPS, and the online backup API is identical.
+python3 -c 'import sqlite3, sys
+src = sqlite3.connect("/var/lib/serabot/serabot.db")
+dst = sqlite3.connect(sys.argv[1])
+with dst:
+    src.backup(dst)
+dst.close()
+src.close()' "$DBBACKUP"
 
 echo "== swap + restart only serabot =="
 # install(1) unlinks the destination first; cp(1) fails with ETXTBSY while

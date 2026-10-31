@@ -67,7 +67,20 @@ jobs:
           fi
           tag="v${version}"
           if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
-            echo "${tag} already exists; nothing to release."
+            echo "${tag} already exists; not re-releasing the client."
+            # A tag can exist without ever having been deployed: it may have been
+            # pushed by hand, or a previous deploy may have failed. Dispatch the
+            # deploy when no successful deploy-ovh run is on record for it, so a
+            # manual tag push no longer silently skips the server.
+            deployed=$(gh run list --workflow deploy-ovh.yml --limit 100 \
+              --json headBranch,conclusion \
+              --jq "[.[] | select(.headBranch == \"${tag}\" and .conclusion == \"success\")] | length")
+            if [ "${deployed}" = "0" ]; then
+              gh workflow run deploy-ovh.yml --ref "${tag}" -f tag="${tag}"
+              echo "Dispatched deploy-ovh.yml for ${tag} (no successful deploy on record)."
+            else
+              echo "${tag} already deployed; nothing to do."
+            fi
             exit 0
           fi
           git tag "${tag}"
