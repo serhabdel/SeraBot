@@ -246,6 +246,13 @@ pub const MAX_SKILL_BODY_BYTES: usize = 96_000;
 const MAX_SKILL_LIST: usize = 256;
 const MAX_BOT_LIST: usize = 64;
 const MAX_BOT_SUMMARY_ITEMS: usize = 64;
+/// Cap for every string array on a bot detail or bot config update.
+pub const MAX_BOT_CONFIG_ITEMS: usize = 64;
+/// Bounds for the optional instructions blob of a bot detail.
+const MAX_BOT_INSTRUCTIONS_CHARS: usize = 96_000;
+const MAX_BOT_INSTRUCTIONS_BYTES: usize = 512_000;
+/// Usage window accepted by `GET /v1/usage`.
+pub const MAX_USAGE_DAYS: u32 = 365;
 
 /// Maximum team members a room may carry. Mirrors the server limit.
 pub const MAX_TEAM_MEMBERS: usize = 5;
@@ -437,6 +444,70 @@ pub fn parse_skill_list(raw: &str) -> Result<Vec<String>, ApiError> {
     Ok(out)
 }
 
+/// Validate a bot config update before it leaves the console: arrays are
+/// capped at [`MAX_BOT_CONFIG_ITEMS`], unique, and use the same id shapes as
+/// the fleet list. Approval tools must be part of the tools when both are
+/// sent together.
+pub fn validate_bot_config_update(update: &BotConfigUpdate) -> Result<(), ApiError> {
+    for items in [
+        update.tools.as_deref(),
+        update.skills.as_deref(),
+        update.require_approval.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if items.len() > MAX_BOT_CONFIG_ITEMS {
+            return Err(ApiError::Validation(
+                "Each list can hold at most 64 entries.",
+            ));
+        }
+        let mut seen = HashSet::with_capacity(items.len());
+        for item in items {
+            if !seen.insert(item.as_str()) {
+                return Err(ApiError::Validation("Each entry can be listed once."));
+            }
+        }
+    }
+    if let Some(tools) = &update.tools {
+        for tool in tools {
+            if tool == "delegate" || !SPECIALIST_TOOLS.contains(&tool.as_str()) {
+                return Err(ApiError::Validation(
+                    "Choose tools from the specialist list.",
+                ));
+            }
+        }
+    }
+    if let Some(skills) = &update.skills {
+        for skill in skills {
+            if !valid_skill_id(skill) {
+                return Err(ApiError::Validation(
+                    "Skill ids are lowercase slugs such as ask.",
+                ));
+            }
+        }
+    }
+    if let Some(approval) = &update.require_approval {
+        for tool in approval {
+            if !valid_speaker(tool) {
+                return Err(ApiError::Validation(
+                    "Approval tools are tool names from the specialist list.",
+                ));
+            }
+        }
+        if let Some(tools) = &update.tools
+            && approval
+                .iter()
+                .any(|tool| !tools.iter().any(|listed| listed == tool))
+        {
+            return Err(ApiError::Validation(
+                "Approval tools must be part of the bot's tools.",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConversationKind {
     Section,
@@ -584,6 +655,96 @@ pub struct BotSummary {
     pub skills: Vec<String>,
     #[serde(default)]
     pub require_approval: Vec<String>,
+}
+
+/// Full bot record from `GET /v1/bots/{id}`: profile, routing, instructions
+/// and counters. Nullable fields and arrays default so an older server that
+/// omits them still parses.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct BotDetail {
+    pub id: String,
+    pub display_name: String,
+    pub role: String,
+    pub description: String,
+    #[serde(default)]
+    pub avatar: String,
+    pub enabled: bool,
+    pub provider: String,
+    pub model: String,
+    #[serde(default)]
+    pub fallback_provider: Option<String>,
+    #[serde(default)]
+    pub fallback_model: Option<String>,
+    #[serde(default)]
+    pub routing_classes: Vec<String>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub instructions_bytes: usize,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub require_approval: Vec<String>,
+    #[serde(default)]
+    pub memory_count: i64,
+    #[serde(default)]
+    pub artifact_count: i64,
+}
+
+/// Body of `PUT /v1/admin/bots/{id}/config`. Every field is optional; the
+/// server keeps the current value when a field is absent.
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct BotConfigUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_approval: Option<Vec<String>>,
+}
+
+/// Token and call counters of one usage slice.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct UsageTotals {
+    #[serde(default)]
+    pub calls: i64,
+    #[serde(default)]
+    pub prompt_tokens: i64,
+    #[serde(default)]
+    pub completion_tokens: i64,
+    #[serde(default)]
+    pub total_tokens: i64,
+}
+
+/// One row of a usage breakdown: `day` on a `per_day` row, `bot` on a
+/// `per_bot` row, plus the counters.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct UsageBucket {
+    #[serde(default)]
+    pub day: Option<String>,
+    #[serde(default)]
+    pub bot: Option<String>,
+    #[serde(default)]
+    pub calls: i64,
+    #[serde(default)]
+    pub prompt_tokens: i64,
+    #[serde(default)]
+    pub completion_tokens: i64,
+    #[serde(default)]
+    pub total_tokens: i64,
+}
+
+/// Report of `GET /v1/usage?days=&bot=&conversation_id=`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct UsageReport {
+    #[serde(default)]
+    pub totals: UsageTotals,
+    #[serde(default)]
+    pub per_day: Vec<UsageBucket>,
+    #[serde(default)]
+    pub per_bot: Vec<UsageBucket>,
 }
 
 /// One conversation row from `GET /v1/conversations`.
@@ -1579,6 +1740,63 @@ impl ApiClient {
         Ok(response.bots)
     }
 
+    /// Full record of one bot: `GET /v1/bots/{id}`.
+    pub fn bot_detail(&self, id: &str) -> Result<BotDetail, ApiError> {
+        if !valid_speaker(id) {
+            return Err(ApiError::Validation("Bot id is not valid."));
+        }
+        let detail: BotDetail = self.get(&["v1", "bots", id], &[])?;
+        let detail = check_bot_detail(detail)?;
+        if detail.id != id {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(detail)
+    }
+
+    /// Replace tools, skills or approval requirements of one bot:
+    /// `PUT /v1/admin/bots/{id}/config`. A write: an unknown outcome is
+    /// never replayed.
+    pub fn update_bot_config(
+        &self,
+        id: &str,
+        update: &BotConfigUpdate,
+    ) -> Result<AdminAck, ApiError> {
+        if !valid_speaker(id) {
+            return Err(ApiError::Validation("Bot id is not valid."));
+        }
+        validate_bot_config_update(update)?;
+        self.admin_request(Method::PUT, &["v1", "admin", "bots", id, "config"], update)
+    }
+
+    /// Token usage report: `GET /v1/usage?days=&bot=&conversation_id=`.
+    /// The filters are optional; `days` is the only required parameter.
+    pub fn usage(
+        &self,
+        days: u32,
+        bot: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Result<UsageReport, ApiError> {
+        if !(1..=MAX_USAGE_DAYS).contains(&days) {
+            return Err(ApiError::Validation("Usage window must be 1–365 days."));
+        }
+        if bot.is_some_and(|bot| !valid_speaker(bot)) {
+            return Err(ApiError::Validation("The bot filter must be a bot id."));
+        }
+        if conversation_id.is_some_and(|id| !valid_id(id)) {
+            return Err(ApiError::Validation("Conversation id is not valid."));
+        }
+        let days_value = days.to_string();
+        let mut query = vec![("days", days_value.as_str())];
+        if let Some(bot) = bot {
+            query.push(("bot", bot));
+        }
+        if let Some(conversation_id) = conversation_id {
+            query.push(("conversation_id", conversation_id));
+        }
+        let report: UsageReport = self.get(&["v1", "usage"], &query)?;
+        check_usage_report(report)
+    }
+
     /// One page of conversation metadata. `cursor` is opaque and must come
     /// from a previous `next_cursor`; it is never guessed from UI state.
     pub fn list_conversations(
@@ -2520,6 +2738,104 @@ fn check_created_bot(bot: CreatedBot, id: &str) -> Result<CreatedBot, ApiError> 
     Ok(bot)
 }
 
+fn check_bot_detail(detail: BotDetail) -> Result<BotDetail, ApiError> {
+    let bad = !valid_speaker(&detail.id)
+        || detail.display_name.is_empty()
+        || detail.display_name.chars().count() > 64
+        || detail.display_name.chars().any(char::is_control)
+        || !valid_speaker(&detail.role)
+        || detail.description.chars().count() > MAX_BOT_DESCRIPTION_CHARS
+        || detail
+            .description
+            .chars()
+            .any(|c| c != '\n' && c != '\r' && c != '\t' && c.is_control())
+        || detail.avatar.chars().count() > 16
+        || detail.avatar.chars().any(char::is_control)
+        || !bounded_text(&detail.provider, 64)
+        || (!detail.model.is_empty() && !valid_model_id(&detail.model))
+        || detail
+            .fallback_provider
+            .as_deref()
+            .is_some_and(|provider| !bounded_text(provider, 64))
+        || detail
+            .fallback_model
+            .as_deref()
+            .is_some_and(|model| !valid_model_id(model))
+        || detail.routing_classes.len() > MAX_BOT_CONFIG_ITEMS
+        || detail
+            .routing_classes
+            .iter()
+            .any(|class| !bounded_text(class, 64))
+        || detail.instructions.as_deref().is_some_and(|text| {
+            text.chars().count() > MAX_BOT_INSTRUCTIONS_CHARS
+                || text
+                    .chars()
+                    .any(|c| c != '\n' && c != '\r' && c != '\t' && c.is_control())
+        })
+        || detail.instructions_bytes > MAX_BOT_INSTRUCTIONS_BYTES
+        || detail.skills.len() > MAX_BOT_CONFIG_ITEMS
+        || detail.tools.len() > MAX_BOT_CONFIG_ITEMS
+        || detail.require_approval.len() > MAX_BOT_CONFIG_ITEMS
+        || detail.tools.iter().any(|tool| !valid_speaker(tool))
+        || detail.skills.iter().any(|skill| !valid_speaker(skill))
+        || detail
+            .require_approval
+            .iter()
+            .any(|tool| !valid_speaker(tool) || !detail.tools.iter().any(|listed| listed == tool))
+        || detail.memory_count < 0
+        || detail.artifact_count < 0;
+    if bad {
+        return Err(ApiError::InvalidResponse);
+    }
+    Ok(detail)
+}
+
+fn usage_counts_ok(
+    calls: i64,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    total_tokens: i64,
+) -> bool {
+    calls >= 0 && prompt_tokens >= 0 && completion_tokens >= 0 && total_tokens >= 0
+}
+
+fn check_usage_report(report: UsageReport) -> Result<UsageReport, ApiError> {
+    let totals_ok = usage_counts_ok(
+        report.totals.calls,
+        report.totals.prompt_tokens,
+        report.totals.completion_tokens,
+        report.totals.total_tokens,
+    );
+    let bad = !totals_ok
+        || report.per_day.len() > MAX_USAGE_DAYS as usize + 1
+        || report.per_bot.len() > MAX_BOT_CONFIG_ITEMS
+        || report.per_day.iter().any(|bucket| {
+            !usage_counts_ok(
+                bucket.calls,
+                bucket.prompt_tokens,
+                bucket.completion_tokens,
+                bucket.total_tokens,
+            ) || bucket
+                .day
+                .as_deref()
+                .is_none_or(|day| !bounded_text(day, 16))
+                || bucket.bot.is_some()
+        })
+        || report.per_bot.iter().any(|bucket| {
+            !usage_counts_ok(
+                bucket.calls,
+                bucket.prompt_tokens,
+                bucket.completion_tokens,
+                bucket.total_tokens,
+            ) || bucket.bot.as_deref().is_none_or(|bot| !valid_speaker(bot))
+                || bucket.day.is_some()
+        });
+    if bad {
+        return Err(ApiError::InvalidResponse);
+    }
+    Ok(report)
+}
+
 fn check_created_conversation(
     node: CreatedConversation,
     kind: ConversationKind,
@@ -2743,6 +3059,196 @@ mod tests {
         assert!(!valid_audio_filename("notes/note.webm"));
         assert!(!valid_audio_filename("note.webm\r\n"));
         assert!(!valid_audio_filename(""));
+    }
+
+    #[test]
+    fn bot_detail_reads_the_server_shape_and_defaults_optional_fields() {
+        let detail: BotDetail = serde_json::from_str(
+            r#"{
+                "id":"analyst",
+                "display_name":"Analyst",
+                "role":"specialist",
+                "description":"Numbers and citations.",
+                "avatar":"A",
+                "enabled":true,
+                "provider":"mistral",
+                "model":"mistral-large-latest",
+                "fallback_provider":"openai",
+                "fallback_model":"gpt-5",
+                "routing_classes":["code","finance"],
+                "instructions":"Be precise.\nCite sources.",
+                "instructions_bytes":24,
+                "skills":["ask"],
+                "tools":["rag_search","xlsx_analyze"],
+                "require_approval":["xlsx_analyze"],
+                "memory_count":3,
+                "artifact_count":1
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(detail.id, "analyst");
+        assert_eq!(detail.fallback_model.as_deref(), Some("gpt-5"));
+        assert_eq!(detail.routing_classes.len(), 2);
+        assert_eq!(detail.instructions_bytes, 24);
+        assert!(check_bot_detail(detail).is_ok());
+
+        // An older server that omits the optional fields still parses.
+        let minimal: BotDetail = serde_json::from_str(
+            r#"{"id":"main","display_name":"Main","role":"orchestrator",
+                "description":"","avatar":"","enabled":true,
+                "provider":"auto","model":""}"#,
+        )
+        .unwrap();
+        assert_eq!(minimal.fallback_provider, None);
+        assert_eq!(minimal.instructions, None);
+        assert!(minimal.routing_classes.is_empty());
+        assert_eq!(minimal.memory_count, 0);
+        assert!(check_bot_detail(minimal).is_ok());
+    }
+
+    #[test]
+    fn bot_detail_rejects_unsafe_server_values() {
+        let base = serde_json::json!({
+            "id":"analyst","display_name":"Analyst","role":"specialist",
+            "description":"ok","avatar":"A","enabled":true,
+            "provider":"mistral","model":"mistral-large-latest"
+        });
+        let parse = |value: serde_json::Value| {
+            check_bot_detail(serde_json::from_value::<BotDetail>(value).unwrap())
+        };
+        assert!(parse(base.clone()).is_ok());
+
+        let mut wrong_id = base.clone();
+        wrong_id["id"] = serde_json::json!("../analyst");
+        assert!(parse(wrong_id).is_err());
+
+        let mut control_name = base.clone();
+        control_name["display_name"] = serde_json::json!("Bad\u{0}name");
+        assert!(parse(control_name).is_err());
+
+        let mut approval_outside = base.clone();
+        approval_outside["tools"] = serde_json::json!(["rag_search"]);
+        approval_outside["require_approval"] = serde_json::json!(["deck_build"]);
+        assert!(parse(approval_outside).is_err());
+
+        let mut too_many = base.clone();
+        too_many["tools"] =
+            serde_json::json!((0..65).map(|i| format!("tool{i}")).collect::<Vec<_>>());
+        assert!(parse(too_many).is_err());
+
+        let mut negative = base.clone();
+        negative["memory_count"] = serde_json::json!(-1);
+        assert!(parse(negative).is_err());
+    }
+
+    #[test]
+    fn bot_config_update_validates_and_serializes_only_present_fields() {
+        let update = BotConfigUpdate {
+            tools: Some(vec!["rag_search".into(), "xlsx_analyze".into()]),
+            skills: None,
+            require_approval: Some(vec!["xlsx_analyze".into()]),
+        };
+        assert!(validate_bot_config_update(&update).is_ok());
+        assert_eq!(
+            serde_json::to_value(&update).unwrap(),
+            serde_json::json!({
+                "tools": ["rag_search", "xlsx_analyze"],
+                "require_approval": ["xlsx_analyze"]
+            })
+        );
+
+        // An empty update is valid and serializes to an empty object.
+        let empty = BotConfigUpdate::default();
+        assert!(validate_bot_config_update(&empty).is_ok());
+        assert_eq!(serde_json::to_value(&empty).unwrap(), serde_json::json!({}));
+
+        let delegate = BotConfigUpdate {
+            tools: Some(vec!["delegate".into()]),
+            ..BotConfigUpdate::default()
+        };
+        assert!(validate_bot_config_update(&delegate).is_err());
+
+        let unknown_tool = BotConfigUpdate {
+            tools: Some(vec!["not-a-tool".into()]),
+            ..BotConfigUpdate::default()
+        };
+        assert!(validate_bot_config_update(&unknown_tool).is_err());
+
+        let duplicate = BotConfigUpdate {
+            skills: Some(vec!["ask".into(), "ask".into()]),
+            ..BotConfigUpdate::default()
+        };
+        assert!(validate_bot_config_update(&duplicate).is_err());
+
+        let too_many = BotConfigUpdate {
+            skills: Some((0..65).map(|i| format!("skill-{i}")).collect()),
+            ..BotConfigUpdate::default()
+        };
+        assert!(validate_bot_config_update(&too_many).is_err());
+
+        let bad_skill = BotConfigUpdate {
+            skills: Some(vec!["Not A Skill".into()]),
+            ..BotConfigUpdate::default()
+        };
+        assert!(validate_bot_config_update(&bad_skill).is_err());
+
+        // Approval tools must be a subset of the tools sent in the same update.
+        let outside = BotConfigUpdate {
+            tools: Some(vec!["rag_search".into()]),
+            require_approval: Some(vec!["deck_build".into()]),
+            ..BotConfigUpdate::default()
+        };
+        assert!(validate_bot_config_update(&outside).is_err());
+    }
+
+    #[test]
+    fn usage_report_reads_the_server_shape_and_rejects_bad_rows() {
+        let report: UsageReport = serde_json::from_str(
+            r#"{
+                "totals":{"calls":10,"prompt_tokens":1000,"completion_tokens":500,"total_tokens":1500},
+                "per_day":[{"day":"2026-10-30","prompt_tokens":600,"completion_tokens":300,
+                            "total_tokens":900,"calls":6}],
+                "per_bot":[{"bot":"analyst","prompt_tokens":400,"completion_tokens":200,
+                            "total_tokens":600,"calls":4}]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(report.totals.calls, 10);
+        assert_eq!(report.totals.total_tokens, 1500);
+        assert_eq!(report.per_day[0].day.as_deref(), Some("2026-10-30"));
+        assert_eq!(report.per_bot[0].bot.as_deref(), Some("analyst"));
+        assert!(check_usage_report(report).is_ok());
+
+        // Missing optional sections default to empty.
+        let totals_only: UsageReport = serde_json::from_str(
+            r#"{"totals":{"calls":1,"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}"#,
+        )
+        .unwrap();
+        assert!(totals_only.per_day.is_empty());
+        assert!(check_usage_report(totals_only).is_ok());
+
+        let negative = serde_json::json!({
+            "totals":{"calls":-1,"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}
+        });
+        assert!(
+            check_usage_report(serde_json::from_value::<UsageReport>(negative).unwrap()).is_err()
+        );
+
+        let bad_day = serde_json::json!({
+            "totals":{"calls":0,"prompt_tokens":0,"completion_tokens":0,"total_tokens":0},
+            "per_day":[{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"calls":1}]
+        });
+        assert!(
+            check_usage_report(serde_json::from_value::<UsageReport>(bad_day).unwrap()).is_err()
+        );
+
+        let bad_bot = serde_json::json!({
+            "totals":{"calls":0,"prompt_tokens":0,"completion_tokens":0,"total_tokens":0},
+            "per_bot":[{"bot":"../analyst","prompt_tokens":1,"completion_tokens":1,"total_tokens":2,"calls":1}]
+        });
+        assert!(
+            check_usage_report(serde_json::from_value::<UsageReport>(bad_bot).unwrap()).is_err()
+        );
     }
 
     #[test]

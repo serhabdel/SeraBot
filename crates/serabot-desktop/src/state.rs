@@ -1,9 +1,10 @@
 use crate::{
-    ApiError, Approval, BotSummary, Catalog, ConnectorStatus, ConnectorTestResult,
+    ApiError, Approval, BotDetail, BotSummary, Catalog, ConnectorStatus, ConnectorTestResult,
     ConversationSummary, CreatedBot, CreatedConversation, CreatedSkill, LibraryEntry, MemoryEntry,
-    Message, ProviderStatus, Scope, Selection, SkillSummary, Task, Team,
+    Message, ProviderStatus, Scope, Selection, SkillSummary, Task, Team, UsageReport,
     worker::{OperationKind, Reply},
 };
+use std::collections::BTreeMap;
 
 pub struct State {
     pub scope: Scope,
@@ -63,6 +64,11 @@ pub struct State {
     pub skills_loaded: bool,
     pub listed_bots: Vec<BotSummary>,
     pub bots_loaded: bool,
+    /// Cached `GET /v1/bots/{id}` records, keyed by bot id. Owner-scoped:
+    /// they survive conversation switches and are cleared on disconnect.
+    pub bot_details: BTreeMap<String, BotDetail>,
+    /// Latest `GET /v1/usage` report. Owner-scoped like the bot details.
+    pub usage: Option<UsageReport>,
     pub error: Option<String>,
     pub unknown_outcome: bool,
 }
@@ -122,6 +128,8 @@ impl Default for State {
             skills_loaded: false,
             listed_bots: Vec::new(),
             bots_loaded: false,
+            bot_details: BTreeMap::new(),
+            usage: None,
             error: None,
             unknown_outcome: false,
         }
@@ -148,6 +156,8 @@ impl State {
         let skills_loaded = self.skills_loaded;
         let listed_bots = self.listed_bots.clone();
         let bots_loaded = self.bots_loaded;
+        let bot_details = self.bot_details.clone();
+        let usage = self.usage.clone();
         // Directory data is owner-scoped but not conversation-scoped.
         let conversations = self.conversations.clone();
         let conversations_loaded = self.conversations_loaded;
@@ -181,6 +191,8 @@ impl State {
             skills_loaded,
             listed_bots,
             bots_loaded,
+            bot_details,
+            usage,
             conversations,
             conversations_loaded,
             memories,
@@ -203,6 +215,8 @@ impl State {
         self.skills_loaded = false;
         self.listed_bots.clear();
         self.bots_loaded = false;
+        self.bot_details.clear();
+        self.usage = None;
         self.conversations.clear();
         self.conversations_loaded = false;
         self.archived.clear();
@@ -287,6 +301,12 @@ impl State {
                 self.listed_bots = bots;
                 self.bots_loaded = true;
             }
+            Reply::BotDetail(detail) => {
+                self.bot_details.insert(detail.id.clone(), detail);
+            }
+            Reply::Usage(report) => {
+                self.usage = Some(report);
+            }
             Reply::Conversations(page) => {
                 self.conversations = page.conversations;
                 self.conversations_loaded = true;
@@ -368,6 +388,9 @@ impl State {
             Reply::ConnectorTested(result) => {
                 self.connector_tests.insert(result.id.clone(), result);
             }
+            // The session applies the optimistic cache update and toast for
+            // a saved bot config; the state only keeps the match exhaustive.
+            Reply::BotConfigSaved { .. } => {}
             Reply::AdminSaved | Reply::BotProfileSaved | Reply::AdminRestarted => {}
         }
         true
@@ -390,6 +413,7 @@ impl State {
                 | OperationKind::UnarchiveConversation
                 | OperationKind::AddMemory
                 | OperationKind::TeamWrite
+                | OperationKind::BotConfigWrite
         );
         if mutation && error.unknown_outcome() {
             self.unknown_outcome = true;
@@ -404,6 +428,7 @@ impl State {
                 OperationKind::UnarchiveConversation => "unarchive",
                 OperationKind::AddMemory => "memory write",
                 OperationKind::TeamWrite => "team update",
+                OperationKind::BotConfigWrite => "bot config update",
                 _ => "model change",
             };
             self.error = Some(format!(

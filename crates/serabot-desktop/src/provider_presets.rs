@@ -99,38 +99,66 @@ const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "mistral",
         label: "Mistral AI",
-        subtitle: "Mistral Large, Magistral, Codestral & Ministral",
+        subtitle: "Mistral Large, Magistral, Codestral, Ministral, Pixtral & open models",
         base_url: "https://api.mistral.ai/v1",
         kind: "mistral",
         default_id: "mistral",
+        // Static fallback list of well-known stable model ids. The live
+        // /models fetch (catalog_fetch) is authoritative; this list only
+        // prefills the form when the catalog is not fetched.
         models: &[
             "mistral-large-latest",
+            "mistral-large-2411",
+            "magistral-medium-latest",
+            "magistral-small-latest",
+            "codestral-latest",
+            "codestral-2501",
+            "ministral-8b-latest",
+            "ministral-3b-latest",
+            "ministral-14b-latest",
+            "devstral-small-latest",
+            "devstral-medium-latest",
             "mistral-medium-latest",
             "mistral-small-latest",
-            "codestral-latest",
-            "ministral-8b-latest",
-            "magistral-medium-latest",
-            "devstral-small-latest",
+            "pixtral-large-latest",
+            "pixtral-12b-latest",
+            "open-mistral-nemo",
+            "open-mistral-7b",
+            "open-mixtral-8x7b",
+            "open-mixtral-8x22b",
+            "mistral-embed",
+            "mistral-moderation-latest",
         ],
         secret_name: "mistral_api_key",
         catalog_fetch: true,
         auth: "api_key",
         badge: "API Key",
-        note: "Mistral Large, Magistral, Codestral & Ministral",
+        note: "Mistral Large, Magistral, Codestral, Ministral, Pixtral & open models",
     },
     ProviderPreset {
         id: "openai",
         label: "OpenAI",
-        subtitle: "GPT-4.1, GPT-4o & o-series reasoning",
+        subtitle: "GPT-5, GPT-4.1, GPT-4o & o-series reasoning",
         base_url: "https://api.openai.com/v1",
         kind: "openai",
         default_id: "openai",
-        models: &["gpt-4.1", "gpt-4.1-mini", "gpt-4o", "o3", "o4-mini"],
+        // Static fallback list; the live /models fetch is authoritative.
+        models: &[
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5-nano",
+            "gpt-4o-mini",
+            "gpt-4.1",
+            "gpt-4.1-mini",
+            "gpt-4o",
+            "o3",
+            "o4-mini",
+        ],
         secret_name: "openai_api_key",
         catalog_fetch: true,
         auth: "api_key",
         badge: "API Key",
-        note: "GPT-4.1, GPT-4o & o-series reasoning",
+        note: "GPT-5, GPT-4.1, GPT-4o & o-series reasoning",
     },
     ProviderPreset {
         id: "openrouter",
@@ -419,5 +447,34 @@ mod tests {
             "http://127.0.0.1:11434/v1"
         );
         assert!(preset_for("nope").is_none());
+    }
+
+    #[test]
+    fn fallback_model_lists_are_unique_well_formed_and_cover_the_flagships() {
+        for preset in presets() {
+            let mut seen = HashSet::new();
+            for model in preset.models {
+                assert!(
+                    crate::valid_model_id(model),
+                    "bad model id {model:?} in {:?}",
+                    preset.id
+                );
+                assert!(seen.insert(model), "duplicate {model:?} in {:?}", preset.id);
+            }
+        }
+        let mistral = preset_for("mistral").unwrap();
+        assert!(mistral.models.len() >= 20, "the fallback list grew");
+        for expected in [
+            "mistral-large-latest",
+            "ministral-14b-latest",
+            "mistral-embed",
+            "mistral-moderation-latest",
+        ] {
+            assert!(mistral.models.contains(&expected), "{expected}");
+        }
+        let openai = preset_for("openai").unwrap();
+        for expected in ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4o-mini"] {
+            assert!(openai.models.contains(&expected), "{expected}");
+        }
     }
 }

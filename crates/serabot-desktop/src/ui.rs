@@ -8,14 +8,18 @@
 
 use dioxus::prelude::*;
 use serabot_desktop::{
-    ApprovalDecision, ConversationKind, Role, SPECIALIST_TOOLS, Selection, TaskStatus, Team,
-    TeamMember, TeamMode,
+    ApprovalDecision, BotConfigUpdate, ConversationKind, MAX_TEAM_MEMBERS, Role, SPECIALIST_TOOLS,
+    Selection, TaskStatus, Team, TeamMember, TeamMode,
     audio_capture::MicRecorder,
-    parse_skill_list, provider_presets,
+    branding, parse_skill_list, provider_presets,
     session::{Section, Session, Theme, humanize_label},
-    teams,
+    teams, valid_skill_id,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
+
+/// Cap for the skills array of one bot config. Mirrors
+/// `MAX_SCAFFOLD_SKILLS` in `api.rs`, which is crate-private.
+const MAX_BOT_SKILLS: usize = 16;
 
 const CSS: &str = include_str!("../assets/app.css");
 
@@ -149,7 +153,10 @@ fn connector_auth_url(connector_id: &str, redirect_uri: Option<&str>) -> Option<
 }
 
 /// Global key bindings, installed once in the WebView.
-/// Cmd/Ctrl+K focuses the sidebar search; Esc closes the topmost sheet or menu.
+/// Cmd/Ctrl+K focuses the sidebar search; Esc closes the topmost sheet, menu
+/// or pop. A pointerdown outside a `.menu-wrap` closes the menu/pop it owns
+/// through its trigger (or hidden `.escape-close`), so the Rust-side open
+/// signal stays in sync instead of only the CSS class changing.
 const GLOBAL_KEYS_JS: &str = r#"(function () {
   if (window.__serabotKeys) { return; }
   window.__serabotKeys = true;
@@ -165,7 +172,7 @@ const GLOBAL_KEYS_JS: &str = r#"(function () {
       return;
     }
     if (event.key === 'Escape') {
-      var open = document.querySelectorAll('.sheet.open, .menu.open');
+      var open = document.querySelectorAll('.sheet.open, .menu.open, .pop.open');
       for (var i = open.length - 1; i >= 0; i -= 1) {
         var overlay = open[i];
         var closer = overlay.querySelector('.escape-close');
@@ -175,6 +182,20 @@ const GLOBAL_KEYS_JS: &str = r#"(function () {
         if (trigger) { trigger.click(); return; }
         overlay.classList.remove('open');
       }
+    }
+  });
+  document.addEventListener('pointerdown', function (event) {
+    var open = document.querySelectorAll('.pop.open, .menu.open');
+    for (var i = 0; i < open.length; i += 1) {
+      var overlay = open[i];
+      if (overlay.contains(event.target)) { continue; }
+      var parent = overlay.parentElement;
+      var wrap = parent ? parent.closest('.menu-wrap') : null;
+      if (wrap && wrap.contains(event.target)) { continue; }
+      var closer = overlay.querySelector('.escape-close');
+      if (closer) { closer.click(); continue; }
+      var trigger = wrap ? wrap.querySelector('.menu-trigger') : null;
+      if (trigger) { trigger.click(); } else { overlay.classList.remove('open'); }
     }
   });
 })();"#;
@@ -274,11 +295,165 @@ fn capability_label(tool: &str) -> Option<&'static str> {
     }
 }
 
+/// The `@mention` query being typed at the end of `text`, if any: the last
+/// `@` whose tail contains no whitespace, is at most 32 chars and matches
+/// `[a-z0-9-_]*`. A bare `@` yields `Some("")`.
+fn mention_query(text: &str) -> Option<String> {
+    let at = text.rfind('@')?;
+    let tail = &text[at + 1..];
+    if tail.len() > 32 || tail.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if !tail
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    Some(tail.to_owned())
+}
+
+/// The `/command` query at the start of the last line of `text`, if the rest
+/// of that line has no whitespace. A bare `/` yields `Some("")`.
+fn slash_query(text: &str) -> Option<String> {
+    let line = text.rsplit('\n').next().unwrap_or(text);
+    let rest = line.strip_prefix('/')?;
+    if rest.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(rest.to_owned())
+}
+
+/// Replace the trailing `@query` in `text` with `@id `.
+fn insert_mention_text(text: &str, id: &str) -> String {
+    match text.rfind('@') {
+        Some(at) => format!("{}@{} ", &text[..at], id),
+        None => format!("{}@{} ", text, id),
+    }
+}
+
+/// Replace the `/query` at the start of the last line of `text` with `id `.
+fn insert_slash_text(text: &str, id: &str) -> String {
+    let line_start = text.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    format!("{}{} ", &text[..line_start], id)
+}
+
+/// Bots matching a mention query: `(id, display name, avatar)`.
+fn mention_bot_matches(session: &Session, query: &str) -> Vec<(String, String, String)> {
+    let needle = query.to_lowercase();
+    session
+        .state
+        .listed_bots
+        .iter()
+        .filter(|bot| {
+            needle.is_empty()
+                || bot.id.to_lowercase().contains(&needle)
+                || session
+                    .bot_display_name(&bot.id)
+                    .to_lowercase()
+                    .contains(&needle)
+        })
+        .map(|bot| {
+            (
+                bot.id.clone(),
+                session.bot_display_name(&bot.id),
+                session.bot_avatar(&bot.id),
+            )
+        })
+        .collect()
+}
+
+/// Connector ids matching a mention query.
+fn mention_connector_matches(session: &Session, query: &str) -> Vec<String> {
+    let needle = query.to_lowercase();
+    session
+        .state
+        .connectors
+        .iter()
+        .map(|connector| connector.id.clone())
+        .filter(|id| needle.is_empty() || id.to_lowercase().contains(&needle))
+        .collect()
+}
+
+/// Skills matching a slash query: `(id, name, description)`.
+fn slash_skill_matches(session: &Session, query: &str) -> Vec<(String, String, String)> {
+    let needle = query.to_lowercase();
+    session
+        .state
+        .listed_skills
+        .iter()
+        .filter(|skill| {
+            needle.is_empty()
+                || skill.id.to_lowercase().contains(&needle)
+                || skill.name.to_lowercase().contains(&needle)
+        })
+        .map(|skill| {
+            (
+                skill.id.clone(),
+                skill.name.clone(),
+                skill.description.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Specialist tools matching a slash query (by id or capability label).
+fn slash_tool_matches(query: &str) -> Vec<&'static str> {
+    let needle = query.to_lowercase();
+    SPECIALIST_TOOLS
+        .iter()
+        .copied()
+        .filter(|tool| {
+            needle.is_empty()
+                || tool.contains(&needle)
+                || capability_label(tool)
+                    .is_some_and(|label| label.to_lowercase().contains(&needle))
+        })
+        .collect()
+}
+
+/// Parse a picker value (`"auto"` or `"provider|model"`) into a selection —
+/// exactly what the old `<select>` did with its option values.
+fn parse_model_value(raw: &str) -> Selection {
+    if raw == "auto" {
+        Selection::auto()
+    } else {
+        let (provider, model) = raw.split_once('|').unwrap_or(("auto", ""));
+        if provider == "auto" {
+            Selection::auto()
+        } else {
+            Selection {
+                provider: provider.to_owned(),
+                model: model.to_owned(),
+            }
+        }
+    }
+}
+
+/// Set the draft model selection from a picker value.
+fn set_model_draft(session: &mut Session, raw: &str) {
+    session.state.draft = parse_model_value(raw);
+}
+
 pub fn run() {
     #[cfg(windows)]
     {
         let config = dioxus::desktop::Config::new()
             .with_menu(Option::<dioxus::desktop::muda::Menu>::None)
+            // WebView2 flags: on Windows the dioxus:// origin maps to
+            // http://dioxus.index.html, which is not a secure context, so
+            // navigator.mediaDevices is undefined and getUserMedia fails with
+            // "Microphone capture is not available in this window"; without a
+            // host handler WebView2 also denies the capture permission request.
+            // Treat our own app origin as secure and auto-accept mic capture for
+            // this trusted page. wry REPLACES its default args when additional
+            // args are given, so re-add the defaults here.
+            .with_windows_browser_args(
+                "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection \
+                 --autoplay-policy=no-user-gesture-required \
+                 --unsafely-treat-insecure-origin-as-secure=http://dioxus.index.html \
+                 --auto-accept-camera-and-microphone-capture",
+            )
             .with_window(
                 dioxus::desktop::WindowBuilder::new()
                     .with_title("SeraBot Owner")
@@ -400,196 +575,29 @@ fn Icon(name: String, #[props(default = 20)] size: u32) -> Element {
 }
 
 /// Inline brand SVG logos for all supported connectors and providers.
+/// The SVG markup itself lives in [`branding`]; a brand without a known
+/// mark falls back to an initial-letter avatar.
 #[component]
 pub fn BrandLogo(brand: String, #[props(default = 24)] size: u32) -> Element {
-    let key = brand.to_ascii_lowercase().replace('_', "-");
-    let key = key.as_str();
+    let title = branding::brand_label(&brand).map(str::to_owned);
+    let svg = branding::brand_svg(&brand).map(str::to_owned);
+    let initial: String = brand
+        .chars()
+        .next()
+        .map(|c| c.to_uppercase().collect::<String>())
+        .unwrap_or_else(|| "?".to_owned());
     rsx! {
         div {
             class: "brand-logo",
             style: "width: {size}px; height: {size}px;",
-            match key {
-                "google-drive" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        path { d: "M8.3 3.5L2.2 14.1l3.5 6.1 6.1-10.6z", fill: "#0F9D58" }
-                        path { d: "M15.7 3.5H8.3l6.1 10.6h7.4z", fill: "#FFC107" }
-                        path { d: "M11.8 14.1l-3.5 6.1h12.2l3.5-6.1z", fill: "#2196F3" }
-                    }
-                },
-                "google-sheets" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "3", y: "3", width: "18", height: "18", rx: "3.5", fill: "#0F9D58" }
-                        path { d: "M7 8h10M7 12h10M7 16h10M12 8v8", stroke: "#ffffff", "stroke-width": "1.8", "stroke-linecap": "round" }
-                    }
-                },
-                "google-calendar" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "3", y: "4", width: "18", height: "17", rx: "3", fill: "#ffffff" }
-                        path { d: "M3 7a3 3 0 0 1 3-3h12a3 3 0 0 1 3 3v3H3V7z", fill: "#4285F4" }
-                        rect { x: "7", y: "2", width: "2", height: "3.5", rx: "1", fill: "#EA4335" }
-                        rect { x: "15", y: "2", width: "2", height: "3.5", rx: "1", fill: "#FBBC05" }
-                        path { d: "M8 13.5h3a1 1 0 0 1 1 1v0a1 1 0 0 1-1 1h-2m2 0a1 1 0 0 1 1 1v0a1 1 0 0 1-1 1H8M15 13.5v5m-1.5-3.5L15 13.5", stroke: "#4285F4", "stroke-width": "1.5", "stroke-linecap": "round", "stroke-linejoin": "round" }
-                    }
-                },
-                "gmail" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        path { d: "M4 6.5v11a1.5 1.5 0 0 0 1.5 1.5H8V11l4 3 4-3v8h2.5a1.5 1.5 0 0 0 1.5-1.5v-11l-8 6-8-6z", fill: "#EA4335" }
-                        path { d: "M4 6.5A1.5 1.5 0 0 1 5.5 5H7l5 3.8L17 5h1.5A1.5 1.5 0 0 1 20 6.5V9l-8 6-8-6V6.5z", fill: "#4285F4" }
-                        path { d: "M4 6.5L12 12.5l8-6v-1a1.5 1.5 0 0 0-1.5-1.5H5.5A1.5 1.5 0 0 0 4 5.5v1z", fill: "#FBBC05" }
-                    }
-                },
-                "outlook" | "outlook-calendar" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "3", y: "4", width: "18", height: "16", rx: "3", fill: "#0078D4" }
-                        circle { cx: "9.5", cy: "12", r: "4.5", fill: "#106EBE" }
-                        path { d: "M3 6l9 6 9-6", stroke: "#ffffff", "stroke-width": "1.5", "stroke-linecap": "round" }
-                        circle { cx: "9.5", cy: "12", r: "2.3", fill: "none", stroke: "#ffffff", "stroke-width": "1.8" }
-                    }
-                },
-                "notion" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "3", y: "3", width: "18", height: "18", rx: "3.5", fill: "#000000" }
-                        path { d: "M7 6.5h3l4 6.5V6.5h3v11h-3l-4-6.5v6.5H7v-11z", fill: "#ffffff" }
-                    }
-                },
-                "agentmail" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "3", y: "4", width: "18", height: "16", rx: "3", fill: "#6366F1" }
-                        path { d: "M3 6.5l9 6.5 9-6.5", stroke: "#ffffff", "stroke-width": "1.5" }
-                        path { d: "M13 8l-3 4.5h3.5L11 17l5-5.5h-3.5L14 8z", fill: "#FBBF24" }
-                    }
-                },
-                "elevenlabs" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#111827" }
-                        rect { x: "8", y: "6", width: "2.6", height: "12", rx: "1.3", fill: "#ffffff" }
-                        rect { x: "13.4", y: "6", width: "2.6", height: "12", rx: "1.3", fill: "#ffffff" }
-                    }
-                },
-                "tavily" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#0F766E" }
-                        circle { cx: "12", cy: "12", r: "6.5", stroke: "#5EEAD4", "stroke-width": "1.6" }
-                        circle { cx: "12", cy: "12", r: "3", fill: "#14B8A6" }
-                        path { d: "M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3", stroke: "#99F6E4", "stroke-width": "1.6", "stroke-linecap": "round" }
-                    }
-                },
-                "firecrawl" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#7C2D12" }
-                        path { d: "M12 4.5c2.5 3 5.5 5 5.5 9a5.5 5.5 0 0 1-11 0c0-4 3-6 5.5-9z", fill: "#F97316" }
-                        path { d: "M12 9.5c1.2 1.6 2.6 2.6 2.6 4.6a2.6 2.6 0 0 1-5.2 0c0-2 1.4-3 2.6-4.6z", fill: "#FDBA74" }
-                    }
-                },
-                "google-antigravity" | "antigravity" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#1E1B4B" }
-                        circle { cx: "12", cy: "12", r: "7", stroke: "#818CF8", "stroke-width": "1.4", "stroke-dasharray": "3 2" }
-                        path { d: "M12 4v16M4 12h16M7 7l10 10M17 7L7 17", stroke: "#38BDF8", "stroke-width": "1.2", "stroke-linecap": "round" }
-                        circle { cx: "12", cy: "12", r: "3", fill: "#F43F5E" }
-                    }
-                },
-                "deepseek" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#1D4ED8" }
-                        path { d: "M6 15c2-4 5-7 10-7-2 4-5 7-10 7zM12 8c1-3 3-5 5-5-1 3-3 5-5 5zM8 15c-1 2-2 3-4 4 1-2 2-3 4-4z", fill: "#93C5FD" }
-                        circle { cx: "15", cy: "10", r: "1.2", fill: "#ffffff" }
-                    }
-                },
-                "minimax" | "minimax-cn" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#FF4D4D" }
-                        path { d: "M6 16V8l3.5 4L12 9l2.5 3L18 8v8", stroke: "#ffffff", "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round" }
-                    }
-                },
-                "mistral" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#FA520F" }
-                        rect { x: "6", y: "7", width: "2.8", height: "2.8", fill: "#ffffff" }
-                        rect { x: "15.2", y: "7", width: "2.8", height: "2.8", fill: "#ffffff" }
-                        rect { x: "6", y: "10.2", width: "2.8", height: "2.8", fill: "#ffffff" }
-                        rect { x: "9.1", y: "10.2", width: "2.8", height: "2.8", fill: "#ffffff" }
-                        rect { x: "12.1", y: "10.2", width: "2.8", height: "2.8", fill: "#ffffff" }
-                        rect { x: "15.2", y: "10.2", width: "2.8", height: "2.8", fill: "#ffffff" }
-                        rect { x: "6", y: "13.4", width: "2.8", height: "2.8", fill: "#ffffff" }
-                        rect { x: "15.2", y: "13.4", width: "2.8", height: "2.8", fill: "#ffffff" }
-                    }
-                },
-                "openai" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#10A37F" }
-                        path { d: "M12 6.5a2.5 2.5 0 0 1 2.4 1.8l-1.3.7a1.2 1.2 0 0 0-1.8.3L12 6.5zm3.5 2a2.5 2.5 0 0 1 .5 3l-1.3-.7a1.2 1.2 0 0 0-.6-1.8l1.4-.5zm-.5 4.5a2.5 2.5 0 0 1-2.4 1.8l.1-1.5a1.2 1.2 0 0 0 1.2-.8l1.1.5zm-4 1.5a2.5 2.5 0 0 1-2.4-1.8l1.3-.7a1.2 1.2 0 0 0 1.8-.3L11 14.5zm-3.5-2a2.5 2.5 0 0 1-.5-3l1.3.7a1.2 1.2 0 0 0 .6 1.8l-1.4.5zm.5-4.5A2.5 2.5 0 0 1 10.4 6.2l-.1 1.5a1.2 1.2 0 0 0-1.2.8l-1.1-.5z", stroke: "#ffffff", "stroke-width": "1.3" }
-                    }
-                },
-                "openrouter" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#6366F1" }
-                        path { d: "M6 18V12a4 4 0 0 1 4-4h8M14 4l4 4-4 4M14 14l4 4-4 4", stroke: "#ffffff", "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round" }
-                    }
-                },
-                "groq" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#F55036" }
-                        path { d: "M15 8.5A5 5 0 1 0 16 14h-4v-2h6v2a7 7 0 1 1-1.8-7.5L15 8.5z", fill: "#ffffff" }
-                    }
-                },
-                "xai" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#000000" }
-                        path { d: "M6 6l8 12h4L10 6H6zM15 6l3 4.5-1.8 2.2L13 6h2zM6 18l3-4.5 1.8 2.2L8 18H6z", fill: "#ffffff" }
-                    }
-                },
-                "moonshot" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#0B132B" }
-                        path { d: "M12 5a7 7 0 1 0 7 7c-.2 0-.4 0-.6-.03A6 6 0 0 1 12 5.03V5z", fill: "#38BDF8" }
-                        circle { cx: "16", cy: "8", r: "1", fill: "#FDE047" }
-                    }
-                },
-                "cerebras" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#D946EF" }
-                        rect { x: "6", y: "6", width: "4.5", height: "4.5", rx: "1", fill: "#ffffff" }
-                        rect { x: "13.5", y: "6", width: "4.5", height: "4.5", rx: "1", fill: "#ffffff" }
-                        rect { x: "6", y: "13.5", width: "4.5", height: "4.5", rx: "1", fill: "#ffffff" }
-                        rect { x: "13.5", y: "13.5", width: "4.5", height: "4.5", rx: "1", fill: "#ffffff" }
-                    }
-                },
-                "together" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#2563EB" }
-                        path { d: "M7 12h10M12 7v10M7 7l10 10M17 7L7 17", stroke: "rgba(255,255,255,0.4)", "stroke-width": "1.2" }
-                        circle { cx: "7", cy: "12", r: "2", fill: "#ffffff" }
-                        circle { cx: "17", cy: "12", r: "2", fill: "#ffffff" }
-                        circle { cx: "12", cy: "7", r: "2", fill: "#ffffff" }
-                        circle { cx: "12", cy: "17", r: "2", fill: "#ffffff" }
-                    }
-                },
-                "fireworks" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#7C3AED" }
-                        path { d: "M12 4v4m0 8v4M4 12h4m8 0h4m-11.5-5.5l3 3m5 5l3 3m-11 0l3-3m5-5l3-3", stroke: "#FBBF24", "stroke-width": "1.8", "stroke-linecap": "round" }
-                        circle { cx: "12", cy: "12", r: "2.5", fill: "#ffffff" }
-                    }
-                },
-                "muse-code" | "muse" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#0891B2" }
-                        path { d: "M8 8l-4 4 4 4M16 8l4 4-4 4M12 6v12", stroke: "#ffffff", "stroke-width": "1.8", "stroke-linecap": "round", "stroke-linejoin": "round" }
-                    }
-                },
-                "ollama" => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#334155" }
-                        path { d: "M9 17v-4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v4M10 8h.01M14 8h.01M10 5v3M14 5v3M9 17h6", stroke: "#ffffff", "stroke-width": "1.8", "stroke-linecap": "round", "stroke-linejoin": "round" }
-                    }
-                },
-                _ => rsx! {
-                    svg { "viewBox": "0 0 24 24", width: "{size}", height: "{size}", fill: "none",
-                        rect { x: "2", y: "2", width: "20", height: "20", rx: "5", fill: "#475569" }
-                        path { d: "M12 4l7 4-7 4-7-4 7-4zM5 10.5l7 4 7-4M5 14.5l7 4 7-4", stroke: "#ffffff", "stroke-width": "1.6", "stroke-linecap": "round", "stroke-linejoin": "round" }
-                    }
-                },
+            title: title.as_deref().unwrap_or(""),
+            if let Some(svg) = svg {
+                div {
+                    style: "width: 100%; height: 100%; display: flex;",
+                    dangerous_inner_html: "{svg}",
+                }
+            } else {
+                span { style: "font-size: {size * 3 / 5}px; font-weight: 600;", "{initial}" }
             }
         }
     }
@@ -1090,7 +1098,7 @@ fn Shell(session: Signal<Session>) -> Element {
 
     rsx! {
         div { class: "app-shell",
-            Sidebar { session, overlay, drawer_open, toast }
+            Sidebar { session, overlay, drawer_open, toast, inspector_open }
             div {
                 class: if drawer_open() { "scrim drawer-scrim open" } else { "scrim drawer-scrim" },
                 onclick: move |_| drawer_open.set(false),
@@ -1234,15 +1242,44 @@ fn NewMenu(
     }
 }
 
+/// Inline SVG pin button: toggles a bot id or conversation id in the pin
+/// list. Stops propagation so it never triggers the surrounding row.
+#[component]
+fn PinToggle(session: Signal<Session>, id: String, pinned: bool) -> Element {
+    rsx! {
+        button {
+            class: if pinned { "pin-toggle pinned" } else { "pin-toggle" },
+            title: if pinned { "Unpin" } else { "Pin" },
+            onclick: move |event| {
+                event.stop_propagation();
+                session.write().toggle_pin(id.clone());
+            },
+            svg {
+                width: 13,
+                height: 13,
+                "viewBox": "0 0 24 24",
+                fill: "none",
+                stroke: "currentColor",
+                "stroke-width": 1.8,
+                "stroke-linecap": "round",
+                "stroke-linejoin": "round",
+                path { d: "M9 4h6l1.2 7 2.3 2.3V16H5.5v-2.7L7.8 11 9 4zM12 16v4.5" }
+            }
+        }
+    }
+}
+
 #[component]
 fn Sidebar(
     session: Signal<Session>,
     overlay: Signal<Overlay>,
     drawer_open: Signal<bool>,
     toast: Signal<Option<(String, bool)>>,
+    inspector_open: Signal<bool>,
 ) -> Element {
     let mut overlay = overlay;
     let mut toast = toast;
+    let mut inspector_open = inspector_open;
     let connected = session.read().state.connected;
     let mut search = use_signal(String::new);
     let mut collapsed = use_signal(HashSet::<String>::new);
@@ -1250,6 +1287,7 @@ fn Sidebar(
     let needle = search().trim().to_lowercase();
     let current = session.read().conversation.clone();
     let loaded = session.read().state.conversations_loaded;
+    let pins = session.read().pins.clone();
     let items = {
         let state = session.read();
         let bots = &state.state.listed_bots;
@@ -1290,6 +1328,7 @@ fn Sidebar(
                         .unwrap_or(0);
                     items.push(RailItem::Bot {
                         active: id == current,
+                        pinned: pins.contains(&bot.id),
                         id,
                         label: state.bot_display_name(&bot.id),
                         role: bot.role.clone(),
@@ -1326,6 +1365,7 @@ fn Sidebar(
                         active: child.id == current,
                         unread: child.unread_count,
                         archived: false,
+                        pinned: pins.contains(&child.id),
                     });
                 }
                 if child.normalized_kind() == "group" {
@@ -1344,6 +1384,7 @@ fn Sidebar(
                                 active: grand.id == current,
                                 unread: grand.unread_count,
                                 archived: false,
+                                pinned: pins.contains(&grand.id),
                             });
                         }
                     }
@@ -1417,6 +1458,7 @@ fn Sidebar(
                     active: conversation.id == current,
                     unread: conversation.unread_count,
                     archived: false,
+                    pinned: pins.contains(&conversation.id),
                 });
             }
         }
@@ -1440,6 +1482,7 @@ fn Sidebar(
                         active: false,
                         unread: 0,
                         archived: true,
+                        pinned: pins.contains(&conversation.id),
                     });
                 }
             }
@@ -1504,33 +1547,39 @@ fn Sidebar(
                                 }
                             }
                         },
-                        RailItem::Bot { id, label, role, avatar, active, enabled, live, unread } => rsx! {
-                            div { key: "{id}", class: if active { "thread active" } else { "thread" },
-                                button {
-                                    class: "thread-main thread-bot",
-                                    onclick: {
-                                        let id = id.clone();
-                                        move |_| {
-                                            let bot = id.strip_prefix("dir:").unwrap_or(&id).to_owned();
-                                            session.write().open_bot_chat(bot);
+                        RailItem::Bot { id, label, role, avatar, active, enabled, live, unread, pinned } => {
+                            let pin_id = id.strip_prefix("dir:").unwrap_or(&id).to_owned();
+                            rsx! {
+                                div { key: "{id}", class: if active { "thread active" } else { "thread" },
+                                    button {
+                                        class: "thread-main thread-bot",
+                                        onclick: {
+                                            let id = id.clone();
+                                            move |_| {
+                                                let bot = id.strip_prefix("dir:").unwrap_or(&id).to_owned();
+                                                session.write().open_bot_chat(bot);
+                                                // A bot click also reveals its profile in the inspector.
+                                                inspector_open.set(true);
+                                            }
+                                        },
+                                        span { class: "avatar sm bot", style: avatar_style(&id), "{avatar}" }
+                                        div { class: "thread-copy",
+                                            span { class: "thread-title", "{label}" }
+                                            span { class: "thread-meta", if enabled { "{role}" } else { "{role} · disabled" } }
                                         }
-                                    },
-                                    span { class: "avatar sm bot", style: avatar_style(&id), "{avatar}" }
-                                    div { class: "thread-copy",
-                                        span { class: "thread-title", "{label}" }
-                                        span { class: "thread-meta", if enabled { "{role}" } else { "{role} · disabled" } }
+                                        if unread > 0 {
+                                            span { class: "unread-badge", "{unread}" }
+                                        }
                                     }
-                                    if unread > 0 {
-                                        span { class: "unread-badge", "{unread}" }
+                                    span {
+                                        class: if live { "thread-dot live" } else { "thread-dot off" },
+                                        title: if live { "live" } else { "restart required" }
                                     }
-                                }
-                                span {
-                                    class: if live { "thread-dot live" } else { "thread-dot off" },
-                                    title: if live { "live" } else { "restart required" }
+                                    PinToggle { session, id: pin_id, pinned }
                                 }
                             }
                         },
-                        RailItem::Thread { id, label, subtitle, depth, active, unread, archived } => {
+                        RailItem::Thread { id, label, subtitle, depth, active, unread, archived, pinned } => {
                             let editing = renaming().as_ref().map(|(edit, _)| edit == &id).unwrap_or(false);
                             rsx! {
                                 div {
@@ -1616,6 +1665,7 @@ fn Sidebar(
                                                     },
                                                     Icon { name: "undo", size: 15 }
                                                 }
+                                                PinToggle { session, id: id.clone(), pinned }
                                             } else {
                                                 button {
                                                     class: "btn icon",
@@ -1648,6 +1698,7 @@ fn Sidebar(
                                                     },
                                                     Icon { name: "trash", size: 15 }
                                                 }
+                                                PinToggle { session, id: id.clone(), pinned }
                                             }
                                         }
                                     }
@@ -1684,6 +1735,7 @@ enum RailItem {
         enabled: bool,
         live: bool,
         unread: i64,
+        pinned: bool,
     },
     Thread {
         id: String,
@@ -1693,6 +1745,7 @@ enum RailItem {
         active: bool,
         unread: i64,
         archived: bool,
+        pinned: bool,
     },
 }
 
@@ -1893,9 +1946,6 @@ fn Topbar(
             div { class: "topbar-actions",
                 if session.read().state.task.is_some() {
                     span { class: "spinner", title: "A turn is running" }
-                }
-                if section == Section::Chat {
-                    ModelSelect { session }
                 }
                 button {
                     class: "icon-btn",
@@ -2196,6 +2246,12 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
     // The recorder is owned by the signal but taken out for every capture, so
     // no borrow of the signal is alive across an await point.
     let mut recorder = use_signal(MicRecorder::new);
+    // Composer pickers: `Some(query)` while a bare `@query` (mention) or a
+    // line-leading `/query` (skill/tool) is being typed.
+    let mut mention = use_signal(|| Option::<String>::None);
+    let mut mention_idx = use_signal(|| 0usize);
+    let mut slash = use_signal(|| Option::<String>::None);
+    let mut slash_idx = use_signal(|| 0usize);
     let transcript_error = session.read().state.transcript_error.clone();
     use_effect(move || {
         let transcript = session.read().state.transcript.clone();
@@ -2227,13 +2283,53 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
         .as_ref()
         .map(teams::member_ids)
         .unwrap_or_default();
+    // Picker contents for the open pop (empty when no pop is open). The slash
+    // pop wins over the mention pop when both triggers are present.
+    let show_mention = mention().is_some() && slash().is_none();
+    let show_slash = slash().is_some();
+    let mention_q = mention().unwrap_or_default();
+    let slash_q = slash().unwrap_or_default();
+    let mention_bots = if show_mention {
+        mention_bot_matches(&session.read(), &mention_q)
+    } else {
+        Vec::new()
+    };
+    let mention_conns = if show_mention {
+        mention_connector_matches(&session.read(), &mention_q)
+    } else {
+        Vec::new()
+    };
+    let mention_total = mention_bots.len() + mention_conns.len();
+    let mention_active = mention_idx().min(mention_total.saturating_sub(1));
+    let slash_skills = if show_slash {
+        slash_skill_matches(&session.read(), &slash_q)
+    } else {
+        Vec::new()
+    };
+    let slash_tools = if show_slash {
+        slash_tool_matches(&slash_q)
+    } else {
+        Vec::new()
+    };
+    let slash_total = slash_skills.len() + slash_tools.len();
+    let slash_active = slash_idx().min(slash_total.saturating_sub(1));
+    // Copies for the key handler closures (they move their captures).
+    let key_mention_bots = mention_bots.clone();
+    let key_mention_conns = mention_conns.clone();
+    let key_slash_skills = slash_skills.clone();
+    let key_slash_tools = slash_tool_matches(&slash_q);
     rsx! {
         div { class: "pane-body chat-body",
             div { class: "chat-column",
                 div { class: "chat-head",
                     div { class: "row",
                         span { class: "micro", "Conversation" }
-                        ModelBar { session }
+                        // The model selector only applies to one-to-one bot
+                        // chats; rooms and the owner chat stay auto-routed
+                        // (the Providers page keeps the full ModelBar).
+                        if is_one_to_one {
+                            ModelBar { session }
+                        }
                     }
                     NewMenu { session, overlay, right: true }
                 }
@@ -2363,8 +2459,83 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                             value: "{composer}",
                             placeholder: if accepts { format!("Message {active_name}…") } else { "This node does not accept turns".into() },
                             disabled: !accepts,
-                            oninput: move |event| session.write().composer = event.value(),
+                            oninput: move |event| {
+                                let value = event.value();
+                                session.write().composer = value.clone();
+                                mention.set(mention_query(&value));
+                                mention_idx.set(0);
+                                slash.set(slash_query(&value));
+                                slash_idx.set(0);
+                            },
                             onkeydown: move |event: KeyboardEvent| {
+                                // Same priority as the render below: slash wins.
+                                let mention_open = mention().is_some() && slash().is_none();
+                                let slash_open = slash().is_some();
+                                if mention_open || slash_open {
+                                    match event.key() {
+                                        Key::ArrowDown => {
+                                            event.prevent_default();
+                                            if mention_open {
+                                                let count = key_mention_bots.len() + key_mention_conns.len();
+                                                if count > 0 {
+                                                    mention_idx.set((mention_idx() + 1).min(count - 1));
+                                                }
+                                            } else {
+                                                let count = key_slash_skills.len() + key_slash_tools.len();
+                                                if count > 0 {
+                                                    slash_idx.set((slash_idx() + 1).min(count - 1));
+                                                }
+                                            }
+                                        }
+                                        Key::ArrowUp => {
+                                            event.prevent_default();
+                                            if mention_open {
+                                                mention_idx.set(mention_idx().saturating_sub(1));
+                                            } else {
+                                                slash_idx.set(slash_idx().saturating_sub(1));
+                                            }
+                                        }
+                                        Key::Enter => {
+                                            event.prevent_default();
+                                            event.stop_propagation();
+                                            if mention_open {
+                                                let count = key_mention_bots.len() + key_mention_conns.len();
+                                                let idx = mention_idx().min(count.saturating_sub(1));
+                                                let id = if idx < key_mention_bots.len() {
+                                                    key_mention_bots.get(idx).map(|b| b.0.clone())
+                                                } else {
+                                                    key_mention_conns.get(idx - key_mention_bots.len()).cloned()
+                                                };
+                                                if let Some(id) = id {
+                                                    let text = session.read().composer.clone();
+                                                    session.write().composer = insert_mention_text(&text, &id);
+                                                    mention.set(None);
+                                                }
+                                            } else {
+                                                let count = key_slash_skills.len() + key_slash_tools.len();
+                                                let idx = slash_idx().min(count.saturating_sub(1));
+                                                let id = if idx < key_slash_skills.len() {
+                                                    key_slash_skills.get(idx).map(|s| s.0.clone())
+                                                } else {
+                                                    key_slash_tools.get(idx - key_slash_skills.len()).map(|t| t.to_string())
+                                                };
+                                                if let Some(id) = id {
+                                                    let text = session.read().composer.clone();
+                                                    session.write().composer = insert_slash_text(&text, &id);
+                                                    slash.set(None);
+                                                }
+                                            }
+                                        }
+                                        Key::Escape => {
+                                            event.prevent_default();
+                                            event.stop_propagation();
+                                            mention.set(None);
+                                            slash.set(None);
+                                        }
+                                        _ => {}
+                                    }
+                                    return;
+                                }
                                 if event.key() == Key::Enter
                                     && !event.modifiers().contains(Modifiers::SHIFT)
                                 {
@@ -2451,86 +2622,134 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                             }
                         }
                     }
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn ModelSelect(session: Signal<Session>) -> Element {
-    let (options, value, allowed, changed) = {
-        let session = session.read();
-        let catalog = session.state.catalog.as_ref();
-        let mut options = vec![("auto".to_owned(), String::new())];
-        if let Some(catalog) = catalog {
-            for entry in &catalog.entries {
-                options.push((entry.provider.clone(), entry.model.clone()));
-            }
-            if catalog.entries.is_empty() {
-                for provider in &catalog.providers {
-                    for model in &provider.models {
-                        options.push((provider.id.clone(), model.clone()));
-                    }
-                }
-            }
-        }
-        let draft = session.state.draft.clone();
-        let value = if draft.is_auto() {
-            "auto".to_owned()
-        } else {
-            format!("{}|{}", draft.provider, draft.model)
-        };
-        let saved = catalog
-            .map(|catalog| {
-                if catalog.selection.is_auto() {
-                    "auto".to_owned()
-                } else {
-                    format!("{}|{}", catalog.selection.provider, catalog.selection.model)
-                }
-            })
-            .unwrap_or_else(|| "auto".to_owned());
-        let allowed = catalog.is_some_and(|catalog| catalog.allows(&draft));
-        let changed = value != saved;
-        (options, value, allowed, changed)
-    };
-    rsx! {
-        div { class: "row",
-            select {
-                class: "select model-select",
-                value: "{value}",
-                title: "Model for the next turn",
-                onchange: move |event| {
-                    let raw = event.value();
-                    let next = if raw == "auto" {
-                        Selection::auto()
-                    } else {
-                        let (provider, model) = raw.split_once('|').unwrap_or(("auto", ""));
-                        if provider == "auto" {
-                            Selection::auto()
-                        } else {
-                            Selection { provider: provider.to_owned(), model: model.to_owned() }
+                    if show_mention {
+                        div { class: "mention-pop pop above open",
+                            // Hidden closer: GLOBAL_KEYS_JS clicks it on Esc /
+                            // outside pointerdown so the signal stays in sync.
+                            button {
+                                class: "escape-close",
+                                style: "display: none;",
+                                tabindex: -1,
+                                onclick: move |_| {
+                                    mention.set(None);
+                                    mention_idx.set(0);
+                                },
+                            }
+                            div { class: "pop-list",
+                                if mention_total == 0 {
+                                    div { class: "pop-empty", "No bots or connectors match." }
+                                }
+                                if !mention_bots.is_empty() {
+                                    div { class: "pop-group", "Bots" }
+                                    for (index, (id, name, avatar)) in mention_bots.iter().enumerate() {
+                                        button {
+                                            key: "{id}",
+                                            class: if index == mention_active { "pop-item active" } else { "pop-item" },
+                                            onclick: {
+                                                let id = id.clone();
+                                                move |_| {
+                                                    let text = session.read().composer.clone();
+                                                    session.write().composer = insert_mention_text(&text, &id);
+                                                    mention.set(None);
+                                                    mention_idx.set(0);
+                                                }
+                                            },
+                                            span { class: "avatar sm bot", style: avatar_style(id), "{avatar}" }
+                                            span { "{name}" }
+                                            span { class: "micro", "@{id}" }
+                                        }
+                                    }
+                                }
+                                if !mention_conns.is_empty() {
+                                    div { class: "pop-group", "Connectors" }
+                                    for (offset, cid) in mention_conns.iter().enumerate() {
+                                        button {
+                                            key: "{cid}",
+                                            class: if mention_bots.len() + offset == mention_active { "pop-item active" } else { "pop-item" },
+                                            onclick: {
+                                                let cid = cid.clone();
+                                                move |_| {
+                                                    let text = session.read().composer.clone();
+                                                    session.write().composer = insert_mention_text(&text, &cid);
+                                                    mention.set(None);
+                                                    mention_idx.set(0);
+                                                }
+                                            },
+                                            BrandLogo { brand: cid.clone(), size: 18 }
+                                            span { "{cid}" }
+                                        }
+                                    }
+                                }
+                            }
                         }
-                    };
-                    session.write().state.draft = next;
-                },
-                for (provider, model) in options {
-                    if provider == "auto" {
-                        option { value: "auto", "Auto · approved route" }
-                    } else {
-                        option { value: "{provider}|{model}", "{human_model(&model)} · {human_provider(&provider)}" }
                     }
-                }
-            }
-            if changed {
-                button {
-                    class: "btn primary sm",
-                    disabled: !allowed,
-                    onclick: move |_| {
-                        let draft = session.read().state.draft.clone();
-                        session.write().apply_model(draft);
-                    },
-                    "Apply"
+                    if show_slash {
+                        div { class: "mention-pop pop above open",
+                            button {
+                                class: "escape-close",
+                                style: "display: none;",
+                                tabindex: -1,
+                                onclick: move |_| {
+                                    slash.set(None);
+                                    slash_idx.set(0);
+                                },
+                            }
+                            div { class: "pop-list",
+                                if slash_total == 0 {
+                                    div { class: "pop-empty", "No skills or tools match." }
+                                }
+                                if !slash_skills.is_empty() {
+                                    div { class: "pop-group", "Skills" }
+                                    for (index, (id, name, description)) in slash_skills.iter().enumerate() {
+                                        button {
+                                            key: "{id}",
+                                            class: if index == slash_active { "pop-item active" } else { "pop-item" },
+                                            onclick: {
+                                                let id = id.clone();
+                                                move |_| {
+                                                    let text = session.read().composer.clone();
+                                                    session.write().composer = insert_slash_text(&text, &id);
+                                                    slash.set(None);
+                                                    slash_idx.set(0);
+                                                }
+                                            },
+                                            div { style: "display: flex; flex-direction: column; align-items: flex-start; min-width: 0;",
+                                                span { "{name}" }
+                                                if !description.trim().is_empty() {
+                                                    span { class: "caption", "{description}" }
+                                                }
+                                                span { class: "micro", "{id}" }
+                                            }
+                                        }
+                                    }
+                                }
+                                if !slash_tools.is_empty() {
+                                    div { class: "pop-group", "Tools" }
+                                    for (offset, tool) in slash_tools.iter().enumerate() {
+                                        button {
+                                            key: "{tool}",
+                                            class: if slash_skills.len() + offset == slash_active { "pop-item active" } else { "pop-item" },
+                                            onclick: {
+                                                let tool = tool.to_string();
+                                                move |_| {
+                                                    let text = session.read().composer.clone();
+                                                    session.write().composer = insert_slash_text(&text, &tool);
+                                                    slash.set(None);
+                                                    slash_idx.set(0);
+                                                }
+                                            },
+                                            div { style: "display: flex; flex-direction: column; align-items: flex-start; min-width: 0;",
+                                                span { "{tool}" }
+                                                if let Some(label) = capability_label(tool) {
+                                                    span { class: "caption", "{label}" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2539,10 +2758,13 @@ fn ModelSelect(session: Signal<Session>) -> Element {
 
 #[component]
 fn ModelBar(session: Signal<Session>) -> Element {
-    let (options, current, allowed, saved) = {
+    // Picker items: (value, label). "auto" first, then the catalog entries
+    // (or the static provider model lists when the catalog is empty).
+    let (items, current, allowed, saved) = {
         let session = session.read();
         let catalog = session.state.catalog.as_ref();
-        let mut options = vec![("auto".to_owned(), String::new())];
+        let mut items: Vec<(String, String)> =
+            vec![("auto".to_owned(), "Auto · approved route".to_owned())];
         let mut current = "auto".to_owned();
         let mut allowed = false;
         let mut saved = "auto".to_owned();
@@ -2551,12 +2773,22 @@ fn ModelBar(session: Signal<Session>) -> Element {
                 current = format!("{}|{}", catalog.selection.provider, catalog.selection.model);
             }
             for entry in &catalog.entries {
-                options.push((entry.provider.clone(), entry.model.clone()));
+                items.push((
+                    format!("{}|{}", entry.provider, entry.model),
+                    format!(
+                        "{} · {}",
+                        human_model(&entry.model),
+                        human_provider(&entry.provider)
+                    ),
+                ));
             }
             if catalog.entries.is_empty() {
                 for provider in &catalog.providers {
                     for model in &provider.models {
-                        options.push((provider.id.clone(), model.clone()));
+                        items.push((
+                            format!("{}|{}", provider.id, model),
+                            format!("{} · {}", human_model(model), human_provider(&provider.id)),
+                        ));
                     }
                 }
             }
@@ -2571,7 +2803,7 @@ fn ModelBar(session: Signal<Session>) -> Element {
                 )
             };
         }
-        (options, current, allowed, saved)
+        (items, current, allowed, saved)
     };
     let value = {
         let draft = session.read().state.draft.clone();
@@ -2582,31 +2814,124 @@ fn ModelBar(session: Signal<Session>) -> Element {
         }
     };
     let changed = value != current;
+    let current_label = items
+        .iter()
+        .find(|(item_value, _)| *item_value == value)
+        .map(|(_, label)| label.clone())
+        .unwrap_or_else(|| "Auto · approved route".to_owned());
+    let mut open = use_signal(|| false);
+    let mut query = use_signal(String::new);
+    let mut active_idx = use_signal(|| 0usize);
+    // Case-insensitive substring match on the human label and on the raw
+    // provider/model ids carried by the item value.
+    let needle = query().trim().to_lowercase();
+    let filtered: Vec<(usize, String, String)> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            needle.is_empty()
+                || item.1.to_lowercase().contains(&needle)
+                || item.0.to_lowercase().contains(&needle)
+        })
+        .map(|(index, item)| (index, item.0.clone(), item.1.clone()))
+        .collect();
+    let active = if filtered.is_empty() {
+        0
+    } else {
+        active_idx().min(filtered.len() - 1)
+    };
+    // The key handler runs from its own closure: give it its own copy so the
+    // pop-list below can still use `filtered`.
+    let keyed = filtered.clone();
     rsx! {
         div { class: "model-bar",
             span { class: "micro", "Model" }
-            select {
-                class: "select model-select",
-                value: "{value}",
-                onchange: move |event| {
-                    let raw = event.value();
-                    let next = if raw == "auto" {
-                        Selection::auto()
-                    } else {
-                        let (provider, model) = raw.split_once('|').unwrap_or(("auto", ""));
-                        if provider == "auto" {
-                            Selection::auto()
-                        } else {
-                            Selection { provider: provider.to_owned(), model: model.to_owned() }
+            div {
+                class: "menu-wrap",
+                onkeydown: move |event: KeyboardEvent| {
+                    if !open() {
+                        return;
+                    }
+                    let count = keyed.len();
+                    match event.key() {
+                        Key::ArrowDown => {
+                            event.prevent_default();
+                            if count > 0 {
+                                active_idx.set((active_idx() + 1).min(count - 1));
+                            }
                         }
-                    };
-                    session.write().state.draft = next;
+                        Key::ArrowUp => {
+                            event.prevent_default();
+                            active_idx.set(active_idx().saturating_sub(1));
+                        }
+                        Key::Enter => {
+                            event.prevent_default();
+                            event.stop_propagation();
+                            if let Some((_, item_value, _)) =
+                                keyed.get(active_idx().min(count.saturating_sub(1)))
+                            {
+                                let mut session = session.write();
+                                set_model_draft(&mut session, item_value);
+                                open.set(false);
+                                query.set(String::new());
+                            }
+                        }
+                        Key::Escape => {
+                            event.prevent_default();
+                            event.stop_propagation();
+                            open.set(false);
+                        }
+                        _ => {}
+                    }
                 },
-                for (provider, model) in options {
-                    if provider == "auto" {
-                        option { value: "auto", "Auto · approved route" }
-                    } else {
-                        option { value: "{provider}|{model}", "{human_model(&model)} · {human_provider(&provider)}" }
+                button {
+                    class: "btn ghost sm menu-trigger",
+                    title: "Pick the model route for the next turn",
+                    onclick: move |_| {
+                        if !open() {
+                            query.set(String::new());
+                            let position = items.iter().position(|(v, _)| *v == value).unwrap_or(0);
+                            active_idx.set(position);
+                        }
+                        open.set(!open());
+                    },
+                    span { "{current_label}" }
+                    Icon { name: if open() { "chevron-up" } else { "chevron-down" }, size: 14 }
+                }
+                div {
+                    class: if open() { "pop open" } else { "pop" },
+                    style: "min-width: 280px;",
+                    div { class: "pop-search",
+                        input {
+                            class: "input",
+                            placeholder: "Search models…",
+                            value: "{query}",
+                            oninput: move |event| {
+                                query.set(event.value());
+                                active_idx.set(0);
+                            },
+                        }
+                    }
+                    div { class: "pop-list",
+                        if filtered.is_empty() {
+                            div { class: "pop-empty", "No models match." }
+                        }
+                        for (index, item_value, label) in filtered.clone() {
+                            button {
+                                key: "{item_value}",
+                                class: if index == active { "pop-item active" } else { "pop-item" },
+                                onclick: move |_| {
+                                    let mut session = session.write();
+                                    set_model_draft(&mut session, &item_value);
+                                    open.set(false);
+                                    query.set(String::new());
+                                },
+                                span { "{label}" }
+                                if item_value == current {
+                                    Icon { name: "check", size: 14 }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2681,6 +3006,421 @@ fn Inspector(session: Signal<Session>, overlay: Signal<Overlay>, open: Signal<bo
             .map(teams::member_ids)
             .unwrap_or_default();
         (members, state.state.team_loaded, state.state.team_loading)
+    };
+    // A dir: conversation is a one-to-one bot chat: the Details tab shows
+    // that bot's profile (from the cached GET /v1/bots/{id}) next to the
+    // conversation card.
+    let chat_bot_id = conversation.strip_prefix("dir:").map(str::to_owned);
+    let bot_detail = chat_bot_id
+        .as_deref()
+        .and_then(|id| session.read().state.bot_details.get(id).cloned());
+    let bot_live = chat_bot_id.as_deref().and_then(|id| {
+        session
+            .read()
+            .state
+            .listed_bots
+            .iter()
+            .find(|bot| bot.id == id)
+            .map(|bot| bot.live)
+    });
+    let pins = session.read().pins.clone();
+    let listed_skills = session.read().state.listed_skills.clone();
+    let mut skill_query = use_signal(String::new);
+    // Skills card: "add a skill" filter + the tiny saved caption after a write.
+    let mut add_query = use_signal(String::new);
+    let mut skills_saved = use_signal(|| false);
+    let pins_view = {
+        let rows: Vec<(String, String, String, bool)> = pins
+            .iter()
+            .map(|pin| {
+                let state = session.read();
+                (
+                    pin.clone(),
+                    state.pin_label(pin),
+                    state.pin_avatar(pin),
+                    state.pin_is_bot(pin),
+                )
+            })
+            .collect();
+        rsx! {
+            if !rows.is_empty() {
+                div { class: "pins",
+                    for (pin, label, avatar, is_bot) in rows {
+                        div {
+                            key: "{pin}",
+                            class: "pin-row",
+                            title: "Open {label}",
+                            onclick: {
+                                let pin = pin.clone();
+                                move |_| session.write().open_pin(pin.clone())
+                            },
+                            if is_bot {
+                                span { class: "avatar sm bot", style: avatar_style(&pin), "{avatar}" }
+                            } else {
+                                span { class: "avatar sm user", "{avatar}" }
+                            }
+                            span { class: "thread-title", "{label}" }
+                            PinToggle { session, id: pin.clone(), pinned: true }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    let bot_profile_view = if let Some(bot_id) = chat_bot_id.clone() {
+        if let Some(detail) = bot_detail.clone() {
+            let avatar = if detail.avatar.trim().is_empty() {
+                session.read().bot_avatar(&detail.id)
+            } else {
+                detail.avatar.clone()
+            };
+            let fallback_provider = detail
+                .fallback_provider
+                .as_deref()
+                .map(human_provider)
+                .unwrap_or_else(|| "—".to_owned());
+            let fallback_model = detail
+                .fallback_model
+                .as_deref()
+                .map(human_model)
+                .unwrap_or_else(|| "—".to_owned());
+            let pinned_route = session
+                .read()
+                .state
+                .catalog
+                .as_ref()
+                .map(|catalog| catalog.selection.clone());
+            let skill_needle = skill_query().trim().to_lowercase();
+            let skill_chips: Vec<String> = detail
+                .skills
+                .iter()
+                .filter(|skill| {
+                    skill_needle.is_empty() || skill.to_lowercase().contains(&skill_needle)
+                })
+                .cloned()
+                .collect();
+            // Skills the owner can still attach: valid ids, not already on the
+            // bot, matching the add-filter.
+            let attached_skills = detail.skills.clone();
+            let skills_bot_id = detail.id.clone();
+            let add_needle = add_query().trim().to_lowercase();
+            let addable_skills: Vec<(String, String, String)> = listed_skills
+                .iter()
+                .filter(|skill| valid_skill_id(&skill.id))
+                .filter(|skill| !attached_skills.iter().any(|s| s == &skill.id))
+                .filter(|skill| {
+                    add_needle.is_empty()
+                        || skill.id.to_lowercase().contains(&add_needle)
+                        || skill.name.to_lowercase().contains(&add_needle)
+                })
+                .map(|skill| {
+                    (
+                        skill.id.clone(),
+                        skill.name.clone(),
+                        skill.description.clone(),
+                    )
+                })
+                .collect();
+            let skills_full = attached_skills.len() >= MAX_BOT_SKILLS;
+            let tool_rows: Vec<(String, bool, Option<&'static str>)> = detail
+                .tools
+                .iter()
+                .map(|tool| {
+                    (
+                        tool.clone(),
+                        detail.require_approval.iter().any(|item| item == tool),
+                        capability_label(tool),
+                    )
+                })
+                .collect();
+            let instructions = detail.instructions.clone();
+            let instruction_preview = instructions.as_ref().map(|text| {
+                let truncated: String = text.chars().take(8000).collect();
+                let cut = text.chars().count() > 8000;
+                (truncated, if cut { "…" } else { "" })
+            });
+            rsx! {
+                div { class: "card",
+                    div { class: "card-head",
+                        h3 { class: "card-title", "{detail.display_name}" }
+                        span { class: "chip", "{detail.role}" }
+                    }
+                    div { class: "row",
+                        span { class: "avatar lg bot", style: avatar_style(&detail.id), "{avatar}" }
+                        div { class: "chips",
+                            span {
+                                class: if detail.enabled { "chip ok" } else { "chip warn" },
+                                if detail.enabled { "enabled" } else { "disabled" }
+                            }
+                            if let Some(live) = bot_live {
+                                span {
+                                    class: if live { "chip ok" } else { "chip warn" },
+                                    if live { "live" } else { "restart required" }
+                                }
+                            }
+                        }
+                    }
+                    if !detail.description.trim().is_empty() {
+                        p { class: "card-sub", "{detail.description}" }
+                    }
+                }
+                div { class: "card",
+                    div { class: "card-head",
+                        h3 { class: "card-title", "Routing" }
+                    }
+                    div { class: "kv-row",
+                        span { class: "kv-key", "Provider" }
+                        span { class: "kv-val", "{human_provider(&detail.provider)}" }
+                    }
+                    div { class: "kv-row",
+                        span { class: "kv-key", "Model" }
+                        span { class: "kv-val", "{human_model(&detail.model)}" }
+                    }
+                    div { class: "kv-row",
+                        span { class: "kv-key", "Fallback provider" }
+                        span { class: "kv-val", "{fallback_provider}" }
+                    }
+                    div { class: "kv-row",
+                        span { class: "kv-key", "Fallback model" }
+                        span { class: "kv-val", "{fallback_model}" }
+                    }
+                    if !detail.routing_classes.is_empty() {
+                        div { class: "chips",
+                            for class in detail.routing_classes.clone() {
+                                span { class: "chip muted", "{class}" }
+                            }
+                        }
+                        p { class: "hint", "Routing classes this bot accepts." }
+                    }
+                    if let Some(selection) = pinned_route {
+                        if !selection.is_auto()
+                            && (selection.provider != detail.provider || selection.model != detail.model)
+                        {
+                            p { class: "hint",
+                                "This conversation is pinned to {human_model(&selection.model)} via {human_provider(&selection.provider)} in the chat head."
+                            }
+                        }
+                    }
+                }
+                div { class: "card",
+                    div { class: "card-head",
+                        h3 { class: "card-title", "Skills" }
+                        span { class: "chip muted", "{detail.skills.len()} / {MAX_BOT_SKILLS}" }
+                        if skills_saved() {
+                            span { class: "caption", "saved" }
+                        }
+                    }
+                    div { class: "skill-row",
+                        input {
+                            class: "input grow",
+                            placeholder: "Filter skills…",
+                            value: "{skill_query}",
+                            oninput: move |event| skill_query.set(event.value()),
+                        }
+                    }
+                    if detail.skills.is_empty() {
+                        p { class: "hint", "No skills attached." }
+                    } else if skill_chips.is_empty() {
+                        p { class: "hint", "No skill matches the filter." }
+                    } else {
+                        div { class: "chips",
+                            for skill in skill_chips {
+                                {
+                                    let bot_id = skills_bot_id.clone();
+                                    let attached = attached_skills.clone();
+                                    let skill_id = skill.clone();
+                                    rsx! {
+                                        span { class: "chip accent",
+                                            "{skill}"
+                                            button {
+                                                class: "team-chip remove",
+                                                title: "Remove {skill}",
+                                                onclick: move |_| {
+                                                    let mut next: Vec<String> = attached
+                                                        .iter()
+                                                        .filter(|s| **s != skill_id)
+                                                        .cloned()
+                                                        .collect();
+                                                    next.retain(|s| valid_skill_id(s));
+                                                    session.write().save_bot_config(
+                                                        bot_id.clone(),
+                                                        BotConfigUpdate {
+                                                            skills: Some(next),
+                                                            ..Default::default()
+                                                        },
+                                                    );
+                                                    skills_saved.set(true);
+                                                },
+                                                Icon { name: "x", size: 12 }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    div { class: "skill-row",
+                        input {
+                            class: "input grow",
+                            placeholder: "Add a skill…",
+                            value: "{add_query}",
+                            oninput: move |event| {
+                                add_query.set(event.value());
+                                skills_saved.set(false);
+                            },
+                        }
+                    }
+                    if !addable_skills.is_empty() {
+                        div {
+                            class: "pop-list",
+                            style: "max-height: 180px; margin-top: 6px; border: 1px solid var(--hairline); border-radius: var(--r-xs);",
+                            for (id, name, description) in addable_skills {
+                                {
+                                    let bot_id = skills_bot_id.clone();
+                                    let attached = attached_skills.clone();
+                                    let pick_id = id.clone();
+                                    rsx! {
+                                        button {
+                                            key: "{id}",
+                                            class: "pop-item",
+                                            disabled: skills_full,
+                                            title: if skills_full { "Skill cap reached ({MAX_BOT_SKILLS})" } else { "Attach {id}" },
+                                            onclick: move |_| {
+                                                if !valid_skill_id(&pick_id) || attached.len() >= MAX_BOT_SKILLS {
+                                                    return;
+                                                }
+                                                let mut next = attached.clone();
+                                                if next.contains(&pick_id) {
+                                                    return;
+                                                }
+                                                next.push(pick_id.clone());
+                                                session.write().save_bot_config(
+                                                    bot_id.clone(),
+                                                    BotConfigUpdate {
+                                                        skills: Some(next),
+                                                        ..Default::default()
+                                                    },
+                                                );
+                                                skills_saved.set(true);
+                                                add_query.set(String::new());
+                                            },
+                                            div { style: "display: flex; flex-direction: column; align-items: flex-start; gap: 1px; min-width: 0;",
+                                                span { "{name}" }
+                                                if !description.trim().is_empty() {
+                                                    span { class: "caption", "{description}" }
+                                                }
+                                                span { class: "micro", "{id}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if !add_query().trim().is_empty() {
+                        p { class: "hint", "No unattached skill matches." }
+                    }
+                    if skills_full {
+                        p { class: "hint", "A bot carries at most {MAX_BOT_SKILLS} skills." }
+                    }
+                }
+                div { class: "card",
+                    div { class: "card-head",
+                        h3 { class: "card-title", "Tools" }
+                        span { class: "chip muted", "{detail.tools.len()}" }
+                    }
+                    if tool_rows.is_empty() {
+                        p { class: "hint", "No tools enabled." }
+                    } else {
+                        div { class: "chips",
+                            for (tool, needs_approval, _cap) in tool_rows.clone() {
+                                span {
+                                    class: if needs_approval { "chip warn" } else { "chip" },
+                                    title: if needs_approval { "Requires approval" } else { "Enabled tool" },
+                                    "{tool}"
+                                }
+                            }
+                        }
+                        div { class: "row",
+                            for (tool, _needs_approval, cap) in tool_rows {
+                                if let Some(label) = cap {
+                                    span { class: "tiny", "{tool}: {label}" }
+                                }
+                            }
+                        }
+                    }
+                }
+                div { class: "card",
+                    div { class: "card-head",
+                        h3 { class: "card-title", "Instructions" }
+                        span { class: "chip muted", "{detail.instructions_bytes} bytes" }
+                    }
+                    if let Some((preview, ellipsis)) = instruction_preview {
+                        details {
+                            summary { "Preview prompt" }
+                            pre {
+                                style: "max-height: 240px; overflow: auto; margin: 8px 0 0; white-space: pre-wrap;",
+                                "{preview}{ellipsis}"
+                            }
+                        }
+                        p { class: "hint", "{detail.instructions_bytes} bytes total; shown truncated to 8,000 characters." }
+                    } else {
+                        p { class: "hint", "No custom instructions; the role prompt applies." }
+                    }
+                }
+                div { class: "card",
+                    div { class: "card-head",
+                        h3 { class: "card-title", "Memory & Library" }
+                    }
+                    div { class: "kv-row",
+                        span { class: "kv-key", "Memories" }
+                        span { class: "kv-val", "{detail.memory_count}" }
+                    }
+                    div { class: "kv-row",
+                        span { class: "kv-key", "Artifacts" }
+                        span { class: "kv-val", "{detail.artifact_count}" }
+                    }
+                    div { class: "row",
+                        button {
+                            class: "btn ghost sm",
+                            onclick: {
+                                let id = detail.id.clone();
+                                move |_| session.write().open_bot(id.clone())
+                            },
+                            "Open in Fleet"
+                        }
+                        button {
+                            class: "btn ghost sm",
+                            onclick: move |_| session.write().open_section(Section::Memory),
+                            "Open Memory"
+                        }
+                    }
+                }
+            }
+        } else {
+            rsx! {
+                div { class: "card",
+                    div { class: "card-head",
+                        h3 { class: "card-title", "Bot profile" }
+                        span { class: "spinner", title: "Loading bot record" }
+                    }
+                    div { class: "skeleton", " " }
+                    p { class: "hint", "Loading the bot record from the server…" }
+                    div { class: "row",
+                        button {
+                            class: "btn ghost sm",
+                            onclick: {
+                                let bot_id = bot_id.clone();
+                                move |_| session.write().load_bot_detail(bot_id.clone())
+                            },
+                            Icon { name: "refresh", size: 14 }
+                            "Refresh"
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        rsx! {}
     };
     let details_view = rsx! {
         div { class: "card",
@@ -2825,6 +3565,7 @@ fn Inspector(session: Signal<Session>, overlay: Signal<Overlay>, open: Signal<bo
             }
             div { class: "inspector-body",
                 if section == Section::Chat {
+                    {pins_view}
                     div { class: "inspector-tabs",
                         button {
                             class: if tab() == InspectorTab::Details { "tab active" } else { "tab" },
@@ -2845,7 +3586,10 @@ fn Inspector(session: Signal<Session>, overlay: Signal<Overlay>, open: Signal<bo
                         }
                     }
                     {match tab() {
-                        InspectorTab::Details => details_view,
+                        InspectorTab::Details => rsx! {
+                            {details_view}
+                            {bot_profile_view}
+                        },
                         InspectorTab::Library => library_view,
                         InspectorTab::Members => members_view,
                     }}
@@ -2962,36 +3706,63 @@ fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
             })
             .collect(),
     };
-    let (members, candidates) = {
+    // Current picks as removable rows at the top of the picker.
+    let members: Vec<(String, String, String, String)> = {
         let state = session.read();
-        let roster = state
+        picked()
+            .iter()
+            .filter_map(|id| {
+                state
+                    .state
+                    .listed_bots
+                    .iter()
+                    .find(|bot| bot.id == *id)
+                    .map(|bot| {
+                        (
+                            id.clone(),
+                            state.bot_display_name(id),
+                            state.bot_avatar(id),
+                            bot.role.clone(),
+                        )
+                    })
+            })
+            .collect()
+    };
+    // Every enabled bot as a picker option; current picks are marked selected
+    // and toggle off, the rest toggle on (capped by with_member).
+    let picker_options: Vec<(String, String, String, String, bool)> = {
+        let state = session.read();
+        state
             .state
             .listed_bots
             .iter()
             .filter(|bot| bot.enabled)
             .map(|bot| {
+                let id = bot.id.clone();
                 (
-                    bot.id.clone(),
-                    state.bot_display_name(&bot.id),
-                    state.bot_avatar(&bot.id),
+                    id.clone(),
+                    state.bot_display_name(&id),
+                    state.bot_avatar(&id),
                     bot.role.clone(),
+                    picked().contains(&id),
                 )
             })
-            .collect::<Vec<_>>();
-        let selected = roster
-            .iter()
-            .filter(|(id, ..)| picked().contains(id))
-            .cloned()
-            .collect::<Vec<_>>();
-        let available = teams::available_bots(&state.state.listed_bots, &draft_team)
-            .into_iter()
-            .filter_map(|id| roster.iter().find(|(bot, ..)| *bot == id).cloned())
-            .collect::<Vec<_>>();
-        (selected, available)
+            .collect()
     };
+    let mut picker_query = use_signal(String::new);
+    let picker_needle = picker_query().trim().to_lowercase();
+    let picker_rows: Vec<(String, String, String, String, bool)> = picker_options
+        .into_iter()
+        .filter(|(_, name, _, role, _)| {
+            picker_needle.is_empty()
+                || name.to_lowercase().contains(&picker_needle)
+                || role.to_lowercase().contains(&picker_needle)
+        })
+        .collect();
+    let picker_empty = picker_rows.is_empty();
     let picked_count = picked().len();
     let members_empty = members.is_empty();
-    let candidates_empty = candidates.is_empty();
+    let team_full = picked_count >= MAX_TEAM_MEMBERS;
     rsx! {
         div {
             class: "scrim open",
@@ -3070,7 +3841,7 @@ fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
                 if kind == ConversationKind::Room {
                     div { class: "field",
                         label { class: "field-label", "Members" }
-                        span { class: "hint", "{picked_count} of 5 bots picked. The group is created first, then its members are written in the same step." }
+                        span { class: "member-count", "{picked_count} of {MAX_TEAM_MEMBERS} bots selected. The group is created first, then its members are written in the same step." }
                         div { class: "roster",
                             for (bot_id, bot_name, bot_avatar, bot_role) in members {
                                 div { key: "{bot_id}", class: "roster-row",
@@ -3105,28 +3876,46 @@ fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
                                 p { class: "hint", "No bot picked yet." }
                             }
                         }
-                        div { class: "roster",
-                            for (bot_id, bot_name, bot_avatar, _) in candidates {
-                                button {
-                                    key: "{bot_id}",
-                                    class: "roster-row",
-                                    onclick: {
-                                        let id = bot_id.clone();
-                                        let team = draft_team.clone();
-                                        move |_| {
-                                            let mut picked = picked;
-                                            if let Some(next) = teams::with_member(&team, &id) {
-                                                picked.set(next);
-                                            }
-                                        }
-                                    },
-                                    span { class: "avatar sm bot", style: avatar_style(&bot_id), "{bot_avatar}" }
-                                    span { class: "thread-title", "{bot_name}" }
-                                    span { class: "chip accent", "add" }
-                                }
+                        div { class: "member-picker",
+                            input {
+                                class: "input",
+                                placeholder: "Search bots…",
+                                value: "{picker_query}",
+                                oninput: move |event| picker_query.set(event.value()),
                             }
-                            if candidates_empty {
-                                p { class: "hint", "No other enabled bot can join this group." }
+                            div { class: "pop-list", style: "max-height: 220px;",
+                                for (bot_id, bot_name, bot_avatar, bot_role, selected) in picker_rows {
+                                    button {
+                                        key: "{bot_id}",
+                                        class: if selected { "member-option selected" } else { "member-option" },
+                                        disabled: !selected && team_full,
+                                        title: if selected { "Remove from group" } else if team_full { "The group is full" } else { "Add to group" },
+                                        onclick: {
+                                            let id = bot_id.clone();
+                                            let team = draft_team.clone();
+                                            move |_| {
+                                                let mut picked = picked;
+                                                let next = if selected {
+                                                    teams::without_member(&team, &id)
+                                                } else {
+                                                    teams::with_member(&team, &id)
+                                                };
+                                                if let Some(next) = next {
+                                                    picked.set(next);
+                                                }
+                                            }
+                                        },
+                                        span { class: "avatar sm bot", style: avatar_style(&bot_id), "{bot_avatar}" }
+                                        div { class: "thread-copy",
+                                            span { class: "thread-title", "{bot_name}" }
+                                            span { class: "thread-meta", "{bot_role}" }
+                                        }
+                                        span { class: "member-check" }
+                                    }
+                                }
+                                if picker_empty {
+                                    p { class: "hint", "No enabled bot matches the search." }
+                                }
                             }
                         }
                     }
@@ -3180,7 +3969,7 @@ fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
     let conversation = session.read().conversation.clone();
     let is_room = teams::is_room(&conversation);
     let rules_draft = session.read().team_rules_draft.clone();
-    let (members, available, mode, loading, error) = {
+    let (members, mode, loading, error) = {
         let state = session.read();
         let team = state.state.team.clone();
         let members = team
@@ -3201,39 +3990,56 @@ fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let available = team
-            .as_ref()
-            .map(|team| {
-                teams::available_bots(&state.state.listed_bots, team)
-                    .into_iter()
-                    .map(|id| {
-                        (
-                            id.clone(),
-                            state.bot_display_name(&id),
-                            state.bot_avatar(&id),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
         (
             members,
-            available,
             team.as_ref().map(|team| team.mode),
             state.state.team_loading,
             state.state.team_error.clone(),
         )
+    };
+    // The live team is captured for the picker toggles (with_member /
+    // without_member do the capped membership maths).
+    let team = session.read().state.team.clone();
+    let member_ids = members
+        .iter()
+        .map(|(id, ..)| id.clone())
+        .collect::<Vec<_>>();
+    // Every enabled bot is a picker option: current members show selected
+    // and toggle off, the rest (teams::available_bots) toggle on.
+    let picker_options: Vec<(String, String, String, String, bool)> = {
+        let state = session.read();
+        state
+            .state
+            .listed_bots
+            .iter()
+            .filter(|bot| bot.enabled)
+            .map(|bot| {
+                let id = bot.id.clone();
+                (
+                    id.clone(),
+                    state.bot_display_name(&id),
+                    state.bot_avatar(&id),
+                    bot.role.clone(),
+                    member_ids.contains(&id),
+                )
+            })
+            .collect()
     };
     let needle = bot_query().trim().to_lowercase();
     let mode_value = mode
         .map(|mode| mode.as_str())
         .unwrap_or("selected")
         .to_owned();
-    let candidates = available
+    let picker_rows: Vec<(String, String, String, String, bool)> = picker_options
         .into_iter()
-        .filter(|(_, name, _)| needle.is_empty() || name.to_lowercase().contains(&needle))
-        .collect::<Vec<_>>();
-    let candidates_empty = candidates.is_empty();
+        .filter(|(_, name, _, role, _)| {
+            needle.is_empty()
+                || name.to_lowercase().contains(&needle)
+                || role.to_lowercase().contains(&needle)
+        })
+        .collect();
+    let picker_empty = picker_rows.is_empty();
+    let team_full = member_ids.len() >= MAX_TEAM_MEMBERS;
     rsx! {
         div {
             class: "scrim open",
@@ -3325,29 +4131,49 @@ fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                         span { class: "hint", "A group holds up to five enabled bots. The orchestrator is always implied." }
                     }
                     div { class: "field",
-                        label { class: "field-label", "Add bot" }
-                        input {
-                            class: "input",
-                            value: "{bot_query}",
-                            placeholder: "Search enabled bots",
-                            oninput: move |event| bot_query.set(event.value()),
-                        }
-                        div { class: "roster",
-                            for (id, name, avatar) in candidates {
-                                button {
-                                    key: "{id}",
-                                    class: "roster-row",
-                                    onclick: {
-                                        let id = id.clone();
-                                        move |_| session.write().add_team_member(id.clone())
-                                    },
-                                    span { class: "avatar sm bot", style: avatar_style(&id), "{avatar}" }
-                                    span { class: "thread-title", "{name}" }
-                                    span { class: "chip accent", "add" }
-                                }
+                        label { class: "field-label", "Bots" }
+                        span { class: "member-count", "{member_ids.len()} of {MAX_TEAM_MEMBERS} bots selected" }
+                        div { class: "member-picker",
+                            input {
+                                class: "input",
+                                value: "{bot_query}",
+                                placeholder: "Search bots…",
+                                oninput: move |event| bot_query.set(event.value()),
                             }
-                            if candidates_empty {
-                                p { class: "hint", "No other enabled bot can join this group." }
+                            div { class: "pop-list", style: "max-height: 220px;",
+                                for (id, name, avatar, role, selected) in picker_rows {
+                                    button {
+                                        key: "{id}",
+                                        class: if selected { "member-option selected" } else { "member-option" },
+                                        disabled: !selected && team_full,
+                                        title: if selected { "Remove from group" } else if team_full { "The group is full" } else { "Add to group" },
+                                        onclick: {
+                                            let id = id.clone();
+                                            let team = team.clone();
+                                            move |_| {
+                                                if let Some(team) = team.clone() {
+                                                    let next = if selected {
+                                                        teams::without_member(&team, &id)
+                                                    } else {
+                                                        teams::with_member(&team, &id)
+                                                    };
+                                                    if let Some(next) = next {
+                                                        session.write().set_team_members(next);
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        span { class: "avatar sm bot", style: avatar_style(&id), "{avatar}" }
+                                        div { class: "thread-copy",
+                                            span { class: "thread-title", "{name}" }
+                                            span { class: "thread-meta", "{role}" }
+                                        }
+                                        span { class: "member-check" }
+                                    }
+                                }
+                                if picker_empty {
+                                    p { class: "hint", "No enabled bot matches the search." }
+                                }
                             }
                         }
                     }
@@ -3944,6 +4770,7 @@ fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Eleme
         .map(|preset| (preset.id, preset.label))
         .collect::<Vec<_>>();
     let chosen = provider_presets::preset_for(&selected()).copied();
+    let chosen_label = chosen.map(|preset| preset.label).unwrap_or("the provider");
     let id = session.read().provider.id.clone();
     let kind = session.read().provider.kind.clone();
     let base_url = session.read().provider.base_url.clone();
@@ -4022,7 +4849,7 @@ fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Eleme
                         if preset.auth == "oauth" {
                             div { class: "banner info", style: "margin: 8px 0; display: flex; flex-direction: column; gap: 6px;",
                                 strong { "OAuth PKCE Authentication" }
-                                p { class: "tiny", "Connect saves the provider. Then press Sign in on its card: your browser opens, you approve, and the tokens go straight to the server's encrypted store." }
+                                p { class: "tiny", "Save the provider first. Then open the Providers page and press the primary “Sign in with {preset.label}” button on its card: your browser opens, you approve, and the tokens go straight to the server's encrypted store. Nothing is typed or pasted here." }
                             }
                         }
                         div { class: "chips",
@@ -4080,7 +4907,7 @@ fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Eleme
                             label { class: "field-label", "Sign-in" }
                             div { class: "banner info", style: "display: flex; flex-direction: column; gap: 6px;",
                                 strong { "This provider uses OAuth, not an API key." }
-                                p { class: "tiny", "Save the provider, then press Sign in on its card. Your browser opens, you approve, and the tokens are stored in the server's encrypted store ({secret_name}). Nothing is typed or pasted here." }
+                                p { class: "tiny", "After you save, use the “Sign in with {chosen_label}” button on this provider's card on the Providers page — not this form. Your browser opens, you approve, and the tokens land in the server's encrypted store ({secret_name}). Nothing is typed or pasted here." }
                             }
                         }
                     } else {
@@ -4147,6 +4974,65 @@ fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element 
     let api_key = session.read().provider.api_key.clone();
     let catalog_fetch = session.read().provider.catalog_fetch;
     let can_save = session.read().can_admin();
+    let usage = session.read().state.usage.clone();
+    // Per-day rows preformatted: (day label, "N tokens · M calls").
+    let usage_days: Vec<(String, String)> = usage
+        .as_ref()
+        .map(|report| {
+            report
+                .per_day
+                .iter()
+                .take(14)
+                .map(|bucket| {
+                    (
+                        bucket.day.clone().unwrap_or_else(|| "—".to_owned()),
+                        format!("{} tokens · {} calls", bucket.total_tokens, bucket.calls),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let usage_card = rsx! {
+        div { class: "card",
+            div { class: "card-head",
+                h3 { class: "card-title", "Token usage" }
+                button {
+                    class: "btn ghost sm",
+                    onclick: move |_| session.write().load_usage(7),
+                    "Load last 7 days"
+                }
+            }
+            if let Some(report) = usage.clone() {
+                div { class: "kv-row",
+                    span { class: "kv-key", "Calls" }
+                    span { class: "kv-val", "{report.totals.calls}" }
+                }
+                div { class: "kv-row",
+                    span { class: "kv-key", "Prompt tokens" }
+                    span { class: "kv-val", "{report.totals.prompt_tokens}" }
+                }
+                div { class: "kv-row",
+                    span { class: "kv-key", "Completion tokens" }
+                    span { class: "kv-val", "{report.totals.completion_tokens}" }
+                }
+                div { class: "kv-row",
+                    span { class: "kv-key", "Total tokens" }
+                    span { class: "kv-val", "{report.totals.total_tokens}" }
+                }
+                if report.per_day.is_empty() {
+                    p { class: "caption", "No calls in this window." }
+                }
+                for (day, summary) in usage_days.clone() {
+                    div { class: "kv-row",
+                        span { class: "kv-key", "{day}" }
+                        span { class: "kv-val", "{summary}" }
+                    }
+                }
+            } else {
+                p { class: "caption", "No usage report loaded yet. Load the last 7 days to see calls and tokens." }
+            }
+        }
+    };
     let provider_rows: Vec<ProviderRow> = providers
         .iter()
         .map(|provider| {
@@ -4207,6 +5093,7 @@ fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element 
                     ModelBar { session }
                     p { class: "tiny", "Applies to the next turn; a running turn keeps its pinned route." }
                 }
+                {usage_card}
                 if !loaded {
                     div { class: "card",
                         div { class: "skeleton title" }
@@ -4222,6 +5109,14 @@ fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element 
                                 secrets.iter().any(|(_, _, configured)| *configured) || provider_id == "ollama"
                             };
                             let signing_in = session.read().oauth_signing_in.as_deref() == Some(provider_id.as_str());
+                            // Preset label for the kind, else the brand label.
+                            let kind_label = provider_presets::presets()
+                                .iter()
+                                .find(|preset| preset.kind == provider_kind)
+                                .map(|preset| preset.label)
+                                .or_else(|| branding::brand_label(&provider_kind))
+                                .unwrap_or(provider_kind.as_str())
+                                .to_owned();
                             rsx! {
                                 div { class: "card", key: "{provider_id}",
                                     div { class: "card-head",
@@ -4284,7 +5179,14 @@ fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element 
                                                     let kind = provider_kind.clone();
                                                     move |_| session.write().sign_in_provider(id.clone(), kind.clone())
                                                 },
-                                                if signing_in { "Waiting for browser…" } else if is_connected { "Sign in again" } else { "Sign in" }
+                                                BrandLogo { brand: provider_kind.clone(), size: 16 }
+                                                if signing_in {
+                                                    "Waiting for browser…"
+                                                } else if is_connected {
+                                                    "Sign in again with {kind_label}"
+                                                } else {
+                                                    "Sign in with {kind_label}"
+                                                }
                                             }
                                         }
                                     }
@@ -5416,6 +6318,77 @@ fn SettingsView(session: Signal<Session>) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mention_query_tracks_a_trailing_at_token() {
+        assert_eq!(mention_query(""), None);
+        assert_eq!(mention_query("hello"), None);
+        assert_eq!(mention_query("hey @"), Some(String::new()));
+        assert_eq!(mention_query("hey @ana"), Some("ana".into()));
+        assert_eq!(
+            mention_query("hey @an-a_2 "),
+            None,
+            "trailing space closes the token"
+        );
+        assert_eq!(
+            mention_query("mail a@b.example"),
+            None,
+            "non-slug tail rejected"
+        );
+        assert_eq!(mention_query("ping @Analyst"), None, "uppercase rejected");
+        assert_eq!(
+            mention_query(&format!("@{}", "a".repeat(33))),
+            None,
+            "longer than 32 chars rejected"
+        );
+        assert_eq!(
+            mention_query(&format!("@{}", "a".repeat(32))),
+            Some("a".repeat(32))
+        );
+        assert_eq!(mention_query("@one then @two"), Some("two".into()));
+        assert_eq!(mention_query("héllo @ana wörld"), None);
+        assert_eq!(mention_query("héllo @ana"), Some("ana".into()));
+    }
+
+    #[test]
+    fn slash_query_tracks_a_line_leading_command() {
+        assert_eq!(slash_query(""), None);
+        assert_eq!(slash_query("hello"), None);
+        assert_eq!(slash_query("/"), Some(String::new()));
+        assert_eq!(slash_query("/sk"), Some("sk".into()));
+        assert_eq!(slash_query("line one\n/de"), Some("de".into()));
+        assert_eq!(slash_query("/deck build"), None, "space ends the command");
+        assert_eq!(slash_query("https://x"), None, "not at line start");
+        assert_eq!(slash_query("a /b"), None, "not at line start");
+    }
+
+    #[test]
+    fn insertions_replace_only_the_trailing_trigger() {
+        assert_eq!(insert_mention_text("hey @an", "analyst"), "hey @analyst ");
+        assert_eq!(insert_mention_text("@", "gmail"), "@gmail ");
+        assert_eq!(insert_mention_text("no trigger", "x"), "no trigger@x ");
+        assert_eq!(
+            insert_mention_text("one\ntwo @mk", "maker"),
+            "one\ntwo @maker "
+        );
+        assert_eq!(insert_slash_text("/sk", "skill_load"), "skill_load ");
+        assert_eq!(
+            insert_slash_text("line\n/de", "deck_build"),
+            "line\ndeck_build "
+        );
+        assert_eq!(insert_slash_text("/", "rag_search"), "rag_search ");
+    }
+
+    #[test]
+    fn model_picker_values_parse_like_the_old_select() {
+        assert!(parse_model_value("auto").is_auto());
+        assert!(parse_model_value("auto|").is_auto());
+        assert!(parse_model_value("garbage").is_auto());
+        let parsed = parse_model_value("groq|llama-3.3-70b");
+        assert_eq!(parsed.provider, "groq");
+        assert_eq!(parsed.model, "llama-3.3-70b");
+        assert!(!parsed.is_auto());
+    }
 
     #[test]
     fn authorization_urls_are_fixed_https_endpoints() {

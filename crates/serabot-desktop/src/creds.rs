@@ -6,7 +6,7 @@
 //! token in a process-local map only. No token is ever logged or written to
 //! disk, and release builds do not read token environment variables.
 
-use crate::{default_server_url, valid_token, validate_endpoint};
+use crate::{default_server_url, valid_id, valid_speaker, valid_token, validate_endpoint};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -25,13 +25,66 @@ pub const TOKEN_ENV_FALLBACK: &str = "SERABOT_OWNER_TOKEN";
 const SETTINGS_FILE: &str = "settings.json";
 const TEMP_SETTINGS_FILE: &str = "settings.json.tmp";
 
-/// Non-secret persisted settings. Only the server origin and UI theme are stored.
+/// Maximum number of pinned conversations or bots in the sidebar/inspector.
+pub const MAX_PINS: usize = 24;
+
+/// Non-secret persisted settings. Only the server origin, UI theme and the
+/// pin list are stored.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Settings {
     #[serde(default)]
     pub server: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pins: Option<Vec<String>>,
+}
+
+/// A pin is either a bot id slug (`analyst`) or a full conversation id
+/// (`dir:analyst`, `room:review`, `windows-owner`, or a numeric chat id).
+pub fn valid_pin_id(id: &str) -> bool {
+    if !valid_id(id) {
+        return false;
+    }
+    if valid_speaker(id) {
+        return true;
+    }
+    id == "windows-owner"
+        || id.chars().all(|c| c.is_ascii_digit())
+        || ["sec:", "grp:", "dir:", "room:"]
+            .iter()
+            .any(|prefix| id.starts_with(prefix))
+}
+
+/// Keep only valid, unique pins in first-seen order, capped at [`MAX_PINS`].
+pub fn sanitize_pins(pins: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for pin in pins {
+        if out.len() >= MAX_PINS {
+            break;
+        }
+        if valid_pin_id(&pin) && !out.iter().any(|kept| kept == &pin) {
+            out.push(pin);
+        }
+    }
+    out
+}
+
+/// Toggle one pin in place. Returns `true` when the list changed. Invalid
+/// ids, duplicates already present and a full list are no-ops.
+pub fn toggle_pin_in_list(pins: &mut Vec<String>, id: &str) -> bool {
+    if !valid_pin_id(id) {
+        return false;
+    }
+    if let Some(position) = pins.iter().position(|pin| pin == id) {
+        pins.remove(position);
+        return true;
+    }
+    if pins.len() >= MAX_PINS {
+        return false;
+    }
+    pins.push(id.to_owned());
+    true
 }
 
 /// `%APPDATA%\SeraBot` on Windows, `$HOME/.config/SeraBot` elsewhere.
@@ -80,14 +133,20 @@ pub fn load_settings_from(dir: &Path) -> Settings {
         "dark" | "light" => Some(theme),
         _ => None,
     });
+    let pins = settings
+        .pins
+        .map(sanitize_pins)
+        .filter(|pins| !pins.is_empty());
     match validate_endpoint(settings.server.trim()) {
         Ok(url) => Settings {
             server: url.origin().ascii_serialization(),
             theme,
+            pins,
         },
         Err(_) => Settings {
             server: String::new(),
             theme,
+            pins,
         },
     }
 }
@@ -106,6 +165,11 @@ pub fn save_settings_to(dir: &Path, settings: &Settings) -> Result<(), String> {
     let text = serde_json::to_string_pretty(&Settings {
         server,
         theme: settings.theme.clone(),
+        pins: settings
+            .pins
+            .as_ref()
+            .map(|pins| sanitize_pins(pins.clone()))
+            .filter(|pins| !pins.is_empty()),
     })
     .map_err(|_| "Could not encode settings.".to_owned())?;
     fs::create_dir_all(dir).map_err(|_| "Could not create the settings directory.".to_owned())?;
@@ -278,6 +342,7 @@ mod tests {
             &Settings {
                 server: "https://bot.example/".into(),
                 theme: Some("light".into()),
+                pins: Some(vec!["dir:analyst".into(), "room:review".into()]),
             },
         )
         .unwrap();
@@ -285,11 +350,13 @@ mod tests {
             load_settings_from(&dir),
             Settings {
                 server: "https://bot.example".into(),
-                theme: Some("light".into())
+                theme: Some("light".into()),
+                pins: Some(vec!["dir:analyst".into(), "room:review".into()])
             }
         );
         let text = fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
         assert!(text.contains("https://bot.example"));
+        assert!(text.contains("dir:analyst"));
         assert!(!text.contains("token"));
 
         save_settings_to(
@@ -297,11 +364,90 @@ mod tests {
             &Settings {
                 server: "http://127.0.0.1:8787".into(),
                 theme: None,
+                pins: None,
             },
         )
         .unwrap();
         assert_eq!(load_settings_from(&dir).server, "http://127.0.0.1:8787");
+        assert_eq!(load_settings_from(&dir).pins, None);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pins_round_trip_sanitizes_duplicates_invalid_and_overflow() {
+        let dir = temp_dir("settings-pins");
+        save_settings_to(
+            &dir,
+            &Settings {
+                server: String::new(),
+                theme: None,
+                pins: Some(vec![
+                    "analyst".into(),
+                    "dir:analyst".into(),
+                    "analyst".into(),
+                    "../escape".into(),
+                    "bad id".into(),
+                    "windows-owner".into(),
+                    "room:review".into(),
+                    "12345".into(),
+                ]),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            load_settings_from(&dir).pins,
+            Some(vec![
+                "analyst".to_string(),
+                "dir:analyst".to_string(),
+                "windows-owner".to_string(),
+                "room:review".to_string(),
+                "12345".to_string(),
+            ])
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pin_ids_are_bot_slugs_or_conversation_ids() {
+        assert!(valid_pin_id("analyst"));
+        assert!(valid_pin_id("bot-2"));
+        assert!(valid_pin_id("dir:analyst"));
+        assert!(valid_pin_id("sec:finance"));
+        assert!(valid_pin_id("grp:ops"));
+        assert!(valid_pin_id("room:review"));
+        assert!(valid_pin_id("windows-owner"));
+        assert!(valid_pin_id("1234567890"));
+        assert!(!valid_pin_id(""));
+        assert!(!valid_pin_id("../etc"));
+        assert!(!valid_pin_id("bad id"));
+        assert!(!valid_pin_id("Main"));
+        assert!(!valid_pin_id("unknown:thing"));
+        assert!(!valid_pin_id(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn toggling_pins_dedups_caps_and_rejects_invalid_ids() {
+        let mut pins = Vec::new();
+        assert!(toggle_pin_in_list(&mut pins, "analyst"));
+        assert_eq!(pins, vec!["analyst".to_string()]);
+        // Toggling an already pinned id unpins it, so duplicates never appear.
+        assert!(toggle_pin_in_list(&mut pins, "analyst"));
+        assert!(pins.is_empty());
+        assert!(toggle_pin_in_list(&mut pins, "analyst"));
+        assert!(toggle_pin_in_list(&mut pins, "room:review"));
+        assert_eq!(pins.len(), 2);
+        assert!(!toggle_pin_in_list(&mut pins, "not a pin"));
+        assert_eq!(pins.len(), 2, "invalid ids are a no-op");
+        for index in 0..MAX_PINS - 2 {
+            assert!(toggle_pin_in_list(&mut pins, &format!("bot-{index}")));
+        }
+        assert_eq!(pins.len(), MAX_PINS);
+        assert!(!toggle_pin_in_list(&mut pins, "one-too-many"), "cap holds");
+        assert!(
+            toggle_pin_in_list(&mut pins, "analyst"),
+            "removal still works at the cap"
+        );
+        assert_eq!(pins.len(), MAX_PINS - 1);
     }
 
     #[test]
@@ -365,6 +511,7 @@ mod tests {
         let settings = Settings {
             server: "http://owner.example".into(),
             theme: None,
+            pins: None,
         };
         // Invalid saved origins fall back to the optional compiled hint.
         assert_eq!(prefill_server(&settings), default_server_url());

@@ -4,9 +4,9 @@
 //! the worker and SSE threads, never on the UI thread.
 
 use crate::{
-    ApiError, ApprovalDecision, AudioUpdate, BotProfileUpdate, ConnectorUpdate, ConversationKind,
-    MAX_SKILL_BODY_BYTES, MAX_SKILL_DESCRIPTION_CHARS, Message, NewProvider, Role,
-    SPECIALIST_TOOLS, Selection, TaskStatus, TeamMode,
+    ApiError, ApprovalDecision, AudioUpdate, BotConfigUpdate, BotProfileUpdate, ConnectorUpdate,
+    ConversationKind, MAX_SKILL_BODY_BYTES, MAX_SKILL_DESCRIPTION_CHARS, MAX_USAGE_DAYS, Message,
+    NewProvider, Role, SPECIALIST_TOOLS, Selection, TaskStatus, TeamMode,
     api::{
         MEMORY_KINDS, valid_conversation_title, valid_credential, valid_memory_content,
         valid_memory_kind, valid_memory_source, valid_model_id, valid_provider_id,
@@ -16,8 +16,8 @@ use crate::{
     events::{EventStream, EventUpdate},
     state::State,
     teams, updater, valid_bot_description, valid_bot_id, valid_conversation_parent, valid_id,
-    valid_new_skill_id, valid_skill_body, valid_skill_description, valid_slug, valid_text,
-    valid_token, validate_team_members, validate_tool_list,
+    valid_new_skill_id, valid_skill_body, valid_skill_description, valid_slug, valid_speaker,
+    valid_text, valid_token, validate_bot_config_update, validate_team_members, validate_tool_list,
     worker::{Credentials, Job, Operation, OperationKind, Reply, Worker},
 };
 use secrecy::ExposeSecret;
@@ -301,6 +301,9 @@ pub struct Session {
     pub connect_error: Option<String>,
     pub connecting: bool,
     pub theme: Theme,
+    /// Pinned bots/conversations shown in the inspector strip. Persisted in
+    /// settings.json through [`creds::Settings::pins`].
+    pub pins: Vec<String>,
     pub section: Section,
     pub conversation: String,
     pub composer: String,
@@ -331,6 +334,11 @@ pub struct Session {
     pub downloading: bool,
     download_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     pending: Option<OperationKind>,
+    /// Bot id whose `GET /v1/bots/{id}` is in flight (dedup of loads).
+    bot_detail_pending: Option<String>,
+    /// The bot config write in flight: (bot id, update), kept so the cached
+    /// detail can be updated optimistically when the save succeeds.
+    bot_config_pending: Option<(String, BotConfigUpdate)>,
     /// The team to write on a room that is being created right now.
     pending_team: Option<Vec<String>>,
     /// Set when the console opened a freshly created room: the room is
@@ -355,6 +363,7 @@ impl Session {
     pub fn new() -> Self {
         let settings = creds::load_settings();
         let theme = Theme::from_stored(settings.theme.as_deref());
+        let pins = settings.pins.clone().unwrap_or_default();
         let server = creds::prefill_server(&settings);
         let token = creds::load_token()
             .map(|token| token.expose_secret().to_owned())
@@ -374,6 +383,7 @@ impl Session {
             connect_error: None,
             connecting: false,
             theme,
+            pins,
             section: Section::Chat,
             conversation: "windows-owner".into(),
             composer: String::new(),
@@ -399,6 +409,8 @@ impl Session {
             downloading: false,
             download_rx: None,
             pending: None,
+            bot_detail_pending: None,
+            bot_config_pending: None,
             pending_team: None,
             pending_room_refresh: false,
             reconnect_at: None,
@@ -522,6 +534,8 @@ impl Session {
         }
         self.composer.zeroize();
         self.pending = None;
+        self.bot_detail_pending = None;
+        self.bot_config_pending = None;
         self.scheduled = None;
         self.refreshing = false;
         self.poll_history = false;
@@ -560,19 +574,103 @@ impl Session {
         }
     }
 
-    pub fn set_theme(&mut self, theme: Theme) {
-        self.theme = theme;
+    /// Build the settings snapshot to persist: the current server origin,
+    /// theme and pins. `None` when no origin is known yet.
+    fn ui_settings_snapshot(&self) -> Option<creds::Settings> {
         let origin = self
             .credentials
             .as_ref()
             .map(|credentials| credentials.endpoint.origin().ascii_serialization())
             .unwrap_or_else(|| self.server.clone());
-        if !origin.is_empty() {
-            let _ = creds::save_settings(&creds::Settings {
-                server: origin,
-                theme: Some(theme.as_str().into()),
-            });
+        (!origin.is_empty()).then(|| creds::Settings {
+            server: origin,
+            theme: Some(self.theme.as_str().into()),
+            pins: (!self.pins.is_empty()).then(|| self.pins.clone()),
+        })
+    }
+
+    /// Persist theme and pins next to the server origin, like the credential
+    /// save does. Failures are ignored: pins are a UI convenience.
+    fn save_ui_settings(&self) {
+        if let Some(settings) = self.ui_settings_snapshot() {
+            let _ = creds::save_settings(&settings);
         }
+    }
+
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+        self.save_ui_settings();
+    }
+
+    /// Toggle a pinned bot id or conversation id. The id is validated
+    /// locally (bot slug or conversation id), deduplicated and capped at
+    /// [`creds::MAX_PINS`], then persisted with the current theme and server.
+    pub fn toggle_pin(&mut self, id: String) {
+        if creds::toggle_pin_in_list(&mut self.pins, &id) {
+            self.save_ui_settings();
+        }
+    }
+
+    pub fn is_pinned(&self, id: &str) -> bool {
+        self.pins.iter().any(|pin| pin == id)
+    }
+
+    /// Open a pinned entry: bare bot ids go to their one-to-one chat,
+    /// conversation ids to the chat itself.
+    pub fn open_pin(&mut self, id: String) {
+        if id.contains(':') || id == "windows-owner" || id.chars().all(|c| c.is_ascii_digit()) {
+            self.open_conversation(id);
+        } else {
+            self.open_bot_chat(id);
+        }
+    }
+
+    /// Display label for a pinned id: the bot display name when the id is a
+    /// bot (or a dir: chat of one), else the conversation label.
+    pub fn pin_label(&self, id: &str) -> String {
+        if let Some(bot) = id.strip_prefix("dir:")
+            && self.state.listed_bots.iter().any(|item| item.id == bot)
+        {
+            return self.bot_display_name(bot);
+        }
+        if self.state.listed_bots.iter().any(|item| item.id == id) {
+            return self.bot_display_name(id);
+        }
+        if let Some(conversation) = self
+            .state
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == id)
+        {
+            return self.conversation_label(conversation);
+        }
+        if id == "windows-owner" {
+            return "Owner".into();
+        }
+        humanize_label(id)
+    }
+
+    /// True when the pin refers to a bot (bare slug or dir: chat), so the UI
+    /// renders a bot avatar and opens the one-to-one chat.
+    pub fn pin_is_bot(&self, id: &str) -> bool {
+        if let Some(bot) = id.strip_prefix("dir:") {
+            return self.state.listed_bots.iter().any(|item| item.id == bot);
+        }
+        self.state.listed_bots.iter().any(|item| item.id == id)
+    }
+
+    /// Avatar letter for a pinned id: the bot avatar for bot pins, else the
+    /// first letter of the label.
+    pub fn pin_avatar(&self, id: &str) -> String {
+        if self.pin_is_bot(id) {
+            let bot = id.strip_prefix("dir:").unwrap_or(id);
+            return self.bot_avatar(bot);
+        }
+        self.pin_label(id)
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "·".into())
     }
 
     pub fn refresh(&mut self) {
@@ -689,6 +787,9 @@ impl Session {
         } else {
             self.start_request(Operation::Catalog);
         }
+        // A dir: conversation is a one-to-one bot chat: load that bot's
+        // detail right behind the transcript, like the catalog chain.
+        self.schedule_open_bot_detail();
     }
 
     pub fn open_bot(&mut self, id: String) {
@@ -715,6 +816,103 @@ impl Session {
     pub fn close_bot(&mut self) {
         self.selected_bot = None;
         self.bot_profile = BotProfileDraft::default();
+    }
+
+    /// Schedule a detail load for the bot of the open `dir:` conversation,
+    /// unless the detail is cached or already in flight. Used when a
+    /// conversation opens and on reconnect, next to the catalog refresh.
+    fn schedule_open_bot_detail(&mut self) {
+        let Some(bot) = self
+            .conversation
+            .strip_prefix("dir:")
+            .filter(|bot| valid_speaker(bot))
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        if self.state.bot_details.contains_key(&bot)
+            || self.bot_detail_pending.as_deref() == Some(bot.as_str())
+        {
+            return;
+        }
+        self.schedule(Operation::BotDetail { id: bot }, Duration::ZERO);
+    }
+
+    /// Load `GET /v1/bots/{id}` into the cache. One request per bot id:
+    /// cached details and in-flight loads are never requested again.
+    pub fn load_bot_detail(&mut self, id: String) {
+        if !valid_speaker(&id) || !self.state.connected {
+            return;
+        }
+        if self.state.bot_details.contains_key(&id)
+            || self.bot_detail_pending.as_deref() == Some(id.as_str())
+        {
+            return;
+        }
+        let operation = Operation::BotDetail { id };
+        if self.pending.is_some() || !self.ready() {
+            self.schedule(operation, Duration::ZERO);
+        } else {
+            self.start_request(operation);
+        }
+    }
+
+    /// Save tools, skills or approval requirements of one bot
+    /// (`PUT /v1/admin/bots/{id}/config`). Validated locally first; on
+    /// success the cached detail is updated optimistically and a toast is
+    /// set. A failed write with an unknown outcome is never resent.
+    pub fn save_bot_config(&mut self, id: String, update: BotConfigUpdate) {
+        if !valid_speaker(&id) {
+            self.admin_error = Some("Bot id is not valid.".into());
+            return;
+        }
+        if let Err(error) = validate_bot_config_update(&update) {
+            self.admin_error = Some(error.to_string());
+            return;
+        }
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.admin_error = None;
+        self.admin_notice = None;
+        self.start_request(Operation::UpdateBotConfig { id, update });
+    }
+
+    /// Load the token usage report for the last `days` days (1–365).
+    pub fn load_usage(&mut self, days: u32) {
+        self.load_usage_scoped(days, None, None);
+    }
+
+    /// Load the usage report, optionally scoped to one bot or conversation.
+    pub fn load_usage_scoped(
+        &mut self,
+        days: u32,
+        bot: Option<String>,
+        conversation: Option<String>,
+    ) {
+        if !(1..=MAX_USAGE_DAYS).contains(&days) {
+            self.state.error = Some("Usage window must be 1–365 days.".into());
+            return;
+        }
+        if bot.as_deref().is_some_and(|bot| !valid_speaker(bot)) {
+            self.state.error = Some("The bot filter must be a bot id.".into());
+            return;
+        }
+        if conversation.as_deref().is_some_and(|id| !valid_id(id)) {
+            self.state.error = Some("Conversation id is not valid.".into());
+            return;
+        }
+        let operation = Operation::Usage {
+            days,
+            bot,
+            conversation,
+        };
+        if self.pending.is_some() || !self.ready() {
+            self.schedule(operation, Duration::ZERO);
+        } else {
+            self.start_request(operation);
+        }
     }
 
     pub fn open_bot_chat(&mut self, id: String) {
@@ -1098,6 +1296,15 @@ impl Session {
             return;
         };
         let kind = operation.kind();
+        // Track the bot-scoped payloads so loads dedup and a saved config can
+        // update the cached detail optimistically when it completes.
+        match &operation {
+            Operation::BotDetail { id } => self.bot_detail_pending = Some(id.clone()),
+            Operation::UpdateBotConfig { id, update } => {
+                self.bot_config_pending = Some((id.clone(), update.clone()))
+            }
+            _ => {}
+        }
         let job = Job {
             scope: self.state.scope.clone(),
             credentials: Arc::clone(credentials),
@@ -1123,6 +1330,13 @@ impl Session {
                 continue;
             }
             self.pending = None;
+            self.bot_detail_pending = None;
+            // The in-flight config write (if any) resolves with this completion.
+            let bot_config = if completion.kind == OperationKind::BotConfigWrite {
+                self.bot_config_pending.take()
+            } else {
+                None
+            };
             if completion.kind == OperationKind::Health {
                 self.connecting = false;
             }
@@ -1244,6 +1458,11 @@ impl Session {
                         }
                         continue;
                     }
+                    // Capture the ack before the state consumes the reply.
+                    let bot_config_saved = match &reply {
+                        Reply::BotConfigSaved { restart_required } => Some(*restart_required),
+                        _ => None,
+                    };
                     if !self.state.receive(&completion.scope, reply) {
                         continue;
                     }
@@ -1293,6 +1512,11 @@ impl Session {
                         OperationKind::ListConversations if self.refreshing => {
                             self.refreshing = false;
                             self.ensure_section_data();
+                            // On connect the open dir: conversation's bot
+                            // detail refreshes too, like the catalog chain.
+                            // Scheduled after ensure_section_data because a
+                            // started request clears the scheduled slot.
+                            self.schedule_open_bot_detail();
                         }
                         OperationKind::Submit => {
                             self.poll_history = false;
@@ -1512,6 +1736,35 @@ impl Session {
                             self.scheduled = None;
                             self.reconnect_at = Some(Instant::now() + Duration::from_secs(8));
                         }
+                        // The detail is cached in the state; nothing else to do.
+                        OperationKind::BotDetail => {}
+                        // The usage report is cached in the state.
+                        OperationKind::Usage => {}
+                        OperationKind::BotConfigWrite => {
+                            if let Some((id, update)) = bot_config {
+                                // Optimistic update of the cached detail; the
+                                // read-back below shows the server's own view.
+                                if let Some(detail) = self.state.bot_details.get_mut(&id) {
+                                    if let Some(tools) = update.tools {
+                                        detail.tools = tools;
+                                    }
+                                    if let Some(skills) = update.skills {
+                                        detail.skills = skills;
+                                    }
+                                    if let Some(require_approval) = update.require_approval {
+                                        detail.require_approval = require_approval;
+                                    }
+                                }
+                                self.admin_error = None;
+                                self.toast = Some(if bot_config_saved == Some(true) {
+                                    "Bot config saved. Restart the server to apply the change."
+                                        .into()
+                                } else {
+                                    "Bot config saved.".into()
+                                });
+                                self.schedule(Operation::BotDetail { id }, Duration::ZERO);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1524,13 +1777,12 @@ impl Session {
             return;
         };
         let origin = credentials.endpoint.origin().ascii_serialization();
-        let settings = creds::save_settings(&creds::Settings {
-            server: origin.clone(),
-            theme: Some(self.theme.as_str().into()),
-        });
+        let settings = self
+            .ui_settings_snapshot()
+            .map(|snapshot| creds::save_settings(&snapshot));
         let token = creds::save_token(credentials.token.expose_secret());
         self.server = origin;
-        if settings.is_err() || token.is_err() {
+        if settings.as_ref().is_some_and(|result| result.is_err()) || token.is_err() {
             self.state.error = Some("Connected, but the credential could not be saved.".into());
         }
     }

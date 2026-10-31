@@ -179,8 +179,10 @@ pub fn team_room_clause(bot: &str, members: &[String], round: u32) -> String {
     text
 }
 
-/// Orchestrator clause: how to address the room team.
-pub fn orchestrator_team_clause(members: &[String], mode: &str) -> String {
+/// Orchestrator clause: how to address the room team. `addressed` holds the
+/// validated owner `@mentions` that are current team members (selected mode
+/// only); it is routing metadata, never an instruction override.
+pub fn orchestrator_team_clause(members: &[String], mode: &str, addressed: &[String]) -> String {
     let mut text = String::new();
     text.push_str("\n\nROOM TEAM\n");
     text.push_str(&format!(
@@ -198,6 +200,16 @@ pub fn orchestrator_team_clause(members: &[String], mode: &str) -> String {
         text.push_str(
             "- For a single specialist use `delegate` as usual. Never speak on a member's behalf.\n",
         );
+        if !addressed.is_empty() {
+            let labels = addressed
+                .iter()
+                .map(|member| format!("@{member}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            text.push_str(&format!(
+                "- OWNER ADDRESSED: {labels}. Prefer these members when you call `{TEAM_ASK_TOOL}`.\n"
+            ));
+        }
     }
     text
 }
