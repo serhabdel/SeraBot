@@ -22,6 +22,7 @@ pub mod embeddings;
 pub mod error;
 pub mod fetch;
 pub mod firecrawl;
+pub mod fleet;
 pub mod gateway;
 pub mod llm;
 pub mod maker;

@@ -24,7 +24,9 @@ use crate::admin::{
     AdminStore, BotConfigOverlay, BotProfile, ProviderSecrets, connector_secret_roles,
 };
 use crate::auth::{self, AuthService};
-use crate::config::{Config, OAuthConnectorSettings, ProviderConfig, scaffold_specialist_bot};
+use crate::config::{
+    BotConfig, Config, OAuthConnectorSettings, ProviderConfig, build_specialist_bot,
+};
 use crate::connectors::{ApiKeyProbe, probe_api_key};
 use crate::domain::Task;
 use crate::error::{Result, SeraError};
@@ -37,7 +39,7 @@ use crate::orchestration::{
 };
 use crate::runtime::{ApprovalNotice, Notifier, Runtime};
 use crate::secrets::SharedSecrets;
-use crate::skills::{SkillCatalog, create_skill, discard_created_skill};
+use crate::skills::create_user_skill;
 use crate::store::{Store, StoredConversation, User, UserRole, UserStatus};
 use crate::util::{constant_time_eq, sha256_hex, truncate_chars};
 
@@ -116,11 +118,10 @@ impl ApiState {
         secrets: SharedSecrets,
     ) -> Result<Self> {
         let auth = if config.auth.enabled {
-            Some(Arc::new(AuthService::new(
-                &config,
-                store.clone(),
-                &secrets,
-            )?))
+            let fleet = runtime.fleet();
+            Some(Arc::new(
+                AuthService::new(&config, store.clone(), &secrets)?.with_fleet(fleet),
+            ))
         } else {
             None
         };
@@ -148,7 +149,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/usage", get(usage))
         .route("/v1/messages", post(send_message))
         .route("/v1/bots", get(list_bots).post(create_bot))
-        .route("/v1/bots/{id}", get(bot_detail))
+        .route(
+            "/v1/bots/{id}",
+            get(bot_detail).put(update_bot).delete(delete_bot),
+        )
         .route("/v1/skills", get(list_skills).post(create_skill_pack))
         .route(
             "/v1/conversations",
@@ -531,27 +535,33 @@ fn team_conversation(
     Ok(record)
 }
 
-fn team_member_view(state: &ApiState, bots: &[crate::config::ConfiguredBot], bot: &str) -> Value {
+fn team_member_view(
+    state: &ApiState,
+    user_id: &str,
+    bots: &[crate::config::ConfiguredBot],
+    bot: &str,
+) -> Value {
     let entry = bots.iter().find(|candidate| candidate.id == bot);
     json!({
         "bot": bot,
         "role": entry.map(|entry| entry.role.clone()).unwrap_or_else(|| "unknown".into()),
         "enabled": entry.is_some_and(|entry| entry.enabled),
-        "live": state.runtime.bot_loaded(bot),
+        "live": state.runtime.bot_loaded(user_id, bot),
     })
 }
 
 fn team_view(
     state: &ApiState,
+    user_id: &str,
     conversation_id: &str,
     members: &[String],
     mode: &str,
     rules: &str,
 ) -> Result<Value> {
-    let bots = crate::config::list_configured_bots(&state.config)?;
+    let bots = state.runtime.fleet().configured(user_id)?;
     let members = members
         .iter()
-        .map(|bot| team_member_view(state, &bots, bot))
+        .map(|bot| team_member_view(state, user_id, &bots, bot))
         .collect::<Vec<_>>();
     Ok(json!({
         "conversation_id": conversation_id,
@@ -578,7 +588,7 @@ async fn conversation_team(
                 String::new(),
             ),
         };
-        let body = team_view(&state, &id, &members, &mode, &rules)?;
+        let body = team_view(&state, &user.id, &id, &members, &mode, &rules)?;
         state.runtime.scan_owner_output(&body.to_string())?;
         Ok(body)
     })();
@@ -629,7 +639,7 @@ async fn set_conversation_team(
         // Rules reach every later model request in the room, so they are
         // scanned before they are stored, not only on the way out.
         state.runtime.scan_owner_output(&request.rules)?;
-        let bots = crate::config::list_configured_bots(&state.config)?;
+        let bots = state.runtime.fleet().configured(&user.id)?;
         for member in &request.members {
             let entry = bots.iter().find(|candidate| candidate.id == *member);
             let Some(entry) = entry else {
@@ -643,7 +653,7 @@ async fn set_conversation_team(
             if !entry.enabled {
                 return Err(SeraError::Validation(format!("bot {member} is disabled")));
             }
-            if !state.runtime.bot_loaded(member) {
+            if !state.runtime.bot_loaded(&user.id, member) {
                 return Err(SeraError::Validation(format!("bot {member} is not loaded")));
             }
         }
@@ -673,7 +683,14 @@ async fn set_conversation_team(
         state
             .store
             .append_event(&user.id, crate::teams::AUDIT_MEMBER_SET, &details)?;
-        let body = team_view(&state, &id, &request.members, mode.as_str(), &request.rules)?;
+        let body = team_view(
+            &state,
+            &user.id,
+            &id,
+            &request.members,
+            mode.as_str(),
+            &request.rules,
+        )?;
         state.runtime.scan_owner_output(&body.to_string())?;
         Ok(body)
     })();
@@ -1027,23 +1044,54 @@ struct CreateBotRequest {
     skills: Option<Vec<String>>,
 }
 
+/// Legacy path labels returned to the desktop client, which validates their
+/// shape. The database row is authoritative; these are not files.
+fn bot_file_label(id: &str) -> String {
+    format!("db/bots/{id}.toml")
+}
+
+fn prompt_file_label(id: &str) -> String {
+    format!("db/prompts/{id}.txt")
+}
+
+/// `POST /v1/bots` — scaffold a disabled specialist as a row owned by the
+/// session user. The fixed template is shared; the description, tools, and
+/// skills are validated and policy-scanned before the insert.
 async fn create_bot(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
     Json(request): Json<CreateBotRequest>,
 ) -> Result<Json<Value>> {
-    if state.runtime.bot_loaded(&request.id) {
-        return Err(SeraError::InvalidState("bot already exists".into()));
-    }
     state.runtime.scan_owner_output(&request.description)?;
-    let scaffolded = scaffold_specialist_bot(
-        &state.config,
+    let fleet = state.runtime.fleet();
+    let known = fleet
+        .catalog()
+        .effective(&state.store, &user.id)?
+        .skill_ids();
+    let scaffolded = build_specialist_bot(
         &request.id,
         &request.description,
         request.tools.as_deref(),
         request.skills.as_deref(),
+        &known,
         state.runtime.policy(),
     )?;
+    if state
+        .runtime
+        .fleet()
+        .row(&user.id, &scaffolded.id)?
+        .is_some()
+    {
+        return Err(SeraError::InvalidState("bot already exists".into()));
+    }
+    let config = serde_json::to_value(&scaffolded.config)?;
+    if !state
+        .store
+        .insert_bot(&user.id, &scaffolded.id, &config, &scaffolded.prompt, false)?
+    {
+        return Err(SeraError::InvalidState("bot already exists".into()));
+    }
+    state.runtime.fleet().invalidate(&user.id);
     if let Err(error) = state.store.record_audit(
         &user.id,
         "bot.scaffolded",
@@ -1054,16 +1102,15 @@ async fn create_bot(
         Some(state.runtime.policy_version()),
         Some(&json!({
             "id": scaffolded.id,
-            "bot_file": scaffolded.bot_file,
-            "prompt_file": scaffolded.prompt_file,
             "enabled": false,
             "role": "specialist",
             "tools": scaffolded.tools,
             "skills": scaffolded.skills,
+            "scope": "user",
         })),
     ) {
-        let _ = std::fs::remove_file(&scaffolded.bot_path);
-        let _ = std::fs::remove_file(&scaffolded.prompt_path);
+        let _ = state.store.delete_bot(&user.id, &scaffolded.id);
+        state.runtime.fleet().invalidate(&user.id);
         return Err(error);
     }
     Ok(Json(json!({
@@ -1075,33 +1122,50 @@ async fn create_bot(
             "tools": scaffolded.tools,
             "skills": scaffolded.skills,
             "require_approval": scaffolded.require_approval,
-            "bot_file": scaffolded.bot_file,
-            "prompt_file": scaffolded.prompt_file,
+            "bot_file": bot_file_label(&scaffolded.id),
+            "prompt_file": prompt_file_label(&scaffolded.id),
         }
     })))
 }
 
-async fn list_bots(State(state): State<Arc<ApiState>>) -> Result<Json<Value>> {
-    let configured = crate::config::list_configured_bots(&state.config)?;
+async fn list_bots(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let configured = state.runtime.fleet().configured(&user.id)?;
     let bots = configured
         .into_iter()
         .map(|bot| {
-            let profile = state
-                .admin
-                .as_ref()
-                .and_then(|admin| admin.bot_profile(&bot.id));
+            let id = bot.id.clone();
+            let profile = if user.is_admin() {
+                state
+                    .admin
+                    .as_ref()
+                    .and_then(|admin| admin.bot_profile(&id))
+            } else {
+                None
+            };
+            let (tools, skills, require_approval) = if user.is_admin() {
+                bot_lists_with_override(&state, &bot)
+            } else {
+                (
+                    bot.tools.clone(),
+                    bot.skills.clone(),
+                    bot.require_approval.clone(),
+                )
+            };
             json!({
-                "id": bot.id,
+                "id": id,
                 "role": bot.role,
                 "enabled": bot.enabled,
-                "live": state.runtime.bot_loaded(&bot.id),
+                "live": state.runtime.bot_loaded(&user.id, &bot.id),
                 "model": bot.model,
                 "display_name": profile.as_ref().map(|p| p.display_name.clone()).filter(|name| !name.is_empty()),
                 "description": profile.as_ref().map(|p| p.description.clone()).filter(|text| !text.is_empty()),
                 "avatar": profile.as_ref().map(|p| p.avatar.clone()).filter(|avatar| !avatar.is_empty()),
-                "tools": bot.tools,
-                "skills": bot.skills,
-                "require_approval": bot.require_approval,
+                "tools": tools,
+                "skills": skills,
+                "require_approval": require_approval,
             })
         })
         .collect::<Vec<_>>();
@@ -1110,8 +1174,9 @@ async fn list_bots(State(state): State<Arc<ApiState>>) -> Result<Json<Value>> {
     Ok(Json(body))
 }
 
-/// Bot config lists with the admin-console overlay merged over the bot file, so
-/// the console sees values it just saved even before the restart.
+/// Bot config lists with the admin-console overlay merged over the admin's
+/// row, so the console sees values it just saved even before the restart.
+/// Only called for the admin; members never see the overlay.
 fn bot_lists_with_override(
     state: &ApiState,
     entry: &crate::config::ConfiguredBot,
@@ -1137,9 +1202,20 @@ fn bot_lists_with_override(
 
 /// Cap for the `instructions` field of `GET /v1/bots/{id}`.
 const MAX_INSTRUCTIONS_BYTES: usize = 32 * 1024;
+/// Spec cap for a bot system prompt.
+const MAX_BOT_PROMPT_BYTES: usize = 100_000;
+
+fn parse_bot_config(row: &crate::store::StoredBot) -> Result<BotConfig> {
+    let mut config: BotConfig = serde_json::from_value(row.config.clone())
+        .map_err(|_| SeraError::InvalidState(format!("bot '{}' config is invalid", row.name)))?;
+    config.name = row.name.clone();
+    config.enabled = row.enabled;
+    Ok(config)
+}
 
 /// `GET /v1/bots/{id}` — one bot's full owner-facing detail. No secrets and no
-/// secret values; the response passes the egress scan.
+/// secret values; the response passes the egress scan. Another user's bot is a
+/// 404.
 async fn bot_detail(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
@@ -1148,20 +1224,41 @@ async fn bot_detail(
     if !safe_bot_label(&id) {
         return Err(SeraError::NotFound(format!("bot {id}")));
     }
-    let configured = crate::config::list_configured_bots(&state.config)?;
+    let row = state
+        .runtime
+        .fleet()
+        .row(&user.id, &id)?
+        .ok_or_else(|| SeraError::NotFound(format!("bot {id}")))?;
+    let configured = state.runtime.fleet().configured(&user.id)?;
     let Some(entry) = configured.iter().find(|bot| bot.id == id) else {
         return Err(SeraError::NotFound(format!("bot {id}")));
     };
-    let profile = state
-        .admin
+    let profile = if user.is_admin() {
+        state
+            .admin
+            .as_ref()
+            .and_then(|admin| admin.bot_profile(&id))
+    } else {
+        None
+    };
+    // The desktop detail record expects strings, so an absent profile falls
+    // back to the bot id and empty text instead of null.
+    let display_name = profile
         .as_ref()
-        .and_then(|admin| admin.bot_profile(&id));
-    let loaded = state.runtime.bot(&id).cloned();
-    let prompt = loaded.as_ref().map(|bot| bot.prompt.clone()).or_else(|| {
-        crate::config::load_bot_prompt(&state.config, &id)
-            .ok()
-            .flatten()
-    });
+        .map(|p| p.display_name.clone())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| id.clone());
+    let description = profile
+        .as_ref()
+        .map(|p| p.description.clone())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_default();
+    let avatar = profile
+        .as_ref()
+        .map(|p| p.avatar.clone())
+        .filter(|avatar| !avatar.is_empty())
+        .unwrap_or_default();
+    let loaded = state.runtime.bot(&user.id, &id);
     let model_hint = loaded
         .as_ref()
         .and_then(|bot| bot.config.model.clone())
@@ -1175,21 +1272,30 @@ async fn bot_detail(
         .unwrap_or_else(|| "default".into());
     let fallback = state.runtime.router().fallback_for_model(&model);
     let routing_classes = state.runtime.router().classes_for_model(&model);
-    let (tools, skills, require_approval) = bot_lists_with_override(&state, entry);
-    let (instructions, instructions_bytes) = match prompt {
-        Some(text) if text.len() <= MAX_INSTRUCTIONS_BYTES => (Some(text.clone()), text.len()),
+    let (tools, skills, require_approval) = if user.is_admin() {
+        bot_lists_with_override(&state, entry)
+    } else {
+        (
+            entry.tools.clone(),
+            entry.skills.clone(),
+            entry.require_approval.clone(),
+        )
+    };
+    let prompt = row.prompt;
+    let (instructions, instructions_bytes) = if prompt.len() <= MAX_INSTRUCTIONS_BYTES {
+        (Some(prompt.clone()), prompt.len())
+    } else {
         // Over the cap the content is withheld entirely; the byte count is kept.
-        Some(text) => (None, text.len()),
-        None => (None, 0),
+        (None, prompt.len())
     };
     let memory_count = state.store.count_memories(&user.id)?;
     let artifact_count = state.store.count_bot_artifacts(&user.id, &id)?;
     let body = json!({
         "id": entry.id,
-        "display_name": profile.as_ref().map(|p| p.display_name.clone()).filter(|name| !name.is_empty()),
+        "display_name": display_name,
         "role": entry.role,
-        "description": profile.as_ref().map(|p| p.description.clone()).filter(|text| !text.is_empty()),
-        "avatar": profile.as_ref().map(|p| p.avatar.clone()).filter(|avatar| !avatar.is_empty()),
+        "description": description,
+        "avatar": avatar,
         "enabled": entry.enabled,
         "provider": provider,
         "model": model,
@@ -1210,6 +1316,198 @@ async fn bot_detail(
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct UpdateBotRequest {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    tools: Option<Vec<String>>,
+    #[serde(default)]
+    skills: Option<Vec<String>>,
+    #[serde(default)]
+    require_approval: Option<Vec<String>>,
+}
+
+/// `PUT /v1/bots/{id}` — update the session user's bot row. Enable/disable and
+/// prompt edits are ordinary scoped DB writes; the fleet cache is invalidated
+/// so the next turn sees them. A change that would leave the fleet invalid
+/// (for example disabling `main` or a delegate) is rejected before the write.
+async fn update_bot(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateBotRequest>,
+) -> Result<Json<Value>> {
+    if !safe_bot_label(&id) {
+        return Err(SeraError::NotFound(format!("bot {id}")));
+    }
+    if request.enabled.is_none()
+        && request.prompt.is_none()
+        && request.tools.is_none()
+        && request.skills.is_none()
+        && request.require_approval.is_none()
+    {
+        return Err(SeraError::Validation(
+            "at least one of enabled, prompt, tools, skills, require_approval is required".into(),
+        ));
+    }
+    // Untrusted input is scanned before it is validated or stored.
+    for list in [&request.tools, &request.skills, &request.require_approval]
+        .into_iter()
+        .flatten()
+    {
+        for item in list {
+            state.runtime.scan_owner_output(item)?;
+        }
+    }
+    let row = state
+        .runtime
+        .fleet()
+        .row(&user.id, &id)?
+        .ok_or_else(|| SeraError::NotFound(format!("bot {id}")))?;
+    let mut config = parse_bot_config(&row)?;
+
+    let prompt_changed = request.prompt.is_some();
+    let prompt = match request.prompt {
+        Some(prompt) => {
+            if prompt.trim().is_empty() {
+                return Err(SeraError::Validation("bot prompt must not be empty".into()));
+            }
+            if prompt.len() > MAX_BOT_PROMPT_BYTES {
+                return Err(SeraError::Validation(format!(
+                    "bot prompt exceeds {MAX_BOT_PROMPT_BYTES} bytes"
+                )));
+            }
+            if prompt
+                .chars()
+                .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+            {
+                return Err(SeraError::Validation(
+                    "bot prompt contains unsupported control characters".into(),
+                ));
+            }
+            state.runtime.scan_owner_output(&prompt)?;
+            prompt
+        }
+        None => row.prompt.clone(),
+    };
+    let tools = match &request.tools {
+        Some(tools) => validate_bot_tool_list(&state, tools, config.role)?,
+        None => config.tools.clone(),
+    };
+    let skills = match &request.skills {
+        Some(skills) => validate_bot_skill_list(&state, &user.id, skills)?,
+        None => config.skills.clone(),
+    };
+    let require_approval = match &request.require_approval {
+        Some(list) => validate_require_approval_list(list, &tools)?,
+        None => validate_require_approval_list(&config.require_approval, &tools)?,
+    };
+    let enabled = request.enabled.unwrap_or(row.enabled);
+    if !enabled && config.role == BotRole::Orchestrator {
+        return Err(SeraError::Validation(
+            "the orchestrator cannot be disabled".into(),
+        ));
+    }
+
+    // Validate the fleet the write would produce, not just the row.
+    let mut candidate = state.runtime.fleet().candidates(&user.id)?;
+    let Some(bot) = candidate.iter_mut().find(|bot| bot.config.name == id) else {
+        return Err(SeraError::NotFound(format!("bot {id}")));
+    };
+    bot.config.enabled = enabled;
+    bot.config.tools = tools.clone();
+    bot.config.skills = skills.clone();
+    bot.config.require_approval = require_approval.clone();
+    bot.prompt = prompt.clone();
+    crate::fleet::FleetRegistry::validate_fleet(&candidate)?;
+
+    config.enabled = enabled;
+    config.tools = tools.clone();
+    config.skills = skills.clone();
+    config.require_approval = require_approval.clone();
+    let role = config.role.as_str().to_owned();
+    let config = serde_json::to_value(&config)?;
+    if !state
+        .store
+        .update_bot(&user.id, &id, &config, &prompt, enabled)?
+    {
+        return Err(SeraError::NotFound(format!("bot {id}")));
+    }
+    state.runtime.fleet().invalidate(&user.id);
+    state.store.record_audit(
+        &user.id,
+        "bot.updated",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({
+            "id": id,
+            "enabled": enabled,
+            "role": role,
+            "prompt_changed": prompt_changed,
+            "tools_changed": request.tools.is_some(),
+            "skills_changed": request.skills.is_some(),
+            "require_approval_changed": request.require_approval.is_some(),
+        })),
+    )?;
+    Ok(Json(json!({
+        "bot": {
+            "id": id,
+            "enabled": enabled,
+            "role": role,
+            "live": state.runtime.bot_loaded(&user.id, &id),
+            "tools": tools,
+            "skills": skills,
+            "require_approval": require_approval,
+        }
+    })))
+}
+
+/// `DELETE /v1/bots/{id}` — remove one specialist owned by the session user.
+/// The orchestrator cannot be deleted, and a delete that would leave a
+/// delegate dangling is rejected before the write.
+async fn delete_bot(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    if !safe_bot_label(&id) {
+        return Err(SeraError::NotFound(format!("bot {id}")));
+    }
+    let Some(row) = state.runtime.fleet().row(&user.id, &id)? else {
+        return Err(SeraError::NotFound(format!("bot {id}")));
+    };
+    if row.name == crate::orchestration::ORCHESTRATOR_BOT {
+        return Err(SeraError::Validation(
+            "the orchestrator cannot be deleted".into(),
+        ));
+    }
+    let mut candidate = state.runtime.fleet().candidates(&user.id)?;
+    candidate.retain(|bot| bot.config.name != id);
+    crate::fleet::FleetRegistry::validate_fleet(&candidate)?;
+    if !state.store.delete_bot(&user.id, &id)? {
+        return Err(SeraError::NotFound(format!("bot {id}")));
+    }
+    state.runtime.fleet().invalidate(&user.id);
+    state.store.record_audit(
+        &user.id,
+        "bot.deleted",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({"id": id, "scope": "user"})),
+    )?;
+    Ok(Json(json!({"deleted": true, "id": id})))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateSkillRequest {
     id: String,
     #[serde(default)]
@@ -1218,10 +1516,18 @@ struct CreateSkillRequest {
     body: Option<String>,
 }
 
-async fn list_skills(State(state): State<Arc<ApiState>>) -> Result<Json<Value>> {
-    let catalog = SkillCatalog::load(&state.config)?;
-    let skills = catalog.summaries();
-    Ok(Json(json!({ "skills": skills })))
+async fn list_skills(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let fleet = state.runtime.fleet();
+    let skills = fleet
+        .catalog()
+        .effective(&state.store, &user.id)?
+        .summaries();
+    let body = json!({ "skills": skills });
+    state.runtime.scan_owner_output(&body.to_string())?;
+    Ok(Json(body))
 }
 
 async fn create_skill_pack(
@@ -1234,12 +1540,15 @@ async fn create_skill_pack(
     if let Some(body) = &request.body {
         state.runtime.scan_owner_output(body)?;
     }
-    let created = create_skill(
-        &state.config,
+    let fleet = state.runtime.fleet();
+    let created = create_user_skill(
+        &state.store,
+        &user.id,
         &request.id,
         &request.description,
         request.body.as_deref(),
         state.runtime.policy(),
+        fleet.catalog(),
     )?;
     if let Err(error) = state.store.record_audit(
         &user.id,
@@ -1251,11 +1560,11 @@ async fn create_skill_pack(
         Some(state.runtime.policy_version()),
         Some(&json!({
             "id": created.id,
-            "file": created.file,
-            "live": false,
+            "name": created.name,
+            "scope": "user",
         })),
     ) {
-        let _ = discard_created_skill(&state.config, &created);
+        let _ = state.store.delete_user_skill(&user.id, &created.id);
         return Err(error);
     }
     Ok(Json(json!({
@@ -1263,7 +1572,7 @@ async fn create_skill_pack(
             "id": created.id,
             "name": created.name,
             "description": created.description,
-            "file": created.file,
+            "file": format!("user_skills/{}/SKILL.md", created.id),
             "live": false,
         }
     })))
@@ -2494,8 +2803,12 @@ async fn admin_set_bot_profile(
 ) -> AdminResult<Json<Value>> {
     require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
-    if !state.runtime.bot_loaded(&id) {
-        let configured = crate::config::list_configured_bots(&state.config).map_err(admin_error)?;
+    if !state.runtime.bot_loaded(&user.id, &id) {
+        let configured = state
+            .runtime
+            .fleet()
+            .configured(&user.id)
+            .map_err(admin_error)?;
         if !configured.iter().any(|bot| bot.id == id) {
             return Err(admin_error(SeraError::NotFound(format!("bot {id}"))));
         }
@@ -2576,15 +2889,19 @@ fn validate_bot_tool_list(
 }
 
 /// Skill list rules matching the desktop `parse_skill_list` semantics plus the
-/// server's catalog check: at most 16 unique, valid skill ids that exist.
-fn validate_bot_skill_list(state: &ApiState, skills: &[String]) -> Result<Vec<String>> {
+/// acting user's effective catalog check: at most 16 unique, valid skill ids
+/// that exist in the shipped catalog or the user's own rows.
+fn validate_bot_skill_list(
+    state: &ApiState,
+    user_id: &str,
+    skills: &[String],
+) -> Result<Vec<String>> {
     if skills.len() > MAX_BOT_CONFIG_SKILLS {
         return Err(SeraError::Validation(format!(
             "at most {MAX_BOT_CONFIG_SKILLS} skills are allowed"
         )));
     }
-    let catalog = SkillCatalog::load(&state.config)?;
-    let known = catalog.skill_ids();
+    let known = state.runtime.fleet().effective_skill_ids(user_id)?;
     let mut seen = HashSet::with_capacity(skills.len());
     let mut out = Vec::with_capacity(skills.len());
     for skill in skills {
@@ -2642,7 +2959,11 @@ async fn admin_update_bot_config(
 ) -> AdminResult<Json<Value>> {
     require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
-    let configured = crate::config::list_configured_bots(&state.config).map_err(admin_error)?;
+    let configured = state
+        .runtime
+        .fleet()
+        .configured(&user.id)
+        .map_err(admin_error)?;
     let Some(entry) = configured.iter().find(|bot| bot.id == id) else {
         return Err(admin_error(SeraError::NotFound(format!("bot {id}"))));
     };
@@ -2660,20 +2981,24 @@ async fn admin_update_bot_config(
             state.runtime.scan_owner_output(item).map_err(admin_error)?;
         }
     }
-    let role = state.runtime.bot(&id).map(|bot| bot.config.role).unwrap_or(
-        if entry.role == BotRole::Orchestrator.as_str() {
+    let role = state
+        .runtime
+        .bot(&user.id, &id)
+        .map(|bot| bot.config.role)
+        .unwrap_or(if entry.role == BotRole::Orchestrator.as_str() {
             BotRole::Orchestrator
         } else {
             BotRole::Specialist
-        },
-    );
+        });
     let (current_tools, _, _) = bot_lists_with_override(&state, entry);
     let tools = match &request.tools {
         Some(tools) => Some(validate_bot_tool_list(&state, tools, role).map_err(admin_error)?),
         None => None,
     };
     let skills = match &request.skills {
-        Some(skills) => Some(validate_bot_skill_list(&state, skills).map_err(admin_error)?),
+        Some(skills) => {
+            Some(validate_bot_skill_list(&state, &user.id, skills).map_err(admin_error)?)
+        }
         None => None,
     };
     let effective_tools = tools.clone().unwrap_or_else(|| current_tools.clone());
@@ -3345,7 +3670,7 @@ mod tests {
             config.auth.base_url = "https://bot.example.example".into();
             config.auth.max_users = 10;
         }
-        config.base_dir = base_dir;
+        config.base_dir = base_dir.canonicalize().unwrap_or_else(|_| base_dir.clone());
         let directory = std::env::temp_dir().join(format!("serabot-api-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
         let database = directory.join("serabot.db");
@@ -3393,9 +3718,12 @@ mod tests {
             );
         }
         let secrets = SharedSecrets::new(crate::secrets::SecretStore::from_map(secrets));
+        let fleet = runtime.fleet();
         let auth = match auth_issuer {
             Some(issuer) => {
-                let mut service = AuthService::new(&config, store.clone(), &secrets).unwrap();
+                let mut service = AuthService::new(&config, store.clone(), &secrets)
+                    .unwrap()
+                    .with_fleet(fleet);
                 service.set_issuer_url(issuer).unwrap();
                 Some(service)
             }
@@ -4043,31 +4371,27 @@ mod tests {
     #[tokio::test]
     async fn lists_configured_bots_without_prompts_or_secrets() {
         let root = temp_base();
-        let (app, _, _) = app_with_root(true, Policy::empty(), root.clone());
+        let secret = "super-secret-prompt-body-should-not-leak";
+        let mut notes = test_bot("notes", crate::orchestration::BotRole::Specialist);
+        notes.config.skills = vec!["ask".into()];
+        notes.config.tools = vec!["skill_list".into()];
+        notes.config.enabled = false;
+        notes.prompt = secret.to_string();
+        let (app, _, _) = app_with_fleet(
+            true,
+            Policy::empty(),
+            root.clone(),
+            vec![
+                test_bot("main", crate::orchestration::BotRole::Orchestrator),
+                notes,
+            ],
+        );
         let denied = app
             .clone()
             .oneshot(request(&app, "GET", "/v1/bots", false, None))
             .await
             .unwrap();
         assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
-
-        let empty = app
-            .clone()
-            .oneshot(request(&app, "GET", "/v1/bots", true, None))
-            .await
-            .unwrap();
-        assert_eq!(empty.status(), StatusCode::OK);
-        assert_eq!(read_json(empty).await["bots"].as_array().unwrap().len(), 0);
-
-        let secret = "super-secret-prompt-body-should-not-leak";
-        std::fs::create_dir_all(root.join("prompts")).unwrap();
-        std::fs::write(root.join("prompts").join("notes.txt"), secret).unwrap();
-        std::fs::create_dir_all(root.join("bots")).unwrap();
-        std::fs::write(
-            root.join("bots").join("notes.toml"),
-            "name = \"notes\"\nrole = \"specialist\"\ntrigger = \"command\"\nsystem_prompt = \"prompts/notes.txt\"\nskills = [\"ask\"]\ntools = [\"skill_list\"]\nenabled = false\n",
-        )
-        .unwrap();
 
         let listed = app
             .clone()
@@ -4077,13 +4401,13 @@ mod tests {
         assert_eq!(listed.status(), StatusCode::OK);
         let listed = read_json(listed).await;
         let bots = listed["bots"].as_array().unwrap();
-        assert_eq!(bots.len(), 1);
-        assert_eq!(bots[0]["id"], "notes");
-        assert_eq!(bots[0]["role"], "specialist");
-        assert_eq!(bots[0]["enabled"], false);
-        assert_eq!(bots[0]["live"], false);
-        assert_eq!(bots[0]["tools"][0], "skill_list");
-        assert_eq!(bots[0]["skills"][0], "ask");
+        assert_eq!(bots.len(), 2);
+        let notes = bots.iter().find(|bot| bot["id"] == "notes").unwrap();
+        assert_eq!(notes["role"], "specialist");
+        assert_eq!(notes["enabled"], false);
+        assert_eq!(notes["live"], true);
+        assert_eq!(notes["tools"][0], "skill_list");
+        assert_eq!(notes["skills"][0], "ask");
         let text = listed.to_string();
         assert!(!text.contains(secret));
         assert!(!text.contains("system_prompt"));
@@ -4267,14 +4591,17 @@ mod tests {
         assert_eq!(value["bot"]["enabled"], false);
         assert_eq!(value["bot"]["role"], "specialist");
         assert_eq!(value["bot"]["live"], false);
-        assert_eq!(value["bot"]["bot_file"], "bots/notes.toml");
-        assert_eq!(value["bot"]["prompt_file"], "prompts/notes.txt");
+        assert_eq!(value["bot"]["bot_file"], "db/bots/notes.toml");
+        assert_eq!(value["bot"]["prompt_file"], "db/prompts/notes.txt");
         assert!(!value.to_string().contains("delegate"));
-        let toml = std::fs::read_to_string(root.join("bots").join("notes.toml")).unwrap();
-        assert!(toml.contains("enabled = false"));
-        assert!(toml.contains("role = \"specialist\""));
-        assert!(!toml.contains("delegates = [\""));
-        assert!(root.join("prompts").join("notes.txt").is_file());
+        let row = store
+            .get_bot(&admin(&store), "notes")
+            .unwrap()
+            .expect("notes row");
+        assert!(!row.enabled);
+        assert!(row.prompt.contains("do not delegate"));
+        assert!(row.prompt.contains("Synthetic notes specialist."));
+        assert_eq!(row.config["role"], "specialist");
         assert!(
             store
                 .list_audit(10)
@@ -4309,6 +4636,7 @@ mod tests {
             .unwrap();
         assert_eq!(escaped.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(!root.join("outside.toml").exists());
+        assert!(store.get_bot(&admin(&store), "outside").unwrap().is_none());
 
         let delegate = app
             .clone()
@@ -4323,13 +4651,14 @@ mod tests {
             .unwrap();
         assert_eq!(delegate.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(!root.join("bots").join("other.toml").exists());
+        assert!(store.get_bot(&admin(&store), "other").unwrap().is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
     async fn bot_scaffold_rejects_policy_violations() {
         let root = temp_base();
-        let (app, _, _) = app_with_root(
+        let (app, _, store) = app_with_root(
             true,
             Policy::from_text("synthetic blocked phrase"),
             root.clone(),
@@ -4350,6 +4679,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(!root.join("bots").join("notes.toml").exists());
+        assert!(store.get_bot(&admin(&store), "notes").unwrap().is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4389,12 +4719,16 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let value = read_json(response).await;
         assert_eq!(value["skill"]["id"], "notes-pack");
-        assert_eq!(value["skill"]["file"], "skills/notes-pack/SKILL.md");
+        assert_eq!(value["skill"]["file"], "user_skills/notes-pack/SKILL.md");
         assert_eq!(value["skill"]["live"], false);
         assert!(!value.to_string().contains(marker));
-        let raw = std::fs::read_to_string(root.join("skills").join("notes-pack").join("SKILL.md"))
-            .unwrap();
-        assert!(raw.contains(marker));
+        let row = store
+            .get_user_skill(&admin(&store), "notes-pack")
+            .unwrap()
+            .expect("user skill row");
+        assert!(row.body.contains(marker));
+        assert_eq!(row.description, "Public summary");
+        assert!(!root.join("skills").join("notes-pack").exists());
         assert!(
             store
                 .list_audit(10)
@@ -4455,7 +4789,7 @@ mod tests {
     #[tokio::test]
     async fn skill_registration_rejects_policy_violations() {
         let root = temp_base();
-        let (app, _, _) = app_with_root(
+        let (app, _, store) = app_with_root(
             true,
             Policy::from_text("synthetic blocked phrase"),
             root.clone(),
@@ -4477,6 +4811,12 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(!root.join("skills").join("notes-pack").exists());
+        assert!(
+            store
+                .get_user_skill(&admin(&store), "notes-pack")
+                .unwrap()
+                .is_none()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5262,19 +5602,6 @@ mod tests {
         assert_eq!(body["conversation"]["id"], "sec:finance");
     }
 
-    fn write_bot(root: &std::path::Path, id: &str, prompt: &str, extra: &str) {
-        std::fs::create_dir_all(root.join("prompts")).unwrap();
-        std::fs::write(root.join("prompts").join(format!("{id}.txt")), prompt).unwrap();
-        std::fs::create_dir_all(root.join("bots")).unwrap();
-        std::fs::write(
-            root.join("bots").join(format!("{id}.toml")),
-            format!(
-                "name = \"{id}\"\ntrigger = \"command\"\nsystem_prompt = \"prompts/{id}.txt\"\n{extra}"
-            ),
-        )
-        .unwrap();
-    }
-
     #[tokio::test]
     async fn usage_endpoint_rolls_up_model_used_rows_clamps_days_and_filters() {
         let (app, _, store) = app();
@@ -5433,14 +5760,24 @@ mod tests {
     #[tokio::test]
     async fn bot_detail_returns_owner_fields_and_caps_instructions() {
         let root = temp_base();
-        write_bot(
-            &root,
-            "notes",
-            "Synthetic notes prompt.",
-            "role = \"specialist\"\nskills = [\"ask\"]\ntools = [\"skill_list\"]\nenabled = true\n",
+        let mut notes = test_bot("notes", crate::orchestration::BotRole::Specialist);
+        notes.config.skills = vec!["ask".into()];
+        notes.config.tools = vec!["skill_list".into()];
+        notes.config.enabled = true;
+        notes.prompt = "Synthetic notes prompt.".into();
+        let mut big = test_bot("big", crate::orchestration::BotRole::Specialist);
+        big.config.enabled = true;
+        big.prompt = "x".repeat(40_000);
+        let (app, _, store) = app_with_fleet(
+            true,
+            Policy::empty(),
+            root.clone(),
+            vec![
+                test_bot("main", crate::orchestration::BotRole::Orchestrator),
+                notes,
+                big,
+            ],
         );
-        write_bot(&root, "big", &"x".repeat(40_000), "enabled = true\n");
-        let (app, _, store) = app_with_root(true, Policy::empty(), root.clone());
 
         let denied = app
             .clone()
@@ -5508,13 +5845,19 @@ mod tests {
     #[tokio::test]
     async fn admin_bot_config_update_validates_persists_and_requires_restart() {
         let root = temp_base();
-        write_bot(
-            &root,
-            "notes",
-            "Synthetic notes prompt.",
-            "role = \"specialist\"\nskills = []\ntools = [\"skill_list\"]\nenabled = true\n",
+        let mut notes = test_bot("notes", crate::orchestration::BotRole::Specialist);
+        notes.config.tools = vec!["skill_list".into()];
+        notes.config.enabled = true;
+        notes.prompt = "Synthetic notes prompt.".into();
+        let (app, config, store) = app_with_fleet(
+            true,
+            Policy::empty(),
+            root.clone(),
+            vec![
+                test_bot("main", crate::orchestration::BotRole::Orchestrator),
+                notes,
+            ],
         );
-        let (app, config, store) = app_with_root(true, Policy::empty(), root.clone());
 
         let denied = app
             .clone()
@@ -6378,6 +6721,11 @@ mod tests {
             .unwrap();
         let resolved = store.session_user(&sha256_hex(&token)).unwrap().unwrap();
         assert_eq!(resolved.id, account.id);
+        // The post-login hook seeded the default fleet in the same request.
+        let bots = store.list_bots(&account.id).unwrap();
+        assert_eq!(bots.len(), 1);
+        assert_eq!(bots[0].name, "main");
+        assert!(!bots[0].prompt.is_empty());
 
         // An unknown state renders the error page, not a stack trace.
         let response = app
@@ -6660,5 +7008,215 @@ mod tests {
             location.starts_with(&format!("{}/authorize", idp.issuer)),
             "{location}"
         );
+    }
+
+    // ---- Per-user fleets and skills (phase 3) ----
+
+    /// A member's fleet seeds from the templates independently of the admin's,
+    /// and no bot or skill of one user is readable, updatable, or deletable
+    /// from the other's session.
+    #[tokio::test]
+    async fn member_bots_and_skills_are_isolated_and_validate_per_user() {
+        let (app, _, store) = app_with_team();
+        let admin_id = admin(&store);
+        let (member, member_token) = member_with_session(&store);
+
+        // The admin creates a bot and a skill.
+        let created = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/bots",
+                true,
+                Some(json!({"id": "admin-notes", "description": "Admin notes."})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let created = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/skills",
+                true,
+                Some(json!({"id": "admin-skill", "description": "Admin only"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+
+        // The member's first list seeds the default fleet from the templates.
+        let listed = read_json(
+            app.clone()
+                .oneshot(request_with_token("GET", "/v1/bots", &member_token, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let ids = listed["bots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|bot| bot["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["analyst", "main", "maker", "watcher"]);
+        assert_eq!(store.count_bots(&member.id).unwrap(), 4);
+        assert_eq!(store.count_bots(&admin_id).unwrap(), 5);
+
+        // The member's own detail works without an admin profile; the
+        // display name falls back to the bot id.
+        let own = read_json(
+            app.clone()
+                .oneshot(request_with_token(
+                    "GET",
+                    "/v1/bots/main",
+                    &member_token,
+                    None,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(own["id"], "main");
+        assert_eq!(own["display_name"], "main");
+        assert_eq!(own["role"], "orchestrator");
+
+        // The admin's bot is invisible to the member through every verb.
+        for (method, body) in [
+            ("GET", None),
+            ("PUT", Some(json!({"prompt": "hijacked"}))),
+            ("DELETE", None),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request_with_token(
+                    method,
+                    "/v1/bots/admin-notes",
+                    &member_token,
+                    body,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method}");
+        }
+        assert!(
+            store
+                .get_bot(&admin_id, "admin-notes")
+                .unwrap()
+                .unwrap()
+                .prompt
+                .contains("Admin notes.")
+        );
+
+        // The admin's skill is invisible; the member's own skill is not.
+        let listed = read_json(
+            app.clone()
+                .oneshot(request_with_token("GET", "/v1/skills", &member_token, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            !listed["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|skill| skill["id"] == "admin-skill")
+        );
+        let created = app
+            .clone()
+            .oneshot(request_with_token(
+                "POST",
+                "/v1/skills",
+                &member_token,
+                Some(json!({"id": "member-skill", "description": "Member only"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        assert!(
+            store
+                .get_user_skill(&member.id, "member-skill")
+                .unwrap()
+                .is_some()
+        );
+        let admin_skills = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/skills", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            !admin_skills["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|skill| skill["id"] == "member-skill")
+        );
+
+        // The orchestrator rule is per user: the member cannot disable main,
+        // and the admin's main is untouched.
+        let disable = app
+            .clone()
+            .oneshot(request_with_token(
+                "PUT",
+                "/v1/bots/main",
+                &member_token,
+                Some(json!({"enabled": false})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(disable.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(store.get_bot(&member.id, "main").unwrap().unwrap().enabled);
+        assert!(store.get_bot(&admin_id, "main").unwrap().unwrap().enabled);
+
+        // A member's prompt edit and specialist disable/delete are scoped.
+        let updated = app
+            .clone()
+            .oneshot(request_with_token(
+                "PUT",
+                "/v1/bots/analyst",
+                &member_token,
+                Some(json!({"enabled": false, "prompt": "Member analyst prompt."})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+        let member_analyst = store.get_bot(&member.id, "analyst").unwrap().unwrap();
+        assert!(!member_analyst.enabled);
+        assert_eq!(member_analyst.prompt, "Member analyst prompt.");
+        let admin_analyst = store.get_bot(&admin_id, "analyst").unwrap().unwrap();
+        assert!(admin_analyst.enabled);
+        assert_eq!(admin_analyst.prompt, "test prompt");
+
+        let deleted = app
+            .clone()
+            .oneshot(request_with_token(
+                "DELETE",
+                "/v1/bots/maker",
+                &member_token,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+        assert!(store.get_bot(&member.id, "maker").unwrap().is_none());
+        assert!(store.get_bot(&admin_id, "maker").unwrap().is_some());
+
+        // The orchestrator cannot be deleted either.
+        let delete_main = app
+            .clone()
+            .oneshot(request_with_token(
+                "DELETE",
+                "/v1/bots/main",
+                &member_token,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(delete_main.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

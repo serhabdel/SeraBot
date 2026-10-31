@@ -9,6 +9,12 @@
 //! runtime check. Only a small set of maintenance helpers (task claiming,
 //! lease recovery, approval expiry, routine claiming) works across users;
 //! each is documented with the reason it must.
+//!
+//! Phase 3 adds two more user-owned tables: `bots` (keyed `(user_id, name)`,
+//! with the system prompt in the row) and `user_skills` (a user's own skill
+//! rows on top of the shipped catalog). Every bot and skill method below is
+//! scoped exactly like the rest: the acting user's id is the first argument
+//! and an unknown or foreign id is indistinguishable from a missing row.
 
 use std::path::{Path, PathBuf};
 use std::sync::Once;
@@ -38,6 +44,7 @@ const MIGRATION_6: &str = include_str!("../migrations/0006_console_redesign.sql"
 const MIGRATION_7: &str = include_str!("../migrations/0007_conversation_read_rowid.sql");
 const MIGRATION_8: &str = include_str!("../migrations/0008_users_and_sessions.sql");
 const MIGRATION_9: &str = include_str!("../migrations/0009_user_scoping.sql");
+const MIGRATION_10: &str = include_str!("../migrations/0010_user_fleet.sql");
 
 /// Fixed admin id written by migration 0008 and mirrored in
 /// `kv['admin_user_id']`. Code resolves the admin through the kv entry (the
@@ -152,6 +159,32 @@ impl DeviceToken {
     pub fn active_at(&self, now: DateTime<Utc>) -> bool {
         self.revoked_at.is_none() && self.expires_at.is_none_or(|expires| expires > now)
     }
+}
+
+/// One per-user bot row. `config` is the JSON the runtime parses into
+/// `config::BotConfig`; `prompt` is the system prompt text (the store and API
+/// write paths cap it at 100 KB). The `enabled` column is authoritative over
+/// the copy inside `config`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct StoredBot {
+    pub name: String,
+    pub config: Value,
+    pub prompt: String,
+    pub enabled: bool,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// One skill row created by a user. `body` is the instruction text (the
+/// markdown after the frontmatter), matching what the shipped catalog exposes
+/// through `skill_load`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct UserSkill {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub body: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 pub type StoreConnection = PooledConnection<SqliteConnectionManager>;
@@ -345,6 +378,11 @@ impl Store {
             connection.execute_batch(MIGRATION_9)?;
             connection.pragma_update(None, "user_version", 9)?;
         }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 10 {
+            connection.execute_batch(MIGRATION_10)?;
+            connection.pragma_update(None, "user_version", 10)?;
+        }
         let stored_dimension: Option<String> = connection
             .query_row(
                 "SELECT value FROM kv WHERE key = 'embedding_dimension'",
@@ -375,14 +413,205 @@ impl Store {
         Ok(())
     }
 
-    pub fn upsert_bot(&self, name: &str, config: &Value, enabled: bool) -> Result<()> {
+    /// Insert or replace one bot row for the acting user. Seeding and the
+    /// prompt-repair path use this; the API's create path uses
+    /// [`Store::insert_bot`] so a duplicate is an explicit conflict.
+    pub fn upsert_bot(
+        &self,
+        user_id: &str,
+        name: &str,
+        config: &Value,
+        prompt: &str,
+        enabled: bool,
+    ) -> Result<()> {
         let connection = self.connection()?;
         connection.execute(
-            "INSERT INTO bots(name, config_json, enabled, updated_at) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(name) DO UPDATE SET config_json=excluded.config_json, enabled=excluded.enabled, updated_at=excluded.updated_at",
-            params![name, serde_json::to_string(config)?, enabled as i64, now_string()],
+            "INSERT INTO bots(user_id, name, config_json, prompt, enabled, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(user_id, name) DO UPDATE SET
+                 config_json=excluded.config_json,
+                 prompt=excluded.prompt,
+                 enabled=excluded.enabled,
+                 updated_at=excluded.updated_at",
+            params![
+                user_id,
+                name,
+                serde_json::to_string(config)?,
+                prompt,
+                enabled as i64,
+                now_string()
+            ],
         )?;
         Ok(())
+    }
+
+    /// Insert a bot row for the acting user. Returns false when the user
+    /// already owns a bot with that name; another user's row never conflicts.
+    pub fn insert_bot(
+        &self,
+        user_id: &str,
+        name: &str,
+        config: &Value,
+        prompt: &str,
+        enabled: bool,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "INSERT INTO bots(user_id, name, config_json, prompt, enabled, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(user_id, name) DO NOTHING",
+            params![
+                user_id,
+                name,
+                serde_json::to_string(config)?,
+                prompt,
+                enabled as i64,
+                now_string()
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Replace the behavior config, prompt, and enabled flag of one bot owned
+    /// by the acting user. Returns false when the row does not exist or
+    /// belongs to another user.
+    pub fn update_bot(
+        &self,
+        user_id: &str,
+        name: &str,
+        config: &Value,
+        prompt: &str,
+        enabled: bool,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE bots SET config_json = ?3, prompt = ?4, enabled = ?5, updated_at = ?6
+             WHERE user_id = ?1 AND name = ?2",
+            params![
+                user_id,
+                name,
+                serde_json::to_string(config)?,
+                prompt,
+                enabled as i64,
+                now_string()
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Fill an empty prompt on one of the acting user's bot rows. Used by the
+    /// startup repair for rows that migration 0010 backfilled without prompt
+    /// text (SQL cannot read the prompt files).
+    pub fn set_bot_prompt(&self, user_id: &str, name: &str, prompt: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE bots SET prompt = ?3, updated_at = ?4 WHERE user_id = ?1 AND name = ?2",
+            params![user_id, name, prompt, now_string()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Delete one bot owned by the acting user. Returns false when the row
+    /// does not exist or belongs to another user.
+    pub fn delete_bot(&self, user_id: &str, name: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "DELETE FROM bots WHERE user_id = ?1 AND name = ?2",
+            params![user_id, name],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The acting user's fleet rows, ordered by bot name.
+    pub fn list_bots(&self, user_id: &str) -> Result<Vec<StoredBot>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT name, config_json, prompt, enabled, updated_at
+             FROM bots WHERE user_id = ?1 ORDER BY name",
+        )?;
+        let rows = statement.query_map(params![user_id], stored_bot_from_row)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// One bot of the acting user; another user's bot is indistinguishable
+    /// from a missing one.
+    pub fn get_bot(&self, user_id: &str, name: &str) -> Result<Option<StoredBot>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT name, config_json, prompt, enabled, updated_at
+                 FROM bots WHERE user_id = ?1 AND name = ?2",
+                params![user_id, name],
+                stored_bot_from_row,
+            )
+            .optional()?)
+    }
+
+    pub fn count_bots(&self, user_id: &str) -> Result<usize> {
+        let connection = self.connection()?;
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM bots WHERE user_id = ?1",
+            params![user_id],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// Insert one user-created skill. Returns false when the acting user
+    /// already owns a skill with that id; another user's row never conflicts.
+    pub fn insert_user_skill(
+        &self,
+        user_id: &str,
+        id: &str,
+        name: &str,
+        description: &str,
+        body: &str,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        let stamp = now_string();
+        let changed = connection.execute(
+            "INSERT INTO user_skills(user_id, id, name, description, body, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+             ON CONFLICT(user_id, id) DO NOTHING",
+            params![user_id, id, name, description, body, stamp],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The acting user's own skill rows, ordered by id.
+    pub fn list_user_skills(&self, user_id: &str) -> Result<Vec<UserSkill>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, name, description, body, created_at, updated_at
+             FROM user_skills WHERE user_id = ?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![user_id], user_skill_from_row)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// One user-created skill of the acting user; another user's skill is
+    /// indistinguishable from a missing one.
+    pub fn get_user_skill(&self, user_id: &str, id: &str) -> Result<Option<UserSkill>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT id, name, description, body, created_at, updated_at
+                 FROM user_skills WHERE user_id = ?1 AND id = ?2",
+                params![user_id, id],
+                user_skill_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Delete one user-created skill of the acting user. Used to roll back a
+    /// failed audit write after a successful insert.
+    pub fn delete_user_skill(&self, user_id: &str, id: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "DELETE FROM user_skills WHERE user_id = ?1 AND id = ?2",
+            params![user_id, id],
+        )?;
+        Ok(changed == 1)
     }
 
     pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
@@ -2579,6 +2808,35 @@ fn user_from_row(row: &Row<'_>) -> rusqlite::Result<User> {
     })
 }
 
+fn stored_bot_from_row(row: &Row<'_>) -> rusqlite::Result<StoredBot> {
+    let config_json: String = row.get(1)?;
+    let config = serde_json::from_str(&config_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            config_json.len(),
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })?;
+    Ok(StoredBot {
+        name: row.get(0)?,
+        config,
+        prompt: row.get(2)?,
+        enabled: row.get::<_, i64>(3)? != 0,
+        updated_at: parse_datetime(&row.get::<_, String>(4)?),
+    })
+}
+
+fn user_skill_from_row(row: &Row<'_>) -> rusqlite::Result<UserSkill> {
+    Ok(UserSkill {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        description: row.get(2)?,
+        body: row.get(3)?,
+        created_at: parse_datetime(&row.get::<_, String>(4)?),
+        updated_at: parse_datetime(&row.get::<_, String>(5)?),
+    })
+}
+
 /// Roles and statuses are written only through the checked enums above and
 /// the schema CHECK constraints, so an unparseable value is a corrupt row:
 /// fail the read loudly instead of guessing a default (a wrong guess here
@@ -3211,7 +3469,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -3276,7 +3534,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -3314,8 +3572,8 @@ mod tests {
                     .pragma_update(None, "user_version", index as i64 + 1)
                     .unwrap();
             }
-            // Pre-migration operator state: a CLI device token and a
-            // conversation, with no user anywhere.
+            // Pre-migration operator state: a CLI device token, a
+            // conversation, and the file-era bot row, with no user anywhere.
             connection
                 .execute(
                     "INSERT INTO device_tokens(id, label, token_hash, created_at)
@@ -3330,6 +3588,13 @@ mod tests {
                     [],
                 )
                 .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO bots(name, config_json, enabled, updated_at)
+                     VALUES ('main', '{\"name\":\"main\"}', 1, '2026-01-01T00:00:00.000Z')",
+                    [],
+                )
+                .unwrap();
         }
         let store = Store::open(&path, 384, 5000).unwrap();
         let admin_id = admin(&store);
@@ -3338,7 +3603,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -3376,6 +3641,31 @@ mod tests {
         assert!(!attempt.created);
         assert_eq!(attempt.user.id, ADMIN_USER_ID);
         assert_eq!(attempt.user.role, UserRole::Admin, "role is never upserted");
+
+        // The file-era bot row now belongs to the admin; its prompt is empty
+        // until the startup fleet seeding repairs it from the template.
+        let bots = store.list_bots(&admin_id).unwrap();
+        assert_eq!(bots.len(), 1);
+        assert_eq!(bots[0].name, "main");
+        assert!(bots[0].enabled);
+        assert_eq!(bots[0].prompt, "");
+        assert_eq!(bots[0].config["name"], "main");
+        assert!(
+            store
+                .get_bot(&admin_id, "main")
+                .unwrap()
+                .is_some_and(|bot| bot.prompt.is_empty())
+        );
+        // The per-user skill table arrived with the same migration.
+        let connection = store.connection().unwrap();
+        let user_skills: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='user_skills'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(user_skills, 1);
     }
 
     /// A database at `user_version = 8` (phase 1, users exist but data rows
@@ -3444,7 +3734,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -3557,6 +3847,260 @@ mod tests {
             )
             .unwrap();
         assert!(after > before, "events sequence must keep advancing");
+    }
+
+    /// A database at `user_version = 9` (phase 2, every user-owned table is
+    /// scoped but `bots` is still keyed by name) migrates to 10: the bot rows
+    /// land under the admin with an empty prompt, and `user_skills` exists
+    /// with a per-user primary key.
+    #[test]
+    fn migrates_a_version_nine_database_to_per_user_fleets() {
+        let path = std::env::temp_dir().join(format!("serabot-store-v9-{}.db", new_id()));
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            let migrations = [
+                MIGRATION_1,
+                MIGRATION_2,
+                MIGRATION_3,
+                MIGRATION_4,
+                MIGRATION_5,
+                MIGRATION_6,
+                MIGRATION_7,
+                MIGRATION_8,
+                MIGRATION_9,
+            ];
+            for (index, migration) in migrations.iter().enumerate() {
+                connection.execute_batch(migration).unwrap();
+                connection
+                    .pragma_update(None, "user_version", index as i64 + 1)
+                    .unwrap();
+            }
+            connection
+                .execute(
+                    "INSERT INTO bots(name, config_json, enabled, updated_at)
+                     VALUES ('main', '{\"name\":\"main\",\"role\":\"orchestrator\"}', 1,
+                             '2026-01-01T00:00:00.000Z')",
+                    [],
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path, 384, 5000).unwrap();
+        let connection = store.connection().unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 10);
+
+        // The old row is now the admin's, with the empty prompt the migration
+        // header documents; startup seeding fills it from the template.
+        let bot = store.get_bot(ADMIN_USER_ID, "main").unwrap().unwrap();
+        assert_eq!(bot.name, "main");
+        assert_eq!(bot.prompt, "");
+        assert!(bot.enabled);
+        assert_eq!(bot.config["role"], "orchestrator");
+
+        // The bots primary key is (user_id, name): the same bot name can
+        // exist for two users, but not twice for one user.
+        let member = store
+            .create_user("microsoft:fleet-member", "m@example.example", "M")
+            .unwrap();
+        store
+            .upsert_bot(
+                &member.id,
+                "main",
+                &serde_json::json!({"name": "main"}),
+                "member prompt",
+                true,
+            )
+            .unwrap();
+        assert_eq!(store.count_bots(ADMIN_USER_ID).unwrap(), 1);
+        assert_eq!(store.count_bots(&member.id).unwrap(), 1);
+        let duplicate = connection.execute(
+            "INSERT INTO bots(user_id, name, config_json, prompt, enabled, updated_at)
+             VALUES (?1, 'main', '{}', '', 1, '2026-01-01T00:00:00.000Z')",
+            params![ADMIN_USER_ID],
+        );
+        assert!(duplicate.is_err(), "bots PK must be (user_id, name)");
+
+        // user_skills is per user: the same id can exist for both users.
+        assert!(
+            store
+                .insert_user_skill(ADMIN_USER_ID, "notes", "Notes", "Admin notes", "# Notes\n")
+                .unwrap()
+        );
+        assert!(
+            store
+                .insert_user_skill(&member.id, "notes", "Notes", "Member notes", "# Notes\n")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .insert_user_skill(ADMIN_USER_ID, "notes", "Notes", "Again", "# Notes\n")
+                .unwrap()
+        );
+        assert_eq!(store.list_user_skills(ADMIN_USER_ID).unwrap().len(), 1);
+        assert_eq!(store.list_user_skills(&member.id).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .get_user_skill(&member.id, "notes")
+                .unwrap()
+                .unwrap()
+                .description,
+            "Member notes"
+        );
+        assert!(
+            store
+                .get_user_skill(ADMIN_USER_ID, "missing")
+                .unwrap()
+                .is_none()
+        );
+
+        // Both new tables reference users(id) and are referentially clean.
+        for table in ["bots", "user_skills"] {
+            let fk: Option<i64> = connection
+                .query_row(
+                    &format!(
+                        "SELECT 1 FROM pragma_foreign_key_list('{table}') WHERE \"table\" = 'users' AND \"from\" = 'user_id'"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(None);
+            assert_eq!(fk, Some(1), "{table}.user_id must reference users(id)");
+        }
+        let fk_errors: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk_errors, 0);
+        let index: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_bots_user'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1);
+    }
+
+    /// Bot rows are strictly per user: the same name is two independent rows,
+    /// and every read/update/delete is filtered by the acting user.
+    #[test]
+    fn bots_are_scoped_per_user() {
+        let store = store();
+        let admin = admin(&store);
+        let member = store
+            .create_user("microsoft:bot-member", "b@example.example", "B")
+            .unwrap();
+        let admin_config = serde_json::json!({"name": "notes", "enabled": true});
+        let member_config = serde_json::json!({"name": "notes", "enabled": false});
+        assert!(
+            store
+                .insert_bot(&admin, "notes", &admin_config, "admin prompt", true)
+                .unwrap()
+        );
+        assert!(
+            store
+                .insert_bot(&member.id, "notes", &member_config, "member prompt", false)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .insert_bot(&admin, "notes", &admin_config, "again", true)
+                .unwrap()
+        );
+
+        let admin_bot = store.get_bot(&admin, "notes").unwrap().unwrap();
+        assert_eq!(admin_bot.prompt, "admin prompt");
+        assert!(admin_bot.enabled);
+        let member_bot = store.get_bot(&member.id, "notes").unwrap().unwrap();
+        assert_eq!(member_bot.prompt, "member prompt");
+        assert!(!member_bot.enabled);
+
+        // Cross-user writes and deletes miss; the owner's row is untouched.
+        assert!(
+            store
+                .insert_bot(&admin, "admin-only", &admin_config, "admin only", true)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .update_bot(&member.id, "admin-only", &member_config, "hijacked", true)
+                .unwrap()
+        );
+        assert_eq!(
+            store.get_bot(&admin, "admin-only").unwrap().unwrap().prompt,
+            "admin only"
+        );
+        assert!(!store.delete_bot(&member.id, "admin-only").unwrap());
+        assert!(store.get_bot(&admin, "admin-only").unwrap().is_some());
+        assert!(store.get_bot(&admin, "notes").unwrap().is_some());
+
+        // The owner can update and delete their own row.
+        assert!(
+            store
+                .update_bot(&admin, "notes", &admin_config, "new prompt", false)
+                .unwrap()
+        );
+        assert_eq!(
+            store.get_bot(&admin, "notes").unwrap().unwrap().prompt,
+            "new prompt"
+        );
+        assert!(store.delete_bot(&admin, "notes").unwrap());
+        assert!(store.get_bot(&admin, "notes").unwrap().is_none());
+        assert!(store.get_bot(&member.id, "notes").unwrap().is_some());
+    }
+
+    /// User-created skills are strictly per user: the same id can exist for
+    /// two users, and one user's row is invisible to the other.
+    #[test]
+    fn user_skills_are_scoped_per_user() {
+        let store = store();
+        let admin = admin(&store);
+        let member = store
+            .create_user("microsoft:skill-member", "s@example.example", "S")
+            .unwrap();
+        assert!(
+            store
+                .insert_user_skill(&admin, "notes", "Notes", "Admin notes", "# Admin\n")
+                .unwrap()
+        );
+        assert!(
+            store
+                .insert_user_skill(&member.id, "notes", "Notes", "Member notes", "# Member\n")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .insert_user_skill(&admin, "notes", "Notes", "Again", "# Again\n")
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_user_skill(&admin, "notes")
+                .unwrap()
+                .unwrap()
+                .description,
+            "Admin notes"
+        );
+        assert_eq!(
+            store
+                .get_user_skill(&member.id, "notes")
+                .unwrap()
+                .unwrap()
+                .description,
+            "Member notes"
+        );
+        assert!(
+            store
+                .get_user_skill(&member.id, "missing")
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.delete_user_skill(&member.id, "notes").unwrap());
+        assert!(store.get_user_skill(&admin, "notes").unwrap().is_some());
+        assert!(!store.delete_user_skill(&member.id, "notes").unwrap());
     }
 
     #[test]

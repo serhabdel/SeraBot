@@ -24,6 +24,7 @@ use serabot::firecrawl::{
     FirecrawlClient, FirecrawlCrawlTool, FirecrawlLimits, FirecrawlMapTool, FirecrawlScrapeTool,
     FirecrawlSearchTool,
 };
+use serabot::fleet::FleetRegistry;
 use serabot::gateway::{Gateway, ToolRegistry};
 use serabot::llm::LlmClient;
 use serabot::maker::{
@@ -386,18 +387,15 @@ fn check(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.database.busy_timeout_ms,
     )?;
     store.health()?;
-    for bot in &bots {
-        store.upsert_bot(
-            &bot.config.name,
-            &serde_json::to_value(&bot.config)?,
-            bot.config.enabled,
-        )?;
-    }
-    let catalog = SkillCatalog::load(&config)?;
+    let catalog = Arc::new(SkillCatalog::load(&config)?);
+    let fleet = FleetRegistry::new(config.clone(), store.clone(), bots, catalog.clone())?;
+    let admin_user_id = store.admin_user_id()?;
+    fleet.seed(&admin_user_id)?;
+    let bot_count = fleet.rows(&admin_user_id)?.len();
     println!(
         "ok: database={}, bots={}, skills={}, blocklist_terms={}, api={}, telegram={}",
         store.path().display(),
-        bots.len(),
+        bot_count,
         catalog.skill_ids().len(),
         policy.term_count(),
         config.api.enabled,
@@ -422,12 +420,18 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     if store.reconcile_dispatching_actions()? > 0 {
         tracing::warn!("reconciled actions with unknown external outcomes");
     }
-    for bot in &bots {
-        store.upsert_bot(
-            &bot.config.name,
-            &serde_json::to_value(&bot.config)?,
-            bot.config.enabled,
-        )?;
+    // The repository fleet is the seed source. The admin gets its rows now;
+    // members are seeded at account creation and lazily on first fleet use.
+    let catalog = Arc::new(SkillCatalog::load(&config)?);
+    let fleet = Arc::new(FleetRegistry::new(
+        config.clone(),
+        store.clone(),
+        bots,
+        catalog.clone(),
+    )?);
+    let seeded = fleet.seed(&admin_user_id)?;
+    if seeded > 0 {
+        tracing::info!(bots = seeded, "seeded the admin fleet from templates");
     }
 
     secrets
@@ -719,27 +723,23 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     if config.api.enabled {
         notifiers.push(Arc::new(ApiNotifier::new(store.clone())));
     }
-    let catalog = Arc::new(SkillCatalog::load(&config)?);
-    register_skill_tools(&mut registry, SkillRuntime::new(catalog, &bots))?;
-    let bot_map: Arc<std::collections::HashMap<String, serabot::config::LoadedBot>> = Arc::new(
-        bots.iter()
-            .cloned()
-            .map(|bot| (bot.config.name.clone(), bot))
-            .collect(),
-    );
+    register_skill_tools(
+        &mut registry,
+        SkillRuntime::new(catalog, fleet.clone(), store.clone()),
+    )?;
     registry.register(serabot::delegate::DelegateTool::new(
         store.clone(),
-        bot_map.clone(),
+        fleet.clone(),
         router.clone(),
     ))?;
     registry.register(serabot::teams::TeamAskTool::new(
         store.clone(),
-        bot_map.clone(),
+        fleet.clone(),
         router.clone(),
     ))?;
     registry.register(serabot::teams::TeamReplyTool::new(
         store.clone(),
-        bot_map,
+        fleet.clone(),
         router.clone(),
         policy.clone(),
     ))?;
@@ -753,12 +753,12 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.runtime.owner_standing_consent,
     );
 
-    let runtime = Runtime::new(
+    let runtime = Runtime::with_fleet(
         config.clone(),
         store.clone(),
         gateway,
         router,
-        bots,
+        fleet,
         notifier,
         shutdown.clone(),
     )?;

@@ -1,4 +1,13 @@
-use std::collections::{HashMap, HashSet};
+//! Turn execution: per-user bot routing, the durable turn loop, and the
+//! schedules that feed it.
+//!
+//! Bots are resolved through the per-user [`FleetRegistry`] (phase 3 of the
+//! multi-user reconstruction): a task's owning user is the only fleet that can
+//! serve its turn, and the prompt, tool allowlist, delegation targets, and
+//! memory injection all come from that user's rows. A user with an invalid
+//! fleet fails closed without affecting any other user.
+
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -14,6 +23,7 @@ use crate::config::{Config, LoadedBot};
 use crate::delegate::{DELEGATE_TOOL, HANDOFF_QUEUED_KEY};
 use crate::domain::{Action, Approval, LlmMessage, Role, Task, ToolCall, Turn, new_id};
 use crate::error::{Result, SeraError};
+use crate::fleet::FleetRegistry;
 use crate::gateway::{
     Decision, DecisionResult, Gateway, Tool, ToolContext, ToolOutcome, ToolOutput, ToolSpec,
 };
@@ -266,7 +276,7 @@ pub struct Runtime {
     store: Store,
     gateway: Gateway,
     router: ModelRouter,
-    bots: Arc<HashMap<String, LoadedBot>>,
+    fleet: Arc<FleetRegistry>,
     notifier: Arc<dyn Notifier>,
     semaphore: Arc<Semaphore>,
     worker_id: String,
@@ -280,12 +290,36 @@ enum TurnOutcome {
 }
 
 impl Runtime {
+    /// Build a runtime from the repository seed templates. The templates are
+    /// copied into each user's fleet rows lazily; production uses
+    /// [`Runtime::with_fleet`] so the skill and delegation tools share the same
+    /// registry.
     pub fn new(
         config: Arc<Config>,
         store: Store,
         gateway: Gateway,
-        mut router: ModelRouter,
+        router: ModelRouter,
         bots: Vec<LoadedBot>,
+        notifier: Arc<dyn Notifier>,
+        shutdown: CancellationToken,
+    ) -> Result<Self> {
+        let catalog = Arc::new(crate::skills::SkillCatalog::load(&config)?);
+        let fleet = Arc::new(FleetRegistry::new(
+            config.clone(),
+            store.clone(),
+            bots,
+            catalog,
+        )?);
+        Self::with_fleet(config, store, gateway, router, fleet, notifier, shutdown)
+    }
+
+    /// Build a runtime around an existing per-user fleet registry.
+    pub fn with_fleet(
+        config: Arc<Config>,
+        store: Store,
+        gateway: Gateway,
+        mut router: ModelRouter,
+        fleet: Arc<FleetRegistry>,
         notifier: Arc<dyn Notifier>,
         shutdown: CancellationToken,
     ) -> Result<Self> {
@@ -294,22 +328,18 @@ impl Runtime {
                 "runtime.max_concurrent_turns must be positive".into(),
             ));
         }
-        for bot in &bots {
+        for bot in fleet.templates() {
             if let Some(model) = &bot.config.model {
                 router.add_default_model(model)?;
             }
         }
-        let bot_map: HashMap<String, LoadedBot> = bots
-            .into_iter()
-            .map(|bot| (bot.config.name.clone(), bot))
-            .collect();
         let semaphore = Arc::new(Semaphore::new(config.runtime.max_concurrent_turns));
         Ok(Self {
             config,
             store,
             gateway,
             router,
-            bots: Arc::new(bot_map),
+            fleet,
             notifier,
             semaphore,
             worker_id: format!("worker-{}", &uuid::Uuid::new_v4().to_string()[..8]),
@@ -325,13 +355,27 @@ impl Runtime {
         &self.config
     }
 
-    pub fn bot_loaded(&self, name: &str) -> bool {
-        self.bots.contains_key(name)
+    /// The per-user fleet registry shared with the skill and delegation
+    /// tools.
+    pub fn fleet(&self) -> Arc<FleetRegistry> {
+        self.fleet.clone()
     }
 
-    /// The loaded bot registry entry, if the bot is live.
-    pub fn bot(&self, name: &str) -> Option<&LoadedBot> {
-        self.bots.get(name)
+    /// Whether the acting user's fleet currently contains this bot. A fleet
+    /// that fails validation reports false (fail closed).
+    pub fn bot_loaded(&self, user_id: &str, name: &str) -> bool {
+        self.fleet
+            .load(user_id)
+            .map(|fleet| fleet.contains_key(name))
+            .unwrap_or(false)
+    }
+
+    /// The acting user's loaded bot registry entry, if the bot is live.
+    pub fn bot(&self, user_id: &str, name: &str) -> Option<LoadedBot> {
+        self.fleet
+            .load(user_id)
+            .ok()
+            .and_then(|fleet| fleet.get(name).cloned())
     }
 
     pub fn router(&self) -> &ModelRouter {
@@ -439,8 +483,8 @@ impl Runtime {
     ) -> Result<ModelSelection> {
         validate_conversation_id(conversation_id)?;
         self.guard_conversation_scope(user_id, conversation_id)?;
-        let bot = self
-            .bots
+        let fleet = self.fleet.load(user_id)?;
+        let bot = fleet
             .get(bot)
             .ok_or_else(|| SeraError::NotFound("bot not found".into()))?;
         let selection = match self.stored_model_selection(conversation_id)? {
@@ -468,8 +512,8 @@ impl Runtime {
     ) -> Result<ModelSelection> {
         validate_conversation_id(conversation_id)?;
         self.guard_conversation_scope(user_id, conversation_id)?;
-        let bot = self
-            .bots
+        let fleet = self.fleet.load(user_id)?;
+        let bot = fleet
             .get(bot)
             .ok_or_else(|| SeraError::NotFound("bot not found".into()))?;
         let stored = match self.stored_model_selection(conversation_id)? {
@@ -595,6 +639,7 @@ impl Runtime {
             )?;
             return Ok(task);
         }
+        let fleet = self.fleet.load(user_id)?;
         let (bot, text, ask_mode) = if let Some(rest) = text.strip_prefix("/ask") {
             let question = rest.trim();
             if question.is_empty() {
@@ -639,8 +684,8 @@ impl Runtime {
                 Ok(scope) if scope.kind == ConversationKind::Room => ORCHESTRATOR_BOT,
                 Ok(scope) if scope.kind == ConversationKind::Direct && bot_override.is_none() => {
                     match conversation_id.strip_prefix("dir:") {
-                        Some(id) if self.bots.contains_key(id) => {
-                            if !self.bots[id].config.enabled {
+                        Some(id) if fleet.contains_key(id) => {
+                            if !fleet[id].config.enabled {
                                 return Err(SeraError::InvalidState(format!(
                                     "bot {id} is disabled"
                                 )));
@@ -654,18 +699,18 @@ impl Runtime {
             };
             (bot.to_string(), text.to_string(), false)
         };
-        if !self.bots.contains_key(&bot) {
+        if !fleet.contains_key(&bot) {
             return Err(SeraError::NotFound(format!("bot {bot}")));
         }
         let selection = self.effective_model_selection(user_id, conversation_id, &bot)?;
         let route = self.router.pin(&selection)?;
         let owner_text = text.clone();
         // In rooms, `@mention` tokens are parsed from the owner text and
-        // validated against the configured bot ids. They are routing metadata
-        // only: never instructions, and never routed to non-members.
+        // validated against the acting user's bot ids. They are routing
+        // metadata only: never instructions, and never routed to non-members.
         let mentions = match parse_conversation_scope(conversation_id) {
             Ok(scope) if scope.kind == ConversationKind::Room => {
-                let known: HashSet<String> = self.bots.keys().cloned().collect();
+                let known: HashSet<String> = fleet.keys().cloned().collect();
                 parse_mentions(&text, &known)
             }
             _ => Vec::new(),
@@ -747,8 +792,15 @@ impl Runtime {
         root_task_id: &str,
         members: &[String],
     ) {
+        let fleet = match self.fleet.load(user_id) {
+            Ok(fleet) => fleet,
+            Err(error) => {
+                warn!(%error, "room team fleet is invalid; fan-out skipped");
+                return;
+            }
+        };
         for member in members {
-            let Some(bot) = self.bots.get(member) else {
+            let Some(bot) = fleet.get(member) else {
                 warn!(bot = %member, "room team member is not loaded; skipped");
                 continue;
             };
@@ -1168,8 +1220,8 @@ impl Runtime {
         self.store
             .ensure_conversation_accepts_turns(&user, &payload.conversation_id)?;
         self.checked_route(&payload.route)?;
-        let bot = self
-            .bots
+        let fleet = self.fleet.load(&user)?;
+        let bot = fleet
             .get(&payload.bot)
             .ok_or_else(|| SeraError::NotFound(format!("bot {}", payload.bot)))?;
         if !bot.config.enabled {
@@ -1279,8 +1331,8 @@ impl Runtime {
         let mut state: TurnState = serde_json::from_value(turn.state.clone())
             .map_err(|_| SeraError::InvalidState("stored turn state is invalid".into()))?;
         self.checked_route(&state.route)?;
-        let bot = self
-            .bots
+        let fleet = self.fleet.load(&user)?;
+        let bot = fleet
             .get(&turn.bot)
             .ok_or_else(|| SeraError::NotFound(format!("bot {}", turn.bot)))?;
         let pending = state
@@ -1468,12 +1520,15 @@ impl Runtime {
         mut state: TurnState,
         conversation_id: &str,
     ) -> Result<TurnOutcome> {
-        let bot = self
-            .bots
-            .get(&turn.bot)
-            .ok_or_else(|| SeraError::NotFound(format!("bot {}", turn.bot)))?;
+        let bot = {
+            let fleet = self.fleet.load(&task.user_id)?;
+            fleet
+                .get(&turn.bot)
+                .cloned()
+                .ok_or_else(|| SeraError::NotFound(format!("bot {}", turn.bot)))?
+        };
         let user = task.user_id.clone();
-        let context = self.tool_context(task, turn, bot, &state)?;
+        let context = self.tool_context(task, turn, &bot, &state)?;
         let mut tool_names = bot.config.tools.clone();
         for extra in [TEAM_ASK_TOOL, TEAM_REPLY_TOOL] {
             if context.allowed_tools.contains(extra) && !tool_names.iter().any(|name| name == extra)
@@ -1616,7 +1671,7 @@ impl Runtime {
                 .messages
                 .push(LlmMessage::assistant(assistant.content, tool_calls.clone()));
             if let Some(pending) = self
-                .execute_calls(task, bot, &mut state, tool_calls, &context)
+                .execute_calls(task, &bot, &mut state, tool_calls, &context)
                 .await?
             {
                 return self.suspend_for_approval(task, turn, state, pending).await;
@@ -2349,7 +2404,7 @@ mod tests {
                 require_approval: vec![],
                 enabled: true,
                 temperature: None,
-                role: Default::default(),
+                role: crate::orchestration::BotRole::Orchestrator,
                 delegates: vec![],
             },
             prompt: "test prompt".into(),
@@ -2421,6 +2476,22 @@ mod tests {
     }
 
     fn restart(runtime: &Runtime, config: Config, bots: Vec<LoadedBot>) -> Runtime {
+        // The database is authoritative after seeding: overwrite the admin's
+        // rows with the new templates so the restarted runtime sees them.
+        let admin = runtime.store.admin_user_id().unwrap();
+        for bot in &bots {
+            runtime
+                .store
+                .upsert_bot(
+                    &admin,
+                    &bot.config.name,
+                    &serde_json::to_value(&bot.config).unwrap(),
+                    &bot.prompt,
+                    bot.config.enabled,
+                )
+                .unwrap();
+        }
+        runtime.fleet().invalidate(&admin);
         let client = LlmClient::new(&config.llm.base_url, "test", 10, 100).unwrap();
         let router = ModelRouter::new(
             &config.llm,
@@ -2905,12 +2976,9 @@ mod tests {
         )
         .unwrap();
         let bots = orchestrator_bots();
-        let bot_map: Arc<HashMap<String, LoadedBot>> = Arc::new(
-            bots.iter()
-                .cloned()
-                .map(|bot| (bot.config.name.clone(), bot))
-                .collect(),
-        );
+        let catalog = Arc::new(crate::skills::SkillCatalog::load(&config).unwrap());
+        let fleet =
+            Arc::new(FleetRegistry::new(config.clone(), store.clone(), bots, catalog).unwrap());
         let router = ModelRouter::new(
             &config.llm,
             std::collections::BTreeMap::from([(
@@ -2925,21 +2993,21 @@ mod tests {
         registry
             .register(crate::delegate::DelegateTool::new(
                 store.clone(),
-                bot_map.clone(),
+                fleet.clone(),
                 router.clone(),
             ))
             .unwrap();
         registry
             .register(crate::teams::TeamAskTool::new(
                 store.clone(),
-                bot_map.clone(),
+                fleet.clone(),
                 router.clone(),
             ))
             .unwrap();
         registry
             .register(crate::teams::TeamReplyTool::new(
                 store.clone(),
-                bot_map,
+                fleet.clone(),
                 router.clone(),
                 Arc::new(crate::policy::Policy::empty()),
             ))
@@ -2951,12 +3019,12 @@ mod tests {
             1,
             false,
         );
-        let runtime = Runtime::new(
+        let runtime = Runtime::with_fleet(
             config,
             store.clone(),
             gateway,
             router,
-            bots,
+            fleet,
             notifier,
             CancellationToken::new(),
         )
@@ -3785,5 +3853,67 @@ mod tests {
             .unwrap();
         assert_eq!(runs, 1);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The three prompt builders inject only the acting user's 20 most recent
+    /// memories. A member's fact never appears in the admin's prompt and vice
+    /// versa.
+    #[tokio::test]
+    async fn prompts_inject_only_the_acting_users_memories() {
+        let server = MockServer::start().await;
+        let (runtime, store) = setup(
+            &server.uri(),
+            Arc::new(Capture::default()),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let admin = admin(&store);
+        let member = store
+            .create_user("microsoft:prompt-member", "p@example.example", "P")
+            .unwrap();
+        memory::add(&store, &admin, "fact", "ADMIN-PRIVATE-FACT", "test").unwrap();
+        memory::add(&store, &member.id, "fact", "MEMBER-PRIVATE-FACT", "test").unwrap();
+        let bot = bot();
+
+        let admin_prompt = runtime.system_prompt(&admin, "owner", &bot, false, &[]);
+        assert!(admin_prompt.contains("ADMIN-PRIVATE-FACT"));
+        assert!(!admin_prompt.contains("MEMBER-PRIVATE-FACT"));
+        let member_prompt = runtime.system_prompt(&member.id, "owner", &bot, false, &[]);
+        assert!(member_prompt.contains("MEMBER-PRIVATE-FACT"));
+        assert!(!member_prompt.contains("ADMIN-PRIVATE-FACT"));
+
+        let team = TeamContext {
+            root_task_id: "root".into(),
+            root_turn_id: None,
+            from_bot: ORCHESTRATOR_BOT.into(),
+            round: 0,
+        };
+        let admin_team = runtime
+            .team_system_prompt(&admin, "owner", &bot, "objective", &team)
+            .unwrap();
+        assert!(admin_team.contains("ADMIN-PRIVATE-FACT"));
+        assert!(!admin_team.contains("MEMBER-PRIVATE-FACT"));
+        let member_team = runtime
+            .team_system_prompt(&member.id, "owner", &bot, "objective", &team)
+            .unwrap();
+        assert!(member_team.contains("MEMBER-PRIVATE-FACT"));
+        assert!(!member_team.contains("ADMIN-PRIVATE-FACT"));
+
+        let handoff = HandoffContext {
+            handoff_id: "handoff".into(),
+            parent_task_id: "task".into(),
+            parent_turn_id: "turn".into(),
+            memory_ids: vec![],
+            skill: None,
+        };
+        let admin_handoff = runtime
+            .handoff_system_prompt(&admin, &bot, "objective", &handoff)
+            .unwrap();
+        assert!(admin_handoff.contains("ADMIN-PRIVATE-FACT"));
+        assert!(!admin_handoff.contains("MEMBER-PRIVATE-FACT"));
+        let member_handoff = runtime
+            .handoff_system_prompt(&member.id, &bot, "objective", &handoff)
+            .unwrap();
+        assert!(member_handoff.contains("MEMBER-PRIVATE-FACT"));
+        assert!(!member_handoff.contains("ADMIN-PRIVATE-FACT"));
     }
 }

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,6 +7,7 @@ use tracing::warn;
 use crate::config::LoadedBot;
 use crate::domain::new_id;
 use crate::error::{Result, SeraError};
+use crate::fleet::{Fleet, FleetRegistry};
 use crate::gateway::{Tool, ToolContext, ToolOutput, ToolSpec};
 use crate::memory;
 use crate::model_router::ModelRouter;
@@ -22,21 +22,21 @@ pub const HANDOFF_QUEUED_KEY: &str = "handoff_queued";
 #[derive(Clone)]
 pub struct DelegateTool {
     store: Store,
-    bots: Arc<HashMap<String, LoadedBot>>,
+    fleet: Arc<FleetRegistry>,
     router: ModelRouter,
 }
 
 impl DelegateTool {
-    pub fn new(store: Store, bots: Arc<HashMap<String, LoadedBot>>, router: ModelRouter) -> Self {
+    pub fn new(store: Store, fleet: Arc<FleetRegistry>, router: ModelRouter) -> Self {
         Self {
             store,
-            bots,
+            fleet,
             router,
         }
     }
 
-    fn orchestrator(&self) -> Result<&LoadedBot> {
-        self.bots
+    fn orchestrator<'a>(&self, fleet: &'a Fleet) -> Result<&'a LoadedBot> {
+        fleet
             .get(ORCHESTRATOR_BOT)
             .filter(|bot| bot.config.enabled && bot.config.role == BotRole::Orchestrator)
             .ok_or_else(|| SeraError::Config("orchestrator bot is not configured".into()))
@@ -80,7 +80,8 @@ impl Tool for DelegateTool {
                 "only the orchestrator may delegate".into(),
             ));
         }
-        let orchestrator = self.orchestrator()?;
+        let fleet = self.fleet.load(&context.user_id)?;
+        let orchestrator = self.orchestrator(&fleet)?;
         let task_id = context
             .task_id
             .as_deref()
@@ -107,8 +108,7 @@ impl Tool for DelegateTool {
                 "handoff to_bot is not delegated by main".into(),
             ));
         }
-        let specialist = self
-            .bots
+        let specialist = fleet
             .get(&to_bot)
             .ok_or_else(|| SeraError::NotFound(format!("bot {to_bot}")))?;
         if !specialist.config.enabled || specialist.config.role != BotRole::Specialist {
@@ -310,20 +310,21 @@ mod tests {
         }
     }
 
-    fn bots() -> Arc<HashMap<String, LoadedBot>> {
-        Arc::new(
-            [
-                bot(
-                    ORCHESTRATOR_BOT,
-                    BotRole::Orchestrator,
-                    vec!["analyst".to_string()],
-                ),
-                bot("analyst", BotRole::Specialist, vec![]),
-            ]
-            .into_iter()
-            .map(|bot| (bot.config.name.clone(), bot))
-            .collect(),
-        )
+    fn bots() -> Vec<LoadedBot> {
+        vec![
+            bot(
+                ORCHESTRATOR_BOT,
+                BotRole::Orchestrator,
+                vec!["analyst".to_string()],
+            ),
+            bot("analyst", BotRole::Specialist, vec![]),
+        ]
+    }
+
+    fn fleet(store: &Store) -> Arc<FleetRegistry> {
+        let config = Arc::new(Config::default());
+        let catalog = Arc::new(crate::skills::SkillCatalog::load(&config).unwrap());
+        Arc::new(FleetRegistry::new(config, store.clone(), bots(), catalog).unwrap())
     }
 
     fn router() -> ModelRouter {
@@ -381,7 +382,7 @@ mod tests {
     #[tokio::test]
     async fn delegate_audits_the_child_task_it_queues() {
         let (store, parent) = store();
-        let tool = DelegateTool::new(store.clone(), bots(), router());
+        let tool = DelegateTool::new(store.clone(), fleet(&store), router());
         let turn = store
             .create_turn(&admin(&store), &parent, ORCHESTRATOR_BOT, ROOM, &json!({}))
             .unwrap();
@@ -433,7 +434,7 @@ mod tests {
     #[tokio::test]
     async fn delegate_queues_no_child_task_when_the_audit_fails() {
         let (store, parent) = store();
-        let tool = DelegateTool::new(store.clone(), bots(), router());
+        let tool = DelegateTool::new(store.clone(), fleet(&store), router());
         let turn = store
             .create_turn(&admin(&store), &parent, ORCHESTRATOR_BOT, ROOM, &json!({}))
             .unwrap();

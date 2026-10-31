@@ -46,6 +46,7 @@
 //! unknown key id.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -68,6 +69,7 @@ use url::Url;
 
 use crate::config::{AuthConfig, Config, KNOWN_AUTH_PROVIDERS};
 use crate::error::{Result, SeraError};
+use crate::fleet::FleetRegistry;
 use crate::secrets::SharedSecrets;
 use crate::store::{Store, User};
 use crate::util::{sha256_hex, truncate_chars};
@@ -164,6 +166,11 @@ pub struct AuthService {
     login_ttl: Duration,
     pending: Mutex<HashMap<String, PendingLogin>>,
     provider_cache: Mutex<Option<ProviderSnapshot>>,
+    /// Per-user fleet registry used to seed a new account's default fleet at
+    /// the end of a successful first sign-in. Optional so unit tests can build
+    /// the service without a runtime; the lazy seed in the registry is the
+    /// safety net either way.
+    fleet: Option<Arc<FleetRegistry>>,
 }
 
 impl std::fmt::Debug for AuthService {
@@ -232,7 +239,16 @@ impl AuthService {
             login_ttl: LOGIN_STATE_TTL,
             pending: Mutex::new(HashMap::new()),
             provider_cache: Mutex::new(None),
+            fleet: None,
         })
+    }
+
+    /// Attach the per-user fleet registry so a newly created account gets the
+    /// default fleet immediately. Seeding failures are logged, not fatal: the
+    /// registry also seeds lazily on first use.
+    pub fn with_fleet(mut self, fleet: Arc<FleetRegistry>) -> Self {
+        self.fleet = Some(fleet);
+        self
     }
 
     /// Whether sign-in is served at all. Always true for a built service;
@@ -464,6 +480,19 @@ impl AuthService {
             pending.invite_hash.as_deref(),
             self.max_users,
         )?;
+        // Post-login hook: a brand-new account gets the default fleet in the
+        // same request. A failure is logged and left to the registry's lazy
+        // seed, so a seeding problem never locks the new user out.
+        if outcome.created {
+            match &self.fleet {
+                Some(fleet) => {
+                    if let Err(error) = fleet.seed(&outcome.user.id) {
+                        warn!(%error, "new user fleet seeding failed; will seed on first use");
+                    }
+                }
+                None => warn!("no fleet registry attached; new user fleet will seed on first use"),
+            }
+        }
         if let Err(error) = self.store.record_audit(
             &outcome.user.id,
             "auth.login",

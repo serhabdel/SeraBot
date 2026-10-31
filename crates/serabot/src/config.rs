@@ -1,10 +1,19 @@
+//! Configuration and fleet templates.
+//!
+//! `bots/*.toml` + `prompts/*.txt` are **seed templates** for the per-user
+//! fleets (phase 3 of the multi-user reconstruction): `load_bots` reads and
+//! validates them once at startup, and `fleet::FleetRegistry` copies them
+//! into each user's `bots` rows. The database is authoritative after seeding;
+//! the admin console's `bot_config_overrides` are applied only when the
+//! admin's own fleet is loaded, never to the templates.
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SeraError};
-use crate::orchestration::{BotFleetMember, BotRole, safe_bot_label, validate_bot_fleet};
+use crate::orchestration::{BotFleetMember, BotRole, validate_bot_fleet};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -63,7 +72,8 @@ pub struct Config {
     #[serde(skip)]
     pub base_dir: PathBuf,
     /// Admin-console bot config overrides (tools/skills/require_approval),
-    /// applied over the bot files by `load_bots`/`list_configured_bots`.
+    /// applied when the admin's own fleet is loaded from the database. Never
+    /// applied to the seed templates, so members do not inherit them.
     /// Populated from the admin overlay at load; never read from TOML.
     #[serde(skip)]
     pub bot_config_overrides: BTreeMap<String, crate::admin::BotConfigOverlay>,
@@ -1274,9 +1284,8 @@ pub fn load_bots(config: &Config, dir: impl AsRef<Path>) -> Result<Vec<LoadedBot
     let mut bots = Vec::new();
     for path in paths {
         let raw = std::fs::read_to_string(&path)?;
-        let mut bot: BotConfig = toml::from_str(&raw)
+        let bot: BotConfig = toml::from_str(&raw)
             .map_err(|error| SeraError::Config(format!("{}: {error}", path.display())))?;
-        apply_bot_config_override(config, &mut bot);
         if bot.name.is_empty() || bot.name.len() > 64 {
             return Err(SeraError::Config(format!(
                 "{}: invalid bot name",
@@ -1346,7 +1355,8 @@ pub fn load_bots(config: &Config, dir: impl AsRef<Path>) -> Result<Vec<LoadedBot
     Ok(bots)
 }
 
-/// On-disk fleet summary. Prompt files are not read. Secret material is not returned.
+/// Console-facing bot summary. Prompt text is never part of a listing; the
+/// detail endpoint reads the owner's row separately.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfiguredBot {
     pub id: String,
@@ -1358,146 +1368,9 @@ pub struct ConfiguredBot {
     pub require_approval: Vec<String>,
 }
 
-pub fn list_configured_bots(config: &Config) -> Result<Vec<ConfiguredBot>> {
-    const MAX_BOTS: usize = 64;
-    const MAX_ITEMS: usize = 64;
-    const MAX_FILE_BYTES: usize = 65_536;
-
-    validate_relative_dir("fleet.bots_dir", &config.fleet.bots_dir)?;
-    let base = config.base_dir.canonicalize().map_err(|error| {
-        SeraError::Config(format!(
-            "configuration directory cannot be resolved: {error}"
-        ))
-    })?;
-    let dir = base.join(&config.fleet.bots_dir);
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let dir = dir.canonicalize().map_err(|error| {
-        SeraError::Config(format!("fleet directory cannot be resolved: {error}"))
-    })?;
-    if !dir.starts_with(&base) {
-        return Err(SeraError::Config(
-            "fleet directory escapes the configuration directory".into(),
-        ));
-    }
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map_err(|error| SeraError::Config(format!("fleet directory cannot be read: {error}")))?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
-        .collect();
-    paths.sort();
-    if paths.len() > MAX_BOTS {
-        return Err(SeraError::Config("too many bot files".into()));
-    }
-    let mut names = std::collections::HashSet::new();
-    let mut bots = Vec::with_capacity(paths.len());
-    for path in paths {
-        let canonical = path
-            .canonicalize()
-            .map_err(|_| SeraError::Config("bot file cannot be resolved".into()))?;
-        if !canonical.starts_with(&dir) {
-            return Err(SeraError::Config(
-                "bot file escapes the fleet directory".into(),
-            ));
-        }
-        let raw = std::fs::read_to_string(&canonical)?;
-        if raw.len() > MAX_FILE_BYTES {
-            return Err(SeraError::Config("bot file is too large".into()));
-        }
-        let mut bot: BotConfig =
-            toml::from_str(&raw).map_err(|_| SeraError::Config("bot file is invalid".into()))?;
-        apply_bot_config_override(config, &mut bot);
-        let id = bot.name;
-        if !safe_bot_label(&id) || !names.insert(id.clone()) {
-            return Err(SeraError::Config("bot file is invalid".into()));
-        }
-        if bot.tools.len() > MAX_ITEMS
-            || bot.skills.len() > MAX_ITEMS
-            || bot.require_approval.len() > MAX_ITEMS
-            || bot.tools.iter().any(|item| !safe_bot_label(item))
-            || bot.skills.iter().any(|item| !safe_bot_label(item))
-            || bot
-                .require_approval
-                .iter()
-                .any(|item| !safe_bot_label(item) || !bot.tools.contains(item))
-        {
-            return Err(SeraError::Config("bot file is invalid".into()));
-        }
-        bots.push(ConfiguredBot {
-            id,
-            role: bot.role.as_str().to_owned(),
-            enabled: bot.enabled,
-            model: bot.model,
-            tools: bot.tools,
-            skills: bot.skills,
-            require_approval: bot.require_approval,
-        });
-    }
-    bots.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok(bots)
-}
-
-/// Read one bot's system prompt file (`bots/<id>.toml` → its `system_prompt`),
-/// with the same confinement rules as `load_bots`. Returns `Ok(None)` when the
-/// bot file does not exist. Used by owner-facing detail endpoints; list
-/// endpoints never call this so prompts stay out of fleet listings.
-pub fn load_bot_prompt(config: &Config, id: &str) -> Result<Option<String>> {
-    if !safe_bot_label(id) {
-        return Err(SeraError::Validation("invalid bot id".into()));
-    }
-    validate_relative_dir("fleet.bots_dir", &config.fleet.bots_dir)?;
-    let base = config.base_dir.canonicalize().map_err(|error| {
-        SeraError::Config(format!(
-            "configuration directory cannot be resolved: {error}"
-        ))
-    })?;
-    let dir = base.join(&config.fleet.bots_dir);
-    if !dir.exists() {
-        return Ok(None);
-    }
-    let dir = dir.canonicalize().map_err(|error| {
-        SeraError::Config(format!("fleet directory cannot be resolved: {error}"))
-    })?;
-    if !dir.starts_with(&base) {
-        return Err(SeraError::Config(
-            "fleet directory escapes the configuration directory".into(),
-        ));
-    }
-    let bot_path = dir.join(format!("{id}.toml"));
-    if !bot_path.exists() {
-        return Ok(None);
-    }
-    let canonical = bot_path
-        .canonicalize()
-        .map_err(|_| SeraError::Config("bot file cannot be resolved".into()))?;
-    if !canonical.starts_with(&dir) {
-        return Err(SeraError::Config(
-            "bot file escapes the fleet directory".into(),
-        ));
-    }
-    let raw = std::fs::read_to_string(&canonical)?;
-    let mut bot: BotConfig =
-        toml::from_str(&raw).map_err(|_| SeraError::Config("bot file is invalid".into()))?;
-    apply_bot_config_override(config, &mut bot);
-    let prompt_path = config.path(&bot.system_prompt);
-    let prompt_canonical = prompt_path.canonicalize().map_err(|error| {
-        SeraError::Config(format!(
-            "cannot resolve prompt {}: {error}",
-            prompt_path.display()
-        ))
-    })?;
-    if !prompt_canonical.starts_with(&config.base_dir) {
-        return Err(SeraError::Config(
-            "prompt escapes the configuration directory".into(),
-        ));
-    }
-    Ok(Some(std::fs::read_to_string(&prompt_canonical)?))
-}
-
-/// Overlay the admin-console bot config (tools/skills/require_approval) over a
-/// bot file's parsed config. Only fields the console actually saved override.
+/// Overlay the admin-console bot config (tools/skills/require_approval) over
+/// the admin's own fleet rows. Only fields the console actually saved
+/// override; members' fleets are loaded without it.
 pub fn apply_bot_config_override(config: &Config, bot: &mut BotConfig) {
     if let Some(overrides) = config.bot_config_overrides.get(&bot.name) {
         if let Some(tools) = &overrides.tools {
@@ -1593,28 +1466,30 @@ const MAX_BOT_DESCRIPTION_CHARS: usize = 2000;
 const MAX_SCAFFOLD_TOOLS: usize = 32;
 const MAX_SCAFFOLD_SKILLS: usize = 16;
 
+/// A specialist built from the fixed template, ready to become a per-user
+/// `bots` row. No filesystem paths: the prompt lives in the row.
 #[derive(Debug, Clone)]
-pub struct ScaffoldedBot {
+pub struct ScaffoldedSpecialist {
     pub id: String,
-    pub bot_file: String,
-    pub prompt_file: String,
-    pub bot_path: PathBuf,
-    pub prompt_path: PathBuf,
+    pub config: BotConfig,
+    pub prompt: String,
     pub tools: Vec<String>,
     pub skills: Vec<String>,
     pub require_approval: Vec<String>,
 }
 
-/// Write `bots/<id>.toml` and `prompts/<id>.txt` from the fixed specialist template.
-/// Paths come from `[fleet]`, never from the caller. The bot stays disabled.
-pub fn scaffold_specialist_bot(
-    config: &Config,
+/// Build the fixed specialist template as a per-user fleet row. `known_skills`
+/// is the acting user's effective catalog ids (shipped ∪ their own rows).
+/// The bot stays disabled. The caller writes the row through the acting
+/// user's scoped store method.
+pub fn build_specialist_bot(
     id: &str,
     description: &str,
     tools: Option<&[String]>,
     skills: Option<&[String]>,
+    known_skills: &[String],
     policy: &crate::policy::Policy,
-) -> Result<ScaffoldedBot> {
+) -> Result<ScaffoldedSpecialist> {
     validate_bot_id(id)?;
     if description.chars().count() > MAX_BOT_DESCRIPTION_CHARS {
         return Err(SeraError::Validation("description is too long".into()));
@@ -1635,7 +1510,7 @@ pub fn scaffold_specialist_bot(
             .map(|tool| (*tool).to_owned())
             .collect(),
     };
-    let skills = normalize_skill_list(config, skills.unwrap_or(&[]))?;
+    let skills = normalize_skill_list(known_skills, skills.unwrap_or(&[]))?;
     let prompt = specialist_prompt(description);
     if !policy.is_allowed(description) || !policy.is_allowed(&prompt) {
         return Err(SeraError::PolicyViolation);
@@ -1645,28 +1520,24 @@ pub fn scaffold_specialist_bot(
         .filter(|tool| EXTERNAL_EFFECT_TOOLS.contains(&tool.as_str()))
         .cloned()
         .collect();
-
-    let bots_dir = fleet_dir(config, &config.fleet.bots_dir)?;
-    let prompts_dir = fleet_dir(config, &config.fleet.prompts_dir)?;
-    let bot_path = bots_dir.join(format!("{id}.toml"));
-    let prompt_path = prompts_dir.join(format!("{id}.txt"));
-    if bot_path.exists() || prompt_path.exists() {
-        return Err(SeraError::InvalidState("bot already exists".into()));
-    }
-    let bot_file = relative_fleet_file(&config.fleet.bots_dir, &format!("{id}.toml"));
-    let prompt_file = relative_fleet_file(&config.fleet.prompts_dir, &format!("{id}.txt"));
-    let toml_body = render_bot_toml(id, &prompt_file, &skills, &tools, &require_approval);
-    write_new_file(&prompt_path, &prompt)?;
-    if let Err(error) = write_new_file(&bot_path, &toml_body) {
-        let _ = std::fs::remove_file(&prompt_path);
-        return Err(error);
-    }
-    Ok(ScaffoldedBot {
+    let config = BotConfig {
+        name: id.to_owned(),
+        trigger: "command".into(),
+        model: None,
+        // The prompt is stored in the row, not read from a file.
+        system_prompt: String::new(),
+        skills: skills.clone(),
+        tools: tools.clone(),
+        require_approval: require_approval.clone(),
+        enabled: false,
+        temperature: None,
+        role: BotRole::Specialist,
+        delegates: Vec::new(),
+    };
+    Ok(ScaffoldedSpecialist {
         id: id.to_owned(),
-        bot_file,
-        prompt_file,
-        bot_path,
-        prompt_path,
+        config,
+        prompt,
         tools,
         skills,
         require_approval,
@@ -1713,15 +1584,13 @@ fn normalize_tool_list(tools: &[String]) -> Result<Vec<String>> {
     Ok(out)
 }
 
-fn normalize_skill_list(config: &Config, skills: &[String]) -> Result<Vec<String>> {
+fn normalize_skill_list(known: &[String], skills: &[String]) -> Result<Vec<String>> {
     if skills.len() > MAX_SCAFFOLD_SKILLS {
         return Err(SeraError::Validation("too many skills".into()));
     }
     if skills.is_empty() {
         return Ok(Vec::new());
     }
-    let catalog = crate::skills::SkillCatalog::load(config)?;
-    let known = catalog.skill_ids();
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(skills.len());
     for skill in skills {
@@ -1747,89 +1616,6 @@ fn specialist_prompt(description: &str) -> String {
         body.push('\n');
     }
     body
-}
-
-fn render_bot_toml(
-    id: &str,
-    prompt_file: &str,
-    skills: &[String],
-    tools: &[String],
-    require_approval: &[String],
-) -> String {
-    format!(
-        "name = {id}\nrole = \"specialist\"\ndelegates = []\ntrigger = \"command\"\nsystem_prompt = {prompt}\nskills = {skills}\ntools = {tools}\nrequire_approval = {approvals}\nenabled = false\n",
-        id = toml_basic_string(id),
-        prompt = toml_basic_string(prompt_file),
-        skills = toml_string_array(skills),
-        tools = toml_string_array(tools),
-        approvals = toml_string_array(require_approval),
-    )
-}
-
-fn toml_basic_string(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
-fn toml_string_array(values: &[String]) -> String {
-    if values.is_empty() {
-        return "[]".into();
-    }
-    let items = values
-        .iter()
-        .map(|value| toml_basic_string(value))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("[{items}]")
-}
-
-fn fleet_dir(config: &Config, relative: &str) -> Result<PathBuf> {
-    validate_relative_dir("fleet directory", relative)?;
-    let dir = config.base_dir.join(relative);
-    std::fs::create_dir_all(&dir)?;
-    let base = config.base_dir.canonicalize().map_err(|error| {
-        SeraError::Config(format!(
-            "configuration directory cannot be resolved: {error}"
-        ))
-    })?;
-    let dir = dir.canonicalize().map_err(|error| {
-        SeraError::Config(format!("fleet directory cannot be resolved: {error}"))
-    })?;
-    if !dir.starts_with(&base) {
-        return Err(SeraError::Config(
-            "fleet directory escapes the configuration directory".into(),
-        ));
-    }
-    Ok(dir)
-}
-
-fn relative_fleet_file(dir: &str, file_name: &str) -> String {
-    let mut parts = Vec::new();
-    for component in Path::new(dir).components() {
-        if let std::path::Component::Normal(part) = component {
-            parts.push(part.to_string_lossy().into_owned());
-        }
-    }
-    parts.push(file_name.to_owned());
-    parts.join("/")
-}
-
-fn write_new_file(path: &Path, contents: &str) -> Result<()> {
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(mut file) => {
-            use std::io::Write;
-            file.write_all(contents.as_bytes())?;
-            file.sync_all()?;
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(SeraError::InvalidState("bot already exists".into()))
-        }
-        Err(error) => Err(error.into()),
-    }
 }
 
 fn validate_relative_dir(label: &str, value: &str) -> Result<()> {
@@ -2270,102 +2056,86 @@ enabled = false
     }
 
     #[test]
-    fn scaffolds_disabled_specialist_under_configured_dirs() {
-        let root = std::env::temp_dir().join(format!("serabot-scaffold-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let root = root.canonicalize().unwrap();
-        let skill_dir = root.join("skills").join("ask");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: \"Ask\"\ndescription: \"Synthetic ask skill\"\n---\n\n# Ask\n",
-        )
-        .unwrap();
-        let config = Config {
-            base_dir: root.clone(),
-            skills: SkillsConfig {
-                dir: "skills".into(),
-            },
-            ..Config::default()
-        };
+    fn builds_a_disabled_specialist_from_the_fixed_template() {
         let policy = crate::policy::Policy::empty();
-        let scaffolded = scaffold_specialist_bot(
-            &config,
+        let known = vec!["ask".to_owned()];
+        let scaffolded = build_specialist_bot(
             "notes",
             "Synthetic notes specialist.",
             Some(&["rag_search".into(), "firecrawl_search".into()]),
             Some(&["ask".into()]),
+            &known,
             &policy,
         )
         .unwrap();
-        assert_eq!(scaffolded.bot_file, "bots/notes.toml");
-        assert_eq!(scaffolded.prompt_file, "prompts/notes.txt");
-        assert!(scaffolded.bot_path.starts_with(&root));
-        assert!(scaffolded.prompt_path.starts_with(&root));
-        let raw = std::fs::read_to_string(&scaffolded.bot_path).unwrap();
-        let bot: BotConfig = toml::from_str(&raw).unwrap();
-        assert_eq!(bot.name, "notes");
-        assert!(!bot.enabled);
-        assert_eq!(bot.role, BotRole::Specialist);
-        assert!(bot.delegates.is_empty());
-        assert_eq!(bot.system_prompt, "prompts/notes.txt");
-        assert_eq!(bot.tools, vec!["rag_search", "firecrawl_search"]);
-        assert_eq!(bot.skills, vec!["ask"]);
-        assert_eq!(bot.require_approval, vec!["firecrawl_search"]);
-        assert!(!bot.tools.iter().any(|tool| tool == "delegate"));
-        let prompt = std::fs::read_to_string(&scaffolded.prompt_path).unwrap();
-        assert!(prompt.contains("do not delegate"));
-        assert!(prompt.contains("Synthetic notes specialist."));
-        assert!(scaffold_specialist_bot(&config, "notes", "", None, None, &policy).is_err());
-        assert!(scaffold_specialist_bot(&config, "../outside", "", None, None, &policy).is_err());
-        assert!(scaffold_specialist_bot(&config, "main", "", None, None, &policy).is_err());
+        assert_eq!(scaffolded.id, "notes");
+        assert_eq!(scaffolded.config.name, "notes");
+        assert!(!scaffolded.config.enabled);
+        assert_eq!(scaffolded.config.role, BotRole::Specialist);
+        assert!(scaffolded.config.delegates.is_empty());
+        assert!(scaffolded.config.system_prompt.is_empty());
+        assert_eq!(
+            scaffolded.config.tools,
+            vec!["rag_search", "firecrawl_search"]
+        );
+        assert_eq!(scaffolded.config.skills, vec!["ask"]);
+        assert_eq!(scaffolded.config.require_approval, vec!["firecrawl_search"]);
         assert!(
-            scaffold_specialist_bot(
-                &config,
+            !scaffolded
+                .config
+                .tools
+                .iter()
+                .any(|tool| tool == "delegate")
+        );
+        assert!(scaffolded.prompt.contains("do not delegate"));
+        assert!(scaffolded.prompt.contains("Synthetic notes specialist."));
+        assert!(build_specialist_bot("../outside", "", None, None, &known, &policy).is_err());
+        assert!(build_specialist_bot("main", "", None, None, &known, &policy).is_err());
+        assert!(
+            build_specialist_bot(
                 "other",
                 "",
                 Some(&["delegate".into()]),
                 None,
+                &known,
                 &policy
             )
             .is_err()
         );
         assert!(
-            scaffold_specialist_bot(
-                &config,
+            build_specialist_bot(
                 "other",
                 "",
                 Some(&["not_a_tool".into()]),
                 None,
+                &known,
                 &policy
             )
             .is_err()
         );
         assert!(
-            scaffold_specialist_bot(
-                &config,
+            build_specialist_bot(
                 "other",
                 "",
                 None,
                 Some(&["missing-skill".into()]),
+                &known,
                 &policy
             )
             .is_err()
         );
         let blocked = crate::policy::Policy::from_text("synthetic blocked phrase");
         assert!(
-            scaffold_specialist_bot(
-                &config,
+            build_specialist_bot(
                 "other",
                 "notes about synthetic blocked phrase",
                 None,
                 None,
+                &known,
                 &blocked
             )
             .is_err()
         );
-        assert!(!root.join("bots").join("other.toml").exists());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

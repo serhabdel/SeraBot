@@ -7,7 +7,6 @@
 //! the event stream stay the single source of truth. Every bound is counted in
 //! Rust from that persisted state, never from model intent.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -17,9 +16,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::config::LoadedBot;
 use crate::domain::{Role, new_id};
 use crate::error::{Result, SeraError};
+use crate::fleet::{Fleet, FleetRegistry};
 use crate::gateway::{Tool, ToolContext, ToolOutput, ToolSpec};
 use crate::model_router::ModelRouter;
 use crate::orchestration::{
@@ -267,7 +266,7 @@ fn refuse_bound(
 
 /// Build the payload of one member turn on the same conversation.
 fn member_turn_payload(
-    bots: &HashMap<String, LoadedBot>,
+    bots: &Fleet,
     router: &ModelRouter,
     conversation_id: &str,
     to_bot: &str,
@@ -335,15 +334,15 @@ pub(crate) fn enqueue_turn_task_with_id(
 #[derive(Clone)]
 pub struct TeamAskTool {
     store: Store,
-    bots: Arc<HashMap<String, LoadedBot>>,
+    fleet: Arc<FleetRegistry>,
     router: ModelRouter,
 }
 
 impl TeamAskTool {
-    pub fn new(store: Store, bots: Arc<HashMap<String, LoadedBot>>, router: ModelRouter) -> Self {
+    pub fn new(store: Store, fleet: Arc<FleetRegistry>, router: ModelRouter) -> Self {
         Self {
             store,
-            bots,
+            fleet,
             router,
         }
     }
@@ -498,6 +497,7 @@ impl Tool for TeamAskTool {
             ));
         }
 
+        let fleet = self.fleet.load(&context.user_id)?;
         let batch = to_bots.len();
         let mut queued = Vec::new();
         for to_bot in &to_bots {
@@ -512,7 +512,7 @@ impl Tool for TeamAskTool {
             // read before these rows exist, so the bound still covers this turn.
             let child = new_id();
             let payload = member_turn_payload(
-                &self.bots,
+                &fleet,
                 &self.router,
                 conversation_id,
                 to_bot,
@@ -570,7 +570,7 @@ impl Tool for TeamAskTool {
 #[derive(Clone)]
 pub struct TeamReplyTool {
     store: Store,
-    bots: Arc<HashMap<String, LoadedBot>>,
+    fleet: Arc<FleetRegistry>,
     router: ModelRouter,
     policy: Arc<Policy>,
 }
@@ -578,13 +578,13 @@ pub struct TeamReplyTool {
 impl TeamReplyTool {
     pub fn new(
         store: Store,
-        bots: Arc<HashMap<String, LoadedBot>>,
+        fleet: Arc<FleetRegistry>,
         router: ModelRouter,
         policy: Arc<Policy>,
     ) -> Self {
         Self {
             store,
-            bots,
+            fleet,
             router,
             policy,
         }
@@ -718,8 +718,9 @@ impl Tool for TeamReplyTool {
         // never leave an untracked team message behind. The count above is read
         // before these rows exist, so the bound still covers this turn.
         let child = new_id();
+        let fleet = self.fleet.load(&context.user_id)?;
         let payload = member_turn_payload(
-            &self.bots,
+            &fleet,
             &self.router,
             conversation_id,
             &to_bot,
@@ -853,17 +854,18 @@ mod tests {
         }
     }
 
-    fn bots() -> Arc<HashMap<String, LoadedBot>> {
-        Arc::new(
-            [
-                bot("main", BotRole::Orchestrator),
-                bot("analyst", BotRole::Specialist),
-                bot("maker", BotRole::Specialist),
-            ]
-            .into_iter()
-            .map(|bot| (bot.config.name.clone(), bot))
-            .collect(),
-        )
+    fn bots() -> Vec<LoadedBot> {
+        vec![
+            bot("main", BotRole::Orchestrator),
+            bot("analyst", BotRole::Specialist),
+            bot("maker", BotRole::Specialist),
+        ]
+    }
+
+    fn fleet(store: &Store) -> Arc<FleetRegistry> {
+        let config = Arc::new(Config::default());
+        let catalog = Arc::new(crate::skills::SkillCatalog::load(&config).unwrap());
+        Arc::new(FleetRegistry::new(config, store.clone(), bots(), catalog).unwrap())
     }
 
     fn router() -> ModelRouter {
@@ -938,7 +940,7 @@ mod tests {
     #[tokio::test]
     async fn team_ask_audits_the_member_turn_it_queues() {
         let (store, root) = store();
-        let tool = TeamAskTool::new(store.clone(), bots(), router());
+        let tool = TeamAskTool::new(store.clone(), fleet(&store), router());
         let turn = store
             .create_turn(&admin(&store), &root, ORCHESTRATOR_BOT, ROOM, &json!({}))
             .unwrap();
@@ -993,7 +995,7 @@ mod tests {
     #[tokio::test]
     async fn team_ask_queues_no_member_turn_when_the_audit_fails() {
         let (store, root) = store();
-        let tool = TeamAskTool::new(store.clone(), bots(), router());
+        let tool = TeamAskTool::new(store.clone(), fleet(&store), router());
         let turn = store
             .create_turn(&admin(&store), &root, ORCHESTRATOR_BOT, ROOM, &json!({}))
             .unwrap();
@@ -1031,7 +1033,7 @@ mod tests {
     #[tokio::test]
     async fn team_ask_refuses_a_ninth_team_message() {
         let (store, root) = store();
-        let tool = TeamAskTool::new(store.clone(), bots(), router());
+        let tool = TeamAskTool::new(store.clone(), fleet(&store), router());
         // Six messages fit, so asking two more members lands exactly on eight.
         for _ in 0..6 {
             seed(&store, AUDIT_ASKED, &root, ORCHESTRATOR_BOT);
@@ -1081,7 +1083,12 @@ mod tests {
         let (store, root) = store();
         seed(&store, AUDIT_REPLIED, &root, "analyst");
         seed(&store, AUDIT_REPLIED, &root, "analyst");
-        let tool = TeamReplyTool::new(store.clone(), bots(), router(), Arc::new(Policy::empty()));
+        let tool = TeamReplyTool::new(
+            store.clone(),
+            fleet(&store),
+            router(),
+            Arc::new(Policy::empty()),
+        );
         let admin = admin(&store);
         let task = store
             .enqueue_task(
@@ -1118,7 +1125,12 @@ mod tests {
     #[tokio::test]
     async fn peer_reply_rounds_stop_at_three() {
         let (store, root) = store();
-        let tool = TeamReplyTool::new(store.clone(), bots(), router(), Arc::new(Policy::empty()));
+        let tool = TeamReplyTool::new(
+            store.clone(),
+            fleet(&store),
+            router(),
+            Arc::new(Policy::empty()),
+        );
         let admin = admin(&store);
         let task = store
             .enqueue_task(
@@ -1152,7 +1164,12 @@ mod tests {
     #[tokio::test]
     async fn team_reply_requires_a_team_turn_and_a_team_member() {
         let (store, root) = store();
-        let tool = TeamReplyTool::new(store.clone(), bots(), router(), Arc::new(Policy::empty()));
+        let tool = TeamReplyTool::new(
+            store.clone(),
+            fleet(&store),
+            router(),
+            Arc::new(Policy::empty()),
+        );
         let admin = admin(&store);
         let task = store
             .enqueue_task(

@@ -1624,7 +1624,7 @@ mod tests {
                 require_approval: vec![],
                 enabled: true,
                 temperature: None,
-                role: Default::default(),
+                role: crate::orchestration::BotRole::Orchestrator,
                 delegates: vec![],
             },
             prompt: "test".into(),

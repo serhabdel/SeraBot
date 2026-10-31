@@ -64,14 +64,14 @@ never merge without the owner's OK.
 
 ## Phase 3 — per-user fleet, skills, memory
 
-- [ ] T3.1 Migration `0010_user_fleet.sql`: `bots (user_id, name)` +
+- [x] T3.1 Migration `0010_user_fleet.sql`: `bots (user_id, name)` +
       `prompt` column; `user_skills` table.
-- [ ] T3.2 Fleet seeding on user create; per-user load + validation
+- [x] T3.2 Fleet seeding on user create; per-user load + validation
       (orchestrator rule scoped per user).
-- [ ] T3.3 Skills: shipped catalog ∪ user rows; tools resolve per user.
-- [ ] T3.4 Memory injection limited to the acting user's rows.
-- [ ] T3.5 API: per-user bot CRUD + skill create (policy-scanned).
-- [ ] T3.6 Phase gate + commit + push.
+- [x] T3.3 Skills: shipped catalog ∪ user rows; tools resolve per user.
+- [x] T3.4 Memory injection limited to the acting user's rows.
+- [x] T3.5 API: per-user bot CRUD + skill create (policy-scanned).
+- [x] T3.6 Phase gate + commit + push.
 
 ## Phase 4 — user secrets, providers, Telegram
 
