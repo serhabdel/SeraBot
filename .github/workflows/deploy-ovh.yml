@@ -105,7 +105,9 @@ jobs:
           pubkey = open("/tmp/deploy_key.pub").read().strip()
           json.dump({"token": token, "pubkey": pubkey}, open("/tmp/sign-req.json", "w"))
           PY
-          curl -s --fail -X POST "https://${{ vars.OVH_VPS_IP }}:8788/sign" \
+          # The broker speaks plain HTTP on 8788 (ThreadingHTTPServer); the JWT
+          # is the only auth. See docs/deploy-automation.md for the TLS caveat.
+          curl -s --fail -X POST "http://${{ vars.OVH_VPS_IP }}:8788/sign" \
             -H "Content-Type: application/json" --data @/tmp/sign-req.json > /tmp/sign-resp.json
           python3 - <<'PY'
           import json

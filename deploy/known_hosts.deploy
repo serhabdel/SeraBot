@@ -1,4 +1,8 @@
-# Pinned host key of the OVH VPS deploy port (2222). Host keys are public;
-# pinning prevents MITM. Fill during the one-time VPS setup:
-#   ssh-keyscan -p 2222 <VPS_IP> > deploy/known_hosts.deploy
-# The deploy workflow uses StrictHostKeyChecking=yes with this file.
+# Pinned host key of the OVH VPS deploy port (2222). Host key pinning prevents
+# MITM: the deploy workflow connects with StrictHostKeyChecking=yes and this
+# file as UserKnownHostsFile, so a changed host key fails the deploy instead of
+# silently trusting it.
+#
+# Regenerate only when the VPS host key is legitimately rotated:
+#   ssh-keyscan -p 2222 51.222.36.17 > deploy/known_hosts.deploy
+[51.222.36.17]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE3yd8yJeLb+BIwCOpRyHLy5Z7hRiLmGHuFc6ynR59hL

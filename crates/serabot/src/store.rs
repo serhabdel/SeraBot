@@ -20,6 +20,7 @@ const MIGRATION_3: &str = include_str!("../migrations/0003_device_tokens.sql");
 const MIGRATION_4: &str = include_str!("../migrations/0004_conversation_meta.sql");
 const MIGRATION_5: &str = include_str!("../migrations/0005_conversation_teams.sql");
 const MIGRATION_6: &str = include_str!("../migrations/0006_console_redesign.sql");
+const MIGRATION_7: &str = include_str!("../migrations/0007_conversation_read_rowid.sql");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceToken {
@@ -178,6 +179,11 @@ impl Store {
         if version < 6 {
             connection.execute_batch(MIGRATION_6)?;
             connection.pragma_update(None, "user_version", 6)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 7 {
+            connection.execute_batch(MIGRATION_7)?;
+            connection.pragma_update(None, "user_version", 7)?;
         }
         let stored_dimension: Option<String> = connection
             .query_row(
@@ -433,7 +439,7 @@ impl Store {
                         (SELECT MAX(m.created_at) FROM messages m WHERE m.conversation_id = c.id),
                         (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id
                            AND m.role = 'assistant'
-                           AND (c.last_read_at IS NULL OR m.created_at > c.last_read_at))
+                           AND (c.last_read_rowid IS NULL OR m.rowid > c.last_read_rowid))
                  FROM conversations c WHERE c.id = ?1",
                 params![id],
                 conversation_from_row,
@@ -455,7 +461,7 @@ impl Store {
                     (SELECT MAX(m.created_at) FROM messages m WHERE m.conversation_id = c.id),
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id
                        AND m.role = 'assistant'
-                       AND (c.last_read_at IS NULL OR m.created_at > c.last_read_at))
+                       AND (c.last_read_rowid IS NULL OR m.rowid > c.last_read_rowid))
              FROM conversations c
              WHERE (?2 = 1 OR c.archived_at IS NULL)
                AND (?3 IS NULL OR c.updated_at < ?3 OR (c.updated_at = ?3 AND c.id < ?4))
@@ -490,9 +496,19 @@ impl Store {
     /// Returns false when the id is unknown.
     pub fn mark_conversation_read(&self, id: &str) -> Result<bool> {
         let connection = self.connection()?;
+        // Record the newest message's rowid, not the wall clock: rowids are
+        // monotonic, so a message appended immediately after this call is
+        // always counted as unread. Timestamp comparison could not promise
+        // that (see migrations/0007_conversation_read_rowid.sql).
         let changed = connection.execute(
-            "UPDATE conversations SET last_read_at = ?2 WHERE id = ?1",
-            params![id, now_string()],
+            "UPDATE conversations
+                SET last_read_rowid = (
+                    SELECT COALESCE(MAX(m.rowid), 0)
+                      FROM messages m
+                     WHERE m.conversation_id = ?1
+                )
+              WHERE id = ?1",
+            params![id],
         )?;
         Ok(changed == 1)
     }
@@ -1830,7 +1846,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -1881,7 +1897,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
