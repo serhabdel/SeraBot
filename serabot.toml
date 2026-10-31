@@ -44,11 +44,14 @@ max_output_tokens = 32768
 data_egress_approved = false
 # Builtin kind. Empty means a generic OpenAI-compatible base.
 kind = "mistral"
-# Fetch GET {base}/models, cache it, and intersect with the allowlist. Fail closed.
+# Fetch GET {base}/models and cache it. A fresh verified catalog EXPANDS the advertised
+# list to the full live models; selection is still verified (allowlist + snapshot) and
+# fails closed when the refresh fails or the snapshot is stale.
 catalog_fetch = true
 catalog_ttl_secs = 1800
 # [llm] is the reserved "default" provider. Its model and bot overrides are allowed too.
-# /models and /providers show the allowlist, narrowed by the cached catalog when fetch is on.
+# /models and /providers show the live catalog when fresh, else the configured allowlist;
+# picking a model still requires it to be in the verified snapshot and the allowlist.
 # Optional logical classes for orchestration handoffs (models must appear above or in [llm].model).
 # [llm.classes]
 # routine = ["mistral-small-latest", "ministral-8b-latest"]
@@ -66,7 +69,8 @@ models = [
   "pixtral-large-latest",
 ]
 # Optional profiles. Store each api_key_secret with `serabot secrets set` before enabling.
-# Selection never grants consent. catalog_fetch narrows `models` and hides them if refresh fails.
+# Selection never grants consent. catalog_fetch expands the displayed list to the live
+# catalog when fresh and falls back to `models` when the refresh fails or is stale.
 # kind fills base_url when it is omitted. Cloud Code Assist hosts are rejected.
 #
 # [llm.providers.deepseek]
@@ -137,6 +141,9 @@ user_agent = "SeraBot/0.1 (personal research agent)"
 timeout_secs = 30
 max_response_bytes = 5242880
 morning_brief_enabled = true
+# When true, a watch run or morning brief with zero new/changed items and zero
+# failures sends no owner notification (the run is still recorded and audited).
+silent_when_empty = false
 
 [elevenlabs]
 enabled = false

@@ -24,6 +24,9 @@ window.__serabotMic = state;
 if (typeof MediaRecorder === "undefined" || !MediaRecorder) {
   return { ok: false, error: "This window has no MediaRecorder support." };
 }
+if (window.isSecureContext === false) {
+  return { ok: false, error: "This window is not a secure context, so the microphone API is unavailable. Launch via the packaged app (WebView2 flags missing?)." };
+}
 if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
   return { ok: false, error: "Microphone capture is not available in this window." };
 }
@@ -32,7 +35,10 @@ try {
   stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 } catch (error) {
   const name = error && error.name ? error.name : "";
-  if (name === "NotAllowedError" || name === "SecurityError") {
+  if (name === "NotAllowedError") {
+    return { ok: false, error: "Microphone permission was denied. (WebView2 denied the capture permission)" };
+  }
+  if (name === "SecurityError") {
     return { ok: false, error: "Microphone permission was denied." };
   }
   if (name === "NotFoundError" || name === "DevicesNotFoundError") {
@@ -345,6 +351,29 @@ mod tests {
         assert!(STOP_JS.contains(STATE_KEY));
         assert!(READ_JS.contains(STATE_KEY));
         assert!(CANCEL_JS.contains(STATE_KEY));
+    }
+
+    #[test]
+    fn start_script_checks_secure_context_before_the_microphone_api() {
+        let secure_check = START_JS
+            .find("window.isSecureContext === false")
+            .expect("START_JS must probe window.isSecureContext");
+        let media_guard = START_JS
+            .find("navigator.mediaDevices")
+            .expect("START_JS must guard navigator.mediaDevices");
+        assert!(secure_check < media_guard);
+        assert!(START_JS.contains(
+            "This window is not a secure context, so the microphone API is unavailable. Launch via the packaged app (WebView2 flags missing?)."
+        ));
+    }
+
+    #[test]
+    fn start_script_hints_at_webview2_when_permission_is_denied() {
+        assert!(START_JS.contains(
+            "Microphone permission was denied. (WebView2 denied the capture permission)"
+        ));
+        // SecurityError keeps the plain message.
+        assert!(START_JS.contains(r#"error: "Microphone permission was denied.""#));
     }
 
     #[test]

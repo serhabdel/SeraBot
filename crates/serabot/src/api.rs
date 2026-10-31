@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,7 +20,9 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 
-use crate::admin::{AdminStore, BotProfile, ProviderSecrets, connector_secret_roles};
+use crate::admin::{
+    AdminStore, BotConfigOverlay, BotProfile, ProviderSecrets, connector_secret_roles,
+};
 use crate::config::{Config, OAuthConnectorSettings, ProviderConfig, scaffold_specialist_bot};
 use crate::connectors::{ApiKeyProbe, probe_api_key};
 use crate::domain::Task;
@@ -29,7 +31,9 @@ use crate::gateway::Decision;
 use crate::maker::ArtifactStore;
 use crate::memory;
 use crate::model_router::ModelSelection;
-use crate::orchestration::{ConversationKind, scoped_conversation_id, validate_conversation_id};
+use crate::orchestration::{
+    BotRole, ConversationKind, safe_bot_label, scoped_conversation_id, validate_conversation_id,
+};
 use crate::runtime::{ApprovalNotice, Notifier, Runtime};
 use crate::secrets::SharedSecrets;
 use crate::skills::{SkillCatalog, create_skill, discard_created_skill};
@@ -121,8 +125,10 @@ pub fn router(state: ApiState) -> Router {
     let protected = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
+        .route("/v1/usage", get(usage))
         .route("/v1/messages", post(send_message))
         .route("/v1/bots", get(list_bots).post(create_bot))
+        .route("/v1/bots/{id}", get(bot_detail))
         .route("/v1/skills", get(list_skills).post(create_skill_pack))
         .route(
             "/v1/conversations",
@@ -161,6 +167,7 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/admin/audio", put(admin_set_audio))
         .route("/v1/admin/bots/{id}", put(admin_set_bot_profile))
+        .route("/v1/admin/bots/{id}/config", put(admin_update_bot_config))
         .route("/v1/admin/restart", post(admin_restart))
         .route("/v1/connectors", get(list_connectors))
         .route("/v1/models", get(models))
@@ -271,6 +278,47 @@ async fn status(State(state): State<Arc<ApiState>>) -> Response {
         "policy_version": "managed-by-server",
     }))
     .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageQuery {
+    #[serde(default)]
+    days: Option<i64>,
+    #[serde(default)]
+    bot: Option<String>,
+    #[serde(default)]
+    conversation_id: Option<String>,
+}
+
+/// `GET /v1/usage` rolls up `model.used` audit rows. `days` defaults to 7 and
+/// is clamped to 1..=90; `bot` and `conversation_id` are optional filters.
+async fn usage(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<UsageQuery>,
+) -> Result<Json<Value>> {
+    let days = query.days.unwrap_or(7).clamp(1, 90);
+    if let Some(bot) = &query.bot
+        && !safe_bot_label(bot)
+    {
+        return Err(SeraError::Validation("invalid bot id".into()));
+    }
+    if let Some(conversation_id) = &query.conversation_id {
+        validate_conversation_id(conversation_id)?;
+    }
+    let since = Utc::now() - chrono::Duration::days(days);
+    let rollup = state.store.usage_rollup(
+        since,
+        query.bot.as_deref(),
+        query.conversation_id.as_deref(),
+    )?;
+    let body = json!({
+        "totals": rollup.totals,
+        "per_day": rollup.per_day,
+        "per_bot": rollup.per_bot,
+    });
+    // Same egress scan as the model catalog endpoints.
+    state.runtime.scan_owner_output(&body.to_string())?;
+    Ok(Json(body))
 }
 
 #[derive(Debug, Deserialize)]
@@ -966,6 +1014,103 @@ async fn list_bots(State(state): State<Arc<ApiState>>) -> Result<Json<Value>> {
         })
         .collect::<Vec<_>>();
     let body = json!({ "bots": bots });
+    state.runtime.scan_owner_output(&body.to_string())?;
+    Ok(Json(body))
+}
+
+/// Bot config lists with the admin-console overlay merged over the bot file, so
+/// the console sees values it just saved even before the restart.
+fn bot_lists_with_override(
+    state: &ApiState,
+    entry: &crate::config::ConfiguredBot,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut tools = entry.tools.clone();
+    let mut skills = entry.skills.clone();
+    let mut require_approval = entry.require_approval.clone();
+    if let Some(admin) = &state.admin
+        && let Some(overlay) = admin.bot_config(&entry.id)
+    {
+        if let Some(value) = overlay.tools {
+            tools = value;
+        }
+        if let Some(value) = overlay.skills {
+            skills = value;
+        }
+        if let Some(value) = overlay.require_approval {
+            require_approval = value;
+        }
+    }
+    (tools, skills, require_approval)
+}
+
+/// Cap for the `instructions` field of `GET /v1/bots/{id}`.
+const MAX_INSTRUCTIONS_BYTES: usize = 32 * 1024;
+
+/// `GET /v1/bots/{id}` — one bot's full owner-facing detail. No secrets and no
+/// secret values; the response passes the egress scan.
+async fn bot_detail(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    if !safe_bot_label(&id) {
+        return Err(SeraError::NotFound(format!("bot {id}")));
+    }
+    let configured = crate::config::list_configured_bots(&state.config)?;
+    let Some(entry) = configured.iter().find(|bot| bot.id == id) else {
+        return Err(SeraError::NotFound(format!("bot {id}")));
+    };
+    let profile = state
+        .admin
+        .as_ref()
+        .and_then(|admin| admin.bot_profile(&id));
+    let loaded = state.runtime.bot(&id).cloned();
+    let prompt = loaded.as_ref().map(|bot| bot.prompt.clone()).or_else(|| {
+        crate::config::load_bot_prompt(&state.config, &id)
+            .ok()
+            .flatten()
+    });
+    let model_hint = loaded
+        .as_ref()
+        .and_then(|bot| bot.config.model.clone())
+        .or_else(|| state.config.llm.bot_models.get(&id).cloned())
+        .or_else(|| entry.model.clone());
+    let model = model_hint.unwrap_or_else(|| state.config.llm.model.clone());
+    let provider = state
+        .runtime
+        .router()
+        .provider_for_model(&model)
+        .unwrap_or_else(|| "default".into());
+    let fallback = state.runtime.router().fallback_for_model(&model);
+    let routing_classes = state.runtime.router().classes_for_model(&model);
+    let (tools, skills, require_approval) = bot_lists_with_override(&state, entry);
+    let (instructions, instructions_bytes) = match prompt {
+        Some(text) if text.len() <= MAX_INSTRUCTIONS_BYTES => (Some(text.clone()), text.len()),
+        // Over the cap the content is withheld entirely; the byte count is kept.
+        Some(text) => (None, text.len()),
+        None => (None, 0),
+    };
+    let memory_count = state.store.count_memories()?;
+    let artifact_count = state.store.count_bot_artifacts(&id)?;
+    let body = json!({
+        "id": entry.id,
+        "display_name": profile.as_ref().map(|p| p.display_name.clone()).filter(|name| !name.is_empty()),
+        "role": entry.role,
+        "description": profile.as_ref().map(|p| p.description.clone()).filter(|text| !text.is_empty()),
+        "avatar": profile.as_ref().map(|p| p.avatar.clone()).filter(|avatar| !avatar.is_empty()),
+        "enabled": entry.enabled,
+        "provider": provider,
+        "model": model,
+        "fallback_provider": fallback.as_ref().map(|route| route.provider.clone()),
+        "fallback_model": fallback.as_ref().map(|route| route.model.clone()),
+        "routing_classes": routing_classes,
+        "instructions": instructions,
+        "instructions_bytes": instructions_bytes,
+        "skills": skills,
+        "tools": tools,
+        "require_approval": require_approval,
+        "memory_count": memory_count,
+        "artifact_count": artifact_count,
+    });
     state.runtime.scan_owner_output(&body.to_string())?;
     Ok(Json(body))
 }
@@ -2226,6 +2371,176 @@ async fn admin_set_bot_profile(
         .map_err(admin_error)?;
     audit_config(&state, "config.bot_profile_saved", json!({"bot": id}))?;
     Ok(Json(json!({"saved": true, "restart_required": false})))
+}
+
+const MAX_BOT_CONFIG_TOOLS: usize = 32;
+const MAX_BOT_CONFIG_SKILLS: usize = 16;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BotConfigRequest {
+    #[serde(default)]
+    tools: Option<Vec<String>>,
+    #[serde(default)]
+    skills: Option<Vec<String>>,
+    #[serde(default)]
+    require_approval: Option<Vec<String>>,
+}
+
+/// Tool list rules matching the desktop `validate_tool_list` semantics on top
+/// of the server's tool registry: at most 32 unique safe ids, `delegate` only
+/// for the orchestrator, and every other tool must be a registered tool.
+fn validate_bot_tool_list(
+    state: &ApiState,
+    tools: &[String],
+    role: BotRole,
+) -> Result<Vec<String>> {
+    if tools.len() > MAX_BOT_CONFIG_TOOLS {
+        return Err(SeraError::Validation(format!(
+            "at most {MAX_BOT_CONFIG_TOOLS} tools are allowed"
+        )));
+    }
+    let mut seen = HashSet::with_capacity(tools.len());
+    let mut out = Vec::with_capacity(tools.len());
+    for tool in tools {
+        if !safe_bot_label(tool) {
+            return Err(SeraError::Validation(format!("invalid tool id '{tool}'")));
+        }
+        if tool == crate::delegate::DELEGATE_TOOL {
+            if role != BotRole::Orchestrator {
+                return Err(SeraError::Validation(
+                    "specialists cannot be granted delegate".into(),
+                ));
+            }
+        } else if !state.runtime.gateway().registry().is_registered(tool) {
+            return Err(SeraError::Validation(format!("unknown tool '{tool}'")));
+        }
+        if !seen.insert(tool.clone()) {
+            return Err(SeraError::Validation(format!("duplicate tool '{tool}'")));
+        }
+        out.push(tool.clone());
+    }
+    Ok(out)
+}
+
+/// Skill list rules matching the desktop `parse_skill_list` semantics plus the
+/// server's catalog check: at most 16 unique, valid skill ids that exist.
+fn validate_bot_skill_list(state: &ApiState, skills: &[String]) -> Result<Vec<String>> {
+    if skills.len() > MAX_BOT_CONFIG_SKILLS {
+        return Err(SeraError::Validation(format!(
+            "at most {MAX_BOT_CONFIG_SKILLS} skills are allowed"
+        )));
+    }
+    let catalog = SkillCatalog::load(&state.config)?;
+    let known = catalog.skill_ids();
+    let mut seen = HashSet::with_capacity(skills.len());
+    let mut out = Vec::with_capacity(skills.len());
+    for skill in skills {
+        crate::skills::validate_skill_id(skill)?;
+        if !known.iter().any(|id| id == skill) {
+            return Err(SeraError::Validation(format!("unknown skill '{skill}'")));
+        }
+        if !seen.insert(skill.clone()) {
+            return Err(SeraError::Validation(format!("duplicate skill '{skill}'")));
+        }
+        out.push(skill.clone());
+    }
+    Ok(out)
+}
+
+/// `require_approval` entries must be safe ids contained in the bot's
+/// effective tool list (the new tools when the request sets them).
+fn validate_require_approval_list(list: &[String], tools: &[String]) -> Result<Vec<String>> {
+    if list.len() > MAX_BOT_CONFIG_TOOLS {
+        return Err(SeraError::Validation(format!(
+            "at most {MAX_BOT_CONFIG_TOOLS} require_approval entries are allowed"
+        )));
+    }
+    let mut seen = HashSet::with_capacity(list.len());
+    let mut out = Vec::with_capacity(list.len());
+    for item in list {
+        if !safe_bot_label(item) {
+            return Err(SeraError::Validation(format!(
+                "invalid require_approval entry '{item}'"
+            )));
+        }
+        if !tools.iter().any(|tool| tool == item) {
+            return Err(SeraError::Validation(format!(
+                "require_approval entry '{item}' is not in the bot's tools"
+            )));
+        }
+        if !seen.insert(item.clone()) {
+            return Err(SeraError::Validation(format!(
+                "duplicate require_approval entry '{item}'"
+            )));
+        }
+        out.push(item.clone());
+    }
+    Ok(out)
+}
+
+/// `PUT /v1/admin/bots/{id}/config` — validate and persist a partial bot
+/// config update (tools/skills/require_approval) into the admin overlay, like
+/// `admin_set_bot_profile`. Takes effect after restart.
+async fn admin_update_bot_config(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(request): Json<BotConfigRequest>,
+) -> AdminResult<Json<Value>> {
+    let admin = admin_store(&state)?;
+    let configured = crate::config::list_configured_bots(&state.config).map_err(admin_error)?;
+    let Some(entry) = configured.iter().find(|bot| bot.id == id) else {
+        return Err(admin_error(SeraError::NotFound(format!("bot {id}"))));
+    };
+    if request.tools.is_none() && request.skills.is_none() && request.require_approval.is_none() {
+        return Err(admin_error(SeraError::Validation(
+            "at least one of tools, skills, require_approval is required".into(),
+        )));
+    }
+    // Untrusted input is scanned before it is validated or stored.
+    for list in [&request.tools, &request.skills, &request.require_approval]
+        .into_iter()
+        .flatten()
+    {
+        for item in list {
+            state.runtime.scan_owner_output(item).map_err(admin_error)?;
+        }
+    }
+    let role = state.runtime.bot(&id).map(|bot| bot.config.role).unwrap_or(
+        if entry.role == BotRole::Orchestrator.as_str() {
+            BotRole::Orchestrator
+        } else {
+            BotRole::Specialist
+        },
+    );
+    let (current_tools, _, _) = bot_lists_with_override(&state, entry);
+    let tools = match &request.tools {
+        Some(tools) => Some(validate_bot_tool_list(&state, tools, role).map_err(admin_error)?),
+        None => None,
+    };
+    let skills = match &request.skills {
+        Some(skills) => Some(validate_bot_skill_list(&state, skills).map_err(admin_error)?),
+        None => None,
+    };
+    let effective_tools = tools.clone().unwrap_or_else(|| current_tools.clone());
+    let require_approval = match &request.require_approval {
+        Some(list) => {
+            Some(validate_require_approval_list(list, &effective_tools).map_err(admin_error)?)
+        }
+        None => None,
+    };
+    admin
+        .set_bot_config(
+            &id,
+            BotConfigOverlay {
+                tools,
+                skills,
+                require_approval,
+            },
+        )
+        .map_err(admin_error)?;
+    audit_config(&state, "config.bot_config_saved", json!({"bot": id}))?;
+    Ok(Json(json!({"saved": true, "restart_required": true})))
 }
 
 #[derive(Deserialize)]
@@ -4318,6 +4633,403 @@ mod tests {
         let body = read_json(created).await;
         assert_eq!(body["conversation"]["title"], "Finance");
         assert_eq!(body["conversation"]["id"], "sec:finance");
+    }
+
+    fn write_bot(root: &std::path::Path, id: &str, prompt: &str, extra: &str) {
+        std::fs::create_dir_all(root.join("prompts")).unwrap();
+        std::fs::write(root.join("prompts").join(format!("{id}.txt")), prompt).unwrap();
+        std::fs::create_dir_all(root.join("bots")).unwrap();
+        std::fs::write(
+            root.join("bots").join(format!("{id}.toml")),
+            format!(
+                "name = \"{id}\"\ntrigger = \"command\"\nsystem_prompt = \"prompts/{id}.txt\"\n{extra}"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn usage_endpoint_rolls_up_model_used_rows_clamps_days_and_filters() {
+        let (app, _, store) = app();
+        let denied = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/usage", false, None))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let empty = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/usage", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(empty["totals"]["calls"], 0);
+        assert_eq!(empty["totals"]["prompt_tokens"], 0);
+        assert!(empty["per_day"].as_array().unwrap().is_empty());
+        assert!(empty["per_bot"].as_array().unwrap().is_empty());
+
+        let task = store
+            .enqueue_task(
+                "turn",
+                "main",
+                &json!({"conversation_id": "owner"}),
+                0,
+                Utc::now(),
+            )
+            .unwrap();
+        store
+            .record_audit(
+                "system",
+                "model.used",
+                None,
+                Some(&task.id),
+                None,
+                None,
+                Some("policy-synthetic"),
+                Some(&json!({
+                    "provider": "default",
+                    "model": "test",
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                    "history_messages": 2,
+                    "prompt_chars_est": 40,
+                })),
+            )
+            .unwrap();
+        store
+            .record_audit(
+                "system",
+                "model.used",
+                None,
+                Some(&task.id),
+                None,
+                None,
+                Some("policy-synthetic"),
+                Some(&json!({
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 100, "total_tokens": 200}
+                })),
+            )
+            .unwrap();
+        let old =
+            (Utc::now() - chrono::Duration::days(100)).to_rfc3339_opts(SecondsFormat::Millis, true);
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                &format!(
+                    "UPDATE audit_log SET at = '{old}' WHERE json_extract(details_json, '$.usage.total_tokens') = 200"
+                ),
+                [],
+            )
+            .unwrap();
+
+        // days=500 clamps to 90, so the 100-day-old row is excluded.
+        let body = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/usage?days=500", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["totals"]["calls"], 1);
+        assert_eq!(body["totals"]["prompt_tokens"], 10);
+        assert_eq!(body["totals"]["completion_tokens"], 5);
+        assert_eq!(body["totals"]["total_tokens"], 15);
+        assert_eq!(body["per_day"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["per_day"][0]["day"],
+            Utc::now().format("%Y-%m-%d").to_string()
+        );
+        assert_eq!(body["per_bot"].as_array().unwrap().len(), 1);
+        assert_eq!(body["per_bot"][0]["bot"], "main");
+        assert_eq!(body["per_bot"][0]["calls"], 1);
+
+        // days=0 clamps to 1; today's row is still inside the window.
+        let body = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/usage?days=0", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["totals"]["calls"], 1);
+
+        // Bot and conversation filters.
+        let body = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/usage?bot=analyst", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["totals"]["calls"], 0);
+        let body = read_json(
+            app.clone()
+                .oneshot(request(
+                    &app,
+                    "GET",
+                    "/v1/usage?conversation_id=owner",
+                    true,
+                    None,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["totals"]["calls"], 1);
+        let body = read_json(
+            app.clone()
+                .oneshot(request(
+                    &app,
+                    "GET",
+                    "/v1/usage?conversation_id=dir%3Aother",
+                    true,
+                    None,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["totals"]["calls"], 0);
+
+        // An unsafe bot filter value is rejected.
+        let invalid = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/usage?bot=bad%20id", true, None))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn bot_detail_returns_owner_fields_and_caps_instructions() {
+        let root = temp_base();
+        write_bot(
+            &root,
+            "notes",
+            "Synthetic notes prompt.",
+            "role = \"specialist\"\nskills = [\"ask\"]\ntools = [\"skill_list\"]\nenabled = true\n",
+        );
+        write_bot(&root, "big", &"x".repeat(40_000), "enabled = true\n");
+        let (app, _, store) = app_with_root(true, Policy::empty(), root.clone());
+
+        let denied = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/bots/notes", false, None))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let body = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/bots/notes", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["id"], "notes");
+        assert_eq!(body["role"], "specialist");
+        assert_eq!(body["enabled"], true);
+        assert_eq!(body["provider"], "default");
+        assert_eq!(body["model"], "test");
+        assert_eq!(body["fallback_provider"], Value::Null);
+        assert_eq!(body["fallback_model"], Value::Null);
+        assert_eq!(body["routing_classes"].as_array().unwrap().len(), 0);
+        assert_eq!(body["instructions"], "Synthetic notes prompt.");
+        assert_eq!(body["instructions_bytes"], "Synthetic notes prompt.".len());
+        assert_eq!(body["skills"][0], "ask");
+        assert_eq!(body["tools"][0], "skill_list");
+        assert_eq!(body["memory_count"], 0);
+        assert_eq!(body["artifact_count"], 0);
+        // No prompt path or secret material leaks.
+        let text = body.to_string();
+        assert!(!text.contains("prompts/notes.txt"));
+        assert!(!text.contains("synthetic-test-key"));
+
+        crate::memory::add(&store, "fact", "synthetic fact", "test").unwrap();
+        let body = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/bots/notes", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["memory_count"], 1);
+
+        // Over the 32 KB cap the instructions content is withheld, bytes kept.
+        let big = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/bots/big", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(big["instructions"], Value::Null);
+        assert_eq!(big["instructions_bytes"], 40_000);
+
+        let missing = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/bots/nobody", true, None))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn admin_bot_config_update_validates_persists_and_requires_restart() {
+        let root = temp_base();
+        write_bot(
+            &root,
+            "notes",
+            "Synthetic notes prompt.",
+            "role = \"specialist\"\nskills = []\ntools = [\"skill_list\"]\nenabled = true\n",
+        );
+        let (app, config, store) = app_with_root(true, Policy::empty(), root.clone());
+
+        let denied = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PUT",
+                "/v1/admin/bots/notes/config",
+                false,
+                Some(json!({"tools": []})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let missing = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PUT",
+                "/v1/admin/bots/nobody/config",
+                true,
+                Some(json!({"tools": []})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let cases: Vec<(Value, StatusCode)> = vec![
+            (json!({}), StatusCode::UNPROCESSABLE_ENTITY),
+            (
+                json!({"tools": ["not_a_tool"]}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                json!({"tools": ["delegate"]}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                json!({"tools": (0..33).map(|i| format!("t{i}")).collect::<Vec<_>>()}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                json!({"skills": ["nope"]}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                json!({"skills": (0..17).map(|i| format!("s{i}")).collect::<Vec<_>>()}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                json!({"tools": [], "require_approval": ["skill_list"]}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+        ];
+        for (payload, expected) in cases {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    &app,
+                    "PUT",
+                    "/v1/admin/bots/notes/config",
+                    true,
+                    Some(payload),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+
+        // Valid partial update: empty tools, one known skill, empty approvals.
+        let saved = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PUT",
+                "/v1/admin/bots/notes/config",
+                true,
+                Some(json!({"tools": [], "skills": ["ask"], "require_approval": []})),
+            ))
+            .await
+            .unwrap();
+        let status = saved.status();
+        let saved_body = read_json(saved).await;
+        assert_eq!(status, StatusCode::OK, "{saved_body}");
+        assert_eq!(saved_body["saved"], true);
+        assert_eq!(saved_body["restart_required"], true);
+
+        let overlay =
+            crate::admin::AdminOverlay::load(&crate::admin::AdminOverlay::path_for(&config))
+                .unwrap();
+        let entry = overlay.bot_configs.get("notes").expect("overlay entry");
+        assert_eq!(entry.tools, Some(vec![]));
+        assert_eq!(entry.skills, Some(vec!["ask".to_string()]));
+        assert_eq!(entry.require_approval, Some(vec![]));
+        assert!(
+            store
+                .list_audit(100)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.event == "config.bot_config_saved")
+        );
+
+        // The detail endpoint reflects the saved override before the restart.
+        let body = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/bots/notes", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["tools"].as_array().unwrap().len(), 0);
+        assert_eq!(body["skills"][0], "ask");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn admin_bot_config_allows_delegate_for_the_orchestrator_only() {
+        let (app, config, _) = app();
+        let saved = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PUT",
+                "/v1/admin/bots/main/config",
+                true,
+                Some(json!({"tools": ["delegate"]})),
+            ))
+            .await
+            .unwrap();
+        let status = saved.status();
+        let body = read_json(saved).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["restart_required"], true);
+        let overlay =
+            crate::admin::AdminOverlay::load(&crate::admin::AdminOverlay::path_for(&config))
+                .unwrap();
+        assert_eq!(
+            overlay
+                .bot_configs
+                .get("main")
+                .and_then(|e| e.tools.clone()),
+            Some(vec!["delegate".to_string()])
+        );
     }
 
     #[tokio::test]

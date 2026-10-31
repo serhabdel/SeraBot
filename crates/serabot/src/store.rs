@@ -6,6 +6,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{OptionalExtension, Row, params};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::domain::{
@@ -39,6 +40,40 @@ impl DeviceToken {
 }
 
 pub type StoreConnection = PooledConnection<SqliteConnectionManager>;
+
+/// Token-usage rollup over `model.used` audit rows.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct UsageRollup {
+    pub totals: UsageTotals,
+    pub per_day: Vec<UsageDay>,
+    pub per_bot: Vec<UsageBot>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct UsageTotals {
+    pub calls: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct UsageDay {
+    pub day: String,
+    pub calls: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct UsageBot {
+    pub bot: String,
+    pub calls: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+}
 
 /// The team attached to a `room:` conversation: an ordered list of bot ids.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -911,6 +946,119 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Token-usage rollup over `model.used` audit rows since `since`.
+    ///
+    /// `bot` attributes rows through the joined task's bot (falling back to a
+    /// `bot` field in the audit details, which the current writer does not
+    /// set); `conversation_id` filters through the task payload. Rows without
+    /// a `usage` object still count as calls with zero tokens. All lists are
+    /// capped.
+    pub fn usage_rollup(
+        &self,
+        since: DateTime<Utc>,
+        bot: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Result<UsageRollup> {
+        use rusqlite::types::Value as SqlValue;
+
+        let mut where_clause = String::from(
+            " FROM audit_log a LEFT JOIN tasks t ON t.id = a.task_id
+              WHERE a.event = 'model.used' AND a.at >= ?1",
+        );
+        let mut args: Vec<SqlValue> = vec![SqlValue::Text(to_string(since))];
+        if let Some(bot) = bot {
+            where_clause
+                .push_str(" AND COALESCE(t.bot, json_extract(a.details_json, '$.bot')) = ?");
+            args.push(SqlValue::Text(bot.to_owned()));
+        }
+        if let Some(conversation_id) = conversation_id {
+            where_clause.push_str(
+                " AND COALESCE(json_extract(t.payload_json, '$.conversation_id'), json_extract(a.details_json, '$.conversation_id')) = ?",
+            );
+            args.push(SqlValue::Text(conversation_id.to_owned()));
+        }
+        let token_sums = "COUNT(*),
+            COALESCE(SUM(CAST(json_extract(a.details_json, '$.usage.prompt_tokens') AS INTEGER)), 0),
+            COALESCE(SUM(CAST(json_extract(a.details_json, '$.usage.completion_tokens') AS INTEGER)), 0),
+            COALESCE(SUM(CAST(json_extract(a.details_json, '$.usage.total_tokens') AS INTEGER)), 0)";
+
+        let connection = self.connection()?;
+        let totals = {
+            let sql = format!("SELECT {token_sums}{where_clause}");
+            connection.query_row(&sql, rusqlite::params_from_iter(args.iter()), |row| {
+                Ok(UsageTotals {
+                    calls: row.get(0)?,
+                    prompt_tokens: row.get(1)?,
+                    completion_tokens: row.get(2)?,
+                    total_tokens: row.get(3)?,
+                })
+            })?
+        };
+        let per_day = {
+            let sql = format!(
+                "SELECT substr(a.at, 1, 10), {token_sums}{where_clause}
+                 GROUP BY substr(a.at, 1, 10) ORDER BY substr(a.at, 1, 10) DESC LIMIT 100"
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                Ok(UsageDay {
+                    day: row.get(0)?,
+                    calls: row.get(1)?,
+                    prompt_tokens: row.get(2)?,
+                    completion_tokens: row.get(3)?,
+                    total_tokens: row.get(4)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let per_bot = {
+            let sql = format!(
+                "SELECT COALESCE(t.bot, json_extract(a.details_json, '$.bot'), 'unknown'), {token_sums}{where_clause}
+                 GROUP BY COALESCE(t.bot, json_extract(a.details_json, '$.bot'), 'unknown')
+                 ORDER BY COALESCE(t.bot, json_extract(a.details_json, '$.bot'), 'unknown') ASC LIMIT 100"
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                Ok(UsageBot {
+                    bot: row.get(0)?,
+                    calls: row.get(1)?,
+                    prompt_tokens: row.get(2)?,
+                    completion_tokens: row.get(3)?,
+                    total_tokens: row.get(4)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        Ok(UsageRollup {
+            totals,
+            per_day,
+            per_bot,
+        })
+    }
+
+    /// Total number of reviewable memories in the store.
+    pub fn count_memories(&self) -> Result<i64> {
+        let connection = self.connection()?;
+        Ok(connection.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?)
+    }
+
+    /// Artifacts produced by one bot: distinct artifact hashes on actions whose
+    /// turn belonged to the bot, plus `artifact.created` audit rows recorded
+    /// with the bot as actor (none today; the gateway actor is owner/system).
+    pub fn count_bot_artifacts(&self, bot: &str) -> Result<i64> {
+        let connection = self.connection()?;
+        Ok(connection.query_row(
+            "SELECT
+                (SELECT COUNT(DISTINCT a.artifact_hash)
+                   FROM actions a JOIN turns t ON t.id = a.turn_id
+                  WHERE t.bot = ?1 AND a.artifact_hash IS NOT NULL)
+              + (SELECT COUNT(*) FROM audit_log
+                  WHERE event = 'artifact.created' AND actor = ?1)",
+            params![bot],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn append_event(&self, kind: &str, payload: &Value) -> Result<i64> {
         let connection = self.connection()?;
         connection.execute(
@@ -1727,6 +1875,236 @@ mod tests {
         let team = store.get_conversation_team("room:review").unwrap().unwrap();
         assert_eq!(team.rules, "Always cite sources.");
         assert_eq!(team.members, vec!["analyst".to_owned()]);
+    }
+
+    fn model_used(store: &Store, task_id: Option<&str>, prompt: i64, completion: i64) -> i64 {
+        store
+            .record_audit(
+                "system",
+                "model.used",
+                None,
+                task_id,
+                None,
+                None,
+                Some("policy-synthetic"),
+                Some(&serde_json::json!({
+                    "provider": "default",
+                    "model": "synthetic-model",
+                    "usage": {
+                        "prompt_tokens": prompt,
+                        "completion_tokens": completion,
+                        "total_tokens": prompt + completion,
+                    },
+                    "history_messages": 3,
+                    "prompt_chars_est": 120,
+                })),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn usage_rollup_aggregates_by_day_bot_and_conversation_with_filters() {
+        let store = store();
+        let task_main = store
+            .enqueue_task(
+                "turn",
+                "main",
+                &serde_json::json!({"conversation_id": "room:review"}),
+                0,
+                utc_now(),
+            )
+            .unwrap();
+        let task_analyst = store
+            .enqueue_task(
+                "turn",
+                "analyst",
+                &serde_json::json!({"conversation_id": "dir:analyst"}),
+                0,
+                utc_now(),
+            )
+            .unwrap();
+        model_used(&store, Some(&task_main.id), 10, 5);
+        model_used(&store, Some(&task_main.id), 20, 10);
+        model_used(&store, Some(&task_analyst.id), 1, 1);
+        // A model.used row without a usage object still counts as a call.
+        store
+            .record_audit(
+                "system",
+                "model.used",
+                None,
+                None,
+                None,
+                None,
+                Some("policy-synthetic"),
+                Some(&serde_json::json!({"provider": "default", "model": "synthetic-model"})),
+            )
+            .unwrap();
+        // Other events are ignored.
+        store
+            .record_audit(
+                "owner",
+                "model.selected",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Backdate the analyst row to three days ago for the per_day split.
+        let three_days_ago = to_string(Utc::now() - chrono::Duration::days(3));
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE audit_log SET at = ?1 WHERE task_id = ?2",
+                params![three_days_ago, task_analyst.id],
+            )
+            .unwrap();
+
+        let week = Utc::now() - chrono::Duration::days(7);
+        let rollup = store.usage_rollup(week, None, None).unwrap();
+        assert_eq!(rollup.totals.calls, 4);
+        assert_eq!(rollup.totals.prompt_tokens, 31);
+        assert_eq!(rollup.totals.completion_tokens, 16);
+        assert_eq!(rollup.totals.total_tokens, 47);
+        assert_eq!(rollup.per_day.len(), 2);
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let old = (Utc::now() - chrono::Duration::days(3))
+            .format("%Y-%m-%d")
+            .to_string();
+        let today_row = rollup.per_day.iter().find(|row| row.day == today).unwrap();
+        assert_eq!(today_row.calls, 3);
+        assert_eq!(today_row.total_tokens, 45);
+        let old_row = rollup.per_day.iter().find(|row| row.day == old).unwrap();
+        assert_eq!(old_row.calls, 1);
+        assert_eq!(old_row.total_tokens, 2);
+
+        let per_bot: std::collections::BTreeMap<&str, &UsageBot> = rollup
+            .per_bot
+            .iter()
+            .map(|row| (row.bot.as_str(), row))
+            .collect();
+        assert_eq!(per_bot.len(), 3);
+        assert_eq!(per_bot["main"].calls, 2);
+        assert_eq!(per_bot["main"].total_tokens, 45);
+        assert_eq!(per_bot["analyst"].calls, 1);
+        assert_eq!(per_bot["unknown"].calls, 1);
+        assert_eq!(per_bot["unknown"].total_tokens, 0);
+
+        // Bot filter.
+        let rollup = store.usage_rollup(week, Some("analyst"), None).unwrap();
+        assert_eq!(rollup.totals.calls, 1);
+        assert_eq!(rollup.totals.total_tokens, 2);
+        assert_eq!(rollup.per_bot.len(), 1);
+        assert_eq!(rollup.per_bot[0].bot, "analyst");
+
+        // Conversation filter attributes through the task payload.
+        let rollup = store.usage_rollup(week, None, Some("room:review")).unwrap();
+        assert_eq!(rollup.totals.calls, 2);
+        assert_eq!(rollup.totals.total_tokens, 45);
+        assert!(rollup.per_bot.iter().all(|row| row.bot == "main"));
+
+        // The `since` cutoff excludes the backdated row.
+        let rollup = store
+            .usage_rollup(Utc::now() - chrono::Duration::days(1), None, None)
+            .unwrap();
+        assert_eq!(rollup.totals.calls, 3);
+        assert_eq!(rollup.per_day.len(), 1);
+    }
+
+    #[test]
+    fn usage_rollup_empty_result_shape_and_row_caps() {
+        let store = store();
+        let rollup = store
+            .usage_rollup(Utc::now() - chrono::Duration::days(7), None, None)
+            .unwrap();
+        assert_eq!(rollup.totals, UsageTotals::default());
+        assert!(rollup.per_day.is_empty());
+        assert!(rollup.per_bot.is_empty());
+        // per_bot is capped at 100 rows even with more bots.
+        for index in 0..120 {
+            let task = store
+                .enqueue_task(
+                    "turn",
+                    &format!("bot-{index:03}"),
+                    &serde_json::json!({}),
+                    0,
+                    utc_now(),
+                )
+                .unwrap();
+            model_used(&store, Some(&task.id), 1, 1);
+        }
+        let rollup = store
+            .usage_rollup(Utc::now() - chrono::Duration::days(90), None, None)
+            .unwrap();
+        assert_eq!(rollup.totals.calls, 120);
+        assert_eq!(rollup.per_bot.len(), 100);
+    }
+
+    #[test]
+    fn memory_and_bot_artifact_counts() {
+        let store = store();
+        assert_eq!(store.count_memories().unwrap(), 0);
+        assert_eq!(store.count_bot_artifacts("main").unwrap(), 0);
+        crate::memory::add(&store, "fact", "synthetic fact", "test").unwrap();
+        assert_eq!(store.count_memories().unwrap(), 1);
+
+        let task = store
+            .enqueue_task("turn", "main", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        let turn = store
+            .create_turn(&task.id, "main", "owner", &serde_json::json!({}))
+            .unwrap();
+        store
+            .create_action(
+                "deck_build",
+                Some(&task.id),
+                Some(&turn.id),
+                "{}",
+                "hash-a",
+                None,
+                Some("artifact-a"),
+                "policy-synthetic",
+            )
+            .unwrap();
+        store
+            .create_action(
+                "deck_build",
+                Some(&task.id),
+                Some(&turn.id),
+                "{}",
+                "hash-b",
+                None,
+                Some("artifact-a"),
+                "policy-synthetic",
+            )
+            .unwrap();
+        // Another bot's action must not count for main.
+        let other_task = store
+            .enqueue_task("turn", "analyst", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        let other_turn = store
+            .create_turn(&other_task.id, "analyst", "owner", &serde_json::json!({}))
+            .unwrap();
+        store
+            .create_action(
+                "deck_build",
+                Some(&other_task.id),
+                Some(&other_turn.id),
+                "{}",
+                "hash-c",
+                None,
+                Some("artifact-c"),
+                "policy-synthetic",
+            )
+            .unwrap();
+        // Distinct hashes for main: artifact-a counted once.
+        assert_eq!(store.count_bot_artifacts("main").unwrap(), 1);
+        assert_eq!(store.count_bot_artifacts("analyst").unwrap(), 1);
+        assert_eq!(store.count_bot_artifacts("nobody").unwrap(), 0);
     }
 
     #[test]

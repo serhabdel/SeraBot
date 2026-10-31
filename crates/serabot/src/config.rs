@@ -55,6 +55,11 @@ pub struct Config {
     pub fleet: FleetConfig,
     #[serde(skip)]
     pub base_dir: PathBuf,
+    /// Admin-console bot config overrides (tools/skills/require_approval),
+    /// applied over the bot files by `load_bots`/`list_configured_bots`.
+    /// Populated from the admin overlay at load; never read from TOML.
+    #[serde(skip)]
+    pub bot_config_overrides: BTreeMap<String, crate::admin::BotConfigOverlay>,
 }
 
 impl Default for Config {
@@ -83,6 +88,7 @@ impl Default for Config {
             connectors: ConnectorsConfig::default(),
             fleet: FleetConfig::default(),
             base_dir: PathBuf::from("."),
+            bot_config_overrides: BTreeMap::new(),
         }
     }
 }
@@ -683,6 +689,11 @@ pub struct WatcherConfig {
     pub max_response_bytes: usize,
     #[serde(default)]
     pub morning_brief_enabled: bool,
+    /// When true, a watch run or morning brief with zero new/changed items and
+    /// zero failures sends no owner notification (the run is still recorded).
+    /// Default false keeps the current always-notify behavior.
+    #[serde(default)]
+    pub silent_when_empty: bool,
 }
 
 impl Default for WatcherConfig {
@@ -693,6 +704,7 @@ impl Default for WatcherConfig {
             timeout_secs: default_fetch_timeout(),
             max_response_bytes: default_fetch_bytes(),
             morning_brief_enabled: false,
+            silent_when_empty: false,
         }
     }
 }
@@ -1063,8 +1075,9 @@ pub fn load_bots(config: &Config, dir: impl AsRef<Path>) -> Result<Vec<LoadedBot
     let mut bots = Vec::new();
     for path in paths {
         let raw = std::fs::read_to_string(&path)?;
-        let bot: BotConfig = toml::from_str(&raw)
+        let mut bot: BotConfig = toml::from_str(&raw)
             .map_err(|error| SeraError::Config(format!("{}: {error}", path.display())))?;
+        apply_bot_config_override(config, &mut bot);
         if bot.name.is_empty() || bot.name.len() > 64 {
             return Err(SeraError::Config(format!(
                 "{}: invalid bot name",
@@ -1194,8 +1207,9 @@ pub fn list_configured_bots(config: &Config) -> Result<Vec<ConfiguredBot>> {
         if raw.len() > MAX_FILE_BYTES {
             return Err(SeraError::Config("bot file is too large".into()));
         }
-        let bot: BotConfig =
+        let mut bot: BotConfig =
             toml::from_str(&raw).map_err(|_| SeraError::Config("bot file is invalid".into()))?;
+        apply_bot_config_override(config, &mut bot);
         let id = bot.name;
         if !safe_bot_label(&id) || !names.insert(id.clone()) {
             return Err(SeraError::Config("bot file is invalid".into()));
@@ -1224,6 +1238,79 @@ pub fn list_configured_bots(config: &Config) -> Result<Vec<ConfiguredBot>> {
     }
     bots.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(bots)
+}
+
+/// Read one bot's system prompt file (`bots/<id>.toml` → its `system_prompt`),
+/// with the same confinement rules as `load_bots`. Returns `Ok(None)` when the
+/// bot file does not exist. Used by owner-facing detail endpoints; list
+/// endpoints never call this so prompts stay out of fleet listings.
+pub fn load_bot_prompt(config: &Config, id: &str) -> Result<Option<String>> {
+    if !safe_bot_label(id) {
+        return Err(SeraError::Validation("invalid bot id".into()));
+    }
+    validate_relative_dir("fleet.bots_dir", &config.fleet.bots_dir)?;
+    let base = config.base_dir.canonicalize().map_err(|error| {
+        SeraError::Config(format!(
+            "configuration directory cannot be resolved: {error}"
+        ))
+    })?;
+    let dir = base.join(&config.fleet.bots_dir);
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let dir = dir.canonicalize().map_err(|error| {
+        SeraError::Config(format!("fleet directory cannot be resolved: {error}"))
+    })?;
+    if !dir.starts_with(&base) {
+        return Err(SeraError::Config(
+            "fleet directory escapes the configuration directory".into(),
+        ));
+    }
+    let bot_path = dir.join(format!("{id}.toml"));
+    if !bot_path.exists() {
+        return Ok(None);
+    }
+    let canonical = bot_path
+        .canonicalize()
+        .map_err(|_| SeraError::Config("bot file cannot be resolved".into()))?;
+    if !canonical.starts_with(&dir) {
+        return Err(SeraError::Config(
+            "bot file escapes the fleet directory".into(),
+        ));
+    }
+    let raw = std::fs::read_to_string(&canonical)?;
+    let mut bot: BotConfig =
+        toml::from_str(&raw).map_err(|_| SeraError::Config("bot file is invalid".into()))?;
+    apply_bot_config_override(config, &mut bot);
+    let prompt_path = config.path(&bot.system_prompt);
+    let prompt_canonical = prompt_path.canonicalize().map_err(|error| {
+        SeraError::Config(format!(
+            "cannot resolve prompt {}: {error}",
+            prompt_path.display()
+        ))
+    })?;
+    if !prompt_canonical.starts_with(&config.base_dir) {
+        return Err(SeraError::Config(
+            "prompt escapes the configuration directory".into(),
+        ));
+    }
+    Ok(Some(std::fs::read_to_string(&prompt_canonical)?))
+}
+
+/// Overlay the admin-console bot config (tools/skills/require_approval) over a
+/// bot file's parsed config. Only fields the console actually saved override.
+pub fn apply_bot_config_override(config: &Config, bot: &mut BotConfig) {
+    if let Some(overrides) = config.bot_config_overrides.get(&bot.name) {
+        if let Some(tools) = &overrides.tools {
+            bot.tools = tools.clone();
+        }
+        if let Some(skills) = &overrides.skills {
+            bot.skills = skills.clone();
+        }
+        if let Some(require_approval) = &overrides.require_approval {
+            bot.require_approval = require_approval.clone();
+        }
+    }
 }
 
 /// Specialist tools the owner API may write into a scaffolded bot file.

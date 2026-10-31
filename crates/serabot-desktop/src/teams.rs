@@ -79,6 +79,48 @@ pub fn live_members(team: &Team) -> Vec<&TeamMember> {
     team.members.iter().filter(|member| member.live).collect()
 }
 
+/// Parse `@mention` tokens from composer text for the @picker.
+///
+/// A mention is `'@'` followed by `[a-z0-9][a-z0-9-_]{0,31}` (1–32 chars).
+/// Duplicates collapse, the first-seen order is kept, and only ids present
+/// in `valid_ids` are returned. The scan is byte-based over ASCII, so
+/// multibyte UTF-8 never produces a partial token.
+pub fn parse_mentions(text: &str, valid_ids: &[String]) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'@' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut end = start;
+        if end < bytes.len() && (bytes[end].is_ascii_lowercase() || bytes[end].is_ascii_digit()) {
+            end += 1;
+            while end < bytes.len()
+                && end - start < 32
+                && (bytes[end].is_ascii_lowercase()
+                    || bytes[end].is_ascii_digit()
+                    || bytes[end] == b'-'
+                    || bytes[end] == b'_')
+            {
+                end += 1;
+            }
+            let candidate = &text[start..end];
+            if valid_ids.iter().any(|id| id == candidate)
+                && !out.iter().any(|mention| mention == candidate)
+            {
+                out.push(candidate.to_owned());
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +219,49 @@ mod tests {
         assert!(!is_room("windows-owner"));
         assert!(!is_room("grp:ops"));
         assert!(!is_room("dir:analyst"));
+    }
+
+    #[test]
+    fn mentions_are_parsed_deduped_ordered_and_filtered() {
+        let valid = vec![
+            "analyst".to_string(),
+            "maker-2".to_string(),
+            "watcher".to_string(),
+        ];
+        assert_eq!(
+            parse_mentions("hey @analyst and @maker-2, cc @analyst @watcher", &valid),
+            vec![
+                "analyst".to_string(),
+                "maker-2".to_string(),
+                "watcher".to_string()
+            ]
+        );
+        // Unknown ids and non-slug tokens are dropped.
+        assert_eq!(
+            parse_mentions("@ghost @Analyst @analyst! @", &valid),
+            vec!["analyst".to_string()]
+        );
+        // '@' followed by a non [a-z0-9] char starts no token.
+        assert!(parse_mentions("email a@b.example @-x @_y", &valid).is_empty());
+        assert!(parse_mentions("", &valid).is_empty());
+        // Underscores are allowed after the first char.
+        let with_underscore = vec!["bot_1".to_string()];
+        assert_eq!(
+            parse_mentions("ping @bot_1 now", &with_underscore),
+            vec!["bot_1".to_string()]
+        );
+        // The token stops at 32 chars: a 33-char run is truncated and only
+        // matches when the 32-char prefix is a valid id.
+        let long = vec!["a".repeat(32)];
+        assert_eq!(
+            parse_mentions(&format!("@{}", "a".repeat(33)), &long),
+            vec!["a".repeat(32)]
+        );
+        assert!(parse_mentions(&format!("@{}", "a".repeat(33)), &valid).is_empty());
+        // Multibyte text around a mention never breaks the scan.
+        assert_eq!(
+            parse_mentions("héllo @analyst wörld", &valid),
+            vec!["analyst".to_string()]
+        );
     }
 }

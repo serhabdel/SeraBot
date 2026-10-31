@@ -54,6 +54,7 @@ limits, and the body limit apply to every `/v1/*` route exactly as before.
 | --- | --- | --- |
 | `GET` | `/v1/health` | `{ok, version, build}`; `503` if the database is unavailable. The database path is not returned. |
 | `GET` | `/v1/status` | Pending tasks, pending approvals, loopback API status. |
+| `GET` | `/v1/usage?days=7&bot=&conversation_id=` | Token rollup over `audit_log` rows with event `model.used`: `{totals: {calls, prompt_tokens, completion_tokens, total_tokens}, per_day: [...], per_bot: [...]}`. `days` is clamped to 1–90 (default 7); `bot` and `conversation_id` are optional filters. Read-only; egress-scanned. Use it to measure the re-read share of prompt tokens (see `docs/architecture-grok-team-review.md`). |
 
 ## Chat
 
@@ -75,6 +76,12 @@ response has an unknown outcome—read task state and history instead of blindly
 resubmitting.
 
 `GET /v1/tasks/{id}` returns the task view.
+
+In `room:` conversations, `@bot-id` mentions in the owner text are parsed and
+validated against the configured bot ids: in `all` mode the fan-out is
+restricted to the mentioned members; in `selected` mode the orchestrator prompt
+gets an `OWNER ADDRESSED: @…` clause. Mentions naming unknown bots are ignored
+and never become instructions.
 
 ## Provider and model selection
 
@@ -109,6 +116,12 @@ Returns `{"selection": {...}}`. Unknown providers/models and unapproved
 profiles are rejected; client-supplied endpoints are not accepted. The
 selection applies to future turns only. See [model routing](model-routing.md).
 
+Catalog note: when a provider has `catalog_fetch` on, data egress approved, and
+a fresh live `/models` snapshot, its advertised list in `/v1/models` is the
+**full live catalog** (not just the configured allowlist). Selecting a model is
+still gated: only ids present in the verified snapshot are accepted, so the
+wider list cannot smuggle in an unverified model.
+
 ## Fleet scaffold
 
 `GET /v1/bots` lists bot files under the configured bots directory. Each entry
@@ -136,6 +149,26 @@ and `skill_load`. Unknown tools, `delegate`, and unknown skills are rejected.
 The description is checked against the content policy. The response reports
 `enabled: false` and `live: false` — restart before the bot can run, and add it
 to `main.delegates` yourself if `main` should hand work to it.
+
+`GET /v1/bots/{id}` returns the owner-facing detail for one bot: `id`,
+`display_name`, `role`, `description`, `avatar`, `enabled`, `provider`, `model`,
+`fallback_provider`, `fallback_model`, `routing_classes`, `instructions`
+(prompt body, capped at 32 KB), `instructions_bytes`, `skills`, `tools`,
+`require_approval`, `memory_count`, `artifact_count`. No secrets or secret
+values are returned. Unknown bots get `404`.
+
+`PUT /v1/admin/bots/{id}/config` (owner token) updates `tools`, `skills`, and/or
+`require_approval` for an existing bot:
+
+```json
+{"skills": ["ask", "triage"], "tools": ["skill_list", "rag_search"]}
+```
+
+At least one field is required. Validation mirrors scaffold rules (≤32 tools,
+≤16 skills, `delegate` only on the orchestrator, tools must be registered,
+skills must exist, `require_approval ⊆ tools`). The change is stored as an
+admin overlay, audited as `config.bot_config_saved`, and the response is
+`{"saved": true, "restart_required": true}`.
 
 See [Orchestration](orchestration.md).
 

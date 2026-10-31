@@ -1,9 +1,9 @@
 use crate::{
-    ApiClient, ApiError, Approval, ApprovalDecision, AudioUpdate, BotProfileUpdate, BotSummary,
-    Catalog, ConnectorStatus, ConnectorTestResult, ConnectorUpdate, ConversationKind,
-    ConversationPage, ConversationSummary, CreatedBot, CreatedConversation, CreatedSkill, Health,
-    History, LibraryEntry, MemoryEntry, NewProvider, ProviderStatus, Scope, Selection,
-    SkillSummary, Task, Team, TeamMode, Transcription,
+    ApiClient, ApiError, Approval, ApprovalDecision, AudioUpdate, BotConfigUpdate, BotDetail,
+    BotProfileUpdate, BotSummary, Catalog, ConnectorStatus, ConnectorTestResult, ConnectorUpdate,
+    ConversationKind, ConversationPage, ConversationSummary, CreatedBot, CreatedConversation,
+    CreatedSkill, Health, History, LibraryEntry, MemoryEntry, NewProvider, ProviderStatus, Scope,
+    Selection, SkillSummary, Task, Team, TeamMode, Transcription, UsageReport,
 };
 use secrecy::SecretString;
 use std::sync::{
@@ -54,6 +54,9 @@ pub enum OperationKind {
     OAuthSignIn,
     AdminProfile,
     AdminRestart,
+    BotDetail,
+    BotConfigWrite,
+    Usage,
 }
 
 pub enum Operation {
@@ -154,6 +157,21 @@ pub enum Operation {
         update: BotProfileUpdate,
     },
     AdminRestart,
+    /// `GET /v1/bots/{id}`: the full record of one bot.
+    BotDetail {
+        id: String,
+    },
+    /// `PUT /v1/admin/bots/{id}/config`: a write, never replayed blindly.
+    UpdateBotConfig {
+        id: String,
+        update: BotConfigUpdate,
+    },
+    /// `GET /v1/usage?days=&bot=&conversation_id=`.
+    Usage {
+        days: u32,
+        bot: Option<String>,
+        conversation: Option<String>,
+    },
 }
 
 impl Operation {
@@ -196,6 +214,9 @@ impl Operation {
             Self::ConnectorOAuthSignIn { .. } => OperationKind::OAuthSignIn,
             Self::AdminSetBotProfile { .. } => OperationKind::AdminProfile,
             Self::AdminRestart => OperationKind::AdminRestart,
+            Self::BotDetail { .. } => OperationKind::BotDetail,
+            Self::UpdateBotConfig { .. } => OperationKind::BotConfigWrite,
+            Self::Usage { .. } => OperationKind::Usage,
         }
     }
 }
@@ -240,6 +261,11 @@ pub enum Reply {
     },
     BotProfileSaved,
     AdminRestarted,
+    BotDetail(BotDetail),
+    BotConfigSaved {
+        restart_required: bool,
+    },
+    Usage(UsageReport),
 }
 
 pub struct Job {
@@ -535,6 +561,21 @@ fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
                 Reply::AdminSaved
             }
         }),
+        Operation::BotDetail { id } => client.bot_detail(id).map(Reply::BotDetail),
+        Operation::UpdateBotConfig { id, update } => {
+            client
+                .update_bot_config(id, update)
+                .map(|ack| Reply::BotConfigSaved {
+                    restart_required: ack.restart_required,
+                })
+        }
+        Operation::Usage {
+            days,
+            bot,
+            conversation,
+        } => client
+            .usage(*days, bot.as_deref(), conversation.as_deref())
+            .map(Reply::Usage),
     }
 }
 

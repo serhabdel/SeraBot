@@ -40,9 +40,25 @@ pub struct AdminOverlay {
     pub audio: Option<AudioOverlay>,
     #[serde(default)]
     pub bots: BTreeMap<String, BotProfile>,
+    /// Per-bot behavior overrides (tools/skills/require_approval) merged over
+    /// the bot files at startup. Each field is optional so partial updates
+    /// keep the rest of the file's values.
+    #[serde(default)]
+    pub bot_configs: BTreeMap<String, BotConfigOverlay>,
     /// ElevenLabs auth mode chosen in the console (api_key or oauth sign-in).
     #[serde(default)]
     pub elevenlabs_auth: Option<ElevenLabsAuth>,
+}
+
+/// Owner-editable bot behavior lists. `None` means "keep the bot file's value".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotConfigOverlay {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_approval: Option<Vec<String>>,
 }
 
 /// Owner-facing identity for a bot. The bot file stays authoritative for
@@ -129,6 +145,9 @@ impl AdminOverlay {
                 config.audio.understanding_model = audio.understanding_model.clone();
             }
         }
+        // Bot behavior overrides are not TOML config; they are merged over the
+        // bot files by load_bots/list_configured_bots after startup.
+        config.bot_config_overrides = self.bot_configs.clone();
         Ok(())
     }
 }
@@ -166,6 +185,33 @@ impl AdminStore {
             .bots
             .get(id)
             .cloned()
+    }
+
+    pub fn bot_config(&self, id: &str) -> Option<BotConfigOverlay> {
+        self.overlay
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .bot_configs
+            .get(id)
+            .cloned()
+    }
+
+    /// Merge a partial bot config update into the overlay. The API validates
+    /// the lists before calling this; only the saved fields change.
+    pub fn set_bot_config(&self, id: &str, update: BotConfigOverlay) -> Result<()> {
+        self.mutate(|overlay| {
+            let entry = overlay.bot_configs.entry(id.to_owned()).or_default();
+            if let Some(tools) = update.tools {
+                entry.tools = Some(tools);
+            }
+            if let Some(skills) = update.skills {
+                entry.skills = Some(skills);
+            }
+            if let Some(require_approval) = update.require_approval {
+                entry.require_approval = Some(require_approval);
+            }
+            Ok(())
+        })
     }
 
     pub fn set_bot_profile(&self, id: &str, profile: BotProfile) -> Result<()> {

@@ -43,7 +43,16 @@ struct OpportunityItem {
     url: Option<String>,
 }
 
-/// Build the daily brief text. `lookback_hours` bounds which new/changed
+/// A built brief plus the counts behind the optional silent-when-empty rule.
+#[derive(Debug, Clone)]
+pub struct BriefReport {
+    pub text: String,
+    /// True when the brief has no section at all (no deadlines, no new or
+    /// changed items, no source warnings).
+    pub empty: bool,
+}
+
+/// Build the daily brief. `lookback_hours` bounds which new/changed
 /// opportunities are considered; deadlines are always evaluated relative to
 /// `now`.
 pub fn build_brief(
@@ -52,6 +61,16 @@ pub fn build_brief(
     tz: Tz,
     lookback_hours: u64,
 ) -> Result<String> {
+    Ok(build_brief_report(store, now, tz, lookback_hours)?.text)
+}
+
+/// Build the daily brief text together with its emptiness flag.
+pub fn build_brief_report(
+    store: &Store,
+    now: DateTime<Utc>,
+    tz: Tz,
+    lookback_hours: u64,
+) -> Result<BriefReport> {
     let connection = store.connection()?;
     let local_now = now.with_timezone(&tz);
     let today = local_now.date_naive();
@@ -183,16 +202,20 @@ pub fn build_brief(
         );
     }
 
-    if sections == 0 {
+    let empty = sections == 0;
+    if empty {
         out.push_str("\nNo new items, deadline changes, or source warnings.\n");
     }
 
     if out.chars().count() > MAX_BRIEF_CHARS {
         let mut truncated = truncate_chars(&out, MAX_BRIEF_CHARS - 20);
         truncated.push_str("\n[brief truncated]\n");
-        return Ok(truncated);
+        return Ok(BriefReport {
+            text: truncated,
+            empty: false,
+        });
     }
-    Ok(out)
+    Ok(BriefReport { text: out, empty })
 }
 
 fn deadline_item(

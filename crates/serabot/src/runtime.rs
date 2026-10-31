@@ -21,7 +21,7 @@ use crate::memory;
 use crate::model_router::{ModelRouter, ModelSelection, PinnedRoute, ProviderView};
 use crate::orchestration::{
     BotRole, ConversationKind, HandoffContext, ORCHESTRATOR_BOT, assistant_speaker,
-    parse_conversation_scope, validate_conversation_id,
+    parse_conversation_scope, safe_bot_label, validate_conversation_id,
 };
 use crate::retrieval::{RetrievedChunk, Retriever, evidence_block};
 use crate::skills::on_demand_skill_clause;
@@ -49,6 +49,11 @@ pub struct TurnPayload {
     /// `all` fan-out. Carries the room-turn frame used to enforce the bounds.
     #[serde(default)]
     pub team: Option<TeamContext>,
+    /// Validated `@mention` bot ids parsed from the owner text in a `room:`
+    /// conversation. Routing metadata only: never injected as instructions,
+    /// and never routed to bots that are not room team members.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +96,10 @@ struct TurnState {
     team: Option<TeamContext>,
     #[serde(default)]
     team_asked: bool,
+    /// History rows sent as context at the start of this turn (metadata for
+    /// the `model.used` audit row).
+    #[serde(default)]
+    history_messages: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,6 +314,19 @@ impl Runtime {
 
     pub fn bot_loaded(&self, name: &str) -> bool {
         self.bots.contains_key(name)
+    }
+
+    /// The loaded bot registry entry, if the bot is live.
+    pub fn bot(&self, name: &str) -> Option<&LoadedBot> {
+        self.bots.get(name)
+    }
+
+    pub fn router(&self) -> &ModelRouter {
+        &self.router
+    }
+
+    pub fn gateway(&self) -> &Gateway {
+        &self.gateway
     }
 
     pub fn policy_version(&self) -> &str {
@@ -585,6 +607,16 @@ impl Runtime {
         let selection = self.effective_model_selection(conversation_id, &bot)?;
         let route = self.router.pin(&selection)?;
         let owner_text = text.clone();
+        // In rooms, `@mention` tokens are parsed from the owner text and
+        // validated against the configured bot ids. They are routing metadata
+        // only: never instructions, and never routed to non-members.
+        let mentions = match parse_conversation_scope(conversation_id) {
+            Ok(scope) if scope.kind == ConversationKind::Room => {
+                let known: HashSet<String> = self.bots.keys().cloned().collect();
+                parse_mentions(&text, &known)
+            }
+            _ => Vec::new(),
+        };
         let payload = TurnPayload {
             conversation_id: conversation_id.to_owned(),
             text,
@@ -594,6 +626,7 @@ impl Runtime {
             route: Some(route),
             handoff: None,
             team: None,
+            mentions: mentions.clone(),
         };
         let task = self.store.enqueue_task(
             "turn",
@@ -607,13 +640,43 @@ impl Runtime {
             &json!({"task_id": task.id, "kind": "turn", "bot": bot}),
         )?;
         // Room mode `all`: every team member answers the owner's message without
-        // waiting for the orchestrator to select.
+        // waiting for the orchestrator to select. When the owner mentioned
+        // bots, the fan-out is restricted to mentioned ∩ current members;
+        // mentions naming non-members are ignored (never routed).
         if !ask_mode
             && bot == ORCHESTRATOR_BOT
             && let Some(team) = self.store.get_conversation_team(conversation_id)?
             && team.mode == TeamMode::All.as_str()
         {
-            self.enqueue_team_fanout(conversation_id, &owner_text, &task.id, &team.members);
+            let mut members = team.members.clone();
+            if !mentions.is_empty() {
+                let kept: Vec<String> = members
+                    .iter()
+                    .filter(|member| mentions.contains(member))
+                    .cloned()
+                    .collect();
+                let details = json!({
+                    "root_task_id": task.id,
+                    "conversation_id": conversation_id,
+                    "mentions": mentions,
+                    "members": team.members,
+                    "kept": kept,
+                });
+                if let Err(error) = self.store.record_audit(
+                    "system",
+                    "team.mention_filtered",
+                    None,
+                    Some(&task.id),
+                    None,
+                    None,
+                    Some(self.gateway.policy().version()),
+                    Some(&details),
+                ) {
+                    warn!(%error, "mention-filtered room fan-out was not audited");
+                }
+                members = kept;
+            }
+            self.enqueue_team_fanout(conversation_id, &owner_text, &task.id, &members);
         }
         Ok(task)
     }
@@ -655,6 +718,7 @@ impl Runtime {
                     route: Some(route),
                     handoff: None,
                     team: Some(frame.clone()),
+                    mentions: Vec::new(),
                 })?)
             })();
             let payload = match payload {
@@ -885,8 +949,8 @@ impl Runtime {
             .timezone
             .parse()
             .map_err(|_| SeraError::Config("invalid schedule timezone".into()))?;
-        let text = crate::brief::build_brief(&self.store, Utc::now(), tz, 24)?;
-        let text = if self.gateway.scan_egress(&text).is_err() {
+        let report = crate::brief::build_brief_report(&self.store, Utc::now(), tz, 24)?;
+        let text = if self.gateway.scan_egress(&report.text).is_err() {
             self.store.record_audit(
                 "system",
                 "brief.blocked_by_policy",
@@ -899,8 +963,28 @@ impl Runtime {
             )?;
             "The morning brief was withheld because it violated the content policy.".to_string()
         } else {
-            text
+            report.text
         };
+        // Opt-in silence: an empty brief (no deadlines, no new/changed items,
+        // no source warnings) sends no notification but is still audited.
+        if self.config.watcher.silent_when_empty && report.empty {
+            let details = json!({
+                "task_id": task.id,
+                "conversation_id": payload.conversation_id,
+            });
+            self.store.record_audit(
+                "system",
+                "brief.silent_run",
+                None,
+                Some(&task.id),
+                None,
+                None,
+                Some(self.gateway.policy().version()),
+                Some(&details),
+            )?;
+            self.store.append_event("brief.silent_run", &details)?;
+            return Ok(TurnOutcome::Completed);
+        }
         self.notifier
             .send_text(&payload.conversation_id, &text)
             .await?;
@@ -931,12 +1015,37 @@ impl Runtime {
         )?;
         let reports =
             crate::watcher::watch_all(&self.store, &fetcher, &sources, &self.config).await?;
-        let mut text = String::from("Source watch\n");
         let mut failures = 0;
         for report in &reports {
             if !report.ok {
                 failures += 1;
             }
+        }
+        // Opt-in silence: zero new/changed items and zero failures across all
+        // sources skips the notification; source_runs and the audit ledger are
+        // still recorded (watch_all already wrote source_runs).
+        if watch_run_is_silent(self.config.watcher.silent_when_empty, &reports) {
+            let details = json!({
+                "task_id": task.id,
+                "conversation_id": payload.conversation_id,
+                "sources": reports.len(),
+                "failed": failures,
+            });
+            self.store.record_audit(
+                "system",
+                "watch.silent_run",
+                None,
+                Some(&task.id),
+                None,
+                None,
+                Some(self.gateway.policy().version()),
+                Some(&details),
+            )?;
+            self.store.append_event("watch.silent_run", &details)?;
+            return Ok(TurnOutcome::Completed);
+        }
+        let mut text = String::from("Source watch\n");
+        for report in &reports {
             text.push_str(&format!(
                 "- {}: new {}, changed {}, failed {}, seen {}\n",
                 report.source, report.new, report.changed, report.failed, report.items_seen
@@ -1013,6 +1122,7 @@ impl Runtime {
             self.store
                 .history_for_llm(&payload.conversation_id, self.config.runtime.history_limit)?
         };
+        let history_messages = history.len();
         let turn =
             self.store
                 .create_turn(&task.id, &payload.bot, &payload.conversation_id, &json!({}))?;
@@ -1038,13 +1148,19 @@ impl Runtime {
             handoff: payload.handoff.clone(),
             team: payload.team.clone(),
             team_asked: false,
+            history_messages,
         };
         let system = if let Some(ref handoff) = payload.handoff {
             self.handoff_system_prompt(bot, &payload.text, handoff)?
         } else if let Some(team) = &payload.team {
             self.team_system_prompt(&payload.conversation_id, bot, &payload.text, team)?
         } else {
-            self.system_prompt(&payload.conversation_id, bot, payload.ask_mode)
+            self.system_prompt(
+                &payload.conversation_id,
+                bot,
+                payload.ask_mode,
+                &payload.mentions,
+            )
         };
         state.messages.push(LlmMessage::system(system));
         state.messages.extend(history);
@@ -1307,6 +1423,8 @@ impl Runtime {
                 Some(&json!({
                     "provider": route.selection.provider, "model": route.selection.model,
                     "usage": response.usage,
+                    "history_messages": state.history_messages,
+                    "prompt_chars_est": estimate_prompt_chars(&state.messages),
                 })),
             )?;
             let assistant = response.message;
@@ -1736,7 +1854,13 @@ impl Runtime {
         Ok(prompt)
     }
 
-    fn system_prompt(&self, conversation_id: &str, bot: &LoadedBot, ask_mode: bool) -> String {
+    fn system_prompt(
+        &self,
+        conversation_id: &str,
+        bot: &LoadedBot,
+        ask_mode: bool,
+        mentions: &[String],
+    ) -> String {
         let mut prompt = String::new();
         prompt.push_str(&bot.prompt);
         prompt.push_str("\n\nOPERATING RULES\n");
@@ -1760,9 +1884,21 @@ impl Runtime {
         if bot.config.name == ORCHESTRATOR_BOT
             && let Some(team) = &team
         {
+            // In `selected` mode the orchestrator learns which members the
+            // owner addressed; mentions of non-members are dropped here too.
+            let addressed: Vec<String> = if team.mode == TeamMode::Selected.as_str() {
+                team.members
+                    .iter()
+                    .filter(|member| mentions.contains(member))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
             prompt.push_str(&crate::teams::orchestrator_team_clause(
                 &team.members,
                 &team.mode,
+                &addressed,
             ));
         }
         if let Some(team) = &team {
@@ -1810,6 +1946,68 @@ impl Runtime {
         }
         self.gateway.scan_egress(&combined)
     }
+}
+
+/// Manual (regex-free) parse of `@` mentions from owner text: `@` followed by
+/// `[a-z0-9][a-z0-9-_]{0,31}`. A candidate is kept only when it is a configured
+/// bot id (and passes `safe_bot_label`), so mentions can never carry arbitrary
+/// strings. Order is preserved, duplicates removed.
+fn parse_mentions(text: &str, known_bots: &HashSet<String>) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'@' {
+            index += 1;
+            continue;
+        }
+        let start = index + 1;
+        let mut end = start;
+        while end < bytes.len() && end - start < 32 {
+            let byte = bytes[end];
+            let valid = byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || (end > start && (byte == b'-' || byte == b'_'));
+            if !valid {
+                break;
+            }
+            end += 1;
+        }
+        if end > start {
+            let first = bytes[start];
+            if first.is_ascii_lowercase() || first.is_ascii_digit() {
+                let candidate = &text[start..end];
+                if safe_bot_label(candidate)
+                    && known_bots.contains(candidate)
+                    && !out.iter().any(|mention| mention == candidate)
+                {
+                    out.push(candidate.to_owned());
+                }
+            }
+        }
+        index = if end > start { end } else { start };
+    }
+    out
+}
+
+/// Opt-in silence rule for a watch run: silent only when every source reported
+/// zero new items, zero changed items, zero failures, and no source error.
+fn watch_run_is_silent(silent_when_empty: bool, reports: &[crate::watcher::WatchReport]) -> bool {
+    silent_when_empty
+        && reports
+            .iter()
+            .all(|report| report.new == 0 && report.changed == 0 && report.failed == 0 && report.ok)
+}
+
+/// Rough prompt-size estimate recorded on `model.used` audit rows: the summed
+/// content chars of the messages sent this round, divided by 4, rounded up.
+/// Pure metadata; it never changes routing or payloads.
+pub(crate) fn estimate_prompt_chars(messages: &[LlmMessage]) -> usize {
+    let chars: usize = messages
+        .iter()
+        .map(|message| message.content.as_deref().map_or(0, str::len))
+        .sum();
+    chars.div_ceil(4)
 }
 
 const TOOL_NOTICE_PREFIX: &str = "AVAILABLE TOOLS THIS TURN:";
@@ -1992,11 +2190,28 @@ mod tests {
         notifier: Arc<Capture>,
         calls: Arc<std::sync::atomic::AtomicUsize>,
     ) -> (Runtime, Store) {
+        setup_custom(
+            server_uri,
+            notifier,
+            calls,
+            std::env::current_dir().unwrap(),
+            false,
+        )
+    }
+
+    fn setup_custom(
+        server_uri: &str,
+        notifier: Arc<Capture>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        base_dir: std::path::PathBuf,
+        silent_when_empty: bool,
+    ) -> (Runtime, Store) {
         let mut config = Config::default();
         config.llm.data_egress_approved = true;
         config.llm.base_url = server_uri.into();
         config.llm.model = "test".into();
-        config.base_dir = std::env::current_dir().unwrap();
+        config.base_dir = base_dir;
+        config.watcher.silent_when_empty = silent_when_empty;
         let config = Arc::new(config);
         let store = Store::open(
             std::env::temp_dir().join(format!("serabot-runtime-{}.db", uuid::Uuid::new_v4())),
@@ -2965,5 +3180,327 @@ mod tests {
                     == Some("peer replies per bot")
         }));
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn mention_parsing_keeps_only_configured_bot_ids() {
+        let known: HashSet<String> = ["main", "analyst", "maker"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            parse_mentions("@analyst hi @nobody", &known),
+            vec!["analyst".to_string()]
+        );
+        assert!(parse_mentions("no mentions here", &known).is_empty());
+        assert_eq!(
+            parse_mentions("@analyst @analyst", &known),
+            vec!["analyst".to_string()]
+        );
+        // An email-like token parses but is not a configured bot.
+        assert_eq!(
+            parse_mentions("mail a@b.com then @maker", &known),
+            vec!["maker".to_string()]
+        );
+        assert!(parse_mentions("@", &known).is_empty());
+        // First char must be [a-z0-9]; '-'/'_' are only allowed after it.
+        assert!(parse_mentions("@-bad", &known).is_empty());
+        assert!(parse_mentions("@Analyst", &known).is_empty());
+        // Mention ids are capped at 32 chars after '@'.
+        let long = format!("@{}", "a".repeat(40));
+        assert!(parse_mentions(&long, &known).is_empty());
+        let known_dashed: HashSet<String> = ["watcher-1"].into_iter().map(String::from).collect();
+        assert_eq!(
+            parse_mentions("hey @watcher-1!", &known_dashed),
+            vec!["watcher-1".to_string()]
+        );
+        // Punctuation terminates the id.
+        assert_eq!(
+            parse_mentions("(@maker).", &known),
+            vec!["maker".to_string()]
+        );
+    }
+
+    #[test]
+    fn prompt_char_estimate_sums_content_and_divides_by_four() {
+        assert_eq!(estimate_prompt_chars(&[]), 0);
+        let messages = vec![
+            LlmMessage::system("abcd"),
+            LlmMessage::user("12345678"),
+            LlmMessage::assistant(None, vec![]),
+        ];
+        assert_eq!(estimate_prompt_chars(&messages), 3);
+        // 5 chars rounds up to 2 tokens' worth of estimate.
+        assert_eq!(estimate_prompt_chars(&[LlmMessage::user("abcde")]), 2);
+    }
+
+    #[tokio::test]
+    async fn room_mentions_restrict_all_mode_fanout_to_mentioned_members() {
+        let server = MockServer::start().await;
+        let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
+        store
+            .create_conversation("room:review", "room", None)
+            .unwrap();
+        store
+            .set_conversation_team(
+                "room:review",
+                &["analyst".into(), "maker".into()],
+                "all",
+                "",
+            )
+            .unwrap();
+        let task = runtime
+            .submit_text("room:review", "@analyst please review @nobody", None)
+            .unwrap();
+        assert_eq!(task.bot, "main");
+        let payload: TurnPayload =
+            serde_json::from_value(store.get_task(&task.id).unwrap().payload).unwrap();
+        assert_eq!(payload.mentions, vec!["analyst".to_string()]);
+        // Fan-out is restricted to mentioned ∩ members: main + analyst only.
+        assert_eq!(store.pending_task_count().unwrap(), 2);
+        let mut bots = Vec::new();
+        for _ in 0..2 {
+            bots.push(store.claim_task("worker", 30).unwrap().unwrap().bot);
+        }
+        bots.sort();
+        assert_eq!(bots, vec!["analyst", "main"]);
+        let audit = store.list_audit(50).unwrap();
+        let filtered = audit
+            .iter()
+            .find(|entry| entry.event == "team.mention_filtered")
+            .expect("mention filter audit");
+        let details = filtered.details.as_ref().unwrap();
+        assert_eq!(details["mentions"], json!(["analyst"]));
+        assert_eq!(details["kept"], json!(["analyst"]));
+        assert_eq!(details["members"], json!(["analyst", "maker"]));
+        // The mention never reached the model endpoint.
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn room_without_mentions_fans_out_to_every_member_unchanged() {
+        let server = MockServer::start().await;
+        let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
+        store
+            .create_conversation("room:review", "room", None)
+            .unwrap();
+        store
+            .set_conversation_team(
+                "room:review",
+                &["analyst".into(), "maker".into()],
+                "all",
+                "",
+            )
+            .unwrap();
+        let task = runtime
+            .submit_text("room:review", "synthetic", None)
+            .unwrap();
+        let payload: TurnPayload =
+            serde_json::from_value(store.get_task(&task.id).unwrap().payload).unwrap();
+        assert!(payload.mentions.is_empty());
+        assert_eq!(store.pending_task_count().unwrap(), 3);
+        assert!(
+            !store
+                .list_audit(50)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.event == "team.mention_filtered")
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_mode_room_adds_owner_addressed_clause_for_member_mentions() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(Sequence::new(vec![json!({
+                "choices": [{"message": {"content": "Synthetic answer."}, "finish_reason": "stop"}]
+            })]))
+            .mount(&server)
+            .await;
+        let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
+        store
+            .create_conversation("room:review", "room", None)
+            .unwrap();
+        store
+            .set_conversation_team(
+                "room:review",
+                &["analyst".into(), "maker".into()],
+                "selected",
+                "",
+            )
+            .unwrap();
+        let task = runtime
+            .submit_text("room:review", "@maker check this @nobody", None)
+            .unwrap();
+        let payload: TurnPayload =
+            serde_json::from_value(store.get_task(&task.id).unwrap().payload).unwrap();
+        assert_eq!(payload.mentions, vec!["maker".to_string()]);
+        let claimed = store.claim_task("worker", 30).unwrap().unwrap();
+        assert_eq!(claimed.id, task.id);
+        runtime.process_task(claimed).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("OWNER ADDRESSED: @maker"), "{system}");
+        assert!(!system.contains("@nobody"), "{system}");
+    }
+
+    #[test]
+    fn watch_silence_rule_requires_flag_and_fully_quiet_reports() {
+        use crate::watcher::WatchReport;
+        let quiet = WatchReport {
+            source: "portal".into(),
+            new: 0,
+            changed: 0,
+            failed: 0,
+            items_seen: 0,
+            ok: true,
+            warnings: vec![],
+        };
+        assert!(watch_run_is_silent(true, std::slice::from_ref(&quiet)));
+        assert!(!watch_run_is_silent(false, std::slice::from_ref(&quiet)));
+        let mut failing = quiet.clone();
+        failing.ok = false;
+        assert!(!watch_run_is_silent(true, &[failing]));
+        let mut with_new = quiet.clone();
+        with_new.new = 1;
+        assert!(!watch_run_is_silent(true, &[with_new]));
+        let mut with_failed_items = quiet.clone();
+        with_failed_items.failed = 1;
+        assert!(!watch_run_is_silent(true, &[with_failed_items]));
+        let mut mixed = quiet.clone();
+        mixed.changed = 2;
+        assert!(!watch_run_is_silent(true, &[quiet.clone(), mixed]));
+    }
+
+    #[tokio::test]
+    async fn brief_silent_when_empty_skips_notify_but_records_audit() {
+        let server = MockServer::start().await;
+        let notifier = Arc::new(Capture::default());
+        let (runtime, store) = setup_custom(
+            &server.uri(),
+            notifier.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            std::env::current_dir().unwrap(),
+            true,
+        );
+        let task = store
+            .enqueue_task(
+                "brief",
+                "watcher",
+                &json!({"conversation_id": "owner"}),
+                5,
+                Utc::now(),
+            )
+            .unwrap();
+        runtime.process_task(task).await.unwrap();
+        // Empty store → empty brief → no notification with the flag on.
+        assert!(notifier.texts.lock().unwrap().is_empty());
+        let audit = store.list_audit(50).unwrap();
+        assert!(audit.iter().any(|entry| entry.event == "brief.silent_run"));
+        assert!(
+            !audit
+                .iter()
+                .any(|entry| entry.event == "brief.blocked_by_policy")
+        );
+        assert!(
+            store
+                .events_after(0, 100)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "brief.silent_run")
+        );
+    }
+
+    #[tokio::test]
+    async fn brief_default_flag_sends_even_when_empty() {
+        let server = MockServer::start().await;
+        let notifier = Arc::new(Capture::default());
+        let (runtime, store) = setup_custom(
+            &server.uri(),
+            notifier.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            std::env::current_dir().unwrap(),
+            false,
+        );
+        let task = store
+            .enqueue_task(
+                "brief",
+                "watcher",
+                &json!({"conversation_id": "owner"}),
+                5,
+                Utc::now(),
+            )
+            .unwrap();
+        runtime.process_task(task).await.unwrap();
+        let texts = notifier.texts.lock().unwrap();
+        assert_eq!(texts.len(), 1);
+        assert!(texts[0].contains("No new items"));
+        assert!(
+            !store
+                .list_audit(50)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.event == "brief.silent_run")
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_failing_source_still_notifies_when_silent_flag_is_on() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("<html></html>", "text/html"))
+            .mount(&server)
+            .await;
+        let base = std::env::temp_dir().join(format!("serabot-watch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(base.join("config")).unwrap();
+        let port = url::Url::parse(&server.uri()).unwrap().port().unwrap();
+        std::fs::write(
+            base.join("config").join("sources.toml"),
+            format!(
+                "[[sources]]\nname = \"portal\"\nurl = \"http://localhost:{port}/feed\"\nkind = \"rss\"\nenabled = true\n"
+            ),
+        )
+        .unwrap();
+        let notifier = Arc::new(Capture::default());
+        let (runtime, store) = setup_custom(
+            &server.uri(),
+            notifier.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            base.clone(),
+            true,
+        );
+        let task = store
+            .enqueue_task(
+                "watch",
+                "watcher",
+                &json!({"conversation_id": "owner"}),
+                5,
+                Utc::now(),
+            )
+            .unwrap();
+        runtime.process_task(task).await.unwrap();
+        // The runtime fetcher does not allow plain-HTTP localhost, so the
+        // source fails: a failure is never silent, even with the flag on.
+        let texts = notifier.texts.lock().unwrap();
+        assert_eq!(texts.len(), 1);
+        assert!(texts[0].contains("Source watch"));
+        drop(texts);
+        assert!(
+            !store
+                .list_audit(100)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.event == "watch.silent_run")
+        );
+        // The run is still recorded in source_runs.
+        let runs: i64 = store
+            .connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM source_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(runs, 1);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
