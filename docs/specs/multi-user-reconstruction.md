@@ -186,8 +186,10 @@ scanning, WAL store) changes.
   stay in config. Model routing resolves per user: `ModelRouter` is built
   from the acting user's credentials against the admin-defined model
   catalog; a user without a provider's credentials simply cannot route to
-  that provider (fail closed, explicit error). Members add API keys or run
-  OAuth logins from their console.
+  that provider (fail closed, explicit error). Members add API keys, run
+  OAuth logins from their console, or use a provider the admin explicitly
+  granted them (an auditable, revocable permission — never a shared
+  secret).
 - Other connectors (Google, Notion, AgentMail) keep their global
   single-operator form in v1; per-user expansion follows the OneDrive
   pattern once it proves out.
@@ -364,15 +366,17 @@ Synthetic fixtures only; no live provider is ever contacted from tests
    existing tokens migrate into the operator's user-credential store with
    nothing lost, members bring their own keys/logins, and credential
    resolution is strictly per user (fail closed — no silent fallback to
-   another user's key).
+   another user's key). The admin may additionally **grant** a member
+   access to an admin-owned provider — an explicit, auditable, revocable
+   per-user permission that never exposes the credential itself.
 5. Telegram is linkable per user from the desktop app (linking-code flow);
    the single server bot token stays admin-managed in the age store.
 6. Bot fleets become per-user DB copies seeded from today's default fleet;
    the shipped `skills/` catalog stays server-managed; user-created skills
    are per-user DB rows.
-7. One Microsoft app registration for sign-in (public client + PKCE); the
-   OneDrive consent is a second, connector-specific flow — whether it reuses
-   the same registration is an open question (below).
+7. One Microsoft app registration for everything (public client + PKCE):
+   sign-in scopes at login, OneDrive `Files.ReadWrite` consent added
+   incrementally when a user connects their drive.
 8. The server keeps the restart-to-apply model (no hot reload) in v1.
 9. The sign-in screen shows three providers — Microsoft enabled, Google
    and GitHub visible but disabled ("coming soon") — on web, desktop, and
@@ -404,15 +408,18 @@ Synthetic fixtures only; no live provider is ever contacted from tests
 
 ## Open questions
 
-1. **App registration** — one Azure app for both sign-in and OneDrive consent
-   (incremental consent) or two registrations?
-2. **Provider sharing** — credentials resolve strictly per user (assumed);
-   should the admin also be able to *grant* a member access to an
-   admin-owned provider, or is BYO the only path?
-3. **Data deletion** — admin-disable user keeps data (assumed); do we also
-   need full delete/export of a user's rows?
-4. **Deployment** — the OVH VPS is at 97% disk; enlargement/cleanup is a
-   prerequisite for shipping. Owner decision required.
+Resolved by the owner (2026-10-31):
+
+1. **App registration** — one Azure app for both sign-in and OneDrive
+   consent (incremental consent). Single registration, kept simple.
+2. **Provider sharing** — BYO plus explicit, revocable admin grants;
+   grants never expose the credential itself.
+3. **Data deletion** — v1 ships admin-disable; a full user-data export
+   tool is a possible later addition, out of scope here.
+4. **Deployment disk** — the owner authorized removing the unused
+   openclaw data from the VPS (openclaw only; every other service and
+   dataset untouched) to free space; headroom is re-assessed after
+   cleanup.
 
 ## Phasing (detail comes in the plan, not this spec)
 
