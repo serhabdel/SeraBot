@@ -22,7 +22,7 @@ artifacts.
 | [Crafting Apps adoption](craft-adoption.md) | Storytold craft repos: take `deckcraft-pptx` for text-only generated decks and bounded import/edit of owner decks; skip the editors, MCP servers, and egui shells. |
 | [ElevenLabs](elevenlabs.md) | Speech, STT, sound effects, and image/video flow tools. |
 | [Owner wake checklist](owner-wake.md) | Morning status: `main` tip, OVH binary for `27b1018`, configure-later, smoke commands. |
-| [Multi-user spec](specs/multi-user-reconstruction.md) | Draft: small-circle multi-user reconstruction — OIDC sign-in, UID-scoped data, per-user bots and connectors. Awaiting owner approval. |
+| [Multi-user spec](specs/multi-user-reconstruction.md) | Owner-approved: small-circle multi-user — OIDC sign-in, UID-scoped data, per-user bots and connectors. Implementation in progress. |
 
 Related sources of truth:
 

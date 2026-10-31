@@ -1,9 +1,9 @@
 # Spec: SeraBot multi-user reconstruction (small trusted circle)
 
-Status: **draft, awaiting owner approval.** Approving this spec deliberately
-rewrites the product boundary in `AGENTS.md` (which today forbids multi-user
-auth). Nothing in this spec is implemented until the owner approves it and the
-`AGENTS.md` rewrite lands as the first change.
+Status: **approved by the owner, 2026-10-31; implementation in progress** on
+`spec/multi-user-reconstruction` (see `tasks/plan.md` and `tasks/todo.md`).
+The `AGENTS.md` product boundary was rewritten as the first change (phase
+0). Nothing merges to `main` without the owner's explicit OK.
 
 ## Objective
 
