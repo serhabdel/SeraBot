@@ -904,10 +904,14 @@ pub fn parse_inline(text: &str) -> Vec<InlineSpan> {
             }
         }
 
-        // Consume normal text up to the next formatting token
-        let next_pos = rest[1..]
-            .find(['*', '`', '['])
-            .map(|idx| idx + 1)
+        // Consume normal text up to the next formatting token. Skip the first
+        // *char* (not byte): slicing at byte 1 panics when `rest` starts with a
+        // multibyte character (emoji, accented letters).
+        let next_pos = rest
+            .char_indices()
+            .skip(1)
+            .find(|(_, c)| matches!(c, '*' | '`' | '['))
+            .map(|(idx, _)| idx)
             .unwrap_or(rest.len());
 
         let chunk = &rest[..next_pos];
@@ -6377,6 +6381,58 @@ mod tests {
             "line\ndeck_build "
         );
         assert_eq!(insert_slash_text("/", "rag_search"), "rag_search ");
+    }
+
+    #[test]
+    fn mention_and_markdown_helpers_never_panic_on_multibyte_input() {
+        // Fuzz-ish sweep: none of these may panic, whatever the bytes.
+        let inputs = [
+            "@analyst hi",
+            "ciao @ana",
+            "@😀",
+            "é@x",
+            "😀 @analyst",
+            "héllo wörld @maker 😀",
+            "@",
+            "@@",
+            &format!("@{}", "a".repeat(40)),
+            "line\n@mk",
+            "/",
+            "/dé",
+            "é/de",
+        ];
+        for input in inputs {
+            let q = mention_query(input);
+            let s = slash_query(input);
+            if let Some(q) = q {
+                let _ = insert_mention_text(input, &q);
+            }
+            if let Some(s) = s {
+                let _ = insert_slash_text(input, &s);
+            }
+            // A user message is rendered through the markdown parser on submit.
+            let _ = parse_markdown_blocks(input);
+            let _ = parse_inline(input);
+        }
+        // Markdown edge cases, incl. multibyte right after formatting tokens.
+        let md = [
+            "**bold**😀",
+            "😀",
+            "é",
+            "`code`é",
+            "[lbl](https://x)é",
+            "*it*😀",
+            "# é",
+            "- é😀",
+            "| a | b |\n|---|---|\n| é | 😀 |",
+            "```rust\nlet é = 1;\n```",
+            "> é 😀",
+            "**`c`**😀",
+        ];
+        for input in md {
+            let _ = parse_markdown_blocks(input);
+            let _ = parse_inline(input);
+        }
     }
 
     #[test]
