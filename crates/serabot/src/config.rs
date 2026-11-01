@@ -382,6 +382,9 @@ pub struct ServerConfig {
     pub body_limit_bytes: usize,
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
+    /// Per-minute request budget for each acting user (default 60). Public
+    /// sign-in routes share one anonymous bucket. Multiple sessions of the
+    /// same user share the user's budget rather than multiplying it.
     #[serde(default = "default_rate_limit")]
     pub rate_limit_per_minute: u32,
     #[serde(default = "default_event_retention_days")]
@@ -852,7 +855,10 @@ impl AuthConfig {
 /// value cannot hide until the quota turns on.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsersConfig {
-    /// Daily task budget per user (default 500). Enforced at enqueue.
+    /// Daily task budget per user (default 500). Enforced atomically at the
+    /// user-facing enqueue points. The window is the **UTC calendar day**,
+    /// the same bucketing `usage_rollup` uses for its `per_day` rows; a user
+    /// at the cap gets an explicit validation error, never a silent drop.
     #[serde(default = "default_users_task_quota")]
     pub tasks_per_user_per_day: u64,
 }

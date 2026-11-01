@@ -6,6 +6,13 @@
 //! serve its turn, and the prompt, tool allowlist, delegation targets, and
 //! memory injection all come from that user's rows. A user with an invalid
 //! fleet fails closed without affecting any other user.
+//!
+//! Phase 5 enforces `[users].tasks_per_user_per_day` at the user-facing
+//! enqueue points ([`Runtime::submit_text`]) through the store's atomic
+//! quota check. Internal continuations — approval resumes, handoffs, team
+//! fan-out — are not re-counted: they continue work that already consumed a
+//! slot when the user submitted it. Admin-configured scheduled routines are
+//! server work and are likewise not charged to the user's request budget.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -394,8 +401,10 @@ impl Runtime {
         self.gateway.policy()
     }
 
-    pub fn scan_owner_output(&self, text: &str) -> Result<()> {
-        self.gateway.scan_egress(text)
+    /// Scan owner/console output against the policy and attribute a block to
+    /// the acting user in the audit ledger.
+    pub fn scan_owner_output(&self, user_id: &str, text: &str) -> Result<()> {
+        self.gateway.scan_egress(user_id, text)
     }
 
     pub async fn refresh_model_catalogs(&self, user_id: &str) -> Result<()> {
@@ -426,7 +435,7 @@ impl Runtime {
     pub fn model_catalog(&self, user_id: &str) -> Result<Vec<ProviderView>> {
         let catalog = self.router.catalog(user_id);
         self.gateway
-            .scan_egress(&serde_json::to_string(&catalog)?)?;
+            .scan_egress(user_id, &serde_json::to_string(&catalog)?)?;
         Ok(catalog)
     }
 
@@ -436,7 +445,7 @@ impl Runtime {
     ) -> Result<Vec<crate::model_router::CatalogEntry>> {
         let entries = self.router.catalog_entries(user_id);
         self.gateway
-            .scan_egress(&serde_json::to_string(&entries)?)?;
+            .scan_egress(user_id, &serde_json::to_string(&entries)?)?;
         Ok(entries)
     }
 
@@ -510,12 +519,12 @@ impl Runtime {
         };
         if selection.is_auto_mode() {
             self.gateway
-                .scan_egress(&serde_json::to_string(&selection)?)?;
+                .scan_egress(user_id, &serde_json::to_string(&selection)?)?;
             return Ok(selection);
         }
         self.router.validate_selection(user_id, &selection)?;
         self.gateway
-            .scan_egress(&serde_json::to_string(&selection)?)?;
+            .scan_egress(user_id, &serde_json::to_string(&selection)?)?;
         Ok(selection)
     }
 
@@ -545,7 +554,7 @@ impl Runtime {
             &self.config.llm.bot_models,
         )?;
         self.gateway
-            .scan_egress(&serde_json::to_string(&resolved)?)?;
+            .scan_egress(user_id, &serde_json::to_string(&resolved)?)?;
         Ok(resolved)
     }
 
@@ -570,7 +579,7 @@ impl Runtime {
             selection
         };
         let value = serde_json::to_string(&stored)?;
-        self.gateway.scan_egress(&value)?;
+        self.gateway.scan_egress(user_id, &value)?;
         self.store.record_audit(
             user_id,
             "model.selected",
@@ -586,7 +595,11 @@ impl Runtime {
         Ok(stored)
     }
 
-    fn checked_route<'a>(&self, route: &'a Option<PinnedRoute>) -> Result<&'a PinnedRoute> {
+    fn checked_route<'a>(
+        &self,
+        user_id: &str,
+        route: &'a Option<PinnedRoute>,
+    ) -> Result<&'a PinnedRoute> {
         let route = route.as_ref().ok_or_else(|| {
             SeraError::Forbidden(
                 "turn has no pinned model route; owner must resubmit the request".into(),
@@ -594,7 +607,7 @@ impl Runtime {
         })?;
         self.router.validate_pinned(route)?;
         self.gateway
-            .scan_egress(&serde_json::to_string(&route.selection)?)?;
+            .scan_egress(user_id, &serde_json::to_string(&route.selection)?)?;
         Ok(route)
     }
 
@@ -618,7 +631,7 @@ impl Runtime {
             return Err(SeraError::Validation("message is too long".into()));
         }
         if text == "/brief" || text.starts_with("/brief ") {
-            let task = self.store.enqueue_task(
+            let task = self.store.enqueue_task_with_quota(
                 user_id,
                 "brief",
                 "watcher",
@@ -628,6 +641,7 @@ impl Runtime {
                 })?,
                 5,
                 Utc::now(),
+                self.config.users.tasks_per_user_per_day,
             )?;
             self.store.append_event(
                 user_id,
@@ -637,7 +651,7 @@ impl Runtime {
             return Ok(task);
         }
         if text == "/watch" || text.starts_with("/watch ") {
-            let task = self.store.enqueue_task(
+            let task = self.store.enqueue_task_with_quota(
                 user_id,
                 "watch",
                 "watcher",
@@ -647,6 +661,7 @@ impl Runtime {
                 })?,
                 5,
                 Utc::now(),
+                self.config.users.tasks_per_user_per_day,
             )?;
             self.store.append_event(
                 user_id,
@@ -742,13 +757,16 @@ impl Runtime {
             team: None,
             mentions: mentions.clone(),
         };
-        let task = self.store.enqueue_task(
+        // User-initiated work: the daily quota is checked atomically with the
+        // insert, so a user at the cap gets an explicit validation error.
+        let task = self.store.enqueue_task_with_quota(
             user_id,
             "turn",
             &bot,
             &serde_json::to_value(payload)?,
             0,
             Utc::now(),
+            self.config.users.tasks_per_user_per_day,
         )?;
         self.store.append_event(
             user_id,
@@ -913,6 +931,8 @@ impl Runtime {
             action_id: result.action.id.clone(),
             decision: decision_label.into(),
         };
+        // A resume continues the turn that already consumed a quota slot at
+        // submit time; it is not a new user request and is not re-counted.
         self.store.enqueue_task(
             user_id,
             "resume",
@@ -1098,7 +1118,7 @@ impl Runtime {
             .parse()
             .map_err(|_| SeraError::Config("invalid schedule timezone".into()))?;
         let report = crate::brief::build_brief_report(&self.store, &user, Utc::now(), tz, 24)?;
-        let text = if self.gateway.scan_egress(&report.text).is_err() {
+        let text = if self.gateway.scan_egress(&user, &report.text).is_err() {
             self.store.record_audit(
                 &user,
                 "brief.blocked_by_policy",
@@ -1207,7 +1227,7 @@ impl Runtime {
                 text.push_str(&format!("  warning: {}\n", truncate_chars(warning, 300)));
             }
         }
-        if self.gateway.scan_egress(&text).is_err() {
+        if self.gateway.scan_egress(&user, &text).is_err() {
             text = "Source watch completed, but the report was withheld by the content policy."
                 .to_string();
         }
@@ -1235,7 +1255,7 @@ impl Runtime {
         let user = task.user_id.clone();
         self.store
             .ensure_conversation_accepts_turns(&user, &payload.conversation_id)?;
-        self.checked_route(&payload.route)?;
+        self.checked_route(&user, &payload.route)?;
         let fleet = self.fleet.load(&user)?;
         let bot = fleet
             .get(&payload.bot)
@@ -1254,7 +1274,7 @@ impl Runtime {
             }
             let state: TurnState = serde_json::from_value(existing.state.clone())
                 .map_err(|_| SeraError::InvalidState("stored turn state is invalid".into()))?;
-            self.checked_route(&state.route)?;
+            self.checked_route(&user, &state.route)?;
             if state.route != payload.route {
                 return Err(SeraError::Forbidden(
                     "turn route does not match queued route".into(),
@@ -1346,7 +1366,7 @@ impl Runtime {
         let turn = self.store.get_turn(&user, &payload.turn_id)?;
         let mut state: TurnState = serde_json::from_value(turn.state.clone())
             .map_err(|_| SeraError::InvalidState("stored turn state is invalid".into()))?;
-        self.checked_route(&state.route)?;
+        self.checked_route(&user, &state.route)?;
         let fleet = self.fleet.load(&user)?;
         let bot = fleet
             .get(&turn.bot)
@@ -1583,7 +1603,7 @@ impl Runtime {
             .join(", ");
         upsert_tool_notice(&mut state.messages, &tool_names);
         let temperature = bot.config.temperature;
-        self.checked_route(&state.route)?;
+        self.checked_route(&user, &state.route)?;
 
         let tool_round_cap = self
             .config
@@ -1595,10 +1615,10 @@ impl Runtime {
             if self.shutdown.is_cancelled() {
                 return Err(SeraError::Internal("shutting down".into()));
             }
-            let route = self.checked_route(&state.route)?;
-            self.scan_model_messages(&state.messages)?;
+            let route = self.checked_route(&user, &state.route)?;
+            self.scan_model_messages(&user, &state.messages)?;
             self.gateway
-                .scan_egress(&serde_json::to_string(&tool_specs)?)?;
+                .scan_egress(&user, &serde_json::to_string(&tool_specs)?)?;
             let response = self
                 .router
                 .complete(&user, route, &state.messages, &tool_specs, temperature)
@@ -1643,7 +1663,7 @@ impl Runtime {
                         text = ABSTENTION.to_string();
                     }
                 }
-                if self.gateway.scan_egress(&text).is_err() {
+                if self.gateway.scan_egress(&user, &text).is_err() {
                     text =
                         "I cannot share that output because it violates the content policy.".into();
                 }
@@ -2154,7 +2174,7 @@ impl Runtime {
         prompt
     }
 
-    fn scan_model_messages(&self, messages: &[LlmMessage]) -> Result<()> {
+    fn scan_model_messages(&self, user_id: &str, messages: &[LlmMessage]) -> Result<()> {
         let mut combined = String::new();
         for message in messages {
             if let Some(content) = &message.content {
@@ -2174,7 +2194,7 @@ impl Runtime {
                 combined.push('\n');
             }
         }
-        self.gateway.scan_egress(&combined)
+        self.gateway.scan_egress(user_id, &combined)
     }
 }
 
@@ -2684,6 +2704,43 @@ mod tests {
         assert_eq!(persisted, ModelSelection::auto_mode());
     }
 
+    /// The daily cap is enforced at `submit_text` for the acting user only:
+    /// the (N+1)th message fails with an explicit validation error while a
+    /// second user still has their own budget.
+    #[tokio::test]
+    async fn submit_text_enforces_the_per_user_daily_task_quota() {
+        let server = MockServer::start().await;
+        let (runtime, store) = setup(
+            &server.uri(),
+            Arc::new(Capture::default()),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let mut config = (*runtime.config).clone();
+        config.users.tasks_per_user_per_day = 1;
+        let runtime = restart(&runtime, config, vec![bot()]);
+        let admin_id = admin(&store);
+        let member = store
+            .create_user("microsoft:quota-member", "q@example.example", "Q")
+            .unwrap();
+
+        runtime
+            .submit_text(&admin_id, "owner", "first", None)
+            .unwrap();
+        let error = runtime
+            .submit_text(&admin_id, "owner", "second", None)
+            .unwrap_err();
+        assert!(
+            matches!(&error, SeraError::Validation(message) if message.contains("1 tasks per user per UTC day")),
+            "unexpected error: {error}"
+        );
+        // The member's budget is untouched by the admin's usage.
+        runtime
+            .submit_text(&member.id, "member-owner", "first", None)
+            .unwrap();
+        assert_eq!(store.pending_task_count(&admin_id).unwrap(), 1);
+        assert_eq!(store.pending_task_count(&member.id).unwrap(), 1);
+    }
+
     #[tokio::test]
     async fn conversation_selection_is_isolated_persisted_and_pinned_at_enqueue() {
         let server = MockServer::start().await;
@@ -2794,7 +2851,11 @@ mod tests {
         );
         let mut message = LlmMessage::user("safe");
         message.name = Some("restricted".into());
-        assert!(runtime.scan_model_messages(&[message]).is_err());
+        assert!(
+            runtime
+                .scan_model_messages(&admin(&store), &[message])
+                .is_err()
+        );
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 

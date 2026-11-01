@@ -92,11 +92,11 @@ never merge without the owner's OK.
 
 ## Phase 5 — gateway authority, quotas
 
-- [ ] T5.1 Approvals/grants decide within the owning user; gateway actor
+- [x] T5.1 Approvals/grants decide within the owning user; gateway actor
       from context.
-- [ ] T5.2 Quotas: `tasks_per_user_per_day` at enqueue; per-session rate
+- [x] T5.2 Quotas: `tasks_per_user_per_day` at enqueue; per-session rate
       limit.
-- [ ] T5.3 Phase gate + commit + push.
+- [x] T5.3 Phase gate + commit + push.
 
 ## Phase 6 — consoles, docs
 

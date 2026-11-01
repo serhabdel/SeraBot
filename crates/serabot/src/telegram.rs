@@ -1104,7 +1104,7 @@ fn provider_catalog_reply(runtime: &Runtime, user_id: &str) -> Result<String> {
          Future turns include this conversation's history; running turns keep their original selection.\n\
          /models lists the same allowlist as flat provider / model lines.",
     );
-    runtime.scan_owner_output(&reply)?;
+    runtime.scan_owner_output(user_id, &reply)?;
     Ok(reply)
 }
 
@@ -1218,7 +1218,7 @@ fn model_command(
         }
         _ => return Ok(None),
     };
-    runtime.scan_owner_output(&reply)?;
+    runtime.scan_owner_output(user_id, &reply)?;
     Ok(Some(reply))
 }
 

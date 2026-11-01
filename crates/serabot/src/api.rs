@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -107,7 +107,10 @@ pub struct ApiState {
     /// OneDrive consent (auth code + PKCE); `None` while `[onedrive]` is off.
     onedrive_consent: Option<Arc<OneDriveConsent>>,
     token_hash: String,
-    rate: Arc<Mutex<VecDeque<Instant>>>,
+    /// Per-user request buckets for the per-minute limit. Keyed by the
+    /// acting user id (never a token); public sign-in routes without an
+    /// authenticated user share one `anonymous` bucket.
+    rate: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
     rate_limit: usize,
     admin: Option<AdminStore>,
     /// The OIDC sign-in service; `None` while `[auth] enabled = false`, so
@@ -149,7 +152,7 @@ impl ApiState {
             onedrive,
             onedrive_consent,
             token_hash: config.api.token_hash.to_ascii_lowercase(),
-            rate: Arc::new(Mutex::new(VecDeque::new())),
+            rate: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: config.server.rate_limit_per_minute.max(1) as usize,
             admin: AdminStore::open(&config).ok(),
             auth,
@@ -283,10 +286,12 @@ pub fn router(state: ApiState) -> Router {
             shared.config.server.body_limit_bytes,
         ))
         .layer(middleware::from_fn_with_state(shared.clone(), rate_limit));
+    // `authorize` runs first so the rate limiter can key on the authenticated
+    // user; an unknown token is rejected before it can create a bucket.
     let protected = protected
         .merge(audio)
-        .layer(middleware::from_fn_with_state(shared.clone(), authorize))
-        .layer(middleware::from_fn_with_state(shared.clone(), rate_limit));
+        .layer(middleware::from_fn_with_state(shared.clone(), rate_limit))
+        .layer(middleware::from_fn_with_state(shared.clone(), authorize));
     crate::web::router()
         .merge(public_auth)
         .merge(protected)
@@ -403,7 +408,9 @@ async fn usage(
         "per_bot": rollup.per_bot,
     });
     // Same egress scan as the model catalog endpoints.
-    state.runtime.scan_owner_output(&body.to_string())?;
+    state
+        .runtime
+        .scan_owner_output(&user.id, &body.to_string())?;
     Ok(Json(body))
 }
 
@@ -506,7 +513,11 @@ async fn conversation_messages(
         .list_visible_messages(&user.id, &id, query.limit.unwrap_or(100).clamp(1, 200))?
         .into_iter()
         .map(|message| {
-            let content = if state.runtime.scan_owner_output(&message.content).is_ok() {
+            let content = if state
+                .runtime
+                .scan_owner_output(&user.id, &message.content)
+                .is_ok()
+            {
                 message.content
             } else {
                 "[Content withheld by policy]".to_owned()
@@ -521,7 +532,7 @@ async fn conversation_messages(
                 .name
                 .as_deref()
                 .filter(|name| crate::orchestration::safe_bot_label(name))
-                && state.runtime.scan_owner_output(name).is_ok()
+                && state.runtime.scan_owner_output(&user.id, name).is_ok()
             {
                 body["name"] = json!(name);
             }
@@ -529,7 +540,7 @@ async fn conversation_messages(
                 .bot
                 .as_deref()
                 .filter(|bot| crate::orchestration::safe_bot_label(bot))
-                && state.runtime.scan_owner_output(bot).is_ok()
+                && state.runtime.scan_owner_output(&user.id, bot).is_ok()
             {
                 body["bot"] = json!(bot);
             }
@@ -628,7 +639,9 @@ async fn conversation_team(
             ),
         };
         let body = team_view(&state, &user.id, &id, &members, &mode, &rules)?;
-        state.runtime.scan_owner_output(&body.to_string())?;
+        state
+            .runtime
+            .scan_owner_output(&user.id, &body.to_string())?;
         Ok(body)
     })();
     match body {
@@ -677,7 +690,7 @@ async fn set_conversation_team(
         }
         // Rules reach every later model request in the room, so they are
         // scanned before they are stored, not only on the way out.
-        state.runtime.scan_owner_output(&request.rules)?;
+        state.runtime.scan_owner_output(&user.id, &request.rules)?;
         let bots = state.runtime.fleet().configured(&user.id)?;
         for member in &request.members {
             let entry = bots.iter().find(|candidate| candidate.id == *member);
@@ -730,7 +743,9 @@ async fn set_conversation_team(
             mode.as_str(),
             &request.rules,
         )?;
-        state.runtime.scan_owner_output(&body.to_string())?;
+        state
+            .runtime
+            .scan_owner_output(&user.id, &body.to_string())?;
         Ok(body)
     })();
     match body {
@@ -771,6 +786,7 @@ async fn conversation_library(
 /// Raw owner audio, transcribed with the configured audio provider.
 async fn transcribe_audio(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
@@ -824,7 +840,7 @@ async fn transcribe_audio(
     }
     match crate::audio::transcribe_audio_bytes(&state.config, &body, &filename).await {
         Ok(text) => {
-            if let Err(error) = state.runtime.scan_owner_output(&text) {
+            if let Err(error) = state.runtime.scan_owner_output(&user.id, &text) {
                 return error.into_response();
             }
             Json(json!({
@@ -1101,7 +1117,9 @@ async fn create_bot(
     Extension(user): Extension<ActingUser>,
     Json(request): Json<CreateBotRequest>,
 ) -> Result<Json<Value>> {
-    state.runtime.scan_owner_output(&request.description)?;
+    state
+        .runtime
+        .scan_owner_output(&user.id, &request.description)?;
     let fleet = state.runtime.fleet();
     let known = fleet
         .catalog()
@@ -1209,7 +1227,9 @@ async fn list_bots(
         })
         .collect::<Vec<_>>();
     let body = json!({ "bots": bots });
-    state.runtime.scan_owner_output(&body.to_string())?;
+    state
+        .runtime
+        .scan_owner_output(&user.id, &body.to_string())?;
     Ok(Json(body))
 }
 
@@ -1349,7 +1369,9 @@ async fn bot_detail(
         "memory_count": memory_count,
         "artifact_count": artifact_count,
     });
-    state.runtime.scan_owner_output(&body.to_string())?;
+    state
+        .runtime
+        .scan_owner_output(&user.id, &body.to_string())?;
     Ok(Json(body))
 }
 
@@ -1397,7 +1419,7 @@ async fn update_bot(
         .flatten()
     {
         for item in list {
-            state.runtime.scan_owner_output(item)?;
+            state.runtime.scan_owner_output(&user.id, item)?;
         }
     }
     let row = state
@@ -1426,7 +1448,7 @@ async fn update_bot(
                     "bot prompt contains unsupported control characters".into(),
                 ));
             }
-            state.runtime.scan_owner_output(&prompt)?;
+            state.runtime.scan_owner_output(&user.id, &prompt)?;
             prompt
         }
         None => row.prompt.clone(),
@@ -1565,7 +1587,9 @@ async fn list_skills(
         .effective(&state.store, &user.id)?
         .summaries();
     let body = json!({ "skills": skills });
-    state.runtime.scan_owner_output(&body.to_string())?;
+    state
+        .runtime
+        .scan_owner_output(&user.id, &body.to_string())?;
     Ok(Json(body))
 }
 
@@ -1574,10 +1598,12 @@ async fn create_skill_pack(
     Extension(user): Extension<ActingUser>,
     Json(request): Json<CreateSkillRequest>,
 ) -> Result<Json<Value>> {
-    state.runtime.scan_owner_output(&request.id)?;
-    state.runtime.scan_owner_output(&request.description)?;
+    state.runtime.scan_owner_output(&user.id, &request.id)?;
+    state
+        .runtime
+        .scan_owner_output(&user.id, &request.description)?;
     if let Some(body) = &request.body {
-        state.runtime.scan_owner_output(body)?;
+        state.runtime.scan_owner_output(&user.id, body)?;
     }
     let fleet = state.runtime.fleet();
     let created = create_user_skill(
@@ -1658,7 +1684,7 @@ async fn create_conversation(
         None | Some("") => None,
         Some(raw) => {
             let title = normalize_conversation_title(raw)?;
-            state.runtime.scan_owner_output(&title)?;
+            state.runtime.scan_owner_output(&user.id, &title)?;
             Some(title)
         }
     };
@@ -1801,7 +1827,7 @@ async fn rename_conversation(
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
     let title = normalize_conversation_title(&request.title)?;
-    state.runtime.scan_owner_output(&title)?;
+    state.runtime.scan_owner_output(&user.id, &title)?;
     if !state.store.rename_conversation(&user.id, &id, &title)? {
         return Err(SeraError::NotFound(format!("conversation {id}")));
     }
@@ -1903,7 +1929,9 @@ async fn list_memories(
         None => memory::list(&state.store, &user.id, limit)?,
     };
     let body = json!({"memories": memories});
-    state.runtime.scan_owner_output(&body.to_string())?;
+    state
+        .runtime
+        .scan_owner_output(&user.id, &body.to_string())?;
     Ok(Json(body))
 }
 
@@ -1921,7 +1949,9 @@ async fn add_memory(
     Extension(user): Extension<ActingUser>,
     Json(request): Json<AddMemoryRequest>,
 ) -> Result<Json<Value>> {
-    state.runtime.scan_owner_output(&request.content)?;
+    state
+        .runtime
+        .scan_owner_output(&user.id, &request.content)?;
     let source = request
         .source
         .as_deref()
@@ -3230,7 +3260,7 @@ async fn admin_set_bot_profile(
     for value in [&request.display_name, &request.description, &request.avatar] {
         state
             .runtime
-            .scan_owner_output(value)
+            .scan_owner_output(&user.id, value)
             .map_err(admin_error)?;
     }
     admin
@@ -3392,7 +3422,10 @@ async fn admin_update_bot_config(
         .flatten()
     {
         for item in list {
-            state.runtime.scan_owner_output(item).map_err(admin_error)?;
+            state
+                .runtime
+                .scan_owner_output(&user.id, item)
+                .map_err(admin_error)?;
         }
     }
     let role = state
@@ -3924,16 +3957,34 @@ fn html_response(status: StatusCode, page: String) -> Response {
         .into_response()
 }
 
+/// Per-minute request limit, one bucket per acting user.
+///
+/// The bucket key is the authenticated user id, so one user cannot exhaust
+/// another's budget and multiple sessions of the same user share the
+/// configured limit instead of multiplying it. Requests that reach this
+/// middleware without an `ActingUser` — the public sign-in routes — share one
+/// anonymous bucket. Buckets are pruned on every request, so idle sessions do
+/// not accumulate.
 async fn rate_limit(State(state): State<Arc<ApiState>>, request: Request, next: Next) -> Response {
+    let key = request
+        .extensions()
+        .get::<ActingUser>()
+        .map(|user| user.id.clone())
+        .unwrap_or_else(|| "anonymous".to_owned());
     {
-        let mut entries = state.rate.lock().await;
+        let mut buckets = state.rate.lock().await;
         let now = Instant::now();
-        while entries
-            .front()
-            .is_some_and(|entry| now.duration_since(*entry) > Duration::from_secs(60))
-        {
-            entries.pop_front();
-        }
+        let window = Duration::from_secs(60);
+        buckets.retain(|_, entries| {
+            while entries
+                .front()
+                .is_some_and(|entry| now.duration_since(*entry) > window)
+            {
+                entries.pop_front();
+            }
+            !entries.is_empty()
+        });
+        let entries = buckets.entry(key).or_default();
         if entries.len() >= state.rate_limit {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -4069,22 +4120,27 @@ mod tests {
         base_dir: std::path::PathBuf,
         bots: Vec<LoadedBot>,
     ) -> (Router, Arc<Config>, Store) {
-        app_with_auth_stack(egress_approved, policy, base_dir, bots, None)
+        app_with_auth_stack(egress_approved, policy, base_dir, bots, None, None)
     }
 
-    /// Full app stack, optionally with sign-in enabled. The auth service is
-    /// built against the same store as the API and pointed at `auth_issuer`
-    /// (a loopback mock identity provider in tests).
+    /// Full app stack, optionally with sign-in enabled and a custom
+    /// per-minute rate limit. The auth service is built against the same
+    /// store as the API and pointed at `auth_issuer` (a loopback mock
+    /// identity provider in tests).
     fn app_with_auth_stack(
         egress_approved: bool,
         policy: Policy,
         base_dir: std::path::PathBuf,
         bots: Vec<LoadedBot>,
         auth_issuer: Option<&str>,
+        rate_limit: Option<u32>,
     ) -> (Router, Arc<Config>, Store) {
         let mut config = Config::default();
         config.api.enabled = true;
         config.api.token_hash = sha256_hex("test-token-that-is-long-enough-123");
+        if let Some(limit) = rate_limit {
+            config.server.rate_limit_per_minute = limit;
+        }
         config.llm.data_egress_approved = egress_approved;
         config.llm.model = "test".into();
         config.llm.base_url = "https://example.com/v1".into();
@@ -4191,8 +4247,30 @@ mod tests {
                 crate::orchestration::BotRole::Orchestrator,
             )],
             Some(&idp.issuer),
+            None,
         );
         (app, config, store, idp)
+    }
+
+    /// An app whose per-minute API limit is low enough to exercise the
+    /// per-user buckets without hundreds of requests.
+    fn app_with_rate_limit(limit: u32) -> (Router, Arc<Config>, Store) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::env::current_dir().unwrap());
+        app_with_auth_stack(
+            true,
+            Policy::empty(),
+            root,
+            vec![test_bot(
+                "main",
+                crate::orchestration::BotRole::Orchestrator,
+            )],
+            None,
+            Some(limit),
+        )
     }
 
     fn request(
@@ -4234,6 +4312,24 @@ mod tests {
                     .unwrap_or_else(Body::empty),
             )
             .unwrap()
+    }
+
+    /// Mint a device token owned by a specific user (the CLI helper always
+    /// mints for the admin).
+    fn mint_for(store: &Store, user_id: &str, label: &str) -> String {
+        let mut bytes = [0u8; crate::token_cli::TOKEN_BYTES];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let token = hex::encode(bytes);
+        store
+            .insert_device_token(
+                &crate::domain::new_id(),
+                label,
+                &sha256_hex(&token),
+                Some(user_id),
+                None,
+            )
+            .unwrap();
+        token
     }
 
     #[tokio::test]
@@ -4307,6 +4403,56 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{token}");
         }
+    }
+
+    /// The per-minute limit is per acting user, not one global counter:
+    /// exhausting the admin's budget leaves a member's session untouched, and
+    /// a second admin session shares the admin's budget instead of doubling
+    /// it.
+    #[tokio::test]
+    async fn rate_limit_is_per_user_not_global() {
+        let (app, _, store) = app_with_rate_limit(1);
+        let admin_id = admin(&store);
+        let member = store
+            .create_user("microsoft:rate-member", "r@example.example", "R")
+            .unwrap();
+        let admin_token = mint_for(&store, &admin_id, "admin-session");
+        let member_token = mint_for(&store, &member.id, "member-session");
+
+        let first = app
+            .clone()
+            .oneshot(request_with_token("GET", "/v1/health", &admin_token, None))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = app
+            .clone()
+            .oneshot(request_with_token("GET", "/v1/health", &admin_token, None))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // A second admin session shares the admin's budget.
+        let second_admin_session = mint_for(&store, &admin_id, "admin-session-2");
+        let shared = app
+            .clone()
+            .oneshot(request_with_token(
+                "GET",
+                "/v1/health",
+                &second_admin_session,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(shared.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // The member's budget is independent of the admin's.
+        let member_response = app
+            .clone()
+            .oneshot(request_with_token("GET", "/v1/health", &member_token, None))
+            .await
+            .unwrap();
+        assert_eq!(member_response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

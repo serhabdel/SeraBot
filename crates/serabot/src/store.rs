@@ -15,6 +15,15 @@
 //! rows on top of the shipped catalog). Every bot and skill method below is
 //! scoped exactly like the rest: the acting user's id is the first argument
 //! and an unknown or foreign id is indistinguishable from a missing row.
+//!
+//! Phase 5 adds the per-user task quota:
+//! [`Store::enqueue_task_with_quota`] counts the acting user's tasks for the
+//! current UTC calendar day inside the same `BEGIN IMMEDIATE` transaction as
+//! the insert. A user at the cap gets an explicit `Validation` error and no
+//! row; another user's tasks never count against them. Internal continuations
+//! (approval resumes, handoffs, team fan-out) use [`Store::enqueue_task`]
+//! because they continue work already counted; admin-configured scheduled
+//! routines use it too because they are server work, not user requests.
 
 use std::path::{Path, PathBuf};
 use std::sync::Once;
@@ -24,7 +33,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use rand::RngCore;
-use rusqlite::{OptionalExtension, Row, params};
+use rusqlite::{OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -2716,6 +2725,25 @@ impl Store {
             .ok_or_else(|| SeraError::NotFound(format!("approval {id}")))
     }
 
+    /// The acting user's approval for one of their actions, newest first.
+    ///
+    /// Used by the gateway to re-verify the approval chain before an approved
+    /// action is dispatched: an approval recorded under another user is
+    /// indistinguishable from a missing one, so the caller fails closed.
+    pub fn get_approval_for_action(&self, user_id: &str, action_id: &str) -> Result<Approval> {
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT id, action_id, tool, summary, state, scope, expires_at, created_at, decided_at, note
+                 FROM approvals WHERE action_id = ?1 AND user_id = ?2
+                 ORDER BY created_at DESC LIMIT 1",
+                params![action_id, user_id],
+                map_approval,
+            )
+            .optional()?
+            .ok_or_else(|| SeraError::NotFound(format!("approval for action {action_id}")))
+    }
+
     /// The acting user's pending approvals, oldest first.
     pub fn list_pending_approvals(&self, user_id: &str, limit: usize) -> Result<Vec<Approval>> {
         let connection = self.connection()?;
@@ -3036,8 +3064,13 @@ impl Store {
             .ok_or_else(|| SeraError::NotFound(format!("task {id}")))
     }
 
-    /// Queue one task for the acting user. Every task carries its owner; the
-    /// worker later executes it under this id.
+    /// Queue one task for the acting user without a quota check. Every task
+    /// carries its owner; the worker later executes it under this id.
+    ///
+    /// This is the low-level insert for work that continues an already
+    /// counted request (approval resumes, handoffs, team fan-out) and for
+    /// admin-configured scheduled routines. User-initiated enqueues go
+    /// through [`Store::enqueue_task_with_quota`].
     pub fn enqueue_task(
         &self,
         user_id: &str,
@@ -3047,24 +3080,101 @@ impl Store {
         priority: i64,
         run_after: DateTime<Utc>,
     ) -> Result<Task> {
+        self.enqueue_task_inner(user_id, kind, bot, payload, priority, run_after, None)
+    }
+
+    /// Queue one task for the acting user, enforcing the user's daily task
+    /// quota inside the same immediate transaction as the insert.
+    ///
+    /// The quota window is the **UTC calendar day** (`created_at >= today
+    /// 00:00:00Z`), the same bucketing `usage_rollup` uses for its `per_day`
+    /// rows. A user at the limit gets an explicit `Validation` error naming
+    /// the limit and no row is written. `BEGIN IMMEDIATE` takes the write lock
+    /// before the count, so two concurrent enqueues for the same user cannot
+    /// both claim the last slot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_task_with_quota(
+        &self,
+        user_id: &str,
+        kind: &str,
+        bot: &str,
+        payload: &Value,
+        priority: i64,
+        run_after: DateTime<Utc>,
+        daily_limit: u64,
+    ) -> Result<Task> {
+        self.enqueue_task_inner(
+            user_id,
+            kind,
+            bot,
+            payload,
+            priority,
+            run_after,
+            Some(daily_limit),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_task_inner(
+        &self,
+        user_id: &str,
+        kind: &str,
+        bot: &str,
+        payload: &Value,
+        priority: i64,
+        run_after: DateTime<Utc>,
+        daily_limit: Option<u64>,
+    ) -> Result<Task> {
         let now = utc_now();
         let id = new_id();
         let connection = self.connection()?;
-        connection.execute(
-            "INSERT INTO tasks(id, kind, bot, payload_json, status, priority, attempts, max_attempts,
-                run_after, lease_until, worker_id, fencing_token, uncertain, last_error, created_at, updated_at, user_id)
-             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, 0, 5, ?6, NULL, NULL, 0, 0, NULL, ?7, ?7, ?8)",
-            params![
-                id,
-                kind,
-                bot,
-                serde_json::to_string(payload)?,
-                priority,
-                to_string(run_after),
-                to_string(now),
-                user_id
-            ],
-        )?;
+        match daily_limit {
+            Some(daily_limit) => {
+                let limit = i64::try_from(daily_limit).unwrap_or(i64::MAX);
+                let day_start = now
+                    .date_naive()
+                    .and_hms_opt(0, 0, 0)
+                    .expect("midnight is a valid time")
+                    .and_utc();
+                let transaction =
+                    Transaction::new_unchecked(&connection, TransactionBehavior::Immediate)?;
+                let used: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE user_id = ?1 AND created_at >= ?2",
+                    params![user_id, to_string(day_start)],
+                    |row| row.get(0),
+                )?;
+                if used >= limit {
+                    return Err(SeraError::Validation(format!(
+                        "daily task quota exceeded: {daily_limit} tasks per user per UTC day"
+                    )));
+                }
+                insert_task_row(
+                    &transaction,
+                    &id,
+                    user_id,
+                    kind,
+                    bot,
+                    payload,
+                    priority,
+                    run_after,
+                    now,
+                )?;
+                transaction.commit()?;
+            }
+            None => {
+                insert_task_row(
+                    &connection,
+                    &id,
+                    user_id,
+                    kind,
+                    bot,
+                    payload,
+                    priority,
+                    run_after,
+                    now,
+                )?;
+            }
+        }
         drop(connection);
         self.get_task(user_id, &id)
     }
@@ -3263,6 +3373,38 @@ fn map_approval(row: &Row<'_>) -> rusqlite::Result<Approval> {
 
 fn parse_role(value: &str) -> Role {
     value.parse().unwrap_or(Role::User)
+}
+
+/// Insert one queued task row. Shared by the plain and quota-checked
+/// enqueue paths so the row shape (and its owner) has one definition.
+#[allow(clippy::too_many_arguments)]
+fn insert_task_row(
+    connection: &rusqlite::Connection,
+    id: &str,
+    user_id: &str,
+    kind: &str,
+    bot: &str,
+    payload: &Value,
+    priority: i64,
+    run_after: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO tasks(id, kind, bot, payload_json, status, priority, attempts, max_attempts,
+            run_after, lease_until, worker_id, fencing_token, uncertain, last_error, created_at, updated_at, user_id)
+         VALUES (?1, ?2, ?3, ?4, 'queued', ?5, 0, 5, ?6, NULL, NULL, 0, 0, NULL, ?7, ?7, ?8)",
+        params![
+            id,
+            kind,
+            bot,
+            serde_json::to_string(payload)?,
+            priority,
+            to_string(run_after),
+            to_string(now),
+            user_id
+        ],
+    )?;
+    Ok(())
 }
 
 fn to_string(value: DateTime<Utc>) -> String {
@@ -5125,6 +5267,82 @@ mod tests {
                 .complete_task(&admin, &task.id, claimed.fencing_token)
                 .unwrap()
         );
+    }
+
+    /// The daily quota counts only the acting user's tasks for the current
+    /// UTC day. The (limit + 1)th enqueue fails with an explicit validation
+    /// error and writes nothing; another user still has their own budget.
+    #[test]
+    fn task_quota_is_per_user_and_per_utc_day() {
+        let store = store();
+        let admin = admin(&store);
+        let member = store
+            .create_user("microsoft:quota-member", "q@example.example", "Q")
+            .unwrap();
+        for _ in 0..2 {
+            store
+                .enqueue_task_with_quota(
+                    &admin,
+                    "turn",
+                    "main",
+                    &serde_json::json!({}),
+                    0,
+                    utc_now(),
+                    2,
+                )
+                .unwrap();
+        }
+        let error = store
+            .enqueue_task_with_quota(
+                &admin,
+                "turn",
+                "main",
+                &serde_json::json!({}),
+                0,
+                utc_now(),
+                2,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&error, SeraError::Validation(message) if message.contains("2 tasks per user per UTC day")),
+            "unexpected error: {error}"
+        );
+        assert_eq!(store.pending_task_count(&admin).unwrap(), 2);
+        // The member's budget is untouched by the admin's usage.
+        store
+            .enqueue_task_with_quota(
+                &member.id,
+                "turn",
+                "main",
+                &serde_json::json!({}),
+                0,
+                utc_now(),
+                2,
+            )
+            .unwrap();
+        assert_eq!(store.pending_task_count(&member.id).unwrap(), 1);
+
+        // Backdating the admin's rows past the UTC day boundary frees the
+        // budget: the window is the calendar day, not a rolling counter.
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET created_at = ?1 WHERE user_id = ?2",
+                params![to_string(utc_now() - chrono::Duration::days(1)), admin],
+            )
+            .unwrap();
+        store
+            .enqueue_task_with_quota(
+                &admin,
+                "turn",
+                "main",
+                &serde_json::json!({}),
+                0,
+                utc_now(),
+                2,
+            )
+            .unwrap();
     }
 
     #[test]
