@@ -261,6 +261,100 @@ class HealthInfo {
   final String version;
 }
 
+/// One model-backed capability (speech-to-text or OCR) and whether it can run.
+class VoiceModelStatus {
+  VoiceModelStatus({required this.model, required this.ready, this.detail});
+
+  factory VoiceModelStatus.fromJson(Map<String, dynamic> json) {
+    return VoiceModelStatus(
+      model: json['model'] as String? ?? '',
+      ready: json['ready'] as bool? ?? false,
+      detail: json['detail'] as String?,
+    );
+  }
+
+  final String model;
+  final bool ready;
+
+  /// Why it is not ready; names a setting, never a secret.
+  final String? detail;
+}
+
+/// Text-to-speech readiness plus the configured voice.
+class VoiceSpeechStatus extends VoiceModelStatus {
+  VoiceSpeechStatus({
+    required super.model,
+    required super.ready,
+    super.detail,
+    required this.voiceId,
+  });
+
+  factory VoiceSpeechStatus.fromJson(Map<String, dynamic> json) {
+    return VoiceSpeechStatus(
+      model: json['model'] as String? ?? '',
+      ready: json['ready'] as bool? ?? false,
+      detail: json['detail'] as String?,
+      voiceId: json['voice_id'] as String? ?? '',
+    );
+  }
+
+  final String voiceId;
+}
+
+/// `GET /v1/settings/voice`.
+class VoiceSettings {
+  VoiceSettings({
+    required this.stt,
+    required this.tts,
+    required this.ocr,
+    required this.replyMode,
+    required this.maxSpeechChars,
+  });
+
+  factory VoiceSettings.fromJson(Map<String, dynamic> json) {
+    return VoiceSettings(
+      stt: VoiceModelStatus.fromJson(
+          (json['stt'] as Map<String, dynamic>?) ?? const {}),
+      tts: VoiceSpeechStatus.fromJson(
+          (json['tts'] as Map<String, dynamic>?) ?? const {}),
+      ocr: VoiceModelStatus.fromJson(
+          (json['ocr'] as Map<String, dynamic>?) ?? const {}),
+      replyMode: json['reply_mode'] as String? ?? 'text',
+      maxSpeechChars: json['max_speech_chars'] as int? ?? 0,
+    );
+  }
+
+  final VoiceModelStatus stt;
+  final VoiceSpeechStatus tts;
+  final VoiceModelStatus ocr;
+  final String replyMode;
+  final int maxSpeechChars;
+}
+
+/// `GET/PUT /v1/conversations/{id}/reply-mode`.
+class ReplyMode {
+  ReplyMode({
+    required this.conversationId,
+    required this.mode,
+    required this.voiceReady,
+    this.detail,
+  });
+
+  factory ReplyMode.fromJson(Map<String, dynamic> json) {
+    return ReplyMode(
+      conversationId: json['conversation_id'] as String? ?? '',
+      mode: json['mode'] as String? ?? 'text',
+      voiceReady: json['voice_ready'] as bool? ?? false,
+      detail: json['detail'] as String?,
+    );
+  }
+
+  final String conversationId;
+  final String mode;
+  final bool voiceReady;
+  final String? detail;
+}
+
 enum ApprovalDecision { once, always, deny }
 
 enum ConversationKind { section, group, direct, room }

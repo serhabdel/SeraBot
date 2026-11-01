@@ -395,7 +395,15 @@ async fn main() -> anyhow::Result<()> {
             )?;
             let embedder = FastEmbedder::from_config(&config)?;
             let admin = store.admin_user_id()?;
-            let ingest = ingest_file(&store, &admin, &embedder, &path, &config.documents).await?;
+            let ingest = ingest_file(
+                &store,
+                &admin,
+                &embedder,
+                &path,
+                &config.documents,
+                Some(&config),
+            )
+            .await?;
             let retriever = SqliteRetriever::new(
                 store.clone(),
                 Arc::new(embedder),
@@ -933,13 +941,16 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         let embedder = embedder.clone();
         let admin_index = admin_user_id.clone();
         let shutdown_index = shutdown.clone();
+        // The OCR fallback needs the full config (provider + egress consent),
+        // so the task carries the Arc rather than only the documents section.
+        let config_for_index = config.clone();
         services.push(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 tokio::select! {
                     _ = shutdown_index.cancelled() => break,
                     _ = interval.tick() => {
-                        match index_directory(&store, &admin_index, embedder.as_ref(), &directory, &documents).await {
+                        match index_directory(&store, &admin_index, embedder.as_ref(), &directory, &documents, Some(&config_for_index)).await {
                             Ok(report) => {
                                 if !report.ingested.is_empty() || !report.failures.is_empty() {
                                     tracing::info!(

@@ -61,6 +61,8 @@ pub struct Config {
     #[serde(default)]
     pub audio: AudioConfig,
     #[serde(default)]
+    pub ocr: OcrConfig,
+    #[serde(default)]
     pub skills: SkillsConfig,
     #[serde(default)]
     pub browser: BrowserConfig,
@@ -102,6 +104,7 @@ impl Default for Config {
             schedule: ScheduleConfig::default(),
             documents: DocumentsConfig::default(),
             audio: AudioConfig::default(),
+            ocr: OcrConfig::default(),
             skills: SkillsConfig::default(),
             browser: BrowserConfig::default(),
             connectors: ConnectorsConfig::default(),
@@ -294,6 +297,33 @@ impl Config {
             return Err(SeraError::Config(
                 "audio.telegram_intake requires telegram.enabled".into(),
             ));
+        }
+        if !matches!(self.audio.reply_mode.trim(), "text" | "voice") {
+            return Err(SeraError::Config(
+                "audio.reply_mode must be 'text' or 'voice'".into(),
+            ));
+        }
+        if self.audio.reply_mode.trim() == "voice" && self.audio.voice_id.trim().is_empty() {
+            return Err(SeraError::Config(
+                "audio.reply_mode = 'voice' requires audio.voice_id".into(),
+            ));
+        }
+        if self.audio.max_speech_chars == 0 || self.audio.max_speech_chars > 20_000 {
+            return Err(SeraError::Config(
+                "audio.max_speech_chars must be between 1 and 20000".into(),
+            ));
+        }
+        if self.ocr.enabled {
+            if self.ocr.model.trim().is_empty() {
+                return Err(SeraError::Config(
+                    "ocr.model is required when OCR is enabled".into(),
+                ));
+            }
+            if self.ocr.max_bytes == 0 {
+                return Err(SeraError::Config(
+                    "ocr.max_bytes must be greater than zero".into(),
+                ));
+            }
         }
         if self.elevenlabs.enabled {
             if self.elevenlabs.api_base.is_empty() {
@@ -1266,6 +1296,19 @@ pub struct AudioConfig {
     pub transcription_model: String,
     #[serde(default = "default_audio_understanding_model")]
     pub understanding_model: String,
+    /// Text-to-speech model for voice replies (Mistral Voxtral by default).
+    #[serde(default = "default_audio_speech_model")]
+    pub speech_model: String,
+    /// Voice id for speech synthesis. Empty disables voice replies even when
+    /// the provider is ready.
+    #[serde(default)]
+    pub voice_id: String,
+    /// Default reply mode for new conversations: `text` or `voice`.
+    #[serde(default = "default_reply_mode")]
+    pub reply_mode: String,
+    /// Cap on the characters sent to the speech endpoint per reply.
+    #[serde(default = "default_max_speech_chars")]
+    pub max_speech_chars: usize,
     #[serde(default = "default_audio_max_bytes")]
     pub max_bytes: u64,
     /// Save owner voice/audio messages into the inbox (Telegram only).
@@ -1284,9 +1327,52 @@ impl Default for AudioConfig {
             api_key_secret: None,
             transcription_model: default_audio_transcription_model(),
             understanding_model: default_audio_understanding_model(),
+            speech_model: default_audio_speech_model(),
+            voice_id: String::new(),
+            reply_mode: default_reply_mode(),
+            max_speech_chars: default_max_speech_chars(),
             max_bytes: default_audio_max_bytes(),
             telegram_intake: false,
             telegram_max_bytes: default_telegram_audio_max_bytes(),
+        }
+    }
+}
+
+/// Optical character recognition for documents with no text layer.
+///
+/// Disabled by default. When enabled, `documents.rs` falls back to it only
+/// when the built-in extractor returns less than `min_text_chars`, so a normal
+/// text PDF never costs an OCR call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Reserved provider id: `default` uses [llm] credentials and egress consent.
+    #[serde(default = "default_audio_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key_secret: Option<String>,
+    #[serde(default = "default_ocr_model")]
+    pub model: String,
+    #[serde(default = "default_ocr_max_bytes")]
+    pub max_bytes: u64,
+    /// Extracted text below this many characters triggers the OCR fallback.
+    #[serde(default = "default_ocr_min_text_chars")]
+    pub min_text_chars: usize,
+}
+
+impl Default for OcrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_audio_provider(),
+            base_url: None,
+            api_key_secret: None,
+            model: default_ocr_model(),
+            max_bytes: default_ocr_max_bytes(),
+            min_text_chars: default_ocr_min_text_chars(),
         }
     }
 }
@@ -2033,6 +2119,24 @@ fn default_audio_transcription_model() -> String {
 }
 fn default_audio_understanding_model() -> String {
     "voxtral-small-latest".into()
+}
+fn default_audio_speech_model() -> String {
+    "voxtral-mini-tts-2603".into()
+}
+fn default_reply_mode() -> String {
+    "text".into()
+}
+fn default_max_speech_chars() -> usize {
+    4000
+}
+fn default_ocr_model() -> String {
+    "mistral-ocr-latest".into()
+}
+fn default_ocr_max_bytes() -> u64 {
+    20_971_520
+}
+fn default_ocr_min_text_chars() -> usize {
+    200
 }
 fn default_audio_max_bytes() -> u64 {
     52_428_800

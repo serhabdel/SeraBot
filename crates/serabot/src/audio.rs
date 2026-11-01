@@ -26,6 +26,10 @@ pub const DEFAULT_MAX_AUDIO_BYTES: u64 = 52_428_800; // 50 MiB
 /// Telegram voice notes are small; audio documents may be larger (see docs/audio.md).
 pub const DEFAULT_TELEGRAM_AUDIO_MAX_BYTES: u64 = 20_971_520; // 20 MiB
 
+/// Hard cap on a synthesized speech response. A few minutes of mp3 is well
+/// under this; anything larger means the provider ignored the input bound.
+pub const MAX_SPEECH_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "wav", "mp3", "mpeg", "ogg", "oga", "opus", "m4a", "aac", "flac", "webm",
 ];
@@ -168,6 +172,59 @@ pub async fn transcribe_audio_bytes(
     client.transcribe_bytes(bytes, filename, None).await
 }
 
+/// Whether voice replies can be produced right now.
+///
+/// Ready means: audio enabled, provider resolvable, key stored, egress
+/// approved, and a voice id configured. Anything else names the missing
+/// setting and never carries a secret.
+pub fn speech_provider_state(config: &Config) -> AudioProviderState {
+    match audio_provider_credential(config) {
+        Ok(_) => {
+            if config.audio.voice_id.trim().is_empty() {
+                return AudioProviderState::Unavailable(
+                    "voice replies need audio.voice_id; pick a voice in Settings".into(),
+                );
+            }
+            AudioProviderState::Ready
+        }
+        Err(error) => AudioProviderState::Unavailable(error.to_string()),
+    }
+}
+
+/// Synthesize speech for one reply with the configured provider.
+///
+/// The text is bounded by `audio.max_speech_chars`; a longer reply is rejected
+/// rather than silently truncated, so the caller can fall back to text and say
+/// why. Returns mp3 bytes.
+pub async fn synthesize_speech(config: &Config, text: &str) -> Result<Vec<u8>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(SeraError::Validation("speech text is empty".into()));
+    }
+    let chars = trimmed.chars().count();
+    if chars > config.audio.max_speech_chars {
+        return Err(SeraError::Validation(format!(
+            "reply is {chars} characters; voice replies are capped at {} - reply in text or shorten it",
+            config.audio.max_speech_chars
+        )));
+    }
+    let (provider, api_key) = audio_provider_credential(config)?;
+    let client = MistralAudioClient::new(
+        provider.base_url,
+        api_key,
+        config.llm.timeout_secs,
+        &config.audio,
+        provider.data_egress_approved,
+    )?;
+    client
+        .synthesize_speech(
+            trimmed,
+            config.audio.voice_id.trim(),
+            config.audio.speech_model.trim(),
+        )
+        .await
+}
+
 #[derive(Clone)]
 pub struct MistralAudioClient {
     http: reqwest::Client,
@@ -244,6 +301,83 @@ impl MistralAudioClient {
 
     pub fn destination_understand(&self) -> String {
         format!("{}/chat/completions", self.base_url)
+    }
+
+    pub fn destination_speech(&self) -> String {
+        format!("{}/audio/speech", self.base_url)
+    }
+
+    /// Synthesize speech for `text` and return the encoded audio bytes.
+    ///
+    /// `voice_id` and `model` come from the caller so the settings surface can
+    /// change them without rebuilding the client. The response format is mp3,
+    /// which Telegram accepts as a voice note. The text is truncated by the
+    /// caller, never here: a silent cut would hide a configuration mistake.
+    pub async fn synthesize_speech(
+        &self,
+        text: &str,
+        voice_id: &str,
+        model: &str,
+    ) -> Result<Vec<u8>> {
+        self.ensure_egress()?;
+        if text.trim().is_empty() {
+            return Err(SeraError::Validation("speech text is empty".into()));
+        }
+        if voice_id.trim().is_empty() {
+            return Err(SeraError::Config(
+                "audio.voice_id is required for voice replies".into(),
+            ));
+        }
+        validate_model_id(model)?;
+        let body = serde_json::json!({
+            "model": model,
+            "input": text,
+            "voice_id": voice_id,
+            "response_format": "mp3",
+            "stream": false,
+        });
+        let response = self
+            .http
+            .post(self.destination_speech())
+            .bearer_auth(self.api_key.expose_secret())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| {
+                let detail = if error.is_timeout() {
+                    "request timed out"
+                } else if error.is_connect() {
+                    "connection failed"
+                } else {
+                    "transport error"
+                };
+                SeraError::External(format!("speech request failed: {detail}"))
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.bytes().await.unwrap_or_default();
+            let code = sanitize_provider_error(&body);
+            return Err(SeraError::External(format!(
+                "speech provider failed (HTTP {}): {code}",
+                status.as_u16()
+            )));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|_| SeraError::External("speech response could not be read".into()))?;
+        if bytes.is_empty() {
+            return Err(SeraError::External(
+                "speech provider returned no audio".into(),
+            ));
+        }
+        if bytes.len() > MAX_SPEECH_RESPONSE_BYTES {
+            return Err(SeraError::External(format!(
+                "speech response exceeded the {MAX_SPEECH_RESPONSE_BYTES} byte limit"
+            )));
+        }
+        Ok(bytes.to_vec())
     }
 
     pub async fn transcribe_file(&self, path: &Path, language: Option<&str>) -> Result<String> {

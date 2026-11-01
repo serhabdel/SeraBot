@@ -347,6 +347,58 @@ class ApiClient {
     return HealthInfo.fromJson(json);
   }
 
+  /// Voice, speech, and OCR readiness for this server.
+  Future<VoiceSettings> voiceSettings() async {
+    final json = await _request('GET', ['v1', 'settings', 'voice']);
+    return VoiceSettings.fromJson(json);
+  }
+
+  /// Save the voice/OCR settings. Admin only; a member gets 403.
+  Future<void> saveVoiceSettings({
+    String? speechModel,
+    String? voiceId,
+    String? replyMode,
+    bool? ocrEnabled,
+    String? ocrModel,
+  }) async {
+    if (replyMode != null && replyMode != 'text' && replyMode != 'voice') {
+      throw ApiException(ApiErrorKind.validation,
+          detail: 'Reply mode must be text or voice.');
+    }
+    await _request('PUT', ['v1', 'settings', 'voice'], body: {
+      'speech_model': ?speechModel,
+      'voice_id': ?voiceId,
+      'reply_mode': ?replyMode,
+      'ocr_enabled': ?ocrEnabled,
+      'ocr_model': ?ocrModel,
+    });
+  }
+
+  /// The reply mode selected for one conversation.
+  Future<ReplyMode> replyMode(String conversationId) async {
+    _checkId(conversationId);
+    final json = await _request(
+      'GET',
+      ['v1', 'conversations', conversationId, 'reply-mode'],
+    );
+    return ReplyMode.fromJson(json);
+  }
+
+  /// Switch one conversation between text and voice replies.
+  Future<ReplyMode> setReplyMode(String conversationId, String mode) async {
+    _checkId(conversationId);
+    if (mode != 'text' && mode != 'voice') {
+      throw ApiException(ApiErrorKind.validation,
+          detail: 'Reply mode must be text or voice.');
+    }
+    final json = await _request(
+      'PUT',
+      ['v1', 'conversations', conversationId, 'reply-mode'],
+      body: {'mode': mode},
+    );
+    return ReplyMode.fromJson(json);
+  }
+
   Future<Catalog> models(String conversationId) async {
     _checkId(conversationId);
     final json = await _request(

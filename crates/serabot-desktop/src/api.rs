@@ -932,6 +932,60 @@ pub struct AudioUpdate {
     pub understanding_model: Option<String>,
 }
 
+/// `GET /v1/settings/voice`: readiness for speech-to-text, text-to-speech,
+/// and OCR, plus the default reply mode. No secret ever appears here.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct VoiceSettings {
+    #[serde(default)]
+    pub stt: VoiceModelStatus,
+    #[serde(default)]
+    pub tts: VoiceSpeechStatus,
+    #[serde(default)]
+    pub ocr: VoiceModelStatus,
+    #[serde(default)]
+    pub reply_mode: String,
+    #[serde(default)]
+    pub max_speech_chars: usize,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct VoiceModelStatus {
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub ready: bool,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct VoiceSpeechStatus {
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub voice_id: String,
+    #[serde(default)]
+    pub ready: bool,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// `PUT /v1/settings/voice`. Every field is optional so a partial save keeps
+/// the rest.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct VoiceUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speech_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ocr_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ocr_model: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct BotProfileUpdate {
     pub display_name: String,
@@ -2643,6 +2697,32 @@ impl ApiClient {
             return Err(ApiError::Validation("Check the audio model names."));
         }
         self.admin_request(Method::PUT, &["v1", "admin", "audio"], update)
+    }
+
+    pub fn voice_settings(&self) -> Result<VoiceSettings, ApiError> {
+        self.request(Method::GET, &["v1", "settings", "voice"], &[], None::<&()>)
+    }
+
+    pub fn admin_set_voice(&self, update: &VoiceUpdate) -> Result<AdminAck, ApiError> {
+        if update
+            .speech_model
+            .as_deref()
+            .is_some_and(|model| !valid_model_id(model))
+            || update
+                .ocr_model
+                .as_deref()
+                .is_some_and(|model| !valid_model_id(model))
+        {
+            return Err(ApiError::Validation("Check the model names."));
+        }
+        if update
+            .reply_mode
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "text" | "voice"))
+        {
+            return Err(ApiError::Validation("Reply mode must be text or voice."));
+        }
+        self.admin_request(Method::PUT, &["v1", "settings", "voice"], update)
     }
 
     pub fn admin_set_bot_profile(

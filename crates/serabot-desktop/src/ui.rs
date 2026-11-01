@@ -6141,6 +6141,23 @@ fn SettingsView(session: Signal<Session>) -> Element {
     let audio_transcription = session.read().audio.transcription_model.clone();
     let audio_understanding = session.read().audio.understanding_model.clone();
     let can_admin = session.read().can_admin();
+    // Voice/OCR surface. Read-only status comes from the server; the editable
+    // fields are the draft the Save button writes.
+    let voice_loaded = session.read().voice.loaded;
+    let voice_loading = session.read().voice.loading;
+    let voice_stt = session.read().voice.stt_model.clone();
+    let voice_stt_ready = session.read().voice.stt_ready;
+    let voice_stt_detail = session.read().voice.stt_detail.clone();
+    let voice_tts = session.read().voice.tts_model.clone();
+    let voice_tts_ready = session.read().voice.tts_ready;
+    let voice_tts_detail = session.read().voice.tts_detail.clone();
+    let voice_id = session.read().voice.voice_id.clone();
+    let voice_ocr = session.read().voice.ocr_model.clone();
+    let voice_ocr_ready = session.read().voice.ocr_ready;
+    let voice_ocr_detail = session.read().voice.ocr_detail.clone();
+    let voice_ocr_enabled = session.read().voice.ocr_enabled;
+    let voice_reply_mode = session.read().voice.reply_mode.clone();
+    let voice_max_chars = session.read().voice.max_speech_chars;
     // The live sandbox posture. Every value the server does not report stays
     // "unknown"; nothing is guessed.
     let status = session.read().status.status.clone();
@@ -6514,6 +6531,119 @@ fn SettingsView(session: Signal<Session>) -> Element {
                         disabled: !can_admin,
                         onclick: move |_| session.write().save_audio(),
                         "Save audio settings"
+                    }
+                }
+                div { class: "card",
+                    div { class: "card-head",
+                        h3 { class: "card-title", "Voice and OCR" }
+                        if voice_loading {
+                            span { class: "chip muted", "Loading" }
+                        }
+                    }
+                    div { class: "card-actions",
+                        span {
+                            class: if voice_stt_ready { "chip ok" } else { "chip warn" },
+                            if voice_stt_ready { "Speech to text ready" } else { "Speech to text off" }
+                        }
+                        span {
+                            class: if voice_tts_ready { "chip ok" } else { "chip warn" },
+                            if voice_tts_ready { "Voice replies ready" } else { "Voice replies off" }
+                        }
+                        span {
+                            class: if voice_ocr_ready { "chip ok" } else { "chip warn" },
+                            if voice_ocr_ready { "OCR ready" } else { "OCR off" }
+                        }
+                    }
+                    if !voice_loaded {
+                        p { class: "tiny",
+                            "Load the settings to see whether speech-to-text, voice replies, and OCR can run on this server."
+                        }
+                        button {
+                            class: "btn ghost",
+                            disabled: voice_loading,
+                            onclick: move |_| session.write().load_voice(),
+                            "Load voice settings"
+                        }
+                    } else {
+                        p { class: "tiny",
+                            "Scanned PDFs and images fall back to OCR when the built-in extractor finds no text. Voice replies send a Telegram voice note instead of text."
+                        }
+                        if let Some(detail) = voice_stt_detail.clone() {
+                            p { class: "tiny", "Speech to text: {detail}" }
+                        }
+                        if let Some(detail) = voice_tts_detail.clone() {
+                            p { class: "tiny", "Voice replies: {detail}" }
+                        }
+                        if let Some(detail) = voice_ocr_detail.clone() {
+                            p { class: "tiny", "OCR: {detail}" }
+                        }
+                        div { class: "form-grid",
+                            div { class: "field",
+                                label { class: "field-label", "Speech-to-text model" }
+                                input {
+                                    class: "input",
+                                    value: "{voice_stt}",
+                                    disabled: true,
+                                    placeholder: "speech-to-text model",
+                                }
+                            }
+                            div { class: "field",
+                                label { class: "field-label", "Text-to-speech model" }
+                                input {
+                                    class: "input",
+                                    value: "{voice_tts}",
+                                    placeholder: "voxtral-mini-tts-2603",
+                                    oninput: move |event| session.write().voice.tts_model = event.value(),
+                                }
+                            }
+                            div { class: "field",
+                                label { class: "field-label", "Voice id" }
+                                input {
+                                    class: "input",
+                                    value: "{voice_id}",
+                                    placeholder: "voice id from the provider",
+                                    oninput: move |event| session.write().voice.voice_id = event.value(),
+                                }
+                            }
+                            div { class: "field",
+                                label { class: "field-label", "OCR model" }
+                                input {
+                                    class: "input",
+                                    value: "{voice_ocr}",
+                                    placeholder: "mistral-ocr-latest",
+                                    oninput: move |event| session.write().voice.ocr_model = event.value(),
+                                }
+                            }
+                        }
+                        label { class: "check",
+                            input {
+                                "type": "checkbox",
+                                checked: voice_ocr_enabled,
+                                onchange: move |event| session.write().voice.ocr_enabled = event.checked(),
+                            }
+                            span { "Use OCR when a PDF or image has no text layer" }
+                        }
+                        div { class: "card-actions",
+                            for mode in ["text", "voice"] {
+                                button {
+                                    class: if voice_reply_mode == mode { "btn primary" } else { "btn ghost" },
+                                    onclick: {
+                                        let mode = mode.to_string();
+                                        move |_| session.write().voice.reply_mode = mode.clone()
+                                    },
+                                    if mode == "voice" { "Reply with voice" } else { "Reply with text" }
+                                }
+                            }
+                        }
+                        p { class: "tiny",
+                            "Voice replies are capped at {voice_max_chars} characters. In Telegram, /voice and /text switch the mode for that chat."
+                        }
+                        button {
+                            class: "btn primary",
+                            disabled: !can_admin,
+                            onclick: move |_| session.write().save_voice(),
+                            "Save voice settings"
+                        }
                     }
                 }
                 div { class: "card",

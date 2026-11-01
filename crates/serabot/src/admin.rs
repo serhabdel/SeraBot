@@ -39,6 +39,8 @@ pub struct AdminOverlay {
     #[serde(default)]
     pub audio: Option<AudioOverlay>,
     #[serde(default)]
+    pub ocr: Option<OcrOverlay>,
+    #[serde(default)]
     pub bots: BTreeMap<String, BotProfile>,
     /// Per-bot behavior overrides (tools/skills/require_approval) merged over
     /// the bot files at startup. Each field is optional so partial updates
@@ -78,6 +80,24 @@ pub struct AudioOverlay {
     pub enabled: bool,
     pub transcription_model: String,
     pub understanding_model: String,
+    /// Text-to-speech model for voice replies. Absent in overlays written by
+    /// older builds, which keep the TOML value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech_model: Option<String>,
+    /// Voice id for speech synthesis; empty means voice replies are not ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_id: Option<String>,
+    /// Default reply mode for new conversations: `text` or `voice`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_mode: Option<String>,
+}
+
+/// OCR settings chosen in the console. Absent fields keep the TOML value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrOverlay {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl AdminOverlay {
@@ -143,6 +163,26 @@ impl AdminOverlay {
             }
             if !audio.understanding_model.trim().is_empty() {
                 config.audio.understanding_model = audio.understanding_model.clone();
+            }
+            if let Some(model) = audio.speech_model.as_ref().filter(|m| !m.trim().is_empty()) {
+                config.audio.speech_model = model.clone();
+            }
+            if let Some(voice) = &audio.voice_id {
+                config.audio.voice_id = voice.clone();
+            }
+            if let Some(mode) = audio.reply_mode.as_ref().filter(|m| !m.trim().is_empty()) {
+                if !matches!(mode.trim(), "text" | "voice") {
+                    return Err(SeraError::Config(
+                        "admin audio reply_mode must be 'text' or 'voice'".into(),
+                    ));
+                }
+                config.audio.reply_mode = mode.trim().to_owned();
+            }
+        }
+        if let Some(ocr) = &self.ocr {
+            config.ocr.enabled = ocr.enabled;
+            if let Some(model) = ocr.model.as_ref().filter(|m| !m.trim().is_empty()) {
+                config.ocr.model = model.clone();
             }
         }
         // Bot behavior overrides are not TOML config; they are merged over
@@ -596,6 +636,94 @@ impl AdminStore {
                 enabled,
                 transcription_model: candidate.audio.transcription_model,
                 understanding_model: candidate.audio.understanding_model,
+                speech_model: None,
+                voice_id: None,
+                reply_mode: None,
+            });
+            Ok(())
+        })
+    }
+
+    /// Update the voice/OCR settings chosen in the console.
+    ///
+    /// Every field is optional so a partial update keeps the rest. Enabling
+    /// voice replies validates the model and voice id before writing, and
+    /// enabling OCR checks that the provider credential is stored — the same
+    /// fail-closed rule `set_audio` uses.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_voice_settings(
+        &self,
+        base: &Config,
+        secrets: &SharedSecrets,
+        speech_model: Option<String>,
+        voice_id: Option<String>,
+        reply_mode: Option<String>,
+        ocr_enabled: Option<bool>,
+        ocr_model: Option<String>,
+    ) -> Result<()> {
+        let mut candidate = base.clone();
+        self.snapshot().apply(&mut candidate)?;
+        if let Some(model) = speech_model {
+            if !crate::providers::valid_model_id(&model) {
+                return Err(SeraError::Validation("invalid speech model id".into()));
+            }
+            candidate.audio.speech_model = model;
+        }
+        if let Some(voice) = voice_id {
+            let voice = voice.trim().to_owned();
+            if voice.len() > 128 || voice.chars().any(char::is_control) {
+                return Err(SeraError::Validation("invalid voice id".into()));
+            }
+            candidate.audio.voice_id = voice;
+        }
+        if let Some(mode) = reply_mode.as_deref() {
+            let mode = mode.trim();
+            if !matches!(mode, "text" | "voice") {
+                return Err(SeraError::Validation(
+                    "reply mode must be 'text' or 'voice'".into(),
+                ));
+            }
+            candidate.audio.reply_mode = mode.to_owned();
+        }
+        if let Some(model) = ocr_model {
+            if !crate::providers::valid_model_id(&model) {
+                return Err(SeraError::Validation("invalid OCR model id".into()));
+            }
+            candidate.ocr.model = model;
+        }
+        if let Some(enabled) = ocr_enabled {
+            candidate.ocr.enabled = enabled;
+        }
+        if candidate.audio.reply_mode == "voice" && candidate.audio.voice_id.trim().is_empty() {
+            return Err(SeraError::Validation(
+                "voice replies need a voice id".into(),
+            ));
+        }
+        if candidate.ocr.enabled {
+            let provider = crate::ocr::resolve_ocr_provider(&candidate.llm, &candidate.ocr)?;
+            if !secrets.has(&provider.api_key_secret) {
+                return Err(SeraError::Validation(format!(
+                    "OCR needs secret {} before it can be enabled",
+                    provider.api_key_secret
+                )));
+            }
+        }
+
+        self.mutate(|overlay| {
+            let audio = overlay.audio.get_or_insert(AudioOverlay {
+                enabled: candidate.audio.enabled,
+                transcription_model: candidate.audio.transcription_model.clone(),
+                understanding_model: candidate.audio.understanding_model.clone(),
+                speech_model: None,
+                voice_id: None,
+                reply_mode: None,
+            });
+            audio.speech_model = Some(candidate.audio.speech_model.clone());
+            audio.voice_id = Some(candidate.audio.voice_id.clone());
+            audio.reply_mode = Some(candidate.audio.reply_mode.clone());
+            overlay.ocr = Some(OcrOverlay {
+                enabled: candidate.ocr.enabled,
+                model: Some(candidate.ocr.model.clone()),
             });
             Ok(())
         })

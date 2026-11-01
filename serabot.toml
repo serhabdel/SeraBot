@@ -256,9 +256,27 @@ provider = "default"
 # api_key_secret = "llm_api_key"
 transcription_model = "voxtral-mini-latest"
 understanding_model = "voxtral-small-latest"
+# Text-to-speech for voice replies. voice_id is required before /voice or
+# reply_mode = "voice" can produce audio; empty means voice falls back to text.
+speech_model = "voxtral-mini-tts-2603"
+voice_id = ""
+reply_mode = "text"
+max_speech_chars = 4000
 max_bytes = 52428800
 telegram_intake = false
 telegram_max_bytes = 20971520
+
+# Optical character recognition for PDFs and images with no text layer.
+# Falls back only when the built-in extractor returns fewer than
+# min_text_chars characters, so a normal text PDF never costs a call.
+[ocr]
+enabled = false
+provider = "default"
+# base_url = "https://api.mistral.ai/v1"
+# api_key_secret = "llm_api_key"
+model = "mistral-ocr-latest"
+max_bytes = 20971520
+min_text_chars = 200
 
 [browser]
 enabled = false

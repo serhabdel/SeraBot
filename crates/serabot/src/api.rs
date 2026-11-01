@@ -228,6 +228,14 @@ pub fn router(state: ApiState) -> Router {
             post(admin_connector_oauth_complete),
         )
         .route("/v1/admin/audio", put(admin_set_audio))
+        .route(
+            "/v1/settings/voice",
+            get(voice_settings).put(admin_set_voice),
+        )
+        .route(
+            "/v1/conversations/{id}/reply-mode",
+            get(get_reply_mode).put(set_reply_mode),
+        )
         .route("/v1/admin/bots/{id}", put(admin_set_bot_profile))
         .route("/v1/admin/bots/{id}/config", put(admin_update_bot_config))
         .route("/v1/admin/restart", post(admin_restart))
@@ -2702,6 +2710,7 @@ fn admin_error(error: SeraError) -> (StatusCode, Json<Value>) {
         SeraError::Validation(message) | SeraError::Config(message) => {
             (StatusCode::UNPROCESSABLE_ENTITY, message.clone())
         }
+        SeraError::Forbidden(message) => (StatusCode::FORBIDDEN, message.clone()),
         SeraError::PolicyViolation => (
             StatusCode::FORBIDDEN,
             "blocked by the content policy".to_owned(),
@@ -3229,6 +3238,175 @@ async fn admin_set_audio(
         json!({"enabled": request.enabled}),
     )?;
     Ok(Json(json!({"saved": true, "restart_required": true})))
+}
+
+/// Voice, speech-to-text, text-to-speech, and OCR settings for the console.
+///
+/// Readable by any signed-in user (they need to know whether voice replies
+/// work), writable by the admin only. Every value is a model id, a voice id, or
+/// a mode name — never a secret.
+#[derive(Serialize)]
+struct VoiceSettings {
+    stt: ModelSetting,
+    tts: SpeechSetting,
+    ocr: ModelSetting,
+    reply_mode: String,
+    max_speech_chars: usize,
+}
+
+#[derive(Serialize)]
+struct ModelSetting {
+    model: String,
+    ready: bool,
+    /// Why it is not ready. Names the missing setting, never a secret.
+    detail: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SpeechSetting {
+    model: String,
+    voice_id: String,
+    ready: bool,
+    detail: Option<String>,
+}
+
+fn voice_settings_payload(config: &Config) -> VoiceSettings {
+    let (stt_ready, stt_detail) = match crate::audio::audio_provider_state(config) {
+        crate::audio::AudioProviderState::Ready => (true, None),
+        crate::audio::AudioProviderState::Unavailable(reason) => (false, Some(reason)),
+    };
+    let (tts_ready, tts_detail) = match crate::audio::speech_provider_state(config) {
+        crate::audio::AudioProviderState::Ready => (true, None),
+        crate::audio::AudioProviderState::Unavailable(reason) => (false, Some(reason)),
+    };
+    let (ocr_ready, ocr_detail) = match crate::ocr::ocr_provider_state(config) {
+        crate::ocr::OcrProviderState::Ready => (true, None),
+        crate::ocr::OcrProviderState::Unavailable(reason) => (false, Some(reason)),
+    };
+    VoiceSettings {
+        stt: ModelSetting {
+            model: config.audio.transcription_model.clone(),
+            ready: stt_ready,
+            detail: stt_detail,
+        },
+        tts: SpeechSetting {
+            model: config.audio.speech_model.clone(),
+            voice_id: config.audio.voice_id.clone(),
+            ready: tts_ready,
+            detail: tts_detail,
+        },
+        ocr: ModelSetting {
+            model: config.ocr.model.clone(),
+            ready: ocr_ready,
+            detail: ocr_detail,
+        },
+        reply_mode: config.audio.reply_mode.clone(),
+        max_speech_chars: config.audio.max_speech_chars,
+    }
+}
+
+async fn voice_settings(State(state): State<Arc<ApiState>>) -> AdminResult<Json<VoiceSettings>> {
+    Ok(Json(voice_settings_payload(&state.config)))
+}
+
+#[derive(Deserialize)]
+struct VoiceSettingsRequest {
+    #[serde(default)]
+    speech_model: Option<String>,
+    #[serde(default)]
+    voice_id: Option<String>,
+    #[serde(default)]
+    reply_mode: Option<String>,
+    #[serde(default)]
+    ocr_enabled: Option<bool>,
+    #[serde(default)]
+    ocr_model: Option<String>,
+}
+
+async fn admin_set_voice(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Json(request): Json<VoiceSettingsRequest>,
+) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
+    let admin = admin_store(&state)?;
+    let reply_mode = request.reply_mode.clone();
+    let ocr_enabled = request.ocr_enabled;
+    admin
+        .set_voice_settings(
+            &state.config,
+            &state.secrets,
+            request.speech_model,
+            request.voice_id,
+            request.reply_mode,
+            request.ocr_enabled,
+            request.ocr_model,
+        )
+        .map_err(admin_error)?;
+    audit_config(
+        &state,
+        &user.id,
+        "config.voice_saved",
+        json!({
+            "reply_mode": reply_mode,
+            "ocr_enabled": ocr_enabled,
+        }),
+    )?;
+    Ok(Json(json!({"saved": true, "restart_required": true})))
+}
+
+#[derive(Serialize)]
+struct ReplyModeResponse {
+    conversation_id: String,
+    mode: String,
+    /// Whether the server can actually produce voice right now.
+    voice_ready: bool,
+    detail: Option<String>,
+}
+
+async fn get_reply_mode(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> AdminResult<Json<ReplyModeResponse>> {
+    let mode = state.store.reply_mode(&user.id, &id).map_err(admin_error)?;
+    let (voice_ready, detail) = match crate::audio::speech_provider_state(&state.config) {
+        crate::audio::AudioProviderState::Ready => (true, None),
+        crate::audio::AudioProviderState::Unavailable(reason) => (false, Some(reason)),
+    };
+    Ok(Json(ReplyModeResponse {
+        conversation_id: id,
+        mode,
+        voice_ready,
+        detail,
+    }))
+}
+
+#[derive(Deserialize)]
+struct ReplyModeRequest {
+    mode: String,
+}
+
+async fn set_reply_mode(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+    Json(request): Json<ReplyModeRequest>,
+) -> AdminResult<Json<ReplyModeResponse>> {
+    state
+        .store
+        .set_reply_mode(&user.id, &id, request.mode.trim())
+        .map_err(admin_error)?;
+    let (voice_ready, detail) = match crate::audio::speech_provider_state(&state.config) {
+        crate::audio::AudioProviderState::Ready => (true, None),
+        crate::audio::AudioProviderState::Unavailable(reason) => (false, Some(reason)),
+    };
+    Ok(Json(ReplyModeResponse {
+        conversation_id: id,
+        mode: request.mode.trim().to_owned(),
+        voice_ready,
+        detail,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -7388,6 +7566,112 @@ mod tests {
                 json!({"id": "github", "enabled": false}),
             ]
         );
+    }
+
+    /// The voice settings surface reports readiness without leaking anything,
+    /// and only the admin may change it.
+    #[tokio::test]
+    async fn voice_settings_report_readiness_and_are_admin_writable() {
+        let (router, _, store) = app();
+        let response = router
+            .clone()
+            .oneshot(request(&router, "GET", "/v1/settings/voice", true, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        // Defaults: audio and OCR are off, so nothing is ready.
+        assert_eq!(body["stt"]["ready"], json!(false));
+        assert_eq!(body["tts"]["ready"], json!(false));
+        assert_eq!(body["ocr"]["ready"], json!(false));
+        assert_eq!(body["reply_mode"], json!("text"));
+        assert_eq!(body["ocr"]["model"], json!("mistral-ocr-latest"));
+        assert_eq!(body["tts"]["model"], json!("voxtral-mini-tts-2603"));
+        // The reason names a setting, never a secret.
+        let detail = body["ocr"]["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("ocr.enabled"), "{detail}");
+
+        // A member cannot write it.
+        let member = store
+            .create_user("microsoft:voice-member", "v@example.example", "V")
+            .unwrap();
+        let member_token = store
+            .mint_session(&member.id, chrono::Duration::hours(1))
+            .unwrap();
+        let response = router
+            .clone()
+            .oneshot(request_with_token(
+                "PUT",
+                "/v1/settings/voice",
+                &member_token,
+                Some(json!({"reply_mode": "voice"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // The admin can, but an invalid mode is rejected.
+        let response = router
+            .clone()
+            .oneshot(request(
+                &router,
+                "PUT",
+                "/v1/settings/voice",
+                true,
+                Some(json!({"reply_mode": "shout"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// Reply mode is per conversation and per user.
+    #[tokio::test]
+    async fn reply_mode_round_trips_per_conversation() {
+        let (app, _, _) = app();
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/conversations/dir:main/reply-mode",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        assert_eq!(body["mode"], json!("text"));
+        assert_eq!(body["voice_ready"], json!(false));
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PUT",
+                "/v1/conversations/dir:main/reply-mode",
+                true,
+                Some(json!({"mode": "voice"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        assert_eq!(body["mode"], json!("voice"));
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PUT",
+                "/v1/conversations/dir:main/reply-mode",
+                true,
+                Some(json!({"mode": "shout"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

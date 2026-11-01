@@ -149,6 +149,19 @@ pub trait Notifier: Send + Sync {
         conversation_id: &str,
         notice: &ApprovalNotice,
     ) -> Result<()>;
+
+    /// Deliver one voice reply. The default falls back to text so a transport
+    /// that cannot carry audio still delivers the content; Telegram overrides
+    /// it with a real voice note.
+    async fn send_voice(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        text: &str,
+        _audio: &[u8],
+    ) -> Result<()> {
+        self.send_text(user_id, conversation_id, text).await
+    }
 }
 
 pub struct NullNotifier;
@@ -1487,6 +1500,43 @@ impl Runtime {
         Ok(())
     }
 
+    /// Deliver the final reply in the conversation's selected mode.
+    ///
+    /// Voice mode synthesizes speech and sends it as a voice note. Every
+    /// failure path falls back to text so the content is never lost: a reply
+    /// that is too long for the speech cap, a provider error, or a transport
+    /// that cannot carry audio all end with the same text the user would have
+    /// received anyway, plus one line saying why.
+    async fn deliver_reply(&self, user_id: &str, conversation_id: &str, text: &str) -> Result<()> {
+        if self.store.reply_mode(user_id, conversation_id)? != "voice" {
+            return self
+                .notifier
+                .send_text(user_id, conversation_id, text)
+                .await;
+        }
+        match crate::audio::synthesize_speech(&self.config, text).await {
+            Ok(audio) => {
+                if self
+                    .notifier
+                    .send_voice(user_id, conversation_id, text, &audio)
+                    .await
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+                self.notifier
+                    .send_text(user_id, conversation_id, text)
+                    .await
+            }
+            Err(error) => {
+                let note = format!("{text}\n\n_voice reply unavailable: {error}_");
+                self.notifier
+                    .send_text(user_id, conversation_id, &note)
+                    .await
+            }
+        }
+    }
+
     /// Post one final assistant reply on every finish path, under the task's
     /// owning user. A handoff turn keeps the specialist name in every
     /// conversation and records `handoff.completed`, including when a limit
@@ -1501,9 +1551,7 @@ impl Runtime {
         state: &TurnState,
         text: &str,
     ) -> Result<()> {
-        self.notifier
-            .send_text(user_id, conversation_id, text)
-            .await?;
+        self.deliver_reply(user_id, conversation_id, text).await?;
         if let Some(handoff) = &state.handoff {
             self.record_assistant(user_id, conversation_id, turn, text, true)?;
             self.store.record_audit(

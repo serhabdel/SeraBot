@@ -8,8 +8,40 @@ SeraBot can send inbox audio to the configured LLM provider for **verbatim trans
 |------|------|------------------|
 | Verbatim transcript | `POST /v1/audio/transcriptions` (multipart `file` + `model`) | `voxtral-mini-latest` (offline/file mode; newer docs also list Voxtral Mini/Small Transcribe 3) |
 | Summary, Q&A, translation, extraction | `POST /v1/chat/completions` with `input_audio` (base64) + text instruction | `voxtral-small-latest` |
+| Voice reply | `POST /v1/audio/speech` (`input`, `voice_id`, `response_format: mp3`) | `voxtral-mini-tts-2603` |
+| Document OCR | `POST /v1/ocr` (`model`, base64 `document_url`/`image_url`) | `mistral-ocr-latest` |
 
 Realtime WebSocket transcription and speech-to-speech agents are **not** wired in this release.
+
+## Voice replies
+
+`/voice` and `/text` in Telegram switch one chat between voice notes and text;
+the setting is stored per user and per conversation, so two accounts using the
+same conversation id never share it. The desktop and mobile consoles expose the
+same switch on their Voice page.
+
+- `speech_model` — text-to-speech model (default `voxtral-mini-tts-2603`).
+- `voice_id` — required for voice replies. Empty means the feature is not ready
+  and every reply stays text.
+- `reply_mode` — default for new conversations: `text` or `voice`.
+- `max_speech_chars` — a longer reply is rejected rather than truncated, and the
+  turn falls back to text with a one-line note. Content is never lost.
+
+Every failure path (provider down, no voice id, reply too long, transport that
+cannot carry audio) delivers the same text the user would have received anyway.
+
+## OCR fallback
+
+`[ocr]` drives `crates/serabot/src/ocr.rs`. Ingestion calls it only when the
+built-in extractor returns fewer than `min_text_chars` characters, so a normal
+text PDF never costs a call. Scanned PDFs and PNG/JPG/WebP images are supported;
+other types are rejected before any network request. A document with no text and
+a failed OCR stays `failed` with the reason recorded rather than indexing
+nothing.
+
+`GET /v1/settings/voice` reports readiness for speech-to-text, text-to-speech,
+and OCR, including the reason a capability is off (never a secret). `PUT` is
+admin-only.
 
 ## Configuration
 
