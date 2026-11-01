@@ -1,4 +1,4 @@
-﻿---
+---
 name: Deadlines
 description: Record evidence-backed deadlines with source, precision, and timezone
 ---

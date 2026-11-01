@@ -1,4 +1,4 @@
-﻿---
+---
 name: One-page brief
 description: Turn a request into a single DeckSpec section with a few cards
 ---

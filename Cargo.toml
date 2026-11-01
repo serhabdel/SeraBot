@@ -3,6 +3,14 @@ members = ["crates/serabot", "crates/serabot-desktop"]
 default-members = ["crates/serabot"]
 resolver = "2"
 
+# The craft PDF exporters (`deckcraft-pdf`, `wordcraft-pdf`) are written
+# against the krilla fork the craft apps pin, not the crates.io 0.8.2 release:
+# `craft-pdf` uses `SerializeSettings::trapped` and
+# `Metadata::modification_date`, which the published crate does not expose.
+# This is a dependency patch, not a vendored source tree.
+[patch.crates-io]
+krilla = { git = "https://github.com/storytold/craft-libs", rev = "92d392cff132eaf53e13afff77f38b5c11b73aa0", version = "=0.8.2" }
+
 [workspace.package]
 version = "0.11.1"
 edition = "2024"

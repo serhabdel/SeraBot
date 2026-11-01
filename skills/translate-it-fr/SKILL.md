@@ -1,4 +1,4 @@
-﻿---
+---
 name: Italian to French
 description: French deck text only after the owner has approved the Italian artifact
 ---

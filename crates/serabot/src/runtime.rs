@@ -691,6 +691,24 @@ impl Runtime {
                 ));
             }
             ("analyst".to_string(), request.to_string(), false)
+        } else if let Some(rest) = text.strip_prefix("/docx") {
+            let request = rest.trim();
+            if request.is_empty() {
+                return Err(SeraError::Validation("usage: /docx <brief>".into()));
+            }
+            ("maker".to_string(), request.to_string(), false)
+        } else if let Some(rest) = text.strip_prefix("/pptx") {
+            let request = rest.trim();
+            if request.is_empty() {
+                return Err(SeraError::Validation("usage: /pptx <brief>".into()));
+            }
+            ("maker".to_string(), request.to_string(), false)
+        } else if let Some(rest) = text.strip_prefix("/pdf") {
+            let request = rest.trim();
+            if request.is_empty() {
+                return Err(SeraError::Validation("usage: /pdf <brief>".into()));
+            }
+            ("maker".to_string(), request.to_string(), false)
         } else if let Some(rest) = text.strip_prefix("/timesheets") {
             let request = rest.trim();
             if request.is_empty() {
@@ -1010,6 +1028,22 @@ impl Runtime {
         let before = Utc::now() - chrono::Duration::days(retention);
         if let Err(error) = self.store.prune_events(before) {
             error!(%error, "failed to prune events");
+        }
+        let artifact_retention = self.config.render.artifact_retention_days;
+        if artifact_retention > 0 {
+            match crate::maker::ArtifactStore::new(self.config.artifacts_dir()) {
+                Ok(artifacts) => {
+                    let cutoff = Utc::now() - chrono::Duration::days(artifact_retention as i64);
+                    match artifacts.prune_older_than(cutoff) {
+                        Ok(removed) if removed > 0 => {
+                            info!(removed, "pruned expired artifacts");
+                        }
+                        Ok(_) => {}
+                        Err(error) => error!(%error, "failed to prune artifacts"),
+                    }
+                }
+                Err(error) => error!(%error, "failed to open the artifact store for pruning"),
+            }
         }
     }
 

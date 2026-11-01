@@ -57,6 +57,16 @@ enum OwnerAudioOutcome {
     Failed(&'static str),
 }
 
+/// Outcome of an owner file upload.
+enum OwnerDocumentOutcome {
+    /// The message carries no document; the normal text path applies.
+    NotDocument,
+    /// The file was written to the inbox at this relative path.
+    Saved { relative: String },
+    /// The upload was rejected; one line explains why.
+    Failed(String),
+}
+
 #[derive(Clone)]
 pub struct TelegramClient {
     http: reqwest::Client,
@@ -388,9 +398,9 @@ impl TelegramClient {
             .file_name(if safe_name.is_empty() {
                 "artifact.pdf".into()
             } else {
-                safe_name
+                safe_name.clone()
             })
-            .mime_str("application/pdf")
+            .mime_str(crate::util::mime_for_filename(&safe_name))
             .map_err(|error| telegram_http_error("sendDocument mime", error))?;
         let form = reqwest::multipart::Form::new()
             .text("chat_id", chat_id.to_string())
@@ -662,6 +672,83 @@ impl TelegramClient {
         }
     }
 
+    /// Save an uploaded file into the acting user's inbox.
+    ///
+    /// Telegram caps bot downloads at 20 MB, so the effective limit is the
+    /// smaller of the configured document cap and that ceiling. Each user has
+    /// their own subdirectory under `documents.watch_dir` (named by user id), so
+    /// one user's upload is never indexed into another user's documents. The
+    /// file lands where the document tools already read, so `docx_import`,
+    /// `xlsx_import`, `pptx_import`, `pdf_*`, and `document_index` can use it.
+    async fn handle_owner_document(
+        &self,
+        runtime: &Runtime,
+        store: &Store,
+        user_id: &str,
+        message: &TelegramMessage,
+    ) -> Result<OwnerDocumentOutcome> {
+        let Some(document) = message.document.as_ref() else {
+            return Ok(OwnerDocumentOutcome::NotDocument);
+        };
+        let config = runtime.config();
+        const TELEGRAM_MAX_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
+        let max_bytes = config.documents.max_bytes.min(TELEGRAM_MAX_DOWNLOAD_BYTES);
+        let name = document.file_name.as_deref().unwrap_or("upload.bin");
+        let extension = name
+            .rsplit('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        const ALLOWED: [&str; 8] = [
+            "docx", "xlsx", "pptx", "pdf", "csv", "txt", "md", "markdown",
+        ];
+        if !ALLOWED.contains(&extension.as_str()) {
+            return Ok(OwnerDocumentOutcome::Failed(format!(
+                "I can't take a .{extension} file. Send a DOCX, XLSX, PPTX, PDF, CSV, TXT, or \
+                 Markdown file."
+            )));
+        }
+        if let Some(size) = document.file_size
+            && (size <= 0 || size as u64 > max_bytes)
+        {
+            return Ok(OwnerDocumentOutcome::Failed(format!(
+                "That file is larger than the {max_bytes} byte upload limit."
+            )));
+        }
+        let bytes = match self.download_attachment(&document.file_id, max_bytes).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(%error, "owner document download failed");
+                return Ok(OwnerDocumentOutcome::Failed(
+                    "I couldn't download that file - please send it again.".into(),
+                ));
+            }
+        };
+        let inbox = config
+            .path(&config.documents.watch_dir)
+            .join(user_scope_segment(user_id)?);
+        std::fs::create_dir_all(&inbox)?;
+        let safe = safe_upload_name(name);
+        let target = unique_inbox_path(&inbox, &safe, message.message_id);
+        std::fs::write(&target, &bytes)?;
+        let relative = target
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(&safe)
+            .to_owned();
+        store.record_audit(
+            user_id,
+            "document.telegram_intake",
+            Some(&relative),
+            None,
+            None,
+            Some(&crate::util::sha256_hex(&bytes)),
+            None,
+            Some(&json!({"bytes": bytes.len()})),
+        )?;
+        Ok(OwnerDocumentOutcome::Saved { relative })
+    }
+
     async fn handle_update(
         &self,
         runtime: &Runtime,
@@ -740,6 +827,33 @@ impl TelegramClient {
         artifacts: Option<&ArtifactStore>,
         message: TelegramMessage,
     ) -> Result<()> {
+        match self
+            .handle_owner_document(runtime, store, user_id, &message)
+            .await?
+        {
+            OwnerDocumentOutcome::NotDocument => {}
+            OwnerDocumentOutcome::Failed(line) => {
+                self.send_message(chat_id, &line).await?;
+                return Ok(());
+            }
+            OwnerDocumentOutcome::Saved { relative } => {
+                let caption = message.caption.as_deref().unwrap_or("").trim();
+                if caption.is_empty() {
+                    self.send_message(
+                        chat_id,
+                        &format!(
+                            "Saved `{relative}` to your inbox. Tell me what to do with it, or \
+                             use /docx, /xlsx, /pptx, or /pdf."
+                        ),
+                    )
+                    .await?;
+                } else {
+                    let prompt = format!("The owner uploaded `{relative}` to the inbox. {caption}");
+                    runtime.submit_text(user_id, &chat_id.to_string(), &prompt, None)?;
+                }
+                return Ok(());
+            }
+        }
         match self
             .handle_owner_audio(runtime, store, user_id, &message)
             .await?
@@ -1009,8 +1123,10 @@ pub struct TelegramMessage {
     pub chat: Chat,
     pub from: Option<TelegramUser>,
     pub text: Option<String>,
+    pub caption: Option<String>,
     pub voice: Option<TelegramAttachment>,
     pub audio: Option<TelegramAttachment>,
+    pub document: Option<TelegramAttachment>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1231,6 +1347,9 @@ fn bot_commands() -> Vec<Value> {
         ("approvals", "Resend pending approval prompts"),
         ("ask", "Cited document Q&A — /ask <question>"),
         ("deck", "Italian deck draft — /deck <brief>"),
+        ("docx", "Word document — /docx <brief>"),
+        ("pptx", "PowerPoint deck — /pptx <brief>"),
+        ("pdf", "PDF work — /pdf <brief>"),
         ("xlsx", "Spreadsheet analysis — /xlsx <request>"),
         ("timesheets", "Timesheet analysis — /timesheets <request>"),
         ("brief", "Generate the morning brief"),
@@ -1246,6 +1365,70 @@ fn bot_commands() -> Vec<Value> {
     .into_iter()
     .map(|(command, description)| json!({ "command": command, "description": description }))
     .collect()
+}
+
+/// The per-user inbox directory name: the user id itself.
+///
+/// Ids are generated by [`crate::domain::new_id`] (uuidv7), but this is the
+/// boundary where a value becomes a path component, so it is validated rather
+/// than trusted: only ASCII letters, digits, dash, and underscore survive, and
+/// anything else is rejected so a crafted id can never escape the inbox root.
+fn user_scope_segment(user_id: &str) -> Result<String> {
+    let valid = !user_id.is_empty()
+        && user_id.len() <= 128
+        && user_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'));
+    if !valid {
+        return Err(SeraError::Validation(
+            "the account id is not a safe inbox directory name".into(),
+        ));
+    }
+    Ok(user_id.to_owned())
+}
+
+/// A filename that is safe to join under the inbox: ASCII letters, digits,
+/// dot, dash, and underscore only, at most 120 characters.
+fn safe_upload_name(name: &str) -> String {
+    let base = std::path::Path::new(name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("upload");
+    let cleaned: String = base
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches(['.', '-']).to_string();
+    if cleaned.is_empty() {
+        "upload".to_string()
+    } else {
+        cleaned.chars().take(120).collect()
+    }
+}
+
+/// Keep an existing inbox file instead of overwriting it: a second upload of
+/// `report.docx` becomes `report-<message_id>.docx`.
+fn unique_inbox_path(inbox: &std::path::Path, name: &str, message_id: i64) -> std::path::PathBuf {
+    let candidate = inbox.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = std::path::Path::new(name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("upload");
+    let alternative = match path.extension().and_then(|value| value.to_str()) {
+        Some(extension) => format!("{stem}-{message_id}.{extension}"),
+        None => format!("{stem}-{message_id}"),
+    };
+    inbox.join(alternative)
 }
 
 fn escape_html(text: &str) -> String {
@@ -1765,6 +1948,22 @@ mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn upload_names_are_confined_and_do_not_overwrite() {
+        assert_eq!(safe_upload_name("report.docx"), "report.docx");
+        assert_eq!(safe_upload_name("../../etc/passwd"), "passwd");
+        assert_eq!(safe_upload_name("Résumé final.docx"), "R-sum--final.docx");
+        assert_eq!(safe_upload_name("..."), "upload");
+        assert_eq!(safe_upload_name(""), "upload");
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = unique_inbox_path(dir.path(), "report.docx", 7);
+        assert_eq!(first.file_name().unwrap(), "report.docx");
+        std::fs::write(&first, b"x").unwrap();
+        let second = unique_inbox_path(dir.path(), "report.docx", 7);
+        assert_eq!(second.file_name().unwrap(), "report-7.docx");
+    }
 
     fn default_test_config() -> crate::config::Config {
         let mut config = crate::config::Config::default();

@@ -1,4 +1,4 @@
-﻿---
+---
 name: Cited answers
 description: Answer from the indexed corpus with rag_search citations, or say the evidence is missing
 ---

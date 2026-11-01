@@ -1,9 +1,10 @@
 # Firecrawl integration
 
 SeraBot can call the [Firecrawl](https://firecrawl.dev) v2 API for JavaScript-aware
-scraping, site mapping, web search, and bounded crawls. All four operations are
-gateway tools with `external_effect = true`, so they require owner approval
-(unless standing consent applies) in addition to bot-level tool allowlists.
+scraping, site mapping, web search, bounded crawls, and structured extraction.
+All five operations are gateway tools with `external_effect = true`, so they
+require owner approval (unless standing consent applies) in addition to
+bot-level tool allowlists.
 
 ## Enable
 
@@ -32,7 +33,8 @@ gateway tools with `external_effect = true`, so they require owner approval
 | `firecrawl_scrape` | `POST /v2/scrape` | Single URL → markdown |
 | `firecrawl_map` | `POST /v2/map` | URL discovery (bounded link list) |
 | `firecrawl_search` | `POST /v2/search` | Query + optional markdown bodies |
-| `firecrawl_crawl` | `POST /v2/crawl` + poll | Waits until complete or timeout |
+| `firecrawl_crawl` | `POST /v2/crawl` + poll | Waits until complete or timeout; a timeout returns the pages already collected with status `timeout` |
+| `firecrawl_extract` | `POST /v2/extract` + poll | 1-5 URLs, a prompt, and an optional JSON schema; returns structured data |
 
 Markdown and metadata returned to the model are prefixed as **untrusted page
 content** and are scanned by the blocklist like any other tool output.

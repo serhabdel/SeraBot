@@ -1,4 +1,4 @@
-﻿---
+---
 name: Transcript write-up
 description: Turn an inbox transcription into a cited note without inventing speakers or words
 ---

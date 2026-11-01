@@ -278,6 +278,14 @@ fn human_provider(provider: &str) -> String {
 fn capability_label(tool: &str) -> Option<&'static str> {
     match tool {
         "deck_build" => Some("Slide decks"),
+        "docx_build" | "docx_import" | "docx_edit" | "docx_inspect" | "docx_read" => {
+            Some("Word documents")
+        }
+        "xlsx_build" | "xlsx_import" | "xlsx_edit" | "xlsx_inspect" | "xlsx_read" => {
+            Some("Excel workbooks")
+        }
+        "pptx_import" | "pptx_inspect" | "pptx_edit" => Some("PowerPoint decks"),
+        "pdf_inspect" | "pdf_edit" | "pdf_merge" => Some("PDF pages"),
         "xlsx_analyze" | "timesheet_analyze" => Some("Spreadsheet analysis"),
         "rag_search" | "document_index" => Some("Document search"),
         "fetch_url" | "watch_now" | "firecrawl_scrape" | "firecrawl_map" | "firecrawl_search"
@@ -3578,6 +3586,26 @@ fn Inspector(session: Signal<Session>, overlay: Signal<Overlay>, open: Signal<bo
                                 span { class: "thread-meta",
                                     "{humanize_label(&entry.tool)} · {stamp(&entry.created_at)}"
                                 }
+                            }
+                            button {
+                                class: "btn icon",
+                                title: "Open with the default app",
+                                disabled: downloading,
+                                onclick: {
+                                    let hash = entry.hash.clone();
+                                    move |_| session.write().open_artifact(hash.clone())
+                                },
+                                Icon { name: "external", size: 15 }
+                            }
+                            button {
+                                class: "btn icon",
+                                title: "Show in Explorer",
+                                disabled: downloading,
+                                onclick: {
+                                    let hash = entry.hash.clone();
+                                    move |_| session.write().reveal_artifact(hash.clone())
+                                },
+                                Icon { name: "folder", size: 15 }
                             }
                             button {
                                 class: "btn icon",
