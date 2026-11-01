@@ -28,6 +28,7 @@ pub mod llm;
 pub mod maker;
 pub mod memory;
 pub mod model_router;
+pub mod ocr;
 pub mod onedrive;
 pub mod orchestration;
 pub mod pdf_ops;

@@ -367,6 +367,7 @@ impl Tool for DocumentIndexTool {
                 self.embedder.as_ref(),
                 &path,
                 &self.config.documents,
+                Some(self.config.as_ref()),
             )
             .await?;
             let data = json!({
@@ -388,6 +389,7 @@ impl Tool for DocumentIndexTool {
             self.embedder.as_ref(),
             &path,
             &self.config.documents,
+            Some(self.config.as_ref()),
         )
         .await?;
         let data = serde_json::to_value(&result)?;

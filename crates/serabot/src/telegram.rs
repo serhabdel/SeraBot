@@ -422,6 +422,40 @@ impl TelegramClient {
         Ok(())
     }
 
+    /// Send mp3 bytes as a Telegram voice note.
+    ///
+    /// `sendVoice` is the voice-note surface (a waveform bubble the client can
+    /// play inline), which is what "reply with voice" means to the owner. The
+    /// caption carries the reply text, capped at Telegram's 1024-character
+    /// caption limit; the full text is already in the conversation history.
+    pub async fn send_voice_note(&self, chat_id: i64, audio: &[u8], caption: &str) -> Result<()> {
+        if audio.is_empty() {
+            return Err(SeraError::Validation("voice note is empty".into()));
+        }
+        let part = reqwest::multipart::Part::bytes(audio.to_vec())
+            .file_name("reply.mp3")
+            .mime_str("audio/mpeg")
+            .map_err(|error| telegram_http_error("sendVoice mime", error))?;
+        let form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .text("caption", caption.chars().take(1000).collect::<String>())
+            .part("voice", part);
+        let response: TelegramResponse<Value> = self
+            .http
+            .post(self.url("sendVoice"))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|error| telegram_http_error("sendVoice failed", error))?
+            .json()
+            .await
+            .map_err(|error| telegram_http_error("sendVoice response", error))?;
+        if !response.ok {
+            return Err(telegram_rejected("sendVoice", response.description));
+        }
+        Ok(())
+    }
+
     pub async fn run_polling(
         self: Arc<Self>,
         runtime: Runtime,
@@ -904,6 +938,23 @@ impl TelegramClient {
                 )
                 .await?;
             }
+            "/voice" | "/text" => {
+                let mode = if text == "/voice" { "voice" } else { "text" };
+                store.set_reply_mode(user_id, &chat_id.to_string(), mode)?;
+                let reply = if mode == "voice" {
+                    match crate::audio::speech_provider_state(runtime.config()) {
+                        crate::audio::AudioProviderState::Ready => {
+                            "Voice replies on. Send /text to go back to text.".to_string()
+                        }
+                        crate::audio::AudioProviderState::Unavailable(reason) => {
+                            format!("Voice replies set, but they will fall back to text: {reason}")
+                        }
+                    }
+                } else {
+                    "Text replies on. Send /voice to switch to voice.".to_string()
+                };
+                self.send_message(chat_id, &reply).await?;
+            }
             "/status" => {
                 let pending = store.pending_task_count(user_id)?;
                 let approvals = store.list_pending_approvals(user_id, 20)?;
@@ -1086,6 +1137,24 @@ impl Notifier for TelegramClient {
             Some(chat_id) => self.send_message(chat_id, text).await,
             // The account has no linked chat: other notifiers carry the
             // message, and nothing is ever sent to another user's chat.
+            None => Ok(()),
+        }
+    }
+
+    /// Send the reply as a Telegram voice note.
+    ///
+    /// The caption carries the text so the content is searchable and readable
+    /// without playing the audio. An account with no linked chat is a no-op,
+    /// exactly like `send_text`.
+    async fn send_voice(
+        &self,
+        user_id: &str,
+        _conversation_id: &str,
+        text: &str,
+        audio: &[u8],
+    ) -> Result<()> {
+        match self.notification_chat(user_id)? {
+            Some(chat_id) => self.send_voice_note(chat_id, audio, text).await,
             None => Ok(()),
         }
     }
@@ -1356,7 +1425,9 @@ fn bot_commands() -> Vec<Value> {
         ("models", "List configured providers and models"),
         ("providers", "List models grouped by provider"),
         ("model", "Show or set provider/model for this chat"),
-        ("remember", "Store a fact — /remember <fact>"),
+        ("voice", "Reply with voice notes in this chat"),
+        ("text", "Reply with text in this chat"),
+        ("remember", "Store a fact - /remember <fact>"),
         ("memories", "List stored facts"),
         ("forget", "Delete a fact — /forget <id>"),
         ("approve_deck", "Approve Italian deck for French"),

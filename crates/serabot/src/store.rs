@@ -747,6 +747,30 @@ impl Store {
         Ok(())
     }
 
+    /// The reply mode selected for one conversation: `text` or `voice`.
+    ///
+    /// The key carries the user id because conversation ids such as `dir:main`
+    /// are not globally unique across accounts. An unset or unrecognized value
+    /// reads as `text`, so a corrupt row never silently starts sending audio.
+    pub fn reply_mode(&self, user_id: &str, conversation_id: &str) -> Result<String> {
+        let key = format!("reply_mode:{user_id}:{conversation_id}");
+        Ok(match self.kv_get(&key)? {
+            Some(value) if value == "voice" => "voice".into(),
+            _ => "text".into(),
+        })
+    }
+
+    /// Persist the reply mode for one conversation of one user.
+    pub fn set_reply_mode(&self, user_id: &str, conversation_id: &str, mode: &str) -> Result<()> {
+        if !matches!(mode, "text" | "voice") {
+            return Err(SeraError::Validation(
+                "reply mode must be 'text' or 'voice'".into(),
+            ));
+        }
+        let key = format!("reply_mode:{user_id}:{conversation_id}");
+        self.kv_set(&key, mode)
+    }
+
     /// Insert a device token row. Only the SHA-256 hash is ever stored; the
     /// caller keeps the plaintext. `user_id: None` means the operator CLI
     /// minted the token, so it belongs to the admin account.
@@ -6121,6 +6145,43 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A reply mode is per user *and* per conversation: two accounts using the
+    /// same conversation id never share a setting, and an unset or corrupt
+    /// value reads as text so audio never starts by accident.
+    #[test]
+    fn reply_mode_is_per_user_and_defaults_to_text() {
+        let store = store();
+        let admin_id = admin(&store);
+        let member = member(&store);
+
+        assert_eq!(store.reply_mode(&admin_id, "dir:main").unwrap(), "text");
+
+        store
+            .set_reply_mode(&admin_id, "dir:main", "voice")
+            .unwrap();
+        assert_eq!(store.reply_mode(&admin_id, "dir:main").unwrap(), "voice");
+        // The member's identical conversation id is untouched.
+        assert_eq!(store.reply_mode(&member.id, "dir:main").unwrap(), "text");
+
+        // A different conversation of the same user is untouched.
+        assert_eq!(store.reply_mode(&admin_id, "dir:other").unwrap(), "text");
+
+        store.set_reply_mode(&admin_id, "dir:main", "text").unwrap();
+        assert_eq!(store.reply_mode(&admin_id, "dir:main").unwrap(), "text");
+
+        assert!(
+            store
+                .set_reply_mode(&admin_id, "dir:main", "shout")
+                .is_err()
+        );
+
+        // A corrupt stored value reads as text rather than enabling audio.
+        store
+            .kv_set(&format!("reply_mode:{admin_id}:dir:main"), "garbage")
+            .unwrap();
+        assert_eq!(store.reply_mode(&admin_id, "dir:main").unwrap(), "text");
     }
 
     /// `pending_task_count` is per user; `pending_task_count_all` is the

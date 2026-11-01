@@ -56,6 +56,10 @@ pub struct DirectoryIndexReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DocumentKind {
     Pdf,
+    /// A scanned page or photographed document. There is no text layer to
+    /// extract, so this kind always relies on the OCR fallback. The variant
+    /// carries the concrete image mime so the OCR request is typed correctly.
+    Image(&'static str),
     Text,
     Markdown,
     #[cfg(feature = "docx")]
@@ -68,6 +72,9 @@ impl DocumentKind {
         let extension = path.extension()?.to_str()?.to_ascii_lowercase();
         match extension.as_str() {
             "pdf" => Some(Self::Pdf),
+            "png" => Some(Self::Image("image/png")),
+            "jpg" | "jpeg" => Some(Self::Image("image/jpeg")),
+            "webp" => Some(Self::Image("image/webp")),
             "txt" => Some(Self::Text),
             "md" | "markdown" => Some(Self::Markdown),
             #[cfg(feature = "docx")]
@@ -80,6 +87,7 @@ impl DocumentKind {
     fn mime(self) -> &'static str {
         match self {
             Self::Pdf => "application/pdf",
+            Self::Image(mime) => mime,
             Self::Text => "text/plain",
             Self::Markdown => "text/markdown",
             #[cfg(feature = "docx")]
@@ -134,6 +142,7 @@ pub async fn ingest_file(
     embedder: &dyn Embedder,
     path: &Path,
     config: &DocumentsConfig,
+    ocr: Option<&crate::config::Config>,
 ) -> Result<IngestResult> {
     validate_config(config)?;
     if embedder.dimension() != store.dimension() {
@@ -146,7 +155,7 @@ pub async fn ingest_file(
 
     let kind = DocumentKind::from_path(path).ok_or_else(|| {
         SeraError::Validation(format!(
-            "unsupported document type for {}; supported types are .pdf, .txt, .md, .markdown, \
+            "unsupported document type for {}; supported types are .pdf, .png, .jpg, .jpeg, .webp, .txt, .md, .markdown, \
              .docx and .xlsx",
             path.display()
         ))
@@ -162,9 +171,48 @@ pub async fn ingest_file(
         return duplicate_result(store, user_id, &document.id, sha256);
     }
 
-    let pages = extract_pages(kind, bytes).await?;
-    let page_count = pages.len();
-    if page_count == 0 {
+    // OCR is only worth a network call for formats that can lack a text layer,
+    // and only when the operator enabled it.
+    let ocr_config = ocr.filter(|full| {
+        full.ocr.enabled && matches!(kind, DocumentKind::Pdf | DocumentKind::Image(_))
+    });
+    let ocr_bytes = ocr_config.map(|_| bytes.clone());
+
+    let extracted = extract_pages(kind, bytes).await;
+    let mut pages = match (extracted, ocr_config) {
+        (Ok(pages), _) => pages,
+        // A scanned PDF has no text layer; that is exactly the case OCR exists
+        // for, so fall through with no pages instead of failing.
+        (Err(error), Some(_)) if is_empty_text_error(&error) => Vec::new(),
+        (Err(error), _) => return Err(error),
+    };
+
+    if let (Some(full), Some(bytes)) = (ocr_config, ocr_bytes.as_deref())
+        && extracted_chars(&pages) < full.ocr.min_text_chars
+    {
+        match crate::ocr::recognize_bytes(full, bytes, kind.mime()).await {
+            Ok(recognized) => {
+                let text = crate::ocr::pages_to_text(&recognized);
+                if text.trim().is_empty() {
+                    return Err(SeraError::Validation(
+                        "OCR ran but found no text in the document".into(),
+                    ));
+                }
+                pages = vec![PageText { page: 1, text }];
+            }
+            Err(error) => {
+                // The built-in extractor produced little or nothing and OCR
+                // failed: report why rather than indexing an empty document.
+                if pages.is_empty() {
+                    return Err(error);
+                }
+                tracing::warn!(%error, "OCR fallback failed; indexing the extracted text");
+            }
+        }
+    }
+
+    let page_count = pages.len().max(1);
+    if pages.is_empty() {
         return Err(SeraError::Validation(
             "document contains no pages; refusing to create an empty document".into(),
         ));
@@ -274,11 +322,12 @@ pub async fn index_directory(
     embedder: &dyn Embedder,
     dir: &Path,
     config: &DocumentsConfig,
+    ocr: Option<&crate::config::Config>,
 ) -> Result<DirectoryIndexReport> {
     let files = indexable_files(dir)?;
     let mut report = DirectoryIndexReport::default();
     for path in files {
-        match ingest_file(store, user_id, embedder, &path, config).await {
+        match ingest_file(store, user_id, embedder, &path, config, ocr).await {
             Ok(result) => report.ingested.push(result),
             Err(error) => report.failures.push(DirectoryFailure {
                 path,
@@ -357,6 +406,12 @@ async fn extract_pages(kind: DocumentKind, bytes: Vec<u8>) -> Result<Vec<PageTex
                 })??;
             Ok(pages)
         }
+        // An image has no text layer by definition; the caller's OCR fallback
+        // fills this page.
+        DocumentKind::Image(_) => Ok(vec![PageText {
+            page: 1,
+            text: String::new(),
+        }]),
         DocumentKind::Text | DocumentKind::Markdown => {
             let text = String::from_utf8(bytes).map_err(|_| {
                 SeraError::Validation(
@@ -716,9 +771,24 @@ fn is_constraint_violation(error: &rusqlite::Error) -> bool {
 
 fn empty_text_error() -> SeraError {
     SeraError::Validation(
-        "document contains no extractable text; scanned or image-only files require OCR, which is not supported"
+        "document contains no extractable text; scanned or image-only files require OCR - enable [ocr] and pick a provider in Settings"
             .into(),
     )
+}
+
+/// Whether an extraction error means "no text layer", which the OCR fallback
+/// can rescue. Any other extraction failure is a real error and is returned.
+fn is_empty_text_error(error: &SeraError) -> bool {
+    matches!(error, SeraError::Validation(message) if message.contains("no extractable text"))
+}
+
+/// Total characters of extracted text, used to decide whether OCR is worth a
+/// call.
+fn extracted_chars(pages: &[PageText]) -> usize {
+    pages
+        .iter()
+        .map(|page| page.text.trim().chars().count())
+        .sum()
 }
 
 fn document_title(path: &Path) -> String {
@@ -883,7 +953,7 @@ mod tests {
         let admin = store.admin_user_id().unwrap();
         let embedder = DeterministicTestEmbedder::new(384);
 
-        let first = ingest_file(&store, &admin, &embedder, &path, &test_config())
+        let first = ingest_file(&store, &admin, &embedder, &path, &test_config(), None)
             .await
             .expect("first ingestion");
         assert!(!first.duplicate);
@@ -892,7 +962,7 @@ mod tests {
         assert_eq!(first.sha256.len(), 64);
         assert_eq!(vector_count(&store), 2);
 
-        let second = ingest_file(&store, &admin, &embedder, &path, &test_config())
+        let second = ingest_file(&store, &admin, &embedder, &path, &test_config(), None)
             .await
             .expect("duplicate ingestion");
         assert!(second.duplicate);
@@ -930,7 +1000,7 @@ mod tests {
         let store = Store::open_in_memory(384).expect("store");
         let admin = store.admin_user_id().unwrap();
         let embedder = DeterministicTestEmbedder::new(384);
-        let ingested = ingest_file(&store, &admin, &embedder, &path, &test_config())
+        let ingested = ingest_file(&store, &admin, &embedder, &path, &test_config(), None)
             .await
             .expect("ingestion");
 
@@ -970,7 +1040,7 @@ mod tests {
 
         let scanned = directory.path().join("scanned.pdf");
         std::fs::write(&scanned, make_blank_pdf()).expect("blank PDF");
-        let error = ingest_file(&store, &admin, &embedder, &scanned, &config)
+        let error = ingest_file(&store, &admin, &embedder, &scanned, &config, None)
             .await
             .expect_err("scanned PDF rejected");
         assert!(error.to_string().contains("no extractable text"));
@@ -978,7 +1048,7 @@ mod tests {
         let malformed = directory.path().join("malformed.pdf");
         std::fs::write(&malformed, b"%PDF-1.7\nthis is not a real PDF").expect("malformed PDF");
         assert!(
-            ingest_file(&store, &admin, &embedder, &malformed, &config)
+            ingest_file(&store, &admin, &embedder, &malformed, &config, None)
                 .await
                 .is_err()
         );
@@ -986,7 +1056,7 @@ mod tests {
         let encrypted = directory.path().join("encrypted.pdf");
         std::fs::write(&encrypted, mark_encrypted(make_pdf(&["secret alpha text"])))
             .expect("encrypted PDF");
-        let error = ingest_file(&store, &admin, &embedder, &encrypted, &config)
+        let error = ingest_file(&store, &admin, &embedder, &encrypted, &config, None)
             .await
             .expect_err("encrypted PDF rejected");
         assert!(error.to_string().to_lowercase().contains("encrypted"));
@@ -996,7 +1066,7 @@ mod tests {
         let mut small = config.clone();
         small.max_bytes = 64;
         assert!(
-            ingest_file(&store, &admin, &embedder, &oversized, &small)
+            ingest_file(&store, &admin, &embedder, &oversized, &small, None)
                 .await
                 .is_err()
         );
@@ -1010,9 +1080,16 @@ mod tests {
 
         let store = Store::open_in_memory(384).expect("store");
         let admin = store.admin_user_id().unwrap();
-        let error = ingest_file(&store, &admin, &FailingEmbedder, &path, &test_config())
-            .await
-            .expect_err("embedding failure propagates");
+        let error = ingest_file(
+            &store,
+            &admin,
+            &FailingEmbedder,
+            &path,
+            &test_config(),
+            None,
+        )
+        .await
+        .expect_err("embedding failure propagates");
         assert!(error.to_string().contains("synthetic embedding failure"));
 
         let connection = store.connection().expect("connection");
@@ -1061,7 +1138,7 @@ mod tests {
             chunk_overlap: 7,
             ..DocumentsConfig::default()
         };
-        let result = ingest_file(&store, &admin, &embedder, &path, &config)
+        let result = ingest_file(&store, &admin, &embedder, &path, &config, None)
             .await
             .expect("markdown ingestion");
         assert_eq!(result.pages, 1);
@@ -1096,9 +1173,16 @@ mod tests {
         let store = Store::open_in_memory(384).expect("store");
         let admin = store.admin_user_id().unwrap();
         let embedder = DeterministicTestEmbedder::new(384);
-        let report = index_directory(&store, &admin, &embedder, directory.path(), &test_config())
-            .await
-            .expect("directory ingestion");
+        let report = index_directory(
+            &store,
+            &admin,
+            &embedder,
+            directory.path(),
+            &test_config(),
+            None,
+        )
+        .await
+        .expect("directory ingestion");
         assert_eq!(report.ingested.len(), 2);
         assert!(report.failures.is_empty());
         let count: i64 = store
