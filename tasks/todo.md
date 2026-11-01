@@ -100,10 +100,10 @@ never merge without the owner's OK.
 
 ## Phase 6 — consoles, docs
 
-- [ ] T6.1 Web + desktop sign-in via providers list (Microsoft enabled,
+- [x] T6.1 Web + desktop sign-in via providers list (Microsoft enabled,
       others disabled).
-- [ ] T6.2 Desktop Telegram settings pane (link/unlink, status).
-- [ ] T6.3 Mobile login if the client source is in-repo.
-- [ ] T6.4 Docs updates (deployment, api, connectors, README, spec status).
+- [x] T6.2 Desktop Telegram settings pane (link/unlink, status).
+- [x] T6.3 Mobile login if the client source is in-repo.
+- [x] T6.4 Docs updates (deployment, api, connectors, README, spec status).
 - [ ] T6.5 Final full gate (Windows + WSL), push, PR for owner review —
       merge only on the owner's OK.

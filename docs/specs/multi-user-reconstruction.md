@@ -1,9 +1,12 @@
 # Spec: SeraBot multi-user reconstruction (small trusted circle)
 
-Status: **approved by the owner, 2026-10-31; implementation in progress** on
-`spec/multi-user-reconstruction` (see `tasks/plan.md` and `tasks/todo.md`).
-The `AGENTS.md` product boundary was rewritten as the first change (phase
-0). Nothing merges to `main` without the owner's explicit OK.
+Status: **implemented** on `spec/multi-user-reconstruction`, phases 0-6, per
+`tasks/plan.md` and `tasks/todo.md`. The `AGENTS.md` product boundary was
+rewritten as the first change (phase 0). Migration 0008-0012 carry the schema;
+`auth.rs`, `fleet.rs`, and `user_secrets.rs` are the new modules. Gate at the
+end of phase 6: `cargo fmt --check`, `clippy -D warnings`, and the full
+workspace test suite green, plus `flutter analyze` and `flutter test` for the
+mobile console.
 
 ## Objective
 

@@ -4,13 +4,14 @@
 //! the worker and SSE threads, never on the UI thread.
 
 use crate::{
-    ApiError, ApprovalDecision, AudioUpdate, BotConfigUpdate, BotProfileUpdate, ConnectorUpdate,
-    ConversationKind, MAX_SKILL_BODY_BYTES, MAX_SKILL_DESCRIPTION_CHARS, MAX_USAGE_DAYS, Message,
-    NewProvider, Role, SPECIALIST_TOOLS, Selection, TaskStatus, TeamMode,
+    ApiError, ApprovalDecision, AudioUpdate, AuthProvider, BotConfigUpdate, BotProfileUpdate,
+    ConnectorUpdate, ConversationKind, MAX_SKILL_BODY_BYTES, MAX_SKILL_DESCRIPTION_CHARS,
+    MAX_USAGE_DAYS, Message, NewProvider, PublicApiClient, Role, SPECIALIST_TOOLS, Selection,
+    TaskStatus, TeamMode, TelegramLink, TelegramStatus,
     api::{
-        MEMORY_KINDS, valid_conversation_title, valid_credential, valid_memory_content,
-        valid_memory_kind, valid_memory_source, valid_model_id, valid_provider_id,
-        valid_secret_name,
+        MEMORY_KINDS, valid_auth_provider_id, valid_conversation_title, valid_credential,
+        valid_memory_content, valid_memory_kind, valid_memory_source, valid_model_id,
+        valid_provider_id, valid_secret_name,
     },
     creds,
     events::{EventStream, EventUpdate},
@@ -287,6 +288,91 @@ pub struct StatusUi {
     rx: Option<std::sync::mpsc::Receiver<Result<crate::ServerStatus, String>>>,
 }
 
+type ProvidersReceiver = std::sync::mpsc::Receiver<(String, Result<Vec<AuthProvider>, String>)>;
+
+/// The sign-in section of the connect screen: the public provider list and the
+/// browser flow. The token field stays the fallback for the operator and for
+/// existing installs, so a failed provider read only hides the buttons.
+#[derive(Default)]
+pub struct SignInUi {
+    pub providers: Vec<AuthProvider>,
+    pub loaded: bool,
+    pub loading: bool,
+    /// A provider read has been attempted for the current server field.
+    pub attempted: bool,
+    pub error: Option<String>,
+    pub notice: Option<String>,
+    pub invite_code: String,
+    pub starting: bool,
+    /// The server origin the current provider list belongs to.
+    loaded_for: Option<String>,
+    providers_rx: Option<ProvidersReceiver>,
+    start_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+}
+
+impl SignInUi {
+    /// Drop the invite code and any in-flight result. The provider list is
+    /// server-scoped and survives a disconnect so the next connect screen
+    /// does not flash an empty section.
+    fn reset_transient(&mut self) {
+        self.providers_rx = None;
+        self.start_rx = None;
+        self.loading = false;
+        self.starting = false;
+        self.error = None;
+        self.notice = None;
+        self.clear_secrets();
+    }
+
+    fn clear_secrets(&mut self) {
+        self.invite_code.zeroize();
+        self.invite_code.clear();
+    }
+}
+
+impl Drop for SignInUi {
+    fn drop(&mut self) {
+        self.invite_code.zeroize();
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TelegramAction {
+    Status,
+    Link,
+    Unlink,
+}
+
+enum TelegramReply {
+    Status(TelegramStatus),
+    Link(TelegramLink),
+    Unlinked(bool),
+}
+
+/// The Telegram card of the settings pane. Status reads and link/unlink writes
+/// run on their own thread; the UI only polls the result.
+#[derive(Default)]
+pub struct TelegramUi {
+    pub status: Option<TelegramStatus>,
+    pub loaded: bool,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub link: Option<TelegramLink>,
+    pub linking: bool,
+    pub unlinking: bool,
+    pub confirm_unlink: bool,
+    in_flight: Option<TelegramAction>,
+    rx: Option<std::sync::mpsc::Receiver<(TelegramAction, Result<TelegramReply, String>)>>,
+}
+
+impl Drop for TelegramUi {
+    fn drop(&mut self) {
+        if let Some(link) = self.link.as_mut() {
+            link.code.zeroize();
+        }
+    }
+}
+
 pub struct Session {
     pub state: State,
     pub worker: Option<Worker>,
@@ -329,6 +415,8 @@ pub struct Session {
     pub team_rules_draft: String,
     pub update: UpdateUi,
     pub status: StatusUi,
+    pub sign_in: SignInUi,
+    pub telegram: TelegramUi,
     pub toast: Option<String>,
     /// Artifact download in flight (worker) or file write in flight (thread).
     pub downloading: bool,
@@ -405,6 +493,8 @@ impl Session {
             team_rules_draft: String::new(),
             update: UpdateUi::default(),
             status: StatusUi::default(),
+            sign_in: SignInUi::default(),
+            telegram: TelegramUi::default(),
             toast: None,
             downloading: false,
             download_rx: None,
@@ -474,6 +564,7 @@ impl Session {
     pub fn disconnect(&mut self) {
         self.stop_events();
         self.reset_scope(false);
+        self.sign_in.reset_transient();
         self.credentials = None;
         self.token.zeroize();
         self.connecting = false;
@@ -495,6 +586,7 @@ impl Session {
         let result = creds::forget_token();
         self.stop_events();
         self.reset_scope(false);
+        self.sign_in.reset_transient();
         self.credentials = None;
         self.token.zeroize();
         self.connecting = false;
@@ -515,6 +607,7 @@ impl Session {
         let _ = creds::forget_token();
         self.stop_events();
         self.reset_scope(false);
+        self.sign_in.reset_transient();
         self.credentials = None;
         self.token.zeroize();
         self.connecting = false;
@@ -551,6 +644,7 @@ impl Session {
             self.status.rx = None;
             self.status.loading = false;
             self.status.error = None;
+            self.telegram = TelegramUi::default();
             self.state.created_bot = None;
             self.state.created_conversation = None;
             self.state.created_skill = None;
@@ -691,6 +785,7 @@ impl Session {
         }
         if section == Section::Settings {
             self.refresh_status();
+            self.refresh_telegram();
         }
         self.ensure_section_data();
     }
@@ -746,6 +841,351 @@ impl Session {
                 self.status.error = None;
             }
             Err(error) => self.status.error = Some(error),
+        }
+    }
+
+    /// Read the public sign-in provider list for the server in the field.
+    ///
+    /// The read runs off the UI thread and needs no token: sign-in is the way
+    /// to obtain one. A server that is unreachable, older, or has sign-in
+    /// disabled simply leaves the token field as the way in.
+    pub fn load_auth_providers(&mut self) {
+        if self.sign_in.loading {
+            return;
+        }
+        let server = self.server.trim().to_owned();
+        if self.sign_in.loaded_for.as_deref() == Some(server.as_str()) {
+            return;
+        }
+        self.sign_in.attempted = true;
+        // A list from another origin is never shown against this one.
+        self.sign_in.loaded = false;
+        self.sign_in.providers.clear();
+        let Ok(endpoint) = crate::validate_endpoint(&server) else {
+            return;
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.sign_in.providers_rx = Some(receiver);
+        self.sign_in.loading = true;
+        let request_server = server.clone();
+        if std::thread::Builder::new()
+            .name("serabot-auth-providers".into())
+            .spawn(move || {
+                let result = PublicApiClient::new(endpoint)
+                    .and_then(|client| client.auth_providers())
+                    .map_err(sign_in_error);
+                let _ = sender.send((request_server, result));
+            })
+            .is_err()
+        {
+            self.sign_in.providers_rx = None;
+            self.sign_in.loading = false;
+        }
+    }
+
+    /// Start a browser sign-in for one provider. The browser shows the new
+    /// session token once; the token field below stays the way to connect.
+    pub fn start_sign_in(&mut self, provider: String) {
+        if self.sign_in.starting {
+            return;
+        }
+        if !valid_auth_provider_id(&provider) {
+            self.sign_in.error = Some("Choose a sign-in provider from the server list.".into());
+            return;
+        }
+        let Ok(endpoint) = crate::validate_endpoint(self.server.trim()) else {
+            self.sign_in.error = Some("Enter the server origin first.".into());
+            return;
+        };
+        let invite = self.sign_in.invite_code.trim().to_owned();
+        if !invite.is_empty() && (invite.len() > 256 || invite.chars().any(char::is_control)) {
+            self.sign_in.error =
+                Some("Invite codes are 1–256 characters, without control characters.".into());
+            return;
+        }
+        let invite = (!invite.is_empty()).then_some(invite);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.sign_in.start_rx = Some(receiver);
+        self.sign_in.starting = true;
+        self.sign_in.error = None;
+        self.sign_in.notice = None;
+        if std::thread::Builder::new()
+            .name("serabot-auth-start".into())
+            .spawn(move || {
+                let result = PublicApiClient::new(endpoint)
+                    .and_then(|client| client.auth_login_start(&provider, invite.as_deref()))
+                    .and_then(|url| {
+                        webbrowser::open(&url).map_err(|_| {
+                            ApiError::Validation("Could not open the browser for sign-in.")
+                        })
+                    })
+                    .map_err(sign_in_error);
+                let _ = sender.send(result);
+            })
+            .is_err()
+        {
+            self.sign_in.start_rx = None;
+            self.sign_in.starting = false;
+            self.sign_in.error = Some("Could not start the browser sign-in.".into());
+        }
+    }
+
+    /// Drain the provider read and the browser start independently: the two
+    /// can overlap when the server field blurs into a provider click.
+    fn poll_sign_in(&mut self) {
+        self.poll_auth_providers();
+        self.poll_sign_in_start();
+    }
+
+    fn poll_auth_providers(&mut self) {
+        let Some(receiver) = &self.sign_in.providers_rx else {
+            return;
+        };
+        let Ok((server, result)) = receiver.try_recv() else {
+            return;
+        };
+        self.sign_in.providers_rx = None;
+        self.sign_in.loading = false;
+        match result {
+            Ok(providers) if self.server.trim() == server => {
+                self.sign_in.providers = providers;
+                self.sign_in.loaded = true;
+                self.sign_in.loaded_for = Some(server);
+            }
+            // A server edited while the read was in flight does not inherit
+            // the old list: read the new origin right away.
+            _ => {
+                self.sign_in.loaded = false;
+                self.sign_in.loaded_for = None;
+                if self.server.trim() != server {
+                    self.load_auth_providers();
+                }
+            }
+        }
+    }
+
+    fn poll_sign_in_start(&mut self) {
+        let Some(receiver) = &self.sign_in.start_rx else {
+            return;
+        };
+        let Ok(result) = receiver.try_recv() else {
+            return;
+        };
+        self.sign_in.start_rx = None;
+        self.sign_in.starting = false;
+        match result {
+            Ok(()) => {
+                self.sign_in.clear_secrets();
+                self.sign_in.notice = Some(
+                    "Browser opened. After signing in, paste the session token shown there into the token field below."
+                        .into(),
+                );
+                self.sign_in.error = None;
+            }
+            Err(message) => self.sign_in.error = Some(message),
+        }
+    }
+
+    /// Read the acting user's Telegram binding: `GET /v1/telegram`.
+    pub fn refresh_telegram(&mut self) {
+        if self.telegram.in_flight.is_some() {
+            return;
+        }
+        let Some(credentials) = &self.credentials else {
+            self.telegram.status = None;
+            self.telegram.loaded = true;
+            self.telegram.error = Some("Not connected.".into());
+            return;
+        };
+        let endpoint = credentials.endpoint.clone();
+        let token = secrecy::SecretString::new(credentials.token.expose_secret().to_owned());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.telegram.rx = Some(receiver);
+        self.telegram.in_flight = Some(TelegramAction::Status);
+        self.telegram.loading = true;
+        self.telegram.error = None;
+        if std::thread::Builder::new()
+            .name("serabot-telegram-status".into())
+            .spawn(move || {
+                let result = crate::api::ApiClient::new(endpoint, token)
+                    .and_then(|client| client.telegram())
+                    .map(TelegramReply::Status)
+                    .map_err(telegram_error);
+                let _ = sender.send((TelegramAction::Status, result));
+            })
+            .is_err()
+        {
+            self.telegram.rx = None;
+            self.telegram.in_flight = None;
+            self.telegram.loading = false;
+            self.telegram.loaded = true;
+            self.telegram.error = Some("Could not read the Telegram status.".into());
+        }
+    }
+
+    /// Mint a single-use Telegram linking code: `POST /v1/telegram/link`.
+    pub fn link_telegram(&mut self) {
+        if self.telegram.in_flight.is_some() {
+            return;
+        }
+        if self
+            .telegram
+            .status
+            .as_ref()
+            .is_some_and(|status| !status.enabled)
+        {
+            self.telegram.error = Some("Telegram is not enabled on this deployment.".into());
+            return;
+        }
+        let Some(credentials) = &self.credentials else {
+            self.telegram.error = Some("Connect to the server first.".into());
+            return;
+        };
+        let endpoint = credentials.endpoint.clone();
+        let token = secrecy::SecretString::new(credentials.token.expose_secret().to_owned());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.telegram.rx = Some(receiver);
+        self.telegram.in_flight = Some(TelegramAction::Link);
+        self.telegram.linking = true;
+        self.telegram.confirm_unlink = false;
+        self.telegram.error = None;
+        if std::thread::Builder::new()
+            .name("serabot-telegram-link".into())
+            .spawn(move || {
+                let result = crate::api::ApiClient::new(endpoint, token)
+                    .and_then(|client| client.telegram_link())
+                    .map(TelegramReply::Link)
+                    .map_err(telegram_error);
+                let _ = sender.send((TelegramAction::Link, result));
+            })
+            .is_err()
+        {
+            self.telegram.rx = None;
+            self.telegram.in_flight = None;
+            self.telegram.linking = false;
+            self.telegram.error = Some("Could not request a Telegram linking code.".into());
+        }
+    }
+
+    /// Ask for the unlink confirmation step. Nothing is sent yet.
+    pub fn request_unlink_telegram(&mut self) {
+        if self
+            .telegram
+            .status
+            .as_ref()
+            .is_some_and(|status| status.linked)
+        {
+            self.telegram.confirm_unlink = true;
+            self.telegram.error = None;
+        }
+    }
+
+    pub fn cancel_unlink_telegram(&mut self) {
+        self.telegram.confirm_unlink = false;
+    }
+
+    /// Unlink the acting user's chat: `DELETE /v1/telegram/link`. The caller
+    /// must have passed through [`Self::request_unlink_telegram`].
+    pub fn confirm_unlink_telegram(&mut self) {
+        if !self.telegram.confirm_unlink || self.telegram.in_flight.is_some() {
+            return;
+        }
+        let Some(credentials) = &self.credentials else {
+            self.telegram.error = Some("Connect to the server first.".into());
+            return;
+        };
+        let endpoint = credentials.endpoint.clone();
+        let token = secrecy::SecretString::new(credentials.token.expose_secret().to_owned());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.telegram.rx = Some(receiver);
+        self.telegram.in_flight = Some(TelegramAction::Unlink);
+        self.telegram.unlinking = true;
+        self.telegram.error = None;
+        if std::thread::Builder::new()
+            .name("serabot-telegram-unlink".into())
+            .spawn(move || {
+                let result = crate::api::ApiClient::new(endpoint, token)
+                    .and_then(|client| client.telegram_unlink())
+                    .map(TelegramReply::Unlinked)
+                    .map_err(telegram_error);
+                let _ = sender.send((TelegramAction::Unlink, result));
+            })
+            .is_err()
+        {
+            self.telegram.rx = None;
+            self.telegram.in_flight = None;
+            self.telegram.unlinking = false;
+            self.telegram.error = Some("Could not unlink Telegram.".into());
+        }
+    }
+
+    /// Drain the Telegram read or write, if one is running.
+    fn poll_telegram(&mut self) {
+        let Some(receiver) = &self.telegram.rx else {
+            return;
+        };
+        let Ok((action, result)) = receiver.try_recv() else {
+            return;
+        };
+        self.telegram.rx = None;
+        self.telegram.in_flight = None;
+        match action {
+            TelegramAction::Status => {
+                self.telegram.loading = false;
+                self.telegram.loaded = true;
+                match result {
+                    Ok(TelegramReply::Status(status)) => {
+                        if status.linked {
+                            self.telegram.link = None;
+                            self.telegram.confirm_unlink = false;
+                        }
+                        self.telegram.status = Some(status);
+                        self.telegram.error = None;
+                    }
+                    Ok(_) => {
+                        self.telegram.error = Some("Unexpected Telegram response.".into());
+                    }
+                    Err(message) => self.telegram.error = Some(message),
+                }
+            }
+            TelegramAction::Link => {
+                self.telegram.linking = false;
+                match result {
+                    Ok(TelegramReply::Link(link)) => {
+                        self.telegram.link = Some(link);
+                        self.telegram.error = None;
+                    }
+                    Ok(_) => {
+                        self.telegram.error = Some("Unexpected Telegram response.".into());
+                    }
+                    Err(message) => self.telegram.error = Some(message),
+                }
+            }
+            TelegramAction::Unlink => {
+                self.telegram.unlinking = false;
+                self.telegram.confirm_unlink = false;
+                match result {
+                    Ok(TelegramReply::Unlinked(was_linked)) => {
+                        if let Some(status) = self.telegram.status.as_mut() {
+                            status.linked = false;
+                            status.telegram_user_id = None;
+                            status.telegram_chat_id = None;
+                            status.linked_at = None;
+                        }
+                        self.telegram.link = None;
+                        self.telegram.error = None;
+                        self.toast = Some(if was_linked {
+                            "Telegram unlinked.".into()
+                        } else {
+                            "Telegram was not linked.".into()
+                        });
+                    }
+                    Ok(_) => {
+                        self.telegram.error = Some("Unexpected Telegram response.".into());
+                    }
+                    Err(message) => self.telegram.error = Some(message),
+                }
+            }
         }
     }
 
@@ -1154,6 +1594,8 @@ impl Session {
         self.flush_events();
         self.poll_updates();
         self.poll_status();
+        self.poll_sign_in();
+        self.poll_telegram();
         self.poll_download();
         if let Some(at) = self.reconnect_at {
             if Instant::now() >= at {
@@ -1469,6 +1911,8 @@ impl Session {
                     match completion.kind {
                         OperationKind::Health if self.state.connected => {
                             self.connect_error = None;
+                            self.sign_in.clear_secrets();
+                            self.sign_in.notice = None;
                             self.sync_audio_draft();
                             if self.restarting {
                                 self.restarting = false;
@@ -1832,6 +2276,9 @@ impl Session {
     }
 
     fn ensure_section_data(&mut self) {
+        if self.section == Section::Settings {
+            self.ensure_telegram();
+        }
         if !self.state.connected || self.state.unknown_outcome || self.refreshing {
             return;
         }
@@ -1845,6 +2292,18 @@ impl Session {
             self.start_request(operation);
         } else {
             self.schedule(operation, Duration::ZERO);
+        }
+    }
+
+    /// Load the Telegram card once per connection. A failed read marks the
+    /// card loaded so the tick does not retry it; the manual Refresh does.
+    fn ensure_telegram(&mut self) {
+        if self.state.connected
+            && !self.telegram.loaded
+            && self.telegram.in_flight.is_none()
+            && self.telegram.rx.is_none()
+        {
+            self.refresh_telegram();
         }
     }
 
@@ -2627,6 +3086,35 @@ impl Drop for Session {
     }
 }
 
+/// The server deliberately returns generic error bodies. Map the statuses the
+/// sign-in routes use to the one sentence that tells the person what to do.
+fn sign_in_error(error: ApiError) -> String {
+    match error {
+        ApiError::Http(403) => {
+            "Sign-in is not enabled on this deployment, or that provider is disabled.".into()
+        }
+        ApiError::Http(404) => "This server does not support sign-in. Update the server.".into(),
+        ApiError::Http(409) => "That invite code is not valid or has already been used.".into(),
+        ApiError::Http(422) => "Check the invite code and try again.".into(),
+        other => other.to_string(),
+    }
+}
+
+/// The Telegram routes fail closed with a 403 when the feature is off and a 404
+/// on an older server; both deserve a specific sentence instead of "Forbidden".
+fn telegram_error(error: ApiError) -> String {
+    match error {
+        ApiError::Http(403) => "Telegram is not enabled on this deployment.".into(),
+        ApiError::Http(404) => {
+            "This server does not support Telegram linking. Update the server.".into()
+        }
+        ApiError::Http(409) => {
+            "A Telegram linking request is already pending. Try again in a moment.".into()
+        }
+        other => other.to_string(),
+    }
+}
+
 fn save_download(filename: &str, bytes: &[u8]) -> Result<String, String> {
     let sanitized: String = filename
         .chars()
@@ -2677,7 +3165,8 @@ fn model_csv(raw: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EventRefresh, event_refresh};
+    use super::{EventRefresh, SignInUi, event_refresh, sign_in_error, telegram_error};
+    use crate::ApiError;
 
     #[test]
     fn a_team_event_refreshes_the_team_only_in_a_room() {
@@ -2709,5 +3198,49 @@ mod tests {
             event_refresh("message", "room:review"),
             EventRefresh::History
         );
+    }
+
+    #[test]
+    fn sign_in_errors_name_the_next_action() {
+        assert!(sign_in_error(ApiError::Http(403)).contains("not enabled"));
+        assert!(sign_in_error(ApiError::Http(404)).contains("Update the server"));
+        assert!(sign_in_error(ApiError::Http(409)).contains("invite code"));
+        assert!(sign_in_error(ApiError::Http(422)).contains("invite code"));
+        assert_eq!(
+            sign_in_error(ApiError::Http(500)),
+            ApiError::Http(500).to_string()
+        );
+    }
+
+    #[test]
+    fn telegram_errors_name_the_next_action() {
+        assert!(telegram_error(ApiError::Http(403)).contains("not enabled"));
+        assert!(telegram_error(ApiError::Http(404)).contains("Update the server"));
+        assert!(telegram_error(ApiError::Http(409)).contains("already pending"));
+        assert_eq!(
+            telegram_error(ApiError::Transport),
+            ApiError::Transport.to_string()
+        );
+    }
+
+    #[test]
+    fn resetting_sign_in_drops_the_invite_and_keeps_the_provider_list() {
+        let mut ui = SignInUi::default();
+        ui.providers.push(crate::AuthProvider {
+            id: "microsoft".into(),
+            enabled: true,
+        });
+        ui.loaded = true;
+        ui.invite_code = "synthetic-invite".into();
+        ui.error = Some("old error".into());
+        ui.reset_transient();
+        assert!(
+            ui.providers
+                .iter()
+                .any(|provider| provider.id == "microsoft")
+        );
+        assert!(ui.loaded);
+        assert!(ui.invite_code.is_empty());
+        assert!(ui.error.is_none());
     }
 }

@@ -2172,6 +2172,48 @@ body {
   margin-top: 4px;
 }
 
+.signin {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hairline);
+  background: var(--surface-2);
+}
+
+.signin-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.signin-provider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.signin-provider .btn {
+  flex: 1;
+}
+
+/* A one-time Telegram linking command: monospace, wraps, selects as one unit. */
+.link-code {
+  display: block;
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hairline);
+  background: var(--code-inline-bg);
+  color: var(--code-inline-ink);
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.45;
+  word-break: break-all;
+  user-select: all;
+}
+
 /* ------------------------------------------------------------- model ---- */
 
 .model-bar {

@@ -382,4 +382,112 @@ void main() {
       ),
     );
   });
+
+  test('sign-in providers keep server order and disabled flags', () async {
+    server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final port = server!.port;
+    server!.listen((request) async {
+      if (request.uri.path == '/v1/auth/providers') {
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..write(jsonEncode({
+            'providers': [
+              {'id': 'microsoft', 'enabled': true},
+              {'id': 'google', 'enabled': false},
+              {'id': 'github', 'enabled': false},
+            ],
+          }));
+      } else {
+        request.response.statusCode = HttpStatus.notFound;
+      }
+      await request.response.close();
+    });
+
+    final providers = await ApiClient.authProviders('http://127.0.0.1:$port');
+    expect(providers.map((provider) => provider.id).toList(),
+        ['microsoft', 'google', 'github']);
+    expect(providers.first.enabled, isTrue);
+    expect(providers.first.label, 'Microsoft');
+    expect(providers[1].enabled, isFalse);
+    expect(providers[1].label, 'Google');
+    expect(providers[2].enabled, isFalse);
+    expect(providers[2].label, 'GitHub');
+  });
+
+  test('sign-in providers reject a malformed payload', () async {
+    server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final port = server!.port;
+    server!.listen((request) async {
+      request.response
+        ..statusCode = HttpStatus.ok
+        ..write(jsonEncode({
+          'providers': [
+            {'id': 'microsoft'},
+          ],
+        }));
+      await request.response.close();
+    });
+
+    await expectLater(
+      ApiClient.authProviders('http://127.0.0.1:$port'),
+      throwsA(
+        isA<ApiException>().having(
+          (error) => error.kind,
+          'kind',
+          ApiErrorKind.invalidResponse,
+        ),
+      ),
+    );
+  });
+
+  test('login start sends the provider and optional invite code', () async {
+    server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final port = server!.port;
+    Map<String, dynamic>? seen;
+    server!.listen((request) async {
+      if (request.uri.path == '/v1/auth/login/start') {
+        final body = await utf8.decoder.bind(request).join();
+        seen = jsonDecode(body) as Map<String, dynamic>;
+        request.response
+          ..statusCode = HttpStatus.ok
+          ..write(jsonEncode({
+            'url': 'https://login.example.example/authorize?state=s',
+          }));
+      } else {
+        request.response.statusCode = HttpStatus.notFound;
+      }
+      await request.response.close();
+    });
+
+    final url = await ApiClient.startSignIn(
+      'http://127.0.0.1:$port',
+      provider: 'microsoft',
+      inviteCode: 'invite-code-value',
+    );
+    expect(url, startsWith('https://login.example.example/authorize'));
+    expect(seen?['provider'], 'microsoft');
+    expect(seen?['invite_code'], 'invite-code-value');
+  });
+
+  test('login start refuses an unsafe authorize URL', () async {
+    server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final port = server!.port;
+    server!.listen((request) async {
+      request.response
+        ..statusCode = HttpStatus.ok
+        ..write(jsonEncode({'url': 'http://evil.example.example/authorize'}));
+      await request.response.close();
+    });
+
+    await expectLater(
+      ApiClient.startSignIn('http://127.0.0.1:$port', provider: 'microsoft'),
+      throwsA(
+        isA<ApiException>().having(
+          (error) => error.kind,
+          'kind',
+          ApiErrorKind.invalidResponse,
+        ),
+      ),
+    );
+  });
 }
