@@ -31,10 +31,15 @@ Shipped on `feat/office-tools`:
   the krilla fork the craft apps pin, so the workspace carries a `[patch.crates-io]`
   entry for that revision; the published krilla 0.8.2 does not compile with
   `craft-pdf`.
+- **P4 — upload.** A document sent to the Telegram bot is saved to the inbox
+  under a sanitized, non-overwriting name, so the import tools can use it.
+- **Firecrawl.** `firecrawl_extract` adds structured extraction over 1-5 URLs;
+  a crawl that times out returns its partial pages instead of discarding them;
+  `tavily_search` joins `EXTERNAL_EFFECT_TOOLS`.
 
 Still open: DOCX images/headers/page breaks, PPTX slide/table/image insertion,
-PDF text extraction and watermarking, owner-to-bot upload, and the connector
-work in P3.
+PDF text extraction and watermarking, the desktop attach button, and the
+connector work in P3.
 
 The short version: **the authoring engines were built and tested in 0.9.0,
 then never connected to the fleet.** The agent cannot create a document
