@@ -1151,6 +1151,9 @@ pub struct RenderConfig {
     pub artifacts_dir: String,
     #[serde(default = "default_max_deck_pages")]
     pub max_pages: usize,
+    /// Delete artifacts older than this many days. `0` keeps them forever.
+    #[serde(default)]
+    pub artifact_retention_days: u64,
 }
 
 impl Default for RenderConfig {
@@ -1159,6 +1162,7 @@ impl Default for RenderConfig {
             brand_file: default_brand_file(),
             artifacts_dir: default_artifacts_dir(),
             max_pages: default_max_deck_pages(),
+            artifact_retention_days: 0,
         }
     }
 }
@@ -1400,6 +1404,35 @@ pub fn load_bots(config: &Config, dir: impl AsRef<Path>) -> Result<Vec<LoadedBot
     Ok(bots)
 }
 
+/// Reject a bot row that names a tool this binary cannot register.
+///
+/// `known` is the union of every tool the binary can register, so a tool that
+/// is merely disabled by configuration still passes; the runtime already warns
+/// about those. A misspelled or removed name fails startup instead of silently
+/// disappearing from the turn's tool notice.
+pub fn validate_bot_tools(bots: &[LoadedBot], known: &[&str]) -> Result<()> {
+    let known: std::collections::HashSet<&str> = known.iter().copied().collect();
+    for bot in bots {
+        for tool in &bot.config.tools {
+            if !known.contains(tool.as_str()) {
+                return Err(SeraError::Config(format!(
+                    "bot '{}' lists unknown tool '{}'",
+                    bot.config.name, tool
+                )));
+            }
+        }
+        for tool in &bot.config.require_approval {
+            if !bot.config.tools.contains(tool) {
+                return Err(SeraError::Config(format!(
+                    "bot '{}' requires approval for '{}' but does not list it",
+                    bot.config.name, tool
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Console-facing bot summary. Prompt text is never part of a listing; the
 /// detail endpoint reads the owner's row separately.
 #[derive(Debug, Clone, Serialize)]
@@ -1451,6 +1484,7 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "firecrawl_map",
     "firecrawl_search",
     "firecrawl_crawl",
+    "firecrawl_extract",
     "elevenlabs_list_voices",
     "elevenlabs_text_to_speech",
     "elevenlabs_sound_effect",
@@ -1458,6 +1492,24 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "elevenlabs_generate_image",
     "elevenlabs_generate_video",
     "deck_build",
+    "docx_build",
+    "docx_import",
+    "docx_pdf",
+    "docx_inspect",
+    "docx_read",
+    "docx_edit",
+    "xlsx_build",
+    "xlsx_import",
+    "xlsx_inspect",
+    "xlsx_read",
+    "xlsx_edit",
+    "pptx_import",
+    "pptx_pdf",
+    "pptx_inspect",
+    "pptx_edit",
+    "pdf_inspect",
+    "pdf_edit",
+    "pdf_merge",
     "telegram_send_document",
     "onedrive_upload",
     "onedrive_list",
@@ -1486,6 +1538,8 @@ const EXTERNAL_EFFECT_TOOLS: &[&str] = &[
     "firecrawl_map",
     "firecrawl_search",
     "firecrawl_crawl",
+    "firecrawl_extract",
+    "tavily_search",
     "elevenlabs_text_to_speech",
     "elevenlabs_sound_effect",
     "elevenlabs_transcribe",
@@ -2065,6 +2119,60 @@ fn default_link_selector() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shipped_bots_only_name_known_tools() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bots");
+        let known = crate::tools::known_tool_names();
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(&root).expect("bots directory") {
+            let path = entry.expect("bots entry").path();
+            if path.extension().and_then(|value| value.to_str()) != Some("toml") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path).expect("bot file");
+            let config: BotConfig =
+                toml::from_str(&raw).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            for tool in &config.tools {
+                assert!(
+                    known.contains(&tool.as_str()),
+                    "{} names unknown tool '{tool}'",
+                    path.display()
+                );
+            }
+            for tool in &config.require_approval {
+                assert!(
+                    config.tools.contains(tool),
+                    "{} requires approval for '{tool}' but does not list it",
+                    path.display()
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 5, "expected the shipped bot files");
+    }
+
+    #[test]
+    fn validate_bot_tools_rejects_an_unknown_name() {
+        let bot = LoadedBot {
+            config: BotConfig {
+                name: "synthetic".into(),
+                trigger: "command".into(),
+                model: None,
+                system_prompt: "prompts/main.txt".into(),
+                skills: Vec::new(),
+                tools: vec!["deck_build".into(), "docx_teleport".into()],
+                require_approval: Vec::new(),
+                enabled: true,
+                temperature: None,
+                role: BotRole::default(),
+                delegates: Vec::new(),
+            },
+            prompt: String::new(),
+        };
+        let error = validate_bot_tools(&[bot], &["deck_build"]).unwrap_err();
+        assert!(error.to_string().contains("docx_teleport"));
+    }
 
     #[test]
     fn rejects_empty_llm_config() {

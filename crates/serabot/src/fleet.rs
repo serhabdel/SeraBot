@@ -32,6 +32,31 @@ use crate::store::{Store, StoredBot};
 /// A user's loaded fleet, keyed by bot id.
 pub type Fleet = HashMap<String, LoadedBot>;
 
+/// Replace a user's bot rows with the shipped templates.
+///
+/// This is the explicit opt-in behind `serabot fleet reseed`: the database is
+/// authoritative after seeding, so a binary upgrade never rewrites a fleet on
+/// its own. Every existing row for the user is dropped first, which means
+/// prompt edits, tool allowlists, and scaffolded bots are lost — the command
+/// prints the plan before writing and supports `--dry-run`.
+///
+/// Returns the number of templates written.
+pub fn reseed_user(store: &Store, user_id: &str, templates: &[LoadedBot]) -> Result<usize> {
+    for row in store.list_bots(user_id)? {
+        store.delete_bot(user_id, &row.name)?;
+    }
+    for template in templates {
+        store.upsert_bot(
+            user_id,
+            &template.config.name,
+            &serde_json::to_value(&template.config)?,
+            &template.prompt,
+            template.config.enabled,
+        )?;
+    }
+    Ok(templates.len())
+}
+
 /// The per-user fleet registry shared by the runtime, the skill tools, and
 /// the delegation/team tools. Cheap to clone (`Arc` inside).
 #[derive(Clone)]
@@ -139,6 +164,7 @@ impl FleetRegistry {
     /// The acting user's rows, seeding the default fleet when the user has
     /// none. Rows are returned even when the fleet is structurally invalid so
     /// the console can show what needs fixing.
+    #[allow(dead_code)]
     pub fn rows(&self, user_id: &str) -> Result<Vec<StoredBot>> {
         self.seed(user_id)?;
         self.store.list_bots(user_id)
@@ -304,6 +330,42 @@ mod tests {
             .create_user("microsoft:fleet-member", "f@example.example", "F")
             .unwrap()
             .id
+    }
+
+    /// `serabot fleet reseed` replaces the rows wholesale: an edited prompt, a
+    /// narrowed tool list, and a scaffolded bot the templates do not know all
+    /// disappear, and the shipped templates are written back.
+    #[test]
+    fn reseed_replaces_the_rows_with_the_shipped_templates() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let registry = registry(&store, config());
+        registry.seed(&admin).unwrap();
+
+        // Customize one row and add a bot the templates do not contain.
+        store
+            .set_bot_prompt(&admin, "main", "edited by the operator")
+            .unwrap();
+        store
+            .upsert_bot(
+                &admin,
+                "custom",
+                &serde_json::to_value(bot("custom", BotRole::Specialist, vec![], false).config)
+                    .unwrap(),
+                "custom prompt",
+                false,
+            )
+            .unwrap();
+
+        let written = reseed_user(&store, &admin, &templates()).unwrap();
+        assert_eq!(written, 2);
+
+        let rows = store.list_bots(&admin).unwrap();
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, vec!["analyst", "main"]);
+        let main = rows.iter().find(|row| row.name == "main").unwrap();
+        assert_eq!(main.prompt, "main prompt");
+        assert!(rows.iter().all(|row| row.name != "custom"));
     }
 
     #[test]

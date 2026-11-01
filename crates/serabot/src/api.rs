@@ -1061,9 +1061,10 @@ async fn artifact(
 ) -> Result<Response> {
     let artifact = state.artifacts.load(&hash)?;
     let filename = artifact.filename.replace(['"', '\\', '\r', '\n'], "-");
+    let mime = crate::util::mime_for_filename(&artifact.filename);
     Ok((
         [
-            ("content-type", "application/pdf"),
+            ("content-type", mime),
             ("x-content-type-options", "nosniff"),
             (
                 "content-disposition",
@@ -3282,7 +3283,7 @@ async fn admin_set_bot_profile(
     Ok(Json(json!({"saved": true, "restart_required": false})))
 }
 
-const MAX_BOT_CONFIG_TOOLS: usize = 32;
+const MAX_BOT_CONFIG_TOOLS: usize = 64;
 const MAX_BOT_CONFIG_SKILLS: usize = 16;
 
 #[derive(Deserialize)]

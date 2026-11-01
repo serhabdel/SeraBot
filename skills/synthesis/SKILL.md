@@ -1,4 +1,4 @@
-﻿---
+---
 name: Synthesis
 description: Separate facts, inferences, open questions, decisions, and actions with provenance
 ---

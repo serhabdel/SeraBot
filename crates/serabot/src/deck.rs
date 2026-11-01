@@ -37,6 +37,7 @@ pub(crate) const BULLETS_PER_PAGE: usize = 6;
 pub struct DeckSpec {
     pub title: String,
     pub subtitle: Option<String>,
+    #[serde(default = "default_language")]
     pub language: Language,
     pub date_label: Option<String>,
     pub author: Option<String>,
@@ -44,12 +45,18 @@ pub struct DeckSpec {
     pub footer: Option<String>,
 }
 
+fn default_language() -> Language {
+    Language::It
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeckSection {
     pub part_title: Option<String>,
     pub title: String,
+    #[serde(default)]
     pub cards: Vec<DeckCard>,
+    #[serde(default)]
     pub bullets: Vec<String>,
 }
 
@@ -58,6 +65,7 @@ pub struct DeckSection {
 pub struct DeckCard {
     pub heading: String,
     pub body: String,
+    #[serde(default)]
     pub bullets: Vec<String>,
     pub monogram: Option<String>,
 }

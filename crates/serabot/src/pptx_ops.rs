@@ -982,6 +982,15 @@ fn artifact_meta(filename: &str, source_artifact: Option<String>) -> ArtifactMet
     }
 }
 
+fn pdf_filename(source: &str) -> String {
+    let stem = Path::new(source)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("deck");
+    let stem: String = stem.chars().take(100).collect();
+    format!("{stem}.pdf")
+}
+
 fn edited_filename(source: &str) -> String {
     let stem = Path::new(source)
         .file_stem()
@@ -1116,6 +1125,146 @@ impl Tool for PptxImportTool {
     }
 }
 
+/// Render a `.pptx` to PDF with the DeckCraft PDF exporter.
+///
+/// This is the conversion path for an owner deck: the slides are rendered at
+/// their own size with a selectable text layer. It does not rebuild the deck
+/// from a `DeckSpec`.
+pub struct PptxPdfTool {
+    artifacts: Arc<ArtifactStore>,
+    store: Store,
+    inbox: PathBuf,
+}
+
+impl PptxPdfTool {
+    pub fn new(
+        artifacts: Arc<ArtifactStore>,
+        store: Store,
+        inbox: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let inbox = inbox.into();
+        std::fs::create_dir_all(&inbox)?;
+        let inbox = inbox.canonicalize()?;
+        Ok(Self {
+            artifacts,
+            store,
+            inbox,
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for PptxPdfTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "pptx_pdf".into(),
+            description:
+                "Render a .pptx to PDF. Accepts an inbox path or an artifact hash. The slides are \
+                 exported at their own size with a selectable text layer; the result is stored as \
+                 a new PDF artifact whose source_artifact is the package. Bounded to 32 MiB and \
+                 500 slides; password-protected packages and packages carrying a VBA project are \
+                 rejected."
+                    .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path relative to the configured inbox"},
+                    "artifact": {"type": "string", "description": "Artifact hash of an imported .pptx"},
+                    "filename": {"type": "string", "description": "Optional artifact filename ending in .pdf"}
+                },
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        reject_unknown_keys(&args, &["path", "artifact", "filename"])?;
+        let path = argument(&args, "path").map(str::to_owned);
+        let artifact = argument(&args, "artifact").map(str::to_owned);
+        let (bytes, source_name, source_artifact) = match (path, artifact) {
+            (Some(path), None) => {
+                let artifacts = self.artifacts.clone();
+                let inbox = self.inbox.clone();
+                let (stored, _) = tokio::task::spawn_blocking(move || {
+                    artifacts.ingest_inbox_file(&inbox, &path, &["pptx"], MAX_PPTX_BYTES, summarize)
+                })
+                .await
+                .map_err(|error| SeraError::Internal(format!("PPTX task failed: {error}")))??;
+                (stored.bytes, stored.filename, stored.hash)
+            }
+            (None, Some(hash)) => {
+                let stored = self.artifacts.load(&hash)?;
+                if !is_pptx_artifact(&stored) {
+                    return Err(invalid("artifact is not a .pptx package"));
+                }
+                check_size(&stored.bytes)?;
+                (stored.bytes, stored.filename, stored.hash)
+            }
+            (Some(_), Some(_)) => {
+                return Err(invalid("provide either path or artifact, not both"));
+            }
+            (None, None) => {
+                return Err(invalid("path or artifact is required"));
+            }
+        };
+
+        let filename = match argument(&args, "filename") {
+            Some(filename) => {
+                if !filename.to_ascii_lowercase().ends_with(".pdf") {
+                    return Err(invalid("filename must end with .pdf"));
+                }
+                if filename.chars().count() > 120 {
+                    return Err(invalid("filename is longer than 120 characters"));
+                }
+                filename.to_owned()
+            }
+            None => pdf_filename(&source_name),
+        };
+        let pdf = tokio::task::spawn_blocking(move || {
+            let presentation = open(&bytes)?;
+            deckcraft_pdf::export(&presentation, &deckcraft_pdf::PdfOptions::default())
+                .map_err(|error| SeraError::Internal(format!("cannot render pptx to PDF: {error}")))
+        })
+        .await
+        .map_err(|error| SeraError::Internal(format!("PPTX task failed: {error}")))??;
+
+        let stored = self.artifacts.save(
+            &pdf,
+            &filename,
+            artifact_meta(&filename, Some(source_artifact.clone())),
+        )?;
+        self.store.record_audit(
+            &context.actor,
+            "pptx.pdf_exported",
+            Some("pptx_pdf"),
+            context.task_id.as_deref(),
+            None,
+            None,
+            None,
+            Some(&json!({
+                "artifact_hash": stored.hash,
+                "source_artifact": source_artifact,
+            })),
+        )?;
+        Ok(ToolOutput {
+            content: format!(
+                "filename: {}\nartifact: {}\nsource_artifact: {}\n",
+                stored.filename, stored.hash, source_artifact
+            ),
+            data: Some(json!({
+                "artifact_hash": stored.hash,
+                "filename": stored.filename,
+                "source_artifact": source_artifact,
+            })),
+            artifact_path: Some(format!("artifacts/{}", stored.filename)),
+            artifact_hash: Some(stored.hash),
+            filename: Some(stored.filename),
+            destination: None,
+        })
+    }
+}
+
 /// Read-only summary of a stored package.
 pub struct PptxInspectTool {
     artifacts: Arc<ArtifactStore>,
@@ -1237,7 +1386,8 @@ impl Tool for PptxEditTool {
                             }
                         },
                         "additionalProperties": false
-                    }
+                    },
+                    "filename": {"type": "string", "description": "Optional artifact filename ending in .pptx"}
                 },
                 "required": ["artifact", "edit"],
                 "additionalProperties": false
@@ -1247,7 +1397,7 @@ impl Tool for PptxEditTool {
     }
 
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
-        reject_unknown_keys(&args, &["artifact", "edit"])?;
+        reject_unknown_keys(&args, &["artifact", "edit", "filename"])?;
         let hash = argument(&args, "artifact")
             .ok_or_else(|| invalid("artifact is required"))?
             .to_owned();
@@ -1263,7 +1413,18 @@ impl Tool for PptxEditTool {
         }
         check_size(&source.bytes)?;
         let source_artifact = source.hash.clone();
-        let filename = edited_filename(&source.filename);
+        let filename = match argument(&args, "filename") {
+            Some(filename) => {
+                if !filename.to_ascii_lowercase().ends_with(".pptx") {
+                    return Err(invalid("filename must end with .pptx"));
+                }
+                if filename.chars().count() > 120 {
+                    return Err(invalid("filename is longer than 120 characters"));
+                }
+                filename.to_owned()
+            }
+            None => edited_filename(&source.filename),
+        };
         let input = source.bytes;
         let (bytes, summary, info, stripped) = tokio::task::spawn_blocking(move || {
             let mut presentation = open(&input)?;
@@ -1710,6 +1871,30 @@ mod tests {
         assert_eq!(texts.len(), MAX_LISTED_SHAPES + 1);
         assert_eq!(texts.last().map(String::as_str), Some("Last shape edited"));
         assert_eq!(texts.first().map(String::as_str), Some("Shape 1"));
+    }
+
+    #[tokio::test]
+    async fn exports_an_imported_deck_to_pdf() {
+        let harness = harness();
+        let source = imported(&harness, "owner.pptx", &exported()).await;
+        let tool = PptxPdfTool::new(
+            harness.artifacts.clone(),
+            harness.store.clone(),
+            &harness.inbox,
+        )
+        .unwrap();
+        let output = tool
+            .execute(json!({"artifact": source}), &context())
+            .await
+            .expect("the deck converts");
+        let hash = output.artifact_hash.expect("a PDF artifact hash");
+        let stored = harness.artifacts.load(&hash).expect("the PDF artifact");
+        assert!(stored.bytes.starts_with(b"%PDF"), "the result is a PDF");
+        assert!(stored.filename.ends_with(".pdf"));
+        assert_eq!(
+            stored.meta.source_artifact.as_deref(),
+            Some(source.as_str())
+        );
     }
 
     #[tokio::test]

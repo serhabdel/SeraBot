@@ -336,8 +336,9 @@ impl Tool for DocumentIndexTool {
         ToolSpec {
             name: "document_index".into(),
             description:
-                "Index a PDF, text, or Markdown file (or one directory level) from the configured \
-                 inbox into the citation-preserving vector store. Scanned/empty/encrypted PDFs fail \
+                "Index a PDF, Word, Excel, text, or Markdown file (or one directory level) from the \
+                 configured inbox into the citation-preserving vector store. Word and Excel text is \
+                 extracted without evaluating formulas. Scanned/empty/encrypted PDFs fail \
                  explicitly; no OCR is performed."
                     .into(),
             parameters: json!({
@@ -641,6 +642,86 @@ pub fn register_memory_tools(
     Ok(())
 }
 
+/// Every tool name this binary can register, regardless of whether the
+/// connector or feature that provides it is enabled.
+///
+/// Startup uses this to reject a bot file that names a tool which does not
+/// exist. That is the failure class that let the 0.9.0 document tools sit
+/// unreachable for weeks: a bot listing a stale or misspelled tool used to
+/// fail silently and only warn at turn time.
+pub fn known_tool_names() -> Vec<&'static str> {
+    let mut names = vec![
+        // Always registered.
+        "rag_search",
+        "deck_build",
+        "xlsx_analyze",
+        "timesheet_analyze",
+        "xlsx_build",
+        "xlsx_import",
+        "xlsx_edit",
+        "xlsx_inspect",
+        "xlsx_read",
+        "document_index",
+        "memory_save",
+        "memory_list",
+        "memory_delete",
+        "pdf_inspect",
+        "pdf_edit",
+        "pdf_merge",
+        "fetch_url",
+        "watch_now",
+        "skill_list",
+        "skill_search",
+        "skill_load",
+        "delegate",
+        "team_ask",
+        "team_reply",
+        // Conditional on configuration.
+        "audio_transcribe",
+        "audio_understand",
+        "elevenlabs_list_voices",
+        "elevenlabs_text_to_speech",
+        "elevenlabs_sound_effect",
+        "elevenlabs_transcribe",
+        "elevenlabs_generate_image",
+        "elevenlabs_generate_video",
+        "telegram_send_document",
+        "firecrawl_scrape",
+        "firecrawl_map",
+        "firecrawl_search",
+        "firecrawl_crawl",
+        "firecrawl_extract",
+        "tavily_search",
+        "browser_session_start",
+        "browser_session_stop",
+        "browser_navigate",
+        "browser_snapshot",
+        "google_drive_list",
+        "google_sheets_read",
+        "google_calendar_list_events",
+        "gmail_list_messages",
+        "outlook_list_messages",
+        "outlook_calendar_list_events",
+        "notion_query_database",
+        "agentmail_inboxes_list",
+        "agentmail_send",
+        "onedrive_upload",
+        "onedrive_list",
+    ];
+    #[cfg(feature = "docx")]
+    names.extend([
+        "docx_build",
+        "docx_import",
+        "docx_pdf",
+        "docx_edit",
+        "docx_inspect",
+        "docx_read",
+    ]);
+    #[cfg(feature = "pptx")]
+    names.extend(["pptx_import", "pptx_pdf", "pptx_inspect", "pptx_edit"]);
+    names
+}
+
 /// Register the bounded PDF page tools. They read from the artifact store or
 /// the configured inbox only, and write results back through the artifact
 /// store so an approval binds the produced hash.
@@ -669,8 +750,14 @@ pub fn register_workbook_tools(
     registry: &mut crate::gateway::ToolRegistry,
     artifacts: std::sync::Arc<ArtifactStore>,
     store: Store,
+    inbox: PathBuf,
 ) -> Result<()> {
     registry.register(XlsxBuildTool::new(artifacts.clone(), store.clone()))?;
+    registry.register(crate::workbooks::XlsxImportTool::new(
+        artifacts.clone(),
+        store.clone(),
+        inbox,
+    )?)?;
     registry.register(XlsxEditTool::new(artifacts.clone(), store))?;
     registry.register(XlsxInspectTool::new(artifacts.clone()))?;
     registry.register(XlsxReadTool::new(artifacts))?;
@@ -690,6 +777,11 @@ pub fn register_pptx_tools(
     registry.register(crate::pptx_ops::PptxImportTool::new(
         artifacts.clone(),
         store.clone(),
+        inbox.clone(),
+    )?)?;
+    registry.register(crate::pptx_ops::PptxPdfTool::new(
+        artifacts.clone(),
+        store.clone(),
         inbox,
     )?)?;
     registry.register(crate::pptx_ops::PptxInspectTool::new(artifacts.clone()))?;
@@ -704,11 +796,22 @@ pub fn register_docx_tools(
     registry: &mut crate::gateway::ToolRegistry,
     artifacts: std::sync::Arc<ArtifactStore>,
     store: Store,
+    inbox: PathBuf,
 ) -> Result<()> {
     registry.register(crate::docx_ops::DocxBuildTool::new(
         artifacts.clone(),
         store.clone(),
     ))?;
+    registry.register(crate::docx_ops::DocxImportTool::new(
+        artifacts.clone(),
+        store.clone(),
+        inbox.clone(),
+    )?)?;
+    registry.register(crate::docx_ops::DocxPdfTool::new(
+        artifacts.clone(),
+        store.clone(),
+        inbox,
+    )?)?;
     registry.register(crate::docx_ops::DocxEditTool::new(artifacts.clone(), store))?;
     registry.register(crate::docx_ops::DocxInspectTool::new(artifacts.clone()))?;
     registry.register(crate::docx_ops::DocxReadTool::new(artifacts))?;

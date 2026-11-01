@@ -533,7 +533,7 @@ impl Gateway {
                     warn!(tool = %spec.name, "blocked tool output by content policy");
                     return Err(SeraError::PolicyViolation);
                 }
-                if let Some(path) = &value.artifact_path {
+                if value.artifact_hash.is_some() {
                     self.store.record_audit(
                         &context.actor,
                         "artifact.created",
@@ -543,11 +543,26 @@ impl Gateway {
                         None,
                         Some(self.policy.version()),
                         Some(&serde_json::json!({
-                            "path": path,
                             "sha256": value.artifact_hash,
                             "filename": value.filename,
-                            "bytes": value.content.len(),
                         })),
+                    )?;
+                }
+                // A non-external tool never creates an `actions` row, so record
+                // the artifact here as well. The owner library unions both, and
+                // the row is scoped to the acting user.
+                if let (Some(hash), Some(conversation_id)) = (
+                    value.artifact_hash.as_deref(),
+                    context.conversation_id.as_deref(),
+                ) {
+                    self.store.record_conversation_artifact(
+                        &context.user_id,
+                        conversation_id,
+                        context.turn_id.as_deref(),
+                        &spec.name,
+                        hash,
+                        value.filename.as_deref().unwrap_or_default(),
+                        None,
                     )?;
                 }
                 self.store.record_audit(

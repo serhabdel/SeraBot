@@ -1,4 +1,4 @@
-﻿---
+---
 name: Timesheet rows
 description: Total pasted TSV or CSV timesheet rows with timesheet_analyze and explicit units
 ---

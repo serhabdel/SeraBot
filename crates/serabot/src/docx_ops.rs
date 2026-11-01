@@ -27,6 +27,7 @@
 //! after the new text.
 
 use std::io::Read as _;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -558,6 +559,31 @@ fn clip_to_block(text: &str) -> (String, bool) {
 ///
 /// The range is bounded: more than [`MAX_READ_BLOCKS`] blocks is an error that
 /// names the range, never a silent truncation.
+/// Full text of a document, bounded by `max_chars`, for indexing.
+///
+/// `docx_read` is capped at 50 blocks per call because it returns structured
+/// data to a model. Indexing needs the whole body in one pass, so this walks
+/// the document once and stops at the character budget.
+pub fn plain_text(bytes: &[u8], max_chars: usize) -> Result<String> {
+    let document = load(bytes)?;
+    let mut out = String::new();
+    for block in &document.body {
+        if out.chars().count() >= max_chars {
+            break;
+        }
+        let text = match block.as_ref() {
+            Block::Para(paragraph) => paragraph.plain_text(),
+            Block::Table(table) => table_text(table),
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        out.push_str(&text);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 pub fn read_blocks(bytes: &[u8], from: usize, to: usize) -> Result<DocxText> {
     let document = load(bytes)?;
     let block_count = document.body.len();
@@ -1428,6 +1454,288 @@ fn block_listing(info: &DocxInfo) -> String {
     listing
 }
 
+/// Bring an owner-supplied `.docx` into the artifact store.
+///
+/// Without this a Word file in the inbox is unreachable: every other DOCX tool
+/// addresses an artifact hash, and only `docx_build` used to produce one.
+pub struct DocxImportTool {
+    artifacts: Arc<ArtifactStore>,
+    store: Store,
+    inbox: PathBuf,
+}
+
+impl DocxImportTool {
+    pub fn new(
+        artifacts: Arc<ArtifactStore>,
+        store: Store,
+        inbox: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let inbox = inbox.into();
+        std::fs::create_dir_all(&inbox)?;
+        let inbox = inbox.canonicalize()?;
+        Ok(Self {
+            artifacts,
+            store,
+            inbox,
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for DocxImportTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "docx_import".into(),
+            description:
+                "Import a .docx from the configured inbox (or re-check an existing artifact hash) \
+                 into the artifact store. Returns the block count, image count, and table count. \
+                 Bounded to 32 MiB and 4096 package parts; password-protected packages, macros, \
+                 ActiveX parts, and remote references are rejected. Inline images are preserved by \
+                 a later edit."
+                    .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path relative to the configured inbox"},
+                    "artifact": {"type": "string", "description": "Artifact hash of an already imported document"}
+                },
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        reject_unknown_keys(&args, &["path", "artifact"])?;
+        let path = args.get("path").and_then(Value::as_str).map(str::to_owned);
+        let artifact = args
+            .get("artifact")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let (hash, filename, info, source) = match (path, artifact) {
+            (Some(path), None) => {
+                let artifacts = self.artifacts.clone();
+                let inbox = self.inbox.clone();
+                let (stored, info) = tokio::task::spawn_blocking(move || {
+                    artifacts.ingest_inbox_file(&inbox, &path, &["docx"], MAX_DOCX_BYTES, inspect)
+                })
+                .await
+                .map_err(|error| SeraError::Internal(format!("DOCX task failed: {error}")))??;
+                (stored.hash, stored.filename, info, None)
+            }
+            (None, Some(hash)) => {
+                let stored = self.artifacts.load(&hash)?;
+                if !stored.filename.to_ascii_lowercase().ends_with(".docx") {
+                    return Err(invalid("artifact is not a .docx document"));
+                }
+                if stored.bytes.len() > MAX_DOCX_BYTES {
+                    return Err(invalid("document exceeds the 32 MiB limit"));
+                }
+                let bytes = stored.bytes;
+                let info = tokio::task::spawn_blocking(move || inspect(&bytes))
+                    .await
+                    .map_err(|error| SeraError::Internal(format!("DOCX task failed: {error}")))??;
+                (stored.hash, stored.filename, info, Some(hash))
+            }
+            (Some(_), Some(_)) => return Err(invalid("provide either path or artifact, not both")),
+            (None, None) => return Err(invalid("path or artifact is required")),
+        };
+
+        self.store.record_audit(
+            &context.actor,
+            "docx.imported",
+            Some("docx_import"),
+            context.task_id.as_deref(),
+            None,
+            None,
+            None,
+            Some(&json!({
+                "artifact_hash": hash.clone(),
+                "source_artifact": source,
+                "blocks": info.block_count,
+                "images": info.images,
+                "tables": info.tables,
+            })),
+        )?;
+
+        let data = json!({
+            "artifact_hash": hash.clone(),
+            "source_artifact": source,
+            "filename": filename.clone(),
+            "blocks": info.block_count,
+            "images": info.images,
+            "tables": info.tables,
+        });
+        Ok(ToolOutput {
+            content: format!(
+                "blocks: {}\nimages: {}\ntables: {}\nfilename: {}\nartifact: {}\n",
+                info.block_count, info.images, info.tables, filename, hash
+            ),
+            data: Some(data),
+            artifact_path: Some(format!("artifacts/{filename}")),
+            artifact_hash: Some(hash),
+            filename: Some(filename),
+            destination: None,
+        })
+    }
+}
+
+/// Render a `.docx` to PDF with the WordCraft PDF exporter.
+///
+/// This is the conversion path for an owner document: the layout is computed
+/// by WordCraft and written with embedded font subsets and selectable text. It
+/// does not rebuild the document from a `DocxSpec`.
+pub struct DocxPdfTool {
+    artifacts: Arc<ArtifactStore>,
+    store: Store,
+    inbox: PathBuf,
+}
+
+impl DocxPdfTool {
+    pub fn new(
+        artifacts: Arc<ArtifactStore>,
+        store: Store,
+        inbox: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let inbox = inbox.into();
+        std::fs::create_dir_all(&inbox)?;
+        let inbox = inbox.canonicalize()?;
+        Ok(Self {
+            artifacts,
+            store,
+            inbox,
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for DocxPdfTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "docx_pdf".into(),
+            description:
+                "Render a .docx to PDF. Accepts an inbox path or an artifact hash. The layout is \
+                 computed by the WordCraft engine and written with embedded font subsets and \
+                 selectable text; the result is stored as a new PDF artifact whose source_artifact \
+                 is the document. Bounded to 32 MiB and 5000 blocks; password-protected packages, \
+                 macros, ActiveX parts, and remote references are rejected."
+                    .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path relative to the configured inbox"},
+                    "artifact": {"type": "string", "description": "Artifact hash of an imported .docx"},
+                    "filename": {"type": "string", "description": "Optional artifact filename ending in .pdf"}
+                },
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        reject_unknown_keys(&args, &["path", "artifact", "filename"])?;
+        let path = args.get("path").and_then(Value::as_str).map(str::to_owned);
+        let artifact = args
+            .get("artifact")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let (bytes, source_name, source_artifact) = match (path, artifact) {
+            (Some(path), None) => {
+                let artifacts = self.artifacts.clone();
+                let inbox = self.inbox.clone();
+                let (stored, _) = tokio::task::spawn_blocking(move || {
+                    artifacts.ingest_inbox_file(&inbox, &path, &["docx"], MAX_DOCX_BYTES, inspect)
+                })
+                .await
+                .map_err(|error| SeraError::Internal(format!("DOCX task failed: {error}")))??;
+                (stored.bytes, stored.filename, stored.hash)
+            }
+            (None, Some(hash)) => {
+                let stored = self.artifacts.load(&hash)?;
+                if !stored.filename.to_ascii_lowercase().ends_with(".docx") {
+                    return Err(invalid("artifact is not a .docx document"));
+                }
+                if stored.bytes.len() > MAX_DOCX_BYTES {
+                    return Err(invalid("document exceeds the 32 MiB limit"));
+                }
+                (stored.bytes, stored.filename, stored.hash)
+            }
+            (Some(_), Some(_)) => return Err(invalid("provide either path or artifact, not both")),
+            (None, None) => return Err(invalid("path or artifact is required")),
+        };
+
+        let filename = match args.get("filename").and_then(Value::as_str) {
+            Some(filename) => {
+                if !filename.to_ascii_lowercase().ends_with(".pdf") {
+                    return Err(invalid("filename must end with .pdf"));
+                }
+                if filename.chars().count() > 120 {
+                    return Err(invalid("filename is longer than 120 characters"));
+                }
+                filename.to_owned()
+            }
+            None => pdf_filename(&source_name),
+        };
+        let pdf = tokio::task::spawn_blocking(move || {
+            let document = load(&bytes)?;
+            wordcraft_pdf::export(&document, &wordcraft_pdf::PdfOptions::default())
+                .map_err(|error| SeraError::Internal(format!("cannot render docx to PDF: {error}")))
+        })
+        .await
+        .map_err(|error| SeraError::Internal(format!("DOCX task failed: {error}")))??;
+
+        let stored = self.artifacts.save(
+            &pdf,
+            &filename,
+            ArtifactMeta {
+                title: filename.clone(),
+                filename: filename.clone(),
+                language: Language::En,
+                source_artifact: Some(source_artifact.clone()),
+                created_at: Utc::now(),
+            },
+        )?;
+        self.store.record_audit(
+            &context.actor,
+            "docx.pdf_exported",
+            Some("docx_pdf"),
+            context.task_id.as_deref(),
+            None,
+            None,
+            None,
+            Some(&json!({
+                "artifact_hash": stored.hash,
+                "source_artifact": source_artifact,
+            })),
+        )?;
+        Ok(ToolOutput {
+            content: format!(
+                "filename: {}\nartifact: {}\nsource_artifact: {}\n",
+                stored.filename, stored.hash, source_artifact
+            ),
+            data: Some(json!({
+                "artifact_hash": stored.hash,
+                "filename": stored.filename,
+                "source_artifact": source_artifact,
+            })),
+            artifact_path: Some(format!("artifacts/{}", stored.filename)),
+            artifact_hash: Some(stored.hash),
+            filename: Some(stored.filename),
+            destination: None,
+        })
+    }
+}
+
+fn pdf_filename(source: &str) -> String {
+    let stem = std::path::Path::new(source)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("document");
+    let stem: String = stem.chars().take(100).collect();
+    format!("{stem}.pdf")
+}
+
 pub struct DocxInspectTool {
     artifacts: Arc<ArtifactStore>,
 }
@@ -1467,21 +1775,26 @@ impl Tool for DocxInspectTool {
         reject_unknown_keys(&args, &["artifact"])?;
         let hash = required_artifact(&args)?;
         let stored = self.artifacts.load(&hash)?;
+        let artifact_hash = stored.hash.clone();
+        let filename = stored.filename.clone();
         let bytes = stored.bytes;
         let info = tokio::task::spawn_blocking(move || inspect(&bytes))
             .await
             .map_err(|error| SeraError::Internal(format!("DOCX task failed: {error}")))??;
         let data = serde_json::to_value(&info)?;
         let content = format!(
-            "blocks: {}\nimages: {}\ntables: {}\n\n{}",
+            "blocks: {}\nimages: {}\ntables: {}\nartifact: {}\n\n{}",
             info.block_count,
             info.images,
             info.tables,
+            artifact_hash,
             block_listing(&info)
         );
         Ok(ToolOutput {
             content,
             data: Some(data),
+            artifact_hash: Some(artifact_hash),
+            filename: Some(filename),
             ..ToolOutput::default()
         })
     }
@@ -1624,14 +1937,18 @@ impl Tool for DocxReadTool {
             Selection::Range(from, to) => (from, to),
         };
         let stored = self.artifacts.load(&hash)?;
+        let artifact_hash = stored.hash.clone();
+        let filename = stored.filename.clone();
         let bytes = stored.bytes;
         let text = tokio::task::spawn_blocking(move || read_blocks(&bytes, from, to))
             .await
             .map_err(|error| SeraError::Internal(format!("DOCX task failed: {error}")))??;
         let data = serde_json::to_value(&text)?;
         Ok(ToolOutput {
-            content: block_text_listing(&text),
+            content: format!("{}\nartifact: {artifact_hash}", block_text_listing(&text)),
             data: Some(data),
+            artifact_hash: Some(artifact_hash),
+            filename: Some(filename),
             ..ToolOutput::default()
         })
     }
@@ -2283,9 +2600,12 @@ mod tests {
             .await
             .expect("the tool reads a block");
         assert!(output.content.contains(&long), "the full text is returned");
-        assert!(output.artifact_hash.is_none(), "a read writes no artifact");
+        assert_eq!(
+            output.artifact_hash.as_deref(),
+            Some(hash.as_str()),
+            "a read echoes its source hash but writes nothing"
+        );
         assert!(output.artifact_path.is_none());
-        assert!(output.filename.is_none());
         assert!(output.destination.is_none());
         let data = output.data.expect("structured data");
         assert_eq!(data["blocks"][0]["chars"], json!(long.chars().count()));
@@ -2671,6 +2991,62 @@ mod tests {
         );
         let info = inspect(&stored.bytes).expect("the edited document inspects");
         assert_eq!(info.blocks[3].text, "Edited through the tool.");
+    }
+
+    #[tokio::test]
+    async fn import_brings_an_owner_file_into_the_store() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let artifacts = Arc::new(
+            ArtifactStore::new(directory.path().join("artifacts")).expect("an artifact store"),
+        );
+        let store = Store::open_in_memory(384).expect("an in-memory store");
+        let inbox = directory.path().join("inbox");
+        std::fs::create_dir_all(&inbox).expect("an inbox");
+        let bytes = build(&spec()).expect("the fixture builds");
+        std::fs::write(inbox.join("owner.docx"), &bytes).expect("the fixture file");
+
+        let tool = DocxImportTool::new(artifacts.clone(), store, &inbox).expect("the import tool");
+        let output = tool
+            .execute(json!({"path": "owner.docx"}), &context("docx_import"))
+            .await
+            .expect("the owner file imports");
+        let hash = output.artifact_hash.expect("an imported hash");
+        assert!(output.content.contains("blocks: 8"), "{}", output.content);
+        assert!(output.content.contains("artifact:"), "{}", output.content);
+        let stored = artifacts.load(&hash).expect("the imported artifact");
+        assert_eq!(stored.filename, "owner.docx");
+        assert_eq!(stored.bytes, bytes);
+    }
+
+    #[tokio::test]
+    async fn exports_a_document_to_pdf() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let artifacts = Arc::new(
+            ArtifactStore::new(directory.path().join("artifacts")).expect("an artifact store"),
+        );
+        let store = Store::open_in_memory(384).expect("an in-memory store");
+        let inbox = directory.path().join("inbox");
+        std::fs::create_dir_all(&inbox).expect("an inbox");
+        let bytes = build(&spec()).expect("the fixture builds");
+        std::fs::write(inbox.join("owner.docx"), &bytes).expect("the fixture file");
+
+        let tool = DocxPdfTool::new(artifacts.clone(), store, &inbox).expect("the PDF tool");
+        let output = tool
+            .execute(json!({"path": "owner.docx"}), &context("docx_pdf"))
+            .await
+            .expect("the document converts");
+        let hash = output.artifact_hash.expect("a PDF artifact hash");
+        let source = output.data.as_ref().unwrap()["source_artifact"]
+            .as_str()
+            .expect("a source artifact hash")
+            .to_owned();
+        let stored = artifacts.load(&hash).expect("the PDF artifact");
+        assert!(stored.bytes.starts_with(b"%PDF"), "the result is a PDF");
+        assert!(stored.filename.ends_with(".pdf"));
+        assert_eq!(
+            stored.meta.source_artifact.as_deref(),
+            Some(source.as_str())
+        );
     }
 
     #[tokio::test]

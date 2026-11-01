@@ -1,4 +1,4 @@
-﻿---
+---
 name: ElevenLabs media
 description: List voices or generate speech, sound, images, or video through ElevenLabs after approval
 ---

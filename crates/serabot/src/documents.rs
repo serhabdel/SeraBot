@@ -58,6 +58,9 @@ enum DocumentKind {
     Pdf,
     Text,
     Markdown,
+    #[cfg(feature = "docx")]
+    Docx,
+    Xlsx,
 }
 
 impl DocumentKind {
@@ -67,6 +70,9 @@ impl DocumentKind {
             "pdf" => Some(Self::Pdf),
             "txt" => Some(Self::Text),
             "md" | "markdown" => Some(Self::Markdown),
+            #[cfg(feature = "docx")]
+            "docx" => Some(Self::Docx),
+            "xlsx" => Some(Self::Xlsx),
             _ => None,
         }
     }
@@ -76,9 +82,15 @@ impl DocumentKind {
             Self::Pdf => "application/pdf",
             Self::Text => "text/plain",
             Self::Markdown => "text/markdown",
+            #[cfg(feature = "docx")]
+            Self::Docx => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            Self::Xlsx => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         }
     }
 }
+
+/// Characters of extracted text one document may contribute to the index.
+const MAX_INDEX_TEXT_CHARS: usize = 2_000_000;
 
 #[derive(Debug)]
 struct PageText {
@@ -134,7 +146,8 @@ pub async fn ingest_file(
 
     let kind = DocumentKind::from_path(path).ok_or_else(|| {
         SeraError::Validation(format!(
-            "unsupported document type for {}; supported types are .pdf, .txt, .md and .markdown",
+            "unsupported document type for {}; supported types are .pdf, .txt, .md, .markdown, \
+             .docx and .xlsx",
             path.display()
         ))
     })?;
@@ -350,6 +363,29 @@ async fn extract_pages(kind: DocumentKind, bytes: Vec<u8>) -> Result<Vec<PageTex
                     "text documents must be valid UTF-8; convert the file to UTF-8 first".into(),
                 )
             })?;
+            if text.trim().is_empty() {
+                return Err(empty_text_error());
+            }
+            Ok(vec![PageText { page: 1, text }])
+        }
+        #[cfg(feature = "docx")]
+        DocumentKind::Docx => {
+            let text = tokio::task::spawn_blocking(move || {
+                crate::docx_ops::plain_text(&bytes, MAX_INDEX_TEXT_CHARS)
+            })
+            .await
+            .map_err(|error| SeraError::Internal(format!("DOCX task failed: {error}")))??;
+            if text.trim().is_empty() {
+                return Err(empty_text_error());
+            }
+            Ok(vec![PageText { page: 1, text }])
+        }
+        DocumentKind::Xlsx => {
+            let text = tokio::task::spawn_blocking(move || {
+                crate::workbooks::plain_text(&bytes, MAX_INDEX_TEXT_CHARS)
+            })
+            .await
+            .map_err(|error| SeraError::Internal(format!("workbook task failed: {error}")))??;
             if text.trim().is_empty() {
                 return Err(empty_text_error());
             }

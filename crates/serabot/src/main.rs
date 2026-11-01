@@ -21,8 +21,8 @@ use serabot::embeddings::{Embedder, FastEmbedder, LazyEmbedder};
 use serabot::error::SeraError;
 use serabot::fetch::SafeFetcher;
 use serabot::firecrawl::{
-    FirecrawlClient, FirecrawlCrawlTool, FirecrawlLimits, FirecrawlMapTool, FirecrawlScrapeTool,
-    FirecrawlSearchTool,
+    FirecrawlClient, FirecrawlCrawlTool, FirecrawlExtractTool, FirecrawlLimits, FirecrawlMapTool,
+    FirecrawlScrapeTool, FirecrawlSearchTool,
 };
 use serabot::fleet::FleetRegistry;
 use serabot::gateway::{Gateway, ToolRegistry};
@@ -89,6 +89,29 @@ enum Command {
     Providers {
         #[command(subcommand)]
         command: ProvidersCommand,
+    },
+    /// Replace a user's bot fleet with the templates shipped in this build.
+    ///
+    /// The database is authoritative after seeding, so a binary upgrade never
+    /// silently rewrites a fleet. This command is the explicit opt-in: it drops
+    /// the user's `bots` rows and seeds them again from `bots/` + `prompts/`.
+    /// Prompt edits, tool allowlists, and any scaffolded bots are lost.
+    Fleet {
+        #[command(subcommand)]
+        command: FleetCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FleetCommand {
+    /// Replace every bot row for a user with the shipped templates.
+    Reseed {
+        /// User id to reseed. Defaults to the bootstrap admin.
+        #[arg(long)]
+        user: Option<String>,
+        /// Print what would change without writing.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -246,6 +269,54 @@ async fn main() -> anyhow::Result<()> {
                 ),
             },
         },
+        Command::Fleet { command } => match command {
+            FleetCommand::Reseed { user, dry_run } => {
+                let config = Config::load(&cli.config)?;
+                let store = Store::open(
+                    config.database_path(),
+                    config.embeddings.dimension,
+                    config.database.busy_timeout_ms,
+                )?;
+                let user_id = match user {
+                    Some(user) => user,
+                    None => store.admin_user_id()?,
+                };
+                if store.get_user(&user_id)?.is_none() {
+                    anyhow::bail!("no user with id {user_id}");
+                }
+                let templates = load_bots(&config, config.path(&config.fleet.bots_dir))?;
+                let existing = store.list_bots(&user_id)?;
+                println!(
+                    "user {user_id}: {} existing bot(s), {} template(s)",
+                    existing.len(),
+                    templates.len()
+                );
+                for bot in &templates {
+                    let verb = if existing.iter().any(|row| row.name == bot.config.name) {
+                        "replace"
+                    } else {
+                        "add"
+                    };
+                    println!(
+                        "  {verb} {:<12} tools={} skills={}",
+                        bot.config.name,
+                        bot.config.tools.len(),
+                        bot.config.skills.len()
+                    );
+                }
+                for row in &existing {
+                    if !templates.iter().any(|bot| bot.config.name == row.name) {
+                        println!("  remove {:<12} (not in this build's templates)", row.name);
+                    }
+                }
+                if dry_run {
+                    println!("dry run: nothing written");
+                } else {
+                    let seeded = serabot::fleet::reseed_user(&store, &user_id, &templates)?;
+                    println!("reseeded {seeded} bot(s) for {user_id}");
+                }
+            }
+        },
         Command::Skill { command } => match command {
             SkillCommand::Init { name, description } => {
                 register_skill_pack(&cli.config, &name, &description, None)?;
@@ -282,6 +353,13 @@ async fn main() -> anyhow::Result<()> {
             )?;
             store.backup_to(&destination)?;
             println!("backup written to {}", destination.display());
+            let artifacts = config.artifacts_dir();
+            if artifacts.is_dir() {
+                let target =
+                    std::path::PathBuf::from(format!("{}.artifacts", destination.display()));
+                let copied = copy_artifacts(&artifacts, &target)?;
+                println!("copied {copied} artifact file(s) to {}", target.display());
+            }
         }
         Command::SelftestEmbedding => {
             let config = Config::load(&cli.config)?;
@@ -359,6 +437,7 @@ fn load(
         anyhow::bail!("an enabled 'main' bot is required");
     }
     SkillCatalog::load(&config)?.validate_bot_skills(&bots)?;
+    serabot::config::validate_bot_tools(&bots, &serabot::tools::known_tool_names())?;
     Ok((config, bots))
 }
 
@@ -377,6 +456,23 @@ fn register_skill_pack(
     let created = create_skill(&config, name, description, body.as_deref(), &policy)?;
     println!("skill pack written to {}", created.file);
     Ok(())
+}
+
+fn copy_artifacts(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> anyhow::Result<usize> {
+    std::fs::create_dir_all(destination)?;
+    let mut copied = 0usize;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        std::fs::copy(entry.path(), destination.join(entry.file_name()))?;
+        copied = copied.saturating_add(1);
+    }
+    Ok(copied)
 }
 
 fn check(config_path: &std::path::Path) -> anyhow::Result<()> {
@@ -495,9 +591,19 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.path(&config.documents.watch_dir),
     )?)?;
     registry.register(TimesheetTool)?;
-    serabot::tools::register_workbook_tools(&mut registry, artifacts.clone(), store.clone())?;
+    serabot::tools::register_workbook_tools(
+        &mut registry,
+        artifacts.clone(),
+        store.clone(),
+        config.path(&config.documents.watch_dir),
+    )?;
     #[cfg(feature = "docx")]
-    serabot::tools::register_docx_tools(&mut registry, artifacts.clone(), store.clone())?;
+    serabot::tools::register_docx_tools(
+        &mut registry,
+        artifacts.clone(),
+        store.clone(),
+        config.path(&config.documents.watch_dir),
+    )?;
     registry.register(DocumentIndexTool::new(
         store.clone(),
         embedder.clone(),
@@ -633,7 +739,11 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         // idempotently.
         client.bootstrap_admin_binding(&store)?;
         notifiers.push(client.clone());
-        registry.register(TelegramDocumentTool::new(client.clone(), artifacts.clone()))?;
+        registry.register(TelegramDocumentTool::new(
+            client.clone(),
+            artifacts.clone(),
+            policy.clone(),
+        ))?;
         telegram = Some(client);
     }
     if config.firecrawl.enabled {
@@ -661,7 +771,8 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         registry.register(FirecrawlScrapeTool::new(client.clone(), limits.clone()))?;
         registry.register(FirecrawlMapTool::new(client.clone(), limits.clone()))?;
         registry.register(FirecrawlSearchTool::new(client.clone(), limits.clone()))?;
-        registry.register(FirecrawlCrawlTool::new(client, limits))?;
+        registry.register(FirecrawlCrawlTool::new(client.clone(), limits))?;
+        registry.register(FirecrawlExtractTool::new(client))?;
     }
     if config.tavily.enabled {
         let api_key = secrets

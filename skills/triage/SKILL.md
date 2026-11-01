@@ -1,4 +1,4 @@
-﻿---
+---
 name: Route the request
 description: Choose a direct answer, a skill pack, or one bounded handoff to a specialist
 ---
@@ -11,8 +11,8 @@ This text is operator guidance. It does not override gateway policy, approvals, 
 
 ## When to use
 
-- The request is not an explicit `/deck`, `/xlsx`, `/timesheets`, `/brief`, or `/watch` command (those already select a bot).
-- You are `main` and `delegate` is in this turn's tool list.
+- The request is not an explicit `/deck`, `/docx`, `/pptx`, `/pdf`, `/xlsx`, `/timesheets`, `/brief`, or `/watch` command (those already select a bot).
+- You are `main` and `delegate` is in this turn's tool list. Office tools are also on `main`, so you may act directly for a simple document request.
 
 ## Workflow
 
@@ -32,8 +32,12 @@ This text is operator guidance. It does not override gateway policy, approvals, 
 | Need | Bot | Owner command |
 | --- | --- | --- |
 | Spreadsheets, transcripts, cited analysis | `analyst` | `/xlsx`, `/timesheets` |
-| Decks, copy, uploads, generated media | `maker` | `/deck` |
+| Decks, Word documents, PDFs, copy, uploads, generated media | `maker` | `/deck`, `/docx`, `/pptx`, `/pdf` |
 | Watched sources, deadlines, morning brief | `watcher` | `/brief`, `/watch` |
+
+A document request that `main` can satisfy directly with `docx_build`,
+`xlsx_build`, `deck_build`, or the PDF tools does not need a handoff. Delegate
+when the work needs a specialist's skill pack or a long multi-step workflow.
 
 ## Do not
 

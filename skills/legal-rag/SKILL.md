@@ -1,4 +1,4 @@
-﻿---
+---
 name: Legal corpus
 description: Answer only from the curated legal corpus and refuse to invent authorities
 ---

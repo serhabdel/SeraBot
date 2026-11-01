@@ -1133,6 +1133,8 @@ enum EditKind {
     Rotate { pages: Vec<u32>, degrees: i64 },
     Delete { pages: Vec<u32> },
     Reorder { order: Vec<u32> },
+    Extract { start: u32, end: u32 },
+    StripMetadata,
 }
 
 impl EditKind {
@@ -1141,6 +1143,8 @@ impl EditKind {
             Self::Rotate { .. } => "rotate",
             Self::Delete { .. } => "delete",
             Self::Reorder { .. } => "reorder",
+            Self::Extract { .. } => "extract",
+            Self::StripMetadata => "strip_metadata",
         }
     }
 
@@ -1151,6 +1155,8 @@ impl EditKind {
             }
             Self::Delete { pages } => format!("deleted {} page(s)", pages.len()),
             Self::Reorder { order } => format!("reordered {} page(s)", order.len()),
+            Self::Extract { start, end } => format!("extracted pages {start}-{end}"),
+            Self::StripMetadata => "removed document metadata".to_string(),
         }
     }
 }
@@ -1181,17 +1187,18 @@ impl Tool for PdfEditTool {
         ToolSpec {
             name: "pdf_edit".into(),
             description:
-                "Apply one bounded page operation to a PDF: rotate, delete, or reorder. The result \
-                 is stored as a new artifact whose source_artifact is the input. Documents carrying \
-                 scripts, embedded files, or actions are rejected, and every page index is \
-                 validated before anything is written."
+                "Apply one bounded operation to a PDF: rotate, delete, reorder, extract a page \
+                 range into a new document, or strip metadata. The result is stored as a new \
+                 artifact whose source_artifact is the input. Documents carrying scripts, embedded \
+                 files, or actions are rejected, and every page index is validated before anything \
+                 is written."
                     .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "artifact": {"type": "string", "description": "Artifact hash of the source PDF (preferred)"},
                     "path": {"type": "string", "description": "Path relative to the configured inbox"},
-                    "operation": {"type": "string", "enum": ["rotate", "delete", "reorder"]},
+                    "operation": {"type": "string", "enum": ["rotate", "delete", "reorder", "extract", "strip_metadata"]},
                     "pages": {
                         "type": "array",
                         "items": {"type": "integer"},
@@ -1202,7 +1209,9 @@ impl Tool for PdfEditTool {
                         "type": "array",
                         "items": {"type": "integer"},
                         "description": "Complete 1-based page order for reorder"
-                    }
+                    },
+                    "start": {"type": "integer", "description": "First page of the extracted range (1-based)"},
+                    "end": {"type": "integer", "description": "Last page of the extracted range (1-based)"}
                 },
                 "required": ["operation"],
                 "additionalProperties": false
@@ -1214,7 +1223,16 @@ impl Tool for PdfEditTool {
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
         reject_unknown_keys(
             &args,
-            &["artifact", "path", "operation", "pages", "degrees", "order"],
+            &[
+                "artifact",
+                "path",
+                "operation",
+                "pages",
+                "degrees",
+                "order",
+                "start",
+                "end",
+            ],
         )?;
         let operation = args
             .get("operation")
@@ -1239,9 +1257,23 @@ impl Tool for PdfEditTool {
             "reorder" => EditKind::Reorder {
                 order: pages_argument(&args, "order")?,
             },
+            "extract" => {
+                let start = args
+                    .get("start")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| invalid("start is required for extract"))?;
+                let end = args
+                    .get("end")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| invalid("end is required for extract"))?;
+                EditKind::Extract { start, end }
+            }
+            "strip_metadata" => EditKind::StripMetadata,
             _ => {
                 return Err(invalid(
-                    "operation must be one of rotate, delete, or reorder",
+                    "operation must be one of rotate, delete, reorder, extract, or strip_metadata",
                 ));
             }
         };
@@ -1256,6 +1288,8 @@ impl Tool for PdfEditTool {
                 EditKind::Rotate { pages, degrees } => rotate(&input, pages, *degrees)?,
                 EditKind::Delete { pages } => delete(&input, pages)?,
                 EditKind::Reorder { order } => reorder(&input, order)?,
+                EditKind::Extract { start, end } => extract(&input, PageRange::new(*start, *end))?,
+                EditKind::StripMetadata => strip_metadata(&input)?,
             };
             let info = inspect(&bytes)?;
             Ok::<_, SeraError>((bytes, info))
