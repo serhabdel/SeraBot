@@ -1,0 +1,36 @@
+Calm the console: remove nominal status surfaces, tighten the chat rhythm
+
+Design pass benchmarked against the Grok chat UI, following the Apple
+HIG review (by DeepSeek V4).
+
+Subtraction first - nominal state is silent, only exceptions speak:
+- The sidebar-foot Connected chip and the topbar Online chip now render
+  only when offline; the disconnect state becomes more noticeable because
+  it is the only status that ever appears.
+- Bot liveness dots render only for the exception (restart required)
+  instead of a permanent green dot on every bot.
+- The empty Archived sidebar section no longer renders.
+- The task banner shows only actionable states (awaiting approval,
+  failed) and never renders the task UUID; done/running is already
+  visible in the message list.
+
+Conversation rhythm:
+- Messages group by speaker: a speaker change opens a 16px block,
+  consecutive messages sit 2px apart. Row hover highlight removed - the
+  list reads as a conversation, not a table of records.
+- Message text is capped at 66ch with 15px/1.55 type and real heading
+  rhythm inside assistant messages.
+- Own messages render as a speech bubble (18px/18px/4px/18px, no border)
+  and drop the redundant You label.
+- Timestamps are short: 10:33 today, Oct 30 14:05 otherwise (date math
+  is dependency-free; covered by unit tests).
+- The composer team row is collapsed by default into one caption chip
+  (Talking to N); member pills only render expanded.
+
+Materials: one light source at the top edge instead of three coloured
+blobs; cards and the inspector are opaque planes; blur is reserved for
+chrome that moves over content (topbar, composer, menus, toasts). A
+disabled primary button loses its fill instead of ghosting at 50%.
+
+Gate: fmt clean, clippy -D warnings clean, 606 server + 125 desktop
+tests passing.
