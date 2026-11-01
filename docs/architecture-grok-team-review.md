@@ -2,7 +2,23 @@
 
 - **Scope:** `crates/serabot` (runtime, store, gateway, teams, orchestration, model_router, scheduler, watcher, brief, memory, skills, api, fetch, main) plus `crates/serabot/migrations/`. Every claim is grounded in the code with `file:line` citations. `crates/serabot/src` is byte-identical between the working branch and `design/apple-fluid-polish`, so all citations hold on the target branch.
 - **Reference:** the owner's pasted X thread about a 6-bot Grok team. Its recurring complaints: 75–88% of tokens spent re-reading history (no compaction, no token audit), routines running on chatty bots, every-bot-answers-every-message group chats, slow clocks, no pre-check before fetch, bot-to-bot loops, vague asks, models doing a script's job, bots that should be skills, double charges; and its proposals: front door / hub-and-spoke, durable board, clock, gate with ~10 min approval expiry, "priced by undo" risk tiers, and memory tiers (description / skill / memory / live-source / task-state).
-- **Method:** match each thread idea against the actual code. Items marked *in-flight* are being changed in parallel sessions and are only noted here — this document implements nothing.
+- **Method:** match each thread idea against the actual code.
+- **Status:** written before 0.11.0. Several items it marked *in-flight* shipped in 0.11.0; section 0 records what landed and what is still open. The rest of the document is preserved as the original analysis, with the status column in section 0 as the source of truth.
+
+## 0. Implementation status (0.11.0)
+
+| Item | Status | Where |
+| --- | --- | --- |
+| @mention routing in rooms (gap c) | **Shipped** | `runtime.rs` `parse_mentions` (`:1955`), fan-out filter (`:652-655`), `team.mention_filtered` audit; tests `room_mentions_restrict_all_mode_fanout_to_mentioned_members` (`:3238`) |
+| Usage rollup + re-read measurement (gap e) | **Shipped** | `GET /v1/usage` (`api.rs:128`), `Store::usage_rollup` (`store.rs:956`), `history_messages` / `prompt_chars_est` on `model.used` (`runtime.rs:1426`) |
+| Full live model catalog (gap f, rec 6) | **Shipped** | `Provider::advertised` returns the fresh live list (`model_router.rs:617-628`); `verified_contains` still gates selection; tests `:939`, `:1399` |
+| Silent-when-empty, opt-in (rec 5) | **Shipped** | `watcher.silent_when_empty` (`config.rs`), `runtime.rs:970`, `:1027`; tests `:3350`, `:3378`. Default off — behaviour unchanged unless enabled |
+| Restrict mode `all` (rec 3) | **Partial** | Mentions now restrict the fan-out, but a message with no mentions still fans out to every member (`room_without_mentions_fans_out_to_every_member_unchanged`, `runtime.rs:3281`) |
+| Conditional HTTP + stagger (rec 4) | **Open** | `fetch.rs` still has no ETag / `If-Modified-Since` / 304; `source_stagger_secs` is still parsed and never read (`config.rs:953`) |
+| Risk-tiered approval expiry (gap b, rec 2) | **Open** | `default_approval_expiry() -> 24` hours, flat for every tool (`config.rs:1782-1783`) |
+| History compaction (gap a, rec 1) | **Open** | No `conversation_summaries` table; migrations stop at `0007`; no summarization in `runtime.rs` |
+
+**Still the highest-impact work, in order:** (1) history compaction with a measured before/after via `/v1/usage`; (2) risk-tiered approval expiry; (3) conditional HTTP + stagger; (4) decide whether mode `all` should require an explicit mention.
 
 ## 1. What SeraBot already does that matches or exceeds the thread
 
@@ -65,7 +81,7 @@
 
 ### 1.11 Token-leak audit (partial — see gap e)
 
-- Every model call writes a `model.used` audit row with provider, model and full `usage` (`runtime.rs:1299-1311`; `audit_log` schema `migrations/0001_core.sql:98-110`; `Usage` at `llm.rs:24-34`). What is missing is the rollup that turns this into a re-read percentage.
+- Every model call writes a `model.used` audit row with provider, model and full `usage` (`runtime.rs:1299-1311`; `audit_log` schema `migrations/0001_core.sql:98-110`; `Usage` at `llm.rs:24-34`). Since 0.11.0 the row also carries `history_messages` and `prompt_chars_est`, and `GET /v1/usage` rolls the rows up, so the re-read share is measurable without SQL.
 
 ## 2. Gaps, ranked by impact
 
@@ -73,10 +89,10 @@
 | --- | --- | --- | --- |
 | a | No compaction / token counting; last 50 messages + full prompt + 20 memories re-sent every turn | "75–88% of tokens re-reading history" | **High** — pure cost, unmeasured |
 | b | Flat 24h approval expiry, no risk tiers | "approval expiry ~10 min", "priced by undo gates" | **High** — stale approvals on irreversible actions |
-| c | Room mode `all` = every member answers every message; no @mention routing (in-flight) | "every-bot-answers-every-message group chats" | **Medium-high** — N× model calls per message, capped at 8 |
+| c | Room mode `all` fans out to every member unless the owner names someone; @mention routing now restricts it | "every-bot-answers-every-message group chats" | **Medium** — N× model calls per unaddressed message, capped at 8 |
 | d | Watch/brief always speak; no ETag/304 pre-check; `source_stagger_secs` unused | "no pre-check", "fast clocks" | **Medium** — wasted fetches + noise messages |
-| e | No usage rollup (`/v1/usage`, `prompt_chars_est` in-flight) | "token-leak audit" | **Medium** — gap (a) is invisible without it |
-| f | Live catalog ∩ allowlist hides most models in UIs (full-list change in-flight) | "model catalog" UX | **Low** — cosmetic; gate is intact |
+| e | ~~No usage rollup~~ — shipped in 0.11.0 (`GET /v1/usage`, `prompt_chars_est`) | "token-leak audit" | **Closed** — gap (a) is now measurable |
+| f | ~~Live catalog ∩ allowlist hides most models~~ — shipped in 0.11.0 (full live list, gate intact) | "model catalog" UX | **Closed** |
 
 **(a) No compaction, no token counting — every turn re-sends the tail. Highest impact.**
 `run_turn` rebuilds each prompt as full system prompt + last `history_limit` messages (default **50**, clamped 1–200) + the current message (`runtime.rs:1010-1015`, `:1049-1051`; `store.rs:730`, `:750-763`; defaults `config.rs:1800-1802`, `:912-913`). There is no summarization/compaction anywhere, and nothing records how much of `prompt_tokens` is re-read history — the thread's 75–88% leak exists here unmeasured. Compounding it, the top-20 memory block is re-injected into every prompt (`runtime.rs:1775-1787`).
@@ -84,26 +100,26 @@
 **(b) Approval expiry is flat 24h, not ~10 min, and there are no "priced by undo" tiers.**
 `approval_expiry_hours` defaults to 24 (`config.rs:643-644`, `:1695-1697`) and is applied as `Duration::hours(...)` to every approval (`gateway.rs:158`, `:175`, `:306-311`). Expiry itself works (`store.rs:1109-1165`, maintenance `runtime.rs:785-788`), but a read-only tool and an irreversible send live equally long. Tiering by reversibility/cost-of-undo is absent.
 
-**(c) Room mode `all` = every member answers every message; no @mention routing.**
-`TeamMode::All` fans the owner's message out to one turn per member (`teams.rs:58-82`, fan-out `runtime.rs:609-617`, `:624-700`; prompt clause `teams.rs:190-193`). The hard caps bound cost (`teams.rs:40-46`) but every member still pays a full prompt+history model call per owner message. @mention-style routing is *in-flight* in a parallel session — noted, not implemented here.
+**(c) Room mode `all` fans out to every member unless the owner names someone.**
+`TeamMode::All` fans the owner's message out to one turn per member (`teams.rs:58-82`, fan-out `runtime.rs:609-617`, `:624-700`; prompt clause `teams.rs:190-193`). Since 0.11.0, `@bot` mentions restrict the fan-out to the mentioned members (`runtime.rs:652-655`), but a message with no mention still reaches every member (`runtime.rs:3281`). The hard caps bound cost (`teams.rs:40-46`), yet each recipient still pays a full prompt+history model call.
 
 **(d) Watch/brief always speak; no HTTP pre-check; `source_stagger_secs` is dead config.**
 `run_brief` and `run_watch` unconditionally `send_text`, even when every report has `new=0, changed=0, failed=0` (`runtime.rs:904-906`, `:940-954`). `SafeFetcher.fetch` always issues a full GET and streams the whole body — no ETag / `If-Modified-Since` / 304 handling exists (`fetch.rs:120-195`). `schedule.source_stagger_secs` is parsed and defaulted (`config.rs:940-941`, `:1812-1814`) but never read anywhere; only `watch_times` is consumed (`main.rs:837`).
 
-**(e) No usage rollup to measure the re-read share.**
-`model.used` audit rows exist (`runtime.rs:1299-1311`) but there is no `GET /v1/usage` route (route table `api.rs:122-195`) and no `prompt_chars_est` in the audit details. Both are *in-flight* in a parallel session; until they land, section 4's SQL is the only audit.
+**(e) Usage rollup — closed in 0.11.0.**
+`model.used` audit rows (`runtime.rs:1299-1311`) now carry `history_messages` and `prompt_chars_est`, and `GET /v1/usage` (`api.rs:128`) returns totals, per-day and per-bot rollups via `Store::usage_rollup` (`store.rs:956`). Section 4's SQL is still useful for ad-hoc queries; the endpoint is the supported path.
 
-**(f) Live model catalog is intersected with the allowlist, so UIs show only the overlap.**
-`advertised()` returns `allowlist ∩ freshly-verified-live-catalog` — and an empty list when the catalog is not verified (`model_router.rs:569-581`; intersection counted at `:325`; served via `runtime.rs:352-357` → `api.rs:304-321`). With a 36+-model live catalog and a small allowlist, UIs show ~7 models. Enforcement correctly stays in `catalog_gate` / `verified_contains` (`model_router.rs:273-287`, `:583-599`). Showing the **full live list** while keeping the verified gate on selection is *in-flight*.
+**(f) Live model catalog — closed in 0.11.0.**
+`advertised()` now returns the full fresh live list (`model_router.rs:617-628`); an unverified or stale snapshot still falls back to the allowlist, and `verified_contains` / `catalog_gate` still reject any model not in the verified snapshot (`model_router.rs:273-287`, `:630-645`). The UI shows the full catalog without widening the selection gate.
 
 ## 3. Recommended next steps (NOT implemented — need owner review)
 
 1. **History compaction.** Add a `conversation_summaries` table; keep the last K messages verbatim and compact older spans through a pinned route **whose output passes the gateway scan** (summaries are model output → untrusted; they must go through `scan_egress`/`scan_model_messages` like any model text, `runtime.rs:1292`, `:1791`). Never compact approval-relevant state — it already lives outside the prompt in `turns.state_json` and `actions` (`runtime.rs:1052-1053`). Record compactions in `audit_log` so the cost audit can attribute prompt tokens to "verbatim" vs "compacted".
 2. **Risk-tiered approval expiry ("priced by undo").** Replace the single `approval_expiry_hours` with per-tool / per-`external_effect` classes — e.g. ~10 minutes for irreversible sends, uploads and deletes; hours for read-only actions (`config.rs:643-644`, `gateway.rs:175`, `:306-311`). Tier by cost of undo, not by tool name alone.
-3. **Retire or restrict mode `all`.** Prefer @mention routing (in-flight). Until it lands, consider a per-room team-message cap below `MAX_TEAM_MESSAGES_PER_TURN = 8` (`teams.rs:44`, fan-out `runtime.rs:609-617`).
-4. **Conditional HTTP + stagger.** Persist last ETag/`Last-Modified` per source in `source_runs`, send `If-None-Match`/`If-Modified-Since`, and treat 304 as unchanged in `fetch.rs` (`:120-195`); actually sleep `source_stagger_secs` between source fetches (`config.rs:941`, used nowhere today — `main.rs:837`).
-5. **Silent-when-empty, opt-in.** A `watch.silent_when_empty` flag (default off) that skips the `send_text` in `run_watch` when all reports are `new=0, changed=0, failed=0` (`runtime.rs:940-954`).
-6. **Model catalog full-list change** (in-flight): expose the live catalog in `/v1/models` while keeping `catalog_gate` as the enforcement point (`model_router.rs:273-287`, `api.rs:304-321`).
+3. **Decide mode `all`.** @mention routing shipped in 0.11.0 (`runtime.rs:652-655`), so the remaining choice is whether an unaddressed message should still reach every member. If not, require an explicit mention in `all` mode.
+4. **Conditional HTTP + stagger.** Persist last ETag/`Last-Modified` per source in `source_runs`, send `If-None-Match`/`If-Modified-Since`, and treat 304 as unchanged in `fetch.rs` (`:120-195`); actually sleep `source_stagger_secs` between source fetches (`config.rs:953`, used nowhere today).
+5. **Silent-when-empty — shipped in 0.11.0, opt-in.** `watcher.silent_when_empty` (default off) skips the `send_text` when all reports are quiet and records `watch.silent_run` / `brief.silent_run` (`runtime.rs:970`, `:1027`).
+6. **Full model catalog — shipped in 0.11.0.** `/v1/models` exposes the live catalog while `catalog_gate` remains the enforcement point (`model_router.rs:617-628`).
 
 ## 4. 15-minute cost audit
 
@@ -142,7 +158,7 @@ WHERE event = 'model.used' AND at >= datetime('now', '-7 days')
 GROUP BY model ORDER BY calls DESC;
 ```
 
-The in-flight `GET /v1/usage` endpoint should expose the same rollup as JSON (calls, prompt/completion tokens, prompt share, approx re-read share — per model and per day) so this audit is one HTTP call instead of SQL; until it lands, the queries above are the audit. Compare the resulting prompt share against the thread's 75–88% benchmark.
+The `GET /v1/usage` endpoint (shipped in 0.11.0) exposes the same rollup as JSON — calls, prompt/completion tokens, per day and per bot — so this audit is one HTTP call instead of SQL. The queries above remain useful for ad-hoc analysis (for example, per-model prompt share, which the endpoint does not break out). Compare the resulting prompt share against the thread's 75–88% benchmark.
 
 ## 5. Invariants to preserve when implementing any of the above (from AGENTS.md)
 
