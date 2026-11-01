@@ -204,6 +204,62 @@ fn stamp(raw: &str) -> String {
     raw.chars().take(16).collect::<String>().replace('T', " ")
 }
 
+/// Short timestamp for the chat list: "10:33" when the message is from today
+/// (server stamps are UTC), "Nov 1 10:33" otherwise. A full date on every row
+/// is noise; day separators carry the date instead.
+fn msg_stamp(raw: &str) -> String {
+    let Some(time) = raw.get(11..16) else {
+        return stamp(raw);
+    };
+    let date = raw.get(..10).unwrap_or_default();
+    if date == today_utc_date() {
+        return time.to_owned();
+    }
+    let Some((m, d)) = parse_md(date) else {
+        return stamp(raw);
+    };
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month = MONTHS
+        .get(m.wrapping_sub(1) as usize)
+        .copied()
+        .unwrap_or("?");
+    format!("{month} {d} {time}")
+}
+
+/// Today's date as `YYYY-MM-DD` in UTC, without pulling in a date crate.
+fn today_utc_date() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    civil_from_days((secs / 86_400) as i64)
+}
+
+/// Parse the month and day of a `YYYY-MM-DD` date.
+fn parse_md(date: &str) -> Option<(u32, u32)> {
+    let m = date.get(5..7)?.parse().ok()?;
+    let d = date.get(8..10)?.parse().ok()?;
+    Some((m, d))
+}
+
+/// Howard Hinnant's civil-from-days algorithm: days since 1970-01-01 to
+/// `YYYY-MM-DD`.
+fn civil_from_days(days: i64) -> String {
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// Overlay surfaces that sit above the shell.
 #[derive(Clone, Copy, PartialEq)]
 enum Overlay {
@@ -1584,7 +1640,9 @@ fn Sidebar(
             }
         }
 
-        if needle.is_empty() {
+        // An empty Archived section is chrome that announces its own emptiness;
+        // it only appears once something is actually archived.
+        if needle.is_empty() && !state.state.archived.is_empty() {
             let archived = &state.state.archived;
             let is_collapsed = collapsed().contains("group:archived");
             items.push(RailItem::Header {
@@ -1692,9 +1750,11 @@ fn Sidebar(
                                             span { class: "unread-badge", "{unread}" }
                                         }
                                     }
-                                    span {
-                                        class: if live { "thread-dot live" } else { "thread-dot off" },
-                                        title: if live { "live" } else { "restart required" }
+                                    // Liveness dots only render for the
+                                    // exception (restart required); five
+                                    // identical green dots say nothing.
+                                    if !live {
+                                        span { class: "thread-dot off", title: "restart required" }
                                     }
                                     PinToggle { session, id: pin_id, pinned }
                                 }
@@ -1830,9 +1890,11 @@ fn Sidebar(
                 }
             }
             div { class: "sidebar-foot",
-                span {
-                    class: if connected { "chip ok" } else { "chip danger" },
-                    if connected { "Connected" } else { "Offline" }
+                // Nominal connection state is silent; only the exception
+                // (offline) gets a surface. A permanent green chip trains the
+                // eye to ignore the one moment it matters.
+                if !connected {
+                    span { class: "chip danger", "Offline" }
                 }
                 UserMenu { session, toast }
             }
@@ -2099,8 +2161,10 @@ fn Topbar(
                         if bots_loaded { "Bots {bots}" } else { "Bots" }
                     }
                 }
-                span { class: if connected { "chip ok" } else { "chip danger" },
-                    if connected { "Online" } else { "Offline" }
+                // Same rule as the sidebar foot: show the chip only when
+                // offline, never as a permanent "Online" assertion.
+                if !connected {
+                    span { class: "chip danger", "Offline" }
                 }
             }
         }
@@ -2136,21 +2200,29 @@ fn StatusBanner(session: Signal<Session>) -> Element {
             }
         }
     });
-    let task_view = task.map(|(status, label, bot, id)| {
-        rsx! {
-            div { class: "banner",
-                span { class: "chip", "{label}" }
-                span { class: "tiny", "{bot} · {id}" }
-                if status == TaskStatus::AwaitingApproval {
-                    button {
-                        class: "btn ghost sm",
-                        onclick: move |_| session.write().open_section(Section::Approvals),
-                        "Review approvals"
+    // The task banner exists for actionable states only. A "Done" row pinned
+    // above the conversation is nominal state rendered as chrome; the per-turn
+    // status in the message list already says it. The UUID never leaves the
+    // Inspector.
+    let task_view = task
+        .filter(|(status, _, _, _)| {
+            matches!(status, TaskStatus::AwaitingApproval | TaskStatus::Failed)
+        })
+        .map(|(status, label, bot, _id)| {
+            rsx! {
+                div { class: if status == TaskStatus::Failed { "banner err" } else { "banner" },
+                    span { class: "chip", "{label}" }
+                    span { class: "tiny", "{bot}" }
+                    if status == TaskStatus::AwaitingApproval {
+                        button {
+                            class: "btn ghost sm",
+                            onclick: move |_| session.write().open_section(Section::Approvals),
+                            "Review approvals"
+                        }
                     }
                 }
             }
-        }
-    });
+        });
     let admin_error_view = admin_error.map(|message| {
         rsx! {
             div { class: "banner err",
@@ -2275,13 +2347,38 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                     speaker,
                     avatar,
                     bot,
-                    stamp(&message.created_at),
+                    msg_stamp(&message.created_at),
                     message.content.clone(),
                     peer,
                 )
             })
             .collect()
     };
+    // Group by speaker: a change of speaker opens a new visual block;
+    // consecutive messages from one speaker stay glued together. The class
+    // string is precomputed here because `let` bindings are not allowed
+    // inside the rsx! body.
+    let mut msg_classes: Vec<String> = Vec::with_capacity(messages.len());
+    let mut prev_user: Option<bool> = None;
+    for row in &messages {
+        let (user, peer) = (row.1, row.7);
+        let speaker_change = match prev_user {
+            None => true,
+            Some(previous) => previous != user,
+        };
+        prev_user = Some(user);
+        let mut class = String::from(if user {
+            "msg user"
+        } else if peer {
+            "msg bot peer"
+        } else {
+            "msg bot"
+        });
+        if speaker_change {
+            class.push_str(" speaker-change");
+        }
+        msg_classes.push(class);
+    }
     let task = session
         .read()
         .state
@@ -2362,7 +2459,9 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
             })
             .collect::<Vec<_>>()
     };
-    let mut team_collapsed = use_signal(|| false);
+    // The team row is collapsed by default: routing state changes rarely, so it
+    // sits behind one caption chip instead of a permanent row of pills.
+    let mut team_collapsed = use_signal(|| true);
     let mut recording = use_signal(|| false);
     // The recorder is owned by the signal but taken out for every capture, so
     // no borrow of the signal is alive across an await point.
@@ -2530,16 +2629,12 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                             }
                         }
                     }
-                    for (id, user, speaker, avatar, bot, stamp, content, peer) in messages {
+                    for ((id, user, speaker, avatar, bot, stamp, content, peer), class) in
+                        messages.into_iter().zip(msg_classes.iter())
+                    {
                         div {
                             key: "{id}",
-                            class: if user {
-                                "msg user"
-                            } else if peer {
-                                "msg bot peer"
-                            } else {
-                                "msg bot"
-                            },
+                            class: "{class}",
                             span {
                                 class: if user { "msg-avatar avatar user" } else { "msg-avatar avatar bot" },
                                 style: bot.as_deref().map(avatar_style).unwrap_or_default(),
@@ -2547,7 +2642,11 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                             }
                             div { class: "msg-main",
                                 div { class: "msg-head",
-                                    span { class: "msg-name", "{speaker}" }
+                                    // The own-message label restates what the
+                                    // right-aligned bubble already says.
+                                    if !user {
+                                        span { class: "msg-name", "{speaker}" }
+                                    }
                                     span { class: "msg-time", "{stamp}" }
                                     if let Some(id) = bot.as_ref() {
                                         if let Some((role, live)) = bot_meta.get(id) {
@@ -2669,11 +2768,14 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                             NewMenu { session, overlay }
                             div { class: "team-row",
                                 if group_like {
-                                    span { class: "chip muted", "Talking to" }
+                                    // Collapsed: one caption chip with a count.
+                                    // The member pills only render expanded,
+                                    // so the resting composer has no pill row.
                                     button {
-                                        class: "icon-btn",
+                                        class: "chip muted team-chip",
                                         title: if team_collapsed() { "Show members" } else { "Hide members" },
                                         onclick: move |_| team_collapsed.set(!team_collapsed()),
+                                        "Talking to {talking_to.len()}"
                                         Icon { name: if team_collapsed() { "chevron-right" } else { "chevron-down" }, size: 14 }
                                     }
                                     if !team_collapsed() {
@@ -6701,6 +6803,31 @@ fn SettingsView(session: Signal<Session>) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn civil_from_days_matches_known_dates() {
+        // 1970-01-01 is day 0; 2026-11-01 is day 20758.
+        assert_eq!(civil_from_days(0), "1970-01-01");
+        assert_eq!(civil_from_days(20_758), "2026-11-01");
+        assert_eq!(civil_from_days(20_757), "2026-10-31");
+        // Leap-year boundary.
+        assert_eq!(civil_from_days(18_321), "2020-02-29");
+        assert_eq!(civil_from_days(18_322), "2020-03-01");
+    }
+
+    #[test]
+    fn msg_stamp_shows_time_today_and_short_date_otherwise() {
+        let today = today_utc_date();
+        let stamped_today = format!("{today}T10:33:45Z");
+        assert_eq!(msg_stamp(&stamped_today), "10:33");
+
+        let other = msg_stamp("2026-10-30T14:05:00Z");
+        assert_eq!(other, "Oct 30 14:05");
+
+        // Garbage in, the long form out — never a panic.
+        assert_eq!(msg_stamp(""), "");
+        assert_eq!(msg_stamp("nope"), "nope");
+    }
 
     #[test]
     fn mention_query_tracks_a_trailing_at_token() {

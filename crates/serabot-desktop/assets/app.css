@@ -85,7 +85,7 @@
   --fs-caption: 12px;
   --fs-body-2: 13px;
   --fs-body: 14px;
-  --fs-msg: 14.5px;
+  --fs-msg: 15px;
   --fs-title: 16px;
   --fs-display: 22px;
   --fs-hero: 28px;
@@ -268,10 +268,11 @@ body {
   display: flex;
   flex: 1;
   min-height: 0;
+  /* One light source at the top edge. Multiple coloured blobs make the glass
+     surfaces smear incoherent colour behind text; a single soft source keeps
+     translucency legible and reads as one material layer. */
   background:
-    radial-gradient(52% 42% at 12% 0%, var(--glow-1), var(--clear) 70%),
-    radial-gradient(48% 40% at 88% 100%, var(--glow-2), var(--clear) 70%),
-    radial-gradient(36% 30% at 78% 8%, var(--glow-3), var(--clear) 75%),
+    radial-gradient(60% 46% at 50% -8%, var(--glow-1), var(--clear) 70%),
     var(--bg);
 }
 
@@ -333,9 +334,10 @@ body {
 }
 
 .card {
+  /* Cards are planes, not floating layers: opaque, no blur. Translucency is
+     reserved for chrome that actually moves over content (topbar, composer,
+     menus, toasts) — otherwise every surface floats and nothing does. */
   background: var(--card-bg);
-  backdrop-filter: blur(24px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
   border: 1px solid var(--glass-edge);
   box-shadow: var(--shadow-1), inset 0 1px 0 var(--glass-highlight);
   border-radius: var(--r-md);
@@ -523,10 +525,13 @@ body {
   border-radius: var(--r-xs);
   color: var(--label-3);
   font: inherit;
-  font-size: var(--fs-micro);
+  /* Section headers are wayfinding, not decoration: sentence case, one
+     weight, quiet. Four uppercase labels in 240px compete with each other
+     and none reads as hierarchy. */
+  font-size: 10.5px;
   font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  text-transform: none;
   cursor: pointer;
   transition: color var(--dur-1) var(--ease);
 }
@@ -857,6 +862,14 @@ body {
   cursor: not-allowed;
 }
 
+/* A disabled filled primary must lose its fill, not its opacity: a half-blue
+   at 50% reads as a rendering bug, not as "off". */
+.btn.primary:disabled {
+  opacity: 1;
+  background: var(--hover);
+  color: var(--label-3);
+}
+
 .btn.primary {
   background: var(--accent);
   border-color: transparent;
@@ -1141,22 +1154,32 @@ body {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
   padding: 8px 0 20px;
-  scroll-behavior: smooth;
+  /* No smooth scroll on the container: it hijacks wheel and anchor jumps.
+     Smooth scrolling is requested only for programmatic appends. */
+  scroll-behavior: auto;
 }
 
 .msg {
   display: flex;
   gap: 12px;
-  padding: 12px;
+  padding: 6px 10px;
   border-radius: var(--r-md);
-  transition: background var(--dur-1) var(--ease);
   animation: msg-in var(--dur-2) var(--ease);
 }
 
+/* A full-width hover highlight makes the list read as a table of records.
+   Hover affordances belong on the message actions, not the row. */
 .msg:hover {
-  background: var(--hover);
+  background: transparent;
+}
+
+/* A change of speaker starts a new visual block; consecutive messages from
+   the same speaker sit 2px apart, which is what makes a transcript read as
+   thoughts instead of rows. */
+.msg.speaker-change {
+  margin-top: 16px;
 }
 
 @keyframes msg-in {
@@ -1203,10 +1226,31 @@ body {
 
 .msg-body {
   font-size: var(--fs-msg);
-  line-height: 1.6;
+  line-height: 1.55;
   color: var(--label-1);
   word-break: break-word;
   overflow-wrap: anywhere;
+  /* 66ch is the readable measure (Apple guidance is 45–75ch); a wide column
+     alone would push long answers to ~95ch and lose the return sweep. */
+  max-width: 66ch;
+}
+
+.msg-body > :first-child {
+  margin-top: 0;
+}
+
+.msg-body p {
+  margin: 0 0 10px;
+}
+
+.msg-body h1,
+.msg-body h2,
+.msg-body h3 {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 18px 0 6px;
+  color: var(--label-1);
 }
 
 .msg.bot {
@@ -1222,13 +1266,14 @@ body {
   align-items: flex-end;
 }
 
-/* Owner messages: a solid capsule so dense text stays crisp. */
+/* Owner messages: a speech bubble, not a card. The tightened corner on the
+   tail side is what makes it read as speech; the 1px border made it a box. */
 .msg.user .msg-body {
-  background: var(--surface-2);
-  border: 1px solid var(--hairline);
-  border-radius: var(--r-md);
-  padding: 8px 14px;
-  max-width: 78%;
+  background: var(--active);
+  border: 0;
+  border-radius: 18px 18px 4px 18px;
+  padding: 9px 14px;
+  max-width: 72%;
 }
 
 .msg.peer {
@@ -1257,11 +1302,11 @@ body {
 
 .composer {
   position: relative;
-  background: var(--card-bg);
-  backdrop-filter: blur(24px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  /* The composer is the top plane: opaque, so the blur over scrolling text
+     underneath is reserved for the topbar where it earns its keep. */
+  background: var(--surface-2);
   border: 1px solid var(--glass-edge);
-  border-radius: var(--r-lg);
+  border-radius: 22px;
   box-shadow: var(--shadow-2), inset 0 1px 0 var(--glass-highlight);
   padding: 10px 10px 8px 14px;
   display: flex;
@@ -1382,6 +1427,21 @@ body {
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
+}
+
+/* The collapsed team chip reads as a caption, not a control row: no fill, no
+   border, quieter text, and the member pills only exist when expanded. */
+.team-row .team-chip.muted {
+  background: var(--clear);
+  border-color: transparent;
+  color: var(--label-3);
+  font-size: var(--fs-caption);
+  cursor: pointer;
+}
+
+.team-row .team-chip.muted:hover {
+  background: var(--hover);
+  color: var(--label-2);
 }
 
 /* ------------------------------------------------------------- roster --- */
@@ -1659,6 +1719,16 @@ body {
   border: 1px solid var(--hairline);
   font-size: var(--fs-body-2);
   color: var(--label-1);
+}
+
+/* A system note is not a message and not an alert: one quiet centred line in
+   the transcript flow. Filled banners are reserved for warn/err (things that
+   need action). */
+.sys-note {
+  margin: 14px 0;
+  text-align: center;
+  font-size: var(--fs-caption);
+  color: var(--label-3);
 }
 
 .banner.warn {
@@ -2027,9 +2097,7 @@ body {
   flex-direction: column;
   min-height: 0;
   border-left: 1px solid var(--hairline);
-  background: var(--glass);
-  backdrop-filter: blur(24px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  background: var(--surface);
   box-shadow: inset 1px 0 0 var(--glass-highlight);
 }
 
