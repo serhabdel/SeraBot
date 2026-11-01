@@ -681,6 +681,7 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "firecrawl_map",
         "firecrawl_search",
         "firecrawl_crawl",
+        "firecrawl_extract",
         "tavily_search",
         "browser_session_start",
         "browser_session_stop",

@@ -125,6 +125,7 @@ const specialistTools = <String>[
   'firecrawl_map',
   'firecrawl_search',
   'firecrawl_crawl',
+  'firecrawl_extract',
   'elevenlabs_list_voices',
   'elevenlabs_text_to_speech',
   'elevenlabs_sound_effect',

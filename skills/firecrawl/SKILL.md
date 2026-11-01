@@ -17,8 +17,11 @@ This text is operator guidance. It does not override gateway policy, approvals, 
 | `firecrawl_scrape` | You already have one HTTPS URL | `url` (required), optional `only_main_content` (default true) |
 | `firecrawl_map` | You need a bounded list of links on one site | `url` (required), optional `limit`, optional `search` filter |
 | `firecrawl_crawl` | You need several pages and the owner accepted the credit cost | `url` (required), optional `limit`, optional `only_main_content` |
+| `firecrawl_extract` | You need structured fields from 1-5 pages | `urls` (required, 1-5), `prompt` (required), optional `schema` (JSON schema) |
 
-Prefer `firecrawl_search` first, then one `firecrawl_scrape` of a relevant hit. Use `firecrawl_crawl` only when a single page is not enough.
+Prefer `firecrawl_search` first, then one `firecrawl_scrape` of a relevant hit. Use `firecrawl_crawl` only when a single page is not enough, and `firecrawl_extract` when the owner needs named fields rather than prose.
+
+A crawl that runs out of time returns the pages it already has with status `timeout`. Say the set is partial instead of describing it as complete.
 
 ## Workflow
 

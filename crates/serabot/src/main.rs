@@ -21,8 +21,8 @@ use serabot::embeddings::{Embedder, FastEmbedder, LazyEmbedder};
 use serabot::error::SeraError;
 use serabot::fetch::SafeFetcher;
 use serabot::firecrawl::{
-    FirecrawlClient, FirecrawlCrawlTool, FirecrawlLimits, FirecrawlMapTool, FirecrawlScrapeTool,
-    FirecrawlSearchTool,
+    FirecrawlClient, FirecrawlCrawlTool, FirecrawlExtractTool, FirecrawlLimits, FirecrawlMapTool,
+    FirecrawlScrapeTool, FirecrawlSearchTool,
 };
 use serabot::gateway::{Gateway, ToolRegistry};
 use serabot::llm::LlmClient;
@@ -675,7 +675,8 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         registry.register(FirecrawlScrapeTool::new(client.clone(), limits.clone()))?;
         registry.register(FirecrawlMapTool::new(client.clone(), limits.clone()))?;
         registry.register(FirecrawlSearchTool::new(client.clone(), limits.clone()))?;
-        registry.register(FirecrawlCrawlTool::new(client, limits))?;
+        registry.register(FirecrawlCrawlTool::new(client.clone(), limits))?;
+        registry.register(FirecrawlExtractTool::new(client))?;
     }
     if config.tavily.enabled {
         let api_key = secrets

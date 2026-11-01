@@ -38,6 +38,7 @@ tools = [
   "firecrawl_map",
   "firecrawl_search",
   "firecrawl_crawl",
+  "firecrawl_extract",
   "tavily_search",
 ]
 require_approval = ["firecrawl_crawl", "firecrawl_search", "tavily_search"]
