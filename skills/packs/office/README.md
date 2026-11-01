@@ -21,7 +21,7 @@ Every build, import, and edit returns an artifact hash. Pass that exact hash to 
 
 | Format | Create | Import an owner file | Read | Edit |
 | --- | --- | --- | --- | --- |
-| `.docx` | `docx_build` | `docx_import` | `docx_inspect`, `docx_read` | `docx_edit` |
+| `.docx` | `docx_build` | `docx_import` | `docx_inspect`, `docx_read` | `docx_edit`, `docx_pdf` |
 | `.xlsx` | `xlsx_build` | `xlsx_import` | `xlsx_inspect`, `xlsx_read`, `xlsx_analyze` | `xlsx_edit` |
-| `.pptx` | `deck_build` | `pptx_import` | `pptx_inspect` | `pptx_edit` |
+| `.pptx` | `deck_build` | `pptx_import` | `pptx_inspect` | `pptx_edit`, `pptx_pdf` |
 | `.pdf` | `deck_build` | (inbox path accepted directly) | `pdf_inspect` | `pdf_edit`, `pdf_merge` |

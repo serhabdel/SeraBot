@@ -26,6 +26,11 @@ Shipped on `feat/office-tools`:
   `set_cell_style`, `set_row_height`, `freeze_panes`, `add_sheet`,
   `rename_sheet`, `delete_sheet`, `insert_rows`, `delete_rows`,
   `insert_columns`, `delete_columns`, and `add_chart`.
+- **P2 — conversion.** `docx_pdf` and `pptx_pdf` render an owner document or
+  deck to PDF with selectable text. The craft PDF exporters are written against
+  the krilla fork the craft apps pin, so the workspace carries a `[patch.crates-io]`
+  entry for that revision; the published krilla 0.8.2 does not compile with
+  `craft-pdf`.
 
 Still open: DOCX images/headers/page breaks, PPTX slide/table/image insertion,
 PDF text extraction and watermarking, owner-to-bot upload, and the connector

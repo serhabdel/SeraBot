@@ -68,6 +68,19 @@ A deck the owner supplied is not regenerated. Round-trip it:
 4. The owner's images and media survive the edit; hyperlinks and external links
    are dropped.
 
+## Converting an owner deck to PDF
+
+Call `pptx_pdf` with the deck's artifact hash (or an inbox `path`). It renders
+each slide at its own size with a selectable text layer and returns a new PDF
+artifact hash. Use it when the owner asks for a PDF version of a PowerPoint
+file.
+
+- The renderer is DeckCraft's own; it is close to PowerPoint but not
+  pixel-identical.
+- The same package checks apply: no macros, no password, at most 32 MiB and
+  500 slides.
+- The PDF is not a scan; its text is selectable.
+
 ## Layout budget
 
 About four cards or six section bullets fit on a page. `max_pages` is

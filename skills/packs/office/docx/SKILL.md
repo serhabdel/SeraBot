@@ -26,6 +26,7 @@ or the blocklist.
 | See the block list and the index to edit | `docx_inspect` |
 | Read the full text of one block or a range | `docx_read` |
 | Change, insert, delete, or restyle a block | `docx_edit` |
+| Convert the document to PDF | `docx_pdf` |
 
 Every tool except `docx_import` takes an **artifact hash**, never a path. A
 path is relative to the configured inbox and is accepted only by
@@ -139,6 +140,16 @@ the reply. Pass that exact hash to `telegram_send_document` or
 `onedrive_upload` when those tools are allowlisted. Both require approval.
 
 Do not claim a file was sent until the delivery tool returns.
+
+## Converting to PDF
+
+Call `docx_pdf` with the document hash (or an inbox `path`). It renders the
+document with embedded font subsets and selectable text and returns a new PDF
+artifact hash. Use it when the owner asks for a PDF version of a Word file.
+
+- The layout is WordCraft's own; it is close to Word but not pixel-identical.
+- The same package checks apply: no macros, no ActiveX, no remote references.
+- The PDF is not a scan; its text is selectable.
 
 ## Quality bar
 

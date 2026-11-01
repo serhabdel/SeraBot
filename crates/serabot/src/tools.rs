@@ -702,12 +702,13 @@ pub fn known_tool_names() -> Vec<&'static str> {
     names.extend([
         "docx_build",
         "docx_import",
+        "docx_pdf",
         "docx_edit",
         "docx_inspect",
         "docx_read",
     ]);
     #[cfg(feature = "pptx")]
-    names.extend(["pptx_import", "pptx_inspect", "pptx_edit"]);
+    names.extend(["pptx_import", "pptx_pdf", "pptx_inspect", "pptx_edit"]);
     names
 }
 
@@ -766,6 +767,11 @@ pub fn register_pptx_tools(
     registry.register(crate::pptx_ops::PptxImportTool::new(
         artifacts.clone(),
         store.clone(),
+        inbox.clone(),
+    )?)?;
+    registry.register(crate::pptx_ops::PptxPdfTool::new(
+        artifacts.clone(),
+        store.clone(),
         inbox,
     )?)?;
     registry.register(crate::pptx_ops::PptxInspectTool::new(artifacts.clone()))?;
@@ -787,6 +793,11 @@ pub fn register_docx_tools(
         store.clone(),
     ))?;
     registry.register(crate::docx_ops::DocxImportTool::new(
+        artifacts.clone(),
+        store.clone(),
+        inbox.clone(),
+    )?)?;
+    registry.register(crate::docx_ops::DocxPdfTool::new(
         artifacts.clone(),
         store.clone(),
         inbox,
