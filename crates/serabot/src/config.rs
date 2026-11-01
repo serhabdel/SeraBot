@@ -1,10 +1,19 @@
+//! Configuration and fleet templates.
+//!
+//! `bots/*.toml` + `prompts/*.txt` are **seed templates** for the per-user
+//! fleets (phase 3 of the multi-user reconstruction): `load_bots` reads and
+//! validates them once at startup, and `fleet::FleetRegistry` copies them
+//! into each user's `bots` rows. The database is authoritative after seeding;
+//! the admin console's `bot_config_overrides` are applied only when the
+//! admin's own fleet is loaded, never to the templates.
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SeraError};
-use crate::orchestration::{BotFleetMember, BotRole, safe_bot_label, validate_bot_fleet};
+use crate::orchestration::{BotFleetMember, BotRole, validate_bot_fleet};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -22,6 +31,13 @@ pub struct Config {
     pub telegram: TelegramConfig,
     #[serde(default)]
     pub api: ApiConfig,
+    /// Multi-user OIDC sign-in. Disabled by default; the single-operator
+    /// token flow keeps working unchanged while it is off.
+    #[serde(default)]
+    pub auth: AuthConfig,
+    /// Per-user quotas and limits.
+    #[serde(default)]
+    pub users: UsersConfig,
     #[serde(default)]
     pub policy: PolicyConfig,
     #[serde(default)]
@@ -56,7 +72,8 @@ pub struct Config {
     #[serde(skip)]
     pub base_dir: PathBuf,
     /// Admin-console bot config overrides (tools/skills/require_approval),
-    /// applied over the bot files by `load_bots`/`list_configured_bots`.
+    /// applied when the admin's own fleet is loaded from the database. Never
+    /// applied to the seed templates, so members do not inherit them.
     /// Populated from the admin overlay at load; never read from TOML.
     #[serde(skip)]
     pub bot_config_overrides: BTreeMap<String, crate::admin::BotConfigOverlay>,
@@ -72,6 +89,8 @@ impl Default for Config {
             embeddings: EmbeddingsConfig::default(),
             telegram: TelegramConfig::default(),
             api: ApiConfig::default(),
+            auth: AuthConfig::default(),
+            users: UsersConfig::default(),
             policy: PolicyConfig::default(),
             watcher: WatcherConfig::default(),
             onedrive: OneDriveConfig::default(),
@@ -151,6 +170,8 @@ impl Config {
                 "api.token_hash must be a 64-character hex SHA-256 hash".into(),
             ));
         }
+        self.auth.validate()?;
+        self.users.validate()?;
         if !self.server.bind.starts_with("127.")
             && !self.server.bind.starts_with("localhost")
             && !self.server.bind.starts_with("[::1]")
@@ -361,6 +382,9 @@ pub struct ServerConfig {
     pub body_limit_bytes: usize,
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
+    /// Per-minute request budget for each acting user (default 60). Public
+    /// sign-in routes share one anonymous bucket. Multiple sessions of the
+    /// same user share the user's budget rather than multiplying it.
     #[serde(default = "default_rate_limit")]
     pub rate_limit_per_minute: u32,
     #[serde(default = "default_event_retention_days")]
@@ -408,6 +432,12 @@ pub struct SecretsConfig {
     pub encrypted_file: String,
     #[serde(default = "default_identity_file")]
     pub identity_file: String,
+    /// Server master key for the per-user credential store (phase 4). 32 raw
+    /// bytes, generated on first run with mode 0600 on unix. It is **not** the
+    /// age identity: the age store keeps server-level secrets, this key wraps
+    /// each user's DEK. Never logged, never exposed by any API.
+    #[serde(default = "default_master_key_file")]
+    pub master_key_file: String,
 }
 
 impl Default for SecretsConfig {
@@ -415,6 +445,7 @@ impl Default for SecretsConfig {
         Self {
             encrypted_file: default_secrets_file(),
             identity_file: default_identity_file(),
+            master_key_file: default_master_key_file(),
         }
     }
 }
@@ -660,6 +691,197 @@ impl Default for ApiConfig {
     }
 }
 
+/// Provider ids this build knows. Only `microsoft` can be enabled in v1;
+/// `google` and `github` are rendered by the clients as coming soon.
+pub const KNOWN_AUTH_PROVIDERS: [&str; 3] = ["microsoft", "google", "github"];
+/// The subset of `KNOWN_AUTH_PROVIDERS` that can actually serve sign-in in
+/// v1. Enabling another provider is additive configuration later; for now
+/// listing it is allowed and it is reported disabled.
+pub const ENABLED_AUTH_PROVIDERS: [&str; 1] = ["microsoft"];
+
+/// Multi-user sign-in settings. Defaults keep everything off: while
+/// `enabled = false` the server behaves exactly like the single-operator
+/// deployment and every auth endpoint fails closed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthConfig {
+    #[serde(default = "default_auth_enabled")]
+    pub enabled: bool,
+    /// Provider ids the deployment lists. Unknown ids are rejected at load;
+    /// `google`/`github` are accepted but reported disabled in v1.
+    #[serde(default = "default_auth_providers")]
+    pub providers: Vec<String>,
+    /// Microsoft tenant: `consumers`, `organizations`, a tenant id, or a
+    /// domain. Shared with the OneDrive registration.
+    #[serde(default = "default_auth_tenant")]
+    pub tenant: String,
+    /// Age-store key holding the public client id. The value is never
+    /// logged and never leaves the process.
+    #[serde(default = "default_auth_client_id_secret")]
+    pub client_id_secret: String,
+    /// Public base URL of this server (https). The OIDC redirect lands on
+    /// `{base_url}/v1/auth/callback`, so this is the URL behind the reverse
+    /// proxy, not the loopback bind.
+    #[serde(default)]
+    pub base_url: String,
+    /// Session lifetime for browser sign-ins (default 720h = 30 days).
+    #[serde(default = "default_auth_session_ttl")]
+    pub session_ttl_hours: u64,
+    /// Default invite lifetime (default 48h).
+    #[serde(default = "default_auth_invite_ttl")]
+    pub invite_ttl_hours: u64,
+    /// Maximum number of accounts, invitations included. The product
+    /// boundary is a small trusted circle (≤ ~10); the cap bounds runaway
+    /// growth with an explicit error.
+    #[serde(default = "default_auth_max_users")]
+    pub max_users: usize,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_auth_enabled(),
+            providers: default_auth_providers(),
+            tenant: default_auth_tenant(),
+            client_id_secret: default_auth_client_id_secret(),
+            base_url: String::new(),
+            session_ttl_hours: default_auth_session_ttl(),
+            invite_ttl_hours: default_auth_invite_ttl(),
+            max_users: default_auth_max_users(),
+        }
+    }
+}
+
+impl AuthConfig {
+    /// The providers that can actually serve sign-ins right now: the
+    /// configured list intersected with what this build implements.
+    pub fn effective_providers(&self) -> Vec<&'static str> {
+        ENABLED_AUTH_PROVIDERS
+            .into_iter()
+            .filter(|id| {
+                self.providers
+                    .iter()
+                    .any(|configured| configured.eq_ignore_ascii_case(id))
+            })
+            .collect()
+    }
+
+    fn validate(&self) -> Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for provider in &self.providers {
+            let id = provider.trim();
+            if id.is_empty() || !seen.insert(id.to_ascii_lowercase()) {
+                return Err(SeraError::Config(
+                    "auth.providers entries must be unique and non-empty".into(),
+                ));
+            }
+            if !KNOWN_AUTH_PROVIDERS.contains(&id) {
+                return Err(SeraError::Config(format!(
+                    "auth.providers contains unknown provider '{id}'; known providers are microsoft, google, github"
+                )));
+            }
+        }
+        let tenant = self.tenant.trim();
+        if tenant.is_empty()
+            || tenant.len() > 128
+            || tenant == "."
+            || tenant == ".."
+            || !tenant
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+        {
+            return Err(SeraError::Config(
+                "auth.tenant must be a tenant id or domain name".into(),
+            ));
+        }
+        if !valid_secret_name(&self.client_id_secret) {
+            return Err(SeraError::Config(
+                "auth.client_id_secret must be a secret-store key name".into(),
+            ));
+        }
+        // base_url is validated even while disabled so a typo cannot hide
+        // until someone flips auth on.
+        if !self.base_url.is_empty() {
+            let url = reqwest::Url::parse(self.base_url.trim())
+                .map_err(|_| SeraError::Config("auth.base_url must be a valid URL".into()))?;
+            if url.scheme() != "https" {
+                return Err(SeraError::Config(
+                    "auth.base_url must use https; the OIDC redirect is public".into(),
+                ));
+            }
+            if url.host_str().is_none_or(str::is_empty)
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(SeraError::Config(
+                    "auth.base_url must be a bare URL: host only, no path, credentials, query, or fragment"
+                        .into(),
+                ));
+            }
+        }
+        if self.session_ttl_hours == 0 || self.session_ttl_hours > 24 * 365 {
+            return Err(SeraError::Config(
+                "auth.session_ttl_hours must be between 1 and 8760".into(),
+            ));
+        }
+        if self.invite_ttl_hours == 0 || self.invite_ttl_hours > 24 * 30 {
+            return Err(SeraError::Config(
+                "auth.invite_ttl_hours must be between 1 and 720".into(),
+            ));
+        }
+        if self.max_users == 0 || self.max_users > 50 {
+            return Err(SeraError::Config(
+                "auth.max_users must be between 1 and 50".into(),
+            ));
+        }
+        if self.enabled && self.effective_providers().is_empty() {
+            return Err(SeraError::Config(
+                "auth.providers must include 'microsoft' when auth is enabled; google and github are not enableable yet"
+                    .into(),
+            ));
+        }
+        if self.enabled && self.base_url.trim().is_empty() {
+            return Err(SeraError::Config(
+                "auth.base_url is required when auth is enabled; it is the public https URL the OIDC redirect returns to"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Per-user quota settings. Enforced from phase 5; validated now so a bad
+/// value cannot hide until the quota turns on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsersConfig {
+    /// Daily task budget per user (default 500). Enforced atomically at the
+    /// user-facing enqueue points. The window is the **UTC calendar day**,
+    /// the same bucketing `usage_rollup` uses for its `per_day` rows; a user
+    /// at the cap gets an explicit validation error, never a silent drop.
+    #[serde(default = "default_users_task_quota")]
+    pub tasks_per_user_per_day: u64,
+}
+
+impl Default for UsersConfig {
+    fn default() -> Self {
+        Self {
+            tasks_per_user_per_day: default_users_task_quota(),
+        }
+    }
+}
+
+impl UsersConfig {
+    fn validate(&self) -> Result<()> {
+        if self.tasks_per_user_per_day == 0 || self.tasks_per_user_per_day > 10_000 {
+            return Err(SeraError::Config(
+                "users.tasks_per_user_per_day must be between 1 and 10000".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyConfig {
     #[serde(default = "default_blocklist_file")]
@@ -711,20 +933,38 @@ impl Default for WatcherConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OneDriveConfig {
+    /// Offer OneDrive to every account (phase 4). The admin's existing global
+    /// refresh token keeps working: it is imported into the admin's
+    /// credential row once at startup.
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_graph_base")]
     pub graph_base: String,
+    /// Microsoft tenant for the shared app registration (`common`,
+    /// `consumers`, `organizations`, a tenant id, or a domain).
     #[serde(default = "default_tenant")]
     pub tenant: String,
+    /// Age-store key holding the public app-registration client id. Shared
+    /// with `[auth]` (one Azure app for sign-in and OneDrive consent).
     #[serde(default = "default_graph_client_secret")]
     pub client_id_secret: String,
+    /// Age-store key holding the legacy global refresh token. It is imported
+    /// into the admin's per-user credential on the first startup after the
+    /// upgrade, then only the user store is used.
     #[serde(default = "default_graph_refresh_secret")]
     pub refresh_token_secret: String,
+    /// Destination folder inside **each user's own** drive. The folder name
+    /// is a template applied per drive; `..`, absolute paths, and separator
+    /// tricks are rejected by the client.
     #[serde(default = "default_onedrive_folder")]
     pub folder: String,
     #[serde(default = "default_conflict_behavior")]
     pub conflict_behavior: String,
+    /// Public base URL for the consent redirect. Empty falls back to
+    /// `[auth].base_url`; when both are empty the consent endpoint fails with
+    /// an explicit configuration error (the legacy global flow needs none).
+    #[serde(default)]
+    pub redirect_base_url: String,
 }
 
 impl Default for OneDriveConfig {
@@ -737,6 +977,20 @@ impl Default for OneDriveConfig {
             refresh_token_secret: default_graph_refresh_secret(),
             folder: default_onedrive_folder(),
             conflict_behavior: default_conflict_behavior(),
+            redirect_base_url: String::new(),
+        }
+    }
+}
+
+impl OneDriveConfig {
+    /// The public base URL consent redirects land on: the explicit OneDrive
+    /// override first, then the auth base URL (one app registration).
+    pub fn effective_redirect_base<'a>(&'a self, auth: &'a AuthConfig) -> &'a str {
+        let own = self.redirect_base_url.trim();
+        if own.is_empty() {
+            auth.base_url.trim()
+        } else {
+            own
         }
     }
 }
@@ -1075,9 +1329,8 @@ pub fn load_bots(config: &Config, dir: impl AsRef<Path>) -> Result<Vec<LoadedBot
     let mut bots = Vec::new();
     for path in paths {
         let raw = std::fs::read_to_string(&path)?;
-        let mut bot: BotConfig = toml::from_str(&raw)
+        let bot: BotConfig = toml::from_str(&raw)
             .map_err(|error| SeraError::Config(format!("{}: {error}", path.display())))?;
-        apply_bot_config_override(config, &mut bot);
         if bot.name.is_empty() || bot.name.len() > 64 {
             return Err(SeraError::Config(format!(
                 "{}: invalid bot name",
@@ -1147,7 +1400,8 @@ pub fn load_bots(config: &Config, dir: impl AsRef<Path>) -> Result<Vec<LoadedBot
     Ok(bots)
 }
 
-/// On-disk fleet summary. Prompt files are not read. Secret material is not returned.
+/// Console-facing bot summary. Prompt text is never part of a listing; the
+/// detail endpoint reads the owner's row separately.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfiguredBot {
     pub id: String,
@@ -1159,146 +1413,9 @@ pub struct ConfiguredBot {
     pub require_approval: Vec<String>,
 }
 
-pub fn list_configured_bots(config: &Config) -> Result<Vec<ConfiguredBot>> {
-    const MAX_BOTS: usize = 64;
-    const MAX_ITEMS: usize = 64;
-    const MAX_FILE_BYTES: usize = 65_536;
-
-    validate_relative_dir("fleet.bots_dir", &config.fleet.bots_dir)?;
-    let base = config.base_dir.canonicalize().map_err(|error| {
-        SeraError::Config(format!(
-            "configuration directory cannot be resolved: {error}"
-        ))
-    })?;
-    let dir = base.join(&config.fleet.bots_dir);
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let dir = dir.canonicalize().map_err(|error| {
-        SeraError::Config(format!("fleet directory cannot be resolved: {error}"))
-    })?;
-    if !dir.starts_with(&base) {
-        return Err(SeraError::Config(
-            "fleet directory escapes the configuration directory".into(),
-        ));
-    }
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map_err(|error| SeraError::Config(format!("fleet directory cannot be read: {error}")))?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
-        .collect();
-    paths.sort();
-    if paths.len() > MAX_BOTS {
-        return Err(SeraError::Config("too many bot files".into()));
-    }
-    let mut names = std::collections::HashSet::new();
-    let mut bots = Vec::with_capacity(paths.len());
-    for path in paths {
-        let canonical = path
-            .canonicalize()
-            .map_err(|_| SeraError::Config("bot file cannot be resolved".into()))?;
-        if !canonical.starts_with(&dir) {
-            return Err(SeraError::Config(
-                "bot file escapes the fleet directory".into(),
-            ));
-        }
-        let raw = std::fs::read_to_string(&canonical)?;
-        if raw.len() > MAX_FILE_BYTES {
-            return Err(SeraError::Config("bot file is too large".into()));
-        }
-        let mut bot: BotConfig =
-            toml::from_str(&raw).map_err(|_| SeraError::Config("bot file is invalid".into()))?;
-        apply_bot_config_override(config, &mut bot);
-        let id = bot.name;
-        if !safe_bot_label(&id) || !names.insert(id.clone()) {
-            return Err(SeraError::Config("bot file is invalid".into()));
-        }
-        if bot.tools.len() > MAX_ITEMS
-            || bot.skills.len() > MAX_ITEMS
-            || bot.require_approval.len() > MAX_ITEMS
-            || bot.tools.iter().any(|item| !safe_bot_label(item))
-            || bot.skills.iter().any(|item| !safe_bot_label(item))
-            || bot
-                .require_approval
-                .iter()
-                .any(|item| !safe_bot_label(item) || !bot.tools.contains(item))
-        {
-            return Err(SeraError::Config("bot file is invalid".into()));
-        }
-        bots.push(ConfiguredBot {
-            id,
-            role: bot.role.as_str().to_owned(),
-            enabled: bot.enabled,
-            model: bot.model,
-            tools: bot.tools,
-            skills: bot.skills,
-            require_approval: bot.require_approval,
-        });
-    }
-    bots.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok(bots)
-}
-
-/// Read one bot's system prompt file (`bots/<id>.toml` → its `system_prompt`),
-/// with the same confinement rules as `load_bots`. Returns `Ok(None)` when the
-/// bot file does not exist. Used by owner-facing detail endpoints; list
-/// endpoints never call this so prompts stay out of fleet listings.
-pub fn load_bot_prompt(config: &Config, id: &str) -> Result<Option<String>> {
-    if !safe_bot_label(id) {
-        return Err(SeraError::Validation("invalid bot id".into()));
-    }
-    validate_relative_dir("fleet.bots_dir", &config.fleet.bots_dir)?;
-    let base = config.base_dir.canonicalize().map_err(|error| {
-        SeraError::Config(format!(
-            "configuration directory cannot be resolved: {error}"
-        ))
-    })?;
-    let dir = base.join(&config.fleet.bots_dir);
-    if !dir.exists() {
-        return Ok(None);
-    }
-    let dir = dir.canonicalize().map_err(|error| {
-        SeraError::Config(format!("fleet directory cannot be resolved: {error}"))
-    })?;
-    if !dir.starts_with(&base) {
-        return Err(SeraError::Config(
-            "fleet directory escapes the configuration directory".into(),
-        ));
-    }
-    let bot_path = dir.join(format!("{id}.toml"));
-    if !bot_path.exists() {
-        return Ok(None);
-    }
-    let canonical = bot_path
-        .canonicalize()
-        .map_err(|_| SeraError::Config("bot file cannot be resolved".into()))?;
-    if !canonical.starts_with(&dir) {
-        return Err(SeraError::Config(
-            "bot file escapes the fleet directory".into(),
-        ));
-    }
-    let raw = std::fs::read_to_string(&canonical)?;
-    let mut bot: BotConfig =
-        toml::from_str(&raw).map_err(|_| SeraError::Config("bot file is invalid".into()))?;
-    apply_bot_config_override(config, &mut bot);
-    let prompt_path = config.path(&bot.system_prompt);
-    let prompt_canonical = prompt_path.canonicalize().map_err(|error| {
-        SeraError::Config(format!(
-            "cannot resolve prompt {}: {error}",
-            prompt_path.display()
-        ))
-    })?;
-    if !prompt_canonical.starts_with(&config.base_dir) {
-        return Err(SeraError::Config(
-            "prompt escapes the configuration directory".into(),
-        ));
-    }
-    Ok(Some(std::fs::read_to_string(&prompt_canonical)?))
-}
-
-/// Overlay the admin-console bot config (tools/skills/require_approval) over a
-/// bot file's parsed config. Only fields the console actually saved override.
+/// Overlay the admin-console bot config (tools/skills/require_approval) over
+/// the admin's own fleet rows. Only fields the console actually saved
+/// override; members' fleets are loaded without it.
 pub fn apply_bot_config_override(config: &Config, bot: &mut BotConfig) {
     if let Some(overrides) = config.bot_config_overrides.get(&bot.name) {
         if let Some(tools) = &overrides.tools {
@@ -1394,28 +1511,30 @@ const MAX_BOT_DESCRIPTION_CHARS: usize = 2000;
 const MAX_SCAFFOLD_TOOLS: usize = 32;
 const MAX_SCAFFOLD_SKILLS: usize = 16;
 
+/// A specialist built from the fixed template, ready to become a per-user
+/// `bots` row. No filesystem paths: the prompt lives in the row.
 #[derive(Debug, Clone)]
-pub struct ScaffoldedBot {
+pub struct ScaffoldedSpecialist {
     pub id: String,
-    pub bot_file: String,
-    pub prompt_file: String,
-    pub bot_path: PathBuf,
-    pub prompt_path: PathBuf,
+    pub config: BotConfig,
+    pub prompt: String,
     pub tools: Vec<String>,
     pub skills: Vec<String>,
     pub require_approval: Vec<String>,
 }
 
-/// Write `bots/<id>.toml` and `prompts/<id>.txt` from the fixed specialist template.
-/// Paths come from `[fleet]`, never from the caller. The bot stays disabled.
-pub fn scaffold_specialist_bot(
-    config: &Config,
+/// Build the fixed specialist template as a per-user fleet row. `known_skills`
+/// is the acting user's effective catalog ids (shipped ∪ their own rows).
+/// The bot stays disabled. The caller writes the row through the acting
+/// user's scoped store method.
+pub fn build_specialist_bot(
     id: &str,
     description: &str,
     tools: Option<&[String]>,
     skills: Option<&[String]>,
+    known_skills: &[String],
     policy: &crate::policy::Policy,
-) -> Result<ScaffoldedBot> {
+) -> Result<ScaffoldedSpecialist> {
     validate_bot_id(id)?;
     if description.chars().count() > MAX_BOT_DESCRIPTION_CHARS {
         return Err(SeraError::Validation("description is too long".into()));
@@ -1436,7 +1555,7 @@ pub fn scaffold_specialist_bot(
             .map(|tool| (*tool).to_owned())
             .collect(),
     };
-    let skills = normalize_skill_list(config, skills.unwrap_or(&[]))?;
+    let skills = normalize_skill_list(known_skills, skills.unwrap_or(&[]))?;
     let prompt = specialist_prompt(description);
     if !policy.is_allowed(description) || !policy.is_allowed(&prompt) {
         return Err(SeraError::PolicyViolation);
@@ -1446,28 +1565,24 @@ pub fn scaffold_specialist_bot(
         .filter(|tool| EXTERNAL_EFFECT_TOOLS.contains(&tool.as_str()))
         .cloned()
         .collect();
-
-    let bots_dir = fleet_dir(config, &config.fleet.bots_dir)?;
-    let prompts_dir = fleet_dir(config, &config.fleet.prompts_dir)?;
-    let bot_path = bots_dir.join(format!("{id}.toml"));
-    let prompt_path = prompts_dir.join(format!("{id}.txt"));
-    if bot_path.exists() || prompt_path.exists() {
-        return Err(SeraError::InvalidState("bot already exists".into()));
-    }
-    let bot_file = relative_fleet_file(&config.fleet.bots_dir, &format!("{id}.toml"));
-    let prompt_file = relative_fleet_file(&config.fleet.prompts_dir, &format!("{id}.txt"));
-    let toml_body = render_bot_toml(id, &prompt_file, &skills, &tools, &require_approval);
-    write_new_file(&prompt_path, &prompt)?;
-    if let Err(error) = write_new_file(&bot_path, &toml_body) {
-        let _ = std::fs::remove_file(&prompt_path);
-        return Err(error);
-    }
-    Ok(ScaffoldedBot {
+    let config = BotConfig {
+        name: id.to_owned(),
+        trigger: "command".into(),
+        model: None,
+        // The prompt is stored in the row, not read from a file.
+        system_prompt: String::new(),
+        skills: skills.clone(),
+        tools: tools.clone(),
+        require_approval: require_approval.clone(),
+        enabled: false,
+        temperature: None,
+        role: BotRole::Specialist,
+        delegates: Vec::new(),
+    };
+    Ok(ScaffoldedSpecialist {
         id: id.to_owned(),
-        bot_file,
-        prompt_file,
-        bot_path,
-        prompt_path,
+        config,
+        prompt,
         tools,
         skills,
         require_approval,
@@ -1514,15 +1629,13 @@ fn normalize_tool_list(tools: &[String]) -> Result<Vec<String>> {
     Ok(out)
 }
 
-fn normalize_skill_list(config: &Config, skills: &[String]) -> Result<Vec<String>> {
+fn normalize_skill_list(known: &[String], skills: &[String]) -> Result<Vec<String>> {
     if skills.len() > MAX_SCAFFOLD_SKILLS {
         return Err(SeraError::Validation("too many skills".into()));
     }
     if skills.is_empty() {
         return Ok(Vec::new());
     }
-    let catalog = crate::skills::SkillCatalog::load(config)?;
-    let known = catalog.skill_ids();
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(skills.len());
     for skill in skills {
@@ -1548,89 +1661,6 @@ fn specialist_prompt(description: &str) -> String {
         body.push('\n');
     }
     body
-}
-
-fn render_bot_toml(
-    id: &str,
-    prompt_file: &str,
-    skills: &[String],
-    tools: &[String],
-    require_approval: &[String],
-) -> String {
-    format!(
-        "name = {id}\nrole = \"specialist\"\ndelegates = []\ntrigger = \"command\"\nsystem_prompt = {prompt}\nskills = {skills}\ntools = {tools}\nrequire_approval = {approvals}\nenabled = false\n",
-        id = toml_basic_string(id),
-        prompt = toml_basic_string(prompt_file),
-        skills = toml_string_array(skills),
-        tools = toml_string_array(tools),
-        approvals = toml_string_array(require_approval),
-    )
-}
-
-fn toml_basic_string(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
-fn toml_string_array(values: &[String]) -> String {
-    if values.is_empty() {
-        return "[]".into();
-    }
-    let items = values
-        .iter()
-        .map(|value| toml_basic_string(value))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("[{items}]")
-}
-
-fn fleet_dir(config: &Config, relative: &str) -> Result<PathBuf> {
-    validate_relative_dir("fleet directory", relative)?;
-    let dir = config.base_dir.join(relative);
-    std::fs::create_dir_all(&dir)?;
-    let base = config.base_dir.canonicalize().map_err(|error| {
-        SeraError::Config(format!(
-            "configuration directory cannot be resolved: {error}"
-        ))
-    })?;
-    let dir = dir.canonicalize().map_err(|error| {
-        SeraError::Config(format!("fleet directory cannot be resolved: {error}"))
-    })?;
-    if !dir.starts_with(&base) {
-        return Err(SeraError::Config(
-            "fleet directory escapes the configuration directory".into(),
-        ));
-    }
-    Ok(dir)
-}
-
-fn relative_fleet_file(dir: &str, file_name: &str) -> String {
-    let mut parts = Vec::new();
-    for component in Path::new(dir).components() {
-        if let std::path::Component::Normal(part) = component {
-            parts.push(part.to_string_lossy().into_owned());
-        }
-    }
-    parts.push(file_name.to_owned());
-    parts.join("/")
-}
-
-fn write_new_file(path: &Path, contents: &str) -> Result<()> {
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(mut file) => {
-            use std::io::Write;
-            file.write_all(contents.as_bytes())?;
-            file.sync_all()?;
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(SeraError::InvalidState("bot already exists".into()))
-        }
-        Err(error) => Err(error.into()),
-    }
 }
 
 fn validate_relative_dir(label: &str, value: &str) -> Result<()> {
@@ -1725,6 +1755,9 @@ fn default_secrets_file() -> String {
 fn default_identity_file() -> String {
     "private/age-identity.txt".into()
 }
+fn default_master_key_file() -> String {
+    "private/master.key".into()
+}
 fn default_llm_base_url() -> String {
     "https://api.mistral.ai/v1".into()
 }
@@ -1781,6 +1814,30 @@ fn default_api_enabled() -> bool {
 }
 fn default_approval_expiry() -> i64 {
     24
+}
+fn default_auth_enabled() -> bool {
+    false
+}
+fn default_auth_providers() -> Vec<String> {
+    vec!["microsoft".into()]
+}
+fn default_auth_tenant() -> String {
+    "consumers".into()
+}
+fn default_auth_client_id_secret() -> String {
+    "auth_client_id".into()
+}
+fn default_auth_session_ttl() -> u64 {
+    720
+}
+fn default_auth_invite_ttl() -> u64 {
+    48
+}
+fn default_auth_max_users() -> usize {
+    10
+}
+fn default_users_task_quota() -> u64 {
+    500
 }
 fn default_blocklist_file() -> String {
     "private/blocklist.txt".into()
@@ -2047,102 +2104,86 @@ enabled = false
     }
 
     #[test]
-    fn scaffolds_disabled_specialist_under_configured_dirs() {
-        let root = std::env::temp_dir().join(format!("serabot-scaffold-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let root = root.canonicalize().unwrap();
-        let skill_dir = root.join("skills").join("ask");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: \"Ask\"\ndescription: \"Synthetic ask skill\"\n---\n\n# Ask\n",
-        )
-        .unwrap();
-        let config = Config {
-            base_dir: root.clone(),
-            skills: SkillsConfig {
-                dir: "skills".into(),
-            },
-            ..Config::default()
-        };
+    fn builds_a_disabled_specialist_from_the_fixed_template() {
         let policy = crate::policy::Policy::empty();
-        let scaffolded = scaffold_specialist_bot(
-            &config,
+        let known = vec!["ask".to_owned()];
+        let scaffolded = build_specialist_bot(
             "notes",
             "Synthetic notes specialist.",
             Some(&["rag_search".into(), "firecrawl_search".into()]),
             Some(&["ask".into()]),
+            &known,
             &policy,
         )
         .unwrap();
-        assert_eq!(scaffolded.bot_file, "bots/notes.toml");
-        assert_eq!(scaffolded.prompt_file, "prompts/notes.txt");
-        assert!(scaffolded.bot_path.starts_with(&root));
-        assert!(scaffolded.prompt_path.starts_with(&root));
-        let raw = std::fs::read_to_string(&scaffolded.bot_path).unwrap();
-        let bot: BotConfig = toml::from_str(&raw).unwrap();
-        assert_eq!(bot.name, "notes");
-        assert!(!bot.enabled);
-        assert_eq!(bot.role, BotRole::Specialist);
-        assert!(bot.delegates.is_empty());
-        assert_eq!(bot.system_prompt, "prompts/notes.txt");
-        assert_eq!(bot.tools, vec!["rag_search", "firecrawl_search"]);
-        assert_eq!(bot.skills, vec!["ask"]);
-        assert_eq!(bot.require_approval, vec!["firecrawl_search"]);
-        assert!(!bot.tools.iter().any(|tool| tool == "delegate"));
-        let prompt = std::fs::read_to_string(&scaffolded.prompt_path).unwrap();
-        assert!(prompt.contains("do not delegate"));
-        assert!(prompt.contains("Synthetic notes specialist."));
-        assert!(scaffold_specialist_bot(&config, "notes", "", None, None, &policy).is_err());
-        assert!(scaffold_specialist_bot(&config, "../outside", "", None, None, &policy).is_err());
-        assert!(scaffold_specialist_bot(&config, "main", "", None, None, &policy).is_err());
+        assert_eq!(scaffolded.id, "notes");
+        assert_eq!(scaffolded.config.name, "notes");
+        assert!(!scaffolded.config.enabled);
+        assert_eq!(scaffolded.config.role, BotRole::Specialist);
+        assert!(scaffolded.config.delegates.is_empty());
+        assert!(scaffolded.config.system_prompt.is_empty());
+        assert_eq!(
+            scaffolded.config.tools,
+            vec!["rag_search", "firecrawl_search"]
+        );
+        assert_eq!(scaffolded.config.skills, vec!["ask"]);
+        assert_eq!(scaffolded.config.require_approval, vec!["firecrawl_search"]);
         assert!(
-            scaffold_specialist_bot(
-                &config,
+            !scaffolded
+                .config
+                .tools
+                .iter()
+                .any(|tool| tool == "delegate")
+        );
+        assert!(scaffolded.prompt.contains("do not delegate"));
+        assert!(scaffolded.prompt.contains("Synthetic notes specialist."));
+        assert!(build_specialist_bot("../outside", "", None, None, &known, &policy).is_err());
+        assert!(build_specialist_bot("main", "", None, None, &known, &policy).is_err());
+        assert!(
+            build_specialist_bot(
                 "other",
                 "",
                 Some(&["delegate".into()]),
                 None,
+                &known,
                 &policy
             )
             .is_err()
         );
         assert!(
-            scaffold_specialist_bot(
-                &config,
+            build_specialist_bot(
                 "other",
                 "",
                 Some(&["not_a_tool".into()]),
                 None,
+                &known,
                 &policy
             )
             .is_err()
         );
         assert!(
-            scaffold_specialist_bot(
-                &config,
+            build_specialist_bot(
                 "other",
                 "",
                 None,
                 Some(&["missing-skill".into()]),
+                &known,
                 &policy
             )
             .is_err()
         );
         let blocked = crate::policy::Policy::from_text("synthetic blocked phrase");
         assert!(
-            scaffold_specialist_bot(
-                &config,
+            build_specialist_bot(
                 "other",
                 "notes about synthetic blocked phrase",
                 None,
                 None,
+                &known,
                 &blocked
             )
             .is_err()
         );
-        assert!(!root.join("bots").join("other.toml").exists());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2193,5 +2234,142 @@ enabled = false
         assert!(redirect.validate().is_err());
         redirect.google_calendar.redirect_uri = "http://127.0.0.1:8765/callback".into();
         assert!(redirect.validate().is_ok());
+    }
+
+    /// A config whose non-auth sections pass validation, so `validate()`
+    /// exercises — and can pass — the auth/users checks. The raw default
+    /// leaves `[api] enabled = true` with an empty `token_hash`, which is
+    /// invalid by design (the API demands a configured token).
+    fn valid_config() -> Config {
+        let mut config = Config::default();
+        config.api.enabled = false;
+        config
+    }
+
+    #[test]
+    fn auth_defaults_to_disabled_with_documented_values() {
+        let config = AuthConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.providers, vec!["microsoft".to_string()]);
+        assert_eq!(config.tenant, "consumers");
+        assert_eq!(config.client_id_secret, "auth_client_id");
+        assert_eq!(config.session_ttl_hours, 720);
+        assert_eq!(config.invite_ttl_hours, 48);
+        assert_eq!(config.max_users, 10);
+        assert_eq!(UsersConfig::default().tasks_per_user_per_day, 500);
+        valid_config().validate().unwrap();
+    }
+
+    #[test]
+    fn auth_rejects_unknown_providers_and_bad_values() {
+        let mut config = valid_config();
+        config.auth.providers = vec!["microsoft".into(), "saml".into()];
+        assert!(config.validate().is_err());
+
+        let mut config = valid_config();
+        config.auth.providers = vec!["microsoft".into(), "microsoft".into()];
+        assert!(config.validate().is_err(), "duplicates are rejected");
+
+        let mut config = valid_config();
+        config.auth.tenant = "../escape".into();
+        assert!(config.validate().is_err());
+
+        let mut config = valid_config();
+        config.auth.client_id_secret = "not a secret name".into();
+        assert!(config.validate().is_err());
+
+        let mut config = valid_config();
+        config.auth.session_ttl_hours = 0;
+        assert!(config.validate().is_err());
+        config.auth.session_ttl_hours = 720;
+        config.auth.invite_ttl_hours = 24 * 31;
+        assert!(config.validate().is_err());
+        config.auth.invite_ttl_hours = 48;
+        config.auth.max_users = 0;
+        assert!(config.validate().is_err());
+        config.auth.max_users = 10;
+        config.users.tasks_per_user_per_day = 0;
+        assert!(config.validate().is_err());
+        config.users.tasks_per_user_per_day = 500;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn auth_requires_https_base_url_and_microsoft_when_enabled() {
+        let mut config = valid_config();
+        config.auth.enabled = true;
+        assert!(
+            config.validate().is_err(),
+            "enabled auth requires a base_url"
+        );
+
+        config.auth.base_url = "http://bot.example.example".into();
+        assert!(config.validate().is_err(), "base_url must be https");
+
+        config.auth.base_url = "https://user:pw@example.example/?x=1".into();
+        assert!(
+            config.validate().is_err(),
+            "no credentials, query, fragment"
+        );
+
+        config.auth.base_url = "https://bot.example.example".into();
+        config.validate().unwrap();
+
+        // google/github may be listed but cannot enable sign-in on their own.
+        config.auth.providers = vec!["google".into(), "github".into()];
+        assert!(
+            config.validate().is_err(),
+            "enabled auth must include microsoft"
+        );
+        assert!(config.auth.effective_providers().is_empty());
+
+        config.auth.providers = vec!["microsoft".into(), "google".into(), "github".into()];
+        config.validate().unwrap();
+        assert_eq!(config.auth.effective_providers(), vec!["microsoft"]);
+
+        // While disabled, an invalid base_url still fails fast.
+        let mut config = valid_config();
+        config.auth.base_url = "ftp://example.example".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn auth_section_parses_from_toml() {
+        let raw = r#"
+[api]
+enabled = false
+
+[auth]
+enabled = false
+providers = ["microsoft", "github"]
+tenant = "consumers"
+client_id_secret = "auth_client_id"
+base_url = "https://bot.example.example"
+session_ttl_hours = 720
+invite_ttl_hours = 48
+max_users = 10
+
+[users]
+tasks_per_user_per_day = 500
+"#;
+        let config: Config = toml::from_str(raw).unwrap();
+        assert_eq!(config.auth.providers.len(), 2);
+        assert_eq!(config.auth.base_url, "https://bot.example.example");
+        assert_eq!(config.users.tasks_per_user_per_day, 500);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn the_repository_example_config_parses() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("workspace root")
+            .to_path_buf();
+        let raw = std::fs::read_to_string(root.join("serabot.toml")).unwrap();
+        let config: Config = toml::from_str(&raw).unwrap();
+        assert_eq!(config.secrets.master_key_file, "private/master.key");
+        assert_eq!(config.onedrive.folder, "SeraBot");
+        assert!(config.onedrive.redirect_base_url.is_empty());
     }
 }

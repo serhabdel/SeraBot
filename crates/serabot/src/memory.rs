@@ -1,10 +1,13 @@
 //! Reviewable agent memory.
 //!
-//! Memories are operator-reviewable facts with mandatory provenance. This
+//! Memories are operator-reviewable facts with mandatory provenance, and
+//! **every row belongs to one user**: each function takes the acting user's
+//! id and scopes the SQL to it, so one user's memories are unreachable from
+//! another user's scope (phase 2 of the multi-user reconstruction). This
 //! module provides CRUD only. The runtime separately injects the 20 most
-//! recently updated memories into the orchestrator system prompt as
-//! owner-approved facts, and `delegate` handoffs attach explicitly selected
-//! ids. Specialists never list memory on their own.
+//! recently updated memories of the acting user into the orchestrator system
+//! prompt as owner-approved facts, and `delegate` handoffs attach explicitly
+//! selected ids. Specialists never list memory on their own.
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{OptionalExtension, params};
@@ -33,9 +36,15 @@ pub struct Memory {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Add a reviewable fact. `source` is required provenance (for example a
-/// conversation id, document id or operator note).
-pub fn add(store: &Store, kind: &str, content: &str, source: &str) -> Result<Memory> {
+/// Add a reviewable fact for the acting user. `source` is required
+/// provenance (for example a conversation id, document id or operator note).
+pub fn add(
+    store: &Store,
+    user_id: &str,
+    kind: &str,
+    content: &str,
+    source: &str,
+) -> Result<Memory> {
     let kind = normalize_kind(kind)?;
     let content = normalized_content(content)?;
     let source = normalized_source(source)?;
@@ -52,8 +61,8 @@ pub fn add(store: &Store, kind: &str, content: &str, source: &str) -> Result<Mem
 
     let connection = store.connection()?;
     connection.execute(
-        "INSERT INTO memories(id, kind, content, source, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO memories(id, kind, content, source, created_at, updated_at, user_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             memory.id,
             memory.kind,
@@ -61,54 +70,67 @@ pub fn add(store: &Store, kind: &str, content: &str, source: &str) -> Result<Mem
             memory.source,
             now_string(memory.created_at),
             now_string(memory.updated_at),
+            user_id,
         ],
     )?;
     Ok(memory)
 }
 
-pub fn get(store: &Store, id: &str) -> Result<Memory> {
+/// The acting user's memory by id; another user's memory is
+/// indistinguishable from a missing one.
+pub fn get(store: &Store, user_id: &str, id: &str) -> Result<Memory> {
     let connection = store.connection()?;
     connection
         .query_row(
             "SELECT id, kind, content, source, created_at, updated_at
-             FROM memories WHERE id = ?1",
-            params![id],
+             FROM memories WHERE id = ?1 AND user_id = ?2",
+            params![id, user_id],
             row_to_memory,
         )
         .optional()?
         .ok_or_else(|| SeraError::NotFound(format!("memory {id}")))
 }
 
-pub fn list(store: &Store, limit: usize) -> Result<Vec<Memory>> {
+/// List the acting user's memories, newest first, bounded.
+///
+/// Rows are always filtered by `user_id`; there is no unscoped list, and
+/// an unknown user yields an empty list, never another user's rows.
+pub fn list(store: &Store, user_id: &str, limit: usize) -> Result<Vec<Memory>> {
     let limit = limit.clamp(1, MAX_LIST_LIMIT);
     let connection = store.connection()?;
     let mut statement = connection.prepare(
         "SELECT id, kind, content, source, created_at, updated_at
-         FROM memories ORDER BY updated_at DESC, id DESC LIMIT ?1",
+         FROM memories WHERE user_id = ?1
+         ORDER BY updated_at DESC, id DESC LIMIT ?2",
     )?;
-    let rows = statement.query_map(params![limit as i64], row_to_memory)?;
+    let rows = statement.query_map(params![user_id, limit as i64], row_to_memory)?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-/// Update the content of one memory, preserving kind, source and creation time.
-pub fn update_content(store: &Store, id: &str, content: &str) -> Result<Memory> {
+/// Update the content of one memory of the acting user, preserving kind,
+/// source and creation time.
+pub fn update_content(store: &Store, user_id: &str, id: &str, content: &str) -> Result<Memory> {
     let content = normalized_content(content)?;
     let connection = store.connection()?;
     let changed = connection.execute(
-        "UPDATE memories SET content = ?1, updated_at = ?2 WHERE id = ?3",
-        params![content, now_string(Utc::now()), id],
+        "UPDATE memories SET content = ?1, updated_at = ?2 WHERE id = ?3 AND user_id = ?4",
+        params![content, now_string(Utc::now()), id, user_id],
     )?;
     if changed != 1 {
         return Err(SeraError::NotFound(format!("memory {id}")));
     }
     drop(connection);
-    get(store, id)
+    get(store, user_id, id)
 }
 
-/// Delete exactly one memory. Returns `false` when the id does not exist.
-pub fn delete(store: &Store, id: &str) -> Result<bool> {
+/// Delete exactly one memory of the acting user. Returns `false` when the
+/// id does not exist or belongs to another user.
+pub fn delete(store: &Store, user_id: &str, id: &str) -> Result<bool> {
     let connection = store.connection()?;
-    let changed = connection.execute("DELETE FROM memories WHERE id = ?1", params![id])?;
+    let changed = connection.execute(
+        "DELETE FROM memories WHERE id = ?1 AND user_id = ?2",
+        params![id, user_id],
+    )?;
     Ok(changed == 1)
 }
 
@@ -189,28 +211,36 @@ mod tests {
         Store::open_in_memory(384).expect("store")
     }
 
+    /// The acting user for the single-operator CRUD flows.
+    fn admin(store: &Store) -> String {
+        store.admin_user_id().expect("admin")
+    }
+
     #[test]
     fn crud_round_trip_and_isolation() {
         let store = store();
+        let admin = admin(&store);
         let first = add(
             &store,
+            &admin,
             "preference",
             "Prefers concise Italian summaries",
             "operator:test",
         )
         .expect("first memory");
-        let second = add(&store, "fact", "Lives in Rome", "document:doc-a").expect("second memory");
+        let second =
+            add(&store, &admin, "fact", "Lives in Rome", "document:doc-a").expect("second memory");
         assert_eq!(first.kind, "preference");
         assert_eq!(second.source, "document:doc-a");
 
-        let fetched = get(&store, &first.id).expect("get");
+        let fetched = get(&store, &admin, &first.id).expect("get");
         assert_eq!(fetched, first);
 
-        let listed = list(&store, 10).expect("list");
+        let listed = list(&store, &admin, 10).expect("list");
         assert_eq!(listed.len(), 2);
 
-        let updated =
-            update_content(&store, &first.id, "Prefers very concise summaries").expect("update");
+        let updated = update_content(&store, &admin, &first.id, "Prefers very concise summaries")
+            .expect("update");
         assert_eq!(updated.id, first.id);
         assert_eq!(updated.kind, first.kind);
         assert_eq!(updated.source, first.source);
@@ -218,14 +248,16 @@ mod tests {
         assert!(updated.updated_at >= first.updated_at);
 
         // Updating one memory must not touch the other.
-        let untouched = get(&store, &second.id).expect("second get");
+        let untouched = get(&store, &admin, &second.id).expect("second get");
         assert_eq!(untouched.content, "Lives in Rome");
 
-        assert!(delete(&store, &first.id).expect("delete"));
-        assert!(!delete(&store, &first.id).expect("idempotent delete"));
-        assert!(get(&store, &first.id).is_err());
+        assert!(delete(&store, &admin, &first.id).expect("delete"));
+        assert!(!delete(&store, &admin, &first.id).expect("idempotent delete"));
+        assert!(get(&store, &admin, &first.id).is_err());
         assert_eq!(
-            get(&store, &second.id).expect("second stays").content,
+            get(&store, &admin, &second.id)
+                .expect("second stays")
+                .content,
             "Lives in Rome"
         );
     }
@@ -233,24 +265,76 @@ mod tests {
     #[test]
     fn rejects_unknown_kind_empty_content_and_missing_provenance() {
         let store = store();
-        assert!(add(&store, "guess", "content", "operator:test").is_err());
-        assert!(add(&store, "fact", "   ", "operator:test").is_err());
-        assert!(add(&store, "fact", "content", "  ").is_err());
+        let admin = admin(&store);
+        assert!(add(&store, &admin, "guess", "content", "operator:test").is_err());
+        assert!(add(&store, &admin, "fact", "   ", "operator:test").is_err());
+        assert!(add(&store, &admin, "fact", "content", "  ").is_err());
         assert!(
             add(
                 &store,
+                &admin,
                 "fact",
                 &"x".repeat(MAX_CONTENT_CHARS + 1),
                 "operator:test"
             )
             .is_err()
         );
-        assert!(list(&store, 10).expect("list").is_empty());
+        assert!(list(&store, &admin, 10).expect("list").is_empty());
     }
 
     #[test]
     fn update_missing_memory_is_not_found() {
         let store = store();
-        assert!(update_content(&store, "missing", "content").is_err());
+        let admin = admin(&store);
+        assert!(update_content(&store, &admin, "missing", "content").is_err());
+    }
+
+    /// A second user never sees or touches the admin's memories: reads are
+    /// empty, writes to the admin's ids fail or miss, and deletes report
+    /// false.
+    #[test]
+    fn cross_user_access_is_impossible() {
+        let store = store();
+        let admin = admin(&store);
+        let member = store
+            .create_user("microsoft:memory-member", "m@example.example", "M")
+            .expect("member");
+
+        let admin_memory = add(
+            &store,
+            &admin,
+            "fact",
+            "admin private fact",
+            "operator:test",
+        )
+        .expect("admin memory");
+        assert!(
+            list(&store, &member.id, 100)
+                .expect("member list")
+                .is_empty()
+        );
+        assert!(get(&store, &member.id, &admin_memory.id).is_err());
+        assert!(update_content(&store, &member.id, &admin_memory.id, "rewritten").is_err());
+        assert!(!delete(&store, &member.id, &admin_memory.id).expect("member delete"));
+
+        // The admin's memory is intact.
+        assert_eq!(
+            get(&store, &admin, &admin_memory.id)
+                .expect("admin get")
+                .content,
+            "admin private fact"
+        );
+
+        // And symmetrically, the admin cannot read the member's memories.
+        let member_memory = add(
+            &store,
+            &member.id,
+            "fact",
+            "member private fact",
+            "operator:test",
+        )
+        .expect("member memory");
+        assert!(get(&store, &admin, &member_memory.id).is_err());
+        assert_eq!(list(&store, &admin, 100).expect("admin list").len(), 1);
     }
 }

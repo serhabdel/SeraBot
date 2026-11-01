@@ -16,7 +16,7 @@ use crate::providers::{
 use crate::domain::{LlmMessage, Role, ToolCall};
 use crate::error::{Result, SeraError};
 use crate::gateway::ToolSpec;
-use crate::secrets::SharedSecrets;
+use crate::secrets::{AgeCredentialWriter, CredentialWriter, SharedSecrets};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Usage {
@@ -36,9 +36,7 @@ pub struct LlmResponse {
 }
 
 struct RefreshPersistence {
-    secrets: SharedSecrets,
-    refresh_secret_name: String,
-    access_secret_name: String,
+    writer: Arc<dyn CredentialWriter>,
 }
 
 struct OAuthState {
@@ -149,12 +147,14 @@ impl LlmClient {
         refresh_secret_name: impl Into<String>,
         access_secret_name: impl Into<String>,
     ) -> Result<Self> {
-        let refresh_secret_name = refresh_secret_name.into();
-        if refresh_secret_name.trim().is_empty() {
-            return Err(SeraError::Config(
-                "oauth refresh secret name is missing".into(),
-            ));
-        }
+        let writer = AgeCredentialWriter::new(secrets, refresh_secret_name, access_secret_name)?;
+        self.with_credential_writer(Arc::new(writer))
+    }
+
+    /// Record a custom write-back target for a rotated credential. The
+    /// per-user provider factory passes a writer that merges into the acting
+    /// user's (or grantor's) credential row.
+    pub fn with_credential_writer(self, writer: Arc<dyn CredentialWriter>) -> Result<Self> {
         let oauth = self
             .oauth
             .as_ref()
@@ -162,11 +162,7 @@ impl LlmClient {
         *oauth
             .persistence
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(RefreshPersistence {
-            secrets,
-            refresh_secret_name,
-            access_secret_name: access_secret_name.into(),
-        });
+            .unwrap_or_else(|error| error.into_inner()) = Some(RefreshPersistence { writer });
         Ok(self)
     }
 
@@ -434,7 +430,7 @@ impl LlmClient {
         let oauth = self.oauth.as_ref().ok_or_else(|| {
             SeraError::Secrets("rotated oauth refresh token was not persisted".into())
         })?;
-        let (secrets, refresh_name, access_name) = {
+        let writer = {
             let persistence = oauth
                 .persistence
                 .lock()
@@ -444,23 +440,9 @@ impl LlmClient {
                     "rotated oauth refresh token was not persisted".into(),
                 ));
             };
-            let refresh_name = persistence.refresh_secret_name.trim().to_owned();
-            if refresh_name.is_empty() {
-                return Err(SeraError::Secrets(
-                    "rotated oauth refresh token was not persisted".into(),
-                ));
-            }
-            (
-                persistence.secrets.clone(),
-                refresh_name,
-                persistence.access_secret_name.trim().to_owned(),
-            )
+            persistence.writer.clone()
         };
-        let mut updates = vec![(refresh_name.as_str(), refresh)];
-        if !access_name.is_empty() && access_name != refresh_name {
-            updates.push((access_name.as_str(), access));
-        }
-        match secrets.persist(&updates) {
+        match writer.persist_rotation(refresh, Some(access)) {
             Ok(()) => Ok(()),
             Err(error) => Err(redact_secret_error(error, &[refresh, access])),
         }

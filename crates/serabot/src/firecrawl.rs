@@ -1093,6 +1093,7 @@ mod tests {
             .execute(
                 json!({"url": "https://example.com/"}),
                 &crate::gateway::ToolContext {
+                    user_id: crate::store::ADMIN_USER_ID.to_owned(),
                     actor: "owner".into(),
                     bot: "test".into(),
                     task_id: None,

@@ -235,6 +235,38 @@ a `getUpdates` URL, rotate the bot token with BotFather and store the new value
 with `serabot secrets set` under the configured secret name (default
 `telegram_bot_token`). Do not copy the journal line.
 
+## Sign-in bootstrap (multi-user)
+
+Sign-in is off by default (`[auth] enabled = false`) and every auth route fails
+closed while it is off, so an upgrade changes nothing until you opt in.
+
+1. Register one Azure app as a **public client** with a redirect URI of
+   `<auth.base_url>/v1/auth/callback`. The same registration is used for
+   sign-in and, incrementally, for OneDrive consent.
+2. Store the client id in the age store under `auth.client_id_secret`
+   (default `auth_client_id`):
+   ```bash
+   printf '%s' "$CLIENT_ID" | runuser -u serabot -- /opt/serabot/serabot --config /etc/serabot/serabot.toml secrets set auth_client_id
+   ```
+3. Set `[auth] enabled = true`, `base_url` to the public HTTPS origin, and
+   `max_users`. Keep `providers = ["microsoft"]`; Google and GitHub are
+   accepted in config but reported disabled until they are implemented.
+4. Restart the service. The bootstrap admin account already exists (created by
+   migration 0008) and the operator's existing API and CLI tokens keep working
+   as the admin's sessions — nothing is re-issued.
+5. Mint an invite for each member and send them the code out of band:
+   ```bash
+   curl -sS -X POST -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' -d '{"uses":1}' \
+     https://<base_url>/v1/auth/invites
+   ```
+
+The per-user credential store needs `secrets.master_key_file` (default
+`private/master.key`). It is generated on first run with `0600` permissions and
+must be backed up with the database: without it, member credentials cannot be
+decrypted. It is not the age identity and must never be committed or copied
+into a ticket.
+
 ## OneDrive (native Graph)
 
 SeraBot uses the same Azure **public client** pattern as the existing

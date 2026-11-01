@@ -17,6 +17,7 @@ const DOWNLOADS_PLACEHOLDER: &str = "{{DOWNLOADS}}";
 const DOWNLOADS_UNCONFIGURED: &str =
     "<p class=\"meta\">Client downloads are not configured for this server build.</p>";
 const APP_HTML: &str = include_str!("../assets/app.html");
+const LOGIN_HTML: &str = include_str!("../assets/login.html");
 
 pub(crate) fn build_sha() -> &'static str {
     option_env!("SERABOT_BUILD_SHA").unwrap_or("dev")
@@ -96,6 +97,7 @@ where
     Router::new()
         .route("/", get(landing))
         .route("/app", get(landing))
+        .route("/login", get(login))
         .route("/app/latest.apk", get(latest_apk))
         .route("/app/SHA256SUMS", get(sha256sums))
         .route("/healthz", get(healthz))
@@ -128,6 +130,23 @@ async fn landing() -> Response {
             (header::CACHE_CONTROL, "no-store"),
         ],
         page,
+    )
+        .into_response()
+}
+
+/// The console sign-in page: Microsoft enabled (the link starts the OIDC
+/// flow served by the API), Google and GitHub visibly disabled until they
+/// ship. Static, script-free, and rendered without any state — the flow
+/// itself fails closed when sign-in is not enabled.
+async fn login() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CONTENT_SECURITY_POLICY, CSP),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        LOGIN_HTML,
     )
         .into_response()
 }
@@ -243,5 +262,49 @@ mod tests {
             json!([crate::elevenlabs::oauth_callback_uri()])
         );
         assert!(!bytes.windows(3).any(|w| w == b"sk_"));
+    }
+
+    #[tokio::test]
+    async fn login_page_renders_microsoft_enabled_and_others_disabled() {
+        let response = login().await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .and_then(|value| value.to_str().ok()),
+            Some(CSP)
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let page = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(!page.contains("<script"), "no frameworks, no scripts");
+        // Microsoft is enabled and links into the sign-in flow.
+        assert!(page.contains("Sign in with Microsoft"));
+        assert!(page.contains(r#"href="/login/microsoft""#));
+        // Google and GitHub are visibly disabled with a coming-soon note.
+        assert!(page.contains("Sign in with Google"));
+        assert!(page.contains("Sign in with GitHub"));
+        assert!(page.contains(r#"class="button disabled""#));
+        assert!(page.contains("aria-disabled=\"true\""));
+        assert!(page.contains("coming soon"));
+        // No provider button carries a live href other than Microsoft.
+        assert!(!page.contains(r#"href="/login/google""#));
+        assert!(!page.contains(r#"href="/login/github""#));
     }
 }

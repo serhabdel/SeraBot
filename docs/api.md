@@ -48,6 +48,57 @@ Redirect targets come from a validated build-time `SERABOT_RELEASES_REPO`
 (`owner/repo`); request input is never used in a path. Authentication, rate
 limits, and the body limit apply to every `/v1/*` route exactly as before.
 
+## Sign-in, users, and invitations
+
+SeraBot is invitation-only. The operator (the bootstrap admin) mints
+single-use invite codes; a new subject needs one to create an account, and an
+existing subject signing in again does not. Sign-in is a thin OIDC
+passthrough: the identity provider authenticates, and the returned `id_token`
+is verified against the provider's JWKS before anything is stored. Sessions
+are opaque random tokens, stored only as SHA-256 hashes.
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| `GET` | `/v1/auth/providers` | Public. `{providers: [{id, enabled}]}` in a fixed order. Microsoft is enabled in v1; Google and GitHub are reported `enabled: false` until configured, and clients render them visibly disabled. |
+| `POST` | `/v1/auth/login/start` | Public. `{provider, invite_code?}` → `{url}`. Validates the provider and, when present, the invite (a stale code never reaches the provider). The invite is consumed at the callback, inside the transaction that creates the user, so an abandoned login never burns it. |
+| `GET` | `/v1/auth/callback` | Public. Provider redirect target. Verifies state, nonce, and signature, upserts the namespaced subject (`microsoft:<sub>`), enforces `auth.max_users`, and returns a plain HTML page showing the session token **once**. |
+| `POST` | `/v1/auth/logout` | Authenticated. Revokes the calling session. A static config token has no session row and returns `409`. |
+| `POST` | `/v1/auth/invites` | Admin only. `{uses}` → `{code}`; the raw code is returned once and only its hash is stored. |
+| `GET` | `/v1/users` | Admin only. Lists accounts with role and status. |
+| `POST` | `/v1/users/{id}/disable`, `/enable` | Admin only. Disabled accounts cannot authenticate; the bootstrap admin cannot be disabled. |
+
+`[auth] enabled = false` is the default and every auth route fails closed while
+it is off, so existing single-operator deployments are unaffected.
+
+## User credentials, grants, and Telegram
+
+Per-user credentials live in an envelope-encrypted store: a server master key
+(`secrets.master_key_file`) wraps a per-user data key, which seals that user's
+provider tokens with ChaCha20-Poly1305. Associated data binds every ciphertext
+to its owner and provider, so a blob cannot be replayed across users. No
+endpoint ever returns a secret.
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| `GET` | `/v1/providers` | The acting user's usable providers with a `credential` status (own, granted, or none). |
+| `PUT` | `/v1/providers/{id}/key` | Stores the acting user's API key for that provider. |
+| `DELETE` | `/v1/providers/{id}` | Removes the acting user's credential. |
+| `POST` | `/v1/admin/grants` | Admin only. `{grantee, provider}` grants a member use of an admin-owned provider. Audited and revocable; the secret is never exposed. |
+| `GET` | `/v1/admin/grants` | Admin only. Active grants. |
+| `DELETE` | `/v1/admin/grants/{grantee}/{provider}` | Admin only. Revokes a grant; resolution fails closed immediately. |
+| `GET` | `/v1/connectors` | The acting user's connector status (connected or not; never a token). |
+| `POST` | `/v1/connectors/onedrive/start` | Returns the OneDrive consent URL (auth code + PKCE) for the acting user. |
+| `GET` | `/v1/connectors/onedrive/callback` | Public. Exchanges the code and seals the refresh token under the user's data key. Plain HTML, no token echo. |
+| `DELETE` | `/v1/connectors/onedrive` | Disconnects the acting user's drive. |
+| `GET` | `/v1/telegram` | The acting user's Telegram binding status. |
+| `POST` | `/v1/telegram/link` | Returns a single-use linking code (10 minutes). The user sends `/start <code>` to the bot. |
+| `DELETE` | `/v1/telegram/link` | Unbinds the acting user's Telegram chat. |
+
+Telegram keeps one server bot token (admin-managed). Inbound messages from a
+bound `(telegram_user_id, telegram_chat_id)` act as that user; unbound chats
+are ignored exactly as before. The configured owner pair is bootstrapped as the
+admin's binding, so an existing single-operator install keeps working.
+
 ## Health and status
 
 | Method | Path | Notes |

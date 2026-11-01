@@ -1039,6 +1039,25 @@ fn ConnectView(session: Signal<Session>) -> Element {
     let connecting = session.read().connecting;
     let theme = session.read().theme;
     let version = env!("CARGO_PKG_VERSION");
+    let providers = session.read().sign_in.providers.clone();
+    let providers_loaded = session.read().sign_in.loaded;
+    let providers_loading = session.read().sign_in.loading;
+    let providers_attempted = session.read().sign_in.attempted;
+    let sign_in_error = session.read().sign_in.error.clone();
+    let sign_in_notice = session.read().sign_in.notice.clone();
+    let invite_code = session.read().sign_in.invite_code.clone();
+    let starting = session.read().sign_in.starting;
+    let any_enabled = providers.iter().any(|provider| provider.enabled);
+    // The provider list is public and needs no token. Read it once when the
+    // screen mounts; the server field's blur re-reads it after an edit.
+    let mut asked = use_signal(|| false);
+    use_effect(move || {
+        if asked() {
+            return;
+        }
+        asked.set(true);
+        session.write().load_auth_providers();
+    });
     rsx! {
         div { class: "connect",
             div { class: "connect-card",
@@ -1052,6 +1071,96 @@ fn ConnectView(session: Signal<Session>) -> Element {
                         value: "{server}",
                         placeholder: "https://bot.seradyx.tech",
                         oninput: move |event| session.write().server = event.value(),
+                        onblur: move |_| session.write().load_auth_providers(),
+                    }
+                }
+                div { class: "signin",
+                    div { class: "signin-head",
+                        span { class: "field-label", "Sign in" }
+                        if providers_loading {
+                            span { class: "spinner", title: "Checking sign-in providers" }
+                        }
+                    }
+                    if providers_loaded && !providers.is_empty() {
+                        for provider in providers {
+                            {
+                                let id = provider.id.clone();
+                                let label = provider.label();
+                                let enabled = provider.enabled;
+                                let coming_soon = provider.coming_soon();
+                                let is_microsoft = id == "microsoft";
+                                let click_id = id.clone();
+                                let button_label = format!("Sign in with {label}");
+                                let title = if enabled {
+                                    format!("Open the {label} sign-in page in your browser")
+                                } else if coming_soon {
+                                    "Coming soon".to_owned()
+                                } else {
+                                    "Sign-in is not enabled on this server".to_owned()
+                                };
+                                rsx! {
+                                    div { class: "signin-provider", key: "{id}",
+                                        if enabled {
+                                            button {
+                                                class: "btn primary",
+                                                disabled: starting,
+                                                title: "{title}",
+                                                onclick: move |_| session.write().start_sign_in(click_id.clone()),
+                                                if starting { "Opening browser…" } else { "{button_label}" }
+                                            }
+                                        } else {
+                                            button {
+                                                class: "btn ghost",
+                                                disabled: true,
+                                                "aria-disabled": "true",
+                                                title: "{title}",
+                                                "{button_label}"
+                                            }
+                                            span { class: "chip muted",
+                                                if coming_soon { "coming soon" } else { "not enabled" }
+                                            }
+                                        }
+                                    }
+                                    if is_microsoft {
+                                        div { class: "field",
+                                            label { class: "field-label", "Invite code (new members)" }
+                                            input {
+                                                class: "input",
+                                                value: "{invite_code}",
+                                                placeholder: "leave empty if you already have an account",
+                                                disabled: starting,
+                                                oninput: move |event| session.write().sign_in.invite_code = event.value(),
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if any_enabled {
+                            p { class: "tiny",
+                                "After signing in, the browser shows a session token once. Paste it below and press Connect."
+                            }
+                        } else {
+                            p { class: "tiny",
+                                "Sign-in is not enabled on this server. Paste a session token below."
+                            }
+                        }
+                    } else if providers_loading {
+                        p { class: "tiny", "Checking sign-in providers…" }
+                    } else if server.trim().is_empty() {
+                        p { class: "tiny", "Enter the server origin to sign in." }
+                    } else if providers_attempted {
+                        p { class: "tiny",
+                            "Sign-in is unavailable from this server. Paste a session token below."
+                        }
+                    } else {
+                        p { class: "tiny", "Checking sign-in providers…" }
+                    }
+                    if let Some(message) = sign_in_notice {
+                        div { class: "banner info", span { "{message}" } }
+                    }
+                    if let Some(message) = sign_in_error {
+                        div { class: "banner err", span { "{message}" } }
                     }
                 }
                 div { class: "field",
@@ -6010,6 +6119,14 @@ fn SettingsView(session: Signal<Session>) -> Element {
     let status_error = session.read().status.error.clone();
     let status_loading = session.read().status.loading;
     let restart_pending = session.read().restart_pending;
+    let telegram_status = session.read().telegram.status.clone();
+    let telegram_loaded = session.read().telegram.loaded;
+    let telegram_loading = session.read().telegram.loading;
+    let telegram_error = session.read().telegram.error.clone();
+    let telegram_link = session.read().telegram.link.clone();
+    let telegram_linking = session.read().telegram.linking;
+    let telegram_unlinking = session.read().telegram.unlinking;
+    let telegram_confirm = session.read().telegram.confirm_unlink;
     let policy_version = status
         .as_ref()
         .and_then(|status| status.policy_version.clone())
@@ -6103,6 +6220,110 @@ fn SettingsView(session: Signal<Session>) -> Element {
                             onclick: move |_| session.write().disconnect(),
                             "Disconnect"
                         }
+                    }
+                }
+                div { class: "card",
+                    div { class: "card-head",
+                        h3 { class: "card-title", "Telegram" }
+                        div { class: "row",
+                            if telegram_loading {
+                                span { class: "spinner", title: "Reading Telegram status" }
+                            }
+                            button {
+                                class: "btn ghost sm",
+                                disabled: telegram_loading || telegram_linking || telegram_unlinking,
+                                onclick: move |_| session.write().refresh_telegram(),
+                                Icon { name: "refresh", size: 14 }
+                                "Refresh status"
+                            }
+                        }
+                    }
+                    p { class: "card-sub",
+                        "Link your Telegram account to this console. Messages from the linked chat use your bots, memory and approvals."
+                    }
+                    if let Some(status) = telegram_status {
+                        div { class: "chips",
+                            span {
+                                class: if status.enabled { "chip ok" } else { "chip muted" },
+                                if status.enabled { "bot enabled" } else { "bot disabled" }
+                            }
+                            span {
+                                class: if status.linked { "chip ok" } else { "chip muted" },
+                                if status.linked { "linked" } else { "not linked" }
+                            }
+                            if let Some(chat) = status.chat_label() {
+                                span { class: "chip mono", "{chat}" }
+                            }
+                            if let Some(since) = status.linked_at.as_deref() {
+                                span { class: "chip", "since {stamp(since)}" }
+                            }
+                        }
+                        if !status.enabled {
+                            p { class: "tiny",
+                                "Telegram is disabled on the server ([telegram] enabled = false)."
+                            }
+                        }
+                        if status.linked {
+                            if telegram_confirm {
+                                div { class: "row",
+                                    span { class: "tiny",
+                                        "Unlink this chat? Messages from it will be ignored until you link again."
+                                    }
+                                    button {
+                                        class: "btn danger sm",
+                                        disabled: telegram_unlinking || telegram_loading,
+                                        onclick: move |_| session.write().confirm_unlink_telegram(),
+                                        if telegram_unlinking { "Unlinking…" } else { "Unlink" }
+                                    }
+                                    button {
+                                        class: "btn ghost sm",
+                                        disabled: telegram_unlinking,
+                                        onclick: move |_| session.write().cancel_unlink_telegram(),
+                                        "Cancel"
+                                    }
+                                }
+                            } else {
+                                div { class: "card-actions",
+                                    button {
+                                        class: "btn danger sm",
+                                        onclick: move |_| session.write().request_unlink_telegram(),
+                                        "Unlink Telegram"
+                                    }
+                                }
+                            }
+                        } else if status.enabled {
+                            div { class: "card-actions",
+                                button {
+                                    class: "btn primary",
+                                    disabled: telegram_linking || telegram_loading,
+                                    onclick: move |_| session.write().link_telegram(),
+                                    if telegram_linking { "Requesting code…" } else { "Link Telegram" }
+                                }
+                            }
+                        }
+                    } else if telegram_loading {
+                        div { class: "skeleton block" }
+                    } else if telegram_loaded && telegram_error.is_none() {
+                        p { class: "tiny",
+                            "Telegram status is unavailable. Press Refresh status to retry."
+                        }
+                    } else if !telegram_loaded && telegram_error.is_none() {
+                        p { class: "tiny", "Reading Telegram status…" }
+                    }
+                    if let Some(link) = telegram_link {
+                        div { class: "field",
+                            label { class: "field-label", "Send this command to the SeraBot bot" }
+                            code { class: "link-code", "{link.command()}" }
+                            p { class: "tiny",
+                                "The code works once and expires 10 minutes after it was requested. After sending it, press Refresh status."
+                            }
+                            if let Some(expires) = link.expires_at.as_deref() {
+                                p { class: "tiny", "Expires {expires}." }
+                            }
+                        }
+                    }
+                    if let Some(message) = telegram_error {
+                        div { class: "banner err", span { "{message}" } }
                     }
                 }
                 div { class: "card",

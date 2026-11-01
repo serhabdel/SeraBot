@@ -17,12 +17,35 @@ busy_timeout_ms = 5000
 [secrets]
 encrypted_file = "private/secrets.age"
 identity_file = "private/age-identity.txt"
+# Server master key for the per-user credential store. 32 raw bytes, generated
+# on first run with mode 0600 on unix; never logged or exposed. Not the age
+# identity: it wraps each user's data key.
+master_key_file = "private/master.key"
 
 [api]
 enabled = false
 # Generate with: printf '%s' "$TOKEN" | serabot hash-token
 token_hash = ""
 approval_expiry_hours = 24
+
+# Multi-user sign-in (OIDC; invitation-only, Microsoft in v1).
+# Store the app registration's public client id with:
+#   serabot secrets set auth_client_id
+[auth]
+enabled = false
+providers = ["microsoft"]         # google + github ship shown-but-disabled
+tenant = "consumers"
+client_id_secret = "auth_client_id"
+# Public https base URL the OIDC redirect returns to (behind the reverse
+# proxy, not the loopback bind). Required when enabled.
+base_url = "https://bot.example.example"
+session_ttl_hours = 720
+invite_ttl_hours = 48
+max_users = 10
+
+[users]
+# Daily task budget per user (enforced from phase 5).
+tasks_per_user_per_day = 500
 
 [telegram]
 enabled = false
@@ -161,13 +184,22 @@ poll_interval_ms = 2000
 poll_max_attempts = 60
 
 [onedrive]
+# Availability + defaults. Each account connects its own drive from the
+# console (auth code + PKCE); uploads land in that user's own drive under
+# `folder`. The legacy global refresh token is imported into the admin's
+# credential row once at startup, so an existing single-operator setup keeps
+# working without re-consent.
 enabled = false
 graph_base = "https://graph.microsoft.com/v1.0"
 tenant = "consumers"
+# Age-store key for the shared app registration's public client id (the same
+# registration as [auth]).
 client_id_secret = "onedrive_client_id"
 refresh_token_secret = "onedrive_refresh_token"
 folder = "SeraBot"
 conflict_behavior = "rename"
+# Public base URL for the consent redirect; empty falls back to auth.base_url.
+redirect_base_url = ""
 
 # Firecrawl v2 (scrape / map / search / crawl). Disabled by default.
 # Store the API key in the age secret store: serabot secrets set firecrawl_api_key

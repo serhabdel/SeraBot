@@ -1,9 +1,14 @@
 //! Durable routine scheduling.
 //!
-//! Routines are stored in SQLite. A daily routine owns at most one logical
-//! occurrence per local date, enforced by a conditional `UPDATE ... RETURNING`
-//! on `last_run_for`. Downtime therefore yields exactly one catch-up
-//! occurrence (the most recent one), never a burst of missed runs.
+//! Routines are stored in SQLite, one row per owning user. A daily routine
+//! owns at most one logical occurrence per local date, enforced by a
+//! conditional `UPDATE ... RETURNING` on `last_run_for`. Downtime therefore
+//! yields exactly one catch-up occurrence (the most recent one), never a
+//! burst of missed runs.
+//!
+//! Routine claiming in [`due_routines`] is cross-user by design: the scheduler
+//! service is shared, and each claimed routine carries its owning user so the
+//! enqueued task runs under that user (phase 2 scoping).
 //!
 //! Local-time resolution uses chrono-tz:
 //! * nonexistent local times (spring forward) shift forward past the gap;
@@ -28,18 +33,27 @@ pub struct DueRoutine {
     pub id: String,
     pub name: String,
     pub kind: String,
+    /// Owning user: the task enqueued for this occurrence runs under this id.
+    pub user_id: String,
     /// Local calendar date (`YYYY-MM-DD`) this occurrence belongs to.
     pub scheduled_for_local_date: String,
     /// Stored routine configuration (`time`, `timezone`).
     pub config: Value,
 }
 
-/// Create or update a daily routine without losing its run history.
+/// Create or update the acting user's daily routine without losing its run
+/// history.
 ///
 /// Repeated calls keep `last_run_for` and, unless the configured time or
 /// timezone changed, preserve `next_run_at`. Preserving a past `next_run_at`
 /// is what allows a missed occurrence to be caught up after downtime.
-pub fn ensure_daily_routine(store: &Store, name: &str, time_hhmm: &str, tz: Tz) -> Result<()> {
+pub fn ensure_daily_routine(
+    store: &Store,
+    user_id: &str,
+    name: &str,
+    time_hhmm: &str,
+    tz: Tz,
+) -> Result<()> {
     if name.trim().is_empty() || name.chars().count() > 128 || name.chars().any(char::is_control) {
         return Err(SeraError::Validation("invalid routine name".into()));
     }
@@ -57,8 +71,8 @@ pub fn ensure_daily_routine(store: &Store, name: &str, time_hhmm: &str, tz: Tz) 
     let connection = store.connection()?;
     let existing: Option<(String, String)> = connection
         .query_row(
-            "SELECT next_run_at, config_json FROM routines WHERE name = ?1",
-            params![name],
+            "SELECT next_run_at, config_json FROM routines WHERE name = ?1 AND user_id = ?2",
+            params![name, user_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
@@ -68,9 +82,16 @@ pub fn ensure_daily_routine(store: &Store, name: &str, time_hhmm: &str, tz: Tz) 
             connection.execute(
                 "INSERT INTO routines(
                     id, name, kind, enabled, next_run_at, last_run_for,
-                    config_json, created_at, updated_at
-                 ) VALUES (?1, ?2, 'daily', 1, ?3, NULL, ?4, ?5, ?5)",
-                params![new_id(), name, utc_string(next), config, now_string],
+                    config_json, created_at, updated_at, user_id
+                 ) VALUES (?1, ?2, 'daily', 1, ?3, NULL, ?4, ?5, ?5, ?6)",
+                params![
+                    new_id(),
+                    name,
+                    utc_string(next),
+                    config,
+                    now_string,
+                    user_id
+                ],
             )?;
         }
         Some((old_next, old_config)) => {
@@ -94,8 +115,8 @@ pub fn ensure_daily_routine(store: &Store, name: &str, time_hhmm: &str, tz: Tz) 
             connection.execute(
                 "UPDATE routines
                  SET kind = 'daily', config_json = ?1, next_run_at = ?2, updated_at = ?3
-                 WHERE name = ?4",
-                params![config, next_run_at, now_string, name],
+                 WHERE name = ?4 AND user_id = ?5",
+                params![config, next_run_at, now_string, name, user_id],
             )?;
         }
     }
@@ -103,12 +124,14 @@ pub fn ensure_daily_routine(store: &Store, name: &str, time_hhmm: &str, tz: Tz) 
 }
 
 /// Claim all enabled routines whose latest local occurrence has not been run
-/// for its date yet. Claiming is atomic per routine.
+/// for its date yet. Claiming is atomic per routine and cross-user by design:
+/// the scheduler service is shared, and every claimed occurrence carries its
+/// owning user so the enqueued task runs under it.
 pub fn due_routines(store: &Store, now: DateTime<Utc>, tz: Tz) -> Result<Vec<DueRoutine>> {
     let connection = store.connection()?;
-    let routines: Vec<(String, String, String)> = {
+    let routines: Vec<(String, String, String, String)> = {
         let mut statement = connection.prepare(
-            "SELECT id, config_json, next_run_at
+            "SELECT id, config_json, next_run_at, user_id
              FROM routines WHERE enabled = 1 ORDER BY name ASC",
         )?;
         let rows = statement.query_map([], |row| {
@@ -116,6 +139,7 @@ pub fn due_routines(store: &Store, now: DateTime<Utc>, tz: Tz) -> Result<Vec<Due
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
@@ -124,7 +148,7 @@ pub fn due_routines(store: &Store, now: DateTime<Utc>, tz: Tz) -> Result<Vec<Due
     let now_string = utc_string(now);
     let mut due = Vec::new();
 
-    for (id, config_json, next_run_at) in routines {
+    for (id, config_json, next_run_at, user_id) in routines {
         // A future next_run_at means the routine has not become due yet.
         if parse_utc(&next_run_at).is_some_and(|next| next > now) {
             continue;
@@ -173,6 +197,7 @@ pub fn due_routines(store: &Store, now: DateTime<Utc>, tz: Tz) -> Result<Vec<Due
                 id,
                 name,
                 kind,
+                user_id,
                 scheduled_for_local_date: local_date_string,
                 config: serde_json::from_str(&config_json).unwrap_or(Value::Null),
             });
@@ -261,12 +286,18 @@ mod tests {
         Store::open_in_memory(384).unwrap()
     }
 
+    /// The acting user for the scheduled routines.
+    fn admin(store: &Store) -> String {
+        store.admin_user_id().unwrap()
+    }
+
     fn rome() -> Tz {
         "Europe/Rome".parse().unwrap()
     }
 
     fn insert_routine(
         store: &Store,
+        user_id: &str,
         name: &str,
         time: &str,
         enabled: bool,
@@ -278,8 +309,8 @@ mod tests {
             .execute(
                 "INSERT INTO routines(
                     id, name, kind, enabled, next_run_at, last_run_for,
-                    config_json, created_at, updated_at
-                 ) VALUES (?1, ?2, 'daily', ?3, ?4, ?5, ?6, ?7, ?7)",
+                    config_json, created_at, updated_at, user_id
+                 ) VALUES (?1, ?2, 'daily', ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
                 params![
                     new_id(),
                     name,
@@ -287,7 +318,8 @@ mod tests {
                     utc_string(next_run_at),
                     last_run_for,
                     json!({"time": time, "timezone": "Europe/Rome"}).to_string(),
-                    utc_string(Utc::now())
+                    utc_string(Utc::now()),
+                    user_id
                 ],
             )
             .unwrap();
@@ -307,17 +339,20 @@ mod tests {
     #[test]
     fn ensure_is_idempotent_and_validates_input() {
         let store = store();
-        ensure_daily_routine(&store, "morning-brief", "08:00", rome()).unwrap();
-        ensure_daily_routine(&store, "morning-brief", "08:00", rome()).unwrap();
+        let admin = admin(&store);
+        ensure_daily_routine(&store, &admin, "morning-brief", "08:00", rome()).unwrap();
+        ensure_daily_routine(&store, &admin, "morning-brief", "08:00", rome()).unwrap();
 
-        let connection = store.connection().unwrap();
-        let count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM routines", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
+        {
+            let connection = store.connection().unwrap();
+            let count: i64 = connection
+                .query_row("SELECT COUNT(*) FROM routines", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 1);
+        }
 
-        assert!(ensure_daily_routine(&store, "broken", "25:99", rome()).is_err());
-        assert!(ensure_daily_routine(&store, "", "08:00", rome()).is_err());
+        assert!(ensure_daily_routine(&store, &admin, "broken", "25:99", rome()).is_err());
+        assert!(ensure_daily_routine(&store, &admin, "", "08:00", rome()).is_err());
     }
 
     #[test]
@@ -326,6 +361,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 10, 28, 12, 0, 0).unwrap();
         insert_routine(
             &store,
+            &admin(&store),
             "daily",
             "08:00",
             true,
@@ -347,6 +383,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 10, 28, 12, 0, 0).unwrap();
         insert_routine(
             &store,
+            &admin(&store),
             "daily",
             "08:00",
             true,
@@ -366,6 +403,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 10, 28, 12, 0, 0).unwrap();
         insert_routine(
             &store,
+            &admin(&store),
             "disabled",
             "08:00",
             false,
@@ -383,6 +421,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 3, 29, 2, 0, 0).unwrap();
         insert_routine(
             &store,
+            &admin(&store),
             "dst",
             "02:30",
             true,
@@ -410,6 +449,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 10, 25, 0, 45, 0).unwrap();
         insert_routine(
             &store,
+            &admin(&store),
             "dst",
             "02:30",
             true,
@@ -426,5 +466,49 @@ mod tests {
             "{}",
             stored_next_run(&store, "dst")
         );
+    }
+
+    /// Two users may own a routine of the same name; the shared scheduler
+    /// claims each occurrence under the routine's owning user, so the
+    /// enqueued task runs in the right scope.
+    #[test]
+    fn claiming_returns_each_routines_owning_user() {
+        let store = store();
+        let admin = admin(&store);
+        let member = store
+            .create_user("microsoft:schedule-member", "s@example.example", "S")
+            .unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 10, 28, 12, 0, 0).unwrap();
+        insert_routine(
+            &store,
+            &admin,
+            "morning_brief",
+            "08:00",
+            true,
+            Utc.with_ymd_and_hms(2026, 10, 1, 6, 0, 0).unwrap(),
+            None,
+        );
+        insert_routine(
+            &store,
+            &member.id,
+            "morning_brief",
+            "08:00",
+            true,
+            Utc.with_ymd_and_hms(2026, 10, 1, 6, 0, 0).unwrap(),
+            None,
+        );
+
+        let due = due_routines(&store, now, rome()).unwrap();
+        assert_eq!(due.len(), 2);
+        let mut owners: Vec<&str> = due.iter().map(|routine| routine.user_id.as_str()).collect();
+        owners.sort();
+        assert_eq!(owners, vec![admin.as_str(), member.id.as_str()]);
+        // The same-name routines stayed distinct rows for each owner.
+        let count: i64 = store
+            .connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM routines", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
     }
 }

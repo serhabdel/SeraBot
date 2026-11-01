@@ -1,5 +1,5 @@
 use secrecy::SecretString;
-use serabot_desktop::{ApiClient, ApiError, Selection, validate_endpoint};
+use serabot_desktop::{ApiClient, ApiError, PublicApiClient, Selection, validate_endpoint};
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -35,9 +35,9 @@ fn request(stream: &mut TcpStream) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
-fn server(replies: Vec<(u16, String)>) -> (ApiClient, thread::JoinHandle<Vec<String>>) {
+fn fixture(replies: Vec<(u16, String)>) -> (String, thread::JoinHandle<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = validate_endpoint(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
     let handle = thread::spawn(move || {
         replies.into_iter().map(|(status, body)| {
             let (mut stream, _) = listener.accept().unwrap();
@@ -46,8 +46,27 @@ fn server(replies: Vec<(u16, String)>) -> (ApiClient, thread::JoinHandle<Vec<Str
             req
         }).collect()
     });
+    (url, handle)
+}
+
+fn server(replies: Vec<(u16, String)>) -> (ApiClient, thread::JoinHandle<Vec<String>>) {
+    let (url, handle) = fixture(replies);
     (
-        ApiClient::new(url, SecretString::new(TOKEN.into())).unwrap(),
+        ApiClient::new(
+            validate_endpoint(&url).unwrap(),
+            SecretString::new(TOKEN.into()),
+        )
+        .unwrap(),
+        handle,
+    )
+}
+
+fn public_server(
+    replies: Vec<(u16, String)>,
+) -> (PublicApiClient, thread::JoinHandle<Vec<String>>) {
+    let (url, handle) = fixture(replies);
+    (
+        PublicApiClient::new(validate_endpoint(&url).unwrap()).unwrap(),
         handle,
     )
 }
@@ -604,6 +623,218 @@ fn a_library_response_with_an_unshaped_hash_is_rejected() {
     )]);
     assert_eq!(
         client.library("room:review").unwrap_err(),
+        ApiError::InvalidResponse
+    );
+    handle.join().unwrap();
+}
+
+#[test]
+fn public_sign_in_lists_providers_in_order_and_starts_the_flow() {
+    let (client, handle) = public_server(vec![
+        (
+            200,
+            r#"{"providers":[{"id":"microsoft","enabled":true},{"id":"google","enabled":false},{"id":"github","enabled":false}]}"#
+                .into(),
+        ),
+        (
+            200,
+            r#"{"url":"https://login.example/authorize?client_id=test&state=s"}"#.into(),
+        ),
+        (
+            200,
+            r#"{"url":"https://login.example/authorize?state=noinvite"}"#.into(),
+        ),
+    ]);
+    let providers = client.auth_providers().unwrap();
+    assert_eq!(
+        providers
+            .iter()
+            .map(|provider| provider.id.as_str())
+            .collect::<Vec<_>>(),
+        ["microsoft", "google", "github"]
+    );
+    assert!(providers[0].enabled);
+    assert_eq!(providers[0].label(), "Microsoft");
+    assert!(!providers[1].enabled);
+    assert!(providers[1].coming_soon());
+    assert!(!providers[2].enabled);
+    assert!(providers[2].coming_soon());
+
+    let url = client
+        .auth_login_start("microsoft", Some("invite-code-123"))
+        .unwrap();
+    assert_eq!(
+        url,
+        "https://login.example/authorize?client_id=test&state=s"
+    );
+    let url = client.auth_login_start("microsoft", None).unwrap();
+    assert_eq!(url, "https://login.example/authorize?state=noinvite");
+
+    let requests = handle.join().unwrap();
+    let routes = [
+        "GET /v1/auth/providers ",
+        "POST /v1/auth/login/start ",
+        "POST /v1/auth/login/start ",
+    ];
+    for (request, route) in requests.iter().zip(routes) {
+        assert!(request.starts_with(route), "wrong route: {request}");
+        assert!(
+            !request.to_lowercase().contains("authorization:"),
+            "the public sign-in routes must not carry a bearer token: {request}"
+        );
+    }
+    let body = |index: usize| -> serde_json::Value {
+        serde_json::from_str(requests[index].split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    };
+    assert_eq!(
+        body(1),
+        serde_json::json!({"provider": "microsoft", "invite_code": "invite-code-123"})
+    );
+    assert_eq!(
+        body(2),
+        serde_json::json!({"provider": "microsoft"}),
+        "an empty invite code is omitted"
+    );
+}
+
+#[test]
+fn public_sign_in_errors_stay_numeric_and_unsafe_urls_are_rejected() {
+    let (client, handle) = public_server(vec![
+        (403, r#"{"error":"forbidden"}"#.into()),
+        (409, r#"{"error":"invalid_state"}"#.into()),
+        (
+            200,
+            r#"{"url":"http://login.example/authorize"}"#.into(),
+        ),
+        (200, r#"{"url":"javascript:alert(1)"}"#.into()),
+        (
+            200,
+            r#"{"providers":[{"id":"microsoft","enabled":true},{"id":"microsoft","enabled":false}]}"#
+                .into(),
+        ),
+    ]);
+    assert_eq!(
+        client.auth_login_start("microsoft", None).unwrap_err(),
+        ApiError::Http(403)
+    );
+    assert_eq!(
+        client.auth_login_start("microsoft", None).unwrap_err(),
+        ApiError::Http(409)
+    );
+    assert_eq!(
+        client.auth_login_start("microsoft", None).unwrap_err(),
+        ApiError::InvalidResponse
+    );
+    assert_eq!(
+        client.auth_login_start("microsoft", None).unwrap_err(),
+        ApiError::InvalidResponse
+    );
+    assert_eq!(
+        client.auth_providers().unwrap_err(),
+        ApiError::InvalidResponse
+    );
+    handle.join().unwrap();
+
+    // Local validation happens before any socket is opened.
+    let client = PublicApiClient::new(validate_endpoint("http://127.0.0.1:9").unwrap()).unwrap();
+    assert!(matches!(
+        client.auth_login_start("Microsoft", None),
+        Err(ApiError::Validation(_))
+    ));
+    assert!(matches!(
+        client.auth_login_start("", None),
+        Err(ApiError::Validation(_))
+    ));
+    assert!(matches!(
+        client.auth_login_start("microsoft", Some("bad\ncode")),
+        Err(ApiError::Validation(_))
+    ));
+    let long = "a".repeat(257);
+    assert!(matches!(
+        client.auth_login_start("microsoft", Some(long.as_str())),
+        Err(ApiError::Validation(_))
+    ));
+}
+
+#[test]
+fn telegram_status_link_and_unlink_use_their_routes_and_auth() {
+    let (client, handle) = server(vec![
+        (
+            200,
+            r#"{"enabled":true,"linked":true,"telegram_user_id":40,"telegram_chat_id":30,"linked_at":"2026-11-01T10:00:00Z"}"#
+                .into(),
+        ),
+        (
+            200,
+            r#"{"code":"0123456789abcdef","expires_at":"2026-11-01T10:10:00Z","instructions":"Send /start <code> to the SeraBot Telegram bot."}"#
+                .into(),
+        ),
+        (200, r#"{"linked":false,"was_linked":true}"#.into()),
+    ]);
+    let status = client.telegram().unwrap();
+    assert!(status.enabled);
+    assert!(status.linked);
+    assert_eq!(status.telegram_user_id, Some(40));
+    assert_eq!(status.telegram_chat_id, Some(30));
+    assert_eq!(status.chat_label().as_deref(), Some("chat 30"));
+    assert_eq!(status.linked_at.as_deref(), Some("2026-11-01T10:00:00Z"));
+
+    let link = client.telegram_link().unwrap();
+    assert_eq!(link.code, "0123456789abcdef");
+    assert_eq!(link.command(), "/start 0123456789abcdef");
+    assert_eq!(link.expires_at.as_deref(), Some("2026-11-01T10:10:00Z"));
+
+    assert!(client.telegram_unlink().unwrap());
+
+    let requests = handle.join().unwrap();
+    let routes = [
+        "GET /v1/telegram ",
+        "POST /v1/telegram/link ",
+        "DELETE /v1/telegram/link ",
+    ];
+    for (request, route) in requests.iter().zip(routes) {
+        assert!(request.starts_with(route), "wrong route: {request}");
+        assert!(
+            request
+                .to_lowercase()
+                .contains(&format!("authorization: bearer {TOKEN}\r\n")),
+            "Telegram routes are session-scoped: {request}"
+        );
+    }
+}
+
+#[test]
+fn telegram_reports_an_unlinked_user_and_rejects_unsafe_shapes() {
+    let (client, handle) = server(vec![(
+        200,
+        r#"{"enabled":false,"linked":false,"telegram_user_id":null,"telegram_chat_id":null,"linked_at":null}"#
+            .into(),
+    )]);
+    let status = client.telegram().unwrap();
+    assert!(!status.enabled);
+    assert!(!status.linked);
+    assert!(status.chat_label().is_none());
+    handle.join().unwrap();
+
+    let (client, handle) = server(vec![
+        (403, r#"{"error":"forbidden"}"#.into()),
+        (500, r#"{"error":"internal"}"#.into()),
+        (
+            200,
+            r#"{"enabled":true,"linked":true,"telegram_user_id":40,"telegram_chat_id":-1}"#.into(),
+        ),
+        (200, r#"{"code":"bad code","expires_at":"x"}"#.into()),
+        (200, r#"{"linked":true,"was_linked":true}"#.into()),
+    ]);
+    assert_eq!(client.telegram_link().unwrap_err(), ApiError::Http(403));
+    assert_eq!(client.telegram_unlink().unwrap_err(), ApiError::Http(500));
+    assert_eq!(client.telegram().unwrap_err(), ApiError::InvalidResponse);
+    assert_eq!(
+        client.telegram_link().unwrap_err(),
+        ApiError::InvalidResponse
+    );
+    assert_eq!(
+        client.telegram_unlink().unwrap_err(),
         ApiError::InvalidResponse
     );
     handle.join().unwrap();

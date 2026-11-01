@@ -24,12 +24,11 @@ use serabot::firecrawl::{
     FirecrawlClient, FirecrawlCrawlTool, FirecrawlLimits, FirecrawlMapTool, FirecrawlScrapeTool,
     FirecrawlSearchTool,
 };
+use serabot::fleet::FleetRegistry;
 use serabot::gateway::{Gateway, ToolRegistry};
-use serabot::llm::LlmClient;
 use serabot::maker::{
     ArtifactStore, DeckBuildTool, OneDriveListTool, OneDriveUploadTool, TelegramDocumentTool,
 };
-use serabot::onedrive::OneDriveClient;
 use serabot::policy::Policy;
 use serabot::retrieval::{Retriever, SqliteRetriever};
 use serabot::runtime::{CompositeNotifier, Notifier, RagSearchTool, Runtime, ScheduledPayload};
@@ -44,8 +43,8 @@ use serabot::telegram::TelegramClient;
 use serabot::tools::{
     DocumentIndexTool, FetchUrlTool, TimesheetTool, WatchNowTool, XlsxAnalyzeTool,
 };
+use serabot::user_secrets::UserSecrets;
 use serabot::util::sha256_hex;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Parser)]
@@ -166,6 +165,11 @@ async fn main() -> anyhow::Result<()> {
                 ensure_identity(&config.identity_path())?;
                 let store = SecretStore::open(&config)?;
                 store.save()?;
+                // The per-user credential store's master key is generated on
+                // first run too, so a fresh deployment has both tiers ready.
+                serabot::user_secrets::load_or_create_master_key(
+                    &config.path(&config.secrets.master_key_file),
+                )?;
                 println!(
                     "secret store initialized at {}",
                     config.secrets_path().display()
@@ -312,14 +316,15 @@ async fn main() -> anyhow::Result<()> {
                 config.database.busy_timeout_ms,
             )?;
             let embedder = FastEmbedder::from_config(&config)?;
-            let ingest = ingest_file(&store, &embedder, &path, &config.documents).await?;
+            let admin = store.admin_user_id()?;
+            let ingest = ingest_file(&store, &admin, &embedder, &path, &config.documents).await?;
             let retriever = SqliteRetriever::new(
                 store.clone(),
                 Arc::new(embedder),
                 config.documents.retrieval_k,
             );
             let chunks = retriever
-                .retrieve(&query, config.documents.retrieval_k)
+                .retrieve(&admin, &query, config.documents.retrieval_k)
                 .await?;
             println!(
                 "rag ok: document={} pages={} chunks={} retrieved={}",
@@ -385,18 +390,15 @@ fn check(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.database.busy_timeout_ms,
     )?;
     store.health()?;
-    for bot in &bots {
-        store.upsert_bot(
-            &bot.config.name,
-            &serde_json::to_value(&bot.config)?,
-            bot.config.enabled,
-        )?;
-    }
-    let catalog = SkillCatalog::load(&config)?;
+    let catalog = Arc::new(SkillCatalog::load(&config)?);
+    let fleet = FleetRegistry::new(config.clone(), store.clone(), bots, catalog.clone())?;
+    let admin_user_id = store.admin_user_id()?;
+    fleet.seed(&admin_user_id)?;
+    let bot_count = fleet.rows(&admin_user_id)?.len();
     println!(
         "ok: database={}, bots={}, skills={}, blocklist_terms={}, api={}, telegram={}",
         store.path().display(),
-        bots.len(),
+        bot_count,
         catalog.skill_ids().len(),
         policy.term_count(),
         config.api.enabled,
@@ -414,45 +416,61 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.embeddings.dimension,
         config.database.busy_timeout_ms,
     )?;
+    // The operator's account id (kv['admin_user_id']) is the owner of the
+    // server-level single-operator surfaces that remain in this phase: the
+    // configured document inbox, the scheduled routines, and the selftests.
+    let admin_user_id = store.admin_user_id()?;
     if store.reconcile_dispatching_actions()? > 0 {
         tracing::warn!("reconciled actions with unknown external outcomes");
     }
-    for bot in &bots {
-        store.upsert_bot(
-            &bot.config.name,
-            &serde_json::to_value(&bot.config)?,
-            bot.config.enabled,
-        )?;
+    // The repository fleet is the seed source. The admin gets its rows now;
+    // members are seeded at account creation and lazily on first fleet use.
+    let catalog = Arc::new(SkillCatalog::load(&config)?);
+    let fleet = Arc::new(FleetRegistry::new(
+        config.clone(),
+        store.clone(),
+        bots,
+        catalog.clone(),
+    )?);
+    let seeded = fleet.seed(&admin_user_id)?;
+    if seeded > 0 {
+        tracing::info!(bots = seeded, "seeded the admin fleet from templates");
     }
 
-    secrets
-        .require(&config.llm.api_key_secret)
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "{error}; run `serabot secrets set {}` first",
-                config.llm.api_key_secret
-            )
-        })?;
-    let llm = open_provider_client(
-        &config.llm.default_provider(),
+    // Per-user credential store (phase 4). The operator's existing age-store
+    // provider credentials are copied into the admin's rows exactly once;
+    // after that every provider client is built from the acting user's
+    // credential (own row or an active admin grant).
+    let users = Arc::new(UserSecrets::open(&config, store.clone())?);
+    let imported = serabot::providers::import_age_provider_credentials(
+        &config,
         &secrets,
-        config.llm.timeout_secs,
-        config.llm.max_output_tokens,
-    )?
-    .with_model(&config.llm.model);
-    let mut clients = std::collections::BTreeMap::from([("default".to_owned(), llm)]);
-    for (id, provider) in &config.llm.providers {
-        clients.insert(
-            id.clone(),
-            open_provider_client(
-                provider,
-                &secrets,
-                config.llm.timeout_secs,
-                config.llm.max_output_tokens,
-            )?,
+        &users,
+        &store,
+        &admin_user_id,
+    )?;
+    if imported > 0 {
+        tracing::info!(
+            providers = imported,
+            "imported the operator's provider credentials into the admin account"
         );
     }
-    let router = serabot::model_router::ModelRouter::new(&config.llm, clients)?;
+    // The admin must be able to route the default provider, exactly like the
+    // single-operator build required its key at startup. The credential may
+    // come from the age store (imported above) or from the console.
+    if users.resolve(&admin_user_id, "default")?.is_none() {
+        anyhow::bail!(
+            "no credential for the default provider; run `serabot secrets set {}` first or set it in the console",
+            config.llm.api_key_secret
+        );
+    }
+    let credentials = Arc::new(serabot::providers::UserProviderCredentials::new(
+        users.clone(),
+        secrets.clone(),
+        config.llm.timeout_secs,
+        config.llm.max_output_tokens,
+    ));
+    let router = serabot::model_router::ModelRouter::with_credentials(&config.llm, credentials)?;
 
     let embedder: Arc<dyn Embedder> = Arc::new(LazyEmbedder::new(
         &config.embeddings,
@@ -602,11 +620,18 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     let mut telegram: Option<Arc<TelegramClient>> = None;
     if config.telegram.enabled {
         let token = secrets.require(&config.telegram.bot_token_secret)?;
-        let client = Arc::new(TelegramClient::new(
-            token,
-            config.telegram.owner_user_id,
-            config.telegram.owner_chat_id,
-        )?);
+        let client = Arc::new(
+            TelegramClient::new(
+                token,
+                config.telegram.owner_user_id,
+                config.telegram.owner_chat_id,
+            )?
+            .with_store(store.clone()),
+        );
+        // The configured owner pair becomes the admin's binding before any
+        // notification can be routed; the polling loop repeats this
+        // idempotently.
+        client.bootstrap_admin_binding(&store)?;
         notifiers.push(client.clone());
         registry.register(TelegramDocumentTool::new(client.clone(), artifacts.clone()))?;
         telegram = Some(client);
@@ -678,63 +703,55 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             .context("build connector HTTP client")?;
         register_connector_tools(&mut registry, &config.connectors, &secrets, connector_http)?;
     }
+    let mut onedrive_registry: Option<Arc<serabot::onedrive::OneDriveRegistry>> = None;
     if config.onedrive.enabled {
-        let client_id = secrets.require(&config.onedrive.client_id_secret)?;
-        let refresh_token = secrets.require(&config.onedrive.refresh_token_secret)?;
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context("build OneDrive HTTP client")?;
-        let client = OneDriveClient::new(
-            http,
-            config.onedrive.graph_base.clone(),
-            config.onedrive.tenant.clone(),
-            client_id.to_owned(),
-            refresh_token.to_owned(),
-            config.onedrive.folder.clone(),
-            config.onedrive.conflict_behavior.clone(),
-        )?
-        .with_refresh_persistence(
-            secrets.clone(),
-            config.onedrive.refresh_token_secret.clone(),
-            None,
-        )?;
-        let client = Arc::new(Mutex::new(client));
+        if serabot::onedrive::import_global_refresh_token(
+            &config,
+            &secrets,
+            &users,
+            &store,
+            &admin_user_id,
+        )? {
+            tracing::info!(
+                "imported the global OneDrive refresh token into the admin credential store"
+            );
+        }
+        let onedrive_clients = Arc::new(serabot::onedrive::OneDriveRegistry::new(
+            &config,
+            &secrets,
+            users.clone(),
+        )?);
         registry.register(OneDriveUploadTool::new(
-            client.clone(),
+            onedrive_clients.clone(),
             artifacts.clone(),
             config.onedrive.folder.clone(),
         ))?;
         registry.register(OneDriveListTool::new(
-            client,
+            onedrive_clients.clone(),
             config.onedrive.folder.clone(),
         ))?;
+        onedrive_registry = Some(onedrive_clients);
     }
     if config.api.enabled {
         notifiers.push(Arc::new(ApiNotifier::new(store.clone())));
     }
-    let catalog = Arc::new(SkillCatalog::load(&config)?);
-    register_skill_tools(&mut registry, SkillRuntime::new(catalog, &bots))?;
-    let bot_map: Arc<std::collections::HashMap<String, serabot::config::LoadedBot>> = Arc::new(
-        bots.iter()
-            .cloned()
-            .map(|bot| (bot.config.name.clone(), bot))
-            .collect(),
-    );
+    register_skill_tools(
+        &mut registry,
+        SkillRuntime::new(catalog, fleet.clone(), store.clone()),
+    )?;
     registry.register(serabot::delegate::DelegateTool::new(
         store.clone(),
-        bot_map.clone(),
+        fleet.clone(),
         router.clone(),
     ))?;
     registry.register(serabot::teams::TeamAskTool::new(
         store.clone(),
-        bot_map.clone(),
+        fleet.clone(),
         router.clone(),
     ))?;
     registry.register(serabot::teams::TeamReplyTool::new(
         store.clone(),
-        bot_map,
+        fleet.clone(),
         router.clone(),
         policy.clone(),
     ))?;
@@ -748,12 +765,12 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.runtime.owner_standing_consent,
     );
 
-    let runtime = Runtime::new(
+    let runtime = Runtime::with_fleet(
         config.clone(),
         store.clone(),
         gateway,
         router,
-        bots,
+        fleet,
         notifier,
         shutdown.clone(),
     )?;
@@ -768,7 +785,9 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             config.clone(),
             artifacts.clone(),
             secrets.clone(),
-        );
+            users.clone(),
+            onedrive_registry.clone(),
+        )?;
         let app = serabot::api::router(state);
         let listener = tokio::net::TcpListener::bind(&config.server.bind)
             .await
@@ -801,6 +820,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         let directory = config.path(&config.documents.watch_dir);
         let documents = config.documents.clone();
         let embedder = embedder.clone();
+        let admin_index = admin_user_id.clone();
         let shutdown_index = shutdown.clone();
         services.push(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -808,7 +828,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
                 tokio::select! {
                     _ = shutdown_index.cancelled() => break,
                     _ = interval.tick() => {
-                        match index_directory(&store, embedder.as_ref(), &directory, &documents).await {
+                        match index_directory(&store, &admin_index, embedder.as_ref(), &directory, &documents).await {
                             Ok(report) => {
                                 if !report.ingested.is_empty() || !report.failures.is_empty() {
                                     tracing::info!(
@@ -833,9 +853,15 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             .timezone
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid schedule.timezone"))?;
-        ensure_daily_routine(&store, "morning_brief", &config.schedule.brief_time, tz)?;
+        ensure_daily_routine(
+            &store,
+            &admin_user_id,
+            "morning_brief",
+            &config.schedule.brief_time,
+            tz,
+        )?;
         for (index, time) in config.schedule.watch_times.iter().enumerate() {
-            ensure_daily_routine(&store, &format!("watch_{index}"), time, tz)?;
+            ensure_daily_routine(&store, &admin_user_id, &format!("watch_{index}"), time, tz)?;
         }
         let store = store.clone();
         let shutdown_schedule = shutdown.clone();
@@ -850,11 +876,18 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
                 tokio::select! {
                     _ = shutdown_schedule.cancelled() => break,
                     _ = interval.tick() => {
+                        // The scheduler claims routines across users (the
+                        // service is shared) and enqueues each occurrence
+                        // under the routine's owning user.
                         let due = due_routines(&store, chrono::Utc::now(), tz)?;
                         for routine in due {
                             let kind = if routine.name == "morning_brief" { "brief" } else { "watch" };
-                            let payload = ScheduledPayload { conversation_id: "owner".into() };
+                            let payload = ScheduledPayload {
+                                conversation_id: "owner".into(),
+                                user_id: routine.user_id.clone(),
+                            };
                             store.enqueue_task(
+                                &routine.user_id,
                                 kind,
                                 "watcher",
                                 &serde_json::to_value(&payload)?,
@@ -880,100 +913,66 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn muse_secret_names(config: &Config) -> (String, String) {
-    let profile = config
+/// The provider id a CLI login writes its credential under: the configured id
+/// when one matches, otherwise the canonical default for the kind.
+fn login_provider_id(config: &Config, kind: &str, aliases: &[&str]) -> String {
+    config
         .llm
         .providers
         .iter()
-        .find(|(id, profile)| *id == "muse-code" || profile.kind == "muse-code")
-        .map(|(_, profile)| profile);
-    let api = profile
-        .map(|profile| profile.api_key_secret.clone())
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| "muse_code_api_key".into());
-    let identity = profile
-        .map(|profile| profile.refresh_token_secret.clone())
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| "muse_code_identity".into());
-    (api, identity)
+        .find(|(id, profile)| aliases.iter().any(|alias| *id == *alias) || profile.kind == kind)
+        .map(|(id, _)| id.clone())
+        .unwrap_or_else(|| kind.to_owned())
 }
 
-fn open_provider_client(
-    profile: &serabot::config::ProviderConfig,
-    secrets: &SharedSecrets,
-    timeout_secs: u64,
-    max_output_tokens: u32,
-) -> anyhow::Result<LlmClient> {
-    use serabot::providers::{AuthPlan, OAuthMaterial, OAuthStyle, auth_plan, resolve_base_url};
-    let endpoint = resolve_base_url(&profile.kind, &profile.base_url)?;
-    let api_key = secrets.require(&profile.api_key_secret)?.to_owned();
-    let mut client = LlmClient::new(&endpoint, api_key, timeout_secs, max_output_tokens)?;
-    let plan = auth_plan(&profile.kind, &profile.auth)?;
-    if let AuthPlan::OAuth {
-        style,
-        token_url,
-        client_id_fallback,
-    } = plan
-        && !profile.refresh_token_secret.trim().is_empty()
-    {
-        let refresh_token = secrets.require(&profile.refresh_token_secret)?.to_owned();
-        let client_id = if profile.oauth_client_id_secret.trim().is_empty() {
-            client_id_fallback.unwrap_or("").to_owned()
-        } else {
-            secrets.require(&profile.oauth_client_id_secret)?.to_owned()
-        };
-        let client_secret = if profile.oauth_client_secret_secret.trim().is_empty() {
-            String::new()
-        } else {
-            secrets
-                .require(&profile.oauth_client_secret_secret)?
-                .to_owned()
-        };
-        if style == OAuthStyle::RefreshToken && client_secret.is_empty() {
-            anyhow::bail!("oauth client secret is required to refresh this provider");
-        }
-        client = client.with_oauth(OAuthMaterial {
-            style,
-            refresh_token,
-            token_url: token_url.to_owned(),
-            client_id,
-            client_secret,
-        })?;
-        if style == OAuthStyle::RefreshToken {
-            client = client.with_refresh_persistence(
-                secrets.clone(),
-                profile.refresh_token_secret.clone(),
-                profile.api_key_secret.clone(),
-            )?;
-        }
-    }
-    if serabot::providers::canonical_kind(&profile.kind)? == "google-antigravity" {
-        client = client.with_cloud_code(&profile.project_id)?;
-    }
-    Ok(client)
+/// Store a CLI login's tokens in the admin's per-user credential row.
+///
+/// Phase 4 moved provider credentials out of the age store: the admin account
+/// owns them, rotation writes back there, and the age store keeps only the
+/// server-level app registration values.
+fn store_admin_provider_login(
+    config: &Config,
+    provider: &str,
+    api_key: &str,
+    refresh_token: &str,
+) -> anyhow::Result<()> {
+    let store = Store::open(
+        config.database_path(),
+        config.embeddings.dimension,
+        config.database.busy_timeout_ms,
+    )?;
+    let admin = store.admin_user_id()?;
+    let users = UserSecrets::open(config, store)?;
+    let credential = serabot::user_secrets::ProviderCredential {
+        api_key: api_key.to_owned(),
+        refresh_token: refresh_token.to_owned(),
+    };
+    users.set(&admin, provider, &credential.encode()?)?;
+    println!("stored the {provider} credential for the admin account");
+    Ok(())
 }
 
 async fn login_antigravity(config_path: &std::path::Path) -> anyhow::Result<()> {
     use zeroize::Zeroize;
     let config = Config::load(config_path)?;
-    let mut store = SecretStore::open(&config)?;
-    let profile = config.llm.providers.iter().find(|(id, profile)| {
-        *id == "antigravity" || *id == "google-antigravity" || profile.kind == "google-antigravity"
-    });
-    let api_name = profile
-        .map(|(_, profile)| profile.api_key_secret.clone())
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| "antigravity_access_token".into());
-    let refresh_name = profile
-        .map(|(_, profile)| profile.refresh_token_secret.clone())
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| "antigravity_refresh_token".into());
+    let store = SecretStore::open(&config)?;
+    let provider_id = login_provider_id(
+        &config,
+        "google-antigravity",
+        &["antigravity", "google-antigravity"],
+    );
+    let profile = config
+        .llm
+        .providers
+        .iter()
+        .find(|(id, _)| id.as_str() == provider_id)
+        .map(|(_, profile)| profile);
     let secret_name = profile
-        .map(|(_, profile)| profile.oauth_client_secret_secret.clone())
+        .map(|profile| profile.oauth_client_secret_secret.clone())
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| "antigravity_oauth_client_secret".into());
     if let Some(id_name) = profile
-        .map(|(_, profile)| profile.oauth_client_id_secret.clone())
+        .map(|profile| profile.oauth_client_id_secret.clone())
         .filter(|name| !name.trim().is_empty())
     {
         let stored = store.require(&id_name)?;
@@ -988,10 +987,12 @@ async fn login_antigravity(config_path: &std::path::Path) -> anyhow::Result<()> 
     .await;
     client_secret.zeroize();
     let login = login?;
-    store.set(&api_name, login.access_token.expose_secret())?;
-    store.set(&refresh_name, login.refresh_token.expose_secret())?;
-    store.save()?;
-    println!("stored secret names {api_name} and {refresh_name}");
+    store_admin_provider_login(
+        &config,
+        &provider_id,
+        login.access_token.expose_secret(),
+        login.refresh_token.expose_secret(),
+    )?;
     match login.project_id.as_deref() {
         Some(project) => {
             println!("project_id={project}");
@@ -1008,8 +1009,7 @@ async fn login_antigravity(config_path: &std::path::Path) -> anyhow::Result<()> 
 
 async fn login_muse(config_path: &std::path::Path) -> anyhow::Result<()> {
     let config = Config::load(config_path)?;
-    let mut store = SecretStore::open(&config)?;
-    let (api_name, identity_name) = muse_secret_names(&config);
+    let provider_id = login_provider_id(&config, "muse-code", &["muse-code"]);
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
@@ -1019,9 +1019,10 @@ async fn login_muse(config_path: &std::path::Path) -> anyhow::Result<()> {
         println!("Code: {code}");
     })
     .await?;
-    store.set(&api_name, credentials.api_key.expose_secret())?;
-    store.set(&identity_name, credentials.identity_token.expose_secret())?;
-    store.save()?;
-    println!("stored secret names {api_name} and {identity_name}");
-    Ok(())
+    store_admin_provider_login(
+        &config,
+        &provider_id,
+        credentials.api_key.expose_secret(),
+        credentials.identity_token.expose_secret(),
+    )
 }

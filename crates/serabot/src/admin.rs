@@ -145,8 +145,9 @@ impl AdminOverlay {
                 config.audio.understanding_model = audio.understanding_model.clone();
             }
         }
-        // Bot behavior overrides are not TOML config; they are merged over the
-        // bot files by load_bots/list_configured_bots after startup.
+        // Bot behavior overrides are not TOML config; they are merged over
+        // the admin's own fleet rows by `fleet::FleetRegistry::load` after
+        // startup. Members' fleets never see them.
         config.bot_config_overrides = self.bot_configs.clone();
         Ok(())
     }

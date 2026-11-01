@@ -26,10 +26,23 @@
 //!
 //! The refresh token is supplied already decrypted by the caller. When the
 //! token endpoint returns a different refresh token, that value is written
-//! back to the age store. If an access-token secret name was configured, the
-//! new access token is written in the same update. A failed write fails the
-//! call. Tokens are never logged. Access tokens otherwise stay in memory until
-//! shortly before expiry. `Debug` output redacts tokens and the client id.
+//! back through the configured [`CredentialWriter`]: the age store for the
+//! legacy single-operator client, or the acting user's envelope-encrypted
+//! credential row for the per-user registry ([`OneDriveRegistry`], phase 4).
+//! If an access-token secret name was configured, the new access token is
+//! written in the same update. A failed write fails the call. Tokens are
+//! never logged. Access tokens otherwise stay in memory until shortly before
+//! expiry. `Debug` output redacts tokens and the client id.
+//!
+//! # Per-user drives
+//!
+//! [`OneDriveRegistry`] builds one client per user from that user's own
+//! sealed refresh token and the server app registration, caches it, and
+//! shares one `reqwest::Client`. A user with no connected drive gets an
+//! explicit "connect OneDrive first" error — never another account's drive.
+//! [`OneDriveConsent`] runs the authorization-code + PKCE consent against the
+//! shared Microsoft app registration; the callback seals the refresh token
+//! under the user's DEK before rendering a success page.
 //!
 //! # Outcome semantics
 //!
@@ -39,20 +52,28 @@
 //! not blindly retry such failures; the file may already exist. GET requests
 //! used for folder discovery are the only operations retried.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+use rand::RngCore;
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_RANGE, CONTENT_TYPE};
+use secrecy::ExposeSecret;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::debug;
 use url::Url;
 
-use crate::config::valid_secret_name;
+use crate::config::{Config, valid_secret_name};
 use crate::error::{Result, SeraError};
-use crate::secrets::SharedSecrets;
+use crate::secrets::{AgeCredentialWriter, CredentialWriter, SharedSecrets};
+use crate::store::Store;
+use crate::user_secrets::{UserCredentialWriter, UserSecrets};
 use crate::util::sha256_hex;
 
 /// Files smaller than this use a single `PUT .../content` request.
@@ -155,9 +176,7 @@ struct TokenState {
 }
 
 struct RefreshPersistence {
-    secrets: SharedSecrets,
-    refresh_secret_name: String,
-    access_secret_name: String,
+    writer: Arc<dyn CredentialWriter>,
 }
 
 /// Microsoft Graph OneDrive client for approved artifacts.
@@ -264,11 +283,19 @@ impl OneDriveClient {
                 "onedrive access secret name is invalid".into(),
             ));
         }
+        let writer =
+            AgeCredentialWriter::new(secrets, refresh_secret_name, access_secret_name.to_owned())?;
         self.persistence = Some(RefreshPersistence {
-            secrets,
-            refresh_secret_name: refresh_secret_name.to_owned(),
-            access_secret_name: access_secret_name.to_owned(),
+            writer: Arc::new(writer),
         });
+        Ok(self)
+    }
+
+    /// Write rotated refresh tokens back to a custom target. The per-user
+    /// registry passes a writer that replaces the acting user's sealed
+    /// OneDrive credential.
+    pub fn with_credential_writer(mut self, writer: Arc<dyn CredentialWriter>) -> Result<Self> {
+        self.persistence = Some(RefreshPersistence { writer });
         Ok(self)
     }
 
@@ -507,20 +534,9 @@ impl OneDriveClient {
             ));
         }
         let access = state.access_token.as_deref().unwrap_or("");
-        let mut updates = vec![(persistence.refresh_secret_name.as_str(), refresh)];
-        if !persistence.access_secret_name.is_empty()
-            && persistence.access_secret_name != persistence.refresh_secret_name
-        {
-            if access.is_empty() {
-                return Err(SeraError::Secrets(
-                    "OneDrive rotated refresh token was not persisted".into(),
-                ));
-            }
-            updates.push((persistence.access_secret_name.as_str(), access));
-        }
         persistence
-            .secrets
-            .persist(&updates)
+            .writer
+            .persist_rotation(refresh, Some(access).filter(|value| !value.is_empty()))
             .map_err(|error| redact_persist_error(error, &[refresh, access]))
     }
 
@@ -814,6 +830,478 @@ impl OneDriveClient {
             _ => Err(graph_error(response, "folder creation").await),
         }
     }
+}
+
+// ---- Per-user drives (multi-user phase 4) ----
+
+/// Provider name under which a user's OneDrive refresh token is stored in the
+/// per-user credential store.
+pub const ONEDRIVE_PROVIDER: &str = "onedrive";
+
+/// Delegated scopes requested at consent. `offline_access` is what makes
+/// Microsoft return a refresh token; `Files.ReadWrite` is the narrowest scope
+/// that can deliver into an existing dossier folder (see the module docs).
+pub const CONSENT_SCOPE: &str = "offline_access Files.ReadWrite User.Read";
+
+/// Redirect path registered on the app registration for the consent flow.
+pub const CONSENT_CALLBACK_PATH: &str = "/v1/connectors/onedrive/callback";
+
+/// Pending consent TTL: a browser round trip, not a session.
+pub const CONSENT_STATE_TTL: Duration = Duration::from_secs(10 * 60);
+/// Bound on simultaneous in-flight consents; exceeded, new starts fail closed.
+pub const MAX_PENDING_CONSENTS: usize = 64;
+/// Authorization codes are bounded; providers use far shorter strings.
+const MAX_CONSENT_CODE_CHARS: usize = 2048;
+
+/// One per-user client, cached for the process lifetime (restart-to-apply).
+type CachedClient = Arc<Mutex<OneDriveClient>>;
+
+/// Per-user OneDrive client registry.
+///
+/// Builds a [`OneDriveClient`] lazily from the acting user's sealed refresh
+/// token and the server app registration, and caches it. Every user gets a
+/// client for **their own** credential: there is no fallback to another
+/// account's drive, and a user with no connected drive gets an explicit
+/// "connect OneDrive first" error. Rotated refresh tokens are written back
+/// through the user credential store, never the age store.
+///
+/// One `reqwest::Client` is shared by every per-user client.
+pub struct OneDriveRegistry {
+    users: Arc<UserSecrets>,
+    http: reqwest::Client,
+    graph_base: String,
+    tenant: String,
+    client_id: String,
+    folder: String,
+    conflict_behavior: String,
+    token_url: Option<String>,
+    clients: std::sync::Mutex<std::collections::BTreeMap<String, CachedClient>>,
+}
+
+impl fmt::Debug for OneDriveRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OneDriveRegistry")
+            .field("graph_base", &self.graph_base)
+            .field("tenant", &self.tenant)
+            .field("folder", &self.folder)
+            .field("client_id", &"<redacted>")
+            .field(
+                "cached_users",
+                &self
+                    .clients
+                    .lock()
+                    .map(|clients| clients.len())
+                    .unwrap_or(0),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl OneDriveRegistry {
+    /// Build the registry from validated configuration. The client id is
+    /// required from the age store at startup; a missing value fails
+    /// construction so the tools never run half-configured.
+    pub fn new(config: &Config, secrets: &SharedSecrets, users: Arc<UserSecrets>) -> Result<Self> {
+        if !config.onedrive.enabled {
+            return Err(SeraError::Config("onedrive is not enabled".into()));
+        }
+        let client_id = secrets.require(&config.onedrive.client_id_secret)?;
+        let client_id = validate_secret_like(&client_id, "client_id")?;
+        let tenant = validate_tenant(&config.onedrive.tenant)?;
+        // Validate the destination folder once at startup, before any call.
+        validate_segments(&config.onedrive.folder, MAX_FOLDER_DEPTH, "base_folder")
+            .map_err(SeraError::Config)?;
+        ConflictBehavior::parse(&config.onedrive.conflict_behavior)?;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| SeraError::Internal(format!("OneDrive HTTP client: {error}")))?;
+        Ok(Self {
+            users,
+            http,
+            graph_base: config.onedrive.graph_base.clone(),
+            tenant,
+            client_id,
+            folder: config.onedrive.folder.clone(),
+            conflict_behavior: config.onedrive.conflict_behavior.clone(),
+            token_url: None,
+            clients: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        })
+    }
+
+    /// Override the token endpoint. Intended for tests; HTTPS (or loopback
+    /// HTTP) is enforced exactly like the production endpoint.
+    pub fn with_token_url(mut self, token_url: impl Into<String>) -> Result<Self> {
+        self.token_url = Some(validate_endpoint(&token_url.into(), "token_url", false)?);
+        Ok(self)
+    }
+
+    /// Whether the acting user has connected their own drive. Row existence
+    /// only: nothing is decrypted and no token is exposed.
+    pub fn connected(&self, user_id: &str) -> Result<bool> {
+        Ok(self
+            .users
+            .credential_status(user_id, ONEDRIVE_PROVIDER)?
+            .own)
+    }
+
+    /// Drop the cached client for one user (disconnect, credential change).
+    pub fn invalidate(&self, user_id: &str) {
+        self.clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(user_id);
+    }
+
+    /// The acting user's client, built on first use.
+    ///
+    /// Fails closed when the user has not connected a drive: the error says
+    /// so explicitly and never falls back to the admin's (or any other)
+    /// credential.
+    pub fn client_for(&self, user_id: &str) -> Result<CachedClient> {
+        if let Some(client) = self
+            .clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(user_id)
+            .cloned()
+        {
+            return Ok(client);
+        }
+        let refresh = self.users.get(user_id, ONEDRIVE_PROVIDER)?.ok_or_else(|| {
+            SeraError::Forbidden(
+                "OneDrive is not connected for this account; connect it from the console first"
+                    .into(),
+            )
+        })?;
+        let mut client = OneDriveClient::new(
+            self.http.clone(),
+            self.graph_base.clone(),
+            self.tenant.clone(),
+            self.client_id.clone(),
+            refresh.expose_secret().to_owned(),
+            self.folder.clone(),
+            self.conflict_behavior.clone(),
+        )?
+        .with_credential_writer(Arc::new(UserCredentialWriter::plain(
+            self.users.clone(),
+            user_id,
+            ONEDRIVE_PROVIDER,
+        )))?;
+        if let Some(token_url) = &self.token_url {
+            client.set_token_url(token_url.clone())?;
+        }
+        let client = Arc::new(Mutex::new(client));
+        // A concurrent caller may have built the same user's client first;
+        // keep the first one so every caller shares one token state.
+        Ok(self
+            .clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(user_id.to_owned())
+            .or_insert(client)
+            .clone())
+    }
+}
+
+/// Import the legacy global OneDrive refresh token into the admin's credential
+/// row, once.
+///
+/// Idempotent and lossless: the value is copied verbatim, only when the admin
+/// has no OneDrive credential yet, and a `kv` marker makes the import
+/// once-only so a later disconnect is not undone by a restart. Nothing secret
+/// is logged.
+pub fn import_global_refresh_token(
+    config: &Config,
+    secrets: &SharedSecrets,
+    users: &UserSecrets,
+    store: &Store,
+    admin_id: &str,
+) -> Result<bool> {
+    const MARKER: &str = "onedrive_global_imported";
+    if !config.onedrive.enabled {
+        return Ok(false);
+    }
+    if store.kv_get(MARKER)?.is_some() {
+        return Ok(false);
+    }
+    if users.credential_status(admin_id, ONEDRIVE_PROVIDER)?.own {
+        store.kv_set(MARKER, "1")?;
+        return Ok(false);
+    }
+    let Some(token) = secrets.get(&config.onedrive.refresh_token_secret) else {
+        // Nothing to import yet; stay unmarked so a later CLI-set token is
+        // picked up on the next start.
+        return Ok(false);
+    };
+    users.set(admin_id, ONEDRIVE_PROVIDER, &token)?;
+    store.kv_set(MARKER, "1")?;
+    Ok(true)
+}
+
+/// A pending browser consent: the state binds the callback to the user and
+/// the PKCE verifier.
+struct PendingConsent {
+    user_id: String,
+    verifier: String,
+    created: Instant,
+}
+
+/// OneDrive consent service: authorization code + PKCE against the shared
+/// Microsoft app registration, per user.
+///
+/// The callback is public (the browser is redirected by Microsoft); the
+/// `state` value is the only thing that binds it to a user, exactly like the
+/// sign-in callback. The refresh token is sealed under the user's DEK before
+/// the success page is rendered; no token ever appears in a response.
+pub struct OneDriveConsent {
+    client_id: String,
+    redirect_url: String,
+    authorize_url: String,
+    token_url: String,
+    scope: String,
+    http: reqwest::Client,
+    users: Arc<UserSecrets>,
+    pending: Mutex<HashMap<String, PendingConsent>>,
+    ttl: Duration,
+}
+
+impl fmt::Debug for OneDriveConsent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OneDriveConsent")
+            .field("redirect_url", &self.redirect_url)
+            .field("authorize_url", &self.authorize_url)
+            .field("client_id", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl OneDriveConsent {
+    /// Build the service when OneDrive is enabled; `None` otherwise so every
+    /// consent endpoint fails closed.
+    pub fn new(
+        config: &Config,
+        secrets: &SharedSecrets,
+        users: Arc<UserSecrets>,
+    ) -> Result<Option<Self>> {
+        if !config.onedrive.enabled {
+            return Ok(None);
+        }
+        let client_id = secrets.require(&config.onedrive.client_id_secret)?;
+        let client_id = validate_secret_like(&client_id, "client_id")?;
+        let tenant = validate_tenant(&config.onedrive.tenant)?;
+        let base = config
+            .onedrive
+            .effective_redirect_base(&config.auth)
+            .trim()
+            .trim_end_matches('/')
+            .to_owned();
+        let redirect_url = if base.is_empty() {
+            String::new()
+        } else {
+            validate_endpoint(
+                &format!("{base}{CONSENT_CALLBACK_PATH}"),
+                "onedrive redirect_url",
+                false,
+            )?
+        };
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| {
+                SeraError::Internal(format!("OneDrive consent HTTP client: {error}"))
+            })?;
+        Ok(Some(Self {
+            client_id,
+            redirect_url,
+            authorize_url: format!(
+                "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize"
+            ),
+            token_url: format!("https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"),
+            scope: CONSENT_SCOPE.to_owned(),
+            http,
+            users,
+            pending: Mutex::new(HashMap::new()),
+            ttl: CONSENT_STATE_TTL,
+        }))
+    }
+
+    /// Override the provider endpoints. Intended for tests; HTTPS (or
+    /// loopback HTTP) is enforced exactly like the production endpoints.
+    pub fn set_endpoints(
+        &mut self,
+        authorize_url: impl Into<String>,
+        token_url: impl Into<String>,
+    ) -> Result<()> {
+        self.authorize_url = validate_endpoint(&authorize_url.into(), "authorize_url", false)?;
+        self.token_url = validate_endpoint(&token_url.into(), "token_url", false)?;
+        Ok(())
+    }
+
+    /// Override the pending-consent TTL. Intended for tests; bounded to at
+    /// most a day.
+    pub fn set_ttl(&mut self, ttl: Duration) -> Result<()> {
+        if ttl > Duration::from_secs(24 * 60 * 60) {
+            return Err(SeraError::Validation(
+                "consent ttl must be at most one day".into(),
+            ));
+        }
+        self.ttl = ttl;
+        Ok(())
+    }
+
+    /// Start a consent: bind a fresh state + PKCE verifier to the acting user
+    /// and return the provider's authorize URL.
+    pub async fn start(&self, user_id: &str) -> Result<String> {
+        if self.redirect_url.is_empty() {
+            return Err(SeraError::Config(
+                "OneDrive consent needs a public base URL: set onedrive.redirect_base_url or auth.base_url"
+                    .into(),
+            ));
+        }
+        let (challenge, verifier) = pkce_pair();
+        let mut state_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut state_bytes);
+        let state = hex::encode(state_bytes);
+        let mut url = Url::parse(&self.authorize_url)
+            .map_err(|_| SeraError::Config("OneDrive authorize URL is invalid".into()))?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("client_id", &self.client_id);
+            query.append_pair("response_type", "code");
+            query.append_pair("redirect_uri", &self.redirect_url);
+            query.append_pair("response_mode", "query");
+            query.append_pair("scope", &self.scope);
+            query.append_pair("state", &state);
+            query.append_pair("code_challenge", &challenge);
+            query.append_pair("code_challenge_method", "S256");
+        }
+
+        let mut pending = self.pending.lock().await;
+        let now = Instant::now();
+        pending.retain(|_, consent| now.duration_since(consent.created) < self.ttl);
+        if pending.len() >= MAX_PENDING_CONSENTS {
+            return Err(SeraError::InvalidState(
+                "too many OneDrive consents are in flight; try again shortly".into(),
+            ));
+        }
+        pending.insert(
+            state,
+            PendingConsent {
+                user_id: user_id.to_owned(),
+                verifier,
+                created: now,
+            },
+        );
+        Ok(url.to_string())
+    }
+
+    /// Complete a consent: exchange the code with the PKCE verifier and seal
+    /// the refresh token under the user's DEK. Returns the user id.
+    pub async fn complete(&self, state: &str, code: &str) -> Result<String> {
+        let state = state.trim();
+        if state.is_empty() || state.len() > 256 {
+            return Err(SeraError::InvalidState(
+                "unknown or expired OneDrive consent state".into(),
+            ));
+        }
+        let code = code.trim();
+        if code.is_empty()
+            || code.len() > MAX_CONSENT_CODE_CHARS
+            || code.chars().any(char::is_control)
+        {
+            return Err(SeraError::Validation(
+                "the OneDrive authorization code is invalid".into(),
+            ));
+        }
+        let pending = {
+            let mut pending = self.pending.lock().await;
+            let consent = pending.remove(state).ok_or_else(|| {
+                SeraError::InvalidState("unknown or expired OneDrive consent state".into())
+            })?;
+            if Instant::now().duration_since(consent.created) > self.ttl {
+                return Err(SeraError::InvalidState(
+                    "unknown or expired OneDrive consent state".into(),
+                ));
+            }
+            consent
+        };
+
+        let response = self
+            .http
+            .post(&self.token_url)
+            .form(&[
+                ("client_id", self.client_id.as_str()),
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("redirect_uri", self.redirect_url.as_str()),
+                ("code_verifier", pending.verifier.as_str()),
+                ("scope", self.scope.as_str()),
+            ])
+            .send()
+            .await
+            .map_err(|error| transport_error("consent token exchange", error, false))?;
+        let status = response.status();
+        let body = read_limited(response, MAX_RESPONSE_BYTES)
+            .await
+            .map_err(|_| {
+                SeraError::External("OneDrive consent returned an unreadable response".into())
+            })?;
+        if !status.is_success() {
+            let code = serde_json::from_slice::<TokenResponse>(&body)
+                .ok()
+                .and_then(|token| token.error)
+                .filter(|code| !code.is_empty())
+                .map(|code| sanitize_code(&code))
+                .unwrap_or_else(|| "unknown_error".into());
+            return Err(SeraError::External(format!(
+                "OneDrive consent was rejected (HTTP {}): {code}",
+                status.as_u16()
+            )));
+        }
+        let token: TokenResponse = serde_json::from_slice(&body)
+            .map_err(|_| SeraError::External("invalid OneDrive consent response".into()))?;
+        if let Some(error) = token.error.as_deref().filter(|value| !value.is_empty()) {
+            return Err(SeraError::External(format!(
+                "OneDrive consent was rejected: {}",
+                sanitize_code(error)
+            )));
+        }
+        let refresh = token
+            .refresh_token
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| {
+                SeraError::External(
+                    "Microsoft did not return a refresh token; consent may have been declined"
+                        .into(),
+                )
+            })?;
+        if !is_plausible_token(&refresh) {
+            return Err(SeraError::External(
+                "Microsoft returned an invalid refresh token".into(),
+            ));
+        }
+        self.users
+            .set(&pending.user_id, ONEDRIVE_PROVIDER, &refresh)?;
+        Ok(pending.user_id)
+    }
+}
+
+/// A PKCE verifier/challenge pair (S256), URL-safe and unpadded.
+fn pkce_pair() -> (String, String) {
+    let mut verifier_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut verifier_bytes);
+    let verifier = base64_url(&verifier_bytes);
+    let challenge = base64_url(&Sha256::digest(verifier.as_bytes()));
+    (challenge, verifier)
+}
+
+fn base64_url(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 #[derive(Deserialize)]
@@ -2393,5 +2881,353 @@ mod tests {
         fn matches(&self, request: &Request) -> bool {
             request.headers.get("authorization").is_none()
         }
+    }
+
+    // ---- Per-user drives (multi-user phase 4) ----
+
+    fn per_user_store() -> (Store, Arc<UserSecrets>, String, String) {
+        let store = Store::open_in_memory(384).unwrap();
+        let users = Arc::new(UserSecrets::with_master_key(store.clone(), [5u8; 32]).unwrap());
+        let alice = store
+            .create_user("microsoft:alice", "alice@example.example", "Alice")
+            .unwrap()
+            .id;
+        let bob = store
+            .create_user("microsoft:bob", "bob@example.example", "Bob")
+            .unwrap()
+            .id;
+        (store, users, alice, bob)
+    }
+
+    fn registry_config(server: &MockServer) -> Config {
+        let mut config = Config::default();
+        config.onedrive.enabled = true;
+        config.onedrive.graph_base = format!("{}/v1.0", server.uri());
+        config.onedrive.folder = "SeraBot".into();
+        config
+    }
+
+    fn registry_secrets() -> SharedSecrets {
+        SharedSecrets::new(SecretStore::from_map(BTreeMap::from([(
+            "onedrive_client_id".into(),
+            "client-1".into(),
+        )])))
+    }
+
+    async fn mount_folder_exists_once(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path(FOLDER_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "folder"})))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn per_user_clients_use_their_own_refresh_token() {
+        let server = MockServer::start().await;
+        let (_store, users, alice, bob) = per_user_store();
+        users
+            .set(&alice, ONEDRIVE_PROVIDER, "refresh-alice")
+            .unwrap();
+        users.set(&bob, ONEDRIVE_PROVIDER, "refresh-bob").unwrap();
+        for (refresh, access) in [
+            ("refresh-alice", "access-alice"),
+            ("refresh-bob", "access-bob"),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .and(BodyContains(refresh))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "access_token": access,
+                    "expires_in": 3600,
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        mount_folder_exists_once(&server).await;
+        for access in ["access-alice", "access-bob"] {
+            Mock::given(method("PUT"))
+                .and(path(CONTENT_PATH))
+                .and(header("authorization", format!("Bearer {access}")))
+                .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                    "id": format!("item-{access}"),
+                    "name": "report.pdf",
+                    "size": 3,
+                    "webUrl": "https://example.example/report.pdf",
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let registry = Arc::new(
+            OneDriveRegistry::new(
+                &registry_config(&server),
+                &registry_secrets(),
+                users.clone(),
+            )
+            .unwrap()
+            .with_token_url(format!("{}/token", server.uri()))
+            .unwrap(),
+        );
+        for user in [&alice, &bob] {
+            let client = registry.client_for(user).unwrap();
+            let result = client
+                .lock()
+                .await
+                .upload("report.pdf", b"abc".to_vec(), "application/pdf", None)
+                .await
+                .unwrap();
+            assert!(result.id.starts_with("item-access-"));
+        }
+        server.verify().await;
+        // The cache returns the same client for the same user.
+        assert!(Arc::ptr_eq(
+            &registry.client_for(&alice).unwrap(),
+            &registry.client_for(&alice).unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_user_without_a_connected_drive_fails_closed() {
+        let server = MockServer::start().await;
+        let (_store, users, alice, _bob) = per_user_store();
+        let registry = OneDriveRegistry::new(
+            &registry_config(&server),
+            &registry_secrets(),
+            users.clone(),
+        )
+        .unwrap();
+        let error = registry.client_for(&alice).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("connect it from the console first")
+        );
+        assert!(!registry.connected(&alice).unwrap());
+        // The error never names another account or a token.
+        assert!(!error.to_string().contains("refresh"));
+    }
+
+    #[tokio::test]
+    async fn a_rotated_refresh_token_is_written_back_to_the_user_store() {
+        let server = MockServer::start().await;
+        let (_store, users, alice, _bob) = per_user_store();
+        users.set(&alice, ONEDRIVE_PROVIDER, "refresh-old").unwrap();
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(BodyContains("refresh_token=refresh-old"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-new",
+                "refresh_token": "refresh-new",
+                "expires_in": 3600,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_folder_exists_once(&server).await;
+        Mock::given(method("PUT"))
+            .and(path(CONTENT_PATH))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "item-1",
+                "name": "report.pdf",
+                "size": 3,
+            })))
+            .mount(&server)
+            .await;
+        let registry = OneDriveRegistry::new(
+            &registry_config(&server),
+            &registry_secrets(),
+            users.clone(),
+        )
+        .unwrap()
+        .with_token_url(format!("{}/token", server.uri()))
+        .unwrap();
+        registry
+            .client_for(&alice)
+            .unwrap()
+            .lock()
+            .await
+            .upload("report.pdf", b"abc".to_vec(), "application/pdf", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            users
+                .get(&alice, ONEDRIVE_PROVIDER)
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
+            "refresh-new"
+        );
+    }
+
+    #[tokio::test]
+    async fn consent_start_and_complete_store_the_refresh_token() {
+        let server = MockServer::start().await;
+        let (_store, users, alice, bob) = per_user_store();
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(BodyContains("grant_type=authorization_code"))
+            .and(BodyContains("code_verifier="))
+            .and(BodyContains("code=synthetic-code"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "refresh_token": "refresh-consent",
+                "access_token": "access-consent",
+                "expires_in": 3600,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        config.onedrive.enabled = true;
+        config.onedrive.redirect_base_url = "https://bot.example.example".into();
+        let mut consent = OneDriveConsent::new(&config, &registry_secrets(), users.clone())
+            .unwrap()
+            .unwrap();
+        consent
+            .set_endpoints(
+                format!("{}/authorize", server.uri()),
+                format!("{}/token", server.uri()),
+            )
+            .unwrap();
+
+        let url = consent.start(&alice).await.unwrap();
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("scope=offline_access"));
+        assert!(url.contains("redirect_uri=https%3A%2F%2Fbot.example.example"));
+        let parsed = Url::parse(&url).unwrap();
+        let state = parsed
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.into_owned())
+            .unwrap();
+
+        assert_eq!(
+            consent.complete(&state, "synthetic-code").await.unwrap(),
+            alice
+        );
+        assert_eq!(
+            users
+                .get(&alice, ONEDRIVE_PROVIDER)
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
+            "refresh-consent"
+        );
+        // The state is single use and Bob never sees Alice's token.
+        assert!(consent.complete(&state, "synthetic-code").await.is_err());
+        assert!(users.get(&bob, ONEDRIVE_PROVIDER).unwrap().is_none());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn consent_without_a_public_base_url_fails_closed() {
+        let (_store, users, alice, _bob) = per_user_store();
+        let mut config = Config::default();
+        config.onedrive.enabled = true;
+        let consent = OneDriveConsent::new(&config, &registry_secrets(), users)
+            .unwrap()
+            .unwrap();
+        let error = consent.start(&alice).await.unwrap_err();
+        assert!(error.to_string().contains("public base URL"));
+    }
+
+    #[tokio::test]
+    async fn consent_rejects_an_unknown_state_and_a_missing_refresh_token() {
+        let server = MockServer::start().await;
+        let (_store, users, alice, _bob) = per_user_store();
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "access-only",
+            })))
+            .mount(&server)
+            .await;
+        let mut config = Config::default();
+        config.onedrive.enabled = true;
+        config.onedrive.redirect_base_url = "https://bot.example.example".into();
+        let mut consent = OneDriveConsent::new(&config, &registry_secrets(), users.clone())
+            .unwrap()
+            .unwrap();
+        consent
+            .set_endpoints(
+                format!("{}/authorize", server.uri()),
+                format!("{}/token", server.uri()),
+            )
+            .unwrap();
+        assert!(
+            consent
+                .complete("no-such-state", "synthetic-code")
+                .await
+                .is_err()
+        );
+        let url = consent.start(&alice).await.unwrap();
+        let state = Url::parse(&url)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .map(|(_, value)| value.into_owned())
+            .unwrap();
+        let error = consent
+            .complete(&state, "synthetic-code")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("refresh token"));
+        assert!(users.get(&alice, ONEDRIVE_PROVIDER).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_global_refresh_token_imports_once_and_respects_a_disconnect() {
+        let store = Store::open_in_memory(384).unwrap();
+        let users = UserSecrets::with_master_key(store.clone(), [6u8; 32]).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let mut config = Config::default();
+        config.onedrive.enabled = true;
+        let secrets = SharedSecrets::new(SecretStore::from_map(BTreeMap::from([(
+            "onedrive_refresh_token".into(),
+            "global-refresh".into(),
+        )])));
+
+        assert!(import_global_refresh_token(&config, &secrets, &users, &store, &admin).unwrap());
+        assert_eq!(
+            users
+                .get(&admin, ONEDRIVE_PROVIDER)
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
+            "global-refresh"
+        );
+        // Idempotent: a second startup imports nothing.
+        assert!(!import_global_refresh_token(&config, &secrets, &users, &store, &admin).unwrap());
+        // A disconnect is not undone by the next restart.
+        users.delete(&admin, ONEDRIVE_PROVIDER).unwrap();
+        assert!(!import_global_refresh_token(&config, &secrets, &users, &store, &admin).unwrap());
+        assert!(users.get(&admin, ONEDRIVE_PROVIDER).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_existing_admin_credential_is_never_overwritten_by_the_import() {
+        let store = Store::open_in_memory(384).unwrap();
+        let users = UserSecrets::with_master_key(store.clone(), [6u8; 32]).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let mut config = Config::default();
+        config.onedrive.enabled = true;
+        let secrets = SharedSecrets::new(SecretStore::from_map(BTreeMap::from([(
+            "onedrive_refresh_token".into(),
+            "global-refresh".into(),
+        )])));
+        users
+            .set(&admin, ONEDRIVE_PROVIDER, "consent-refresh")
+            .unwrap();
+        assert!(!import_global_refresh_token(&config, &secrets, &users, &store, &admin).unwrap());
+        assert_eq!(
+            users
+                .get(&admin, ONEDRIVE_PROVIDER)
+                .unwrap()
+                .unwrap()
+                .expose_secret(),
+            "consent-refresh"
+        );
     }
 }

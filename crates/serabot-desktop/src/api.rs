@@ -161,6 +161,14 @@ pub fn valid_provider_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// A sign-in provider id: lowercase ASCII letters, digits or `-`.
+pub fn valid_auth_provider_id(id: &str) -> bool {
+    (1..=32).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 pub fn valid_secret_name(name: &str) -> bool {
     (1..=128).contains(&name.len())
         && name
@@ -949,6 +957,95 @@ pub struct AdminRestart {
     pub restarting: bool,
 }
 
+/// One row of `GET /v1/auth/providers`. The list is public and ordered by the
+/// server; clients render it in that order and never invent a provider.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct AuthProvider {
+    pub id: String,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl AuthProvider {
+    /// The button label for a known provider, else a humanized id.
+    pub fn label(&self) -> String {
+        match self.id.as_str() {
+            "microsoft" => "Microsoft".into(),
+            "google" => "Google".into(),
+            "github" => "GitHub".into(),
+            other => humanize_provider_id(other),
+        }
+    }
+
+    /// Providers the server keeps visible but disabled in v1.
+    pub fn coming_soon(&self) -> bool {
+        matches!(self.id.as_str(), "google" | "github")
+    }
+}
+
+fn humanize_provider_id(id: &str) -> String {
+    id.split(['-', '_'])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The acting user's Telegram binding: `GET /v1/telegram`. The bot token never
+/// appears here; the ids are the user's own.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct TelegramStatus {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub linked: bool,
+    #[serde(default)]
+    pub telegram_user_id: Option<i64>,
+    #[serde(default)]
+    pub telegram_chat_id: Option<i64>,
+    #[serde(default)]
+    pub linked_at: Option<String>,
+}
+
+impl TelegramStatus {
+    /// The linked chat, when the server reports one.
+    pub fn chat_label(&self) -> Option<String> {
+        self.telegram_chat_id.map(|id| format!("chat {id}"))
+    }
+}
+
+/// A single-use Telegram linking code from `POST /v1/telegram/link`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct TelegramLink {
+    pub code: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+}
+
+impl TelegramLink {
+    /// The exact command the member sends to the bot.
+    pub fn command(&self) -> String {
+        format!("/start {}", self.code)
+    }
+}
+
+/// Result of `DELETE /v1/telegram/link`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct TelegramUnlink {
+    #[serde(default)]
+    pub linked: bool,
+    #[serde(default)]
+    pub was_linked: bool,
+}
+
 pub const MEMORY_KINDS: &[&str] = &["preference", "fact", "decision", "context", "note"];
 pub const MAX_MEMORY_CONTENT_CHARS: usize = 4_000;
 pub const MAX_MEMORY_SOURCE_CHARS: usize = 512;
@@ -1308,6 +1405,23 @@ pub(crate) struct ConnectorsEnvelope {
     pub(crate) connectors: Vec<ConnectorStatus>,
 }
 
+/// Build the one HTTP client shape both the authenticated and the public
+/// clients use: no retries, cookies, redirects, environment proxies or
+/// persistent storage.
+fn build_http_client(endpoint: &Url) -> Result<Client, ApiError> {
+    let mut builder = Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
+        .retry(reqwest::retry::never())
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(20));
+    if endpoint.host_str() == Some("localhost") {
+        // Never send a plaintext token to a DNS-resolved non-loopback address.
+        builder = builder.resolve("localhost", SocketAddr::from(([127, 0, 0, 1], 0)));
+    }
+    builder.build().map_err(|_| ApiError::Transport)
+}
+
 /// Construct and use only on a worker thread. No retries, cookies, redirects,
 /// environment proxies or persistent storage. Errors never retain raw bodies/URLs.
 pub struct ApiClient {
@@ -1324,17 +1438,7 @@ impl ApiClient {
                 "API token must contain 32–512 visible ASCII characters, without spaces.",
             ));
         }
-        let mut builder = Client::builder()
-            .redirect(Policy::none())
-            .no_proxy()
-            .retry(reqwest::retry::never())
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(20));
-        if endpoint.host_str() == Some("localhost") {
-            // Never send a plaintext token to a DNS-resolved non-loopback address.
-            builder = builder.resolve("localhost", SocketAddr::from(([127, 0, 0, 1], 0)));
-        }
-        let client = builder.build().map_err(|_| ApiError::Transport)?;
+        let client = build_http_client(&endpoint)?;
         Ok(Self {
             client,
             endpoint,
@@ -2013,6 +2117,34 @@ impl ApiClient {
         Ok(response.providers)
     }
 
+    /// The acting user's Telegram binding: `GET /v1/telegram`.
+    pub fn telegram(&self) -> Result<TelegramStatus, ApiError> {
+        let status: TelegramStatus = self.get(&["v1", "telegram"], &[])?;
+        check_telegram_status(status)
+    }
+
+    /// Mint a single-use linking code: `POST /v1/telegram/link`.
+    pub fn telegram_link(&self) -> Result<TelegramLink, ApiError> {
+        let link: TelegramLink =
+            self.request::<TelegramLink, ()>(Method::POST, &["v1", "telegram", "link"], &[], None)?;
+        check_telegram_link(link)
+    }
+
+    /// Unlink the acting user's chat: `DELETE /v1/telegram/link`. Returns
+    /// whether a binding was actually removed.
+    pub fn telegram_unlink(&self) -> Result<bool, ApiError> {
+        let response: TelegramUnlink = self.request::<TelegramUnlink, ()>(
+            Method::DELETE,
+            &["v1", "telegram", "link"],
+            &[],
+            None,
+        )?;
+        if response.linked {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(response.was_linked)
+    }
+
     pub fn connectors(&self) -> Result<Vec<ConnectorStatus>, ApiError> {
         let response: ConnectorsEnvelope = self.get(&["v1", "connectors"], &[])?;
         Self::normalize_and_validate_connectors(response)
@@ -2537,6 +2669,114 @@ impl ApiClient {
     }
 }
 
+/// Client for the public sign-in entry points. It never sends a bearer token:
+/// the caller by definition has no session yet, and a stale token must not
+/// travel to an endpoint that does not need it.
+pub struct PublicApiClient {
+    client: Client,
+    endpoint: Url,
+}
+
+impl PublicApiClient {
+    pub fn new(endpoint: Url) -> Result<Self, ApiError> {
+        validate_endpoint(endpoint.as_str())?;
+        let client = build_http_client(&endpoint)?;
+        Ok(Self { client, endpoint })
+    }
+
+    fn get<T: DeserializeOwned>(&self, route: &[&str]) -> Result<T, ApiError> {
+        self.request::<T, ()>(Method::GET, route, None)
+    }
+
+    fn request<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        method: Method,
+        route: &[&str],
+        body: Option<&B>,
+    ) -> Result<T, ApiError> {
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .map_err(|_| ApiError::InvalidResponse)?
+            .clear()
+            .extend(route);
+        let mut request = self.client.request(method, url);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request.send().map_err(|_| ApiError::Transport)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ApiError::Http(status.as_u16()));
+        }
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_RESPONSE)
+        {
+            return Err(ApiError::TooLarge);
+        }
+        let mut bytes = Zeroizing::new(Vec::new());
+        response
+            .take(MAX_RESPONSE + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ApiError::Transport)?;
+        if bytes.len() as u64 > MAX_RESPONSE {
+            return Err(ApiError::TooLarge);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| ApiError::InvalidResponse)
+    }
+
+    /// `GET /v1/auth/providers`: the ordered provider list rendered by every
+    /// client. An older server that omits the route fails as `Http(404)`.
+    pub fn auth_providers(&self) -> Result<Vec<AuthProvider>, ApiError> {
+        #[derive(Deserialize)]
+        struct Envelope {
+            providers: Vec<AuthProvider>,
+        }
+        let response: Envelope = self.get(&["v1", "auth", "providers"])?;
+        check_auth_providers(response.providers)
+    }
+
+    /// `POST /v1/auth/login/start`: start the browser flow and return the
+    /// provider's authorization URL. The invite code is optional and is only
+    /// consumed by the server at the callback.
+    pub fn auth_login_start(
+        &self,
+        provider: &str,
+        invite_code: Option<&str>,
+    ) -> Result<String, ApiError> {
+        if !valid_auth_provider_id(provider) {
+            return Err(ApiError::Validation(
+                "Choose a sign-in provider from the server list.",
+            ));
+        }
+        let invite_code = invite_code.map(str::trim).filter(|code| !code.is_empty());
+        if invite_code.is_some_and(|code| code.len() > 256 || code.chars().any(char::is_control)) {
+            return Err(ApiError::Validation(
+                "Invite codes are 1–256 characters, without control characters.",
+            ));
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            provider: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            invite_code: Option<&'a str>,
+        }
+        #[derive(Deserialize)]
+        struct Start {
+            url: String,
+        }
+        let start: Start = self.request(
+            Method::POST,
+            &["v1", "auth", "login", "start"],
+            Some(&Body {
+                provider,
+                invite_code,
+            }),
+        )?;
+        check_login_url(&start.url)
+    }
+}
+
 fn check_id(id: &str) -> Result<(), ApiError> {
     if valid_id(id) {
         Ok(())
@@ -2545,6 +2785,66 @@ fn check_id(id: &str) -> Result<(), ApiError> {
             "IDs must be 1–128 ASCII letters, digits, underscores, colons or hyphens.",
         ))
     }
+}
+
+fn check_auth_providers(providers: Vec<AuthProvider>) -> Result<Vec<AuthProvider>, ApiError> {
+    if providers.len() > 8 {
+        return Err(ApiError::InvalidResponse);
+    }
+    let mut seen = HashSet::with_capacity(providers.len());
+    for provider in &providers {
+        if !valid_auth_provider_id(&provider.id) || !seen.insert(provider.id.as_str()) {
+            return Err(ApiError::InvalidResponse);
+        }
+    }
+    Ok(providers)
+}
+
+/// The browser leg must be a plain HTTPS page. The console opens it in the
+/// system browser, so no other scheme is ever accepted.
+fn check_login_url(raw: &str) -> Result<String, ApiError> {
+    if raw.len() > 8_192 {
+        return Err(ApiError::InvalidResponse);
+    }
+    let url = Url::parse(raw).map_err(|_| ApiError::InvalidResponse)?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(ApiError::InvalidResponse);
+    }
+    Ok(raw.to_owned())
+}
+
+fn check_telegram_status(status: TelegramStatus) -> Result<TelegramStatus, ApiError> {
+    if status.telegram_user_id.is_some_and(|id| id <= 0)
+        || status.telegram_chat_id.is_some_and(|id| id <= 0)
+        || status
+            .linked_at
+            .as_deref()
+            .is_some_and(|stamp| !bounded_text(stamp, 64))
+    {
+        return Err(ApiError::InvalidResponse);
+    }
+    Ok(status)
+}
+
+fn check_telegram_link(link: TelegramLink) -> Result<TelegramLink, ApiError> {
+    if !(1..=128).contains(&link.code.len())
+        || !link.code.bytes().all(|byte| byte.is_ascii_graphic())
+        || link
+            .expires_at
+            .as_deref()
+            .is_some_and(|stamp| !bounded_text(stamp, 64))
+        || link
+            .instructions
+            .as_deref()
+            .is_some_and(|text| !bounded_text(text, 512))
+    {
+        return Err(ApiError::InvalidResponse);
+    }
+    Ok(link)
 }
 
 fn check_room(conversation: &str) -> Result<(), ApiError> {
@@ -3272,5 +3572,89 @@ mod tests {
         assert_eq!(validated[0].default_inbox_id, None);
         assert_eq!(validated[0].redirect_uri, None);
         assert_eq!(validated[0].api_base, None);
+    }
+
+    #[test]
+    fn sign_in_providers_keep_the_server_order_and_reject_unsafe_ids() {
+        let providers: Vec<AuthProvider> = serde_json::from_str(
+            r#"[{"id":"microsoft","enabled":true},{"id":"google","enabled":false},{"id":"github","enabled":false}]"#,
+        )
+        .unwrap();
+        let checked = check_auth_providers(providers).unwrap();
+        assert_eq!(checked[0].id, "microsoft");
+        assert!(checked[0].enabled);
+        assert_eq!(checked[1].label(), "Google");
+        assert!(checked[1].coming_soon());
+        assert!(!checked[0].coming_soon());
+
+        assert!(valid_auth_provider_id("microsoft"));
+        assert!(valid_auth_provider_id("okta-sso"));
+        assert!(!valid_auth_provider_id("Microsoft"));
+        assert!(!valid_auth_provider_id(""));
+        assert!(!valid_auth_provider_id("a/b"));
+        assert!(!valid_auth_provider_id(&"a".repeat(33)));
+
+        let duplicate: Vec<AuthProvider> = serde_json::from_str(
+            r#"[{"id":"microsoft","enabled":true},{"id":"microsoft","enabled":false}]"#,
+        )
+        .unwrap();
+        assert!(check_auth_providers(duplicate).is_err());
+        let unsafe_id: Vec<AuthProvider> =
+            serde_json::from_str(r#"[{"id":"../microsoft","enabled":true}]"#).unwrap();
+        assert!(check_auth_providers(unsafe_id).is_err());
+    }
+
+    #[test]
+    fn login_urls_must_be_plain_https_pages() {
+        assert!(check_login_url("https://login.microsoftonline.com/authorize?x=1").is_ok());
+        for raw in [
+            "http://login.example/authorize",
+            "javascript:alert(1)",
+            "https://user:password@login.example/authorize",
+            "not a url",
+            "",
+        ] {
+            assert!(check_login_url(raw).is_err(), "{raw}");
+        }
+        assert!(check_login_url(&format!("https://login.example/{}", "a".repeat(8_200))).is_err());
+    }
+
+    #[test]
+    fn telegram_shapes_are_bounded_and_display_the_link_command() {
+        let status: TelegramStatus = serde_json::from_str(
+            r#"{"enabled":true,"linked":true,"telegram_user_id":40,"telegram_chat_id":30,"linked_at":"2026-11-01T10:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(check_telegram_status(status.clone()).is_ok());
+        assert_eq!(status.chat_label().as_deref(), Some("chat 30"));
+
+        let mut unlinked = status.clone();
+        unlinked.linked = false;
+        unlinked.telegram_user_id = None;
+        unlinked.telegram_chat_id = None;
+        unlinked.linked_at = None;
+        assert!(check_telegram_status(unlinked.clone()).is_ok());
+        assert!(unlinked.chat_label().is_none());
+
+        let mut bad_chat = status.clone();
+        bad_chat.telegram_chat_id = Some(0);
+        assert!(check_telegram_status(bad_chat).is_err());
+        let mut bad_stamp = status;
+        bad_stamp.linked_at = Some("bad\nstamp".into());
+        assert!(check_telegram_status(bad_stamp).is_err());
+
+        let link: TelegramLink = serde_json::from_str(
+            r#"{"code":"0123456789abcdef","expires_at":"2026-11-01T10:10:00Z","instructions":"Send /start <code> to the bot."}"#,
+        )
+        .unwrap();
+        assert!(check_telegram_link(link.clone()).is_ok());
+        assert_eq!(link.command(), "/start 0123456789abcdef");
+
+        let mut bad_code = link.clone();
+        bad_code.code = "has space".into();
+        assert!(check_telegram_link(bad_code).is_err());
+        let mut empty_code = link;
+        empty_code.code.clear();
+        assert!(check_telegram_link(empty_code).is_err());
     }
 }

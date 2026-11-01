@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::LlmConfig;
+use crate::config::{LlmConfig, ProviderConfig};
 use crate::domain::LlmMessage;
 use crate::error::{Result, SeraError};
 use crate::gateway::ToolSpec;
@@ -17,6 +17,25 @@ use crate::util::sha256_hex;
 
 /// Stored conversation preference when the owner enables automatic routing.
 pub const AUTO_PROVIDER: &str = "auto";
+
+/// Resolves and constructs per-user provider clients.
+///
+/// The router holds the admin-defined *catalog* (endpoints, allowlists,
+/// egress consent); credentials are per user and resolved here. The
+/// production implementation is `providers::UserProviderCredentials`, backed
+/// by the envelope-encrypted user store; tests inject a synthetic resolver.
+///
+/// The contract is fail-closed: `available` is a row-existence check (no
+/// decryption), and `client` errors when the acting user has no credential or
+/// the stored one is corrupt. There is no fallback to another user's key.
+pub trait ProviderCredentials: Send + Sync {
+    /// Whether the acting user can use `provider` (own credential or an
+    /// active admin grant). Never returns the credential itself.
+    fn available(&self, user_id: &str, provider: &str) -> bool;
+
+    /// Build the client for the acting user from their resolved credential.
+    fn client(&self, user_id: &str, provider: &str, profile: &ProviderConfig) -> Result<LlmClient>;
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelSelection {
@@ -80,7 +99,17 @@ pub struct PinnedRoute {
 
 #[derive(Clone)]
 struct Provider {
-    client: LlmClient,
+    id: String,
+    profile: ProviderConfig,
+    /// The client built from explicit credentials (tests, and any caller that
+    /// passes clients to [`ModelRouter::new`]). `None` when the router serves
+    /// per-user credentials.
+    client: Option<LlmClient>,
+    /// Per-user clients built on demand from `credentials`.
+    user_clients: Arc<Mutex<BTreeMap<String, LlmClient>>>,
+    /// The router's per-user resolver, cloned onto each provider so a
+    /// provider can build its own client cache without borrowing the router.
+    credentials: Option<Arc<dyn ProviderCredentials>>,
     models: BTreeSet<String>,
     data_egress_approved: bool,
     fingerprint: String,
@@ -97,10 +126,46 @@ pub struct ModelRouter {
     providers: BTreeMap<String, Provider>,
     default_model: String,
     classes: BTreeMap<String, Vec<String>>,
+    /// `Some` means credentials are resolved per acting user; `None` means
+    /// every provider was built with an explicit client (tests).
+    credentials: Option<Arc<dyn ProviderCredentials>>,
+}
+
+impl std::fmt::Debug for ModelRouter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ModelRouter")
+            .field("providers", &self.providers.keys().collect::<Vec<_>>())
+            .field("default_model", &self.default_model)
+            .field("per_user_credentials", &self.credentials.is_some())
+            .finish()
+    }
 }
 
 impl ModelRouter {
-    pub fn new(config: &LlmConfig, mut clients: BTreeMap<String, LlmClient>) -> Result<Self> {
+    /// Build a router from explicit clients. Every configured provider must
+    /// have one; used by tests and by callers that resolve credentials
+    /// themselves.
+    pub fn new(config: &LlmConfig, clients: BTreeMap<String, LlmClient>) -> Result<Self> {
+        Self::build(config, clients, None)
+    }
+
+    /// Build a router that resolves credentials per acting user.
+    ///
+    /// The catalog stays admin-defined; a provider the acting user has no
+    /// credential for is simply not routable for them.
+    pub fn with_credentials(
+        config: &LlmConfig,
+        credentials: Arc<dyn ProviderCredentials>,
+    ) -> Result<Self> {
+        Self::build(config, BTreeMap::new(), Some(credentials))
+    }
+
+    fn build(
+        config: &LlmConfig,
+        mut clients: BTreeMap<String, LlmClient>,
+        credentials: Option<Arc<dyn ProviderCredentials>>,
+    ) -> Result<Self> {
         if config.providers.contains_key("default") {
             return Err(SeraError::Config(
                 "provider id 'default' is reserved for [llm]".into(),
@@ -142,14 +207,22 @@ impl ModelRouter {
             for model in &profile.models {
                 validate_model(model)?;
             }
-            let client = clients.remove(id).ok_or_else(|| {
-                SeraError::Config("configured provider credential/client is missing".into())
-            })?;
-            if client.base_url() != endpoint {
-                return Err(SeraError::Config(
-                    "provider client endpoint does not match its configuration".into(),
-                ));
-            }
+            let client = match clients.remove(id) {
+                Some(client) => {
+                    if client.base_url() != endpoint {
+                        return Err(SeraError::Config(
+                            "provider client endpoint does not match its configuration".into(),
+                        ));
+                    }
+                    Some(client)
+                }
+                None if credentials.is_some() => None,
+                None => {
+                    return Err(SeraError::Config(
+                        "configured provider credential/client is missing".into(),
+                    ));
+                }
+            };
             let auth_label = match auth_plan(&kind, &profile.auth)? {
                 AuthPlan::ApiKey => "api_key",
                 AuthPlan::OAuth { .. } => "oauth",
@@ -174,7 +247,11 @@ impl ModelRouter {
             providers.insert(
                 id.to_owned(),
                 Provider {
+                    id: id.to_owned(),
+                    profile: profile.clone(),
                     client,
+                    user_clients: Arc::new(Mutex::new(BTreeMap::new())),
+                    credentials: credentials.clone(),
                     models: profile.models.iter().cloned().collect(),
                     data_egress_approved: profile.data_egress_approved,
                     fingerprint,
@@ -214,6 +291,7 @@ impl ModelRouter {
             providers,
             default_model: config.model.clone(),
             classes,
+            credentials,
         })
     }
 
@@ -227,11 +305,37 @@ impl ModelRouter {
         Ok(())
     }
 
-    pub fn catalog(&self) -> Vec<ProviderView> {
+    /// Drop cached per-user clients for one account (credential change,
+    /// disconnect, grant revocation).
+    pub fn invalidate_user(&self, user_id: &str) {
+        for provider in self.providers.values() {
+            provider
+                .user_clients
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(user_id);
+        }
+    }
+
+    /// Drop every cached per-user client. Used when a change can affect more
+    /// than one account (an admin grant or the admin's own credential).
+    pub fn invalidate_all(&self) {
+        for provider in self.providers.values() {
+            provider
+                .user_clients
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
+        }
+    }
+
+    /// The providers the acting user can route to, in provider-id order.
+    pub fn catalog(&self, user_id: &str) -> Vec<ProviderView> {
         self.providers
-            .iter()
-            .map(|(id, provider)| ProviderView {
-                id: id.clone(),
+            .values()
+            .filter(|provider| provider.available(user_id))
+            .map(|provider| ProviderView {
+                id: provider.id.clone(),
                 models: provider.advertised(),
                 data_egress_approved: provider.data_egress_approved,
                 kind: provider.kind.clone(),
@@ -241,16 +345,17 @@ impl ModelRouter {
             .collect()
     }
 
-    pub fn catalog_entries(&self) -> Vec<CatalogEntry> {
+    pub fn catalog_entries(&self, user_id: &str) -> Vec<CatalogEntry> {
         self.providers
-            .iter()
-            .flat_map(|(id, provider)| {
+            .values()
+            .filter(|provider| provider.available(user_id))
+            .flat_map(|provider| {
                 let verified = provider.catalog_verified();
                 provider
                     .advertised()
                     .into_iter()
                     .map(move |model| CatalogEntry {
-                        provider: id.clone(),
+                        provider: provider.id.clone(),
                         model,
                         data_egress_approved: provider.data_egress_approved,
                         catalog_verified: verified,
@@ -259,22 +364,25 @@ impl ModelRouter {
             .collect()
     }
 
-    pub async fn refresh_catalogs(&self) -> Result<Vec<CatalogRefresh>> {
+    pub async fn refresh_catalogs(&self, user_id: &str) -> Result<Vec<CatalogRefresh>> {
         let mut reports = Vec::new();
-        for id in self.providers.keys() {
-            if !self.providers[id].catalog_fetch {
+        for (id, provider) in &self.providers {
+            if !provider.catalog_fetch || !provider.available(user_id) {
                 continue;
             }
-            reports.push(self.refresh_provider(id).await?);
+            reports.push(self.refresh_provider(id, user_id).await?);
         }
         Ok(reports)
     }
 
-    pub fn catalog_gate(&self, selection: &ModelSelection) -> Result<()> {
+    pub fn catalog_gate(&self, user_id: &str, selection: &ModelSelection) -> Result<()> {
         let provider = self
             .providers
             .get(&selection.provider)
             .ok_or_else(|| SeraError::Validation("unknown model provider".into()))?;
+        if !provider.available(user_id) {
+            return Err(no_credential_error(&selection.provider));
+        }
         if !provider.catalog_fetch || !provider.data_egress_approved {
             return Ok(());
         }
@@ -286,7 +394,7 @@ impl ModelRouter {
         ))
     }
 
-    async fn refresh_provider(&self, id: &str) -> Result<CatalogRefresh> {
+    async fn refresh_provider(&self, id: &str, user_id: &str) -> Result<CatalogRefresh> {
         let provider = &self.providers[id];
         if !provider.catalog_fetch || !provider.data_egress_approved {
             return Ok(CatalogRefresh {
@@ -317,7 +425,7 @@ impl ModelRouter {
             });
         }
         match provider
-            .client
+            .client_for(id, user_id)?
             .fetch_model_catalog(&provider.catalog_url, provider.catalog_strict)
             .await
         {
@@ -354,106 +462,154 @@ impl ModelRouter {
         }
     }
 
-    pub fn default_selection(&self, bot_model: Option<&str>) -> ModelSelection {
+    /// The acting user's default route: `[llm]` when they hold its
+    /// credential, otherwise the first provider they can use that advertises
+    /// the model. Falls back to `default` so the caller gets the explicit
+    /// "no credential" error rather than a silent other-user route.
+    pub fn default_selection(&self, user_id: &str, bot_model: Option<&str>) -> ModelSelection {
+        let model = bot_model.unwrap_or(&self.default_model).to_owned();
+        if self
+            .providers
+            .get("default")
+            .is_some_and(|provider| provider.available(user_id))
+        {
+            return ModelSelection {
+                provider: "default".into(),
+                model,
+            };
+        }
+        if let Some(selection) = self.find_available_model(user_id, &model) {
+            return selection;
+        }
+        if let Some(provider) = self
+            .providers
+            .values()
+            .find(|provider| provider.available(user_id))
+            && let Some(model) = provider.advertised().into_iter().next()
+        {
+            return ModelSelection {
+                provider: provider.id.clone(),
+                model,
+            };
+        }
         ModelSelection {
             provider: "default".into(),
-            model: bot_model.unwrap_or(&self.default_model).to_owned(),
+            model,
         }
     }
 
-    /// Deterministic pick from configured, egress-approved provider/model pairs.
+    /// Deterministic pick from the acting user's available, egress-approved
+    /// provider/model pairs.
     ///
-    /// Order: bot `model` override → `llm.bot_models` for the bot → `[llm].model` on
-    /// `default` → first approved pair sorted by provider id then model id.
+    /// Order: bot `model` override → `llm.bot_models` for the bot → `[llm].model`
+    /// on `default` → first approved pair sorted by provider id then model id.
     pub fn autoselect(
         &self,
+        user_id: &str,
         bot_model: Option<&str>,
         bot_name: &str,
         bot_models: &BTreeMap<String, String>,
     ) -> Result<ModelSelection> {
         if let Some(model) = bot_model
-            && let Some(selection) = self.find_approved_model(model, Some("default"))
+            && let Some(selection) = self.find_approved_model(user_id, model, Some("default"))
         {
             return Ok(selection);
         }
         if let Some(model) = bot_models.get(bot_name)
-            && let Some(selection) = self.find_approved_model(model, Some("default"))
+            && let Some(selection) = self.find_approved_model(user_id, model, Some("default"))
         {
             return Ok(selection);
         }
-        if let Some(selection) = self.find_approved_model(&self.default_model, Some("default")) {
+        if let Some(selection) =
+            self.find_approved_model(user_id, &self.default_model, Some("default"))
+        {
             return Ok(selection);
         }
-        self.first_approved().ok_or_else(|| {
-            SeraError::Forbidden(
-                "no provider with data-egress approval is configured for autoselect".into(),
-            )
+        self.first_approved(user_id).ok_or_else(|| {
+            if !self
+                .providers
+                .values()
+                .any(|provider| provider.available(user_id))
+            {
+                SeraError::Forbidden(
+                    "no AI provider credentials are configured for this account; add a provider key or ask the admin for a grant"
+                        .into(),
+                )
+            } else {
+                SeraError::Forbidden(
+                    "no provider with data-egress approval is configured for autoselect".into(),
+                )
+            }
         })
     }
 
-    /// Resolve a logical model class (`routine`, `synthesis`) to an approved route.
+    /// Resolve a logical model class (`routine`, `synthesis`) to an approved
+    /// route for the acting user.
     ///
     /// When `class` is missing, empty, or has no approved models, falls back to
     /// [`Self::autoselect`].
     pub fn select_class(
         &self,
+        user_id: &str,
         class: Option<&str>,
         bot_model: Option<&str>,
         bot_name: &str,
         bot_models: &BTreeMap<String, String>,
     ) -> Result<ModelSelection> {
         let Some(class_name) = class.filter(|name| !name.is_empty()) else {
-            return self.autoselect(bot_model, bot_name, bot_models);
+            return self.autoselect(user_id, bot_model, bot_name, bot_models);
         };
         let Some(models) = self.classes.get(class_name) else {
-            return self.autoselect(bot_model, bot_name, bot_models);
+            return self.autoselect(user_id, bot_model, bot_name, bot_models);
         };
         if models.is_empty() {
-            return self.autoselect(bot_model, bot_name, bot_models);
+            return self.autoselect(user_id, bot_model, bot_name, bot_models);
         }
         if let Some(model) = bot_model
             && models.iter().any(|m| m == model)
         {
-            if let Some(selection) = self.find_approved_model(model, Some("default")) {
+            if let Some(selection) = self.find_approved_model(user_id, model, Some("default")) {
                 return Ok(selection);
             }
-            if let Some(selection) = self.find_approved_model(model, None) {
+            if let Some(selection) = self.find_approved_model(user_id, model, None) {
                 return Ok(selection);
             }
         }
         for model in models {
-            if let Some(selection) = self.find_approved_model(model, Some("default")) {
+            if let Some(selection) = self.find_approved_model(user_id, model, Some("default")) {
                 return Ok(selection);
             }
-            if let Some(selection) = self.find_approved_model(model, None) {
+            if let Some(selection) = self.find_approved_model(user_id, model, None) {
                 return Ok(selection);
             }
         }
-        self.autoselect(bot_model, bot_name, bot_models)
+        self.autoselect(user_id, bot_model, bot_name, bot_models)
     }
 
     pub fn resolve_selection(
         &self,
+        user_id: &str,
         stored: &ModelSelection,
         bot_model: Option<&str>,
         bot_name: &str,
         bot_models: &BTreeMap<String, String>,
     ) -> Result<ModelSelection> {
         if stored.is_auto_mode() {
-            return self.autoselect(bot_model, bot_name, bot_models);
+            return self.autoselect(user_id, bot_model, bot_name, bot_models);
         }
-        self.validate_selection(stored)?;
+        self.validate_selection(user_id, stored)?;
         Ok(stored.clone())
     }
 
     fn find_approved_model(
         &self,
+        user_id: &str,
         model: &str,
         prefer_provider: Option<&str>,
     ) -> Option<ModelSelection> {
         if let Some(id) = prefer_provider
             && let Some(provider) = self.providers.get(id)
-            && provider.is_routable(model)
+            && provider.is_routable(user_id, model)
         {
             return Some(ModelSelection {
                 provider: id.to_owned(),
@@ -461,7 +617,7 @@ impl ModelRouter {
             });
         }
         for (id, provider) in &self.providers {
-            if provider.is_routable(model) {
+            if provider.is_routable(user_id, model) {
                 return Some(ModelSelection {
                     provider: id.clone(),
                     model: model.to_owned(),
@@ -471,18 +627,31 @@ impl ModelRouter {
         None
     }
 
-    pub fn autoselect_available(&self) -> bool {
-        self.first_approved().is_some()
+    /// A provider the acting user can use whose allowlist contains `model`.
+    /// Display/default selection only; routing still gates on egress consent
+    /// and the verified catalog.
+    fn find_available_model(&self, user_id: &str, model: &str) -> Option<ModelSelection> {
+        self.providers
+            .values()
+            .find(|provider| provider.available(user_id) && provider.models.contains(model))
+            .map(|provider| ModelSelection {
+                provider: provider.id.clone(),
+                model: model.to_owned(),
+            })
+    }
+
+    pub fn autoselect_available(&self, user_id: &str) -> bool {
+        self.first_approved(user_id).is_some()
     }
 
     /// Provider whose configured allowlist contains `model` (sorted provider
-    /// order). Display-only routing hint; it does not check egress consent or
-    /// the verified catalog.
+    /// order). Display-only routing hint; it does not check egress consent,
+    /// credentials, or the verified catalog.
     pub fn provider_for_model(&self, model: &str) -> Option<String> {
         self.providers
-            .iter()
-            .find(|(_, provider)| provider.models.contains(model))
-            .map(|(id, _)| id.clone())
+            .values()
+            .find(|provider| provider.models.contains(model))
+            .map(|provider| provider.id.clone())
     }
 
     /// Names of the logical routing classes whose model list contains `model`.
@@ -512,10 +681,10 @@ impl ModelRouter {
         None
     }
 
-    fn first_approved(&self) -> Option<ModelSelection> {
+    fn first_approved(&self, user_id: &str) -> Option<ModelSelection> {
         for (id, provider) in &self.providers {
             for model in provider.advertised() {
-                if provider.is_routable(&model) {
+                if provider.is_routable(user_id, &model) {
                     return Some(ModelSelection {
                         provider: id.clone(),
                         model,
@@ -526,11 +695,14 @@ impl ModelRouter {
         None
     }
 
-    pub fn validate_selection(&self, selection: &ModelSelection) -> Result<()> {
+    pub fn validate_selection(&self, user_id: &str, selection: &ModelSelection) -> Result<()> {
         let provider = self
             .providers
             .get(&selection.provider)
             .ok_or_else(|| SeraError::Validation("unknown model provider".into()))?;
+        if !provider.available(user_id) {
+            return Err(no_credential_error(&selection.provider));
+        }
         if !provider.models.contains(&selection.model) {
             return Err(SeraError::Validation(
                 "model is not allowed for this provider".into(),
@@ -540,7 +712,7 @@ impl ModelRouter {
     }
 
     pub fn pin(&self, selection: &ModelSelection) -> Result<PinnedRoute> {
-        self.validate_selection(selection)?;
+        self.validate_selection_config(selection)?;
         let provider = &self.providers[&selection.provider];
         if !provider.data_egress_approved {
             return Err(SeraError::Forbidden(
@@ -551,6 +723,22 @@ impl ModelRouter {
             selection: selection.clone(),
             fingerprint: provider.fingerprint.clone(),
         })
+    }
+
+    /// Config-only selection validation (no credential check). Used by
+    /// [`Self::pin`], which binds the provider configuration; the acting
+    /// user's credential is checked when the turn completes.
+    fn validate_selection_config(&self, selection: &ModelSelection) -> Result<()> {
+        let provider = self
+            .providers
+            .get(&selection.provider)
+            .ok_or_else(|| SeraError::Validation("unknown model provider".into()))?;
+        if !provider.models.contains(&selection.model) {
+            return Err(SeraError::Validation(
+                "model is not allowed for this provider".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn validate_pinned(&self, route: &PinnedRoute) -> Result<()> {
@@ -565,6 +753,7 @@ impl ModelRouter {
 
     pub(crate) async fn complete(
         &self,
+        user_id: &str,
         route: &PinnedRoute,
         messages: &[LlmMessage],
         tools: &[ToolSpec],
@@ -572,8 +761,12 @@ impl ModelRouter {
     ) -> Result<LlmResponse> {
         self.validate_pinned(route)?;
         let provider = &self.providers[&route.selection.provider];
+        if !provider.available(user_id) {
+            return Err(no_credential_error(&route.selection.provider));
+        }
         if provider.catalog_fetch {
-            self.refresh_provider(&route.selection.provider).await?;
+            self.refresh_provider(&route.selection.provider, user_id)
+                .await?;
             if !provider.verified_contains(&route.selection.model) {
                 return Err(SeraError::Forbidden(
                     "model is not in the verified provider catalog".into(),
@@ -581,13 +774,56 @@ impl ModelRouter {
             }
         }
         provider
-            .client
+            .client_for(&route.selection.provider, user_id)?
             .complete(messages, tools, Some(&route.selection.model), temperature)
             .await
     }
 }
 
+fn no_credential_error(provider: &str) -> SeraError {
+    SeraError::Forbidden(format!(
+        "no credential is configured for provider '{provider}'; add a key or ask the admin for a grant"
+    ))
+}
+
 impl Provider {
+    /// The acting user's client: the explicit client when the router was
+    /// built with one, otherwise a per-user client built once and cached.
+    fn client_for(&self, id: &str, user_id: &str) -> Result<LlmClient> {
+        if self.credentials().is_none() {
+            return self
+                .client
+                .clone()
+                .ok_or_else(|| SeraError::Internal("the provider client is missing".into()));
+        }
+        let mut cache = self
+            .user_clients
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(client) = cache.get(user_id) {
+            return Ok(client.clone());
+        }
+        let credentials = self
+            .credentials()
+            .ok_or_else(|| SeraError::Internal("the provider credentials are missing".into()))?;
+        let client = credentials.client(user_id, id, &self.profile)?;
+        cache.insert(user_id.to_owned(), client.clone());
+        Ok(client)
+    }
+
+    fn credentials(&self) -> Option<&Arc<dyn ProviderCredentials>> {
+        // The router owns the resolver; providers borrow it through the
+        // shared `Arc` stored on each provider at construction time.
+        self.credentials.as_ref()
+    }
+
+    fn available(&self, user_id: &str) -> bool {
+        match self.credentials() {
+            Some(credentials) => credentials.available(user_id, &self.id),
+            None => true,
+        }
+    }
+
     fn lock_catalog(&self) -> std::sync::MutexGuard<'_, CatalogSnapshot> {
         self.catalog
             .lock()
@@ -645,8 +881,8 @@ impl Provider {
         }
     }
 
-    fn is_routable(&self, model: &str) -> bool {
-        self.data_egress_approved && self.verified_contains(model)
+    fn is_routable(&self, user_id: &str, model: &str) -> bool {
+        self.available(user_id) && self.data_egress_approved && self.verified_contains(model)
     }
 }
 
@@ -665,6 +901,185 @@ mod tests {
     use serde_json::json;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The acting user for tests built with explicit clients: the router has
+    /// no credential resolver, so every provider is available to any id.
+    const TEST_USER: &str = "test-user";
+
+    /// A synthetic per-user credential resolver: one API key per user id.
+    struct FakeCredentials {
+        keys: BTreeMap<String, String>,
+        /// Every client build, so cache hits and invalidation are observable.
+        built: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeCredentials {
+        fn new(keys: &[(&str, &str)]) -> Self {
+            Self {
+                keys: keys
+                    .iter()
+                    .map(|(user, key)| ((*user).to_owned(), (*key).to_owned()))
+                    .collect(),
+                built: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn builds(&self) -> Vec<String> {
+            self.built
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        }
+    }
+
+    impl ProviderCredentials for FakeCredentials {
+        fn available(&self, user_id: &str, _provider: &str) -> bool {
+            self.keys.contains_key(user_id)
+        }
+
+        fn client(
+            &self,
+            user_id: &str,
+            _provider: &str,
+            profile: &ProviderConfig,
+        ) -> Result<LlmClient> {
+            let key = self.keys.get(user_id).ok_or_else(|| {
+                SeraError::Forbidden("no credential is configured for this provider".into())
+            })?;
+            self.built
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(user_id.to_owned());
+            let endpoint = resolve_base_url(&profile.kind, &profile.base_url)?;
+            LlmClient::new(endpoint, key.clone(), 5, 100)
+        }
+    }
+
+    #[tokio::test]
+    async fn credentials_resolve_per_user_and_never_fall_back() {
+        let server = MockServer::start().await;
+        let config = LlmConfig {
+            base_url: server.uri(),
+            model: "shared-model".into(),
+            data_egress_approved: true,
+            ..LlmConfig::default()
+        };
+        let credentials = Arc::new(FakeCredentials::new(&[("alice", "alice-key")]));
+        let router = ModelRouter::with_credentials(&config, credentials.clone()).unwrap();
+
+        // Availability is per user: Bob sees no provider at all.
+        assert_eq!(router.catalog("alice").len(), 1);
+        assert!(router.catalog("bob").is_empty());
+        assert!(router.autoselect_available("alice"));
+        assert!(!router.autoselect_available("bob"));
+        let error = router
+            .autoselect("bob", None, "main", &BTreeMap::new())
+            .unwrap_err();
+        assert!(error.to_string().contains("no AI provider credentials"));
+        let error = router
+            .validate_selection(
+                "bob",
+                &ModelSelection {
+                    provider: "default".into(),
+                    model: "shared-model".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("no credential"));
+
+        // Alice routes with her own key; the mock accepts only that key.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer alice-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"choices":[{"message":{"content":"ok"}}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let selection = router
+            .autoselect("alice", None, "main", &BTreeMap::new())
+            .unwrap();
+        let route = router.pin(&selection).unwrap();
+        router
+            .complete("alice", &route, &[LlmMessage::user("synthetic")], &[], None)
+            .await
+            .unwrap();
+        assert_eq!(credentials.builds(), vec!["alice".to_owned()]);
+
+        // Bob cannot complete the same pinned route: no request is sent and no
+        // client is built for him.
+        let error = router
+            .complete("bob", &route, &[LlmMessage::user("synthetic")], &[], None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no credential"));
+        assert_eq!(credentials.builds(), vec!["alice".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn per_user_clients_are_cached_and_invalidation_rebuilds_them() {
+        let server = MockServer::start().await;
+        let config = LlmConfig {
+            base_url: server.uri(),
+            model: "shared-model".into(),
+            data_egress_approved: true,
+            ..LlmConfig::default()
+        };
+        let credentials = Arc::new(FakeCredentials::new(&[
+            ("alice", "alice-key"),
+            ("bob", "bob-key"),
+        ]));
+        let router = ModelRouter::with_credentials(&config, credentials.clone()).unwrap();
+        let route = |user: &str| {
+            let selection = router
+                .autoselect(user, None, "main", &BTreeMap::new())
+                .unwrap();
+            router.pin(&selection).unwrap()
+        };
+        // Two calls for Alice build one client; Bob gets his own.
+        for user in ["alice", "alice", "bob"] {
+            let _ = router
+                .complete(
+                    user,
+                    &route(user),
+                    &[LlmMessage::user("synthetic")],
+                    &[],
+                    None,
+                )
+                .await;
+        }
+        assert_eq!(
+            credentials.builds(),
+            vec!["alice".to_owned(), "bob".to_owned()]
+        );
+        router.invalidate_user("alice");
+        let _ = router
+            .complete(
+                "alice",
+                &route("alice"),
+                &[LlmMessage::user("synthetic")],
+                &[],
+                None,
+            )
+            .await;
+        assert_eq!(
+            credentials.builds(),
+            vec!["alice".to_owned(), "bob".to_owned(), "alice".to_owned()]
+        );
+        router.invalidate_all();
+        let _ = router
+            .complete(
+                "bob",
+                &route("bob"),
+                &[LlmMessage::user("synthetic")],
+                &[],
+                None,
+            )
+            .await;
+        assert_eq!(credentials.builds().len(), 4);
+    }
 
     async fn fixture() -> (
         LlmConfig,
@@ -730,7 +1145,13 @@ mod tests {
                 })
                 .unwrap();
             router
-                .complete(&route, &[LlmMessage::user("synthetic")], &[], None)
+                .complete(
+                    TEST_USER,
+                    &route,
+                    &[LlmMessage::user("synthetic")],
+                    &[],
+                    None,
+                )
                 .await
                 .unwrap();
         }
@@ -754,7 +1175,13 @@ mod tests {
         let revoked = ModelRouter::new(&config, clients.clone()).unwrap();
         assert!(
             revoked
-                .complete(&route, &[LlmMessage::user("synthetic")], &[], None)
+                .complete(
+                    TEST_USER,
+                    &route,
+                    &[LlmMessage::user("synthetic")],
+                    &[],
+                    None
+                )
                 .await
                 .is_err()
         );
@@ -762,14 +1189,26 @@ mod tests {
         invalid.selection.model = "not-allowed".into();
         assert!(
             router
-                .complete(&invalid, &[LlmMessage::user("synthetic")], &[], None)
+                .complete(
+                    TEST_USER,
+                    &invalid,
+                    &[LlmMessage::user("synthetic")],
+                    &[],
+                    None
+                )
                 .await
                 .is_err()
         );
         invalid.selection.provider = "unknown".into();
         assert!(
             router
-                .complete(&invalid, &[LlmMessage::user("synthetic")], &[], None)
+                .complete(
+                    TEST_USER,
+                    &invalid,
+                    &[LlmMessage::user("synthetic")],
+                    &[],
+                    None
+                )
                 .await
                 .is_err()
         );
@@ -808,7 +1247,9 @@ mod tests {
     async fn endpoint_or_secret_reference_changes_reject_pinned_routes() {
         let (mut config, clients, first, second) = fixture().await;
         let router = ModelRouter::new(&config, clients.clone()).unwrap();
-        let route = router.pin(&router.default_selection(None)).unwrap();
+        let route = router
+            .pin(&router.default_selection(TEST_USER, None))
+            .unwrap();
         config.api_key_secret = "rotated_reference".into();
         assert!(
             ModelRouter::new(&config, clients.clone())
@@ -841,7 +1282,7 @@ mod tests {
         bot_models.insert("main".into(), "first-model".into());
         assert_eq!(
             router
-                .autoselect(Some("second-model"), "other", &bot_models)
+                .autoselect(TEST_USER, Some("second-model"), "other", &bot_models)
                 .unwrap(),
             ModelSelection {
                 provider: "second".into(),
@@ -849,14 +1290,18 @@ mod tests {
             }
         );
         assert_eq!(
-            router.autoselect(None, "main", &bot_models).unwrap(),
+            router
+                .autoselect(TEST_USER, None, "main", &bot_models)
+                .unwrap(),
             ModelSelection {
                 provider: "default".into(),
                 model: "first-model".into(),
             }
         );
         assert_eq!(
-            router.autoselect(None, "other", &BTreeMap::new()).unwrap(),
+            router
+                .autoselect(TEST_USER, None, "other", &BTreeMap::new())
+                .unwrap(),
             ModelSelection {
                 provider: "default".into(),
                 model: "first-model".into(),
@@ -871,15 +1316,19 @@ mod tests {
         let bot_models = BTreeMap::new();
         assert_eq!(
             router
-                .select_class(None, None, "other", &bot_models)
+                .select_class(TEST_USER, None, None, "other", &bot_models)
                 .unwrap(),
-            router.autoselect(None, "other", &bot_models).unwrap()
+            router
+                .autoselect(TEST_USER, None, "other", &bot_models)
+                .unwrap()
         );
         assert_eq!(
             router
-                .select_class(Some("missing"), None, "other", &bot_models)
+                .select_class(TEST_USER, Some("missing"), None, "other", &bot_models)
                 .unwrap(),
-            router.autoselect(None, "other", &bot_models).unwrap()
+            router
+                .autoselect(TEST_USER, None, "other", &bot_models)
+                .unwrap()
         );
     }
 
@@ -898,7 +1347,7 @@ mod tests {
         let router = ModelRouter::new(&config, clients).unwrap();
         assert_eq!(
             router
-                .select_class(Some("routine"), None, "other", &BTreeMap::new())
+                .select_class(TEST_USER, Some("routine"), None, "other", &BTreeMap::new())
                 .unwrap(),
             ModelSelection {
                 provider: "default".into(),
@@ -917,7 +1366,11 @@ mod tests {
             .unwrap()
             .data_egress_approved = false;
         let router = ModelRouter::new(&config, clients).unwrap();
-        assert!(router.autoselect(None, "main", &BTreeMap::new()).is_err());
+        assert!(
+            router
+                .autoselect(TEST_USER, None, "main", &BTreeMap::new())
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -967,7 +1420,7 @@ mod tests {
             LlmClient::new(server.uri(), "synthetic-key", 1, 100).unwrap(),
         )]);
         let router = ModelRouter::new(&config, clients).unwrap();
-        let reports = router.refresh_catalogs().await.unwrap();
+        let reports = router.refresh_catalogs(TEST_USER).await.unwrap();
         assert_eq!(reports.len(), 1);
         assert!(reports[0].fetched && reports[0].verified);
         // The refresh report counts the full live list, not the allowlist
@@ -977,20 +1430,23 @@ mod tests {
         // including models outside the configured allowlist (" bad" was
         // dropped by the catalog parser as an invalid id).
         assert_eq!(
-            router.catalog()[0].models,
+            router.catalog(TEST_USER)[0].models,
             vec!["extra".to_string(), "kept".to_string()]
         );
-        assert!(router.catalog()[0].catalog_verified);
+        assert!(router.catalog(TEST_USER)[0].catalog_verified);
         // The hard gate still rejects anything not verified: "missing" is
         // allowlisted but absent from the snapshot, "extra" is live but not
         // allowlisted.
         for model in ["missing", "extra"] {
             assert!(
                 router
-                    .catalog_gate(&ModelSelection {
-                        provider: "default".into(),
-                        model: model.into(),
-                    })
+                    .catalog_gate(
+                        TEST_USER,
+                        &ModelSelection {
+                            provider: "default".into(),
+                            model: model.into(),
+                        }
+                    )
                     .is_err(),
                 "{model} must be gated"
             );
@@ -1002,7 +1458,13 @@ mod tests {
             })
             .unwrap();
         router
-            .complete(&kept, &[LlmMessage::user("synthetic")], &[], None)
+            .complete(
+                TEST_USER,
+                &kept,
+                &[LlmMessage::user("synthetic")],
+                &[],
+                None,
+            )
             .await
             .unwrap();
         let missing = router
@@ -1013,7 +1475,13 @@ mod tests {
             .unwrap();
         assert!(
             router
-                .complete(&missing, &[LlmMessage::user("synthetic")], &[], None)
+                .complete(
+                    TEST_USER,
+                    &missing,
+                    &[LlmMessage::user("synthetic")],
+                    &[],
+                    None
+                )
                 .await
                 .is_err()
         );
@@ -1049,12 +1517,15 @@ mod tests {
             LlmClient::new(server.uri(), "synthetic-key", 1, 100).unwrap(),
         )]);
         let router = ModelRouter::new(&config, clients).unwrap();
-        let reports = router.refresh_catalogs().await.unwrap();
+        let reports = router.refresh_catalogs(TEST_USER).await.unwrap();
         assert!(reports[0].fetched && !reports[0].verified);
         // A closed snapshot falls back to the configured allowlist for
         // display, but selection is still gated (verified_contains is false).
-        assert_eq!(router.catalog()[0].models, vec!["kept".to_string()]);
-        assert!(!router.catalog()[0].catalog_verified);
+        assert_eq!(
+            router.catalog(TEST_USER)[0].models,
+            vec!["kept".to_string()]
+        );
+        assert!(!router.catalog(TEST_USER)[0].catalog_verified);
         let route = router
             .pin(&ModelSelection {
                 provider: "default".into(),
@@ -1063,7 +1534,13 @@ mod tests {
             .unwrap();
         assert!(
             router
-                .complete(&route, &[LlmMessage::user("synthetic")], &[], None)
+                .complete(
+                    TEST_USER,
+                    &route,
+                    &[LlmMessage::user("synthetic")],
+                    &[],
+                    None
+                )
                 .await
                 .is_err()
         );
@@ -1091,10 +1568,13 @@ mod tests {
             LlmClient::new(server.uri(), "synthetic-key", 1, 100).unwrap(),
         )]);
         let router = ModelRouter::new(&config, clients).unwrap();
-        let reports = router.refresh_catalogs().await.unwrap();
+        let reports = router.refresh_catalogs(TEST_USER).await.unwrap();
         assert!(!reports[0].fetched);
-        assert_eq!(router.catalog()[0].models, vec!["kept".to_string()]);
-        assert!(!router.catalog()[0].catalog_verified);
+        assert_eq!(
+            router.catalog(TEST_USER)[0].models,
+            vec!["kept".to_string()]
+        );
+        assert!(!router.catalog(TEST_USER)[0].catalog_verified);
         assert!(server.received_requests().await.unwrap().is_empty());
         assert!(
             router
@@ -1138,19 +1618,22 @@ mod tests {
             LlmClient::new(server.uri(), "synthetic-key", 1, 100).unwrap(),
         )]);
         let router = ModelRouter::new(&config, clients).unwrap();
-        router.refresh_catalogs().await.unwrap();
+        router.refresh_catalogs(TEST_USER).await.unwrap();
         // Fresh snapshot: the advertised list is the full live list.
-        assert_eq!(router.catalog()[0].models, vec!["kept".to_string()]);
-        assert!(router.catalog()[0].catalog_verified);
+        assert_eq!(
+            router.catalog(TEST_USER)[0].models,
+            vec!["kept".to_string()]
+        );
+        assert!(router.catalog(TEST_USER)[0].catalog_verified);
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        router.refresh_catalogs().await.unwrap();
+        router.refresh_catalogs(TEST_USER).await.unwrap();
         // Stale snapshot + failed refresh: display falls back to the
         // configured allowlist (model + models), not the stale live list.
         assert_eq!(
-            router.catalog()[0].models,
+            router.catalog(TEST_USER)[0].models,
             vec!["fallback-model".to_string(), "kept".to_string()]
         );
-        assert!(!router.catalog()[0].catalog_verified);
+        assert!(!router.catalog(TEST_USER)[0].catalog_verified);
     }
 
     #[tokio::test]
@@ -1186,19 +1669,22 @@ mod tests {
             LlmClient::new(&base, "synthetic-m-plan", 1, 100).unwrap(),
         )]);
         let router = ModelRouter::new(&config, clients).unwrap();
-        let reports = router.refresh_catalogs().await.unwrap();
+        let reports = router.refresh_catalogs(TEST_USER).await.unwrap();
         assert!(reports[0].fetched && reports[0].verified);
         assert_eq!(reports[0].model_count, 2);
         assert_eq!(
-            router.catalog()[0].models,
+            router.catalog(TEST_USER)[0].models,
             vec!["MiniMax-M3".to_string(), "MiniMax-M3.1-Flash".to_string()]
         );
         assert!(
             router
-                .catalog_gate(&ModelSelection {
-                    provider: "default".into(),
-                    model: "MiniMax-M2".into(),
-                })
+                .catalog_gate(
+                    TEST_USER,
+                    &ModelSelection {
+                        provider: "default".into(),
+                        model: "MiniMax-M2".into(),
+                    }
+                )
                 .is_err()
         );
 
@@ -1228,11 +1714,11 @@ mod tests {
             )]),
         )
         .unwrap();
-        let loose_reports = loose_router.refresh_catalogs().await.unwrap();
+        let loose_reports = loose_router.refresh_catalogs(TEST_USER).await.unwrap();
         assert!(loose_reports[0].fetched && !loose_reports[0].verified);
         // Closed snapshot: display falls back to the configured allowlist.
         assert_eq!(
-            loose_router.catalog()[0].models,
+            loose_router.catalog(TEST_USER)[0].models,
             vec!["MiniMax-M3.1-Flash".to_string()]
         );
         let route = loose_router
@@ -1243,7 +1729,13 @@ mod tests {
             .unwrap();
         assert!(
             loose_router
-                .complete(&route, &[LlmMessage::user("synthetic")], &[], None)
+                .complete(
+                    TEST_USER,
+                    &route,
+                    &[LlmMessage::user("synthetic")],
+                    &[],
+                    None
+                )
                 .await
                 .is_err()
         );
@@ -1287,11 +1779,11 @@ mod tests {
             LlmClient::new(server.uri(), "synthetic-key", 1, 100).unwrap(),
         )]);
         let router = ModelRouter::new(&config, clients).unwrap();
-        router.refresh_catalogs().await.unwrap();
+        router.refresh_catalogs(TEST_USER).await.unwrap();
         // Fresh snapshot: the full sorted live list, not the allowlist
         // intersection ("deepseek-chat" is allowlisted but not live).
         assert_eq!(
-            router.catalog()[0].models,
+            router.catalog(TEST_USER)[0].models,
             vec!["deepseek-flash".to_string(), "deepseek-v4-pro".to_string()]
         );
         let paths: Vec<_> = server
@@ -1341,19 +1833,22 @@ mod tests {
                 .unwrap(),
         )]);
         let router = ModelRouter::new(&config, clients).unwrap();
-        let reports = router.refresh_catalogs().await.unwrap();
+        let reports = router.refresh_catalogs(TEST_USER).await.unwrap();
         assert!(reports[0].fetched && reports[0].verified);
         assert_eq!(reports[0].model_count, 2);
         assert_eq!(
-            router.catalog()[0].models,
+            router.catalog(TEST_USER)[0].models,
             vec!["extra-model".to_string(), "kept-model".to_string()]
         );
         assert!(
             router
-                .catalog_gate(&ModelSelection {
-                    provider: "default".into(),
-                    model: "missing-model".into(),
-                })
+                .catalog_gate(
+                    TEST_USER,
+                    &ModelSelection {
+                        provider: "default".into(),
+                        model: "missing-model".into(),
+                    }
+                )
                 .is_err()
         );
 
@@ -1386,11 +1881,11 @@ mod tests {
             )]),
         )
         .unwrap();
-        let loose_reports = loose_router.refresh_catalogs().await.unwrap();
+        let loose_reports = loose_router.refresh_catalogs(TEST_USER).await.unwrap();
         assert!(loose_reports[0].fetched && !loose_reports[0].verified);
         // Closed snapshot: display falls back to the configured allowlist.
         assert_eq!(
-            loose_router.catalog()[0].models,
+            loose_router.catalog(TEST_USER)[0].models,
             vec!["kept-model".to_string()]
         );
     }
@@ -1423,37 +1918,43 @@ mod tests {
         };
         // Egress not approved: no fetch, allowlist only.
         let router = ModelRouter::new(&base_config(false), clients()).unwrap();
-        router.refresh_catalogs().await.unwrap();
+        router.refresh_catalogs(TEST_USER).await.unwrap();
         assert_eq!(
-            router.catalog()[0].models,
+            router.catalog(TEST_USER)[0].models,
             vec!["allow-a".to_string(), "allow-b".to_string()]
         );
-        assert!(!router.catalog()[0].catalog_verified);
+        assert!(!router.catalog(TEST_USER)[0].catalog_verified);
         // Fresh verified snapshot: expands to the full live list.
         let router = ModelRouter::new(&base_config(true), clients()).unwrap();
-        router.refresh_catalogs().await.unwrap();
+        router.refresh_catalogs(TEST_USER).await.unwrap();
         assert_eq!(
-            router.catalog()[0].models,
+            router.catalog(TEST_USER)[0].models,
             vec!["live-a".to_string(), "live-b".to_string()]
         );
-        assert!(router.catalog()[0].catalog_verified);
+        assert!(router.catalog(TEST_USER)[0].catalog_verified);
         // Selection of a live model outside the allowlist, or of an allowlisted
         // model absent from the snapshot, is still rejected by the hard gate
         // even though the live list is advertised.
         assert!(
             router
-                .catalog_gate(&ModelSelection {
-                    provider: "default".into(),
-                    model: "live-a".into(),
-                })
+                .catalog_gate(
+                    TEST_USER,
+                    &ModelSelection {
+                        provider: "default".into(),
+                        model: "live-a".into(),
+                    }
+                )
                 .is_err()
         );
         assert!(
             router
-                .catalog_gate(&ModelSelection {
-                    provider: "default".into(),
-                    model: "allow-a".into(),
-                })
+                .catalog_gate(
+                    TEST_USER,
+                    &ModelSelection {
+                        provider: "default".into(),
+                        model: "allow-a".into(),
+                    }
+                )
                 .is_err()
         );
     }

@@ -5,13 +5,12 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
 
 use crate::deck::{Brand, DeckSpec};
 use crate::domain::Language;
 use crate::error::{Result, SeraError};
 use crate::gateway::{ApprovalDetails, Tool, ToolContext, ToolOutput, ToolSpec};
-use crate::onedrive::OneDriveClient;
+use crate::onedrive::OneDriveRegistry;
 use crate::render::render_deck;
 use crate::store::Store;
 use crate::telegram::TelegramClient;
@@ -93,7 +92,10 @@ impl ArtifactStore {
         })
     }
 
-    pub fn approve(&self, store: &Store, hash: &str) -> Result<()> {
+    /// Approve the Italian artifact's content for the acting user. The
+    /// approval marker is content-addressed in `kv` (untouched this phase);
+    /// the audit row records the acting user's id.
+    pub fn approve(&self, store: &Store, user_id: &str, hash: &str) -> Result<()> {
         let artifact = self.load(hash)?;
         if artifact.meta.language != Language::It {
             return Err(SeraError::Validation(
@@ -102,7 +104,7 @@ impl ArtifactStore {
         }
         store.kv_set(&format!("deck_approved:{hash}"), "1")?;
         store.record_audit(
-            "owner",
+            user_id,
             "deck.italian_content_approved",
             None,
             None,
@@ -472,15 +474,18 @@ impl Tool for TelegramDocumentTool {
         let artifact = self.artifacts.load(hash)?;
         Ok(ApprovalDetails {
             summary: format!(
-                "Send '{}' to the owner's private Telegram chat",
+                "Send '{}' to the acting user's private Telegram chat",
                 artifact.filename
             ),
-            destination: Some(format!("telegram:owner:{}", self.client.owner_chat_id())),
+            // The chat is resolved from the acting user's binding at
+            // execution time; the destination binds the approval to that
+            // user, not to a chat id that can change on re-link.
+            destination: Some("telegram:user".into()),
             artifact_hash: Some(artifact.hash),
         })
     }
 
-    async fn execute(&self, args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
         let hash = args
             .get("artifact_hash")
             .and_then(Value::as_str)
@@ -490,39 +495,35 @@ impl Tool for TelegramDocumentTool {
             .and_then(Value::as_str)
             .unwrap_or("SeraBot deliverable");
         let artifact = self.artifacts.load(hash)?;
+        let chat_id = self.client.chat_for(&context.user_id)?;
         self.client
-            .send_document(
-                self.client.owner_chat_id(),
-                &artifact.filename,
-                artifact.bytes,
-                caption,
-            )
+            .send_document(chat_id, &artifact.filename, artifact.bytes, caption)
             .await?;
         Ok(ToolOutput {
             content: format!("Delivered {} to Telegram.", artifact.filename),
             data: Some(json!({"destination": "telegram", "filename": artifact.filename})),
             artifact_hash: Some(artifact.hash),
             filename: Some(artifact.filename),
-            destination: Some("telegram:owner".into()),
+            destination: Some("telegram:user".into()),
             ..ToolOutput::default()
         })
     }
 }
 
 pub struct OneDriveUploadTool {
-    client: Arc<Mutex<OneDriveClient>>,
+    registry: Arc<OneDriveRegistry>,
     artifacts: Arc<ArtifactStore>,
     folder: String,
 }
 
 impl OneDriveUploadTool {
     pub fn new(
-        client: Arc<Mutex<OneDriveClient>>,
+        registry: Arc<OneDriveRegistry>,
         artifacts: Arc<ArtifactStore>,
         folder: impl Into<String>,
     ) -> Self {
         Self {
-            client,
+            registry,
             artifacts,
             folder: folder.into(),
         }
@@ -535,7 +536,7 @@ impl Tool for OneDriveUploadTool {
         ToolSpec {
             name: "onedrive_upload".into(),
             description:
-                "Upload an existing rendered artifact to the approved OneDrive dossier folder."
+                "Upload an existing rendered artifact to the acting user's approved OneDrive dossier folder."
                     .into(),
             parameters: json!({
                 "type": "object",
@@ -570,14 +571,17 @@ impl Tool for OneDriveUploadTool {
         })
     }
 
-    async fn execute(&self, args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
         let hash = args
             .get("artifact_hash")
             .and_then(Value::as_str)
             .ok_or_else(|| SeraError::Validation("artifact_hash is required".into()))?;
         let subfolder = args.get("subfolder").and_then(Value::as_str);
         let artifact = self.artifacts.load(hash)?;
-        let mut client = self.client.lock().await;
+        // The acting user's own client: no connected drive is an explicit
+        // error, never the admin's (or any other account's) drive.
+        let client = self.registry.client_for(&context.user_id)?;
+        let mut client = client.lock().await;
         let result = client
             .upload(
                 &artifact.filename,
@@ -605,14 +609,14 @@ impl Tool for OneDriveUploadTool {
 }
 
 pub struct OneDriveListTool {
-    client: Arc<Mutex<OneDriveClient>>,
+    registry: Arc<OneDriveRegistry>,
     folder: String,
 }
 
 impl OneDriveListTool {
-    pub fn new(client: Arc<Mutex<OneDriveClient>>, folder: impl Into<String>) -> Self {
+    pub fn new(registry: Arc<OneDriveRegistry>, folder: impl Into<String>) -> Self {
         Self {
-            client,
+            registry,
             folder: folder.into(),
         }
     }
@@ -624,7 +628,8 @@ impl Tool for OneDriveListTool {
         ToolSpec {
             name: "onedrive_list".into(),
             description:
-                "List files and folders in the approved OneDrive dossier folder (read-only).".into(),
+                "List files and folders in the acting user's approved OneDrive dossier folder (read-only)."
+                    .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -649,14 +654,15 @@ impl Tool for OneDriveListTool {
         })
     }
 
-    async fn execute(&self, args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
         let subfolder = args.get("subfolder").and_then(Value::as_str);
         let max_pages = args
             .get("max_pages")
             .and_then(Value::as_u64)
             .map(|pages| pages as usize)
             .unwrap_or(5);
-        let client = self.client.lock().await;
+        let client = self.registry.client_for(&context.user_id)?;
+        let client = client.lock().await;
         let result = client.list_folder(subfolder, max_pages).await?;
         Ok(ToolOutput {
             content: format!(
@@ -728,6 +734,7 @@ mod tests {
 
     fn context() -> ToolContext {
         ToolContext {
+            user_id: crate::store::ADMIN_USER_ID.to_owned(),
             actor: "owner".into(),
             bot: "maker".into(),
             task_id: None,
@@ -793,7 +800,9 @@ mod tests {
             .unwrap();
         let args = json!({"spec": deck(Language::Fr), "source_artifact": italian});
         assert!(tool.execute(args.clone(), &context()).await.is_err());
-        artifacts.approve(&store, &italian).unwrap();
+        artifacts
+            .approve(&store, &store.admin_user_id().unwrap(), &italian)
+            .unwrap();
         assert!(tool.execute(args, &context()).await.is_ok());
     }
 

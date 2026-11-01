@@ -5,6 +5,29 @@ defaults to **`enabled = false`**. Config stores **secret-store key names
 only**. Values belong in the age store (`serabot secrets set <name>`). The
 repository has no client secrets.
 
+## Per-user connectors (OneDrive)
+
+OneDrive is the first connector that is **per user** rather than per server.
+The `[onedrive]` section now describes availability and defaults (the server's
+app registration, tenant, folder, conflict behavior); each user connects their
+own Microsoft account and their token is sealed under their own data key in the
+envelope-encrypted credential store, never in the shared age store.
+
+- The operator's existing global refresh token is imported into the admin's
+  credential rows once, losslessly and idempotently; a later disconnect is not
+  undone by a restart.
+- `onedrive_upload` and `onedrive_list` resolve the acting user's client. A
+  user with no connected drive gets an explicit "connect OneDrive first" error
+  and never the admin's drive.
+- Token rotation writes back to the credential's owner: the acting user, or the
+  grantor when the provider was granted by the admin.
+- The consent flow is authorization code + PKCE against the single server app
+  registration, with `Files.ReadWrite` and `offline_access` added incrementally
+  at connect time.
+
+Members connect from their console; the API surface is documented in
+[Owner API](api.md#user-credentials-grants-and-telegram).
+
 Tools register only when that connector is enabled, and only if the named
 client id and client secret (or AgentMail API key) are present. A missing
 value fails startup closed and names the key, not the value. OAuth read tools

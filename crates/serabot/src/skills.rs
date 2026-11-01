@@ -1,4 +1,14 @@
-use std::collections::{BTreeMap, HashMap};
+//! Skills: the shipped server catalog plus each user's own rows.
+//!
+//! `skills/` stays the server-managed catalog every user can allowlist. A
+//! user-created skill is a `user_skills` row written through the same
+//! policy-scanned rendering path as the catalog packs. A user's **effective
+//! catalog** is the shipped catalog union their own rows (phase 3 of the
+//! multi-user reconstruction): `skill_list`, `skill_search`, `skill_load`, and
+//! `validate_bot_skills` all resolve inside that union for the acting user,
+//! so one user's skill id is never loadable from another user's scope.
+
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -9,8 +19,10 @@ use serde_json::{Value, json};
 
 use crate::config::{Config, LoadedBot};
 use crate::error::{Result, SeraError};
+use crate::fleet::FleetRegistry;
 use crate::gateway::{Tool, ToolContext, ToolOutput, ToolRegistry, ToolSpec};
 use crate::policy::Policy;
+use crate::store::Store;
 
 const SKILL_FILE: &str = "SKILL.md";
 const MAX_SKILL_BYTES: usize = 96_000;
@@ -53,7 +65,12 @@ impl SkillCatalog {
                 dir.display()
             ))
         })?;
-        if !base_dir.starts_with(&config.base_dir) {
+        let config_base = config.base_dir.canonicalize().map_err(|error| {
+            SeraError::Config(format!(
+                "configuration directory cannot be resolved: {error}"
+            ))
+        })?;
+        if !base_dir.starts_with(&config_base) {
             return Err(SeraError::Config(
                 "skills.dir must stay inside the configuration directory".into(),
             ));
@@ -75,6 +92,37 @@ impl SkillCatalog {
             .values()
             .map(|record| record.summary.clone())
             .collect()
+    }
+
+    /// The shipped catalog union the acting user's own rows. The shipped
+    /// catalog wins if a user row collides with it: creation rejects a
+    /// collision with the catalog as it exists then, and a skill added to the
+    /// shipped catalog later shadows the older user row rather than breaking
+    /// the user's whole fleet.
+    pub fn effective(&self, store: &Store, user_id: &str) -> Result<Self> {
+        let mut skills = self.skills.clone();
+        for row in store.list_user_skills(user_id)? {
+            validate_skill_id(&row.id)?;
+            if skills.contains_key(&row.id) {
+                continue;
+            }
+            skills.insert(
+                row.id.clone(),
+                SkillRecord {
+                    summary: SkillSummary {
+                        id: row.id,
+                        name: row.name,
+                        description: row.description,
+                        pack: None,
+                    },
+                    body: row.body,
+                },
+            );
+        }
+        Ok(Self {
+            _base_dir: self._base_dir.clone(),
+            skills,
+        })
     }
 
     pub fn validate_bot_skills(&self, bots: &[LoadedBot]) -> Result<()> {
@@ -354,25 +402,32 @@ fn truncate_chars(text: &str, max: usize) -> String {
 #[derive(Clone)]
 pub struct SkillRuntime {
     catalog: Arc<SkillCatalog>,
-    bots: Arc<HashMap<String, LoadedBot>>,
+    fleet: Arc<FleetRegistry>,
+    store: Store,
 }
 
 impl SkillRuntime {
-    pub fn new(catalog: Arc<SkillCatalog>, bots: &[LoadedBot]) -> Self {
-        let bots = bots
-            .iter()
-            .map(|bot| (bot.config.name.clone(), bot.clone()))
-            .collect();
+    pub fn new(catalog: Arc<SkillCatalog>, fleet: Arc<FleetRegistry>, store: Store) -> Self {
         Self {
             catalog,
-            bots: Arc::new(bots),
+            fleet,
+            store,
         }
     }
 
-    fn bot(&self, context: &ToolContext) -> Result<&LoadedBot> {
-        self.bots
+    /// The acting user's loaded bot. A bot id is only resolvable inside its
+    /// owner's fleet.
+    fn bot(&self, context: &ToolContext) -> Result<LoadedBot> {
+        self.fleet
+            .load(&context.user_id)?
             .get(&context.bot)
+            .cloned()
             .ok_or_else(|| SeraError::NotFound(format!("bot '{}'", context.bot)))
+    }
+
+    /// The acting user's effective catalog (shipped ∪ their own rows).
+    fn catalog_for(&self, context: &ToolContext) -> Result<SkillCatalog> {
+        self.catalog.effective(&self.store, &context.user_id)
     }
 }
 
@@ -414,7 +469,8 @@ impl Tool for SkillListTool {
 
     async fn execute(&self, _args: Value, context: &ToolContext) -> Result<ToolOutput> {
         let bot = self.runtime.bot(context)?;
-        let skills = self.runtime.catalog.allowed_summaries(bot);
+        let catalog = self.runtime.catalog_for(context)?;
+        let skills = catalog.allowed_summaries(&bot);
         let content = serde_json::to_string_pretty(&skills)?;
         Ok(ToolOutput {
             content,
@@ -456,7 +512,10 @@ impl Tool for SkillSearchTool {
         if query.len() > 256 {
             return Err(SeraError::Validation("query is too long".into()));
         }
-        let skills = self.runtime.catalog.search_allowed(bot, query);
+        let skills = self
+            .runtime
+            .catalog_for(context)?
+            .search_allowed(&bot, query);
         let content = serde_json::to_string_pretty(&skills)?;
         Ok(ToolOutput {
             content,
@@ -499,7 +558,10 @@ impl Tool for SkillLoadTool {
             .get("id")
             .and_then(Value::as_str)
             .ok_or_else(|| SeraError::Validation("id is required".into()))?;
-        let content = self.runtime.catalog.load_allowed_body(bot, id)?;
+        let content = self
+            .runtime
+            .catalog_for(context)?
+            .load_allowed_body(&bot, id)?;
         Ok(ToolOutput {
             content: content.clone(),
             data: Some(json!({ "id": id })),
@@ -607,6 +669,58 @@ pub fn create_skill(
     })
 }
 
+/// A skill created by a user, stored as a `user_skills` row.
+#[derive(Debug, Clone, Serialize)]
+pub struct CreatedUserSkill {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+/// Create a per-user skill. The id must not collide with the shipped catalog
+/// (users cannot shadow server content) or with the acting user's own rows;
+/// another user's row with the same id is independent. Description and body
+/// go through the same policy scan and rendering as [`create_skill`].
+pub fn create_user_skill(
+    store: &Store,
+    user_id: &str,
+    id: &str,
+    description: &str,
+    body: Option<&str>,
+    policy: &Policy,
+    shipped: &SkillCatalog,
+) -> Result<CreatedUserSkill> {
+    validate_skill_id(id)?;
+    if is_reserved_skill_id(id) {
+        return Err(SeraError::Validation("skill id is reserved".into()));
+    }
+    let rendered = render_skill_markdown(id, description, body)?;
+    if !policy.is_allowed(&rendered.markdown) {
+        return Err(SeraError::PolicyViolation);
+    }
+    if shipped.skills.contains_key(id) {
+        return Err(SeraError::InvalidState(format!(
+            "skill '{id}' already exists in the shipped catalog"
+        )));
+    }
+    if !store.insert_user_skill(
+        user_id,
+        id,
+        &rendered.name,
+        &rendered.description,
+        &rendered.instructions,
+    )? {
+        return Err(SeraError::InvalidState(format!(
+            "skill '{id}' already exists"
+        )));
+    }
+    Ok(CreatedUserSkill {
+        id: id.to_owned(),
+        name: rendered.name,
+        description: rendered.description,
+    })
+}
+
 /// Scaffold a skill pack with the standard stub body.
 pub fn init_skill(
     config: &Config,
@@ -664,6 +778,8 @@ pub fn discard_created_skill(config: &Config, created: &CreatedSkill) -> Result<
 struct RenderedSkill {
     name: String,
     description: String,
+    /// Instruction text after the frontmatter; what `skill_load` returns.
+    instructions: String,
     markdown: String,
 }
 
@@ -681,6 +797,7 @@ fn render_skill_markdown(id: &str, description: &str, body: Option<&str>) -> Res
     Ok(RenderedSkill {
         name,
         description,
+        instructions,
         markdown,
     })
 }
@@ -833,6 +950,7 @@ fn title_case(id: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::BotConfig;
+    use crate::fleet::FleetRegistry;
     use std::fs;
 
     fn write_skill(dir: &Path, id: &str, body: &str) {
@@ -915,7 +1033,7 @@ mod tests {
             "# Deck\n\nDeck instructions.\n",
         );
         let config = test_config(base.path());
-        let catalog = SkillCatalog::load(&config).unwrap();
+        let catalog = Arc::new(SkillCatalog::load(&config).unwrap());
         let bots = vec![LoadedBot {
             config: BotConfig {
                 name: "main".into(),
@@ -927,14 +1045,25 @@ mod tests {
                 require_approval: vec![],
                 enabled: true,
                 temperature: None,
-                role: Default::default(),
+                role: crate::orchestration::BotRole::Orchestrator,
                 delegates: vec![],
             },
             prompt: "prompt".into(),
         }];
         catalog.validate_bot_skills(&bots).unwrap();
-        let runtime = SkillRuntime::new(Arc::new(catalog), &bots);
+        let store = Store::open_in_memory(384).unwrap();
+        let fleet = Arc::new(
+            FleetRegistry::new(
+                Arc::new(config.clone()),
+                store.clone(),
+                bots,
+                catalog.clone(),
+            )
+            .unwrap(),
+        );
+        let runtime = SkillRuntime::new(catalog, fleet, store);
         let context = ToolContext {
+            user_id: crate::store::ADMIN_USER_ID.to_owned(),
             actor: "owner".into(),
             bot: "main".into(),
             task_id: None,
@@ -944,14 +1073,173 @@ mod tests {
             require_approval: Default::default(),
         };
         let bot = runtime.bot(&context).unwrap();
+        let effective = runtime.catalog_for(&context).unwrap();
         assert!(
-            runtime
-                .catalog
-                .load_allowed_body(bot, "ask")
+            effective
+                .load_allowed_body(&bot, "ask")
                 .unwrap()
                 .contains("Instructions")
         );
-        assert!(runtime.catalog.load_allowed_body(bot, "deck").is_err());
+        assert!(effective.load_allowed_body(&bot, "deck").is_err());
+    }
+
+    #[test]
+    fn effective_catalog_is_shipped_plus_the_acting_users_rows() {
+        let base = tempfile::tempdir().unwrap();
+        write_skill(&base.path().join("skills"), "ask", "# Ask\n\nShipped.\n");
+        let config = test_config(base.path());
+        let catalog = SkillCatalog::load(&config).unwrap();
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let member = store
+            .create_user("microsoft:skill-owner", "s@example.example", "S")
+            .unwrap();
+
+        create_user_skill(
+            &store,
+            &member.id,
+            "member-notes",
+            "Member notes",
+            Some("Member-only workflow."),
+            &Policy::empty(),
+            &catalog,
+        )
+        .unwrap();
+
+        let member_catalog = catalog.effective(&store, &member.id).unwrap();
+        assert!(member_catalog.skill_ids().contains(&"ask".to_owned()));
+        assert!(
+            member_catalog
+                .skill_ids()
+                .contains(&"member-notes".to_owned())
+        );
+        let admin_catalog = catalog.effective(&store, &admin).unwrap();
+        assert!(admin_catalog.skill_ids().contains(&"ask".to_owned()));
+        assert!(
+            !admin_catalog
+                .skill_ids()
+                .contains(&"member-notes".to_owned())
+        );
+        assert!(
+            admin_catalog
+                .load_allowed_body(
+                    &LoadedBot {
+                        config: BotConfig {
+                            name: "main".into(),
+                            trigger: "command".into(),
+                            model: None,
+                            system_prompt: String::new(),
+                            skills: vec!["member-notes".into()],
+                            tools: vec![],
+                            require_approval: vec![],
+                            enabled: true,
+                            temperature: None,
+                            role: crate::orchestration::BotRole::Orchestrator,
+                            delegates: vec![],
+                        },
+                        prompt: String::new(),
+                    },
+                    "member-notes",
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn create_user_skill_rejects_shipped_ids_duplicates_and_policy() {
+        let base = tempfile::tempdir().unwrap();
+        write_skill(&base.path().join("skills"), "ask", "# Ask\n\nShipped.\n");
+        let config = test_config(base.path());
+        let catalog = SkillCatalog::load(&config).unwrap();
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let member = store
+            .create_user("microsoft:skill-writer", "w@example.example", "W")
+            .unwrap();
+
+        // A shipped id cannot be shadowed by a user row.
+        assert!(
+            create_user_skill(
+                &store,
+                &member.id,
+                "ask",
+                "Shadow",
+                None,
+                &Policy::empty(),
+                &catalog
+            )
+            .is_err()
+        );
+        assert!(
+            create_user_skill(
+                &store,
+                &member.id,
+                "notes",
+                "Notes",
+                Some("Member workflow."),
+                &Policy::empty(),
+                &catalog
+            )
+            .is_ok()
+        );
+        // The same id is a conflict for the same user...
+        assert!(
+            create_user_skill(
+                &store,
+                &member.id,
+                "notes",
+                "Notes",
+                None,
+                &Policy::empty(),
+                &catalog
+            )
+            .is_err()
+        );
+        // ...but independent for another user.
+        assert!(
+            create_user_skill(
+                &store,
+                &admin,
+                "notes",
+                "Admin notes",
+                None,
+                &Policy::empty(),
+                &catalog
+            )
+            .is_ok()
+        );
+        // The policy scan is unchanged: description and body are both scanned.
+        let blocked = Policy::from_text("synthetic blocked phrase");
+        assert!(matches!(
+            create_user_skill(
+                &store,
+                &member.id,
+                "blocked-body",
+                "Public",
+                Some("mentions synthetic blocked phrase"),
+                &blocked,
+                &catalog
+            ),
+            Err(SeraError::PolicyViolation)
+        ));
+        assert!(matches!(
+            create_user_skill(
+                &store,
+                &member.id,
+                "blocked-description",
+                "synthetic blocked phrase",
+                None,
+                &blocked,
+                &catalog
+            ),
+            Err(SeraError::PolicyViolation)
+        ));
+        assert!(
+            store
+                .get_user_skill(&member.id, "blocked-body")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

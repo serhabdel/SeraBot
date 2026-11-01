@@ -1900,6 +1900,7 @@ mod tests {
 
     fn context(tool: &str) -> ToolContext {
         ToolContext {
+            user_id: crate::store::ADMIN_USER_ID.to_owned(),
             actor: "owner".into(),
             bot: "maker".into(),
             task_id: None,

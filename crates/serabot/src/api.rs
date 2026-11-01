@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Extension, Path, Query, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -13,6 +13,7 @@ use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures::StreamExt;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -23,7 +24,10 @@ use tracing::warn;
 use crate::admin::{
     AdminStore, BotConfigOverlay, BotProfile, ProviderSecrets, connector_secret_roles,
 };
-use crate::config::{Config, OAuthConnectorSettings, ProviderConfig, scaffold_specialist_bot};
+use crate::auth::{self, AuthService};
+use crate::config::{
+    BotConfig, Config, OAuthConnectorSettings, ProviderConfig, build_specialist_bot,
+};
 use crate::connectors::{ApiKeyProbe, probe_api_key};
 use crate::domain::Task;
 use crate::error::{Result, SeraError};
@@ -31,13 +35,17 @@ use crate::gateway::Decision;
 use crate::maker::ArtifactStore;
 use crate::memory;
 use crate::model_router::ModelSelection;
+use crate::onedrive::{
+    CONSENT_CALLBACK_PATH, ONEDRIVE_PROVIDER, OneDriveConsent, OneDriveRegistry,
+};
 use crate::orchestration::{
     BotRole, ConversationKind, safe_bot_label, scoped_conversation_id, validate_conversation_id,
 };
 use crate::runtime::{ApprovalNotice, Notifier, Runtime};
 use crate::secrets::SharedSecrets;
-use crate::skills::{SkillCatalog, create_skill, discard_created_skill};
-use crate::store::{Store, StoredConversation};
+use crate::skills::create_user_skill;
+use crate::store::{Store, StoredConversation, User, UserRole, UserStatus};
+use crate::user_secrets::{ProviderCredential, UserSecrets, validate_provider};
 use crate::util::{constant_time_eq, sha256_hex, truncate_chars};
 
 #[derive(Clone)]
@@ -53,8 +61,9 @@ impl ApiNotifier {
 
 #[async_trait::async_trait]
 impl Notifier for ApiNotifier {
-    async fn send_text(&self, conversation_id: &str, text: &str) -> Result<()> {
+    async fn send_text(&self, user_id: &str, conversation_id: &str, text: &str) -> Result<()> {
         self.store.append_event(
+            user_id,
             "message",
             &json!({"conversation_id": conversation_id, "text": text}),
         )?;
@@ -63,10 +72,12 @@ impl Notifier for ApiNotifier {
 
     async fn approval_requested(
         &self,
+        user_id: &str,
         conversation_id: &str,
         notice: &ApprovalNotice,
     ) -> Result<()> {
         self.store.append_event(
+            user_id,
             "approval",
             &json!({
                 "conversation_id": conversation_id,
@@ -89,34 +100,65 @@ pub struct ApiState {
     config: Arc<Config>,
     artifacts: Arc<ArtifactStore>,
     secrets: SharedSecrets,
+    /// Per-user envelope-encrypted credential store (phase 4).
+    users: Arc<UserSecrets>,
+    /// Per-user OneDrive client registry; `None` while `[onedrive]` is off.
+    onedrive: Option<Arc<OneDriveRegistry>>,
+    /// OneDrive consent (auth code + PKCE); `None` while `[onedrive]` is off.
+    onedrive_consent: Option<Arc<OneDriveConsent>>,
     token_hash: String,
-    rate: Arc<Mutex<VecDeque<Instant>>>,
+    /// Per-user request buckets for the per-minute limit. Keyed by the
+    /// acting user id (never a token); public sign-in routes without an
+    /// authenticated user share one `anonymous` bucket.
+    rate: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
     rate_limit: usize,
     admin: Option<AdminStore>,
+    /// The OIDC sign-in service; `None` while `[auth] enabled = false`, so
+    /// every sign-in endpoint fails closed.
+    auth: Option<Arc<AuthService>>,
     /// Providers with a device sign-in still running in the background.
     oauth_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl ApiState {
+    /// Fails fast when sign-in is enabled but misconfigured: a missing auth
+    /// client id, a bad redirect, or an unusable provider must stop startup
+    /// rather than surface at sign-in time.
     pub fn new(
         runtime: Runtime,
         store: Store,
         config: Arc<Config>,
         artifacts: Arc<ArtifactStore>,
         secrets: SharedSecrets,
-    ) -> Self {
-        Self {
+        users: Arc<UserSecrets>,
+        onedrive: Option<Arc<OneDriveRegistry>>,
+    ) -> Result<Self> {
+        let auth = if config.auth.enabled {
+            let fleet = runtime.fleet();
+            Some(Arc::new(
+                AuthService::new(&config, store.clone(), &secrets)?.with_fleet(fleet),
+            ))
+        } else {
+            None
+        };
+        let onedrive_consent =
+            OneDriveConsent::new(&config, &secrets, users.clone())?.map(Arc::new);
+        Ok(Self {
             runtime,
             store,
             artifacts,
             secrets,
+            users,
+            onedrive,
+            onedrive_consent,
             token_hash: config.api.token_hash.to_ascii_lowercase(),
-            rate: Arc::new(Mutex::new(VecDeque::new())),
+            rate: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: config.server.rate_limit_per_minute.max(1) as usize,
             admin: AdminStore::open(&config).ok(),
+            auth,
             oauth_inflight: Arc::default(),
             config,
-        }
+        })
     }
 }
 
@@ -128,7 +170,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/usage", get(usage))
         .route("/v1/messages", post(send_message))
         .route("/v1/bots", get(list_bots).post(create_bot))
-        .route("/v1/bots/{id}", get(bot_detail))
+        .route(
+            "/v1/bots/{id}",
+            get(bot_detail).put(update_bot).delete(delete_bot),
+        )
         .route("/v1/skills", get(list_skills).post(create_skill_pack))
         .route(
             "/v1/conversations",
@@ -145,6 +190,23 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/memories", get(list_memories).post(add_memory))
         .route("/v1/memories/{id}", delete(delete_memory))
         .route("/v1/providers", get(list_providers))
+        .route("/v1/providers/{id}/key", put(set_provider_key))
+        .route("/v1/providers/{id}", delete(delete_provider_credential))
+        .route("/v1/admin/grants", get(list_grants).post(grant_provider))
+        .route(
+            "/v1/admin/grants/{grantee}/{provider}",
+            delete(revoke_grant_endpoint),
+        )
+        .route("/v1/connectors/onedrive", delete(disconnect_onedrive))
+        .route(
+            "/v1/connectors/onedrive/start",
+            post(start_onedrive_consent),
+        )
+        .route("/v1/telegram", get(telegram_status))
+        .route(
+            "/v1/telegram/link",
+            post(start_telegram_link).delete(unlink_telegram),
+        )
         .route("/v1/admin/providers", post(admin_add_provider))
         .route("/v1/admin/providers/{id}", delete(admin_remove_provider))
         .route(
@@ -188,6 +250,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/audit", get(audit))
         .route("/v1/artifacts/{hash}", get(artifact))
         .route("/v1/artifacts/{hash}/approve", post(approve_artifact))
+        .route("/v1/auth/logout", post(auth_logout))
+        .route("/v1/auth/invites", post(auth_invites))
+        .route("/v1/users", get(list_users))
+        .route("/v1/users/{id}/disable", post(disable_user))
+        .route("/v1/users/{id}/enable", post(enable_user))
         .layer(RequestBodyLimitLayer::new(
             shared.config.server.body_limit_bytes,
         ));
@@ -203,11 +270,30 @@ pub fn router(state: ApiState) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(
             crate::audio::DEFAULT_TELEGRAM_AUDIO_MAX_BYTES as usize,
         ));
+    // Sign-in entry points are public: the caller by definition has no
+    // session token yet. They share the JSON body limit and the per-minute
+    // rate limit, but not the bearer-token middleware.
+    let public_auth = Router::new()
+        .route("/v1/auth/providers", get(auth_providers))
+        .route("/v1/auth/login/start", post(auth_login_start))
+        .route("/v1/auth/callback", get(auth_callback))
+        .route("/login/microsoft", get(auth_login_microsoft))
+        // The OneDrive consent redirect is a browser round trip from
+        // Microsoft: no session exists, and the `state` value binds it to the
+        // user exactly like the sign-in callback.
+        .route(CONSENT_CALLBACK_PATH, get(onedrive_callback))
+        .layer(RequestBodyLimitLayer::new(
+            shared.config.server.body_limit_bytes,
+        ))
+        .layer(middleware::from_fn_with_state(shared.clone(), rate_limit));
+    // `authorize` runs first so the rate limiter can key on the authenticated
+    // user; an unknown token is rejected before it can create a bucket.
     let protected = protected
         .merge(audio)
-        .layer(middleware::from_fn_with_state(shared.clone(), authorize))
-        .layer(middleware::from_fn_with_state(shared.clone(), rate_limit));
+        .layer(middleware::from_fn_with_state(shared.clone(), rate_limit))
+        .layer(middleware::from_fn_with_state(shared.clone(), authorize));
     crate::web::router()
+        .merge(public_auth)
         .merge(protected)
         .layer(TraceLayer::new_for_http())
         .with_state(shared)
@@ -248,16 +334,19 @@ trait Tap: Sized {
 }
 impl<T> Tap for T {}
 
-async fn status(State(state): State<Arc<ApiState>>) -> Response {
-    let pending = state.store.pending_task_count().unwrap_or(-1);
+async fn status(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Response {
+    let pending = state.store.pending_task_count(&user.id).unwrap_or(-1);
     let approvals = state
         .store
-        .list_pending_approvals(50)
+        .list_pending_approvals(&user.id, 50)
         .map(|items| items.len())
         .unwrap_or(0);
     let approval_items = state
         .store
-        .list_pending_approvals(50)
+        .list_pending_approvals(&user.id, 50)
         .unwrap_or_default()
         .into_iter()
         .map(|approval| {
@@ -294,6 +383,7 @@ struct UsageQuery {
 /// is clamped to 1..=90; `bot` and `conversation_id` are optional filters.
 async fn usage(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Query(query): Query<UsageQuery>,
 ) -> Result<Json<Value>> {
     let days = query.days.unwrap_or(7).clamp(1, 90);
@@ -307,6 +397,7 @@ async fn usage(
     }
     let since = Utc::now() - chrono::Duration::days(days);
     let rollup = state.store.usage_rollup(
+        &user.id,
         since,
         query.bot.as_deref(),
         query.conversation_id.as_deref(),
@@ -317,7 +408,9 @@ async fn usage(
         "per_bot": rollup.per_bot,
     });
     // Same egress scan as the model catalog endpoints.
-    state.runtime.scan_owner_output(&body.to_string())?;
+    state
+        .runtime
+        .scan_owner_output(&user.id, &body.to_string())?;
     Ok(Json(body))
 }
 
@@ -331,10 +424,12 @@ struct MessageRequest {
 
 async fn send_message(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Json(request): Json<MessageRequest>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&request.conversation_id)?;
     let task = state.runtime.submit_text(
+        &user.id,
         &request.conversation_id,
         &request.text,
         request.bot.as_deref(),
@@ -351,18 +446,22 @@ struct ModelQuery {
 
 async fn models(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Query(query): Query<ModelQuery>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&query.conversation_id)?;
-    state.runtime.refresh_model_catalogs().await?;
+    state.runtime.refresh_model_catalogs(&user.id).await?;
     let bot = query.bot.as_deref().unwrap_or("main");
-    let selection = state.runtime.model_selection(&query.conversation_id, bot)?;
-    let effective_selection = state
+    let selection = state
         .runtime
-        .effective_model_selection(&query.conversation_id, bot)?;
+        .model_selection(&user.id, &query.conversation_id, bot)?;
+    let effective_selection =
+        state
+            .runtime
+            .effective_model_selection(&user.id, &query.conversation_id, bot)?;
     Ok(Json(json!({
-        "providers": state.runtime.model_catalog()?,
-        "entries": state.runtime.model_catalog_entries()?,
+        "providers": state.runtime.model_catalog(&user.id)?,
+        "entries": state.runtime.model_catalog_entries(&user.id)?,
         "selection": selection,
         "effective_selection": effective_selection,
     })))
@@ -378,11 +477,12 @@ struct SelectModelRequest {
 
 async fn select_model(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<SelectModelRequest>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
-    state.runtime.refresh_model_catalogs().await?;
+    state.runtime.refresh_model_catalogs(&user.id).await?;
     let selection = if request.provider == crate::model_router::AUTO_PROVIDER {
         ModelSelection::auto_mode()
     } else {
@@ -391,7 +491,7 @@ async fn select_model(
             model: request.model,
         }
     };
-    let selection = state.runtime.select_model(&id, selection)?;
+    let selection = state.runtime.select_model(&user.id, &id, selection)?;
     Ok(Json(json!({"selection": selection})))
 }
 
@@ -403,16 +503,21 @@ struct HistoryQuery {
 
 async fn conversation_messages(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
     let messages = state
         .store
-        .list_visible_messages(&id, query.limit.unwrap_or(100).clamp(1, 200))?
+        .list_visible_messages(&user.id, &id, query.limit.unwrap_or(100).clamp(1, 200))?
         .into_iter()
         .map(|message| {
-            let content = if state.runtime.scan_owner_output(&message.content).is_ok() {
+            let content = if state
+                .runtime
+                .scan_owner_output(&user.id, &message.content)
+                .is_ok()
+            {
                 message.content
             } else {
                 "[Content withheld by policy]".to_owned()
@@ -427,7 +532,7 @@ async fn conversation_messages(
                 .name
                 .as_deref()
                 .filter(|name| crate::orchestration::safe_bot_label(name))
-                && state.runtime.scan_owner_output(name).is_ok()
+                && state.runtime.scan_owner_output(&user.id, name).is_ok()
             {
                 body["name"] = json!(name);
             }
@@ -435,15 +540,15 @@ async fn conversation_messages(
                 .bot
                 .as_deref()
                 .filter(|bot| crate::orchestration::safe_bot_label(bot))
-                && state.runtime.scan_owner_output(bot).is_ok()
+                && state.runtime.scan_owner_output(&user.id, bot).is_ok()
             {
                 body["bot"] = json!(bot);
             }
             body
         })
         .collect::<Vec<_>>();
-    // Opening the thread is the owner reading it.
-    state.store.mark_conversation_read(&id)?;
+    // Opening the thread is the acting user reading it.
+    state.store.mark_conversation_read(&user.id, &id)?;
     Ok(Json(json!({"messages": messages})))
 }
 
@@ -460,12 +565,17 @@ fn team_error(error: SeraError) -> Response {
     }
 }
 
-/// A conversation that may carry a team: it must exist and be a `room:`.
-fn team_conversation(state: &ApiState, id: &str) -> Result<StoredConversation> {
+/// A conversation that may carry a team: it must exist for the acting user
+/// and be a `room:`.
+fn team_conversation(
+    state: &ApiState,
+    acting: &ActingUser,
+    id: &str,
+) -> Result<StoredConversation> {
     validate_conversation_id(id)?;
     let record = state
         .store
-        .get_conversation(id)?
+        .get_conversation(&acting.id, id)?
         .ok_or_else(|| SeraError::NotFound(format!("conversation {id}")))?;
     if crate::store::parse_stored_conversation_kind(&record.kind)? != ConversationKind::Room {
         return Err(SeraError::Validation(
@@ -475,27 +585,33 @@ fn team_conversation(state: &ApiState, id: &str) -> Result<StoredConversation> {
     Ok(record)
 }
 
-fn team_member_view(state: &ApiState, bots: &[crate::config::ConfiguredBot], bot: &str) -> Value {
+fn team_member_view(
+    state: &ApiState,
+    user_id: &str,
+    bots: &[crate::config::ConfiguredBot],
+    bot: &str,
+) -> Value {
     let entry = bots.iter().find(|candidate| candidate.id == bot);
     json!({
         "bot": bot,
         "role": entry.map(|entry| entry.role.clone()).unwrap_or_else(|| "unknown".into()),
         "enabled": entry.is_some_and(|entry| entry.enabled),
-        "live": state.runtime.bot_loaded(bot),
+        "live": state.runtime.bot_loaded(user_id, bot),
     })
 }
 
 fn team_view(
     state: &ApiState,
+    user_id: &str,
     conversation_id: &str,
     members: &[String],
     mode: &str,
     rules: &str,
 ) -> Result<Value> {
-    let bots = crate::config::list_configured_bots(&state.config)?;
+    let bots = state.runtime.fleet().configured(user_id)?;
     let members = members
         .iter()
-        .map(|bot| team_member_view(state, &bots, bot))
+        .map(|bot| team_member_view(state, user_id, &bots, bot))
         .collect::<Vec<_>>();
     Ok(json!({
         "conversation_id": conversation_id,
@@ -506,10 +622,14 @@ fn team_view(
     }))
 }
 
-async fn conversation_team(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> Response {
+async fn conversation_team(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Response {
     let body = (|| -> Result<Value> {
-        team_conversation(&state, &id)?;
-        let (members, mode, rules) = match state.store.get_conversation_team(&id)? {
+        team_conversation(&state, &user, &id)?;
+        let (members, mode, rules) = match state.store.get_conversation_team(&user.id, &id)? {
             Some(team) => (team.members, team.mode, team.rules),
             // No team yet is an empty shape, never a 404.
             None => (
@@ -518,8 +638,10 @@ async fn conversation_team(State(state): State<Arc<ApiState>>, Path(id): Path<St
                 String::new(),
             ),
         };
-        let body = team_view(&state, &id, &members, &mode, &rules)?;
-        state.runtime.scan_owner_output(&body.to_string())?;
+        let body = team_view(&state, &user.id, &id, &members, &mode, &rules)?;
+        state
+            .runtime
+            .scan_owner_output(&user.id, &body.to_string())?;
         Ok(body)
     })();
     match body {
@@ -544,11 +666,12 @@ fn default_team_mode() -> String {
 
 async fn set_conversation_team(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<SetTeamRequest>,
 ) -> Response {
     let body = (|| -> Result<Value> {
-        team_conversation(&state, &id)?;
+        team_conversation(&state, &user, &id)?;
         let mode = crate::teams::TeamMode::from_name(&request.mode)?;
         crate::teams::validate_members(&request.members)?;
         if request.rules.chars().count() > 4000 {
@@ -567,8 +690,8 @@ async fn set_conversation_team(
         }
         // Rules reach every later model request in the room, so they are
         // scanned before they are stored, not only on the way out.
-        state.runtime.scan_owner_output(&request.rules)?;
-        let bots = crate::config::list_configured_bots(&state.config)?;
+        state.runtime.scan_owner_output(&user.id, &request.rules)?;
+        let bots = state.runtime.fleet().configured(&user.id)?;
         for member in &request.members {
             let entry = bots.iter().find(|candidate| candidate.id == *member);
             let Some(entry) = entry else {
@@ -582,13 +705,17 @@ async fn set_conversation_team(
             if !entry.enabled {
                 return Err(SeraError::Validation(format!("bot {member} is disabled")));
             }
-            if !state.runtime.bot_loaded(member) {
+            if !state.runtime.bot_loaded(&user.id, member) {
                 return Err(SeraError::Validation(format!("bot {member} is not loaded")));
             }
         }
-        state
-            .store
-            .set_conversation_team(&id, &request.members, mode.as_str(), &request.rules)?;
+        state.store.set_conversation_team(
+            &user.id,
+            &id,
+            &request.members,
+            mode.as_str(),
+            &request.rules,
+        )?;
         let details = json!({
             "conversation_id": id,
             "members": request.members,
@@ -596,7 +723,7 @@ async fn set_conversation_team(
             "rules": request.rules,
         });
         state.store.record_audit(
-            "owner",
+            &user.id,
             crate::teams::AUDIT_MEMBER_SET,
             None,
             None,
@@ -607,9 +734,18 @@ async fn set_conversation_team(
         )?;
         state
             .store
-            .append_event(crate::teams::AUDIT_MEMBER_SET, &details)?;
-        let body = team_view(&state, &id, &request.members, mode.as_str(), &request.rules)?;
-        state.runtime.scan_owner_output(&body.to_string())?;
+            .append_event(&user.id, crate::teams::AUDIT_MEMBER_SET, &details)?;
+        let body = team_view(
+            &state,
+            &user.id,
+            &id,
+            &request.members,
+            mode.as_str(),
+            &request.rules,
+        )?;
+        state
+            .runtime
+            .scan_owner_output(&user.id, &body.to_string())?;
         Ok(body)
     })();
     match body {
@@ -620,16 +756,17 @@ async fn set_conversation_team(
 
 async fn conversation_library(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
     state
         .store
-        .get_conversation(&id)?
+        .get_conversation(&user.id, &id)?
         .ok_or_else(|| SeraError::NotFound(format!("conversation {id}")))?;
     let entries = state
         .store
-        .list_conversation_artifacts(&id)?
+        .list_conversation_artifacts(&user.id, &id)?
         .into_iter()
         .map(|entry| {
             let meta = state.artifacts.meta(&entry.hash).ok();
@@ -649,6 +786,7 @@ async fn conversation_library(
 /// Raw owner audio, transcribed with the configured audio provider.
 async fn transcribe_audio(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
@@ -702,7 +840,7 @@ async fn transcribe_audio(
     }
     match crate::audio::transcribe_audio_bytes(&state.config, &body, &filename).await {
         Ok(text) => {
-            if let Err(error) = state.runtime.scan_owner_output(&text) {
+            if let Err(error) = state.runtime.scan_owner_output(&user.id, &text) {
                 return error.into_response();
             }
             Json(json!({
@@ -758,15 +896,22 @@ fn task_view(task: &Task) -> Value {
     })
 }
 
-async fn task(State(state): State<Arc<ApiState>>, Path(id): Path<String>) -> Result<Json<Value>> {
-    let task = state.store.get_task(&id)?;
+async fn task(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    let task = state.store.get_task(&user.id, &id)?;
     Ok(Json(json!({"task": task_view(&task)})))
 }
 
-async fn list_approvals(State(state): State<Arc<ApiState>>) -> Result<Json<Value>> {
+async fn list_approvals(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
     let approvals = state
         .store
-        .list_pending_approvals(100)?
+        .list_pending_approvals(&user.id, 100)?
         .into_iter()
         .map(|approval| {
             json!({
@@ -790,6 +935,7 @@ struct DecideRequest {
 
 async fn decide_approval(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<DecideRequest>,
 ) -> Result<Json<Value>> {
@@ -810,7 +956,10 @@ async fn decide_approval(
             ));
         }
     };
-    let result = state.runtime.handle_approval(&id, decision).await?;
+    let result = state
+        .runtime
+        .handle_approval(&user.id, &id, decision)
+        .await?;
     Ok(Json(json!({
         "approval_id": result.approval.id,
         "approval_state": result.approval.state,
@@ -830,37 +979,42 @@ struct EventQuery {
 
 async fn events(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     headers: HeaderMap,
     Query(query): Query<EventQuery>,
 ) -> Sse<impl futures::Stream<Item = std::result::Result<SseEvent, Infallible>>> {
     let last = resume_cursor(&headers, query.after);
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let store = state.store.clone();
-    let stream = futures::stream::unfold((last, store), move |(last, store)| async move {
-        loop {
-            tokio::time::sleep(Duration::from_millis(180)).await;
-            match store.events_after(last, limit) {
-                Ok(events) if !events.is_empty() => {
-                    let next = events.last().map(|event| event.id).unwrap_or(last);
-                    let items = events
-                        .into_iter()
-                        .map(|event| {
-                            Ok(SseEvent::default()
-                                .id(event.id.to_string())
-                                .event(event.kind)
-                                .data(event.payload.to_string()))
-                        })
-                        .collect::<Vec<_>>();
-                    return Some((futures::stream::iter(items), (next, store)));
-                }
-                Ok(_) => continue,
-                Err(error) => {
-                    warn!(%error, "event stream query failed");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+    let user_id = user.id;
+    let stream = futures::stream::unfold(
+        (last, store, user_id),
+        move |(last, store, user_id)| async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(180)).await;
+                match store.events_after(&user_id, last, limit) {
+                    Ok(events) if !events.is_empty() => {
+                        let next = events.last().map(|event| event.id).unwrap_or(last);
+                        let items = events
+                            .into_iter()
+                            .map(|event| {
+                                Ok(SseEvent::default()
+                                    .id(event.id.to_string())
+                                    .event(event.kind)
+                                    .data(event.payload.to_string()))
+                            })
+                            .collect::<Vec<_>>();
+                        return Some((futures::stream::iter(items), (next, store, user_id)));
+                    }
+                    Ok(_) => continue,
+                    Err(error) => {
+                        warn!(%error, "event stream query failed");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
                 }
             }
-        }
-    })
+        },
+    )
     .flatten();
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
@@ -886,10 +1040,18 @@ struct AuditQuery {
 
 async fn audit(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Query(query): Query<AuditQuery>,
 ) -> Result<Json<Value>> {
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
-    let entries = state.store.list_audit(limit)?;
+    // Members see only their own rows; the admin keeps the cross-user audit
+    // view (spec: the admin sees everything in audit — audit rows only,
+    // never another user's data).
+    let entries = if user.is_admin() {
+        state.store.list_audit(limit)?
+    } else {
+        state.store.list_audit_for_user(&user.id, limit)?
+    };
     Ok(Json(json!({"audit": entries})))
 }
 
@@ -915,9 +1077,10 @@ async fn artifact(
 
 async fn approve_artifact(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(hash): Path<String>,
 ) -> Result<Json<Value>> {
-    state.artifacts.approve(&state.store, &hash)?;
+    state.artifacts.approve(&state.store, &user.id, &hash)?;
     Ok(Json(json!({
         "artifact_hash": hash,
         "content_approved": true,
@@ -936,24 +1099,58 @@ struct CreateBotRequest {
     skills: Option<Vec<String>>,
 }
 
+/// Legacy path labels returned to the desktop client, which validates their
+/// shape. The database row is authoritative; these are not files.
+fn bot_file_label(id: &str) -> String {
+    format!("db/bots/{id}.toml")
+}
+
+fn prompt_file_label(id: &str) -> String {
+    format!("db/prompts/{id}.txt")
+}
+
+/// `POST /v1/bots` — scaffold a disabled specialist as a row owned by the
+/// session user. The fixed template is shared; the description, tools, and
+/// skills are validated and policy-scanned before the insert.
 async fn create_bot(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Json(request): Json<CreateBotRequest>,
 ) -> Result<Json<Value>> {
-    if state.runtime.bot_loaded(&request.id) {
-        return Err(SeraError::InvalidState("bot already exists".into()));
-    }
-    state.runtime.scan_owner_output(&request.description)?;
-    let scaffolded = scaffold_specialist_bot(
-        &state.config,
+    state
+        .runtime
+        .scan_owner_output(&user.id, &request.description)?;
+    let fleet = state.runtime.fleet();
+    let known = fleet
+        .catalog()
+        .effective(&state.store, &user.id)?
+        .skill_ids();
+    let scaffolded = build_specialist_bot(
         &request.id,
         &request.description,
         request.tools.as_deref(),
         request.skills.as_deref(),
+        &known,
         state.runtime.policy(),
     )?;
+    if state
+        .runtime
+        .fleet()
+        .row(&user.id, &scaffolded.id)?
+        .is_some()
+    {
+        return Err(SeraError::InvalidState("bot already exists".into()));
+    }
+    let config = serde_json::to_value(&scaffolded.config)?;
+    if !state
+        .store
+        .insert_bot(&user.id, &scaffolded.id, &config, &scaffolded.prompt, false)?
+    {
+        return Err(SeraError::InvalidState("bot already exists".into()));
+    }
+    state.runtime.fleet().invalidate(&user.id);
     if let Err(error) = state.store.record_audit(
-        "owner",
+        &user.id,
         "bot.scaffolded",
         None,
         None,
@@ -962,16 +1159,15 @@ async fn create_bot(
         Some(state.runtime.policy_version()),
         Some(&json!({
             "id": scaffolded.id,
-            "bot_file": scaffolded.bot_file,
-            "prompt_file": scaffolded.prompt_file,
             "enabled": false,
             "role": "specialist",
             "tools": scaffolded.tools,
             "skills": scaffolded.skills,
+            "scope": "user",
         })),
     ) {
-        let _ = std::fs::remove_file(&scaffolded.bot_path);
-        let _ = std::fs::remove_file(&scaffolded.prompt_path);
+        let _ = state.store.delete_bot(&user.id, &scaffolded.id);
+        state.runtime.fleet().invalidate(&user.id);
         return Err(error);
     }
     Ok(Json(json!({
@@ -983,43 +1179,63 @@ async fn create_bot(
             "tools": scaffolded.tools,
             "skills": scaffolded.skills,
             "require_approval": scaffolded.require_approval,
-            "bot_file": scaffolded.bot_file,
-            "prompt_file": scaffolded.prompt_file,
+            "bot_file": bot_file_label(&scaffolded.id),
+            "prompt_file": prompt_file_label(&scaffolded.id),
         }
     })))
 }
 
-async fn list_bots(State(state): State<Arc<ApiState>>) -> Result<Json<Value>> {
-    let configured = crate::config::list_configured_bots(&state.config)?;
+async fn list_bots(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let configured = state.runtime.fleet().configured(&user.id)?;
     let bots = configured
         .into_iter()
         .map(|bot| {
-            let profile = state
-                .admin
-                .as_ref()
-                .and_then(|admin| admin.bot_profile(&bot.id));
+            let id = bot.id.clone();
+            let profile = if user.is_admin() {
+                state
+                    .admin
+                    .as_ref()
+                    .and_then(|admin| admin.bot_profile(&id))
+            } else {
+                None
+            };
+            let (tools, skills, require_approval) = if user.is_admin() {
+                bot_lists_with_override(&state, &bot)
+            } else {
+                (
+                    bot.tools.clone(),
+                    bot.skills.clone(),
+                    bot.require_approval.clone(),
+                )
+            };
             json!({
-                "id": bot.id,
+                "id": id,
                 "role": bot.role,
                 "enabled": bot.enabled,
-                "live": state.runtime.bot_loaded(&bot.id),
+                "live": state.runtime.bot_loaded(&user.id, &bot.id),
                 "model": bot.model,
                 "display_name": profile.as_ref().map(|p| p.display_name.clone()).filter(|name| !name.is_empty()),
                 "description": profile.as_ref().map(|p| p.description.clone()).filter(|text| !text.is_empty()),
                 "avatar": profile.as_ref().map(|p| p.avatar.clone()).filter(|avatar| !avatar.is_empty()),
-                "tools": bot.tools,
-                "skills": bot.skills,
-                "require_approval": bot.require_approval,
+                "tools": tools,
+                "skills": skills,
+                "require_approval": require_approval,
             })
         })
         .collect::<Vec<_>>();
     let body = json!({ "bots": bots });
-    state.runtime.scan_owner_output(&body.to_string())?;
+    state
+        .runtime
+        .scan_owner_output(&user.id, &body.to_string())?;
     Ok(Json(body))
 }
 
-/// Bot config lists with the admin-console overlay merged over the bot file, so
-/// the console sees values it just saved even before the restart.
+/// Bot config lists with the admin-console overlay merged over the admin's
+/// row, so the console sees values it just saved even before the restart.
+/// Only called for the admin; members never see the overlay.
 fn bot_lists_with_override(
     state: &ApiState,
     entry: &crate::config::ConfiguredBot,
@@ -1045,30 +1261,63 @@ fn bot_lists_with_override(
 
 /// Cap for the `instructions` field of `GET /v1/bots/{id}`.
 const MAX_INSTRUCTIONS_BYTES: usize = 32 * 1024;
+/// Spec cap for a bot system prompt.
+const MAX_BOT_PROMPT_BYTES: usize = 100_000;
+
+fn parse_bot_config(row: &crate::store::StoredBot) -> Result<BotConfig> {
+    let mut config: BotConfig = serde_json::from_value(row.config.clone())
+        .map_err(|_| SeraError::InvalidState(format!("bot '{}' config is invalid", row.name)))?;
+    config.name = row.name.clone();
+    config.enabled = row.enabled;
+    Ok(config)
+}
 
 /// `GET /v1/bots/{id}` — one bot's full owner-facing detail. No secrets and no
-/// secret values; the response passes the egress scan.
+/// secret values; the response passes the egress scan. Another user's bot is a
+/// 404.
 async fn bot_detail(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
     if !safe_bot_label(&id) {
         return Err(SeraError::NotFound(format!("bot {id}")));
     }
-    let configured = crate::config::list_configured_bots(&state.config)?;
+    let row = state
+        .runtime
+        .fleet()
+        .row(&user.id, &id)?
+        .ok_or_else(|| SeraError::NotFound(format!("bot {id}")))?;
+    let configured = state.runtime.fleet().configured(&user.id)?;
     let Some(entry) = configured.iter().find(|bot| bot.id == id) else {
         return Err(SeraError::NotFound(format!("bot {id}")));
     };
-    let profile = state
-        .admin
+    let profile = if user.is_admin() {
+        state
+            .admin
+            .as_ref()
+            .and_then(|admin| admin.bot_profile(&id))
+    } else {
+        None
+    };
+    // The desktop detail record expects strings, so an absent profile falls
+    // back to the bot id and empty text instead of null.
+    let display_name = profile
         .as_ref()
-        .and_then(|admin| admin.bot_profile(&id));
-    let loaded = state.runtime.bot(&id).cloned();
-    let prompt = loaded.as_ref().map(|bot| bot.prompt.clone()).or_else(|| {
-        crate::config::load_bot_prompt(&state.config, &id)
-            .ok()
-            .flatten()
-    });
+        .map(|p| p.display_name.clone())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| id.clone());
+    let description = profile
+        .as_ref()
+        .map(|p| p.description.clone())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_default();
+    let avatar = profile
+        .as_ref()
+        .map(|p| p.avatar.clone())
+        .filter(|avatar| !avatar.is_empty())
+        .unwrap_or_default();
+    let loaded = state.runtime.bot(&user.id, &id);
     let model_hint = loaded
         .as_ref()
         .and_then(|bot| bot.config.model.clone())
@@ -1082,21 +1331,30 @@ async fn bot_detail(
         .unwrap_or_else(|| "default".into());
     let fallback = state.runtime.router().fallback_for_model(&model);
     let routing_classes = state.runtime.router().classes_for_model(&model);
-    let (tools, skills, require_approval) = bot_lists_with_override(&state, entry);
-    let (instructions, instructions_bytes) = match prompt {
-        Some(text) if text.len() <= MAX_INSTRUCTIONS_BYTES => (Some(text.clone()), text.len()),
-        // Over the cap the content is withheld entirely; the byte count is kept.
-        Some(text) => (None, text.len()),
-        None => (None, 0),
+    let (tools, skills, require_approval) = if user.is_admin() {
+        bot_lists_with_override(&state, entry)
+    } else {
+        (
+            entry.tools.clone(),
+            entry.skills.clone(),
+            entry.require_approval.clone(),
+        )
     };
-    let memory_count = state.store.count_memories()?;
-    let artifact_count = state.store.count_bot_artifacts(&id)?;
+    let prompt = row.prompt;
+    let (instructions, instructions_bytes) = if prompt.len() <= MAX_INSTRUCTIONS_BYTES {
+        (Some(prompt.clone()), prompt.len())
+    } else {
+        // Over the cap the content is withheld entirely; the byte count is kept.
+        (None, prompt.len())
+    };
+    let memory_count = state.store.count_memories(&user.id)?;
+    let artifact_count = state.store.count_bot_artifacts(&user.id, &id)?;
     let body = json!({
         "id": entry.id,
-        "display_name": profile.as_ref().map(|p| p.display_name.clone()).filter(|name| !name.is_empty()),
+        "display_name": display_name,
         "role": entry.role,
-        "description": profile.as_ref().map(|p| p.description.clone()).filter(|text| !text.is_empty()),
-        "avatar": profile.as_ref().map(|p| p.avatar.clone()).filter(|avatar| !avatar.is_empty()),
+        "description": description,
+        "avatar": avatar,
         "enabled": entry.enabled,
         "provider": provider,
         "model": model,
@@ -1111,8 +1369,202 @@ async fn bot_detail(
         "memory_count": memory_count,
         "artifact_count": artifact_count,
     });
-    state.runtime.scan_owner_output(&body.to_string())?;
+    state
+        .runtime
+        .scan_owner_output(&user.id, &body.to_string())?;
     Ok(Json(body))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateBotRequest {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    tools: Option<Vec<String>>,
+    #[serde(default)]
+    skills: Option<Vec<String>>,
+    #[serde(default)]
+    require_approval: Option<Vec<String>>,
+}
+
+/// `PUT /v1/bots/{id}` — update the session user's bot row. Enable/disable and
+/// prompt edits are ordinary scoped DB writes; the fleet cache is invalidated
+/// so the next turn sees them. A change that would leave the fleet invalid
+/// (for example disabling `main` or a delegate) is rejected before the write.
+async fn update_bot(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateBotRequest>,
+) -> Result<Json<Value>> {
+    if !safe_bot_label(&id) {
+        return Err(SeraError::NotFound(format!("bot {id}")));
+    }
+    if request.enabled.is_none()
+        && request.prompt.is_none()
+        && request.tools.is_none()
+        && request.skills.is_none()
+        && request.require_approval.is_none()
+    {
+        return Err(SeraError::Validation(
+            "at least one of enabled, prompt, tools, skills, require_approval is required".into(),
+        ));
+    }
+    // Untrusted input is scanned before it is validated or stored.
+    for list in [&request.tools, &request.skills, &request.require_approval]
+        .into_iter()
+        .flatten()
+    {
+        for item in list {
+            state.runtime.scan_owner_output(&user.id, item)?;
+        }
+    }
+    let row = state
+        .runtime
+        .fleet()
+        .row(&user.id, &id)?
+        .ok_or_else(|| SeraError::NotFound(format!("bot {id}")))?;
+    let mut config = parse_bot_config(&row)?;
+
+    let prompt_changed = request.prompt.is_some();
+    let prompt = match request.prompt {
+        Some(prompt) => {
+            if prompt.trim().is_empty() {
+                return Err(SeraError::Validation("bot prompt must not be empty".into()));
+            }
+            if prompt.len() > MAX_BOT_PROMPT_BYTES {
+                return Err(SeraError::Validation(format!(
+                    "bot prompt exceeds {MAX_BOT_PROMPT_BYTES} bytes"
+                )));
+            }
+            if prompt
+                .chars()
+                .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+            {
+                return Err(SeraError::Validation(
+                    "bot prompt contains unsupported control characters".into(),
+                ));
+            }
+            state.runtime.scan_owner_output(&user.id, &prompt)?;
+            prompt
+        }
+        None => row.prompt.clone(),
+    };
+    let tools = match &request.tools {
+        Some(tools) => validate_bot_tool_list(&state, tools, config.role)?,
+        None => config.tools.clone(),
+    };
+    let skills = match &request.skills {
+        Some(skills) => validate_bot_skill_list(&state, &user.id, skills)?,
+        None => config.skills.clone(),
+    };
+    let require_approval = match &request.require_approval {
+        Some(list) => validate_require_approval_list(list, &tools)?,
+        None => validate_require_approval_list(&config.require_approval, &tools)?,
+    };
+    let enabled = request.enabled.unwrap_or(row.enabled);
+    if !enabled && config.role == BotRole::Orchestrator {
+        return Err(SeraError::Validation(
+            "the orchestrator cannot be disabled".into(),
+        ));
+    }
+
+    // Validate the fleet the write would produce, not just the row.
+    let mut candidate = state.runtime.fleet().candidates(&user.id)?;
+    let Some(bot) = candidate.iter_mut().find(|bot| bot.config.name == id) else {
+        return Err(SeraError::NotFound(format!("bot {id}")));
+    };
+    bot.config.enabled = enabled;
+    bot.config.tools = tools.clone();
+    bot.config.skills = skills.clone();
+    bot.config.require_approval = require_approval.clone();
+    bot.prompt = prompt.clone();
+    crate::fleet::FleetRegistry::validate_fleet(&candidate)?;
+
+    config.enabled = enabled;
+    config.tools = tools.clone();
+    config.skills = skills.clone();
+    config.require_approval = require_approval.clone();
+    let role = config.role.as_str().to_owned();
+    let config = serde_json::to_value(&config)?;
+    if !state
+        .store
+        .update_bot(&user.id, &id, &config, &prompt, enabled)?
+    {
+        return Err(SeraError::NotFound(format!("bot {id}")));
+    }
+    state.runtime.fleet().invalidate(&user.id);
+    state.store.record_audit(
+        &user.id,
+        "bot.updated",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({
+            "id": id,
+            "enabled": enabled,
+            "role": role,
+            "prompt_changed": prompt_changed,
+            "tools_changed": request.tools.is_some(),
+            "skills_changed": request.skills.is_some(),
+            "require_approval_changed": request.require_approval.is_some(),
+        })),
+    )?;
+    Ok(Json(json!({
+        "bot": {
+            "id": id,
+            "enabled": enabled,
+            "role": role,
+            "live": state.runtime.bot_loaded(&user.id, &id),
+            "tools": tools,
+            "skills": skills,
+            "require_approval": require_approval,
+        }
+    })))
+}
+
+/// `DELETE /v1/bots/{id}` — remove one specialist owned by the session user.
+/// The orchestrator cannot be deleted, and a delete that would leave a
+/// delegate dangling is rejected before the write.
+async fn delete_bot(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    if !safe_bot_label(&id) {
+        return Err(SeraError::NotFound(format!("bot {id}")));
+    }
+    let Some(row) = state.runtime.fleet().row(&user.id, &id)? else {
+        return Err(SeraError::NotFound(format!("bot {id}")));
+    };
+    if row.name == crate::orchestration::ORCHESTRATOR_BOT {
+        return Err(SeraError::Validation(
+            "the orchestrator cannot be deleted".into(),
+        ));
+    }
+    let mut candidate = state.runtime.fleet().candidates(&user.id)?;
+    candidate.retain(|bot| bot.config.name != id);
+    crate::fleet::FleetRegistry::validate_fleet(&candidate)?;
+    if !state.store.delete_bot(&user.id, &id)? {
+        return Err(SeraError::NotFound(format!("bot {id}")));
+    }
+    state.runtime.fleet().invalidate(&user.id);
+    state.store.record_audit(
+        &user.id,
+        "bot.deleted",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({"id": id, "scope": "user"})),
+    )?;
+    Ok(Json(json!({"deleted": true, "id": id})))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1125,30 +1577,46 @@ struct CreateSkillRequest {
     body: Option<String>,
 }
 
-async fn list_skills(State(state): State<Arc<ApiState>>) -> Result<Json<Value>> {
-    let catalog = SkillCatalog::load(&state.config)?;
-    let skills = catalog.summaries();
-    Ok(Json(json!({ "skills": skills })))
+async fn list_skills(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let fleet = state.runtime.fleet();
+    let skills = fleet
+        .catalog()
+        .effective(&state.store, &user.id)?
+        .summaries();
+    let body = json!({ "skills": skills });
+    state
+        .runtime
+        .scan_owner_output(&user.id, &body.to_string())?;
+    Ok(Json(body))
 }
 
 async fn create_skill_pack(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Json(request): Json<CreateSkillRequest>,
 ) -> Result<Json<Value>> {
-    state.runtime.scan_owner_output(&request.id)?;
-    state.runtime.scan_owner_output(&request.description)?;
+    state.runtime.scan_owner_output(&user.id, &request.id)?;
+    state
+        .runtime
+        .scan_owner_output(&user.id, &request.description)?;
     if let Some(body) = &request.body {
-        state.runtime.scan_owner_output(body)?;
+        state.runtime.scan_owner_output(&user.id, body)?;
     }
-    let created = create_skill(
-        &state.config,
+    let fleet = state.runtime.fleet();
+    let created = create_user_skill(
+        &state.store,
+        &user.id,
         &request.id,
         &request.description,
         request.body.as_deref(),
         state.runtime.policy(),
+        fleet.catalog(),
     )?;
     if let Err(error) = state.store.record_audit(
-        "owner",
+        &user.id,
         "skill.created",
         None,
         None,
@@ -1157,11 +1625,11 @@ async fn create_skill_pack(
         Some(state.runtime.policy_version()),
         Some(&json!({
             "id": created.id,
-            "file": created.file,
-            "live": false,
+            "name": created.name,
+            "scope": "user",
         })),
     ) {
-        let _ = discard_created_skill(&state.config, &created);
+        let _ = state.store.delete_user_skill(&user.id, &created.id);
         return Err(error);
     }
     Ok(Json(json!({
@@ -1169,7 +1637,7 @@ async fn create_skill_pack(
             "id": created.id,
             "name": created.name,
             "description": created.description,
-            "file": created.file,
+            "file": format!("user_skills/{}/SKILL.md", created.id),
             "live": false,
         }
     })))
@@ -1188,6 +1656,7 @@ struct CreateConversationRequest {
 
 async fn create_conversation(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Json(request): Json<CreateConversationRequest>,
 ) -> Result<Json<Value>> {
     let kind = ConversationKind::from_name(&request.kind)?;
@@ -1215,19 +1684,23 @@ async fn create_conversation(
         None | Some("") => None,
         Some(raw) => {
             let title = normalize_conversation_title(raw)?;
-            state.runtime.scan_owner_output(&title)?;
+            state.runtime.scan_owner_output(&user.id, &title)?;
             Some(title)
         }
     };
-    state
-        .store
-        .create_conversation_titled(&id, kind.as_str(), parent_id, title.as_deref())?;
+    state.store.create_conversation_titled(
+        &user.id,
+        &id,
+        kind.as_str(),
+        parent_id,
+        title.as_deref(),
+    )?;
     let record = state
         .store
-        .get_conversation(&id)?
+        .get_conversation(&user.id, &id)?
         .ok_or_else(|| SeraError::Internal("conversation missing after insert".into()))?;
     state.store.record_audit(
-        "owner",
+        &user.id,
         "conversation.created",
         None,
         None,
@@ -1258,6 +1731,7 @@ struct ConversationListQuery {
 
 async fn list_conversations(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Query(query): Query<ConversationListQuery>,
 ) -> Result<Json<Value>> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
@@ -1266,6 +1740,7 @@ async fn list_conversations(
         Some(value) => Some(parse_conversation_cursor(value)?),
     };
     let records = state.store.list_conversations(
+        &user.id,
         limit,
         cursor.as_ref().map(|(at, id)| (*at, id.as_str())),
         query.include_archived.unwrap_or(false),
@@ -1346,17 +1821,18 @@ struct RenameConversationRequest {
 
 async fn rename_conversation(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<RenameConversationRequest>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
     let title = normalize_conversation_title(&request.title)?;
-    state.runtime.scan_owner_output(&title)?;
-    if !state.store.rename_conversation(&id, &title)? {
+    state.runtime.scan_owner_output(&user.id, &title)?;
+    if !state.store.rename_conversation(&user.id, &id, &title)? {
         return Err(SeraError::NotFound(format!("conversation {id}")));
     }
     state.store.record_audit(
-        "owner",
+        &user.id,
         "conversation.renamed",
         None,
         None,
@@ -1367,21 +1843,22 @@ async fn rename_conversation(
     )?;
     let record = state
         .store
-        .get_conversation(&id)?
+        .get_conversation(&user.id, &id)?
         .ok_or_else(|| SeraError::NotFound(format!("conversation {id}")))?;
     Ok(Json(json!({"conversation": conversation_view(&record)?})))
 }
 
 async fn archive_conversation(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
-    if !state.store.archive_conversation(&id)? {
+    if !state.store.archive_conversation(&user.id, &id)? {
         return Err(SeraError::NotFound(format!("conversation {id}")));
     }
     state.store.record_audit(
-        "owner",
+        &user.id,
         "conversation.archived",
         None,
         None,
@@ -1395,14 +1872,15 @@ async fn archive_conversation(
 
 async fn unarchive_conversation(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
-    if !state.store.unarchive_conversation(&id)? {
+    if !state.store.unarchive_conversation(&user.id, &id)? {
         return Err(SeraError::NotFound(format!("conversation {id}")));
     }
     state.store.record_audit(
-        "owner",
+        &user.id,
         "conversation.unarchived",
         None,
         None,
@@ -1425,6 +1903,7 @@ struct MemoryListQuery {
 
 async fn list_memories(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Query(query): Query<MemoryListQuery>,
 ) -> Result<Json<Value>> {
     let limit = query.limit.unwrap_or(100).clamp(1, memory::MAX_LIST_LIMIT);
@@ -1436,7 +1915,7 @@ async fn list_memories(
     {
         Some(needle) => {
             let needle = needle.to_lowercase();
-            let mut matches = memory::list(&state.store, memory::MAX_LIST_LIMIT)?
+            let mut matches = memory::list(&state.store, &user.id, memory::MAX_LIST_LIMIT)?
                 .into_iter()
                 .filter(|memory| {
                     memory.content.to_lowercase().contains(&needle)
@@ -1447,10 +1926,12 @@ async fn list_memories(
             matches.truncate(limit);
             matches
         }
-        None => memory::list(&state.store, limit)?,
+        None => memory::list(&state.store, &user.id, limit)?,
     };
     let body = json!({"memories": memories});
-    state.runtime.scan_owner_output(&body.to_string())?;
+    state
+        .runtime
+        .scan_owner_output(&user.id, &body.to_string())?;
     Ok(Json(body))
 }
 
@@ -1465,18 +1946,27 @@ struct AddMemoryRequest {
 
 async fn add_memory(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Json(request): Json<AddMemoryRequest>,
 ) -> Result<Json<Value>> {
-    state.runtime.scan_owner_output(&request.content)?;
+    state
+        .runtime
+        .scan_owner_output(&user.id, &request.content)?;
     let source = request
         .source
         .as_deref()
         .map(str::trim)
         .filter(|source| !source.is_empty())
         .unwrap_or("operator:desktop");
-    let memory = memory::add(&state.store, &request.kind, &request.content, source)?;
+    let memory = memory::add(
+        &state.store,
+        &user.id,
+        &request.kind,
+        &request.content,
+        source,
+    )?;
     state.store.record_audit(
-        "owner",
+        &user.id,
         "memory.created",
         None,
         None,
@@ -1494,6 +1984,7 @@ async fn add_memory(
 
 async fn delete_memory(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
     if id.is_empty()
@@ -1504,11 +1995,11 @@ async fn delete_memory(
     {
         return Err(SeraError::Validation("invalid memory id".into()));
     }
-    if !memory::delete(&state.store, &id)? {
+    if !memory::delete(&state.store, &user.id, &id)? {
         return Err(SeraError::NotFound(format!("memory {id}")));
     }
     state.store.record_audit(
-        "owner",
+        &user.id,
         "memory.deleted",
         None,
         None,
@@ -1520,14 +2011,17 @@ async fn delete_memory(
     Ok(Json(json!({"deleted": id})))
 }
 
-async fn list_providers(State(state): State<Arc<ApiState>>) -> Result<Json<Value>> {
-    let catalog = state.runtime.model_catalog()?;
+async fn list_providers(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let catalog = state.runtime.model_catalog(&user.id)?;
     let llm = &state.config.llm;
     let mut settings: BTreeMap<String, ProviderConfig> = llm.providers.clone();
     settings.insert("default".to_owned(), llm.default_provider());
     let mut providers = catalog
         .into_iter()
-        .map(|provider| {
+        .map(|provider| -> Result<Value> {
             let managed = state
                 .admin
                 .as_ref()
@@ -1569,7 +2063,7 @@ async fn list_providers(State(state): State<Arc<ApiState>>) -> Result<Json<Value
                     config.map(|c| c.oauth_client_secret_secret.as_str()),
                 );
             }
-            json!({
+            Ok(json!({
                 "id": provider.id,
                 "kind": provider.kind,
                 "auth": if is_oauth { "oauth" } else { "api_key" },
@@ -1581,9 +2075,10 @@ async fn list_providers(State(state): State<Arc<ApiState>>) -> Result<Json<Value
                 "catalog_verified": provider.catalog_verified,
                 "managed": managed,
                 "secrets": secrets,
-            })
+                "credential": credential_view(&state, &user.id, &provider.id)?,
+            }))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
 
     if let Some(admin) = &state.admin {
         for (id, profile) in admin.snapshot().providers {
@@ -1634,6 +2129,7 @@ async fn list_providers(State(state): State<Arc<ApiState>>) -> Result<Json<Value
                     "catalog_verified": false,
                     "managed": true,
                     "secrets": secrets,
+                    "credential": credential_view(&state, &user.id, &id)?,
                 }));
             }
         }
@@ -1642,7 +2138,10 @@ async fn list_providers(State(state): State<Arc<ApiState>>) -> Result<Json<Value
     Ok(Json(json!({"providers": providers})))
 }
 
-async fn list_connectors(State(state): State<Arc<ApiState>>) -> Result<Json<Value>> {
+async fn list_connectors(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
     let connectors = &state.config.connectors;
     let oauth: [(&str, &dyn OAuthConnectorSettings); 7] = [
         ("google_drive", &connectors.google_drive),
@@ -1729,7 +2228,374 @@ async fn list_connectors(State(state): State<Arc<ApiState>>) -> Result<Json<Valu
         let group = view["id"].as_str().map(connector_group).unwrap_or("Other");
         view["group"] = json!(group);
     }
+    // Per-user OneDrive status (phase 4). The token never appears: only
+    // whether the acting user has connected their own drive.
+    if state.config.onedrive.enabled {
+        let connected = state
+            .onedrive
+            .as_ref()
+            .map(|registry| registry.connected(&user.id))
+            .transpose()?
+            .unwrap_or(false);
+        views.insert(
+            0,
+            json!({
+                "id": "onedrive",
+                "kind": "oauth",
+                "enabled": true,
+                "group": "Productivity",
+                "connected": connected,
+                "redirect_uri": state
+                    .config
+                    .onedrive
+                    .effective_redirect_base(&state.config.auth)
+                    .trim()
+                    .trim_end_matches('/')
+                    .to_owned()
+                    + crate::onedrive::CONSENT_CALLBACK_PATH,
+                "secrets": {
+                    "refresh_token": {
+                        "name": "user credential",
+                        "configured": connected,
+                    },
+                },
+            }),
+        );
+    }
     Ok(Json(json!({"connectors": views})))
+}
+
+// ---- Per-user credentials, OneDrive consent, Telegram linking (phase 4) ----
+
+/// The configured profile for a provider id (`default` is `[llm]` itself).
+fn provider_profile(config: &Config, id: &str) -> Result<ProviderConfig> {
+    validate_provider(id)?;
+    if id == "default" {
+        return Ok(config.llm.default_provider());
+    }
+    config
+        .llm
+        .providers
+        .get(id)
+        .cloned()
+        .ok_or_else(|| SeraError::NotFound(format!("provider {id}")))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetProviderKeyRequest {
+    api_key: String,
+}
+
+/// Store the acting user's API key for one configured provider.
+///
+/// The key is sealed under the user's DEK; only its presence is ever
+/// reported. Setting a key replaces any previous credential for that
+/// provider (including an OAuth token pair), which is the explicit way to
+/// switch a provider to key auth.
+async fn set_provider_key(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+    Json(request): Json<SetProviderKeyRequest>,
+) -> Result<Json<Value>> {
+    provider_profile(&state.config, &id)?;
+    let credential = ProviderCredential {
+        api_key: request.api_key.trim().to_owned(),
+        refresh_token: String::new(),
+    };
+    state.users.set(&user.id, &id, &credential.encode()?)?;
+    state.runtime.invalidate_model_credentials(Some(&user.id));
+    audit_auth(
+        &state,
+        &user.id,
+        "provider.credential_set",
+        json!({"provider": id}),
+    )?;
+    Ok(Json(json!({"id": id, "configured": true})))
+}
+
+/// Delete the acting user's own credential for a provider. A grant the user
+/// holds is untouched (and reported back).
+async fn delete_provider_credential(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    validate_provider(&id)?;
+    let deleted = state.users.delete(&user.id, &id)?;
+    state.runtime.invalidate_model_credentials(Some(&user.id));
+    let status = state.users.credential_status(&user.id, &id)?;
+    audit_auth(
+        &state,
+        &user.id,
+        "provider.credential_deleted",
+        json!({"provider": id, "deleted": deleted}),
+    )?;
+    Ok(Json(json!({
+        "id": id,
+        "deleted": deleted,
+        "configured": status.usable(),
+        "granted": status.granted,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantRequest {
+    grantee: String,
+    provider: String,
+}
+
+fn grant_view(grant: &crate::store::ProviderGrant) -> Value {
+    json!({
+        "grantee": grant.grantee,
+        "provider": grant.provider,
+        "created_at": grant.created_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "revoked_at": grant
+            .revoked_at
+            .map(|at| at.to_rfc3339_opts(SecondsFormat::Secs, true)),
+        "active": grant.active(),
+    })
+}
+
+/// Grant a member access to an admin-owned provider (admin only).
+///
+/// The grant is a permission, never a secret: resolution reads the admin's
+/// credential at call time and the member never learns the value. Audited and
+/// revocable.
+async fn grant_provider(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Json(request): Json<GrantRequest>,
+) -> Result<Json<Value>> {
+    require_admin(&user)?;
+    crate::util::validate_id(&request.grantee)?;
+    provider_profile(&state.config, &request.provider)?;
+    let grant = state
+        .users
+        .grant(&user.id, &request.grantee, &request.provider)?;
+    state.runtime.invalidate_model_credentials(None);
+    audit_auth(
+        &state,
+        &user.id,
+        "provider.granted",
+        json!({"grantee": grant.grantee, "provider": grant.provider}),
+    )?;
+    Ok(Json(json!({"grant": grant_view(&grant)})))
+}
+
+/// Revoke one grant (admin only). Revocation takes effect immediately: cached
+/// per-user clients are dropped before the response is written.
+async fn revoke_grant_endpoint(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path((grantee, provider)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    require_admin(&user)?;
+    crate::util::validate_id(&grantee)?;
+    validate_provider(&provider)?;
+    let revoked = state.users.revoke_grant(&user.id, &grantee, &provider)?;
+    state.runtime.invalidate_model_credentials(None);
+    audit_auth(
+        &state,
+        &user.id,
+        "provider.grant_revoked",
+        json!({"grantee": grantee, "provider": provider, "revoked": revoked}),
+    )?;
+    Ok(Json(json!({
+        "grantee": grantee,
+        "provider": provider,
+        "revoked": revoked,
+    })))
+}
+
+/// Every grant the acting admin has made, revoked ones included. Admin only;
+/// carries no secret.
+async fn list_grants(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    require_admin(&user)?;
+    let grants = state.store.list_provider_grants(&user.id)?;
+    let grants: Vec<Value> = grants.iter().map(grant_view).collect();
+    Ok(Json(json!({"grants": grants})))
+}
+
+/// Start the OneDrive consent flow for the acting user: auth code + PKCE
+/// against the shared app registration.
+async fn start_onedrive_consent(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let consent = state
+        .onedrive_consent
+        .as_ref()
+        .ok_or_else(|| SeraError::Forbidden("OneDrive is not enabled on this deployment".into()))?;
+    let url = consent.start(&user.id).await?;
+    audit_auth(
+        &state,
+        &user.id,
+        "connector.onedrive_consent_started",
+        json!({}),
+    )?;
+    Ok(Json(json!({"url": url})))
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsentCallbackParams {
+    state: String,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// The OneDrive consent redirect target. Public (the browser arrives from
+/// Microsoft); the `state` value binds the callback to the user who started
+/// it. The refresh token is sealed before the success page renders and never
+/// appears in the response.
+async fn onedrive_callback(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<ConsentCallbackParams>,
+) -> Response {
+    let Some(consent) = state.onedrive_consent.as_ref() else {
+        return auth_error_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "OneDrive is not enabled on this deployment.",
+        );
+    };
+    if params.error.is_some() {
+        return auth_error_page(
+            StatusCode::BAD_REQUEST,
+            "OneDrive consent was not granted. Nothing was connected.",
+        );
+    }
+    let Some(code) = params.code.as_deref() else {
+        return auth_error_page(
+            StatusCode::BAD_REQUEST,
+            "The OneDrive consent response was incomplete. Start again from the console.",
+        );
+    };
+    match consent.complete(&params.state, code).await {
+        Ok(user_id) => {
+            if let Some(registry) = &state.onedrive {
+                registry.invalidate(&user_id);
+            }
+            if let Err(error) =
+                audit_auth(&state, &user_id, "connector.onedrive_connected", json!({}))
+            {
+                warn!(%error, "onedrive connect audit write failed");
+            }
+            html_response(
+                StatusCode::OK,
+                auth_page(
+                    "OneDrive connected",
+                    "<p class=\"lede\">Your OneDrive is connected. Uploads from your bots land in your own drive under the configured folder.</p>\n<p class=\"meta\">You can close this page and return to the client.</p>",
+                ),
+            )
+        }
+        Err(error) => {
+            warn!(%error, "onedrive consent callback failed");
+            auth_error_page(
+                StatusCode::BAD_REQUEST,
+                "OneDrive could not be connected. The link may have expired or been used; start again from the console.",
+            )
+        }
+    }
+}
+
+/// Disconnect the acting user's OneDrive: delete the sealed refresh token and
+/// drop the cached client.
+async fn disconnect_onedrive(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let deleted = state.users.delete(&user.id, ONEDRIVE_PROVIDER)?;
+    if let Some(registry) = &state.onedrive {
+        registry.invalidate(&user.id);
+    }
+    audit_auth(
+        &state,
+        &user.id,
+        "connector.onedrive_disconnected",
+        json!({"was_connected": deleted}),
+    )?;
+    Ok(Json(json!({
+        "id": "onedrive",
+        "connected": false,
+        "was_connected": deleted,
+    })))
+}
+
+/// Telegram linking lifetime: long enough to switch apps, short enough that a
+/// leaked code is useless.
+const TELEGRAM_LINK_TTL_MINUTES: i64 = 10;
+
+/// The acting user's Telegram binding status. The chat ids are the user's own
+/// and are not secrets; the bot token never appears.
+async fn telegram_status(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let binding = state.store.telegram_binding_for_user(&user.id)?;
+    Ok(Json(json!({
+        "enabled": state.config.telegram.enabled,
+        "linked": binding.is_some(),
+        "telegram_user_id": binding.as_ref().map(|binding| binding.telegram_user_id),
+        "telegram_chat_id": binding.as_ref().map(|binding| binding.telegram_chat_id),
+        "linked_at": binding
+            .as_ref()
+            .map(|binding| binding.linked_at.to_rfc3339_opts(SecondsFormat::Secs, true)),
+    })))
+}
+
+/// Mint a short-lived, single-use linking code. The user sends
+/// `/start <code>` to the bot; the polling loop consumes the code and records
+/// the binding. Only the code's hash is stored.
+async fn start_telegram_link(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    if !state.config.telegram.enabled {
+        return Err(SeraError::Forbidden(
+            "Telegram is not enabled on this deployment".into(),
+        ));
+    }
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let code = hex::encode(bytes);
+    let expires_at = Utc::now() + chrono::Duration::minutes(TELEGRAM_LINK_TTL_MINUTES);
+    state
+        .store
+        .put_telegram_link_code(&sha256_hex(&code), &user.id, expires_at)?;
+    audit_auth(
+        &state,
+        &user.id,
+        "telegram.link_code_issued",
+        json!({"expires_at": expires_at.to_rfc3339_opts(SecondsFormat::Secs, true)}),
+    )?;
+    Ok(Json(json!({
+        "code": code,
+        "expires_at": expires_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "instructions": "Send /start <code> to the SeraBot Telegram bot.",
+    })))
+}
+
+/// Unbind the acting user's Telegram chat. Later messages from that chat are
+/// ignored exactly like any other unbound chat.
+async fn unlink_telegram(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let was_linked = state.store.unlink_telegram(&user.id)?;
+    audit_auth(
+        &state,
+        &user.id,
+        "telegram.unlinked",
+        json!({"was_linked": was_linked}),
+    )?;
+    Ok(Json(json!({"linked": false, "was_linked": was_linked})))
 }
 
 /// Console grouping only; it carries no security meaning.
@@ -1766,8 +2632,10 @@ fn api_key_probe<'a>(config: &'a Config, id: &str) -> Option<ApiKeyProbe<'a>> {
 /// are stored. Messages are fixed strings; no secret or provider body leaves.
 async fn admin_test_connector(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     let roles = connector_secret_roles(&state.config, &id).map_err(admin_error)?;
     let checked_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
     let missing = roles.iter().find(|(_, name)| !state.secrets.has(name));
@@ -1791,6 +2659,7 @@ async fn admin_test_connector(
     };
     audit_config(
         &state,
+        &user.id,
         "config.connector_tested",
         json!({"connector": id, "ok": ok}),
     )?;
@@ -1854,11 +2723,11 @@ fn admin_store(state: &ApiState) -> AdminResult<&AdminStore> {
         .ok_or_else(|| admin_error(SeraError::Internal("administration is unavailable".into())))
 }
 
-fn audit_config(state: &ApiState, event: &str, details: Value) -> AdminResult<()> {
+fn audit_config(state: &ApiState, actor: &str, event: &str, details: Value) -> AdminResult<()> {
     state
         .store
         .record_audit(
-            "owner",
+            actor,
             event,
             None,
             None,
@@ -1906,8 +2775,10 @@ struct AddProviderRequest {
 
 async fn admin_add_provider(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Json(request): Json<AddProviderRequest>,
 ) -> AdminResult<(StatusCode, Json<Value>)> {
+    require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
     let profile = ProviderConfig {
         base_url: request.base_url,
@@ -1941,6 +2812,7 @@ async fn admin_add_provider(
         .map_err(admin_error)?;
     audit_config(
         &state,
+        &user.id,
         "config.provider_saved",
         json!({"provider": request.id, "kind": kind, "catalog_fetch": catalog_fetch}),
     )?;
@@ -1952,11 +2824,18 @@ async fn admin_add_provider(
 
 async fn admin_remove_provider(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
     admin.remove_provider(&id).map_err(admin_error)?;
-    audit_config(&state, "config.provider_removed", json!({"provider": id}))?;
+    audit_config(
+        &state,
+        &user.id,
+        "config.provider_removed",
+        json!({"provider": id}),
+    )?;
     Ok(Json(json!({"removed": id, "restart_required": true})))
 }
 
@@ -2008,9 +2887,11 @@ fn release_oauth(state: &ApiState, id: &str) {
 /// providers start a bounded background poll and return the code to enter.
 async fn admin_provider_oauth_start(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     body: Option<Json<OAuthStartRequest>>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
     let profile = oauth_profile(&state, admin, &id).map_err(admin_error)?;
     let request = body.map(|Json(body)| body).unwrap_or_default();
@@ -2044,6 +2925,7 @@ async fn admin_provider_oauth_start(
             let (tx, rx) = tokio::sync::oneshot::channel::<(String, String)>();
             let task_state = state.clone();
             let task_id = id.clone();
+            let task_user_id = user.id.clone();
             tokio::spawn(async move {
                 use secrecy::ExposeSecret;
                 let outcome = async {
@@ -2080,6 +2962,7 @@ async fn admin_provider_oauth_start(
                 };
                 let _ = audit_config(
                     &task_state,
+                    &task_user_id,
                     event,
                     json!({"provider": task_id, "kind": "muse-code"}),
                 );
@@ -2107,9 +2990,11 @@ async fn admin_provider_oauth_start(
 /// listener. Tokens are stored server-side and never returned.
 async fn admin_provider_oauth_complete(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<OAuthCompleteRequest>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     use secrecy::ExposeSecret;
     let admin = admin_store(&state)?;
     let profile = oauth_profile(&state, admin, &id).map_err(admin_error)?;
@@ -2159,6 +3044,7 @@ async fn admin_provider_oauth_complete(
     };
     audit_config(
         &state,
+        &user.id,
         "config.provider_oauth_signed_in",
         json!({"provider": id, "kind": "google-antigravity", "project_discovered": login.project_id.is_some()}),
     )?;
@@ -2175,9 +3061,11 @@ async fn admin_provider_oauth_complete(
 /// is stored server-side — the desktop holds verifier and state.
 async fn admin_connector_oauth_start(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<OAuthStartRequest>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     if id != "elevenlabs" {
         return Err(admin_error(SeraError::NotFound(format!(
             "connector {id} does not support OAuth sign-in"
@@ -2193,6 +3081,7 @@ async fn admin_connector_oauth_start(
     .map_err(admin_error)?;
     audit_config(
         &state,
+        &user.id,
         "config.connector_oauth_started",
         json!({"connector": id}),
     )?;
@@ -2204,9 +3093,11 @@ async fn admin_connector_oauth_start(
 /// are never returned to the caller.
 async fn admin_connector_oauth_complete(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<OAuthCompleteRequest>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     if id != "elevenlabs" {
         return Err(admin_error(SeraError::NotFound(format!(
             "connector {id} does not support OAuth sign-in"
@@ -2245,6 +3136,7 @@ async fn admin_connector_oauth_complete(
         .map_err(admin_error)?;
     audit_config(
         &state,
+        &user.id,
         "config.connector_oauth_signed_in",
         json!({"connector": id, "ok": true}),
     )?;
@@ -2263,9 +3155,11 @@ struct ConnectorRequest {
 
 async fn admin_set_connector(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<ConnectorRequest>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
     if let Some(auth) = &request.auth {
         if id != "elevenlabs" {
@@ -2295,6 +3189,7 @@ async fn admin_set_connector(
         .map_err(admin_error)?;
     audit_config(
         &state,
+        &user.id,
         "config.connector_saved",
         json!({"connector": id, "enabled": request.enabled, "credentials": request.values.keys().collect::<Vec<_>>(), "auth": request.auth}),
     )?;
@@ -2312,8 +3207,10 @@ struct AudioRequest {
 
 async fn admin_set_audio(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Json(request): Json<AudioRequest>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
     admin
         .set_audio(
@@ -2326,6 +3223,7 @@ async fn admin_set_audio(
         .map_err(admin_error)?;
     audit_config(
         &state,
+        &user.id,
         "config.audio_saved",
         json!({"enabled": request.enabled}),
     )?;
@@ -2343,12 +3241,18 @@ struct BotProfileRequest {
 
 async fn admin_set_bot_profile(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<BotProfileRequest>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
-    if !state.runtime.bot_loaded(&id) {
-        let configured = crate::config::list_configured_bots(&state.config).map_err(admin_error)?;
+    if !state.runtime.bot_loaded(&user.id, &id) {
+        let configured = state
+            .runtime
+            .fleet()
+            .configured(&user.id)
+            .map_err(admin_error)?;
         if !configured.iter().any(|bot| bot.id == id) {
             return Err(admin_error(SeraError::NotFound(format!("bot {id}"))));
         }
@@ -2356,7 +3260,7 @@ async fn admin_set_bot_profile(
     for value in [&request.display_name, &request.description, &request.avatar] {
         state
             .runtime
-            .scan_owner_output(value)
+            .scan_owner_output(&user.id, value)
             .map_err(admin_error)?;
     }
     admin
@@ -2369,7 +3273,12 @@ async fn admin_set_bot_profile(
             },
         )
         .map_err(admin_error)?;
-    audit_config(&state, "config.bot_profile_saved", json!({"bot": id}))?;
+    audit_config(
+        &state,
+        &user.id,
+        "config.bot_profile_saved",
+        json!({"bot": id}),
+    )?;
     Ok(Json(json!({"saved": true, "restart_required": false})))
 }
 
@@ -2424,15 +3333,19 @@ fn validate_bot_tool_list(
 }
 
 /// Skill list rules matching the desktop `parse_skill_list` semantics plus the
-/// server's catalog check: at most 16 unique, valid skill ids that exist.
-fn validate_bot_skill_list(state: &ApiState, skills: &[String]) -> Result<Vec<String>> {
+/// acting user's effective catalog check: at most 16 unique, valid skill ids
+/// that exist in the shipped catalog or the user's own rows.
+fn validate_bot_skill_list(
+    state: &ApiState,
+    user_id: &str,
+    skills: &[String],
+) -> Result<Vec<String>> {
     if skills.len() > MAX_BOT_CONFIG_SKILLS {
         return Err(SeraError::Validation(format!(
             "at most {MAX_BOT_CONFIG_SKILLS} skills are allowed"
         )));
     }
-    let catalog = SkillCatalog::load(&state.config)?;
-    let known = catalog.skill_ids();
+    let known = state.runtime.fleet().effective_skill_ids(user_id)?;
     let mut seen = HashSet::with_capacity(skills.len());
     let mut out = Vec::with_capacity(skills.len());
     for skill in skills {
@@ -2484,11 +3397,17 @@ fn validate_require_approval_list(list: &[String], tools: &[String]) -> Result<V
 /// `admin_set_bot_profile`. Takes effect after restart.
 async fn admin_update_bot_config(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<BotConfigRequest>,
 ) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
-    let configured = crate::config::list_configured_bots(&state.config).map_err(admin_error)?;
+    let configured = state
+        .runtime
+        .fleet()
+        .configured(&user.id)
+        .map_err(admin_error)?;
     let Some(entry) = configured.iter().find(|bot| bot.id == id) else {
         return Err(admin_error(SeraError::NotFound(format!("bot {id}"))));
     };
@@ -2503,23 +3422,30 @@ async fn admin_update_bot_config(
         .flatten()
     {
         for item in list {
-            state.runtime.scan_owner_output(item).map_err(admin_error)?;
+            state
+                .runtime
+                .scan_owner_output(&user.id, item)
+                .map_err(admin_error)?;
         }
     }
-    let role = state.runtime.bot(&id).map(|bot| bot.config.role).unwrap_or(
-        if entry.role == BotRole::Orchestrator.as_str() {
+    let role = state
+        .runtime
+        .bot(&user.id, &id)
+        .map(|bot| bot.config.role)
+        .unwrap_or(if entry.role == BotRole::Orchestrator.as_str() {
             BotRole::Orchestrator
         } else {
             BotRole::Specialist
-        },
-    );
+        });
     let (current_tools, _, _) = bot_lists_with_override(&state, entry);
     let tools = match &request.tools {
         Some(tools) => Some(validate_bot_tool_list(&state, tools, role).map_err(admin_error)?),
         None => None,
     };
     let skills = match &request.skills {
-        Some(skills) => Some(validate_bot_skill_list(&state, skills).map_err(admin_error)?),
+        Some(skills) => {
+            Some(validate_bot_skill_list(&state, &user.id, skills).map_err(admin_error)?)
+        }
         None => None,
     };
     let effective_tools = tools.clone().unwrap_or_else(|| current_tools.clone());
@@ -2539,7 +3465,12 @@ async fn admin_update_bot_config(
             },
         )
         .map_err(admin_error)?;
-    audit_config(&state, "config.bot_config_saved", json!({"bot": id}))?;
+    audit_config(
+        &state,
+        &user.id,
+        "config.bot_config_saved",
+        json!({"bot": id}),
+    )?;
     Ok(Json(json!({"saved": true, "restart_required": true})))
 }
 
@@ -2551,20 +3482,22 @@ struct RestartRequest {
 
 async fn admin_restart(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Json(request): Json<RestartRequest>,
 ) -> AdminResult<(StatusCode, Json<Value>)> {
+    require_admin(&user).map_err(admin_error)?;
     if !request.confirm {
         return Err(admin_error(SeraError::Validation(
             "restart requires explicit confirmation".into(),
         )));
     }
-    let pending = state.store.pending_task_count().map_err(admin_error)?;
+    let pending = state.store.pending_task_count_all().map_err(admin_error)?;
     if pending > 0 {
         return Err(admin_error(SeraError::InvalidState(format!(
             "{pending} task(s) are still in flight; wait for them to finish"
         ))));
     }
-    audit_config(&state, "config.restart_requested", Value::Null)?;
+    audit_config(&state, &user.id, "config.restart_requested", Value::Null)?;
     tokio::spawn(async {
         tokio::time::sleep(Duration::from_millis(400)).await;
         tracing::warn!("restart requested by the owner console; exiting for systemd");
@@ -2581,10 +3514,58 @@ fn secret_status(secrets: &SharedSecrets, name: Option<&str>) -> Value {
     }
 }
 
+/// The acting user's credential status for one provider: own row, active
+/// admin grant, or neither. Presence only — never a value.
+fn credential_view(state: &ApiState, user_id: &str, provider: &str) -> Result<Value> {
+    let status = state.users.credential_status(user_id, provider)?;
+    Ok(json!({
+        "configured": status.usable(),
+        "own": status.own,
+        "granted": status.granted,
+    }))
+}
+
+/// The identity behind an authenticated request, threaded into handlers
+/// through request extensions. Carries only ids and the role — never a raw
+/// token (the `token_hash` field is the sha256 the server stores).
+#[derive(Clone, Debug)]
+pub struct ActingUser {
+    pub id: String,
+    pub role: UserRole,
+    /// The device-token row id when the bearer token is a session; `None`
+    /// for the static config token, which has no revocable session row.
+    pub session_id: Option<String>,
+    pub token_hash: String,
+}
+
+impl ActingUser {
+    pub fn is_admin(&self) -> bool {
+        self.role == UserRole::Admin
+    }
+}
+
+/// Gate a handler on the admin role. Members receive an explicit 403.
+fn require_admin(user: &ActingUser) -> Result<()> {
+    if user.role != UserRole::Admin {
+        return Err(SeraError::Forbidden(
+            "this endpoint requires the admin role".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the user behind a bearer token, or fail closed.
+///
+/// The static config token is the operator's own credential and maps to the
+/// bootstrap admin. Device tokens map to the owning user recorded on the
+/// row (existing operator tokens were backfilled to the admin by migration
+/// 0008). Unknown owners, disabled accounts, and revoked or expired tokens
+/// all reject identically, so a rejected caller learns nothing about which
+/// check failed.
 async fn authorize(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     if !state.config.api.enabled {
@@ -2608,14 +3589,32 @@ async fn authorize(
     }
     let candidate = sha256_hex(token);
     if constant_time_eq(&candidate, &state.token_hash) {
+        let Some(admin) = active_user(&state, None) else {
+            return unauthorized();
+        };
+        request.extensions_mut().insert(ActingUser {
+            id: admin.id,
+            role: admin.role,
+            session_id: None,
+            token_hash: candidate,
+        });
         return next.run(request).await;
     }
     let now = chrono::Utc::now();
     match state.store.device_token_by_hash(&candidate) {
         Ok(Some(record)) if record.active_at(now) => {
+            let Some(user) = active_user(&state, record.user_id.as_deref()) else {
+                return unauthorized();
+            };
             if let Err(error) = state.store.touch_device_token(&record.id, now) {
                 warn!(%error, "device token last-used update failed");
             }
+            request.extensions_mut().insert(ActingUser {
+                id: user.id,
+                role: user.role,
+                session_id: Some(record.id),
+                token_hash: candidate,
+            });
             next.run(request).await
         }
         Ok(_) => unauthorized(),
@@ -2626,6 +3625,17 @@ async fn authorize(
     }
 }
 
+/// The active user behind a token, or `None` when the owner is missing or
+/// disabled. A `None` owner id maps to the bootstrap admin (pre-migration
+/// rows were backfilled, but the lookup stays explicit either way).
+fn active_user(state: &ApiState, user_id: Option<&str>) -> Option<User> {
+    let user = match user_id {
+        Some(id) => state.store.get_user(id).ok()??,
+        None => state.store.admin_user().ok()??,
+    };
+    (user.status == UserStatus::Active).then_some(user)
+}
+
 fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
@@ -2634,16 +3644,347 @@ fn unauthorized() -> Response {
         .into_response()
 }
 
-async fn rate_limit(State(state): State<Arc<ApiState>>, request: Request, next: Next) -> Response {
-    {
-        let mut entries = state.rate.lock().await;
-        let now = Instant::now();
-        while entries
-            .front()
-            .is_some_and(|entry| now.duration_since(*entry) > Duration::from_secs(60))
-        {
-            entries.pop_front();
+// ---- Auth endpoints (public entry, protected sessions) ----
+
+/// The providers list rendered by web, desktop, and mobile clients. Public
+/// and derived from config; `google`/`github` always report disabled in v1.
+async fn auth_providers(State(state): State<Arc<ApiState>>) -> Json<Value> {
+    let providers: Vec<Value> = auth::provider_report(&state.config.auth)
+        .into_iter()
+        .map(|provider| json!({"id": provider.id, "enabled": provider.enabled}))
+        .collect();
+    Json(json!({"providers": providers}))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginStartRequest {
+    provider: String,
+    #[serde(default)]
+    invite_code: Option<String>,
+}
+
+/// Start a browser sign-in. Public by definition (no session yet); the
+/// invite code, when presented, is validated but consumed only at the
+/// callback — inside the transaction that creates the account.
+async fn auth_login_start(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<LoginStartRequest>,
+) -> Result<Json<Value>> {
+    let service = auth_service(&state)?;
+    if request.provider.len() > 64 {
+        return Err(SeraError::Validation(
+            "provider must be a known provider id".into(),
+        ));
+    }
+    let invite = request
+        .invite_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|code| !code.is_empty());
+    let url = service.login_start(&request.provider, invite).await?;
+    Ok(Json(json!({"url": url})))
+}
+
+/// The `/login` page's Microsoft button target: start the flow and hand the
+/// browser to the provider. Failures render the same minimal error page as
+/// the callback (fail closed, no provider detail).
+async fn auth_login_microsoft(State(state): State<Arc<ApiState>>) -> Response {
+    let Some(service) = state.auth.as_ref() else {
+        return auth_error_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Sign-in is not enabled on this deployment.",
+        );
+    };
+    match service.login_start("microsoft", None).await {
+        Ok(url) => (
+            StatusCode::FOUND,
+            [
+                (header::LOCATION, url.as_str()),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+        )
+            .into_response(),
+        Err(error) => {
+            warn!(%error, "web login start failed");
+            auth_error_page(
+                StatusCode::BAD_REQUEST,
+                "Sign-in could not be started. Check that sign-in is configured, then try again.",
+            )
         }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CallbackParams {
+    state: String,
+    code: String,
+}
+
+/// The OIDC redirect target. Completes the sign-in and shows the new
+/// session token exactly once, with a paste-into-your-client hint; the
+/// token is never stored in the clear and never shown again.
+async fn auth_callback(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<CallbackParams>,
+) -> Response {
+    let Some(service) = state.auth.as_ref() else {
+        return auth_error_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Sign-in is not enabled on this deployment.",
+        );
+    };
+    match service.callback(&params.state, &params.code).await {
+        Ok((_user, token)) => html_response(StatusCode::OK, session_token_page(&token)),
+        Err(error) => {
+            warn!(%error, "auth callback failed");
+            auth_error_page(
+                StatusCode::BAD_REQUEST,
+                "Sign-in could not be completed. The link may have expired or been used; start again from the client.",
+            )
+        }
+    }
+}
+
+/// Revoke the caller's own session. The static config token has no session
+/// row, so it cannot be revoked here — rotating it is a config change.
+async fn auth_logout(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    if user.session_id.is_none() {
+        return Err(SeraError::InvalidState(
+            "this token is the server configuration token and cannot be revoked here".into(),
+        ));
+    }
+    state.store.revoke_session(&user.token_hash)?;
+    audit_auth(&state, &user.id, "auth.logout", json!({}))?;
+    Ok(Json(json!({"revoked": true})))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MintInviteRequest {
+    uses: u32,
+}
+
+/// Mint an invitation (admin only). The raw code is returned exactly once;
+/// the server keeps only its SHA-256 hash.
+async fn auth_invites(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Json(request): Json<MintInviteRequest>,
+) -> Result<Json<Value>> {
+    require_admin(&user)?;
+    let service = auth_service(&state)?;
+    if request.uses == 0 || request.uses > 100 {
+        return Err(SeraError::Validation(
+            "uses must be between 1 and 100".into(),
+        ));
+    }
+    let code = service.mint_invite(request.uses, &user.id)?;
+    audit_auth(
+        &state,
+        &user.id,
+        "auth.invite_minted",
+        json!({"uses": request.uses}),
+    )?;
+    Ok(Json(json!({"code": code})))
+}
+
+/// List accounts (admin only). Member sessions get 403 and never see the
+/// user directory.
+async fn list_users(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    require_admin(&user)?;
+    let users = state.store.list_users()?;
+    let users: Vec<Value> = users.iter().map(user_view).collect();
+    Ok(Json(json!({"users": users})))
+}
+
+fn user_view(user: &User) -> Value {
+    json!({
+        "id": user.id,
+        "provider_subject": user.provider_subject,
+        "email": user.email,
+        "display_name": user.display_name,
+        "role": user.role.as_str(),
+        "status": user.status.as_str(),
+        "created_at": user.created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+    })
+}
+
+async fn disable_user(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    change_user_status(&state, &user, &id, UserStatus::Disabled)
+}
+
+async fn enable_user(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    change_user_status(&state, &user, &id, UserStatus::Active)
+}
+
+/// Enable or disable an account (admin only). A disabled user's sessions
+/// stop authorizing immediately. The admin account itself cannot be
+/// disabled: it owns recovery, and locking it out would strand the
+/// deployment with no admin path at all.
+fn change_user_status(
+    state: &ApiState,
+    acting: &ActingUser,
+    id: &str,
+    status: UserStatus,
+) -> Result<Json<Value>> {
+    require_admin(acting)?;
+    crate::util::validate_id(id)?;
+    let target = state
+        .store
+        .get_user(id)?
+        .ok_or_else(|| SeraError::NotFound(format!("user {id}")))?;
+    if status == UserStatus::Disabled && target.role == UserRole::Admin {
+        return Err(SeraError::Validation(
+            "the admin account cannot be disabled".into(),
+        ));
+    }
+    state.store.set_user_status(id, status)?;
+    audit_auth(
+        state,
+        &acting.id,
+        if status == UserStatus::Disabled {
+            "auth.user_disabled"
+        } else {
+            "auth.user_enabled"
+        },
+        json!({"user_id": id, "status": status.as_str()}),
+    )?;
+    Ok(Json(json!({"id": id, "status": status.as_str()})))
+}
+
+/// The auth service, or an explicit fail-closed error while sign-in is off.
+fn auth_service(state: &ApiState) -> Result<&AuthService> {
+    state
+        .auth
+        .as_deref()
+        .ok_or_else(|| SeraError::Forbidden("sign-in is disabled".into()))
+}
+
+/// Record an auth audit event under the acting user's id.
+fn audit_auth(state: &ApiState, actor: &str, event: &str, details: Value) -> Result<()> {
+    state
+        .store
+        .record_audit(actor, event, None, None, None, None, None, Some(&details))?;
+    Ok(())
+}
+
+/// Minimal page shell matching the landing aesthetic: inline CSS only, no
+/// scripts, no external origins. `body` is server-controlled text only —
+/// never provider- or user-supplied content.
+fn auth_page(title: &str, body: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>{title}</title>
+<style>
+  :root {{ color-scheme: dark light; --bg: #101418; --panel: #171d23; --border: #2b343d; --text: #e6edf3; --muted: #9aa7b4; --accent: #4d9fff; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin: 0; min-height: 100vh; background: var(--bg); color: var(--text); font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; display: flex; justify-content: center; padding: 40px 20px; }}
+  main {{ width: 100%; max-width: 640px; }}
+  .eyebrow {{ margin: 0 0 8px; color: var(--muted); font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; }}
+  h1 {{ margin: 0 0 12px; font-size: 40px; line-height: 1.1; letter-spacing: -0.02em; }}
+  p {{ margin: 0 0 12px; }}
+  .lede {{ color: var(--muted); }}
+  section {{ margin-top: 20px; padding: 20px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; }}
+  code {{ display: block; margin: 12px 0; padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: #0d1116; font-size: 13px; word-break: break-all; user-select: all; }}
+  .meta {{ color: var(--muted); font-size: 14px; }}
+</style>
+</head>
+<body>
+<main>
+<header>
+<p class="eyebrow">SeraBot</p>
+<h1>{title}</h1>
+</header>
+<section>
+{body}
+</section>
+</main>
+</body>
+</html>
+"#
+    )
+}
+
+/// The one-time session token page shown after the OIDC callback.
+fn session_token_page(token: &str) -> String {
+    auth_page(
+        "Signed in",
+        &format!(
+            "<p class=\"lede\">Your session token is below. It is shown <strong>once</strong> and cannot be requested again.</p>\n<code>{token}</code>\n<p class=\"meta\">Paste it into your desktop or mobile client's sign-in field. Treat it like a password; the server stores only its hash.</p>"
+        ),
+    )
+}
+
+/// A plain, link-free error page for failed sign-ins.
+fn auth_error_page(status: StatusCode, message: &str) -> Response {
+    html_response(
+        status,
+        auth_page("Sign-in", &format!("<p class=\"lede\">{message}</p>")),
+    )
+}
+
+fn html_response(status: StatusCode, page: String) -> Response {
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CONTENT_SECURITY_POLICY, crate::web::CSP),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        page,
+    )
+        .into_response()
+}
+
+/// Per-minute request limit, one bucket per acting user.
+///
+/// The bucket key is the authenticated user id, so one user cannot exhaust
+/// another's budget and multiple sessions of the same user share the
+/// configured limit instead of multiplying it. Requests that reach this
+/// middleware without an `ActingUser` — the public sign-in routes — share one
+/// anonymous bucket. Buckets are pruned on every request, so idle sessions do
+/// not accumulate.
+async fn rate_limit(State(state): State<Arc<ApiState>>, request: Request, next: Next) -> Response {
+    let key = request
+        .extensions()
+        .get::<ActingUser>()
+        .map(|user| user.id.clone())
+        .unwrap_or_else(|| "anonymous".to_owned());
+    {
+        let mut buckets = state.rate.lock().await;
+        let now = Instant::now();
+        let window = Duration::from_secs(60);
+        buckets.retain(|_, entries| {
+            while entries
+                .front()
+                .is_some_and(|entry| now.duration_since(*entry) > window)
+            {
+                entries.pop_front();
+            }
+            !entries.is_empty()
+        });
+        let entries = buckets.entry(key).or_default();
         if entries.len() >= state.rate_limit {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -2719,6 +4060,12 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    /// The bootstrap admin's id â€” the acting user behind the config token
+    /// the tests use.
+    fn admin(store: &Store) -> String {
+        store.admin_user_id().unwrap()
+    }
+
     fn app() -> (Router, Arc<Config>, Store) {
         app_with_policy(true, Policy::empty())
     }
@@ -2773,14 +4120,38 @@ mod tests {
         base_dir: std::path::PathBuf,
         bots: Vec<LoadedBot>,
     ) -> (Router, Arc<Config>, Store) {
+        app_with_auth_stack(egress_approved, policy, base_dir, bots, None, None)
+    }
+
+    /// Full app stack, optionally with sign-in enabled and a custom
+    /// per-minute rate limit. The auth service is built against the same
+    /// store as the API and pointed at `auth_issuer` (a loopback mock
+    /// identity provider in tests).
+    fn app_with_auth_stack(
+        egress_approved: bool,
+        policy: Policy,
+        base_dir: std::path::PathBuf,
+        bots: Vec<LoadedBot>,
+        auth_issuer: Option<&str>,
+        rate_limit: Option<u32>,
+    ) -> (Router, Arc<Config>, Store) {
         let mut config = Config::default();
         config.api.enabled = true;
         config.api.token_hash = sha256_hex("test-token-that-is-long-enough-123");
+        if let Some(limit) = rate_limit {
+            config.server.rate_limit_per_minute = limit;
+        }
         config.llm.data_egress_approved = egress_approved;
         config.llm.model = "test".into();
         config.llm.base_url = "https://example.com/v1".into();
         config.llm.models = vec!["test-alternative".into()];
-        config.base_dir = base_dir;
+        if auth_issuer.is_some() {
+            config.auth.enabled = true;
+            config.auth.providers = vec!["microsoft".into()];
+            config.auth.base_url = "https://bot.example.example".into();
+            config.auth.max_users = 10;
+        }
+        config.base_dir = base_dir.canonicalize().unwrap_or_else(|_| base_dir.clone());
         let directory = std::env::temp_dir().join(format!("serabot-api-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&directory).unwrap();
         let database = directory.join("serabot.db");
@@ -2817,19 +4188,89 @@ mod tests {
             )
             .unwrap(),
         );
-        let state = ApiState::new(
+        let mut secrets = std::collections::BTreeMap::from([(
+            config.llm.api_key_secret.clone(),
+            "synthetic-test-key".to_string(),
+        )]);
+        if auth_issuer.is_some() {
+            secrets.insert(
+                config.auth.client_id_secret.clone(),
+                crate::auth::test_idp::TEST_CLIENT_ID.to_string(),
+            );
+        }
+        let secrets = SharedSecrets::new(crate::secrets::SecretStore::from_map(secrets));
+        let users = Arc::new(
+            crate::user_secrets::UserSecrets::with_master_key(store.clone(), [9u8; 32]).unwrap(),
+        );
+        let fleet = runtime.fleet();
+        let auth = match auth_issuer {
+            Some(issuer) => {
+                let mut service = AuthService::new(&config, store.clone(), &secrets)
+                    .unwrap()
+                    .with_fleet(fleet);
+                service.set_issuer_url(issuer).unwrap();
+                Some(service)
+            }
+            None => None,
+        };
+        let mut state = ApiState::new(
             runtime,
             store.clone(),
             config.clone(),
             artifacts,
-            SharedSecrets::new(crate::secrets::SecretStore::from_map(
-                std::collections::BTreeMap::from([(
-                    config.llm.api_key_secret.clone(),
-                    "synthetic-test-key".to_string(),
-                )]),
-            )),
-        );
+            secrets,
+            users,
+            None,
+        )
+        .unwrap();
+        if let Some(service) = auth {
+            state.auth = Some(Arc::new(service));
+        }
         (router(state), config, store)
+    }
+
+    /// An app with sign-in enabled and the auth service pointed at a
+    /// synthetic mock identity provider, for exercising the auth endpoints.
+    async fn auth_app() -> (Router, Arc<Config>, Store, crate::auth::test_idp::MockIdp) {
+        let idp = crate::auth::test_idp::mock_idp().await;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::env::current_dir().unwrap());
+        let (app, config, store) = app_with_auth_stack(
+            true,
+            Policy::empty(),
+            root,
+            vec![test_bot(
+                "main",
+                crate::orchestration::BotRole::Orchestrator,
+            )],
+            Some(&idp.issuer),
+            None,
+        );
+        (app, config, store, idp)
+    }
+
+    /// An app whose per-minute API limit is low enough to exercise the
+    /// per-user buckets without hundreds of requests.
+    fn app_with_rate_limit(limit: u32) -> (Router, Arc<Config>, Store) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::env::current_dir().unwrap());
+        app_with_auth_stack(
+            true,
+            Policy::empty(),
+            root,
+            vec![test_bot(
+                "main",
+                crate::orchestration::BotRole::Orchestrator,
+            )],
+            None,
+            Some(limit),
+        )
     }
 
     fn request(
@@ -2871,6 +4312,24 @@ mod tests {
                     .unwrap_or_else(Body::empty),
             )
             .unwrap()
+    }
+
+    /// Mint a device token owned by a specific user (the CLI helper always
+    /// mints for the admin).
+    fn mint_for(store: &Store, user_id: &str, label: &str) -> String {
+        let mut bytes = [0u8; crate::token_cli::TOKEN_BYTES];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let token = hex::encode(bytes);
+        store
+            .insert_device_token(
+                &crate::domain::new_id(),
+                label,
+                &sha256_hex(&token),
+                Some(user_id),
+                None,
+            )
+            .unwrap();
+        token
     }
 
     #[tokio::test]
@@ -2944,6 +4403,56 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{token}");
         }
+    }
+
+    /// The per-minute limit is per acting user, not one global counter:
+    /// exhausting the admin's budget leaves a member's session untouched, and
+    /// a second admin session shares the admin's budget instead of doubling
+    /// it.
+    #[tokio::test]
+    async fn rate_limit_is_per_user_not_global() {
+        let (app, _, store) = app_with_rate_limit(1);
+        let admin_id = admin(&store);
+        let member = store
+            .create_user("microsoft:rate-member", "r@example.example", "R")
+            .unwrap();
+        let admin_token = mint_for(&store, &admin_id, "admin-session");
+        let member_token = mint_for(&store, &member.id, "member-session");
+
+        let first = app
+            .clone()
+            .oneshot(request_with_token("GET", "/v1/health", &admin_token, None))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = app
+            .clone()
+            .oneshot(request_with_token("GET", "/v1/health", &admin_token, None))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // A second admin session shares the admin's budget.
+        let second_admin_session = mint_for(&store, &admin_id, "admin-session-2");
+        let shared = app
+            .clone()
+            .oneshot(request_with_token(
+                "GET",
+                "/v1/health",
+                &second_admin_session,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(shared.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // The member's budget is independent of the admin's.
+        let member_response = app
+            .clone()
+            .oneshot(request_with_token("GET", "/v1/health", &member_token, None))
+            .await
+            .unwrap();
+        assert_eq!(member_response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -3063,7 +4572,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(store.pending_task_count().unwrap(), 1);
+        assert_eq!(store.pending_task_count(&admin(&store)).unwrap(), 1);
     }
 
     #[tokio::test]
@@ -3136,7 +4645,7 @@ mod tests {
             .to_bytes();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         let original = store
-            .get_task(value["task"]["id"].as_str().unwrap())
+            .get_task(&admin(&store), value["task"]["id"].as_str().unwrap())
             .unwrap();
         let selection = json!({"provider":"default", "model":"test-alternative"});
         let response = app
@@ -3152,7 +4661,10 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            store.get_task(&original.id).unwrap().payload,
+            store
+                .get_task(&admin(&store), &original.id)
+                .unwrap()
+                .payload,
             original.payload
         );
         assert!(store.kv_get("model_selection:owner").unwrap().is_some());
@@ -3210,6 +4722,7 @@ mod tests {
         let (app, _, store) = app_with_policy(true, Policy::from_text("synthetic blocked phrase"));
         store
             .append_message(
+                &admin(&store),
                 "owner",
                 None,
                 crate::domain::Role::User,
@@ -3330,13 +4843,26 @@ mod tests {
     async fn history_returns_only_visible_messages_from_requested_conversation() {
         let (app, _, store) = app();
         store
-            .append_message("owner", None, crate::domain::Role::User, "hello")
-            .unwrap();
-        store
-            .append_message("owner", None, crate::domain::Role::Assistant, "bonjour")
+            .append_message(
+                &admin(&store),
+                "owner",
+                None,
+                crate::domain::Role::User,
+                "hello",
+            )
             .unwrap();
         store
             .append_message(
+                &admin(&store),
+                "owner",
+                None,
+                crate::domain::Role::Assistant,
+                "bonjour",
+            )
+            .unwrap();
+        store
+            .append_message(
+                &admin(&store),
                 "owner",
                 None,
                 crate::domain::Role::System,
@@ -3345,6 +4871,7 @@ mod tests {
             .unwrap();
         store
             .append_message(
+                &admin(&store),
                 "other",
                 None,
                 crate::domain::Role::User,
@@ -3383,6 +4910,7 @@ mod tests {
         let (app, _, store) = app();
         store
             .append_message_named(
+                &admin(&store),
                 "room:review",
                 None,
                 crate::domain::Role::Assistant,
@@ -3392,6 +4920,7 @@ mod tests {
             .unwrap();
         store
             .append_message_named(
+                &admin(&store),
                 "room:review",
                 None,
                 crate::domain::Role::Assistant,
@@ -3424,31 +4953,27 @@ mod tests {
     #[tokio::test]
     async fn lists_configured_bots_without_prompts_or_secrets() {
         let root = temp_base();
-        let (app, _, _) = app_with_root(true, Policy::empty(), root.clone());
+        let secret = "super-secret-prompt-body-should-not-leak";
+        let mut notes = test_bot("notes", crate::orchestration::BotRole::Specialist);
+        notes.config.skills = vec!["ask".into()];
+        notes.config.tools = vec!["skill_list".into()];
+        notes.config.enabled = false;
+        notes.prompt = secret.to_string();
+        let (app, _, _) = app_with_fleet(
+            true,
+            Policy::empty(),
+            root.clone(),
+            vec![
+                test_bot("main", crate::orchestration::BotRole::Orchestrator),
+                notes,
+            ],
+        );
         let denied = app
             .clone()
             .oneshot(request(&app, "GET", "/v1/bots", false, None))
             .await
             .unwrap();
         assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
-
-        let empty = app
-            .clone()
-            .oneshot(request(&app, "GET", "/v1/bots", true, None))
-            .await
-            .unwrap();
-        assert_eq!(empty.status(), StatusCode::OK);
-        assert_eq!(read_json(empty).await["bots"].as_array().unwrap().len(), 0);
-
-        let secret = "super-secret-prompt-body-should-not-leak";
-        std::fs::create_dir_all(root.join("prompts")).unwrap();
-        std::fs::write(root.join("prompts").join("notes.txt"), secret).unwrap();
-        std::fs::create_dir_all(root.join("bots")).unwrap();
-        std::fs::write(
-            root.join("bots").join("notes.toml"),
-            "name = \"notes\"\nrole = \"specialist\"\ntrigger = \"command\"\nsystem_prompt = \"prompts/notes.txt\"\nskills = [\"ask\"]\ntools = [\"skill_list\"]\nenabled = false\n",
-        )
-        .unwrap();
 
         let listed = app
             .clone()
@@ -3458,13 +4983,13 @@ mod tests {
         assert_eq!(listed.status(), StatusCode::OK);
         let listed = read_json(listed).await;
         let bots = listed["bots"].as_array().unwrap();
-        assert_eq!(bots.len(), 1);
-        assert_eq!(bots[0]["id"], "notes");
-        assert_eq!(bots[0]["role"], "specialist");
-        assert_eq!(bots[0]["enabled"], false);
-        assert_eq!(bots[0]["live"], false);
-        assert_eq!(bots[0]["tools"][0], "skill_list");
-        assert_eq!(bots[0]["skills"][0], "ask");
+        assert_eq!(bots.len(), 2);
+        let notes = bots.iter().find(|bot| bot["id"] == "notes").unwrap();
+        assert_eq!(notes["role"], "specialist");
+        assert_eq!(notes["enabled"], false);
+        assert_eq!(notes["live"], true);
+        assert_eq!(notes["tools"][0], "skill_list");
+        assert_eq!(notes["skills"][0], "ask");
         let text = listed.to_string();
         assert!(!text.contains(secret));
         assert!(!text.contains("system_prompt"));
@@ -3590,6 +5115,14 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    async fn read_body(response: Response) -> String {
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
     fn temp_base() -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("serabot-api-fleet-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("skills").join("ask")).unwrap();
@@ -3640,14 +5173,17 @@ mod tests {
         assert_eq!(value["bot"]["enabled"], false);
         assert_eq!(value["bot"]["role"], "specialist");
         assert_eq!(value["bot"]["live"], false);
-        assert_eq!(value["bot"]["bot_file"], "bots/notes.toml");
-        assert_eq!(value["bot"]["prompt_file"], "prompts/notes.txt");
+        assert_eq!(value["bot"]["bot_file"], "db/bots/notes.toml");
+        assert_eq!(value["bot"]["prompt_file"], "db/prompts/notes.txt");
         assert!(!value.to_string().contains("delegate"));
-        let toml = std::fs::read_to_string(root.join("bots").join("notes.toml")).unwrap();
-        assert!(toml.contains("enabled = false"));
-        assert!(toml.contains("role = \"specialist\""));
-        assert!(!toml.contains("delegates = [\""));
-        assert!(root.join("prompts").join("notes.txt").is_file());
+        let row = store
+            .get_bot(&admin(&store), "notes")
+            .unwrap()
+            .expect("notes row");
+        assert!(!row.enabled);
+        assert!(row.prompt.contains("do not delegate"));
+        assert!(row.prompt.contains("Synthetic notes specialist."));
+        assert_eq!(row.config["role"], "specialist");
         assert!(
             store
                 .list_audit(10)
@@ -3682,6 +5218,7 @@ mod tests {
             .unwrap();
         assert_eq!(escaped.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(!root.join("outside.toml").exists());
+        assert!(store.get_bot(&admin(&store), "outside").unwrap().is_none());
 
         let delegate = app
             .clone()
@@ -3696,13 +5233,14 @@ mod tests {
             .unwrap();
         assert_eq!(delegate.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(!root.join("bots").join("other.toml").exists());
+        assert!(store.get_bot(&admin(&store), "other").unwrap().is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
     async fn bot_scaffold_rejects_policy_violations() {
         let root = temp_base();
-        let (app, _, _) = app_with_root(
+        let (app, _, store) = app_with_root(
             true,
             Policy::from_text("synthetic blocked phrase"),
             root.clone(),
@@ -3723,6 +5261,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(!root.join("bots").join("notes.toml").exists());
+        assert!(store.get_bot(&admin(&store), "notes").unwrap().is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3762,12 +5301,16 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let value = read_json(response).await;
         assert_eq!(value["skill"]["id"], "notes-pack");
-        assert_eq!(value["skill"]["file"], "skills/notes-pack/SKILL.md");
+        assert_eq!(value["skill"]["file"], "user_skills/notes-pack/SKILL.md");
         assert_eq!(value["skill"]["live"], false);
         assert!(!value.to_string().contains(marker));
-        let raw = std::fs::read_to_string(root.join("skills").join("notes-pack").join("SKILL.md"))
-            .unwrap();
-        assert!(raw.contains(marker));
+        let row = store
+            .get_user_skill(&admin(&store), "notes-pack")
+            .unwrap()
+            .expect("user skill row");
+        assert!(row.body.contains(marker));
+        assert_eq!(row.description, "Public summary");
+        assert!(!root.join("skills").join("notes-pack").exists());
         assert!(
             store
                 .list_audit(10)
@@ -3828,7 +5371,7 @@ mod tests {
     #[tokio::test]
     async fn skill_registration_rejects_policy_violations() {
         let root = temp_base();
-        let (app, _, _) = app_with_root(
+        let (app, _, store) = app_with_root(
             true,
             Policy::from_text("synthetic blocked phrase"),
             root.clone(),
@@ -3850,6 +5393,12 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(!root.join("skills").join("notes-pack").exists());
+        assert!(
+            store
+                .get_user_skill(&admin(&store), "notes-pack")
+                .unwrap()
+                .is_none()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4026,10 +5575,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(direct_turn.status(), StatusCode::OK);
-        assert_eq!(store.pending_task_count().unwrap(), 1);
+        assert_eq!(store.pending_task_count(&admin(&store)).unwrap(), 1);
         assert_eq!(
             store
-                .get_conversation("dir:analyst")
+                .get_conversation(&admin(&store), "dir:analyst")
                 .unwrap()
                 .unwrap()
                 .parent_id
@@ -4635,19 +6184,6 @@ mod tests {
         assert_eq!(body["conversation"]["id"], "sec:finance");
     }
 
-    fn write_bot(root: &std::path::Path, id: &str, prompt: &str, extra: &str) {
-        std::fs::create_dir_all(root.join("prompts")).unwrap();
-        std::fs::write(root.join("prompts").join(format!("{id}.txt")), prompt).unwrap();
-        std::fs::create_dir_all(root.join("bots")).unwrap();
-        std::fs::write(
-            root.join("bots").join(format!("{id}.toml")),
-            format!(
-                "name = \"{id}\"\ntrigger = \"command\"\nsystem_prompt = \"prompts/{id}.txt\"\n{extra}"
-            ),
-        )
-        .unwrap();
-    }
-
     #[tokio::test]
     async fn usage_endpoint_rolls_up_model_used_rows_clamps_days_and_filters() {
         let (app, _, store) = app();
@@ -4672,6 +6208,7 @@ mod tests {
 
         let task = store
             .enqueue_task(
+                &admin(&store),
                 "turn",
                 "main",
                 &json!({"conversation_id": "owner"}),
@@ -4805,14 +6342,24 @@ mod tests {
     #[tokio::test]
     async fn bot_detail_returns_owner_fields_and_caps_instructions() {
         let root = temp_base();
-        write_bot(
-            &root,
-            "notes",
-            "Synthetic notes prompt.",
-            "role = \"specialist\"\nskills = [\"ask\"]\ntools = [\"skill_list\"]\nenabled = true\n",
+        let mut notes = test_bot("notes", crate::orchestration::BotRole::Specialist);
+        notes.config.skills = vec!["ask".into()];
+        notes.config.tools = vec!["skill_list".into()];
+        notes.config.enabled = true;
+        notes.prompt = "Synthetic notes prompt.".into();
+        let mut big = test_bot("big", crate::orchestration::BotRole::Specialist);
+        big.config.enabled = true;
+        big.prompt = "x".repeat(40_000);
+        let (app, _, store) = app_with_fleet(
+            true,
+            Policy::empty(),
+            root.clone(),
+            vec![
+                test_bot("main", crate::orchestration::BotRole::Orchestrator),
+                notes,
+                big,
+            ],
         );
-        write_bot(&root, "big", &"x".repeat(40_000), "enabled = true\n");
-        let (app, _, store) = app_with_root(true, Policy::empty(), root.clone());
 
         let denied = app
             .clone()
@@ -4847,7 +6394,7 @@ mod tests {
         assert!(!text.contains("prompts/notes.txt"));
         assert!(!text.contains("synthetic-test-key"));
 
-        crate::memory::add(&store, "fact", "synthetic fact", "test").unwrap();
+        crate::memory::add(&store, &admin(&store), "fact", "synthetic fact", "test").unwrap();
         let body = read_json(
             app.clone()
                 .oneshot(request(&app, "GET", "/v1/bots/notes", true, None))
@@ -4880,13 +6427,19 @@ mod tests {
     #[tokio::test]
     async fn admin_bot_config_update_validates_persists_and_requires_restart() {
         let root = temp_base();
-        write_bot(
-            &root,
-            "notes",
-            "Synthetic notes prompt.",
-            "role = \"specialist\"\nskills = []\ntools = [\"skill_list\"]\nenabled = true\n",
+        let mut notes = test_bot("notes", crate::orchestration::BotRole::Specialist);
+        notes.config.tools = vec!["skill_list".into()];
+        notes.config.enabled = true;
+        notes.prompt = "Synthetic notes prompt.".into();
+        let (app, config, store) = app_with_fleet(
+            true,
+            Policy::empty(),
+            root.clone(),
+            vec![
+                test_bot("main", crate::orchestration::BotRole::Orchestrator),
+                notes,
+            ],
         );
-        let (app, config, store) = app_with_root(true, Policy::empty(), root.clone());
 
         let denied = app
             .clone()
@@ -5089,10 +6642,279 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_credentials_are_per_user_and_grants_are_admin_controlled() {
+        let (app, _, store) = app();
+        let admin = admin(&store);
+        // The admin stores a key through the API; the value never comes back.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PUT",
+                "/v1/providers/default/key",
+                true,
+                Some(json!({"api_key": "sk-admin-credential"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/providers", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let default = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "default")
+            .expect("default provider");
+        assert_eq!(default["credential"]["own"], true);
+        assert_eq!(default["credential"]["configured"], true);
+        assert!(!body.to_string().contains("sk-admin-credential"));
+
+        // A member has no credential of their own and cannot grant one.
+        let member = store
+            .create_user("microsoft:member", "member@example.example", "Member")
+            .unwrap();
+        let token = store
+            .mint_session(&member.id, chrono::Duration::hours(1))
+            .unwrap();
+        let body = read_json(
+            app.clone()
+                .oneshot(request_with_token("GET", "/v1/providers", &token, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let default = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "default")
+            .expect("default provider");
+        assert_eq!(default["credential"]["configured"], false);
+        assert_eq!(default["credential"]["granted"], false);
+        let response = app
+            .clone()
+            .oneshot(request_with_token(
+                "POST",
+                "/v1/admin/grants",
+                &token,
+                Some(json!({"grantee": member.id, "provider": "default"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // The admin grants the provider: the member can use it, never read it.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/admin/grants",
+                true,
+                Some(json!({"grantee": member.id, "provider": "default"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(
+            app.clone()
+                .oneshot(request_with_token("GET", "/v1/providers", &token, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let default = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "default")
+            .expect("default provider");
+        assert_eq!(default["credential"]["granted"], true);
+        assert_eq!(default["credential"]["configured"], true);
+
+        // The grant list is admin-only and carries no secret.
+        let response = app
+            .clone()
+            .oneshot(request_with_token("GET", "/v1/admin/grants", &token, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/admin/grants", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["grants"].as_array().unwrap().len(), 1);
+        assert_eq!(body["grants"][0]["grantee"], member.id);
+        assert!(!body.to_string().contains("sk-admin-credential"));
+
+        // Revocation takes effect immediately.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "DELETE",
+                &format!("/v1/admin/grants/{}/default", member.id),
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(
+            app.clone()
+                .oneshot(request_with_token("GET", "/v1/providers", &token, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let default = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "default")
+            .expect("default provider");
+        assert_eq!(default["credential"]["granted"], false);
+        assert_eq!(default["credential"]["configured"], false);
+
+        // A member deleting their own credential never touches the admin's.
+        let response = app
+            .clone()
+            .oneshot(request_with_token(
+                "DELETE",
+                "/v1/providers/default",
+                &token,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/providers", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let default = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "default")
+            .expect("default provider");
+        assert_eq!(default["credential"]["own"], true);
+        assert!(store.user_credential(&admin, "default").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn telegram_status_is_per_user_and_linking_fails_closed_when_disabled() {
+        let (app, _, store) = app();
+        let body = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/telegram", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["enabled"], false);
+        assert_eq!(body["linked"], false);
+        let response = app
+            .clone()
+            .oneshot(request(&app, "POST", "/v1/telegram/link", true, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // A stored binding is reported to its owner only.
+        let member = store
+            .create_user("microsoft:tg", "tg@example.example", "TG")
+            .unwrap();
+        store.link_telegram(&member.id, 40, 30).unwrap();
+        let token = store
+            .mint_session(&member.id, chrono::Duration::hours(1))
+            .unwrap();
+        let body = read_json(
+            app.clone()
+                .oneshot(request_with_token("GET", "/v1/telegram", &token, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["linked"], true);
+        assert_eq!(body["telegram_user_id"], 40);
+        assert_eq!(body["telegram_chat_id"], 30);
+        let admin_body = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/telegram", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(admin_body["linked"], false);
+
+        // Unlinking is scoped: the member's own binding goes away.
+        let response = app
+            .clone()
+            .oneshot(request_with_token(
+                "DELETE",
+                "/v1/telegram/link",
+                &token,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        assert_eq!(body["was_linked"], true);
+        assert!(store.telegram_binding(40, 30).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn onedrive_endpoints_fail_closed_when_disabled() {
+        let (app, _, _) = app();
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/connectors/onedrive/start",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        // Disconnecting when nothing is connected is idempotent and scoped.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "DELETE",
+                "/v1/connectors/onedrive",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        assert_eq!(body["connected"], false);
+        assert_eq!(body["was_connected"], false);
+    }
+
+    #[tokio::test]
     async fn legacy_conversations_list_as_turn_capable_threads() {
         let (app, _, store) = app();
         store
-            .ensure_conversation_accepts_turns("windows-owner")
+            .ensure_conversation_accepts_turns(&admin(&store), "windows-owner")
             .unwrap();
         let response = app
             .clone()
@@ -5228,7 +7050,7 @@ mod tests {
         assert_eq!(details["mode"], "selected");
         assert!(
             store
-                .events_after(0, 100)
+                .events_after(&admin(&store), 0, 100)
                 .unwrap()
                 .iter()
                 .any(|event| event.kind == "team.member_set")
@@ -5512,5 +7334,740 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // ---- Auth endpoints ----
+
+    /// A member account plus a session token minted directly in the store,
+    /// for exercising role gates without the OIDC flow.
+    fn member_with_session(store: &Store) -> (User, String) {
+        let user = store
+            .create_user("microsoft:api-member", "member@example.example", "Member")
+            .unwrap();
+        let token = store
+            .mint_session(&user.id, chrono::Duration::hours(1))
+            .unwrap();
+        (user, token)
+    }
+
+    #[tokio::test]
+    async fn providers_endpoint_is_public_and_matches_the_config() {
+        // Default config: sign-in off, every provider reports disabled.
+        let (app, _, _) = app();
+        let response = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/auth/providers", false, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        let providers = body["providers"].as_array().unwrap().clone();
+        assert_eq!(providers.len(), 3);
+        for row in &providers {
+            assert_eq!(row["enabled"], json!(false), "auth disabled ⇒ all off");
+        }
+        assert_eq!(providers[0]["id"], json!("microsoft"));
+        assert_eq!(providers[1]["id"], json!("google"));
+        assert_eq!(providers[2]["id"], json!("github"));
+
+        // Auth enabled: microsoft on, the others visibly disabled.
+        let (app, _, _, _) = auth_app().await;
+        let response = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/auth/providers", false, None))
+            .await
+            .unwrap();
+        let body = read_json(response).await;
+        let providers = body["providers"].as_array().unwrap().clone();
+        assert_eq!(
+            providers,
+            vec![
+                json!({"id": "microsoft", "enabled": true}),
+                json!({"id": "google", "enabled": false}),
+                json!({"id": "github", "enabled": false}),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn login_start_and_callback_fail_closed_when_auth_is_disabled() {
+        let (app, _, _) = app();
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/auth/login/start",
+                false,
+                Some(json!({"provider": "microsoft"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/auth/callback?state=s&code=c",
+                false,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let page = read_body(response).await;
+        assert!(page.contains("Sign-in is not enabled"));
+        assert!(!page.contains("<script"));
+    }
+
+    #[tokio::test]
+    async fn login_start_returns_the_authorize_url_and_rejects_bad_providers() {
+        let (app, _, store, _) = auth_app().await;
+        let admin = store.admin_user_id().unwrap();
+        store
+            .mint_invite(
+                "api-invite-code-0123456789",
+                1,
+                Utc::now() + chrono::Duration::hours(1),
+                &admin,
+            )
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/auth/login/start",
+                false,
+                Some(json!({"provider": "microsoft", "invite_code": "api-invite-code-0123456789"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        let url = body["url"].as_str().unwrap();
+        assert!(url.contains("/authorize?"), "{url}");
+        assert!(url.contains("code_challenge_method=S256"), "{url}");
+
+        // Unknown provider and spent invites fail closed.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/auth/login/start",
+                false,
+                Some(json!({"provider": "google"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/auth/login/start",
+                false,
+                Some(json!({"provider": "microsoft", "invite_code": "not-a-real-invite"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn callback_shows_the_session_token_exactly_once() {
+        let (app, _, store, idp) = auth_app().await;
+        let admin = store.admin_user_id().unwrap();
+        store
+            .mint_invite(
+                "callback-invite-0123456789",
+                1,
+                Utc::now() + chrono::Duration::hours(1),
+                &admin,
+            )
+            .unwrap();
+        let start = read_json(
+            app.clone()
+                .oneshot(
+                    request(
+                        &app,
+                        "POST",
+                        "/v1/auth/login/start",
+                        false,
+                        Some(json!({"provider": "microsoft", "invite_code": "callback-invite-0123456789"})),
+                    ),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let authorize_url = start["url"].as_str().unwrap().to_owned();
+        let (state, nonce) = crate::auth::test_idp::url_params(&authorize_url);
+        let code = "api-callback-code";
+        let id_token =
+            crate::auth::test_idp::synthetic_id_token(&idp.issuer, &nonce, "subject-api");
+        crate::auth::test_idp::stub_token(&idp.server, code, &id_token).await;
+
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                &format!("/v1/auth/callback?state={state}&code={code}"),
+                false,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("content-security-policy")
+                .and_then(|v| v.to_str().ok()),
+            Some(crate::web::CSP)
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        let page = read_body(response).await;
+        assert!(!page.contains("<script"));
+        assert!(page.contains("shown"), "the one-time hint must be present");
+        assert!(page.contains("Paste it into your"));
+
+        // The page carries the raw token exactly once; only its hash is
+        // stored, and the hash resolves to the newly created member.
+        let token = page
+            .split("<code>")
+            .nth(1)
+            .and_then(|rest| rest.split("</code>").next())
+            .unwrap()
+            .to_owned();
+        assert_eq!(token.len(), Store::SESSION_TOKEN_BYTES * 2);
+        assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            page.matches(&token).count(),
+            1,
+            "the session token must appear exactly once"
+        );
+        let account = store
+            .get_user_by_subject("microsoft:subject-api")
+            .unwrap()
+            .unwrap();
+        let resolved = store.session_user(&sha256_hex(&token)).unwrap().unwrap();
+        assert_eq!(resolved.id, account.id);
+        // The post-login hook seeded the default fleet in the same request.
+        let bots = store.list_bots(&account.id).unwrap();
+        assert_eq!(bots.len(), 1);
+        assert_eq!(bots[0].name, "main");
+        assert!(!bots[0].prompt.is_empty());
+
+        // An unknown state renders the error page, not a stack trace.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/auth/callback?state=bogus&code=whatever",
+                false,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let page = read_body(response).await;
+        assert!(page.contains("could not be completed"));
+        assert!(!page.contains("<script"));
+    }
+
+    #[tokio::test]
+    async fn member_sessions_are_rejected_on_admin_endpoints() {
+        let (app, _, store, _) = auth_app().await;
+        let (_, member_token) = member_with_session(&store);
+
+        // Unauthenticated: 401 everywhere.
+        for (method, uri, body) in [
+            ("GET", "/v1/users", None),
+            ("POST", "/v1/auth/invites", Some(json!({"uses": 1}))),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(&app, method, uri, false, body))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri}"
+            );
+        }
+
+        // Member: 403 on admin endpoints, 200 on ordinary ones.
+        for (method, uri, body) in [
+            ("GET", "/v1/users", None),
+            ("POST", "/v1/auth/invites", Some(json!({"uses": 1}))),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request_with_token(method, uri, &member_token, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+        }
+        let response = app
+            .clone()
+            .oneshot(request_with_token("GET", "/v1/health", &member_token, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The operator's static config token is the admin.
+        let response = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/users", true, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        let users = body["users"].as_array().unwrap();
+        assert_eq!(users.len(), 2, "bootstrap admin + member");
+        assert!(users.iter().any(|user| user["role"] == json!("admin")));
+    }
+
+    #[tokio::test]
+    async fn invites_are_minted_once_and_stored_hashed() {
+        let (app, _, store, _) = auth_app().await;
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/auth/invites",
+                true,
+                Some(json!({"uses": 3})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        let code = body["code"].as_str().unwrap().to_owned();
+        assert!(!code.is_empty());
+        assert!(store.invite_is_redeemable(&sha256_hex(&code)).unwrap());
+
+        // Bounds are enforced.
+        for uses in [0, 101] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    &app,
+                    "POST",
+                    "/v1/auth/invites",
+                    true,
+                    Some(json!({"uses": uses})),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{uses}"
+            );
+        }
+
+        // The audit row names the actor and uses, never the code.
+        let rows: Vec<(String, String)> = store
+            .connection()
+            .unwrap()
+            .prepare("SELECT actor, details_json FROM audit_log WHERE event = 'auth.invite_minted'")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, store.admin_user_id().unwrap());
+        assert!(!rows[0].1.contains(&code));
+    }
+
+    #[tokio::test]
+    async fn logout_revokes_sessions_but_not_the_config_token() {
+        let (app, _, store, _) = auth_app().await;
+        let (_, member_token) = member_with_session(&store);
+
+        let response = app
+            .clone()
+            .oneshot(request_with_token(
+                "POST",
+                "/v1/auth/logout",
+                &member_token,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // The revoked session no longer authorizes.
+        let response = app
+            .clone()
+            .oneshot(request_with_token("GET", "/v1/health", &member_token, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // The static config token has no session row: fail closed.
+        let response = app
+            .clone()
+            .oneshot(request(&app, "POST", "/v1/auth/logout", true, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn admin_can_disable_and_enable_members() {
+        let (app, _, store, _) = auth_app().await;
+        let (member, member_token) = member_with_session(&store);
+
+        // Disabling a member stops their sessions immediately.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                &format!("/v1/users/{}/disable", member.id),
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(request_with_token("GET", "/v1/health", &member_token, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // The directory reflects the status.
+        let response = app
+            .clone()
+            .oneshot(request(&app, "GET", "/v1/users", true, None))
+            .await
+            .unwrap();
+        let body = read_json(response).await;
+        let users = body["users"].as_array().unwrap().clone();
+        let entry = users
+            .iter()
+            .find(|user| user["id"] == json!(member.id))
+            .unwrap();
+        assert_eq!(entry["status"], json!("disabled"));
+
+        // Re-enabling restores access.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                &format!("/v1/users/{}/enable", member.id),
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(request_with_token("GET", "/v1/health", &member_token, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Unknown users and the admin account itself are rejected.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/users/no-such-user/disable",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let admin_id = store.admin_user_id().unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                &format!("/v1/users/{admin_id}/disable"),
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Members cannot flip statuses at all.
+        let response = app
+            .clone()
+            .oneshot(request_with_token(
+                "POST",
+                &format!("/v1/users/{}/disable", member.id),
+                &member_token,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn login_page_link_starts_the_microsoft_flow() {
+        let (app, _, _, idp) = auth_app().await;
+        let response = app
+            .clone()
+            .oneshot(request(&app, "GET", "/login/microsoft", false, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_owned();
+        assert!(
+            location.starts_with(&format!("{}/authorize", idp.issuer)),
+            "{location}"
+        );
+    }
+
+    // ---- Per-user fleets and skills (phase 3) ----
+
+    /// A member's fleet seeds from the templates independently of the admin's,
+    /// and no bot or skill of one user is readable, updatable, or deletable
+    /// from the other's session.
+    #[tokio::test]
+    async fn member_bots_and_skills_are_isolated_and_validate_per_user() {
+        let (app, _, store) = app_with_team();
+        let admin_id = admin(&store);
+        let (member, member_token) = member_with_session(&store);
+
+        // The admin creates a bot and a skill.
+        let created = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/bots",
+                true,
+                Some(json!({"id": "admin-notes", "description": "Admin notes."})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let created = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/skills",
+                true,
+                Some(json!({"id": "admin-skill", "description": "Admin only"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+
+        // The member's first list seeds the default fleet from the templates.
+        let listed = read_json(
+            app.clone()
+                .oneshot(request_with_token("GET", "/v1/bots", &member_token, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let ids = listed["bots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|bot| bot["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["analyst", "main", "maker", "watcher"]);
+        assert_eq!(store.count_bots(&member.id).unwrap(), 4);
+        assert_eq!(store.count_bots(&admin_id).unwrap(), 5);
+
+        // The member's own detail works without an admin profile; the
+        // display name falls back to the bot id.
+        let own = read_json(
+            app.clone()
+                .oneshot(request_with_token(
+                    "GET",
+                    "/v1/bots/main",
+                    &member_token,
+                    None,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(own["id"], "main");
+        assert_eq!(own["display_name"], "main");
+        assert_eq!(own["role"], "orchestrator");
+
+        // The admin's bot is invisible to the member through every verb.
+        for (method, body) in [
+            ("GET", None),
+            ("PUT", Some(json!({"prompt": "hijacked"}))),
+            ("DELETE", None),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request_with_token(
+                    method,
+                    "/v1/bots/admin-notes",
+                    &member_token,
+                    body,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method}");
+        }
+        assert!(
+            store
+                .get_bot(&admin_id, "admin-notes")
+                .unwrap()
+                .unwrap()
+                .prompt
+                .contains("Admin notes.")
+        );
+
+        // The admin's skill is invisible; the member's own skill is not.
+        let listed = read_json(
+            app.clone()
+                .oneshot(request_with_token("GET", "/v1/skills", &member_token, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            !listed["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|skill| skill["id"] == "admin-skill")
+        );
+        let created = app
+            .clone()
+            .oneshot(request_with_token(
+                "POST",
+                "/v1/skills",
+                &member_token,
+                Some(json!({"id": "member-skill", "description": "Member only"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        assert!(
+            store
+                .get_user_skill(&member.id, "member-skill")
+                .unwrap()
+                .is_some()
+        );
+        let admin_skills = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/skills", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            !admin_skills["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|skill| skill["id"] == "member-skill")
+        );
+
+        // The orchestrator rule is per user: the member cannot disable main,
+        // and the admin's main is untouched.
+        let disable = app
+            .clone()
+            .oneshot(request_with_token(
+                "PUT",
+                "/v1/bots/main",
+                &member_token,
+                Some(json!({"enabled": false})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(disable.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(store.get_bot(&member.id, "main").unwrap().unwrap().enabled);
+        assert!(store.get_bot(&admin_id, "main").unwrap().unwrap().enabled);
+
+        // A member's prompt edit and specialist disable/delete are scoped.
+        let updated = app
+            .clone()
+            .oneshot(request_with_token(
+                "PUT",
+                "/v1/bots/analyst",
+                &member_token,
+                Some(json!({"enabled": false, "prompt": "Member analyst prompt."})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+        let member_analyst = store.get_bot(&member.id, "analyst").unwrap().unwrap();
+        assert!(!member_analyst.enabled);
+        assert_eq!(member_analyst.prompt, "Member analyst prompt.");
+        let admin_analyst = store.get_bot(&admin_id, "analyst").unwrap().unwrap();
+        assert!(admin_analyst.enabled);
+        assert_eq!(admin_analyst.prompt, "test prompt");
+
+        let deleted = app
+            .clone()
+            .oneshot(request_with_token(
+                "DELETE",
+                "/v1/bots/maker",
+                &member_token,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+        assert!(store.get_bot(&member.id, "maker").unwrap().is_none());
+        assert!(store.get_bot(&admin_id, "maker").unwrap().is_some());
+
+        // The orchestrator cannot be deleted either.
+        let delete_main = app
+            .clone()
+            .oneshot(request_with_token(
+                "DELETE",
+                "/v1/bots/main",
+                &member_token,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(delete_main.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }

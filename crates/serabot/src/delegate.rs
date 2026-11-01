@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,6 +7,7 @@ use tracing::warn;
 use crate::config::LoadedBot;
 use crate::domain::new_id;
 use crate::error::{Result, SeraError};
+use crate::fleet::{Fleet, FleetRegistry};
 use crate::gateway::{Tool, ToolContext, ToolOutput, ToolSpec};
 use crate::memory;
 use crate::model_router::ModelRouter;
@@ -22,21 +22,21 @@ pub const HANDOFF_QUEUED_KEY: &str = "handoff_queued";
 #[derive(Clone)]
 pub struct DelegateTool {
     store: Store,
-    bots: Arc<HashMap<String, LoadedBot>>,
+    fleet: Arc<FleetRegistry>,
     router: ModelRouter,
 }
 
 impl DelegateTool {
-    pub fn new(store: Store, bots: Arc<HashMap<String, LoadedBot>>, router: ModelRouter) -> Self {
+    pub fn new(store: Store, fleet: Arc<FleetRegistry>, router: ModelRouter) -> Self {
         Self {
             store,
-            bots,
+            fleet,
             router,
         }
     }
 
-    fn orchestrator(&self) -> Result<&LoadedBot> {
-        self.bots
+    fn orchestrator<'a>(&self, fleet: &'a Fleet) -> Result<&'a LoadedBot> {
+        fleet
             .get(ORCHESTRATOR_BOT)
             .filter(|bot| bot.config.enabled && bot.config.role == BotRole::Orchestrator)
             .ok_or_else(|| SeraError::Config("orchestrator bot is not configured".into()))
@@ -80,7 +80,8 @@ impl Tool for DelegateTool {
                 "only the orchestrator may delegate".into(),
             ));
         }
-        let orchestrator = self.orchestrator()?;
+        let fleet = self.fleet.load(&context.user_id)?;
+        let orchestrator = self.orchestrator(&fleet)?;
         let task_id = context
             .task_id
             .as_deref()
@@ -94,7 +95,7 @@ impl Tool for DelegateTool {
             .as_deref()
             .ok_or_else(|| SeraError::InvalidState("delegate requires a conversation id".into()))?;
         self.store
-            .ensure_conversation_accepts_turns(conversation_id)?;
+            .ensure_conversation_accepts_turns(&context.user_id, conversation_id)?;
 
         let to_bot = args
             .get("to_bot")
@@ -107,8 +108,7 @@ impl Tool for DelegateTool {
                 "handoff to_bot is not delegated by main".into(),
             ));
         }
-        let specialist = self
-            .bots
+        let specialist = fleet
             .get(&to_bot)
             .ok_or_else(|| SeraError::NotFound(format!("bot {to_bot}")))?;
         if !specialist.config.enabled || specialist.config.role != BotRole::Specialist {
@@ -141,7 +141,7 @@ impl Tool for DelegateTool {
             })
             .unwrap_or_default();
         for memory_id in &memory_ids {
-            memory::get(&self.store, memory_id)?;
+            memory::get(&self.store, &context.user_id, memory_id)?;
         }
         let model_class = match args
             .get("model_class")
@@ -176,6 +176,7 @@ impl Tool for DelegateTool {
             ModelClass::Synthesis => "synthesis",
         };
         let selection = self.router.select_class(
+            &context.user_id,
             Some(class_name),
             specialist.config.model.as_deref(),
             &specialist.config.name,
@@ -223,6 +224,7 @@ impl Tool for DelegateTool {
             })),
         )?;
         self.store.append_event(
+            &context.user_id,
             "handoff.queued",
             &json!({
                 "handoff_id": handoff.id,
@@ -231,9 +233,13 @@ impl Tool for DelegateTool {
                 "to_bot": to_bot,
             }),
         )?;
-        if let Err(error) =
-            enqueue_turn_task_with_id(&self.store, &child_task_id, &to_bot, &payload)
-        {
+        if let Err(error) = enqueue_turn_task_with_id(
+            &self.store,
+            &context.user_id,
+            &child_task_id,
+            &to_bot,
+            &payload,
+        ) {
             warn!(bot = %to_bot, %error, "audited handoff was not queued");
             return Err(error);
         }
@@ -261,12 +267,21 @@ mod tests {
 
     const ROOM: &str = "room:review";
 
+    /// The bootstrap admin's id â€” the acting user for the delegate fixtures.
+    fn admin(store: &Store) -> String {
+        store.admin_user_id().unwrap()
+    }
+
     /// A room conversation with the orchestrator task that asked for a handoff.
     fn store() -> (Store, String) {
         let store = Store::open_in_memory(384).unwrap();
-        store.create_conversation(ROOM, "room", None).unwrap();
+        let admin = admin(&store);
+        store
+            .create_conversation(&admin, ROOM, "room", None)
+            .unwrap();
         let parent = store
             .enqueue_task(
+                &admin,
                 "turn",
                 ORCHESTRATOR_BOT,
                 &json!({"conversation_id": ROOM, "text": "synthetic", "bot": ORCHESTRATOR_BOT}),
@@ -296,20 +311,21 @@ mod tests {
         }
     }
 
-    fn bots() -> Arc<HashMap<String, LoadedBot>> {
-        Arc::new(
-            [
-                bot(
-                    ORCHESTRATOR_BOT,
-                    BotRole::Orchestrator,
-                    vec!["analyst".to_string()],
-                ),
-                bot("analyst", BotRole::Specialist, vec![]),
-            ]
-            .into_iter()
-            .map(|bot| (bot.config.name.clone(), bot))
-            .collect(),
-        )
+    fn bots() -> Vec<LoadedBot> {
+        vec![
+            bot(
+                ORCHESTRATOR_BOT,
+                BotRole::Orchestrator,
+                vec!["analyst".to_string()],
+            ),
+            bot("analyst", BotRole::Specialist, vec![]),
+        ]
+    }
+
+    fn fleet(store: &Store) -> Arc<FleetRegistry> {
+        let config = Arc::new(Config::default());
+        let catalog = Arc::new(crate::skills::SkillCatalog::load(&config).unwrap());
+        Arc::new(FleetRegistry::new(config, store.clone(), bots(), catalog).unwrap())
     }
 
     fn router() -> ModelRouter {
@@ -330,9 +346,10 @@ mod tests {
         .unwrap()
     }
 
-    fn context(task_id: &str, turn_id: &str) -> ToolContext {
+    fn context(store: &Store, task_id: &str, turn_id: &str) -> ToolContext {
         ToolContext {
-            actor: "owner".into(),
+            user_id: admin(store),
+            actor: admin(store),
             bot: ORCHESTRATOR_BOT.into(),
             task_id: Some(task_id.into()),
             turn_id: Some(turn_id.into()),
@@ -366,11 +383,11 @@ mod tests {
     #[tokio::test]
     async fn delegate_audits_the_child_task_it_queues() {
         let (store, parent) = store();
-        let tool = DelegateTool::new(store.clone(), bots(), router());
+        let tool = DelegateTool::new(store.clone(), fleet(&store), router());
         let turn = store
-            .create_turn(&parent, ORCHESTRATOR_BOT, ROOM, &json!({}))
+            .create_turn(&admin(&store), &parent, ORCHESTRATOR_BOT, ROOM, &json!({}))
             .unwrap();
-        let context = context(&parent, &turn.id);
+        let context = context(&store, &parent, &turn.id);
         let output = tool.execute(args(), &context).await.unwrap();
         let child = output
             .data
@@ -408,7 +425,7 @@ mod tests {
             Some("routine")
         );
         // The queued task is the task the audit names.
-        let task = store.get_task(&child).unwrap();
+        let task = store.get_task(&admin(&store), &child).unwrap();
         assert_eq!(task.bot, "analyst");
         assert_eq!(task.kind, "turn");
         assert_eq!(task.status, "queued");
@@ -418,11 +435,11 @@ mod tests {
     #[tokio::test]
     async fn delegate_queues_no_child_task_when_the_audit_fails() {
         let (store, parent) = store();
-        let tool = DelegateTool::new(store.clone(), bots(), router());
+        let tool = DelegateTool::new(store.clone(), fleet(&store), router());
         let turn = store
-            .create_turn(&parent, ORCHESTRATOR_BOT, ROOM, &json!({}))
+            .create_turn(&admin(&store), &parent, ORCHESTRATOR_BOT, ROOM, &json!({}))
             .unwrap();
-        let context = context(&parent, &turn.id);
+        let context = context(&store, &parent, &turn.id);
         // The event stream write fails, so the handoff is not audited.
         {
             let connection = store.connection().unwrap();
@@ -435,6 +452,6 @@ mod tests {
         );
         // No specialist turn was queued: the audit came first and failed.
         assert_eq!(queued_specialist_tasks(&store), 0);
-        assert_eq!(store.pending_task_count().unwrap(), 1);
+        assert_eq!(store.pending_task_count(&admin(&store)).unwrap(), 1);
     }
 }
