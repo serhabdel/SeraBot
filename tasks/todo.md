@@ -105,5 +105,6 @@ never merge without the owner's OK.
 - [x] T6.2 Desktop Telegram settings pane (link/unlink, status).
 - [x] T6.3 Mobile login if the client source is in-repo.
 - [x] T6.4 Docs updates (deployment, api, connectors, README, spec status).
-- [ ] T6.5 Final full gate (Windows + WSL), push, PR for owner review —
-      merge only on the owner's OK.
+- [x] T6.5 Final full gate (Windows + WSL), push, PR for owner review -
+      merge only on the owner's OK. Merged as PR #9 (b863143) after the
+      Windows, Linux, desktop, and mobile CI checks passed.
