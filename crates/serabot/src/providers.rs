@@ -1,22 +1,33 @@
 //! Native provider registry.
 //!
 //! OpenAI-compatible providers chat on `/chat/completions`. `google-antigravity`
-//! chats on the Cloud Code envelope instead. OAuth credentials stay in the age
-//! secret store. Live catalogs are fetched only after egress consent and are
-//! intersected with the owner allowlist. Mistral, DeepSeek, MiniMax (including
-//! M Plan on the same OpenAI-compatible host), MiniMax China, Muse, and
-//! Antigravity pin catalog fetches to their documented hosts.
+//! chats on the Cloud Code envelope instead. Provider *endpoints and model
+//! catalogs* are admin-defined configuration; *credentials* are per user
+//! (phase 4): the operator's existing age-store values are imported into the
+//! admin's envelope-encrypted rows once, and every client is built from the
+//! acting user's own credential (or an active admin grant). The age store
+//! keeps only server-level values such as the OAuth app client id/secret.
+//! Live catalogs are fetched only after egress consent and are intersected
+//! with the owner allowlist. Mistral, DeepSeek, MiniMax (including M Plan on
+//! the same OpenAI-compatible host), MiniMax China, Muse, and Antigravity pin
+//! catalog fetches to their documented hosts.
 
 use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use secrecy::SecretString;
 use serde_json::Value;
 
+use crate::config::{Config, ProviderConfig};
 use crate::error::{Result, SeraError};
-use crate::llm::validate_base_url;
+use crate::llm::{LlmClient, validate_base_url};
+use crate::model_router::ProviderCredentials;
+use crate::secrets::SharedSecrets;
+use crate::store::Store;
+use crate::user_secrets::{ProviderCredential, UserCredentialWriter, UserSecrets};
 
 pub const MUSE_CLIENT_ID: &str = "1031625952748946";
 pub const MUSE_API_VERSION: &str = "1.0.0";
@@ -795,6 +806,231 @@ fn is_cloud_code_host(host: &str) -> bool {
     })
 }
 
+// ---- Per-user provider credentials (multi-user phase 4) ----
+
+/// Per-user provider client factory.
+///
+/// Provider *endpoints and model catalogs* stay admin-defined in config; the
+/// *credential* comes from the acting user's envelope-encrypted row (or an
+/// active admin grant). Building a client for a user with no credential is an
+/// explicit error — never a fallback to another account's key.
+pub struct UserProviderCredentials {
+    users: Arc<UserSecrets>,
+    server_secrets: SharedSecrets,
+    timeout_secs: u64,
+    max_output_tokens: u32,
+}
+
+impl std::fmt::Debug for UserProviderCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UserProviderCredentials")
+            .field("timeout_secs", &self.timeout_secs)
+            .field("max_output_tokens", &self.max_output_tokens)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UserProviderCredentials {
+    pub fn new(
+        users: Arc<UserSecrets>,
+        server_secrets: SharedSecrets,
+        timeout_secs: u64,
+        max_output_tokens: u32,
+    ) -> Self {
+        Self {
+            users,
+            server_secrets,
+            timeout_secs,
+            max_output_tokens,
+        }
+    }
+}
+
+impl ProviderCredentials for UserProviderCredentials {
+    fn available(&self, user_id: &str, provider: &str) -> bool {
+        self.users
+            .credential_status(user_id, provider)
+            .map(|status| status.usable())
+            .unwrap_or(false)
+    }
+
+    fn client(&self, user_id: &str, provider: &str, profile: &ProviderConfig) -> Result<LlmClient> {
+        let (owner, secret) = self
+            .users
+            .resolve_with_owner(user_id, provider)?
+            .ok_or_else(|| {
+                SeraError::Forbidden(format!(
+                    "no credential is configured for provider '{provider}'; add a key or ask the admin for a grant"
+                ))
+            })?;
+        let credential = ProviderCredential::parse(&secret)?;
+        open_provider_client(
+            profile,
+            &credential,
+            &self.server_secrets,
+            self.timeout_secs,
+            self.max_output_tokens,
+            CredentialOwner {
+                users: &self.users,
+                user_id: &owner,
+                provider,
+            },
+        )
+    }
+}
+
+/// Where a per-user provider client's rotated credential must be written.
+#[derive(Clone, Copy)]
+pub struct CredentialOwner<'a> {
+    pub users: &'a Arc<UserSecrets>,
+    /// The credential's owner: the acting user, or the grantor for a grant.
+    pub user_id: &'a str,
+    pub provider: &'a str,
+}
+
+/// Build one provider client from a resolved credential.
+///
+/// `credential.api_key` is the bearer (an API key, or the access token for an
+/// OAuth provider); `credential.refresh_token` enables the refresh flow. The
+/// OAuth *app* client id/secret stay server-level in the age store — they are
+/// the registration, not the user's secret.
+pub fn open_provider_client(
+    profile: &ProviderConfig,
+    credential: &ProviderCredential,
+    server_secrets: &SharedSecrets,
+    timeout_secs: u64,
+    max_output_tokens: u32,
+    owner: CredentialOwner<'_>,
+) -> Result<LlmClient> {
+    if credential.api_key.trim().is_empty() {
+        return Err(SeraError::Config(
+            "the stored provider credential has no access token or API key".into(),
+        ));
+    }
+    let endpoint = resolve_base_url(&profile.kind, &profile.base_url)?;
+    let mut client = LlmClient::new(
+        &endpoint,
+        credential.api_key.clone(),
+        timeout_secs,
+        max_output_tokens,
+    )?;
+    let plan = auth_plan(&profile.kind, &profile.auth)?;
+    let mut oauth_installed = false;
+    if let AuthPlan::OAuth {
+        style,
+        token_url,
+        client_id_fallback,
+    } = plan
+        && !profile.refresh_token_secret.trim().is_empty()
+        && !credential.refresh_token.trim().is_empty()
+    {
+        let client_id = if profile.oauth_client_id_secret.trim().is_empty() {
+            client_id_fallback.unwrap_or("").to_owned()
+        } else {
+            server_secrets.require(&profile.oauth_client_id_secret)?
+        };
+        let client_secret = if profile.oauth_client_secret_secret.trim().is_empty() {
+            String::new()
+        } else {
+            server_secrets.require(&profile.oauth_client_secret_secret)?
+        };
+        if style == OAuthStyle::RefreshToken && client_secret.is_empty() {
+            return Err(SeraError::Config(
+                "oauth client secret is required to refresh this provider".into(),
+            ));
+        }
+        client = client.with_oauth(OAuthMaterial {
+            style,
+            refresh_token: credential.refresh_token.clone(),
+            token_url: token_url.to_owned(),
+            client_id,
+            client_secret,
+        })?;
+        oauth_installed = true;
+    }
+    if oauth_installed {
+        // Rotation writes back into the credential's owner row (the acting
+        // user, or the grantor for a granted provider).
+        client = client.with_credential_writer(Arc::new(UserCredentialWriter::provider(
+            owner.users.clone(),
+            owner.user_id,
+            owner.provider,
+        )))?;
+    }
+    if canonical_kind(&profile.kind)? == "google-antigravity" {
+        client = client.with_cloud_code(&profile.project_id)?;
+    }
+    Ok(client)
+}
+
+/// Copy the operator's existing age-store provider credentials into the
+/// admin's per-user rows, exactly once.
+///
+/// Lossless: both the API key/access token and the refresh token are carried
+/// over verbatim. Idempotent: a provider the admin already has a row for is
+/// never overwritten, and a `kv` marker per provider makes the import
+/// once-only so a later delete is not undone by a restart. Providers with no
+/// age-store value are left unmarked, so a value set later with
+/// `serabot secrets set` is still imported on the next start. Nothing secret
+/// is logged; the return value is the number of rows imported.
+pub fn import_age_provider_credentials(
+    config: &Config,
+    secrets: &SharedSecrets,
+    users: &UserSecrets,
+    store: &Store,
+    admin_id: &str,
+) -> Result<usize> {
+    let default = config.llm.default_provider();
+    let mut imported = 0;
+    for (id, profile) in std::iter::once(("default", &default)).chain(
+        config
+            .llm
+            .providers
+            .iter()
+            .map(|(id, profile)| (id.as_str(), profile)),
+    ) {
+        let marker = format!("provider_imported:{admin_id}:{id}");
+        if store.kv_get(&marker)?.is_some() {
+            continue;
+        }
+        let api_key = secrets
+            .get(profile.api_key_secret.trim())
+            .unwrap_or_default();
+        let refresh_token = if profile.refresh_token_secret.trim().is_empty() {
+            None
+        } else {
+            secrets.get(profile.refresh_token_secret.trim())
+        };
+        if api_key.is_empty() && refresh_token.is_none() {
+            // Nothing to import yet; leave the marker off.
+            continue;
+        }
+        if users.credential_status(admin_id, id)?.own {
+            // The admin already has a row: never overwrite, just mark it.
+            store.kv_set(&marker, "1")?;
+            continue;
+        }
+        let credential = ProviderCredential {
+            api_key,
+            refresh_token: refresh_token.unwrap_or_default(),
+        };
+        if credential.api_key.is_empty() {
+            // The refresh flow can mint an access token, but the client needs
+            // one to start: report it without any secret and let routing fail
+            // with an explicit error until the operator re-runs the login.
+            tracing::warn!(
+                provider = id,
+                "imported provider credential has no access token; sign in again before routing to it"
+            );
+        }
+        users.set(admin_id, id, &credential.encode()?)?;
+        store.kv_set(&marker, "1")?;
+        imported += 1;
+    }
+    Ok(imported)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1086,5 +1322,165 @@ mod tests {
         .unwrap_err();
         assert!(!rejected.to_string().contains(secret));
         assert!(parse_official_catalog(br#"{"models":[{"id":"kept"}]}"#).is_err());
+    }
+
+    // ---- Per-user credential import (multi-user phase 4) ----
+
+    fn import_fixture() -> (Config, SharedSecrets, Store, UserSecrets, String) {
+        let mut config = Config::default();
+        config.llm.api_key_secret = "llm_api_key".into();
+        config.llm.providers.insert(
+            "antigravity".into(),
+            ProviderConfig {
+                base_url: String::new(),
+                api_key_secret: "antigravity_access_token".into(),
+                models: vec!["gemini-3-pro".into()],
+                data_egress_approved: true,
+                kind: "google-antigravity".into(),
+                auth: "oauth".into(),
+                refresh_token_secret: "antigravity_refresh_token".into(),
+                oauth_client_secret_secret: "antigravity_oauth_client_secret".into(),
+                ..ProviderConfig::default()
+            },
+        );
+        let secrets = SharedSecrets::new(crate::secrets::SecretStore::from_map(
+            std::collections::BTreeMap::from([
+                ("llm_api_key".to_owned(), "sk-operator".to_owned()),
+                (
+                    "antigravity_access_token".to_owned(),
+                    "access-operator".to_owned(),
+                ),
+                (
+                    "antigravity_refresh_token".to_owned(),
+                    "refresh-operator".to_owned(),
+                ),
+            ]),
+        ));
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let users = UserSecrets::with_master_key(store.clone(), [3u8; 32]).unwrap();
+        (config, secrets, store, users, admin)
+    }
+
+    #[test]
+    fn the_age_store_credentials_import_losslessly_and_idempotently() {
+        let (config, secrets, store, users, admin) = import_fixture();
+        let imported =
+            import_age_provider_credentials(&config, &secrets, &users, &store, &admin).unwrap();
+        assert_eq!(imported, 2);
+
+        // Both the API key/access token and the refresh token are preserved.
+        let default =
+            ProviderCredential::parse(&users.get(&admin, "default").unwrap().unwrap()).unwrap();
+        assert_eq!(default.api_key, "sk-operator");
+        assert!(default.refresh_token.is_empty());
+        let antigravity =
+            ProviderCredential::parse(&users.get(&admin, "antigravity").unwrap().unwrap()).unwrap();
+        assert_eq!(antigravity.api_key, "access-operator");
+        assert_eq!(antigravity.refresh_token, "refresh-operator");
+
+        // A second startup imports nothing and changes nothing.
+        assert_eq!(
+            import_age_provider_credentials(&config, &secrets, &users, &store, &admin).unwrap(),
+            0
+        );
+        assert_eq!(
+            ProviderCredential::parse(&users.get(&admin, "antigravity").unwrap().unwrap())
+                .unwrap()
+                .refresh_token,
+            "refresh-operator"
+        );
+    }
+
+    #[test]
+    fn an_existing_admin_credential_is_never_overwritten_and_a_delete_sticks() {
+        let (config, secrets, store, users, admin) = import_fixture();
+        let existing = ProviderCredential {
+            api_key: "sk-console".into(),
+            refresh_token: String::new(),
+        };
+        users
+            .set(&admin, "default", &existing.encode().unwrap())
+            .unwrap();
+        let imported =
+            import_age_provider_credentials(&config, &secrets, &users, &store, &admin).unwrap();
+        assert_eq!(imported, 1, "only the provider without a row is imported");
+        assert_eq!(
+            ProviderCredential::parse(&users.get(&admin, "default").unwrap().unwrap())
+                .unwrap()
+                .api_key,
+            "sk-console"
+        );
+
+        // Deleting an imported credential is not undone by a restart.
+        users.delete(&admin, "antigravity").unwrap();
+        assert_eq!(
+            import_age_provider_credentials(&config, &secrets, &users, &store, &admin).unwrap(),
+            0
+        );
+        assert!(users.get(&admin, "antigravity").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_provider_with_no_age_value_stays_unmarked_until_one_appears() {
+        let mut config = Config::default();
+        config.llm.api_key_secret = "llm_api_key".into();
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let users = UserSecrets::with_master_key(store.clone(), [3u8; 32]).unwrap();
+        let empty = SharedSecrets::new(crate::secrets::SecretStore::from_map(
+            std::collections::BTreeMap::new(),
+        ));
+        assert_eq!(
+            import_age_provider_credentials(&config, &empty, &users, &store, &admin).unwrap(),
+            0
+        );
+        // A value set later with `serabot secrets set` is picked up.
+        let later = SharedSecrets::new(crate::secrets::SecretStore::from_map(
+            std::collections::BTreeMap::from([("llm_api_key".to_owned(), "sk-later".to_owned())]),
+        ));
+        assert_eq!(
+            import_age_provider_credentials(&config, &later, &users, &store, &admin).unwrap(),
+            1
+        );
+        assert_eq!(
+            ProviderCredential::parse(&users.get(&admin, "default").unwrap().unwrap())
+                .unwrap()
+                .api_key,
+            "sk-later"
+        );
+    }
+
+    #[test]
+    fn a_credential_is_built_from_the_users_own_row_and_never_falls_back() {
+        let (config, secrets, store, users, admin) = import_fixture();
+        import_age_provider_credentials(&config, &secrets, &users, &store, &admin).unwrap();
+        let member = store
+            .create_user("microsoft:member", "member@example.example", "Member")
+            .unwrap()
+            .id;
+        let credentials = UserProviderCredentials::new(
+            Arc::new(UserSecrets::with_master_key(store.clone(), [3u8; 32]).unwrap()),
+            secrets.clone(),
+            5,
+            100,
+        );
+        let profile = config.llm.default_provider();
+        // The admin resolves their own imported key.
+        assert!(credentials.available(&admin, "default"));
+        let client = credentials.client(&admin, "default", &profile).unwrap();
+        assert_eq!(client.base_url(), "https://api.mistral.ai/v1");
+        // The member has no credential and no grant: no client, explicit error.
+        assert!(!credentials.available(&member, "default"));
+        let error = credentials
+            .client(&member, "default", &profile)
+            .unwrap_err();
+        assert!(error.to_string().contains("no credential"));
+
+        // A grant makes the admin's credential usable by the member without
+        // copying it.
+        users.grant(&admin, &member, "default").unwrap();
+        assert!(credentials.available(&member, "default"));
+        assert!(credentials.client(&member, "default", &profile).is_ok());
     }
 }

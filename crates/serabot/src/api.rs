@@ -13,6 +13,7 @@ use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures::StreamExt;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -34,6 +35,9 @@ use crate::gateway::Decision;
 use crate::maker::ArtifactStore;
 use crate::memory;
 use crate::model_router::ModelSelection;
+use crate::onedrive::{
+    CONSENT_CALLBACK_PATH, ONEDRIVE_PROVIDER, OneDriveConsent, OneDriveRegistry,
+};
 use crate::orchestration::{
     BotRole, ConversationKind, safe_bot_label, scoped_conversation_id, validate_conversation_id,
 };
@@ -41,6 +45,7 @@ use crate::runtime::{ApprovalNotice, Notifier, Runtime};
 use crate::secrets::SharedSecrets;
 use crate::skills::create_user_skill;
 use crate::store::{Store, StoredConversation, User, UserRole, UserStatus};
+use crate::user_secrets::{ProviderCredential, UserSecrets, validate_provider};
 use crate::util::{constant_time_eq, sha256_hex, truncate_chars};
 
 #[derive(Clone)]
@@ -95,6 +100,12 @@ pub struct ApiState {
     config: Arc<Config>,
     artifacts: Arc<ArtifactStore>,
     secrets: SharedSecrets,
+    /// Per-user envelope-encrypted credential store (phase 4).
+    users: Arc<UserSecrets>,
+    /// Per-user OneDrive client registry; `None` while `[onedrive]` is off.
+    onedrive: Option<Arc<OneDriveRegistry>>,
+    /// OneDrive consent (auth code + PKCE); `None` while `[onedrive]` is off.
+    onedrive_consent: Option<Arc<OneDriveConsent>>,
     token_hash: String,
     rate: Arc<Mutex<VecDeque<Instant>>>,
     rate_limit: usize,
@@ -116,6 +127,8 @@ impl ApiState {
         config: Arc<Config>,
         artifacts: Arc<ArtifactStore>,
         secrets: SharedSecrets,
+        users: Arc<UserSecrets>,
+        onedrive: Option<Arc<OneDriveRegistry>>,
     ) -> Result<Self> {
         let auth = if config.auth.enabled {
             let fleet = runtime.fleet();
@@ -125,11 +138,16 @@ impl ApiState {
         } else {
             None
         };
+        let onedrive_consent =
+            OneDriveConsent::new(&config, &secrets, users.clone())?.map(Arc::new);
         Ok(Self {
             runtime,
             store,
             artifacts,
             secrets,
+            users,
+            onedrive,
+            onedrive_consent,
             token_hash: config.api.token_hash.to_ascii_lowercase(),
             rate: Arc::new(Mutex::new(VecDeque::new())),
             rate_limit: config.server.rate_limit_per_minute.max(1) as usize,
@@ -169,6 +187,23 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/memories", get(list_memories).post(add_memory))
         .route("/v1/memories/{id}", delete(delete_memory))
         .route("/v1/providers", get(list_providers))
+        .route("/v1/providers/{id}/key", put(set_provider_key))
+        .route("/v1/providers/{id}", delete(delete_provider_credential))
+        .route("/v1/admin/grants", get(list_grants).post(grant_provider))
+        .route(
+            "/v1/admin/grants/{grantee}/{provider}",
+            delete(revoke_grant_endpoint),
+        )
+        .route("/v1/connectors/onedrive", delete(disconnect_onedrive))
+        .route(
+            "/v1/connectors/onedrive/start",
+            post(start_onedrive_consent),
+        )
+        .route("/v1/telegram", get(telegram_status))
+        .route(
+            "/v1/telegram/link",
+            post(start_telegram_link).delete(unlink_telegram),
+        )
         .route("/v1/admin/providers", post(admin_add_provider))
         .route("/v1/admin/providers/{id}", delete(admin_remove_provider))
         .route(
@@ -240,6 +275,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/auth/login/start", post(auth_login_start))
         .route("/v1/auth/callback", get(auth_callback))
         .route("/login/microsoft", get(auth_login_microsoft))
+        // The OneDrive consent redirect is a browser round trip from
+        // Microsoft: no session exists, and the `state` value binds it to the
+        // user exactly like the sign-in callback.
+        .route(CONSENT_CALLBACK_PATH, get(onedrive_callback))
         .layer(RequestBodyLimitLayer::new(
             shared.config.server.body_limit_bytes,
         ))
@@ -414,8 +453,8 @@ async fn models(
             .runtime
             .effective_model_selection(&user.id, &query.conversation_id, bot)?;
     Ok(Json(json!({
-        "providers": state.runtime.model_catalog()?,
-        "entries": state.runtime.model_catalog_entries()?,
+        "providers": state.runtime.model_catalog(&user.id)?,
+        "entries": state.runtime.model_catalog_entries(&user.id)?,
         "selection": selection,
         "effective_selection": effective_selection,
     })))
@@ -1942,14 +1981,17 @@ async fn delete_memory(
     Ok(Json(json!({"deleted": id})))
 }
 
-async fn list_providers(State(state): State<Arc<ApiState>>) -> Result<Json<Value>> {
-    let catalog = state.runtime.model_catalog()?;
+async fn list_providers(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let catalog = state.runtime.model_catalog(&user.id)?;
     let llm = &state.config.llm;
     let mut settings: BTreeMap<String, ProviderConfig> = llm.providers.clone();
     settings.insert("default".to_owned(), llm.default_provider());
     let mut providers = catalog
         .into_iter()
-        .map(|provider| {
+        .map(|provider| -> Result<Value> {
             let managed = state
                 .admin
                 .as_ref()
@@ -1991,7 +2033,7 @@ async fn list_providers(State(state): State<Arc<ApiState>>) -> Result<Json<Value
                     config.map(|c| c.oauth_client_secret_secret.as_str()),
                 );
             }
-            json!({
+            Ok(json!({
                 "id": provider.id,
                 "kind": provider.kind,
                 "auth": if is_oauth { "oauth" } else { "api_key" },
@@ -2003,9 +2045,10 @@ async fn list_providers(State(state): State<Arc<ApiState>>) -> Result<Json<Value
                 "catalog_verified": provider.catalog_verified,
                 "managed": managed,
                 "secrets": secrets,
-            })
+                "credential": credential_view(&state, &user.id, &provider.id)?,
+            }))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
 
     if let Some(admin) = &state.admin {
         for (id, profile) in admin.snapshot().providers {
@@ -2056,6 +2099,7 @@ async fn list_providers(State(state): State<Arc<ApiState>>) -> Result<Json<Value
                     "catalog_verified": false,
                     "managed": true,
                     "secrets": secrets,
+                    "credential": credential_view(&state, &user.id, &id)?,
                 }));
             }
         }
@@ -2064,7 +2108,10 @@ async fn list_providers(State(state): State<Arc<ApiState>>) -> Result<Json<Value
     Ok(Json(json!({"providers": providers})))
 }
 
-async fn list_connectors(State(state): State<Arc<ApiState>>) -> Result<Json<Value>> {
+async fn list_connectors(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
     let connectors = &state.config.connectors;
     let oauth: [(&str, &dyn OAuthConnectorSettings); 7] = [
         ("google_drive", &connectors.google_drive),
@@ -2151,7 +2198,374 @@ async fn list_connectors(State(state): State<Arc<ApiState>>) -> Result<Json<Valu
         let group = view["id"].as_str().map(connector_group).unwrap_or("Other");
         view["group"] = json!(group);
     }
+    // Per-user OneDrive status (phase 4). The token never appears: only
+    // whether the acting user has connected their own drive.
+    if state.config.onedrive.enabled {
+        let connected = state
+            .onedrive
+            .as_ref()
+            .map(|registry| registry.connected(&user.id))
+            .transpose()?
+            .unwrap_or(false);
+        views.insert(
+            0,
+            json!({
+                "id": "onedrive",
+                "kind": "oauth",
+                "enabled": true,
+                "group": "Productivity",
+                "connected": connected,
+                "redirect_uri": state
+                    .config
+                    .onedrive
+                    .effective_redirect_base(&state.config.auth)
+                    .trim()
+                    .trim_end_matches('/')
+                    .to_owned()
+                    + crate::onedrive::CONSENT_CALLBACK_PATH,
+                "secrets": {
+                    "refresh_token": {
+                        "name": "user credential",
+                        "configured": connected,
+                    },
+                },
+            }),
+        );
+    }
     Ok(Json(json!({"connectors": views})))
+}
+
+// ---- Per-user credentials, OneDrive consent, Telegram linking (phase 4) ----
+
+/// The configured profile for a provider id (`default` is `[llm]` itself).
+fn provider_profile(config: &Config, id: &str) -> Result<ProviderConfig> {
+    validate_provider(id)?;
+    if id == "default" {
+        return Ok(config.llm.default_provider());
+    }
+    config
+        .llm
+        .providers
+        .get(id)
+        .cloned()
+        .ok_or_else(|| SeraError::NotFound(format!("provider {id}")))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetProviderKeyRequest {
+    api_key: String,
+}
+
+/// Store the acting user's API key for one configured provider.
+///
+/// The key is sealed under the user's DEK; only its presence is ever
+/// reported. Setting a key replaces any previous credential for that
+/// provider (including an OAuth token pair), which is the explicit way to
+/// switch a provider to key auth.
+async fn set_provider_key(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+    Json(request): Json<SetProviderKeyRequest>,
+) -> Result<Json<Value>> {
+    provider_profile(&state.config, &id)?;
+    let credential = ProviderCredential {
+        api_key: request.api_key.trim().to_owned(),
+        refresh_token: String::new(),
+    };
+    state.users.set(&user.id, &id, &credential.encode()?)?;
+    state.runtime.invalidate_model_credentials(Some(&user.id));
+    audit_auth(
+        &state,
+        &user.id,
+        "provider.credential_set",
+        json!({"provider": id}),
+    )?;
+    Ok(Json(json!({"id": id, "configured": true})))
+}
+
+/// Delete the acting user's own credential for a provider. A grant the user
+/// holds is untouched (and reported back).
+async fn delete_provider_credential(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    validate_provider(&id)?;
+    let deleted = state.users.delete(&user.id, &id)?;
+    state.runtime.invalidate_model_credentials(Some(&user.id));
+    let status = state.users.credential_status(&user.id, &id)?;
+    audit_auth(
+        &state,
+        &user.id,
+        "provider.credential_deleted",
+        json!({"provider": id, "deleted": deleted}),
+    )?;
+    Ok(Json(json!({
+        "id": id,
+        "deleted": deleted,
+        "configured": status.usable(),
+        "granted": status.granted,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantRequest {
+    grantee: String,
+    provider: String,
+}
+
+fn grant_view(grant: &crate::store::ProviderGrant) -> Value {
+    json!({
+        "grantee": grant.grantee,
+        "provider": grant.provider,
+        "created_at": grant.created_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "revoked_at": grant
+            .revoked_at
+            .map(|at| at.to_rfc3339_opts(SecondsFormat::Secs, true)),
+        "active": grant.active(),
+    })
+}
+
+/// Grant a member access to an admin-owned provider (admin only).
+///
+/// The grant is a permission, never a secret: resolution reads the admin's
+/// credential at call time and the member never learns the value. Audited and
+/// revocable.
+async fn grant_provider(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Json(request): Json<GrantRequest>,
+) -> Result<Json<Value>> {
+    require_admin(&user)?;
+    crate::util::validate_id(&request.grantee)?;
+    provider_profile(&state.config, &request.provider)?;
+    let grant = state
+        .users
+        .grant(&user.id, &request.grantee, &request.provider)?;
+    state.runtime.invalidate_model_credentials(None);
+    audit_auth(
+        &state,
+        &user.id,
+        "provider.granted",
+        json!({"grantee": grant.grantee, "provider": grant.provider}),
+    )?;
+    Ok(Json(json!({"grant": grant_view(&grant)})))
+}
+
+/// Revoke one grant (admin only). Revocation takes effect immediately: cached
+/// per-user clients are dropped before the response is written.
+async fn revoke_grant_endpoint(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path((grantee, provider)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    require_admin(&user)?;
+    crate::util::validate_id(&grantee)?;
+    validate_provider(&provider)?;
+    let revoked = state.users.revoke_grant(&user.id, &grantee, &provider)?;
+    state.runtime.invalidate_model_credentials(None);
+    audit_auth(
+        &state,
+        &user.id,
+        "provider.grant_revoked",
+        json!({"grantee": grantee, "provider": provider, "revoked": revoked}),
+    )?;
+    Ok(Json(json!({
+        "grantee": grantee,
+        "provider": provider,
+        "revoked": revoked,
+    })))
+}
+
+/// Every grant the acting admin has made, revoked ones included. Admin only;
+/// carries no secret.
+async fn list_grants(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    require_admin(&user)?;
+    let grants = state.store.list_provider_grants(&user.id)?;
+    let grants: Vec<Value> = grants.iter().map(grant_view).collect();
+    Ok(Json(json!({"grants": grants})))
+}
+
+/// Start the OneDrive consent flow for the acting user: auth code + PKCE
+/// against the shared app registration.
+async fn start_onedrive_consent(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let consent = state
+        .onedrive_consent
+        .as_ref()
+        .ok_or_else(|| SeraError::Forbidden("OneDrive is not enabled on this deployment".into()))?;
+    let url = consent.start(&user.id).await?;
+    audit_auth(
+        &state,
+        &user.id,
+        "connector.onedrive_consent_started",
+        json!({}),
+    )?;
+    Ok(Json(json!({"url": url})))
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsentCallbackParams {
+    state: String,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// The OneDrive consent redirect target. Public (the browser arrives from
+/// Microsoft); the `state` value binds the callback to the user who started
+/// it. The refresh token is sealed before the success page renders and never
+/// appears in the response.
+async fn onedrive_callback(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<ConsentCallbackParams>,
+) -> Response {
+    let Some(consent) = state.onedrive_consent.as_ref() else {
+        return auth_error_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "OneDrive is not enabled on this deployment.",
+        );
+    };
+    if params.error.is_some() {
+        return auth_error_page(
+            StatusCode::BAD_REQUEST,
+            "OneDrive consent was not granted. Nothing was connected.",
+        );
+    }
+    let Some(code) = params.code.as_deref() else {
+        return auth_error_page(
+            StatusCode::BAD_REQUEST,
+            "The OneDrive consent response was incomplete. Start again from the console.",
+        );
+    };
+    match consent.complete(&params.state, code).await {
+        Ok(user_id) => {
+            if let Some(registry) = &state.onedrive {
+                registry.invalidate(&user_id);
+            }
+            if let Err(error) =
+                audit_auth(&state, &user_id, "connector.onedrive_connected", json!({}))
+            {
+                warn!(%error, "onedrive connect audit write failed");
+            }
+            html_response(
+                StatusCode::OK,
+                auth_page(
+                    "OneDrive connected",
+                    "<p class=\"lede\">Your OneDrive is connected. Uploads from your bots land in your own drive under the configured folder.</p>\n<p class=\"meta\">You can close this page and return to the client.</p>",
+                ),
+            )
+        }
+        Err(error) => {
+            warn!(%error, "onedrive consent callback failed");
+            auth_error_page(
+                StatusCode::BAD_REQUEST,
+                "OneDrive could not be connected. The link may have expired or been used; start again from the console.",
+            )
+        }
+    }
+}
+
+/// Disconnect the acting user's OneDrive: delete the sealed refresh token and
+/// drop the cached client.
+async fn disconnect_onedrive(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let deleted = state.users.delete(&user.id, ONEDRIVE_PROVIDER)?;
+    if let Some(registry) = &state.onedrive {
+        registry.invalidate(&user.id);
+    }
+    audit_auth(
+        &state,
+        &user.id,
+        "connector.onedrive_disconnected",
+        json!({"was_connected": deleted}),
+    )?;
+    Ok(Json(json!({
+        "id": "onedrive",
+        "connected": false,
+        "was_connected": deleted,
+    })))
+}
+
+/// Telegram linking lifetime: long enough to switch apps, short enough that a
+/// leaked code is useless.
+const TELEGRAM_LINK_TTL_MINUTES: i64 = 10;
+
+/// The acting user's Telegram binding status. The chat ids are the user's own
+/// and are not secrets; the bot token never appears.
+async fn telegram_status(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let binding = state.store.telegram_binding_for_user(&user.id)?;
+    Ok(Json(json!({
+        "enabled": state.config.telegram.enabled,
+        "linked": binding.is_some(),
+        "telegram_user_id": binding.as_ref().map(|binding| binding.telegram_user_id),
+        "telegram_chat_id": binding.as_ref().map(|binding| binding.telegram_chat_id),
+        "linked_at": binding
+            .as_ref()
+            .map(|binding| binding.linked_at.to_rfc3339_opts(SecondsFormat::Secs, true)),
+    })))
+}
+
+/// Mint a short-lived, single-use linking code. The user sends
+/// `/start <code>` to the bot; the polling loop consumes the code and records
+/// the binding. Only the code's hash is stored.
+async fn start_telegram_link(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    if !state.config.telegram.enabled {
+        return Err(SeraError::Forbidden(
+            "Telegram is not enabled on this deployment".into(),
+        ));
+    }
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let code = hex::encode(bytes);
+    let expires_at = Utc::now() + chrono::Duration::minutes(TELEGRAM_LINK_TTL_MINUTES);
+    state
+        .store
+        .put_telegram_link_code(&sha256_hex(&code), &user.id, expires_at)?;
+    audit_auth(
+        &state,
+        &user.id,
+        "telegram.link_code_issued",
+        json!({"expires_at": expires_at.to_rfc3339_opts(SecondsFormat::Secs, true)}),
+    )?;
+    Ok(Json(json!({
+        "code": code,
+        "expires_at": expires_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "instructions": "Send /start <code> to the SeraBot Telegram bot.",
+    })))
+}
+
+/// Unbind the acting user's Telegram chat. Later messages from that chat are
+/// ignored exactly like any other unbound chat.
+async fn unlink_telegram(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let was_linked = state.store.unlink_telegram(&user.id)?;
+    audit_auth(
+        &state,
+        &user.id,
+        "telegram.unlinked",
+        json!({"was_linked": was_linked}),
+    )?;
+    Ok(Json(json!({"linked": false, "was_linked": was_linked})))
 }
 
 /// Console grouping only; it carries no security meaning.
@@ -3067,6 +3481,17 @@ fn secret_status(secrets: &SharedSecrets, name: Option<&str>) -> Value {
     }
 }
 
+/// The acting user's credential status for one provider: own row, active
+/// admin grant, or neither. Presence only — never a value.
+fn credential_view(state: &ApiState, user_id: &str, provider: &str) -> Result<Value> {
+    let status = state.users.credential_status(user_id, provider)?;
+    Ok(json!({
+        "configured": status.usable(),
+        "own": status.own,
+        "granted": status.granted,
+    }))
+}
+
 /// The identity behind an authenticated request, threaded into handlers
 /// through request extensions. Carries only ids and the role — never a raw
 /// token (the `token_hash` field is the sha256 the server stores).
@@ -3718,6 +4143,9 @@ mod tests {
             );
         }
         let secrets = SharedSecrets::new(crate::secrets::SecretStore::from_map(secrets));
+        let users = Arc::new(
+            crate::user_secrets::UserSecrets::with_master_key(store.clone(), [9u8; 32]).unwrap(),
+        );
         let fleet = runtime.fleet();
         let auth = match auth_issuer {
             Some(issuer) => {
@@ -3729,8 +4157,16 @@ mod tests {
             }
             None => None,
         };
-        let mut state =
-            ApiState::new(runtime, store.clone(), config.clone(), artifacts, secrets).unwrap();
+        let mut state = ApiState::new(
+            runtime,
+            store.clone(),
+            config.clone(),
+            artifacts,
+            secrets,
+            users,
+            None,
+        )
+        .unwrap();
         if let Some(service) = auth {
             state.auth = Some(Arc::new(service));
         }
@@ -6057,6 +6493,275 @@ mod tests {
         assert_eq!(tavily["secrets"]["api_key"]["name"], "tavily_api_key");
         assert!(list.iter().any(|connector| connector["id"] == "firecrawl"));
         assert!(!connectors.to_string().contains("synthetic-test-key"));
+    }
+
+    #[tokio::test]
+    async fn provider_credentials_are_per_user_and_grants_are_admin_controlled() {
+        let (app, _, store) = app();
+        let admin = admin(&store);
+        // The admin stores a key through the API; the value never comes back.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "PUT",
+                "/v1/providers/default/key",
+                true,
+                Some(json!({"api_key": "sk-admin-credential"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/providers", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let default = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "default")
+            .expect("default provider");
+        assert_eq!(default["credential"]["own"], true);
+        assert_eq!(default["credential"]["configured"], true);
+        assert!(!body.to_string().contains("sk-admin-credential"));
+
+        // A member has no credential of their own and cannot grant one.
+        let member = store
+            .create_user("microsoft:member", "member@example.example", "Member")
+            .unwrap();
+        let token = store
+            .mint_session(&member.id, chrono::Duration::hours(1))
+            .unwrap();
+        let body = read_json(
+            app.clone()
+                .oneshot(request_with_token("GET", "/v1/providers", &token, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let default = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "default")
+            .expect("default provider");
+        assert_eq!(default["credential"]["configured"], false);
+        assert_eq!(default["credential"]["granted"], false);
+        let response = app
+            .clone()
+            .oneshot(request_with_token(
+                "POST",
+                "/v1/admin/grants",
+                &token,
+                Some(json!({"grantee": member.id, "provider": "default"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // The admin grants the provider: the member can use it, never read it.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/admin/grants",
+                true,
+                Some(json!({"grantee": member.id, "provider": "default"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(
+            app.clone()
+                .oneshot(request_with_token("GET", "/v1/providers", &token, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let default = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "default")
+            .expect("default provider");
+        assert_eq!(default["credential"]["granted"], true);
+        assert_eq!(default["credential"]["configured"], true);
+
+        // The grant list is admin-only and carries no secret.
+        let response = app
+            .clone()
+            .oneshot(request_with_token("GET", "/v1/admin/grants", &token, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/admin/grants", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["grants"].as_array().unwrap().len(), 1);
+        assert_eq!(body["grants"][0]["grantee"], member.id);
+        assert!(!body.to_string().contains("sk-admin-credential"));
+
+        // Revocation takes effect immediately.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "DELETE",
+                &format!("/v1/admin/grants/{}/default", member.id),
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(
+            app.clone()
+                .oneshot(request_with_token("GET", "/v1/providers", &token, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let default = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "default")
+            .expect("default provider");
+        assert_eq!(default["credential"]["granted"], false);
+        assert_eq!(default["credential"]["configured"], false);
+
+        // A member deleting their own credential never touches the admin's.
+        let response = app
+            .clone()
+            .oneshot(request_with_token(
+                "DELETE",
+                "/v1/providers/default",
+                &token,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/providers", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let default = body["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provider| provider["id"] == "default")
+            .expect("default provider");
+        assert_eq!(default["credential"]["own"], true);
+        assert!(store.user_credential(&admin, "default").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn telegram_status_is_per_user_and_linking_fails_closed_when_disabled() {
+        let (app, _, store) = app();
+        let body = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/telegram", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["enabled"], false);
+        assert_eq!(body["linked"], false);
+        let response = app
+            .clone()
+            .oneshot(request(&app, "POST", "/v1/telegram/link", true, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // A stored binding is reported to its owner only.
+        let member = store
+            .create_user("microsoft:tg", "tg@example.example", "TG")
+            .unwrap();
+        store.link_telegram(&member.id, 40, 30).unwrap();
+        let token = store
+            .mint_session(&member.id, chrono::Duration::hours(1))
+            .unwrap();
+        let body = read_json(
+            app.clone()
+                .oneshot(request_with_token("GET", "/v1/telegram", &token, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["linked"], true);
+        assert_eq!(body["telegram_user_id"], 40);
+        assert_eq!(body["telegram_chat_id"], 30);
+        let admin_body = read_json(
+            app.clone()
+                .oneshot(request(&app, "GET", "/v1/telegram", true, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(admin_body["linked"], false);
+
+        // Unlinking is scoped: the member's own binding goes away.
+        let response = app
+            .clone()
+            .oneshot(request_with_token(
+                "DELETE",
+                "/v1/telegram/link",
+                &token,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        assert_eq!(body["was_linked"], true);
+        assert!(store.telegram_binding(40, 30).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn onedrive_endpoints_fail_closed_when_disabled() {
+        let (app, _, _) = app();
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/connectors/onedrive/start",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        // Disconnecting when nothing is connected is idempotent and scoped.
+        let response = app
+            .clone()
+            .oneshot(request(
+                &app,
+                "DELETE",
+                "/v1/connectors/onedrive",
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = read_json(response).await;
+        assert_eq!(body["connected"], false);
+        assert_eq!(body["was_connected"], false);
     }
 
     #[tokio::test]

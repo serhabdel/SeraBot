@@ -45,6 +45,8 @@ const MIGRATION_7: &str = include_str!("../migrations/0007_conversation_read_row
 const MIGRATION_8: &str = include_str!("../migrations/0008_users_and_sessions.sql");
 const MIGRATION_9: &str = include_str!("../migrations/0009_user_scoping.sql");
 const MIGRATION_10: &str = include_str!("../migrations/0010_user_fleet.sql");
+const MIGRATION_11: &str = include_str!("../migrations/0011_user_secrets.sql");
+const MIGRATION_12: &str = include_str!("../migrations/0012_user_telegram.sql");
 
 /// Fixed admin id written by migration 0008 and mirrored in
 /// `kv['admin_user_id']`. Code resolves the admin through the kv entry (the
@@ -188,6 +190,93 @@ pub struct UserSkill {
 }
 
 pub type StoreConnection = PooledConnection<SqliteConnectionManager>;
+
+/// One sealed per-user data key. The plaintext DEK never reaches this layer:
+/// `user_secrets` seals it under the master key and opens it again on demand.
+/// `Debug` shows lengths only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StoredUserKey {
+    pub wrapped_dek: Vec<u8>,
+    pub nonce: Vec<u8>,
+}
+
+impl std::fmt::Debug for StoredUserKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredUserKey")
+            .field("wrapped_dek_bytes", &self.wrapped_dek.len())
+            .field("nonce_bytes", &self.nonce.len())
+            .finish()
+    }
+}
+
+/// One sealed credential blob. `Debug` shows lengths only; the bytes are
+/// ciphertext and are never logged either way.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StoredCredential {
+    pub ciphertext: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for StoredCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredCredential")
+            .field("ciphertext_bytes", &self.ciphertext.len())
+            .field("nonce_bytes", &self.nonce.len())
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+/// Whether the acting user can use a provider, without touching the secret:
+/// `own` is their own credential row, `granted` an active admin grant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CredentialStatus {
+    pub own: bool,
+    pub granted: bool,
+}
+
+impl CredentialStatus {
+    pub fn usable(self) -> bool {
+        self.own || self.granted
+    }
+}
+
+/// One provider grant row. Grants carry no secret: resolution reads the
+/// grantor's credential at call time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderGrant {
+    pub grantor: String,
+    pub grantee: String,
+    pub provider: String,
+    pub created_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+impl ProviderGrant {
+    pub fn active(&self) -> bool {
+        self.revoked_at.is_none()
+    }
+}
+
+/// One Telegram binding row: the chat pair routes to `user_id` while
+/// `revoked_at` is `None`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TelegramBinding {
+    pub user_id: String,
+    pub telegram_user_id: i64,
+    pub telegram_chat_id: i64,
+    pub linked_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+impl TelegramBinding {
+    pub fn active(&self) -> bool {
+        self.revoked_at.is_none()
+    }
+}
 
 /// Token-usage rollup over `model.used` audit rows.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -382,6 +471,16 @@ impl Store {
         if version < 10 {
             connection.execute_batch(MIGRATION_10)?;
             connection.pragma_update(None, "user_version", 10)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 11 {
+            connection.execute_batch(MIGRATION_11)?;
+            connection.pragma_update(None, "user_version", 11)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 12 {
+            connection.execute_batch(MIGRATION_12)?;
+            connection.pragma_update(None, "user_version", 12)?;
         }
         let stored_dimension: Option<String> = connection
             .query_row(
@@ -1074,6 +1173,413 @@ impl Store {
             params![token_hash, now_string()],
         )?;
         Ok(changed > 0)
+    }
+
+    // ---- Per-user credentials and provider grants (multi-user phase 4) ----
+    //
+    // These methods store and return *sealed* bytes only. Encryption and
+    // decryption live in `user_secrets`; nothing here ever sees a plaintext
+    // credential, and every method takes the acting user's id.
+
+    /// The acting user's sealed data key, or `None` before the first write.
+    pub fn user_key(&self, user_id: &str) -> Result<Option<StoredUserKey>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT wrapped_dek, nonce FROM user_keys WHERE user_id = ?1",
+                params![user_id],
+                |row| {
+                    Ok(StoredUserKey {
+                        wrapped_dek: row.get(0)?,
+                        nonce: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Insert the acting user's sealed data key. A concurrent insert wins
+    /// once: the caller re-reads and uses the stored key (never its own
+    /// losing copy), so two racing writes cannot produce two DEKs.
+    pub fn put_user_key(&self, user_id: &str, wrapped_dek: &[u8], nonce: &[u8]) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO user_keys(user_id, wrapped_dek, nonce, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(user_id) DO NOTHING",
+            params![user_id, wrapped_dek, nonce, now_string()],
+        )?;
+        Ok(())
+    }
+
+    /// The acting user's sealed credential for `provider`.
+    pub fn user_credential(
+        &self,
+        user_id: &str,
+        provider: &str,
+    ) -> Result<Option<StoredCredential>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT ciphertext, nonce, updated_at FROM user_credentials
+                 WHERE user_id = ?1 AND provider = ?2",
+                params![user_id, provider],
+                |row| {
+                    Ok(StoredCredential {
+                        ciphertext: row.get(0)?,
+                        nonce: row.get(1)?,
+                        updated_at: parse_datetime(&row.get::<_, String>(2)?),
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Insert or replace the acting user's sealed credential for `provider`.
+    pub fn put_user_credential(
+        &self,
+        user_id: &str,
+        provider: &str,
+        ciphertext: &[u8],
+        nonce: &[u8],
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO user_credentials(user_id, provider, ciphertext, nonce, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(user_id, provider) DO UPDATE SET
+                 ciphertext = excluded.ciphertext,
+                 nonce = excluded.nonce,
+                 updated_at = excluded.updated_at",
+            params![user_id, provider, ciphertext, nonce, now_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Delete the acting user's credential for `provider`. Returns false when
+    /// the acting user has no such row; another user's row is never touched.
+    pub fn delete_user_credential(&self, user_id: &str, provider: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "DELETE FROM user_credentials WHERE user_id = ?1 AND provider = ?2",
+            params![user_id, provider],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The acting user's own credential provider names, sorted. Names only:
+    /// no ciphertext, no value.
+    pub fn list_user_credential_providers(&self, user_id: &str) -> Result<Vec<String>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT provider FROM user_credentials WHERE user_id = ?1 ORDER BY provider LIMIT 256",
+        )?;
+        let rows = statement.query_map(params![user_id], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Whether the acting user has their own credential and/or an active
+    /// admin grant for `provider`. Row existence only; nothing is decrypted.
+    pub fn credential_status(&self, user_id: &str, provider: &str) -> Result<CredentialStatus> {
+        let connection = self.connection()?;
+        let own: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM user_credentials WHERE user_id = ?1 AND provider = ?2)",
+            params![user_id, provider],
+            |row| row.get(0),
+        )?;
+        let granted: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM provider_grants
+                           WHERE grantee = ?1 AND provider = ?2 AND revoked_at IS NULL)",
+            params![user_id, provider],
+            |row| row.get(0),
+        )?;
+        Ok(CredentialStatus { own, granted })
+    }
+
+    /// Record (or re-activate) an admin grant of `provider` to `grantee`.
+    ///
+    /// The grantor must be the bootstrap admin: the product rule is that only
+    /// the admin shares an admin-owned provider, and enforcing it here keeps
+    /// the rule true for every caller. A self-grant is rejected.
+    pub fn upsert_provider_grant(
+        &self,
+        grantor: &str,
+        grantee: &str,
+        provider: &str,
+    ) -> Result<ProviderGrant> {
+        if grantor == grantee {
+            return Err(SeraError::Validation(
+                "a provider cannot be granted to its own owner".into(),
+            ));
+        }
+        if grantor != self.admin_user_id()? {
+            return Err(SeraError::Forbidden(
+                "only the admin can grant a provider".into(),
+            ));
+        }
+        let target = self
+            .get_user(grantee)?
+            .ok_or_else(|| SeraError::NotFound(format!("user {grantee}")))?;
+        if target.status != UserStatus::Active {
+            return Err(SeraError::InvalidState(
+                "the grantee account is disabled".into(),
+            ));
+        }
+        let created_at = now_string();
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO provider_grants(grantor, grantee, provider, created_at, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, NULL)
+             ON CONFLICT(grantor, grantee, provider) DO UPDATE SET
+                 created_at = excluded.created_at,
+                 revoked_at = NULL",
+            params![grantor, grantee, provider, created_at],
+        )?;
+        Ok(ProviderGrant {
+            grantor: grantor.to_owned(),
+            grantee: grantee.to_owned(),
+            provider: provider.to_owned(),
+            created_at: parse_datetime(&created_at),
+            revoked_at: None,
+        })
+    }
+
+    /// Revoke one grant. Returns false when it was already revoked or never
+    /// existed; the row is kept for the audit trail.
+    pub fn revoke_provider_grant(
+        &self,
+        grantor: &str,
+        grantee: &str,
+        provider: &str,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE provider_grants SET revoked_at = ?4
+             WHERE grantor = ?1 AND grantee = ?2 AND provider = ?3 AND revoked_at IS NULL",
+            params![grantor, grantee, provider, now_string()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The active grantor of `provider` for `grantee`, if the admin granted
+    /// it. Used only to resolve a credential and to route rotation back to
+    /// the owner; the id never reaches an API response.
+    pub fn active_grant_grantor(
+        &self,
+        grantor: &str,
+        grantee: &str,
+        provider: &str,
+    ) -> Result<Option<String>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT grantor FROM provider_grants
+                 WHERE grantor = ?1 AND grantee = ?2 AND provider = ?3 AND revoked_at IS NULL",
+                params![grantor, grantee, provider],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Every grant the grantor has ever made, revoked ones included, newest
+    /// first. Admin-facing: carries no secret.
+    pub fn list_provider_grants(&self, grantor: &str) -> Result<Vec<ProviderGrant>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT grantor, grantee, provider, created_at, revoked_at
+             FROM provider_grants WHERE grantor = ?1
+             ORDER BY created_at DESC, grantee, provider LIMIT 500",
+        )?;
+        let rows = statement.query_map(params![grantor], provider_grant_from_row)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The active grants a user holds, sorted by provider. Names only.
+    pub fn list_active_grants_for(&self, grantee: &str) -> Result<Vec<ProviderGrant>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT grantor, grantee, provider, created_at, revoked_at
+             FROM provider_grants WHERE grantee = ?1 AND revoked_at IS NULL
+             ORDER BY provider LIMIT 256",
+        )?;
+        let rows = statement.query_map(params![grantee], provider_grant_from_row)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    // ---- Telegram bindings (multi-user phase 4) ----
+
+    /// The active binding for a Telegram (user, chat) pair, if any. An
+    /// unbound pair is indistinguishable from a revoked one: both are `None`.
+    pub fn telegram_binding(
+        &self,
+        telegram_user_id: i64,
+        telegram_chat_id: i64,
+    ) -> Result<Option<TelegramBinding>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT user_id, telegram_user_id, telegram_chat_id, linked_at, revoked_at
+                 FROM user_telegram
+                 WHERE telegram_user_id = ?1 AND telegram_chat_id = ?2 AND revoked_at IS NULL",
+                params![telegram_user_id, telegram_chat_id],
+                telegram_binding_from_row,
+            )
+            .optional()?)
+    }
+
+    /// The acting user's active binding, if any.
+    pub fn telegram_binding_for_user(&self, user_id: &str) -> Result<Option<TelegramBinding>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT user_id, telegram_user_id, telegram_chat_id, linked_at, revoked_at
+                 FROM user_telegram WHERE user_id = ?1 AND revoked_at IS NULL",
+                params![user_id],
+                telegram_binding_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Bind a Telegram pair to the acting user, replacing their own revoked
+    /// row. A pair already bound to another account fails closed.
+    pub fn link_telegram(
+        &self,
+        user_id: &str,
+        telegram_user_id: i64,
+        telegram_chat_id: i64,
+    ) -> Result<TelegramBinding> {
+        if telegram_user_id <= 0 || telegram_chat_id == 0 {
+            return Err(SeraError::Validation(
+                "invalid Telegram user or chat id".into(),
+            ));
+        }
+        let user = self
+            .get_user(user_id)?
+            .ok_or_else(|| SeraError::NotFound(format!("user {user_id}")))?;
+        if user.status != UserStatus::Active {
+            return Err(SeraError::InvalidState(
+                "this account is disabled; Telegram was not linked".into(),
+            ));
+        }
+        if let Some(existing) = self.telegram_binding(telegram_user_id, telegram_chat_id)?
+            && existing.user_id != user_id
+        {
+            return Err(SeraError::Validation(
+                "this Telegram account is already linked to another account".into(),
+            ));
+        }
+        let linked_at = now_string();
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO user_telegram(user_id, telegram_user_id, telegram_chat_id, linked_at, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, NULL)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 telegram_user_id = excluded.telegram_user_id,
+                 telegram_chat_id = excluded.telegram_chat_id,
+                 linked_at = excluded.linked_at,
+                 revoked_at = NULL",
+            params![user_id, telegram_user_id, telegram_chat_id, linked_at],
+        )?;
+        Ok(TelegramBinding {
+            user_id: user_id.to_owned(),
+            telegram_user_id,
+            telegram_chat_id,
+            linked_at: parse_datetime(&linked_at),
+            revoked_at: None,
+        })
+    }
+
+    /// Revoke the acting user's binding. Returns false when none is active.
+    pub fn unlink_telegram(&self, user_id: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE user_telegram SET revoked_at = ?2
+             WHERE user_id = ?1 AND revoked_at IS NULL",
+            params![user_id, now_string()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// The chat id of the acting user's active binding, if any.
+    pub fn telegram_chat_for(&self, user_id: &str) -> Result<Option<i64>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT telegram_chat_id FROM user_telegram
+                 WHERE user_id = ?1 AND revoked_at IS NULL",
+                params![user_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Store a hashed, single-use Telegram linking code for `user_id`.
+    ///
+    /// Codes live in `kv` (server-level state, not user data) under
+    /// `telegram_link:<sha256>`, so the polling loop and the API share them
+    /// without a second in-memory service. Expired codes are pruned here; the
+    /// raw code is never stored.
+    pub fn put_telegram_link_code(
+        &self,
+        code_hash: &str,
+        user_id: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.prune_telegram_link_codes()?;
+        let value = serde_json::to_string(&TelegramLinkCode {
+            user_id: user_id.to_owned(),
+            expires_at,
+        })?;
+        self.kv_set(&telegram_link_key(code_hash), &value)
+    }
+
+    /// Consume a Telegram linking code exactly once. Returns the user id, or
+    /// `None` for an unknown, expired, or already-used code.
+    pub fn take_telegram_link_code(&self, code_hash: &str) -> Result<Option<String>> {
+        let key = telegram_link_key(code_hash);
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let value: Option<String> = transaction
+            .query_row("SELECT value FROM kv WHERE key = ?1", params![key], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        transaction.execute("DELETE FROM kv WHERE key = ?1", params![key])?;
+        transaction.commit()?;
+        let code: TelegramLinkCode = serde_json::from_str(&value)
+            .map_err(|_| SeraError::InvalidState("stored Telegram link code is invalid".into()))?;
+        if code.expires_at <= Utc::now() {
+            return Ok(None);
+        }
+        Ok(Some(code.user_id))
+    }
+
+    /// Drop expired linking codes. Bounded: a deployment has at most a
+    /// handful of pending codes, and the scan never touches user data.
+    fn prune_telegram_link_codes(&self) -> Result<()> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT key, value FROM kv WHERE key LIKE 'telegram_link:%' LIMIT 200")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut expired = Vec::new();
+        for row in rows {
+            let (key, value) = row?;
+            match serde_json::from_str::<TelegramLinkCode>(&value) {
+                Ok(code) if code.expires_at <= Utc::now() => expired.push(key),
+                Ok(_) => {}
+                // A malformed row can never be redeemed; drop it.
+                Err(_) => expired.push(key),
+            }
+        }
+        for key in expired {
+            connection.execute("DELETE FROM kv WHERE key = ?1", params![key])?;
+        }
+        Ok(())
     }
 
     /// Append one stored message to the acting user's conversation.
@@ -2808,6 +3314,44 @@ fn user_from_row(row: &Row<'_>) -> rusqlite::Result<User> {
     })
 }
 
+fn provider_grant_from_row(row: &Row<'_>) -> rusqlite::Result<ProviderGrant> {
+    Ok(ProviderGrant {
+        grantor: row.get(0)?,
+        grantee: row.get(1)?,
+        provider: row.get(2)?,
+        created_at: parse_datetime(&row.get::<_, String>(3)?),
+        revoked_at: row
+            .get::<_, Option<String>>(4)?
+            .as_deref()
+            .map(parse_datetime),
+    })
+}
+
+fn telegram_binding_from_row(row: &Row<'_>) -> rusqlite::Result<TelegramBinding> {
+    Ok(TelegramBinding {
+        user_id: row.get(0)?,
+        telegram_user_id: row.get(1)?,
+        telegram_chat_id: row.get(2)?,
+        linked_at: parse_datetime(&row.get::<_, String>(3)?),
+        revoked_at: row
+            .get::<_, Option<String>>(4)?
+            .as_deref()
+            .map(parse_datetime),
+    })
+}
+
+/// One pending Telegram linking code, stored hashed in `kv` until the chat
+/// redeems it or it expires.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct TelegramLinkCode {
+    user_id: String,
+    expires_at: DateTime<Utc>,
+}
+
+fn telegram_link_key(code_hash: &str) -> String {
+    format!("telegram_link:{code_hash}")
+}
+
 fn stored_bot_from_row(row: &Row<'_>) -> rusqlite::Result<StoredBot> {
     let config_json: String = row.get(1)?;
     let config = serde_json::from_str(&config_json).map_err(|error| {
@@ -3469,7 +4013,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 12);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -3534,7 +4078,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 12);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -3603,7 +4147,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 12);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -3734,7 +4278,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 12);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -3889,7 +4433,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 12);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.

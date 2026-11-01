@@ -75,20 +75,20 @@ never merge without the owner's OK.
 
 ## Phase 4 — user secrets, providers, Telegram
 
-- [ ] T4.1 `user_secrets.rs` (add `chacha20poly1305`): master key file,
+- [x] T4.1 `user_secrets.rs` (add `chacha20poly1305`): master key file,
       per-user DEK wrap, AEAD seal/open; migration `0011_user_secrets.sql`
       (`user_keys`, `user_credentials`, `provider_grants`).
-- [ ] T4.2 Per-user OneDrive: consent endpoints, DEK-stored refresh token,
+- [x] T4.2 Per-user OneDrive: consent endpoints, DEK-stored refresh token,
       lazy client registry, rotation write-back.
-- [ ] T4.3 Per-user AI providers: credential CRUD, per-user
+- [x] T4.3 Per-user AI providers: credential CRUD, per-user
       `ModelRouter`, lossless admin import from the age store, rotation to
       the user store.
-- [ ] T4.4 Admin provider grants (auditable, revocable, secret never
+- [x] T4.4 Admin provider grants (auditable, revocable, secret never
       exposed); resolution order user → grant.
-- [ ] T4.5 Telegram linking: migration `0012_user_telegram.sql`, linking
+- [x] T4.5 Telegram linking: migration `0012_user_telegram.sql`, linking
       code `/start` flow, per-binding routing; admin pair migrates as the
       admin binding.
-- [ ] T4.6 Phase gate + commit + push.
+- [x] T4.6 Phase gate + commit + push.
 
 ## Phase 5 — gateway authority, quotas
 

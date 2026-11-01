@@ -176,6 +176,7 @@ impl Tool for DelegateTool {
             ModelClass::Synthesis => "synthesis",
         };
         let selection = self.router.select_class(
+            &context.user_id,
             Some(class_name),
             specialist.config.model.as_deref(),
             &specialist.config.name,

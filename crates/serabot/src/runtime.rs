@@ -399,7 +399,7 @@ impl Runtime {
     }
 
     pub async fn refresh_model_catalogs(&self, user_id: &str) -> Result<()> {
-        for report in self.router.refresh_catalogs().await? {
+        for report in self.router.refresh_catalogs(user_id).await? {
             if !report.fetched {
                 continue;
             }
@@ -421,18 +421,33 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn model_catalog(&self) -> Result<Vec<ProviderView>> {
-        let catalog = self.router.catalog();
+    /// The acting user's routable provider catalog. A provider they hold no
+    /// credential for is absent, never shown with another account's status.
+    pub fn model_catalog(&self, user_id: &str) -> Result<Vec<ProviderView>> {
+        let catalog = self.router.catalog(user_id);
         self.gateway
             .scan_egress(&serde_json::to_string(&catalog)?)?;
         Ok(catalog)
     }
 
-    pub fn model_catalog_entries(&self) -> Result<Vec<crate::model_router::CatalogEntry>> {
-        let entries = self.router.catalog_entries();
+    pub fn model_catalog_entries(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::model_router::CatalogEntry>> {
+        let entries = self.router.catalog_entries(user_id);
         self.gateway
             .scan_egress(&serde_json::to_string(&entries)?)?;
         Ok(entries)
+    }
+
+    /// Drop cached per-user provider clients after a credential or grant
+    /// change. `None` clears every account (an admin credential or grant can
+    /// affect more than one user).
+    pub fn invalidate_model_credentials(&self, user_id: Option<&str>) {
+        match user_id {
+            Some(user_id) => self.router.invalidate_user(user_id),
+            None => self.router.invalidate_all(),
+        }
     }
 
     fn stored_model_selection(&self, conversation_id: &str) -> Result<Option<ModelSelection>> {
@@ -491,14 +506,14 @@ impl Runtime {
             Some(stored) => stored,
             None => self
                 .router
-                .default_selection(self.bot_model_hint(bot).as_deref()),
+                .default_selection(user_id, self.bot_model_hint(bot).as_deref()),
         };
         if selection.is_auto_mode() {
             self.gateway
                 .scan_egress(&serde_json::to_string(&selection)?)?;
             return Ok(selection);
         }
-        self.router.validate_selection(&selection)?;
+        self.router.validate_selection(user_id, &selection)?;
         self.gateway
             .scan_egress(&serde_json::to_string(&selection)?)?;
         Ok(selection)
@@ -520,9 +535,10 @@ impl Runtime {
             Some(stored) => stored,
             None => self
                 .router
-                .default_selection(self.bot_model_hint(bot).as_deref()),
+                .default_selection(user_id, self.bot_model_hint(bot).as_deref()),
         };
         let resolved = self.router.resolve_selection(
+            user_id,
             &stored,
             bot.config.model.as_deref(),
             &bot.config.name,
@@ -542,7 +558,7 @@ impl Runtime {
         validate_conversation_id(conversation_id)?;
         self.guard_conversation_scope(user_id, conversation_id)?;
         let stored = if selection.is_auto_mode() {
-            if !self.router.autoselect_available() {
+            if !self.router.autoselect_available(user_id) {
                 return Err(SeraError::Forbidden(
                     "no provider with data-egress approval is configured for autoselect".into(),
                 ));
@@ -550,7 +566,7 @@ impl Runtime {
             ModelSelection::auto_mode()
         } else {
             self.router.pin(&selection)?;
-            self.router.catalog_gate(&selection)?;
+            self.router.catalog_gate(user_id, &selection)?;
             selection
         };
         let value = serde_json::to_string(&stored)?;
@@ -1585,7 +1601,7 @@ impl Runtime {
                 .scan_egress(&serde_json::to_string(&tool_specs)?)?;
             let response = self
                 .router
-                .complete(route, &state.messages, &tool_specs, temperature)
+                .complete(&user, route, &state.messages, &tool_specs, temperature)
                 .await?;
             self.store.record_audit(
                 &user,
@@ -2544,7 +2560,7 @@ mod tests {
             "loaded"
         );
         assert_eq!(
-            runtime.model_catalog().unwrap()[0].models,
+            runtime.model_catalog(&admin(&store)).unwrap()[0].models,
             vec!["alternative", "configured", "loaded", "test"]
         );
         assert!(
@@ -2754,7 +2770,7 @@ mod tests {
             false,
         );
         runtime.router.add_default_model("restricted").unwrap();
-        assert!(runtime.model_catalog().is_err());
+        assert!(runtime.model_catalog(&admin(&store)).is_err());
         let selection = ModelSelection {
             provider: "default".into(),
             model: "restricted".into(),

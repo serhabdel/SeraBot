@@ -268,6 +268,7 @@ fn refuse_bound(
 fn member_turn_payload(
     bots: &Fleet,
     router: &ModelRouter,
+    user_id: &str,
     conversation_id: &str,
     to_bot: &str,
     text: &str,
@@ -282,6 +283,7 @@ fn member_turn_payload(
         )));
     }
     let selection = router.select_class(
+        user_id,
         Some("routine"),
         bot.config.model.as_deref(),
         &bot.config.name,
@@ -514,6 +516,7 @@ impl Tool for TeamAskTool {
             let payload = member_turn_payload(
                 &fleet,
                 &self.router,
+                &context.user_id,
                 conversation_id,
                 to_bot,
                 &objective,
@@ -722,6 +725,7 @@ impl Tool for TeamReplyTool {
         let payload = member_turn_payload(
             &fleet,
             &self.router,
+            &context.user_id,
             conversation_id,
             &to_bot,
             &message,

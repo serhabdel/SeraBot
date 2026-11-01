@@ -17,6 +17,83 @@ pub struct SecretStore {
     values: BTreeMap<String, String>,
 }
 
+/// Where a rotated credential is written back.
+///
+/// Implemented by the age store ([`AgeCredentialWriter`], server-level
+/// secrets) and by the per-user envelope store
+/// (`user_secrets::UserCredentialWriter`, phase 4). Rotation is fail-closed:
+/// a failed write fails the call that triggered it, and the caller keeps the
+/// rotated value in memory for a retry.
+pub trait CredentialWriter: Send + Sync {
+    /// Persist a rotated refresh token and, when the provider issued one, the
+    /// matching access token.
+    fn persist_rotation(&self, refresh: &str, access: Option<&str>) -> Result<()>;
+}
+
+/// [`CredentialWriter`] backed by the age secret store.
+pub struct AgeCredentialWriter {
+    secrets: SharedSecrets,
+    refresh_secret_name: String,
+    access_secret_name: String,
+}
+
+impl std::fmt::Debug for AgeCredentialWriter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AgeCredentialWriter")
+            .field("refresh_secret_name", &self.refresh_secret_name)
+            .field("access_secret_name", &self.access_secret_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AgeCredentialWriter {
+    /// Build a writer for one age-store credential pair. An empty access name
+    /// means only the refresh token is persisted.
+    ///
+    /// Only the age store's own name bounds are enforced here (non-empty,
+    /// at most 128 bytes); the connector and OneDrive call sites apply their
+    /// stricter `valid_secret_name` check before getting here.
+    pub fn new(
+        secrets: SharedSecrets,
+        refresh_secret_name: impl Into<String>,
+        access_secret_name: impl Into<String>,
+    ) -> Result<Self> {
+        let refresh_secret_name = refresh_secret_name.into().trim().to_owned();
+        if refresh_secret_name.is_empty() || refresh_secret_name.len() > 128 {
+            return Err(SeraError::Config(
+                "a rotated credential needs a refresh secret name".into(),
+            ));
+        }
+        let access_secret_name = access_secret_name.into().trim().to_owned();
+        if access_secret_name.len() > 128 {
+            return Err(SeraError::Config(
+                "a rotated credential access secret name is invalid".into(),
+            ));
+        }
+        Ok(Self {
+            secrets,
+            refresh_secret_name,
+            access_secret_name,
+        })
+    }
+}
+
+impl CredentialWriter for AgeCredentialWriter {
+    fn persist_rotation(&self, refresh: &str, access: Option<&str>) -> Result<()> {
+        let mut updates = vec![(self.refresh_secret_name.as_str(), refresh)];
+        if !self.access_secret_name.is_empty()
+            && self.access_secret_name != self.refresh_secret_name
+        {
+            let access = access
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| SeraError::Secrets("rotated credential was not persisted".into()))?;
+            updates.push((self.access_secret_name.as_str(), access));
+        }
+        self.secrets.persist(&updates)
+    }
+}
+
 impl std::fmt::Debug for SecretStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -247,14 +324,14 @@ fn write_encrypted(
 }
 
 #[cfg(unix)]
-fn restrict_permissions(path: &Path) -> Result<()> {
+pub(crate) fn restrict_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> Result<()> {
+pub(crate) fn restrict_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 

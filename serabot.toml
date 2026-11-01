@@ -17,6 +17,10 @@ busy_timeout_ms = 5000
 [secrets]
 encrypted_file = "private/secrets.age"
 identity_file = "private/age-identity.txt"
+# Server master key for the per-user credential store. 32 raw bytes, generated
+# on first run with mode 0600 on unix; never logged or exposed. Not the age
+# identity: it wraps each user's data key.
+master_key_file = "private/master.key"
 
 [api]
 enabled = false
@@ -180,13 +184,22 @@ poll_interval_ms = 2000
 poll_max_attempts = 60
 
 [onedrive]
+# Availability + defaults. Each account connects its own drive from the
+# console (auth code + PKCE); uploads land in that user's own drive under
+# `folder`. The legacy global refresh token is imported into the admin's
+# credential row once at startup, so an existing single-operator setup keeps
+# working without re-consent.
 enabled = false
 graph_base = "https://graph.microsoft.com/v1.0"
 tenant = "consumers"
+# Age-store key for the shared app registration's public client id (the same
+# registration as [auth]).
 client_id_secret = "onedrive_client_id"
 refresh_token_secret = "onedrive_refresh_token"
 folder = "SeraBot"
 conflict_behavior = "rename"
+# Public base URL for the consent redirect; empty falls back to auth.base_url.
+redirect_base_url = ""
 
 # Firecrawl v2 (scrape / map / search / crawl). Disabled by default.
 # Store the API key in the age secret store: serabot secrets set firecrawl_api_key

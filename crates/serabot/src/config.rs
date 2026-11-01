@@ -429,6 +429,12 @@ pub struct SecretsConfig {
     pub encrypted_file: String,
     #[serde(default = "default_identity_file")]
     pub identity_file: String,
+    /// Server master key for the per-user credential store (phase 4). 32 raw
+    /// bytes, generated on first run with mode 0600 on unix. It is **not** the
+    /// age identity: the age store keeps server-level secrets, this key wraps
+    /// each user's DEK. Never logged, never exposed by any API.
+    #[serde(default = "default_master_key_file")]
+    pub master_key_file: String,
 }
 
 impl Default for SecretsConfig {
@@ -436,6 +442,7 @@ impl Default for SecretsConfig {
         Self {
             encrypted_file: default_secrets_file(),
             identity_file: default_identity_file(),
+            master_key_file: default_master_key_file(),
         }
     }
 }
@@ -920,20 +927,38 @@ impl Default for WatcherConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OneDriveConfig {
+    /// Offer OneDrive to every account (phase 4). The admin's existing global
+    /// refresh token keeps working: it is imported into the admin's
+    /// credential row once at startup.
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_graph_base")]
     pub graph_base: String,
+    /// Microsoft tenant for the shared app registration (`common`,
+    /// `consumers`, `organizations`, a tenant id, or a domain).
     #[serde(default = "default_tenant")]
     pub tenant: String,
+    /// Age-store key holding the public app-registration client id. Shared
+    /// with `[auth]` (one Azure app for sign-in and OneDrive consent).
     #[serde(default = "default_graph_client_secret")]
     pub client_id_secret: String,
+    /// Age-store key holding the legacy global refresh token. It is imported
+    /// into the admin's per-user credential on the first startup after the
+    /// upgrade, then only the user store is used.
     #[serde(default = "default_graph_refresh_secret")]
     pub refresh_token_secret: String,
+    /// Destination folder inside **each user's own** drive. The folder name
+    /// is a template applied per drive; `..`, absolute paths, and separator
+    /// tricks are rejected by the client.
     #[serde(default = "default_onedrive_folder")]
     pub folder: String,
     #[serde(default = "default_conflict_behavior")]
     pub conflict_behavior: String,
+    /// Public base URL for the consent redirect. Empty falls back to
+    /// `[auth].base_url`; when both are empty the consent endpoint fails with
+    /// an explicit configuration error (the legacy global flow needs none).
+    #[serde(default)]
+    pub redirect_base_url: String,
 }
 
 impl Default for OneDriveConfig {
@@ -946,6 +971,20 @@ impl Default for OneDriveConfig {
             refresh_token_secret: default_graph_refresh_secret(),
             folder: default_onedrive_folder(),
             conflict_behavior: default_conflict_behavior(),
+            redirect_base_url: String::new(),
+        }
+    }
+}
+
+impl OneDriveConfig {
+    /// The public base URL consent redirects land on: the explicit OneDrive
+    /// override first, then the auth base URL (one app registration).
+    pub fn effective_redirect_base<'a>(&'a self, auth: &'a AuthConfig) -> &'a str {
+        let own = self.redirect_base_url.trim();
+        if own.is_empty() {
+            auth.base_url.trim()
+        } else {
+            own
         }
     }
 }
@@ -1710,6 +1749,9 @@ fn default_secrets_file() -> String {
 fn default_identity_file() -> String {
     "private/age-identity.txt".into()
 }
+fn default_master_key_file() -> String {
+    "private/master.key".into()
+}
 fn default_llm_base_url() -> String {
     "https://api.mistral.ai/v1".into()
 }
@@ -2309,5 +2351,19 @@ tasks_per_user_per_day = 500
         assert_eq!(config.auth.base_url, "https://bot.example.example");
         assert_eq!(config.users.tasks_per_user_per_day, 500);
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn the_repository_example_config_parses() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("workspace root")
+            .to_path_buf();
+        let raw = std::fs::read_to_string(root.join("serabot.toml")).unwrap();
+        let config: Config = toml::from_str(&raw).unwrap();
+        assert_eq!(config.secrets.master_key_file, "private/master.key");
+        assert_eq!(config.onedrive.folder, "SeraBot");
+        assert!(config.onedrive.redirect_base_url.is_empty());
     }
 }

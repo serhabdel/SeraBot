@@ -48,6 +48,7 @@ pub mod teams;
 pub mod telegram;
 pub mod token_cli;
 pub mod tools;
+pub mod user_secrets;
 pub mod util;
 pub mod watcher;
 pub mod web;

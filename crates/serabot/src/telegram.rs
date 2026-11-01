@@ -16,8 +16,8 @@ use crate::gateway::Decision;
 use crate::maker::ArtifactStore;
 use crate::memory;
 use crate::runtime::{ApprovalNotice, Notifier, Runtime};
-use crate::store::Store;
-use crate::util::truncate_chars;
+use crate::store::{Store, UserStatus};
+use crate::util::{sha256_hex, truncate_chars};
 
 const MAX_MESSAGE_CHARS: usize = 3900;
 
@@ -64,6 +64,10 @@ pub struct TelegramClient {
     token: SecretString,
     owner_user_id: i64,
     owner_chat_id: i64,
+    /// Binding lookup for per-user routing (phase 4). `None` in unit tests
+    /// that only exercise the HTTP shape; production always sets it, and
+    /// notification routing fails closed without it.
+    store: Option<Store>,
 }
 
 impl std::fmt::Debug for TelegramClient {
@@ -71,6 +75,7 @@ impl std::fmt::Debug for TelegramClient {
         f.debug_struct("TelegramClient")
             .field("owner_user_id", &self.owner_user_id)
             .field("owner_chat_id", &self.owner_chat_id)
+            .field("per_user_routing", &self.store.is_some())
             .finish()
     }
 }
@@ -103,6 +108,7 @@ impl TelegramClient {
             token: SecretString::new(token),
             owner_user_id,
             owner_chat_id,
+            store: None,
         })
     }
 
@@ -111,8 +117,31 @@ impl TelegramClient {
         self
     }
 
-    pub fn owner_chat_id(&self) -> i64 {
-        self.owner_chat_id
+    /// Attach the store used to resolve per-user bindings. Production always
+    /// sets it; without it, notification routing fails closed.
+    pub fn with_store(mut self, store: Store) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// The chat id of the acting user's active binding. Fails closed when the
+    /// user has not linked Telegram (never falls back to the owner chat).
+    pub fn chat_for(&self, user_id: &str) -> Result<i64> {
+        self.notification_chat(user_id)?.ok_or_else(|| {
+            SeraError::InvalidState("this account has no linked Telegram chat".into())
+        })
+    }
+
+    /// The acting user's chat for a *notification*: `None` when the account
+    /// has no linked chat (other notifiers still deliver), an error when the
+    /// client itself is misconfigured.
+    fn notification_chat(&self, user_id: &str) -> Result<Option<i64>> {
+        let store = self.store.as_ref().ok_or_else(|| {
+            SeraError::InvalidState(
+                "Telegram per-user routing is not configured on this client".into(),
+            )
+        })?;
+        store.telegram_chat_for(user_id)
     }
 
     fn url(&self, method: &str) -> String {
@@ -122,10 +151,6 @@ impl TelegramClient {
             self.token.expose_secret(),
             method
         )
-    }
-
-    fn is_owner(&self, from_id: i64, chat_id: i64) -> bool {
-        from_id == self.owner_user_id && chat_id == self.owner_chat_id
     }
 
     pub async fn get_updates(&self, offset: i64, timeout_secs: u64) -> Result<Vec<Update>> {
@@ -210,7 +235,7 @@ impl TelegramClient {
         Ok(())
     }
 
-    pub async fn send_approval(&self, notice: &ApprovalNotice) -> Result<()> {
+    pub async fn send_approval(&self, chat_id: i64, notice: &ApprovalNotice) -> Result<()> {
         let action = &notice.action;
         let approval = &notice.approval;
         let mut text = String::new();
@@ -246,7 +271,7 @@ impl TelegramClient {
             .http
             .post(self.url("sendMessage"))
             .json(&json!({
-                "chat_id": self.owner_chat_id,
+                "chat_id": chat_id,
                 "text": text,
                 "reply_markup": keyboard,
                 "disable_web_page_preview": true,
@@ -400,16 +425,11 @@ impl TelegramClient {
             .flatten()
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
-        // Single-operator behaviour (phase 2): messages from the configured
-        // owner pair act as the admin user, resolved from the database â€” never
-        // a hardcoded id. Per-user linking arrives in phase 4.
-        let admin = match store.admin_user_id() {
-            Ok(admin) => admin,
-            Err(error) => {
-                error!(%error, "cannot resolve the admin user; Telegram polling not started");
-                return;
-            }
-        };
+        // The configured owner pair becomes the admin's binding once. Every
+        // other chat must link itself with a code from the console.
+        if let Err(error) = self.bootstrap_admin_binding(&store) {
+            error!(%error, "cannot establish the admin Telegram binding");
+        }
         info!("Telegram polling started");
         if let Err(error) = self.register_commands().await {
             warn!(%error, "Telegram command menu registration failed");
@@ -431,17 +451,20 @@ impl TelegramClient {
                                 error!(%error, "failed to persist Telegram offset");
                             }
                         }
+                        let chat_id = update_chat_id(&update);
                         if let Err(error) = self
-                            .handle_update(&runtime, &store, &admin, artifacts.as_deref(), update)
+                            .handle_update(&runtime, &store, artifacts.as_deref(), update)
                             .await
                         {
                             warn!(%error, "Telegram update failed");
-                            let _ = self
-                                .send_message(
-                                    self.owner_chat_id,
-                                    "This request could not be processed. See the audit log.",
-                                )
-                                .await;
+                            if let Some(chat_id) = chat_id {
+                                let _ = self
+                                    .send_message(
+                                        chat_id,
+                                        "This request could not be processed. See the audit log.",
+                                    )
+                                    .await;
+                            }
                         }
                     }
                 }
@@ -454,13 +477,92 @@ impl TelegramClient {
         info!("Telegram polling stopped");
     }
 
+    /// Bind the configured owner pair to the admin account, once.
+    ///
+    /// Idempotent: nothing happens when the pair is already bound or the
+    /// admin already has a (possibly different) binding. The operator's
+    /// existing chat keeps working without re-linking.
+    pub fn bootstrap_admin_binding(&self, store: &Store) -> Result<()> {
+        let admin = store.admin_user_id()?;
+        if store
+            .telegram_binding(self.owner_user_id, self.owner_chat_id)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if store.telegram_binding_for_user(&admin)?.is_some() {
+            return Ok(());
+        }
+        store.link_telegram(&admin, self.owner_user_id, self.owner_chat_id)?;
+        store.record_audit(
+            &admin,
+            "telegram.bootstrap_linked",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&json!({"source": "configured_owner_pair"})),
+        )?;
+        Ok(())
+    }
+
+    /// Consume a linking code and bind this chat to its user.
+    async fn link_chat(
+        &self,
+        store: &Store,
+        telegram_user_id: i64,
+        chat_id: i64,
+        code: &str,
+    ) -> Result<()> {
+        let valid = code.len() == 64 && code.bytes().all(|byte| byte.is_ascii_hexdigit());
+        let user_id = if valid {
+            store.take_telegram_link_code(&sha256_hex(code.to_ascii_lowercase()))?
+        } else {
+            None
+        };
+        let Some(user_id) = user_id else {
+            self.send_message(chat_id, "That linking code is invalid or expired.")
+                .await?;
+            return Ok(());
+        };
+        match store.link_telegram(&user_id, telegram_user_id, chat_id) {
+            Ok(_) => {
+                store.record_audit(
+                    &user_id,
+                    "telegram.linked",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&json!({})),
+                )?;
+                self.send_message(
+                    chat_id,
+                    "Telegram linked. Messages from this chat now act as your SeraBot account.",
+                )
+                .await?;
+            }
+            Err(error) => {
+                warn!(%error, "Telegram linking failed");
+                self.send_message(
+                    chat_id,
+                    "This chat could not be linked. Ask the admin for help.",
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Handle an owner voice/audio message: save the original in the inbox,
     /// transcribe it, and report the outcome with one owner-facing line.
     async fn handle_owner_audio(
         &self,
         runtime: &Runtime,
         store: &Store,
-        admin: &str,
+        user_id: &str,
         message: &TelegramMessage,
     ) -> Result<OwnerAudioOutcome> {
         let config = runtime.config();
@@ -503,7 +605,7 @@ impl TelegramClient {
         match save_telegram_audio_bytes(config, message.message_id, &extension, &bytes, max_bytes) {
             Ok(report) => {
                 store.record_audit(
-                    admin,
+                    user_id,
                     "audio.telegram_intake",
                     Some(&report.relative_path),
                     None,
@@ -536,11 +638,34 @@ impl TelegramClient {
         }
     }
 
+    /// Resolve the acting user for a Telegram (user, chat) pair.
+    ///
+    /// An unbound pair, a revoked binding, an unknown account, and a disabled
+    /// account all yield `None` — the message is ignored exactly like a
+    /// non-owner chat in the single-operator build.
+    fn bound_user(
+        &self,
+        store: &Store,
+        telegram_user_id: i64,
+        chat_id: i64,
+    ) -> Result<Option<String>> {
+        let Some(binding) = store.telegram_binding(telegram_user_id, chat_id)? else {
+            return Ok(None);
+        };
+        match store.get_user(&binding.user_id)? {
+            Some(user) if user.status == UserStatus::Active => Ok(Some(user.id)),
+            Some(_) => {
+                warn!("ignored Telegram message from a disabled account");
+                Ok(None)
+            }
+            None => Ok(None),
+        }
+    }
+
     async fn handle_update(
         &self,
         runtime: &Runtime,
         store: &Store,
-        admin: &str,
         artifacts: Option<&ArtifactStore>,
         update: Update,
     ) -> Result<()> {
@@ -551,232 +676,41 @@ impl TelegramClient {
             let Some(from) = &message.from else {
                 return Ok(());
             };
-            if !self.is_owner(from.id, message.chat.id) {
-                warn!("ignored Telegram message from non-owner");
+            let chat_id = message.chat.id;
+            let Some(user_id) = self.bound_user(store, from.id, chat_id)? else {
+                // Only the linking command is processed from an unbound chat.
+                // Everything else is ignored without a reply, as before.
+                if let Some(code) = start_code(message.text.as_deref()) {
+                    self.link_chat(store, from.id, chat_id, code).await?;
+                } else {
+                    warn!("ignored Telegram message from an unbound chat");
+                }
                 return Ok(());
-            }
-            match self
-                .handle_owner_audio(runtime, store, admin, &message)
-                .await?
-            {
-                OwnerAudioOutcome::NotAudio => {}
-                OwnerAudioOutcome::Unavailable => {
-                    self.send_message(self.owner_chat_id, AUDIO_UNAVAILABLE_MESSAGE)
-                        .await?;
-                    return Ok(());
-                }
-                OwnerAudioOutcome::Failed(line) => {
-                    self.send_message(self.owner_chat_id, line).await?;
-                    return Ok(());
-                }
-                OwnerAudioOutcome::Transcribed { transcript, .. } => {
-                    // The transcript is the owner's message in this chat, so the
-                    // normal turn pipeline answers it like any typed message. No
-                    // status line is sent for a successful transcription.
-                    runtime.submit_text(admin, &message.chat.id.to_string(), &transcript, None)?;
-                    return Ok(());
-                }
-            }
-            let text = message.text.unwrap_or_default();
-            let text = text.trim();
-            if text.is_empty() {
-                let _ = self
-                    .send_message(
-                        self.owner_chat_id,
-                        "Send a text message, or a voice note — voice notes are transcribed \
-                         automatically when audio is enabled in Settings.",
-                    )
-                    .await;
-                return Ok(());
-            }
-            if is_model_command(text) {
-                runtime.refresh_model_catalogs(admin).await?;
-            }
-            if let Some(reply) = model_command(runtime, admin, &message.chat.id.to_string(), text)?
-            {
-                self.send_message(self.owner_chat_id, &reply).await?;
-                return Ok(());
-            }
-            match text {
-                "/start" => {
-                    self.send_message(
-                        self.owner_chat_id,
-                        "SeraBot ready. Use /ask <question>, /status, /approvals, or /revoke.\n\
-                         All external actions require explicit approval.",
-                    )
-                    .await?;
-                }
-                "/status" => {
-                    let pending = store.pending_task_count(admin)?;
-                    let approvals = store.list_pending_approvals(admin, 20)?;
-                    let mut reply = format!(
-                        "Pending tasks: {pending}\nPending approvals: {}\n",
-                        approvals.len()
-                    );
-                    for approval in approvals {
-                        reply.push_str(&format!(
-                            "- {} [{}] expires {}\n",
-                            approval.summary,
-                            approval.id,
-                            approval.expires_at.format("%Y-%m-%d %H:%M UTC")
-                        ));
-                    }
-                    self.send_message(self.owner_chat_id, &reply).await?;
-                }
-                "/approvals" => {
-                    let approvals = store.list_pending_approvals(admin, 20)?;
-                    if approvals.is_empty() {
-                        self.send_message(self.owner_chat_id, "No pending approvals.")
-                            .await?;
-                    } else {
-                        for approval in approvals {
-                            let action = store.get_action(admin, &approval.action_id)?;
-                            let notice = ApprovalNotice { approval, action };
-                            self.send_approval(&notice).await?;
-                        }
-                    }
-                }
-                "/revoke" => {
-                    let count = store.revoke_grants(admin)?;
-                    store.record_audit(
-                        admin,
-                        "approval.grants_revoked",
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some(&json!({"count": count})),
-                    )?;
-                    self.send_message(
-                        self.owner_chat_id,
-                        &format!("Revoked {count} standing grant(s)."),
-                    )
-                    .await?;
-                }
-                "/help" => {
-                    self.send_message(
-                        self.owner_chat_id,
-                        "/ask <question> — cited document Q&A\n\
-                         /deck <brief> — Italian deck draft\n\
-                         /xlsx <request> — spreadsheet analysis\n\
-                         /timesheets <request> — timesheet analysis\n\
-                         /brief — morning brief\n\
-                         /status — queue and approvals\n\
-                         /models — configured providers and models\n\
-                         /providers — same allowlist grouped by provider\n\
-                         /model auto — automatic approved model per bot\n\
-                         /model <provider> <model> — select for this conversation\n\
-                         /brief and /watch — on-demand brief or watch (also see [schedule])\n\
-                         /approvals — resend pending approvals\n\
-                         /approve_deck <sha256> — approve Italian deck content for French\n\
-                         /revoke — revoke all standing grants\n\
-                         Voice notes are transcribed automatically when audio is enabled in Settings",
-                    )
-                    .await?;
-                }
-                _ if text.starts_with("/approve-deck") || text.starts_with("/approve_deck") => {
-                    let hash = text
-                        .trim_start_matches("/approve-deck")
-                        .trim_start_matches("/approve_deck")
-                        .trim();
-                    let Some(artifacts) = artifacts else {
-                        self.send_message(self.owner_chat_id, "Artifact store is unavailable.")
-                            .await?;
-                        return Ok(());
-                    };
-                    artifacts.approve(store, admin, hash)?;
-                    self.send_message(
-                        self.owner_chat_id,
-                        "Italian deck approved for French generation.",
-                    )
-                    .await?;
-                }
-                _ if text.starts_with("/remember") => {
-                    let content = text.trim_start_matches("/remember").trim();
-                    if content.is_empty() {
-                        self.send_message(self.owner_chat_id, "usage: /remember <fact>")
-                            .await?;
-                        return Ok(());
-                    }
-                    let memory = memory::add(store, admin, "fact", content, "owner")?;
-                    store.record_audit(
-                        admin,
-                        "memory.added",
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some(&json!({"memory_id": memory.id})),
-                    )?;
-                    self.send_message(self.owner_chat_id, &format!("Remembered as {}.", memory.id))
-                        .await?;
-                }
-                "/memories" => {
-                    let memories = memory::list(store, admin, 20)?;
-                    if memories.is_empty() {
-                        self.send_message(self.owner_chat_id, "No stored facts.")
-                            .await?;
-                    } else {
-                        let mut reply = String::from("Stored facts:\n");
-                        for memory in memories {
-                            reply.push_str(&format!(
-                                "- [{}] {}\n",
-                                memory.id,
-                                memory.content.chars().take(300).collect::<String>()
-                            ));
-                        }
-                        self.send_message(self.owner_chat_id, &reply).await?;
-                    }
-                }
-                _ if text.starts_with("/forget") => {
-                    let id = text.trim_start_matches("/forget").trim();
-                    let deleted = memory::delete(store, admin, id)?;
-                    store.record_audit(
-                        admin,
-                        "memory.deleted",
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some(&json!({"memory_id": id, "deleted": deleted})),
-                    )?;
-                    self.send_message(
-                        self.owner_chat_id,
-                        if deleted {
-                            "Fact deleted."
-                        } else {
-                            "No such fact."
-                        },
-                    )
-                    .await?;
-                }
-                _ => {
-                    runtime.submit_text(admin, &message.chat.id.to_string(), text, None)?;
-                }
-            }
-            return Ok(());
+            };
+            return self
+                .handle_bound_message(runtime, store, &user_id, chat_id, artifacts, message)
+                .await;
         }
 
         if let Some(callback) = update.callback_query {
-            if callback.from.id != self.owner_user_id {
+            let Some(message) = &callback.message else {
                 let _ = self.answer_callback(&callback.id, "Not authorized.").await;
                 return Ok(());
-            }
-            if let Some(message) = &callback.message
-                && message.chat.id != self.owner_chat_id
-            {
+            };
+            let chat_id = message.chat.id;
+            let Some(user_id) = self.bound_user(store, callback.from.id, chat_id)? else {
                 let _ = self.answer_callback(&callback.id, "Not authorized.").await;
                 return Ok(());
-            }
+            };
             let data = callback.data.unwrap_or_default();
             let Some((decision, approval_id)) = parse_callback(&data) else {
                 let _ = self.answer_callback(&callback.id, "Invalid action.").await;
                 return Ok(());
             };
-            match runtime.handle_approval(admin, approval_id, decision).await {
+            match runtime
+                .handle_approval(&user_id, approval_id, decision)
+                .await
+            {
                 Ok(result) => {
                     let label = match result.approval.state.as_str() {
                         "denied" => "Denied",
@@ -794,21 +728,264 @@ impl TelegramClient {
         }
         Ok(())
     }
+
+    /// Handle one message from a bound chat as its user.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_bound_message(
+        &self,
+        runtime: &Runtime,
+        store: &Store,
+        user_id: &str,
+        chat_id: i64,
+        artifacts: Option<&ArtifactStore>,
+        message: TelegramMessage,
+    ) -> Result<()> {
+        match self
+            .handle_owner_audio(runtime, store, user_id, &message)
+            .await?
+        {
+            OwnerAudioOutcome::NotAudio => {}
+            OwnerAudioOutcome::Unavailable => {
+                self.send_message(chat_id, AUDIO_UNAVAILABLE_MESSAGE)
+                    .await?;
+                return Ok(());
+            }
+            OwnerAudioOutcome::Failed(line) => {
+                self.send_message(chat_id, line).await?;
+                return Ok(());
+            }
+            OwnerAudioOutcome::Transcribed { transcript, .. } => {
+                // The transcript is the user's message in this chat, so the
+                // normal turn pipeline answers it like any typed message. No
+                // status line is sent for a successful transcription.
+                runtime.submit_text(user_id, &chat_id.to_string(), &transcript, None)?;
+                return Ok(());
+            }
+        }
+        let text = message.text.unwrap_or_default();
+        let text = text.trim();
+        if text.is_empty() {
+            let _ = self
+                .send_message(
+                    chat_id,
+                    "Send a text message, or a voice note — voice notes are transcribed \
+                     automatically when audio is enabled in Settings.",
+                )
+                .await;
+            return Ok(());
+        }
+        if is_model_command(text) {
+            runtime.refresh_model_catalogs(user_id).await?;
+        }
+        if let Some(reply) = model_command(runtime, user_id, &chat_id.to_string(), text)? {
+            self.send_message(chat_id, &reply).await?;
+            return Ok(());
+        }
+        match text {
+            "/start" => {
+                self.send_message(
+                    chat_id,
+                    "SeraBot ready. Use /ask <question>, /status, /approvals, or /revoke.\n\
+                     All external actions require explicit approval.",
+                )
+                .await?;
+            }
+            "/status" => {
+                let pending = store.pending_task_count(user_id)?;
+                let approvals = store.list_pending_approvals(user_id, 20)?;
+                let mut reply = format!(
+                    "Pending tasks: {pending}\nPending approvals: {}\n",
+                    approvals.len()
+                );
+                for approval in approvals {
+                    reply.push_str(&format!(
+                        "- {} [{}] expires {}\n",
+                        approval.summary,
+                        approval.id,
+                        approval.expires_at.format("%Y-%m-%d %H:%M UTC")
+                    ));
+                }
+                self.send_message(chat_id, &reply).await?;
+            }
+            "/approvals" => {
+                let approvals = store.list_pending_approvals(user_id, 20)?;
+                if approvals.is_empty() {
+                    self.send_message(chat_id, "No pending approvals.").await?;
+                } else {
+                    for approval in approvals {
+                        let action = store.get_action(user_id, &approval.action_id)?;
+                        let notice = ApprovalNotice { approval, action };
+                        self.send_approval(chat_id, &notice).await?;
+                    }
+                }
+            }
+            "/revoke" => {
+                let count = store.revoke_grants(user_id)?;
+                store.record_audit(
+                    user_id,
+                    "approval.grants_revoked",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&json!({"count": count})),
+                )?;
+                self.send_message(chat_id, &format!("Revoked {count} standing grant(s)."))
+                    .await?;
+            }
+            "/help" => {
+                self.send_message(
+                    chat_id,
+                    "/ask <question> — cited document Q&A\n\
+                     /deck <brief> — Italian deck draft\n\
+                     /xlsx <request> — spreadsheet analysis\n\
+                     /timesheets <request> — timesheet analysis\n\
+                     /brief — morning brief\n\
+                     /status — queue and approvals\n\
+                     /models — configured providers and models\n\
+                     /providers — same allowlist grouped by provider\n\
+                     /model auto — automatic approved model per bot\n\
+                     /model <provider> <model> — select for this conversation\n\
+                     /brief and /watch — on-demand brief or watch (also see [schedule])\n\
+                     /approvals — resend pending approvals\n\
+                     /approve_deck <sha256> — approve Italian deck content for French\n\
+                     /revoke — revoke all standing grants\n\
+                     Voice notes are transcribed automatically when audio is enabled in Settings",
+                )
+                .await?;
+            }
+            _ if text.starts_with("/approve-deck") || text.starts_with("/approve_deck") => {
+                let hash = text
+                    .trim_start_matches("/approve-deck")
+                    .trim_start_matches("/approve_deck")
+                    .trim();
+                let Some(artifacts) = artifacts else {
+                    self.send_message(chat_id, "Artifact store is unavailable.")
+                        .await?;
+                    return Ok(());
+                };
+                artifacts.approve(store, user_id, hash)?;
+                self.send_message(chat_id, "Italian deck approved for French generation.")
+                    .await?;
+            }
+            _ if text.starts_with("/remember") => {
+                let content = text.trim_start_matches("/remember").trim();
+                if content.is_empty() {
+                    self.send_message(chat_id, "usage: /remember <fact>")
+                        .await?;
+                    return Ok(());
+                }
+                let memory = memory::add(store, user_id, "fact", content, "owner")?;
+                store.record_audit(
+                    user_id,
+                    "memory.added",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&json!({"memory_id": memory.id})),
+                )?;
+                self.send_message(chat_id, &format!("Remembered as {}.", memory.id))
+                    .await?;
+            }
+            "/memories" => {
+                let memories = memory::list(store, user_id, 20)?;
+                if memories.is_empty() {
+                    self.send_message(chat_id, "No stored facts.").await?;
+                } else {
+                    let mut reply = String::from("Stored facts:\n");
+                    for memory in memories {
+                        reply.push_str(&format!(
+                            "- [{}] {}\n",
+                            memory.id,
+                            memory.content.chars().take(300).collect::<String>()
+                        ));
+                    }
+                    self.send_message(chat_id, &reply).await?;
+                }
+            }
+            _ if text.starts_with("/forget") => {
+                let id = text.trim_start_matches("/forget").trim();
+                let deleted = memory::delete(store, user_id, id)?;
+                store.record_audit(
+                    user_id,
+                    "memory.deleted",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&json!({"memory_id": id, "deleted": deleted})),
+                )?;
+                self.send_message(
+                    chat_id,
+                    if deleted {
+                        "Fact deleted."
+                    } else {
+                        "No such fact."
+                    },
+                )
+                .await?;
+            }
+            _ => {
+                runtime.submit_text(user_id, &chat_id.to_string(), text, None)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The chat a Telegram update came from, for the best-effort error reply.
+fn update_chat_id(update: &Update) -> Option<i64> {
+    if let Some(message) = &update.message {
+        return Some(message.chat.id);
+    }
+    update
+        .callback_query
+        .as_ref()
+        .and_then(|callback| callback.message.as_ref())
+        .map(|message| message.chat.id)
+}
+
+/// Parse `/start <code>` (also `/start@BotName <code>`). Anything else,
+/// including a bare `/start`, is not a linking attempt.
+fn start_code(text: Option<&str>) -> Option<&str> {
+    let text = text?.trim();
+    let mut parts = text.split_whitespace();
+    let command = parts.next()?;
+    if command.split('@').next()? != "/start" {
+        return None;
+    }
+    let code = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(code)
 }
 
 #[async_trait]
 impl Notifier for TelegramClient {
-    async fn send_text(&self, _user_id: &str, _conversation_id: &str, text: &str) -> Result<()> {
-        self.send_message(self.owner_chat_id, text).await
+    async fn send_text(&self, user_id: &str, _conversation_id: &str, text: &str) -> Result<()> {
+        match self.notification_chat(user_id)? {
+            Some(chat_id) => self.send_message(chat_id, text).await,
+            // The account has no linked chat: other notifiers carry the
+            // message, and nothing is ever sent to another user's chat.
+            None => Ok(()),
+        }
     }
 
     async fn approval_requested(
         &self,
-        _user_id: &str,
+        user_id: &str,
         _conversation_id: &str,
         notice: &ApprovalNotice,
     ) -> Result<()> {
-        self.send_approval(notice).await
+        match self.notification_chat(user_id)? {
+            Some(chat_id) => self.send_approval(chat_id, notice).await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -912,9 +1089,9 @@ fn provider_state(provider: &crate::model_router::ProviderView) -> String {
     "approved, catalog verified".into()
 }
 
-fn provider_catalog_reply(runtime: &Runtime) -> Result<String> {
+fn provider_catalog_reply(runtime: &Runtime, user_id: &str) -> Result<String> {
     let mut reply = String::from("Configured providers:\n");
-    for provider in runtime.model_catalog()? {
+    for provider in runtime.model_catalog(user_id)? {
         let state = provider_state(&provider);
         reply.push_str(&format!("\n{} ({state})\n", provider.id));
         for model in &provider.models {
@@ -939,10 +1116,10 @@ fn model_command(
 ) -> Result<Option<String>> {
     let parts: Vec<_> = text.split_whitespace().collect();
     let reply = match parts.as_slice() {
-        ["/providers"] | ["/providors"] => provider_catalog_reply(runtime)?,
+        ["/providers"] | ["/providors"] => provider_catalog_reply(runtime, user_id)?,
         ["/models"] => {
             let mut reply = String::from("Configured providers and models:\n");
-            for entry in runtime.model_catalog_entries()? {
+            for entry in runtime.model_catalog_entries(user_id)? {
                 let state = if entry.data_egress_approved {
                     "approved"
                 } else {
@@ -950,7 +1127,7 @@ fn model_command(
                 };
                 reply.push_str(&format!("{} / {} ({state})\n", entry.provider, entry.model));
             }
-            for provider in runtime.model_catalog()? {
+            for provider in runtime.model_catalog(user_id)? {
                 if provider.catalog_fetch && !provider.catalog_verified {
                     reply.push_str(&format!(
                         "{id}: catalog unavailable, so no models are advertised until refresh succeeds.\n",
@@ -1743,8 +1920,9 @@ mod tests {
             "update_id": 991,
             "message": {"message_id": 1, "chat": {"id":20}, "from":{"id":99}, "text":"/model default alternative"}
         })).unwrap();
+        // (99, 20) is unbound: the message is ignored, never routed as the admin.
         client
-            .handle_update(&runtime, &store, &admin, None, update)
+            .handle_update(&runtime, &store, None, update)
             .await
             .unwrap();
         assert_eq!(
@@ -1768,11 +1946,152 @@ mod tests {
     }
 
     #[test]
-    fn only_exact_owner_identity_is_accepted() {
+    fn the_configured_owner_pair_bootstraps_the_admin_binding() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
         let client = TelegramClient::new("123:abc_DEF", 10, 20).unwrap();
-        assert!(client.is_owner(10, 20));
-        assert!(!client.is_owner(11, 20));
-        assert!(!client.is_owner(10, 21));
+        client.bootstrap_admin_binding(&store).unwrap();
+        let binding = store.telegram_binding(10, 20).unwrap().unwrap();
+        assert_eq!(binding.user_id, admin);
+        assert!(client.bound_user(&store, 10, 20).unwrap().is_some());
+        assert!(client.bound_user(&store, 11, 20).unwrap().is_none());
+        assert!(client.bound_user(&store, 10, 21).unwrap().is_none());
+        // Idempotent: a second call keeps the same binding and adds no row.
+        client.bootstrap_admin_binding(&store).unwrap();
+        assert_eq!(
+            store.telegram_binding(10, 20).unwrap().unwrap().user_id,
+            admin
+        );
+    }
+
+    #[test]
+    fn parses_start_codes_only_for_the_linking_command() {
+        assert_eq!(start_code(Some("/start abc")), Some("abc"));
+        assert_eq!(start_code(Some("/start@SeraBot abc")), Some("abc"));
+        assert_eq!(start_code(Some("/start")), None);
+        assert_eq!(start_code(Some("/start a b")), None);
+        assert_eq!(start_code(Some("/status abc")), None);
+        assert_eq!(start_code(None), None);
+    }
+
+    #[tokio::test]
+    async fn a_linking_code_binds_a_member_and_unlink_stops_routing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:abc/sendMessage"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": {}})),
+            )
+            .mount(&server)
+            .await;
+        let (runtime, store) = model_runtime();
+        let member = store
+            .create_user("microsoft:tg-member", "tg@example.example", "TG Member")
+            .unwrap()
+            .id;
+        let client = TelegramClient::new("123:abc", 10, 20)
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_store(store.clone());
+
+        let message = |update_id: i64, text: &str| -> Update {
+            serde_json::from_value(json!({
+                "update_id": update_id,
+                "message": {
+                    "message_id": 1,
+                    "chat": {"id": 30, "type": "private"},
+                    "from": {"id": 40},
+                    "text": text,
+                }
+            }))
+            .unwrap()
+        };
+
+        // Unbound chat: a normal message is ignored, exactly as before.
+        client
+            .handle_update(&runtime, &store, None, message(1001, "hello"))
+            .await
+            .unwrap();
+        assert_eq!(store.pending_task_count(&member).unwrap(), 0);
+
+        // A console-issued code links the chat to the member.
+        let code = "ab".repeat(32);
+        store
+            .put_telegram_link_code(
+                &sha256_hex(&code),
+                &member,
+                chrono::Utc::now() + chrono::Duration::minutes(5),
+            )
+            .unwrap();
+        client
+            .handle_update(
+                &runtime,
+                &store,
+                None,
+                message(1002, &format!("/start {code}")),
+            )
+            .await
+            .unwrap();
+        let binding = store.telegram_binding(40, 30).unwrap().unwrap();
+        assert_eq!(binding.user_id, member);
+        // The code is single use.
+        assert!(
+            store
+                .take_telegram_link_code(&sha256_hex(&code))
+                .unwrap()
+                .is_none()
+        );
+
+        // A bound message queues a turn under the member, not the admin.
+        client
+            .handle_update(&runtime, &store, None, message(1003, "hello"))
+            .await
+            .unwrap();
+        assert_eq!(store.pending_task_count(&member).unwrap(), 1);
+        let admin = store.admin_user_id().unwrap();
+        assert_eq!(store.pending_task_count(&admin).unwrap(), 0);
+
+        // Unbinding stops routing immediately.
+        assert!(store.unlink_telegram(&member).unwrap());
+        client
+            .handle_update(&runtime, &store, None, message(1004, "hello"))
+            .await
+            .unwrap();
+        assert_eq!(store.pending_task_count(&member).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_account_stops_receiving_chat_turns() {
+        let (runtime, store) = model_runtime();
+        let member = store
+            .create_user(
+                "microsoft:tg-disabled",
+                "tg2@example.example",
+                "TG Disabled",
+            )
+            .unwrap()
+            .id;
+        store.link_telegram(&member, 40, 30).unwrap();
+        let client = TelegramClient::new("123:abc", 10, 20).unwrap();
+        store
+            .set_user_status(&member, crate::store::UserStatus::Disabled)
+            .unwrap();
+        let update: Update = serde_json::from_value(json!({
+            "update_id": 2001,
+            "message": {
+                "message_id": 1,
+                "chat": {"id": 30, "type": "private"},
+                "from": {"id": 40},
+                "text": "hello",
+            }
+        }))
+        .unwrap();
+        assert!(client.bound_user(&store, 40, 30).unwrap().is_none());
+        client
+            .handle_update(&runtime, &store, None, update)
+            .await
+            .unwrap();
+        assert_eq!(store.pending_task_count(&member).unwrap(), 0);
     }
 
     #[test]
@@ -1897,6 +2216,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_unauthorized_updates() {
+        let store = Store::open_in_memory(384).unwrap();
         let client = TelegramClient::new("123:abc", 10, 20).unwrap();
         let update: Update = serde_json::from_value(json!({
             "update_id": 1,
@@ -1908,10 +2228,16 @@ mod tests {
             }
         }))
         .unwrap();
-        assert!(!client.is_owner(
-            update.message.as_ref().unwrap().from.as_ref().unwrap().id,
-            update.message.as_ref().unwrap().chat.id
-        ));
+        assert!(
+            client
+                .bound_user(
+                    &store,
+                    update.message.as_ref().unwrap().from.as_ref().unwrap().id,
+                    update.message.as_ref().unwrap().chat.id
+                )
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2060,12 +2386,12 @@ mod tests {
     async fn voice_note_without_audio_gets_one_friendly_line() {
         let telegram = telegram_voice_server().await;
         let (runtime, store) = runtime_with_config(default_test_config());
-        let admin = store.admin_user_id().unwrap();
         let client = TelegramClient::new("123:abc", 10, 20)
             .unwrap()
             .with_base_url(telegram.uri());
+        client.bootstrap_admin_binding(&store).unwrap();
         client
-            .handle_update(&runtime, &store, &admin, None, voice_update(501, 7))
+            .handle_update(&runtime, &store, None, voice_update(501, 7))
             .await
             .unwrap();
         let messages = sent_messages(&telegram).await;
@@ -2097,8 +2423,9 @@ mod tests {
         let client = TelegramClient::new("123:abc", 10, 20)
             .unwrap()
             .with_base_url(telegram.uri());
+        client.bootstrap_admin_binding(&store).unwrap();
         client
-            .handle_update(&runtime, &store, &admin, None, voice_update(502, 8))
+            .handle_update(&runtime, &store, None, voice_update(502, 8))
             .await
             .unwrap();
         assert_eq!(provider.received_requests().await.unwrap().len(), 1);
@@ -2124,12 +2451,12 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let config = audio_test_config(&dir, &provider.uri(), Some(AUDIO_TEST_KEY));
         let (runtime, store) = runtime_with_config(config);
-        let admin = store.admin_user_id().unwrap();
         let client = TelegramClient::new("123:abc", 10, 20)
             .unwrap()
             .with_base_url(telegram.uri());
+        client.bootstrap_admin_binding(&store).unwrap();
         client
-            .handle_update(&runtime, &store, &admin, None, voice_update(503, 9))
+            .handle_update(&runtime, &store, None, voice_update(503, 9))
             .await
             .unwrap();
         let messages = sent_messages(&telegram).await;

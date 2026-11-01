@@ -27,6 +27,10 @@ async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"
 calamine = "0.24"
+# AEAD for the per-user credential store (phase 4): ChaCha20-Poly1305 seals
+# each user's provider tokens under a DEK that the master key wraps. Already
+# in the tree transitively (age), so this adds no new crate.
+chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.9"
 clap = { version = "4", features = ["derive", "env"] }
