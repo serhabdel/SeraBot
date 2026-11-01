@@ -295,7 +295,11 @@ pub struct RenameDraft {
 pub struct UpdateUi {
     pub info: Option<updater::UpdateInfo>,
     pub error: Option<String>,
+    /// Result of a manual check that found nothing newer.
+    pub notice: Option<String>,
     pub checking: bool,
+    /// The running check was started by the button, so it reports "up to date".
+    pub manual: bool,
     pub rx: Option<std::sync::mpsc::Receiver<Result<Option<updater::UpdateInfo>, String>>>,
 }
 
@@ -1614,6 +1618,20 @@ impl Session {
         self.start_request(operation);
     }
 
+    /// The "Check for updates" button: unlike the silent launch check, it
+    /// always tells the owner what happened.
+    pub fn check_updates_manual(&mut self) {
+        self.update.notice = None;
+        if updater::configured_repo().is_none() {
+            self.update.error = Some(
+                "This build has no update source. Download the latest release from GitHub.".into(),
+            );
+            return;
+        }
+        self.update.manual = true;
+        self.check_updates();
+    }
+
     pub fn check_updates(&mut self) {
         if self.update.checking || updater::configured_repo().is_none() {
             return;
@@ -1635,6 +1653,7 @@ impl Session {
         {
             self.update.rx = None;
             self.update.checking = false;
+            self.update.manual = false;
             self.update.error = Some("Could not start the update check.".into());
         }
     }
@@ -2374,6 +2393,7 @@ impl Session {
             Some(Ok(Ok(Some(info)))) => {
                 self.update.rx = None;
                 self.update.checking = false;
+                self.update.manual = false;
                 self.update.info = Some(info);
                 self.update.error = None;
             }
@@ -2381,15 +2401,23 @@ impl Session {
                 self.update.rx = None;
                 self.update.checking = false;
                 self.update.info = None;
+                if std::mem::take(&mut self.update.manual) {
+                    self.update.notice = Some(format!(
+                        "You are on the latest version (v{}).",
+                        updater::current_version()
+                    ));
+                }
             }
             Some(Ok(Err(error))) => {
                 self.update.rx = None;
                 self.update.checking = false;
+                self.update.manual = false;
                 self.update.error = Some(error);
             }
             Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
                 self.update.rx = None;
                 self.update.checking = false;
+                self.update.manual = false;
                 self.update.error = Some("The update check stopped.".into());
             }
             Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => {}
