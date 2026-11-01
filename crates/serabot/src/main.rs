@@ -278,6 +278,13 @@ async fn main() -> anyhow::Result<()> {
             )?;
             store.backup_to(&destination)?;
             println!("backup written to {}", destination.display());
+            let artifacts = config.artifacts_dir();
+            if artifacts.is_dir() {
+                let target =
+                    std::path::PathBuf::from(format!("{}.artifacts", destination.display()));
+                let copied = copy_artifacts(&artifacts, &target)?;
+                println!("copied {copied} artifact file(s) to {}", target.display());
+            }
         }
         Command::SelftestEmbedding => {
             let config = Config::load(&cli.config)?;
@@ -354,6 +361,7 @@ fn load(
         anyhow::bail!("an enabled 'main' bot is required");
     }
     SkillCatalog::load(&config)?.validate_bot_skills(&bots)?;
+    serabot::config::validate_bot_tools(&bots, &serabot::tools::known_tool_names())?;
     Ok((config, bots))
 }
 
@@ -372,6 +380,23 @@ fn register_skill_pack(
     let created = create_skill(&config, name, description, body.as_deref(), &policy)?;
     println!("skill pack written to {}", created.file);
     Ok(())
+}
+
+fn copy_artifacts(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> anyhow::Result<usize> {
+    std::fs::create_dir_all(destination)?;
+    let mut copied = 0usize;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        std::fs::copy(entry.path(), destination.join(entry.file_name()))?;
+        copied = copied.saturating_add(1);
+    }
+    Ok(copied)
 }
 
 fn check(config_path: &std::path::Path) -> anyhow::Result<()> {
@@ -477,9 +502,19 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.path(&config.documents.watch_dir),
     )?)?;
     registry.register(TimesheetTool)?;
-    serabot::tools::register_workbook_tools(&mut registry, artifacts.clone(), store.clone())?;
+    serabot::tools::register_workbook_tools(
+        &mut registry,
+        artifacts.clone(),
+        store.clone(),
+        config.path(&config.documents.watch_dir),
+    )?;
     #[cfg(feature = "docx")]
-    serabot::tools::register_docx_tools(&mut registry, artifacts.clone(), store.clone())?;
+    serabot::tools::register_docx_tools(
+        &mut registry,
+        artifacts.clone(),
+        store.clone(),
+        config.path(&config.documents.watch_dir),
+    )?;
     registry.register(DocumentIndexTool::new(
         store.clone(),
         embedder.clone(),
@@ -608,7 +643,11 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             config.telegram.owner_chat_id,
         )?);
         notifiers.push(client.clone());
-        registry.register(TelegramDocumentTool::new(client.clone(), artifacts.clone()))?;
+        registry.register(TelegramDocumentTool::new(
+            client.clone(),
+            artifacts.clone(),
+            policy.clone(),
+        ))?;
         telegram = Some(client);
     }
     if config.firecrawl.enabled {

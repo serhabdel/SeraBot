@@ -1,4 +1,4 @@
-﻿---
+---
 name: Skill creator
 description: Tell the owner how to register an on-demand skill pack
 ---

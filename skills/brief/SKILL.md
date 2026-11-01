@@ -1,4 +1,4 @@
-﻿---
+---
 name: Morning brief
 description: Read the deterministic brief as overdue, due soon, changed, new, then stale sources
 ---

@@ -1237,7 +1237,8 @@ impl Tool for PptxEditTool {
                             }
                         },
                         "additionalProperties": false
-                    }
+                    },
+                    "filename": {"type": "string", "description": "Optional artifact filename ending in .pptx"}
                 },
                 "required": ["artifact", "edit"],
                 "additionalProperties": false
@@ -1247,7 +1248,7 @@ impl Tool for PptxEditTool {
     }
 
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
-        reject_unknown_keys(&args, &["artifact", "edit"])?;
+        reject_unknown_keys(&args, &["artifact", "edit", "filename"])?;
         let hash = argument(&args, "artifact")
             .ok_or_else(|| invalid("artifact is required"))?
             .to_owned();
@@ -1263,7 +1264,18 @@ impl Tool for PptxEditTool {
         }
         check_size(&source.bytes)?;
         let source_artifact = source.hash.clone();
-        let filename = edited_filename(&source.filename);
+        let filename = match argument(&args, "filename") {
+            Some(filename) => {
+                if !filename.to_ascii_lowercase().ends_with(".pptx") {
+                    return Err(invalid("filename must end with .pptx"));
+                }
+                if filename.chars().count() > 120 {
+                    return Err(invalid("filename is longer than 120 characters"));
+                }
+                filename.to_owned()
+            }
+            None => edited_filename(&source.filename),
+        };
         let input = source.bytes;
         let (bytes, summary, info, stripped) = tokio::task::spawn_blocking(move || {
             let mut presentation = open(&input)?;

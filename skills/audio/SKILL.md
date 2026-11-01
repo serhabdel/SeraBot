@@ -1,4 +1,4 @@
-﻿---
+---
 name: Inbox audio
 description: Transcribe or analyze an inbox recording with Mistral audio tools
 ---

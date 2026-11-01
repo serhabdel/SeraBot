@@ -363,9 +363,9 @@ impl TelegramClient {
             .file_name(if safe_name.is_empty() {
                 "artifact.pdf".into()
             } else {
-                safe_name
+                safe_name.clone()
             })
-            .mime_str("application/pdf")
+            .mime_str(crate::util::mime_for_filename(&safe_name))
             .map_err(|error| telegram_http_error("sendDocument mime", error))?;
         let form = reqwest::multipart::Form::new()
             .text("chat_id", chat_id.to_string())
@@ -1028,6 +1028,9 @@ fn bot_commands() -> Vec<Value> {
         ("approvals", "Resend pending approval prompts"),
         ("ask", "Cited document Q&A — /ask <question>"),
         ("deck", "Italian deck draft — /deck <brief>"),
+        ("docx", "Word document — /docx <brief>"),
+        ("pptx", "PowerPoint deck — /pptx <brief>"),
+        ("pdf", "PDF work — /pdf <brief>"),
         ("xlsx", "Spreadsheet analysis — /xlsx <request>"),
         ("timesheets", "Timesheet analysis — /timesheets <request>"),
         ("brief", "Generate the morning brief"),

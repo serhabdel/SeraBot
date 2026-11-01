@@ -22,6 +22,7 @@ const MIGRATION_4: &str = include_str!("../migrations/0004_conversation_meta.sql
 const MIGRATION_5: &str = include_str!("../migrations/0005_conversation_teams.sql");
 const MIGRATION_6: &str = include_str!("../migrations/0006_console_redesign.sql");
 const MIGRATION_7: &str = include_str!("../migrations/0007_conversation_read_rowid.sql");
+const MIGRATION_8: &str = include_str!("../migrations/0008_conversation_artifacts.sql");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceToken {
@@ -219,6 +220,11 @@ impl Store {
         if version < 7 {
             connection.execute_batch(MIGRATION_7)?;
             connection.pragma_update(None, "user_version", 7)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 8 {
+            connection.execute_batch(MIGRATION_8)?;
+            connection.pragma_update(None, "user_version", 8)?;
         }
         let stored_dimension: Option<String> = connection
             .query_row(
@@ -719,9 +725,50 @@ impl Store {
         Ok(messages)
     }
 
+    /// Record an artifact produced by a tool inside a conversation.
+    ///
+    /// The gateway `actions` table only holds tools that asked for approval, so
+    /// a document built by a non-external tool would otherwise never appear in
+    /// the owner's library. This row is written for every tool that returns an
+    /// artifact hash, and the listing below unions both sources.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_conversation_artifact(
+        &self,
+        conversation_id: &str,
+        turn_id: Option<&str>,
+        tool: &str,
+        hash: &str,
+        filename: &str,
+        title: Option<&str>,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO conversation_artifacts
+                 (hash, conversation_id, turn_id, tool, filename, title, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(hash, conversation_id) DO UPDATE SET
+                 turn_id = excluded.turn_id,
+                 tool = excluded.tool,
+                 filename = excluded.filename,
+                 title = excluded.title,
+                 created_at = excluded.created_at",
+            params![
+                hash,
+                conversation_id,
+                turn_id,
+                tool,
+                filename,
+                title,
+                now_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Artifacts produced inside a conversation, newest first. Joins gateway
     /// actions to their turn; the hash may be recorded at approval time or in
-    /// the execution outcome, so both are checked.
+    /// the execution outcome, so both are checked. Artifacts recorded by
+    /// non-approval tools are merged in from `conversation_artifacts`.
     pub fn list_conversation_artifacts(
         &self,
         conversation_id: &str,
@@ -745,7 +792,44 @@ impl Store {
                 hash: row.get(3)?,
             })
         })?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        let mut artifacts = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut statement = connection.prepare(
+            "SELECT hash, tool, created_at
+             FROM conversation_artifacts
+             WHERE conversation_id = ?1
+             ORDER BY created_at DESC
+             LIMIT 100",
+        )?;
+        let rows = statement.query_map(params![conversation_id], |row| {
+            Ok(StoredConversationArtifact {
+                action_id: row.get(0)?,
+                tool: row.get(1)?,
+                created_at: parse_datetime(&row.get::<_, String>(2)?),
+                hash: row.get(0)?,
+            })
+        })?;
+        let recorded = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+
+        // An approval row is the better record when both exist: it carries the
+        // real action id the console uses. Keep it and add the rest.
+        let mut seen = artifacts
+            .iter()
+            .map(|entry| entry.hash.clone())
+            .collect::<std::collections::HashSet<_>>();
+        for entry in recorded {
+            if seen.insert(entry.hash.clone()) {
+                artifacts.push(entry);
+            }
+        }
+        artifacts.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.action_id.cmp(&left.action_id))
+        });
+        artifacts.truncate(100);
+        Ok(artifacts)
     }
 
     pub fn list_visible_messages(
@@ -1048,12 +1132,15 @@ impl Store {
     pub fn count_bot_artifacts(&self, bot: &str) -> Result<i64> {
         let connection = self.connection()?;
         Ok(connection.query_row(
-            "SELECT
-                (SELECT COUNT(DISTINCT a.artifact_hash)
-                   FROM actions a JOIN turns t ON t.id = a.turn_id
-                  WHERE t.bot = ?1 AND a.artifact_hash IS NOT NULL)
-              + (SELECT COUNT(*) FROM audit_log
-                  WHERE event = 'artifact.created' AND actor = ?1)",
+            "SELECT COUNT(*) FROM (
+                SELECT a.artifact_hash AS hash
+                  FROM actions a JOIN turns t ON t.id = a.turn_id
+                 WHERE t.bot = ?1 AND a.artifact_hash IS NOT NULL
+                UNION
+                SELECT ca.hash
+                  FROM conversation_artifacts ca JOIN turns t ON t.id = ca.turn_id
+                 WHERE t.bot = ?1
+             )",
             params![bot],
             |row| row.get(0),
         )?)
@@ -2174,6 +2261,45 @@ mod tests {
     }
 
     #[test]
+    fn conversation_library_includes_non_approval_artifacts() {
+        let store = store();
+        store.ensure_conversation_accepts_turns("dir:main").unwrap();
+        let task = store
+            .enqueue_task("turn", "main", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        let turn = store
+            .create_turn(&task.id, "main", "dir:main", &serde_json::json!({}))
+            .unwrap();
+        store
+            .record_conversation_artifact(
+                "dir:main",
+                Some(&turn.id),
+                "docx_build",
+                "hash-doc",
+                "report.docx",
+                None,
+            )
+            .unwrap();
+        // A second write for the same hash updates the row instead of
+        // duplicating it.
+        store
+            .record_conversation_artifact(
+                "dir:main",
+                Some(&turn.id),
+                "docx_build",
+                "hash-doc",
+                "report.docx",
+                None,
+            )
+            .unwrap();
+        let artifacts = store.list_conversation_artifacts("dir:main").unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].hash, "hash-doc");
+        assert_eq!(artifacts[0].tool, "docx_build");
+        assert_eq!(store.count_bot_artifacts("main").unwrap(), 1);
+    }
+
+    #[test]
     fn visible_history_keeps_specialist_names() {
         let store = store();
         store
@@ -2224,7 +2350,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -2275,7 +2401,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(

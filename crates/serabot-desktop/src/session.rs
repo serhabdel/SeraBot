@@ -287,6 +287,13 @@ pub struct StatusUi {
     rx: Option<std::sync::mpsc::Receiver<Result<crate::ServerStatus, String>>>,
 }
 
+/// What to do with a saved artifact once the download completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingOpen {
+    Open,
+    Reveal,
+}
+
 pub struct Session {
     pub state: State,
     pub worker: Option<Worker>,
@@ -333,6 +340,8 @@ pub struct Session {
     /// Artifact download in flight (worker) or file write in flight (thread).
     pub downloading: bool,
     download_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// What to do with the saved file once the download completes.
+    pending_open: Option<PendingOpen>,
     pending: Option<OperationKind>,
     /// Bot id whose `GET /v1/bots/{id}` is in flight (dedup of loads).
     bot_detail_pending: Option<String>,
@@ -408,6 +417,7 @@ impl Session {
             toast: None,
             downloading: false,
             download_rx: None,
+            pending_open: None,
             pending: None,
             bot_detail_pending: None,
             bot_config_pending: None,
@@ -760,8 +770,27 @@ impl Session {
         self.download_rx = None;
         self.downloading = false;
         match result {
-            Ok(path) => self.toast = Some(format!("Saved to {path}")),
-            Err(error) => self.toast = Some(format!("Download failed: {error}")),
+            Ok(path) => match self.pending_open.take() {
+                Some(PendingOpen::Open) => match open_with_default_app(&path) {
+                    Ok(()) => self.toast = Some(format!("Opened {path}")),
+                    Err(error) => {
+                        self.toast =
+                            Some(format!("Saved to {path}, but could not open it: {error}"))
+                    }
+                },
+                Some(PendingOpen::Reveal) => match reveal_in_explorer(&path) {
+                    Ok(()) => self.toast = Some(format!("Showing {path}")),
+                    Err(error) => {
+                        self.toast =
+                            Some(format!("Saved to {path}, but could not reveal it: {error}"))
+                    }
+                },
+                None => self.toast = Some(format!("Saved to {path}")),
+            },
+            Err(error) => {
+                self.pending_open = None;
+                self.toast = Some(format!("Download failed: {error}"));
+            }
         }
     }
 
@@ -2195,6 +2224,21 @@ impl Session {
     /// Download one library artifact into the Downloads folder. The write runs
     /// off the UI thread; the result lands in `toast` via `poll_download`.
     pub fn download_artifact(&mut self, hash: String) {
+        self.start_download(hash, None);
+    }
+
+    /// Download the artifact, then open it with the operating system's default
+    /// application (Word, Excel, PowerPoint, or a PDF viewer).
+    pub fn open_artifact(&mut self, hash: String) {
+        self.start_download(hash, Some(PendingOpen::Open));
+    }
+
+    /// Download the artifact, then select it in Explorer.
+    pub fn reveal_artifact(&mut self, hash: String) {
+        self.start_download(hash, Some(PendingOpen::Reveal));
+    }
+
+    fn start_download(&mut self, hash: String, action: Option<PendingOpen>) {
         if self.downloading {
             self.toast = Some("A download is already running.".into());
             return;
@@ -2203,8 +2247,10 @@ impl Session {
             self.toast = Some("Wait for the current request, then retry.".into());
             return;
         }
+        self.pending_open = action;
         self.start_request(Operation::FetchArtifact { hash });
         if self.pending.is_none() {
+            self.pending_open = None;
             self.toast = Some("Could not start the download.".into());
         }
     }
@@ -2643,9 +2689,77 @@ fn save_download(filename: &str, bytes: &[u8]) -> Result<String, String> {
     let home = std::env::var("USERPROFILE").map_err(|_| "No home directory is set.".to_string())?;
     let dir = std::path::Path::new(&home).join("Downloads");
     std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-    let path = dir.join(&sanitized);
+    let path = unique_download_path(&dir, &sanitized);
     std::fs::write(&path, bytes).map_err(|err| err.to_string())?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// Never overwrite a file the owner already has. `report.docx` becomes
+/// `report (2).docx`, then `report (3).docx`.
+fn unique_download_path(dir: &std::path::Path, filename: &str) -> std::path::PathBuf {
+    let candidate = dir.join(filename);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = std::path::Path::new(filename);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("artifact");
+    let extension = path.extension().and_then(|value| value.to_str());
+    for counter in 2..1000 {
+        let name = match extension {
+            Some(extension) => format!("{stem} ({counter}).{extension}"),
+            None => format!("{stem} ({counter})"),
+        };
+        let candidate = dir.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(filename)
+}
+
+/// Open a saved artifact with the operating system's default application.
+#[cfg(windows)]
+fn open_with_default_app(path: &str) -> Result<(), String> {
+    std::process::Command::new("explorer")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(windows))]
+fn open_with_default_app(path: &str) -> Result<(), String> {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(opener)
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Select the saved artifact in Explorer (or open its folder elsewhere).
+#[cfg(windows)]
+fn reveal_in_explorer(path: &str) -> Result<(), String> {
+    std::process::Command::new("explorer")
+        .arg(format!("/select,{path}"))
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(windows))]
+fn reveal_in_explorer(path: &str) -> Result<(), String> {
+    let parent = std::path::Path::new(path)
+        .parent()
+        .ok_or_else(|| "the saved file has no parent directory".to_string())?;
+    open_with_default_app(&parent.to_string_lossy())
 }
 
 pub fn humanize_label(raw: &str) -> String {

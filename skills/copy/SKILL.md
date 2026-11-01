@@ -1,4 +1,4 @@
-﻿---
+---
 name: Marketing copy
 description: Draft short owner-language copy for cards, captions, and voiceover without publishing it
 ---

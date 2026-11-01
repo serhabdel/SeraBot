@@ -1,4 +1,4 @@
-﻿---
+---
 name: OneDrive dossier
 description: List or upload an existing artifact in the approved OneDrive folder
 ---

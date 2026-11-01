@@ -5,6 +5,32 @@ PPTX, PDF authoring and editing; the bot/skill/prompt wiring that exposes
 them; artifact delivery to the owner; and the external connectors
 (Firecrawl, Tavily, Google, Microsoft, Notion, AgentMail, OneDrive, browser).
 
+## Status
+
+Shipped on `feat/office-tools`:
+
+- **P0 — unblock.** `deck_build` returns both hashes; every build is recorded
+  in `conversation_artifacts` and appears in the owner library; the office
+  tools are allowlisted on `main`, `maker`, and `analyst` and in the server,
+  desktop, and mobile specialist lists; startup rejects an unknown tool name;
+  the stale "does not author DOCX" skills and prompts are rewritten; `/docx`,
+  `/pptx`, and `/pdf` routes exist; MIME is derived from the filename; the
+  Telegram caption is policy-scanned; the artifact audit records the real hash
+  and filename.
+- **P1 — import.** `docx_import` and `xlsx_import`; `document_index` accepts
+  `.docx` and `.xlsx`; `pdf_edit` exposes `extract` and `strip_metadata`;
+  `pptx_edit` accepts a `filename`; `deck_build` honours its documented
+  defaults; Telegram pre-checks the 50 MB cap; artifact retention and backup
+  coverage; desktop Save As, Open, and Reveal.
+- **P2 — Excel depth.** Formula cells in `xlsx_build`; `xlsx_edit` gains
+  `set_cell_style`, `set_row_height`, `freeze_panes`, `add_sheet`,
+  `rename_sheet`, `delete_sheet`, `insert_rows`, `delete_rows`,
+  `insert_columns`, `delete_columns`, and `add_chart`.
+
+Still open: DOCX images/headers/page breaks, PPTX slide/table/image insertion,
+PDF text extraction and watermarking, owner-to-bot upload, and the connector
+work in P3.
+
 The short version: **the authoring engines were built and tested in 0.9.0,
 then never connected to the fleet.** The agent cannot create a document
 because no bot is allowed to call the tool, the skills tell it the tool does

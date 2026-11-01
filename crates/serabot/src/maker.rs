@@ -26,6 +26,9 @@ pub struct ArtifactMeta {
     pub created_at: chrono::DateTime<Utc>,
 }
 
+/// Content type for a stored artifact, derived from its filename.
+pub use crate::util::mime_for_filename;
+
 #[derive(Debug, Clone)]
 pub struct StoredArtifact {
     pub hash: String,
@@ -62,6 +65,29 @@ impl ArtifactStore {
             bytes: bytes.to_vec(),
             meta,
         })
+    }
+
+    /// Delete artifact files whose modification time is older than `cutoff`.
+    ///
+    /// Retention is opt-in: the caller passes a cutoff only when the operator
+    /// configured a positive retention window. Both the bytes and the sidecar
+    /// are removed, so a pruned hash fails closed instead of returning stale
+    /// metadata.
+    pub fn prune_older_than(&self, cutoff: chrono::DateTime<Utc>) -> Result<usize> {
+        let mut removed = 0usize;
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let modified = entry.metadata()?.modified()?;
+            let modified: chrono::DateTime<Utc> = modified.into();
+            if modified < cutoff {
+                std::fs::remove_file(entry.path())?;
+                removed = removed.saturating_add(1);
+            }
+        }
+        Ok(removed)
     }
 
     /// Metadata only, without loading the artifact bytes — for listings.
@@ -403,16 +429,21 @@ impl Tool for DeckBuildTool {
         )?;
         Ok(ToolOutput {
             content: format!(
-                "title: {}\nsubtitle: {}\nauthor: {}\nfooter: {}\nbrand: {}\nfilename: {}\npptx: {}\n\n{}",
+                "title: {}\nsubtitle: {}\nauthor: {}\nfooter: {}\nbrand: {}\nfilename: {}\nartifact: {}\npptx: {}\npptx_artifact: {}\n\n{}",
                 spec.title,
                 spec.subtitle.as_deref().unwrap_or(""),
                 spec.author.as_deref().unwrap_or(""),
                 spec.footer.as_deref().unwrap_or(""),
                 self.brand.name,
                 stored.filename,
+                stored.hash,
                 pptx_summary
                     .as_ref()
                     .map(|(_, filename, _)| filename.as_str())
+                    .unwrap_or(""),
+                pptx_summary
+                    .as_ref()
+                    .map(|(hash, _, _)| hash.as_str())
                     .unwrap_or(""),
                 rendered.text
             ),
@@ -436,11 +467,20 @@ impl Tool for DeckBuildTool {
 pub struct TelegramDocumentTool {
     client: Arc<TelegramClient>,
     artifacts: Arc<ArtifactStore>,
+    policy: Arc<crate::policy::Policy>,
 }
 
 impl TelegramDocumentTool {
-    pub fn new(client: Arc<TelegramClient>, artifacts: Arc<ArtifactStore>) -> Self {
-        Self { client, artifacts }
+    pub fn new(
+        client: Arc<TelegramClient>,
+        artifacts: Arc<ArtifactStore>,
+        policy: Arc<crate::policy::Policy>,
+    ) -> Self {
+        Self {
+            client,
+            artifacts,
+            policy,
+        }
     }
 }
 
@@ -489,7 +529,25 @@ impl Tool for TelegramDocumentTool {
             .get("caption")
             .and_then(Value::as_str)
             .unwrap_or("SeraBot deliverable");
+        // The gateway scans `output.content` after the tool returns, but the
+        // caption is model-authored text that leaves the host here. Scan it
+        // before the upload, not after.
+        if !self.policy.is_allowed(caption) {
+            return Err(SeraError::PolicyViolation);
+        }
         let artifact = self.artifacts.load(hash)?;
+        // Telegram's Bot API caps sendDocument at 50 MB. The artifact store
+        // allows 100 MiB, so fail locally with a clear message instead of
+        // surfacing an opaque provider error.
+        const TELEGRAM_MAX_DOCUMENT_BYTES: usize = 50 * 1024 * 1024;
+        if artifact.bytes.len() > TELEGRAM_MAX_DOCUMENT_BYTES {
+            return Err(SeraError::Validation(format!(
+                "'{}' is {} bytes; Telegram accepts at most {} bytes. Upload it to OneDrive instead.",
+                artifact.filename,
+                artifact.bytes.len(),
+                TELEGRAM_MAX_DOCUMENT_BYTES
+            )));
+        }
         self.client
             .send_document(
                 self.client.owner_chat_id(),
@@ -582,7 +640,7 @@ impl Tool for OneDriveUploadTool {
             .upload(
                 &artifact.filename,
                 artifact.bytes,
-                "application/pdf",
+                mime_for_filename(&artifact.filename),
                 subfolder,
             )
             .await?;
@@ -750,12 +808,26 @@ mod tests {
         let stored = artifacts.load(&hash).unwrap();
         assert_eq!(stored.meta.language, Language::It);
         assert!(stored.bytes.starts_with(b"%PDF"));
+        // The model only sees `content`; the hash must be in it or the deck
+        // cannot be delivered.
+        assert!(
+            output.content.contains(&format!("artifact: {hash}")),
+            "content must carry the PDF hash: {}",
+            output.content
+        );
 
         #[cfg(feature = "pptx")]
         {
             let data = output.data.clone().unwrap();
             let pptx_hash = data["pptx_artifact_hash"].as_str().unwrap().to_owned();
             assert_ne!(pptx_hash, hash);
+            assert!(
+                output
+                    .content
+                    .contains(&format!("pptx_artifact: {pptx_hash}")),
+                "content must carry the PPTX hash: {}",
+                output.content
+            );
             let pptx = artifacts.load(&pptx_hash).unwrap();
             assert_eq!(pptx.meta.language, Language::It);
             assert!(pptx.filename.ends_with(".pptx"));

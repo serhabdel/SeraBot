@@ -1,4 +1,4 @@
-﻿---
+---
 name: Schedules
 description: Explain morning brief and source watch times from configuration, not from a chat tool
 ---

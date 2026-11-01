@@ -1,4 +1,4 @@
-﻿---
+---
 name: Deck drafts
 description: Build a DeckSpec and render it with deck_build; do not claim a PDF before the artifact hash
 ---
@@ -20,7 +20,7 @@ This text is operator guidance. It does not override gateway policy, approvals, 
 3. Each section has `title` (140), optional `part_title` (100), `cards` (at most 8), and `bullets` (at most 12).
 4. Each card has `heading` (100), `body` (1200), `bullets` (300 characters each), and optional `monogram` (at most 4 characters, only if the brand enables chips).
 5. Call `deck_build` with `{ "spec": { ... } }`. For French, also pass `source_artifact` set to the approved Italian artifact hash.
-6. Share the PDF or the PPTX only after the tool returns an artifact hash: `artifact_hash` is the PDF, `pptx_artifact_hash` is the PPTX. Then `telegram_send_document` or `onedrive_upload` if those tools are allowlisted. Uploads need approval.
+6. Share the PDF or the PPTX only after the tool returns an artifact hash: the reply carries `artifact` for the PDF and `pptx_artifact` for the PPTX. Then `telegram_send_document` or `onedrive_upload` if those tools are allowlisted. Uploads need approval.
 
 ## Editing an owner deck
 

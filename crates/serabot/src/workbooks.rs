@@ -22,6 +22,7 @@
 //! All entry points take byte slices. Files arrive through the inbox or the `ArtifactStore`;
 //! no model-chosen path is ever opened here.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -29,7 +30,8 @@ use chrono::Utc;
 use gridcraft_core::date::{datetime_from_serial, days_in_month, serial_from_ymd};
 use gridcraft_core::{CellRef, DateSystem, RangeRef, Value, letters_to_col};
 use gridcraft_model::{
-    Cell, Formula, NumFmt, Preserved, Sheet, Style, StyleId, Workbook as GridWorkbook,
+    Anchor, BorderLine, BorderStyle, Cell, Chart, ChartKind, Color, Fill, Formula, HAlign,
+    LegendPos, NumFmt, Preserved, Series, Sheet, Style, StyleId, Workbook as GridWorkbook,
 };
 use gridcraft_xlsx::{IoError, ReadReport, read_xlsx, write_xlsx};
 use serde::{Deserialize, Serialize};
@@ -61,6 +63,14 @@ pub const MAX_CELLS: usize = 50_000;
 pub const MAX_TEXT_CHARS: usize = 500;
 pub const MAX_EDITS: usize = 500;
 pub const MAX_WARNINGS: usize = 20;
+/// Cells one style edit may cover.
+pub const MAX_STYLE_CELLS: usize = 10_000;
+/// Rows or columns one insert/delete may move.
+pub const MAX_SHIFT: u32 = 10_000;
+pub const MIN_FONT_SIZE: f64 = 6.0;
+pub const MAX_FONT_SIZE: f64 = 96.0;
+pub const MIN_ROW_HEIGHT: f64 = 0.0;
+pub const MAX_ROW_HEIGHT: f64 = 409.0;
 
 /// Sheets accepted from a workbook the owner supplies. A real workbook is larger than anything
 /// SeraBot builds, so import, inspect, read and edit use these wider bounds; `xlsx_build` keeps
@@ -124,8 +134,10 @@ pub struct SheetSpec {
     pub rows: Vec<Vec<CellValue>>,
 }
 
-/// A literal cell value. There is no formula variant on purpose: formulas are set through
-/// [`Edit::SetFormula`], which never evaluates them.
+/// A cell value written by a build spec.
+///
+/// `Formula` stores the text and never evaluates it: the cached result is left
+/// empty so Excel recalculates when the owner opens the file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum CellValue {
@@ -135,6 +147,8 @@ pub enum CellValue {
     Number(f64),
     /// A calendar date written as `YYYY-MM-DD`.
     Date(String),
+    /// Formula text, with or without a leading `=`. Never evaluated.
+    Formula(String),
 }
 
 /// A bounded literal cell edit against an imported workbook.
@@ -181,6 +195,57 @@ pub enum Edit {
     },
     /// Merge a rectangular range that is not already merged.
     MergeCells { sheet: String, range: String },
+    /// Apply font, fill, border, and alignment to every cell in a range.
+    SetCellStyle {
+        sheet: String,
+        range: String,
+        bold: Option<bool>,
+        italic: Option<bool>,
+        font_size: Option<f64>,
+        font_color: Option<String>,
+        fill: Option<String>,
+        border: Option<String>,
+        align: Option<String>,
+        wrap: Option<bool>,
+    },
+    /// Set a row height in points.
+    SetRowHeight {
+        sheet: String,
+        row: u32,
+        height: f64,
+    },
+    /// Freeze the top `rows` rows and the left `columns` columns.
+    FreezePanes {
+        sheet: String,
+        rows: u32,
+        columns: u32,
+    },
+    /// Add an empty sheet at the end of the workbook.
+    AddSheet { name: String },
+    /// Rename an existing sheet.
+    RenameSheet { sheet: String, name: String },
+    /// Delete a sheet. The last remaining sheet cannot be deleted.
+    DeleteSheet { sheet: String },
+    /// Insert blank rows before the 1-based `at` row.
+    InsertRows { sheet: String, at: u32, count: u32 },
+    /// Delete `count` rows starting at the 1-based `at` row.
+    DeleteRows { sheet: String, at: u32, count: u32 },
+    /// Insert blank columns before the 1-based `at` column.
+    InsertColumns { sheet: String, at: u32, count: u32 },
+    /// Delete `count` columns starting at the 1-based `at` column.
+    DeleteColumns { sheet: String, at: u32, count: u32 },
+    /// Add a chart anchored at a cell, with one series over a values range.
+    AddChart {
+        sheet: String,
+        anchor: String,
+        kind: String,
+        title: Option<String>,
+        categories: Option<String>,
+        values: String,
+        series_name: Option<String>,
+        x_title: Option<String>,
+        y_title: Option<String>,
+    },
 }
 
 impl Edit {
@@ -192,6 +257,17 @@ impl Edit {
             Edit::SetNumberFormat { .. } => "set_number_format",
             Edit::SetColumnWidth { .. } => "set_column_width",
             Edit::MergeCells { .. } => "merge_cells",
+            Edit::SetCellStyle { .. } => "set_cell_style",
+            Edit::SetRowHeight { .. } => "set_row_height",
+            Edit::FreezePanes { .. } => "freeze_panes",
+            Edit::AddSheet { .. } => "add_sheet",
+            Edit::RenameSheet { .. } => "rename_sheet",
+            Edit::DeleteSheet { .. } => "delete_sheet",
+            Edit::InsertRows { .. } => "insert_rows",
+            Edit::DeleteRows { .. } => "delete_rows",
+            Edit::InsertColumns { .. } => "insert_columns",
+            Edit::DeleteColumns { .. } => "delete_columns",
+            Edit::AddChart { .. } => "add_chart",
         }
     }
 
@@ -299,6 +375,259 @@ impl Edit {
                     )));
                 }
                 sheet.merges.push(range);
+                Ok(())
+            }
+            Edit::SetCellStyle {
+                sheet,
+                range,
+                bold,
+                italic,
+                font_size,
+                font_color,
+                fill,
+                border,
+                align,
+                wrap,
+            } => {
+                let range = check_style_range(&format!("{label}.range"), range)?;
+                let font_color = match font_color.as_deref() {
+                    Some(value) => Some(parse_color(&format!("{label}.font_color"), value)?),
+                    None => None,
+                };
+                let fill = match fill.as_deref() {
+                    Some(value) => Some(parse_color(&format!("{label}.fill"), value)?),
+                    None => None,
+                };
+                let border = match border.as_deref() {
+                    Some(value) => Some(parse_border(&format!("{label}.border"), value)?),
+                    None => None,
+                };
+                let align = match align.as_deref() {
+                    Some(value) => Some(parse_align(&format!("{label}.align"), value)?),
+                    None => None,
+                };
+                if let Some(size) = font_size
+                    && (!size.is_finite() || !(MIN_FONT_SIZE..=MAX_FONT_SIZE).contains(size))
+                {
+                    return Err(SeraError::Validation(format!(
+                        "{label}.font_size must be between {MIN_FONT_SIZE} and {MAX_FONT_SIZE} points"
+                    )));
+                }
+                let sheet_index = resolve_sheet(workbook, sheet, &label)?;
+                let cells = range_cells(range);
+                let styles = &mut workbook.styles;
+                let sheet = Arc::make_mut(
+                    workbook
+                        .sheets
+                        .get_mut(sheet_index)
+                        .ok_or_else(missing_sheet)?,
+                );
+                for cell in cells {
+                    let current = sheet.style_id(cell);
+                    let style = styles.derive(current, |style| {
+                        if let Some(value) = bold {
+                            style.font.bold = *value;
+                        }
+                        if let Some(value) = italic {
+                            style.font.italic = *value;
+                        }
+                        if let Some(value) = font_size {
+                            style.font.size = *value as f32;
+                        }
+                        if let Some(value) = font_color {
+                            style.font.color = value;
+                        }
+                        if let Some(value) = fill {
+                            style.fill = Fill::solid(value);
+                        }
+                        if let Some(value) = border {
+                            let line = BorderLine {
+                                style: value,
+                                color: Color::Auto,
+                            };
+                            style.borders.left = line;
+                            style.borders.right = line;
+                            style.borders.top = line;
+                            style.borders.bottom = line;
+                        }
+                        if let Some(value) = align {
+                            style.align.h = value;
+                        }
+                        if let Some(value) = wrap {
+                            style.align.wrap = *value;
+                        }
+                    });
+                    sheet.set_style(cell, style);
+                }
+                Ok(())
+            }
+            Edit::SetRowHeight { sheet, row, height } => {
+                if !height.is_finite() || !(MIN_ROW_HEIGHT..=MAX_ROW_HEIGHT).contains(height) {
+                    return Err(SeraError::Validation(format!(
+                        "{label}.height must be between {MIN_ROW_HEIGHT} and {MAX_ROW_HEIGHT} points"
+                    )));
+                }
+                let row =
+                    check_grid_index(&format!("{label}.row"), *row, gridcraft_core::MAX_ROWS)?;
+                let sheet_index = resolve_sheet(workbook, sheet, &label)?;
+                let sheet = workbook.sheet_mut(sheet_index).ok_or_else(missing_sheet)?;
+                sheet.rows.entry(row).or_default().size = Some(*height as f32);
+                Ok(())
+            }
+            Edit::FreezePanes {
+                sheet,
+                rows,
+                columns,
+            } => {
+                if *rows == 0 && *columns == 0 {
+                    return Err(SeraError::Validation(format!(
+                        "{label}: freeze at least one row or one column"
+                    )));
+                }
+                let rows = check_freeze(&format!("{label}.rows"), *rows, gridcraft_core::MAX_ROWS)?;
+                let columns = check_freeze(
+                    &format!("{label}.columns"),
+                    *columns,
+                    gridcraft_core::MAX_COLS,
+                )?;
+                let sheet_index = resolve_sheet(workbook, sheet, &label)?;
+                let sheet = workbook.sheet_mut(sheet_index).ok_or_else(missing_sheet)?;
+                sheet.freeze = Some((rows, columns));
+                Ok(())
+            }
+            Edit::AddSheet { name } => {
+                check_sheet_name(&format!("{label}.name"), name)?;
+                if workbook.sheet_index(name).is_some() {
+                    return Err(SeraError::Validation(format!(
+                        "{label}.name: a sheet named '{name}' already exists"
+                    )));
+                }
+                workbook.sheets.push(Arc::new(Sheet::new(name.clone())));
+                Ok(())
+            }
+            Edit::RenameSheet { sheet, name } => {
+                check_sheet_name(&format!("{label}.name"), name)?;
+                let sheet_index = resolve_sheet(workbook, sheet, &label)?;
+                if let Some(existing) = workbook.sheet_index(name)
+                    && existing != sheet_index
+                {
+                    return Err(SeraError::Validation(format!(
+                        "{label}.name: a sheet named '{name}' already exists"
+                    )));
+                }
+                Arc::make_mut(
+                    workbook
+                        .sheets
+                        .get_mut(sheet_index)
+                        .ok_or_else(missing_sheet)?,
+                )
+                .name = name.clone();
+                Ok(())
+            }
+            Edit::DeleteSheet { sheet } => {
+                let sheet_index = resolve_sheet(workbook, sheet, &label)?;
+                if workbook.sheets.len() <= 1 {
+                    return Err(SeraError::Validation(format!(
+                        "{label}: a workbook must keep at least one sheet"
+                    )));
+                }
+                workbook.sheets.remove(sheet_index);
+                if workbook.active_sheet >= workbook.sheets.len() {
+                    workbook.active_sheet = workbook.sheets.len().saturating_sub(1);
+                }
+                Ok(())
+            }
+            Edit::InsertRows { sheet, at, count } => {
+                let at = check_grid_index(&format!("{label}.at"), *at, gridcraft_core::MAX_ROWS)?;
+                let count = check_count(&format!("{label}.count"), *count)?;
+                let sheet_index = resolve_sheet(workbook, sheet, &label)?;
+                let sheet = workbook.sheet_mut(sheet_index).ok_or_else(missing_sheet)?;
+                sheet.cells.shift_rows(at, i64::from(count));
+                shift_merges_rows(sheet, at, i64::from(count));
+                Ok(())
+            }
+            Edit::DeleteRows { sheet, at, count } => {
+                let at = check_grid_index(&format!("{label}.at"), *at, gridcraft_core::MAX_ROWS)?;
+                let count = check_count(&format!("{label}.count"), *count)?;
+                let sheet_index = resolve_sheet(workbook, sheet, &label)?;
+                let sheet = workbook.sheet_mut(sheet_index).ok_or_else(missing_sheet)?;
+                let end = at.saturating_add(count);
+                sheet
+                    .cells
+                    .take_range(RangeRef::rows(at, end.saturating_sub(1)));
+                sheet.cells.shift_rows(end, -i64::from(count));
+                shift_merges_rows(sheet, end, -i64::from(count));
+                Ok(())
+            }
+            Edit::InsertColumns { sheet, at, count } => {
+                let at = check_grid_index(&format!("{label}.at"), *at, gridcraft_core::MAX_COLS)?;
+                let count = check_count(&format!("{label}.count"), *count)?;
+                let sheet_index = resolve_sheet(workbook, sheet, &label)?;
+                let sheet = workbook.sheet_mut(sheet_index).ok_or_else(missing_sheet)?;
+                sheet.cells.shift_cols(at, i64::from(count));
+                shift_merges_cols(sheet, at, i64::from(count));
+                Ok(())
+            }
+            Edit::DeleteColumns { sheet, at, count } => {
+                let at = check_grid_index(&format!("{label}.at"), *at, gridcraft_core::MAX_COLS)?;
+                let count = check_count(&format!("{label}.count"), *count)?;
+                let sheet_index = resolve_sheet(workbook, sheet, &label)?;
+                let sheet = workbook.sheet_mut(sheet_index).ok_or_else(missing_sheet)?;
+                let end = at.saturating_add(count);
+                sheet
+                    .cells
+                    .take_range(RangeRef::cols(at, end.saturating_sub(1)));
+                sheet.cells.shift_cols(end, -i64::from(count));
+                shift_merges_cols(sheet, end, -i64::from(count));
+                Ok(())
+            }
+            Edit::AddChart {
+                sheet,
+                anchor,
+                kind,
+                title,
+                categories,
+                values,
+                series_name,
+                x_title,
+                y_title,
+            } => {
+                let kind = parse_chart_kind(&format!("{label}.kind"), kind)?;
+                let anchor = resolve_cell(anchor, &format!("{label}.anchor"))?;
+                if values.trim().is_empty() {
+                    return Err(SeraError::Validation(format!(
+                        "{label}.values must name a range such as Budget!C2:C13"
+                    )));
+                }
+                let id = workbook.next_object_id();
+                let sheet_index = resolve_sheet(workbook, sheet, &label)?;
+                let sheet = workbook.sheet_mut(sheet_index).ok_or_else(missing_sheet)?;
+                sheet.charts.push(Chart {
+                    id,
+                    kind,
+                    anchor: Anchor {
+                        cell: anchor,
+                        width: 480.0,
+                        height: 300.0,
+                        ..Anchor::default()
+                    },
+                    title: title.clone(),
+                    series: vec![Series {
+                        name: series_name.clone(),
+                        categories: categories.clone(),
+                        values: values.clone(),
+                        ..Series::default()
+                    }],
+                    legend: LegendPos::default(),
+                    data_labels: false,
+                    gridlines: true,
+                    style: 10,
+                    x_title: x_title.clone(),
+                    y_title: y_title.clone(),
+                    source: None,
+                    by_rows: false,
+                    pivot: None,
+                });
                 Ok(())
             }
         }
@@ -500,6 +829,44 @@ pub fn build(spec: &WorkbookSpec) -> Result<Vec<u8>> {
 pub fn import(bytes: &[u8]) -> Result<Workbook> {
     let (workbook, report) = load(bytes)?;
     Ok(summarize(&workbook, &report))
+}
+
+/// Full cell text of a workbook, bounded by `max_chars`, for indexing.
+///
+/// Every stored cell is emitted as `Sheet!A1: value`, so a retrieved passage
+/// still names the cell it came from. Formulas are emitted as their text, never
+/// evaluated.
+pub fn plain_text(bytes: &[u8], max_chars: usize) -> Result<String> {
+    let (workbook, _) = load(bytes)?;
+    let mut out = String::new();
+    for sheet in &workbook.sheets {
+        if out.chars().count() >= max_chars {
+            break;
+        }
+        let Some(used) = sheet.cells.used_range() else {
+            continue;
+        };
+        out.push_str(&format!("# {}\n", sheet.name));
+        for (cell_ref, cell) in sheet.cells.iter_range(used) {
+            if out.chars().count() >= max_chars {
+                break;
+            }
+            let record = cell_record(&workbook, sheet, cell_ref, cell);
+            let value = match (&record.formula, &record.cached, &record.value) {
+                (Some(formula), cached, _) => match cached {
+                    Some(cached) => format!("={formula} (cached {cached})"),
+                    None => format!("={formula}"),
+                },
+                (None, _, Some(value)) => value.to_string(),
+                (None, _, None) => continue,
+            };
+            if value.trim().is_empty() {
+                continue;
+            }
+            out.push_str(&format!("{}!{}: {value}\n", sheet.name, cell_ref.a1()));
+        }
+    }
+    Ok(out)
 }
 
 /// Read the values of one worksheet range, so a caller can see what is in a cell before editing
@@ -868,6 +1235,7 @@ impl CellValue {
                 }
                 Ok(())
             }
+            CellValue::Formula(text) => check_formula(label, text),
         }
     }
 }
@@ -908,6 +1276,23 @@ fn write_literal(
                     value: Value::Number(serial),
                     formula: None,
                     style: date_style,
+                },
+            );
+            Ok(())
+        }
+        CellValue::Formula(text) => {
+            check_formula(&cell.a1(), text)?;
+            let text = text.strip_prefix('=').unwrap_or(text).trim().to_string();
+            sheet.set_cell(
+                cell,
+                Cell {
+                    value: Value::Empty,
+                    formula: Some(Arc::new(Formula {
+                        text,
+                        expr: None,
+                        array: None,
+                    })),
+                    style: StyleId::DEFAULT,
                 },
             );
             Ok(())
@@ -1261,6 +1646,137 @@ fn column_width_px(label: &str, width: f64) -> Result<f32> {
     Ok(px.round() as f32)
 }
 
+/// A range for a style edit: single cells are allowed, and the cell count is
+/// bounded so a model cannot style a whole sheet in one call.
+fn check_style_range(label: &str, value: &str) -> Result<RangeRef> {
+    let range = RangeRef::parse(value).ok_or_else(|| {
+        SeraError::Validation(format!(
+            "{label}: '{value}' is not an A1-style range such as A1 or B2:D2"
+        ))
+    })?;
+    if range.count() > MAX_STYLE_CELLS as u64 {
+        return Err(SeraError::Validation(format!(
+            "{label} covers {} cells; a style edit is limited to {MAX_STYLE_CELLS}",
+            range.count()
+        )));
+    }
+    Ok(range)
+}
+
+/// A 1-based row or column index → the model's 0-based index.
+fn check_grid_index(label: &str, value: u32, max: u32) -> Result<u32> {
+    if value == 0 || value > max {
+        return Err(SeraError::Validation(format!(
+            "{label} must be between 1 and {max}"
+        )));
+    }
+    Ok(value - 1)
+}
+
+/// A positive count for a row/column insert or delete.
+fn check_count(label: &str, value: u32) -> Result<u32> {
+    if value == 0 || value > MAX_SHIFT {
+        return Err(SeraError::Validation(format!(
+            "{label} must be between 1 and {MAX_SHIFT}"
+        )));
+    }
+    Ok(value)
+}
+
+/// A frozen row/column count: zero is allowed for one axis, and the value is
+/// not an index, so it is not shifted.
+fn check_freeze(label: &str, value: u32, max: u32) -> Result<u32> {
+    if value > max {
+        return Err(SeraError::Validation(format!(
+            "{label} must be at most {max}"
+        )));
+    }
+    Ok(value)
+}
+
+fn parse_color(label: &str, value: &str) -> Result<Color> {
+    Color::from_hex(value).ok_or_else(|| {
+        SeraError::Validation(format!(
+            "{label}: '{value}' is not a hex colour such as #1F4E79"
+        ))
+    })
+}
+
+fn parse_border(label: &str, value: &str) -> Result<BorderStyle> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => Ok(BorderStyle::None),
+        "thin" => Ok(BorderStyle::Thin),
+        "medium" => Ok(BorderStyle::Medium),
+        "thick" => Ok(BorderStyle::Thick),
+        "dashed" => Ok(BorderStyle::Dashed),
+        "dotted" => Ok(BorderStyle::Dotted),
+        "double" => Ok(BorderStyle::Double),
+        _ => Err(SeraError::Validation(format!(
+            "{label}: '{value}' is not one of none, thin, medium, thick, dashed, dotted, double"
+        ))),
+    }
+}
+
+fn parse_align(label: &str, value: &str) -> Result<HAlign> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "left" => Ok(HAlign::Left),
+        "center" | "centre" => Ok(HAlign::Center),
+        "right" => Ok(HAlign::Right),
+        _ => Err(SeraError::Validation(format!(
+            "{label}: '{value}' is not one of left, center, right"
+        ))),
+    }
+}
+
+fn parse_chart_kind(label: &str, value: &str) -> Result<ChartKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "column" | "column_clustered" => Ok(ChartKind::ColumnClustered),
+        "bar" | "bar_clustered" => Ok(ChartKind::BarClustered),
+        "line" => Ok(ChartKind::Line),
+        "line_markers" => Ok(ChartKind::LineMarkers),
+        "pie" => Ok(ChartKind::Pie),
+        "doughnut" => Ok(ChartKind::Doughnut),
+        "area" => Ok(ChartKind::Area),
+        "scatter" => Ok(ChartKind::Scatter),
+        _ => Err(SeraError::Validation(format!(
+            "{label}: '{value}' is not one of column, bar, line, line_markers, pie, doughnut, area, scatter"
+        ))),
+    }
+}
+
+fn range_cells(range: RangeRef) -> Vec<CellRef> {
+    let mut cells = Vec::new();
+    for row in range.start.row..=range.end.row {
+        for col in range.start.col..=range.end.col {
+            cells.push(CellRef::new(row, col));
+        }
+    }
+    cells
+}
+
+fn shift_index(value: u32, delta: i64) -> u32 {
+    let shifted = i64::from(value) + delta;
+    shifted.clamp(0, i64::from(u32::MAX)) as u32
+}
+
+fn shift_merges_rows(sheet: &mut Sheet, from: u32, delta: i64) {
+    for merge in &mut sheet.merges {
+        if merge.start.row >= from {
+            merge.start.row = shift_index(merge.start.row, delta);
+            merge.end.row = shift_index(merge.end.row, delta);
+        }
+    }
+}
+
+fn shift_merges_cols(sheet: &mut Sheet, from: u32, delta: i64) {
+    for merge in &mut sheet.merges {
+        if merge.start.col >= from {
+            merge.start.col = shift_index(merge.start.col, delta);
+            merge.end.col = shift_index(merge.end.col, delta);
+        }
+    }
+}
+
 fn check_merge_range(label: &str, value: &str) -> Result<RangeRef> {
     let range = RangeRef::parse(value).ok_or_else(|| {
         SeraError::Validation(format!(
@@ -1456,6 +1972,22 @@ fn default_filename(title: &str) -> String {
     }
 }
 
+fn reject_unknown_keys(args: &JsonValue, allowed: &[&str]) -> Result<()> {
+    let Some(object) = args.as_object() else {
+        return Err(SeraError::Validation(
+            "arguments must be a JSON object".into(),
+        ));
+    };
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(SeraError::Validation(format!(
+                "unsupported argument: {key}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn spec_from_args(args: &JsonValue) -> Result<WorkbookSpec> {
     serde_json::from_value(
         args.get("spec")
@@ -1503,6 +2035,7 @@ fn spec_summary(spec: &WorkbookSpec, stored: &crate::maker::StoredArtifact) -> J
 struct RawEdit {
     #[serde(default)]
     op: Option<String>,
+    #[serde(default)]
     sheet: String,
     #[serde(default)]
     address: Option<String>,
@@ -1518,6 +2051,50 @@ struct RawEdit {
     width: Option<f64>,
     #[serde(default)]
     range: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    rows: Option<u32>,
+    #[serde(default)]
+    columns: Option<u32>,
+    #[serde(default)]
+    at: Option<u32>,
+    #[serde(default)]
+    count: Option<u32>,
+    #[serde(default)]
+    height: Option<f64>,
+    #[serde(default)]
+    bold: Option<bool>,
+    #[serde(default)]
+    italic: Option<bool>,
+    #[serde(default)]
+    font_size: Option<f64>,
+    #[serde(default)]
+    font_color: Option<String>,
+    #[serde(default)]
+    fill: Option<String>,
+    #[serde(default)]
+    border: Option<String>,
+    #[serde(default)]
+    align: Option<String>,
+    #[serde(default)]
+    wrap: Option<bool>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    categories: Option<String>,
+    #[serde(default)]
+    values: Option<String>,
+    #[serde(default)]
+    series_name: Option<String>,
+    #[serde(default)]
+    x_title: Option<String>,
+    #[serde(default)]
+    y_title: Option<String>,
+    #[serde(default)]
+    anchor: Option<String>,
 }
 
 impl TryFrom<RawEdit> for Edit {
@@ -1532,7 +2109,7 @@ impl TryFrom<RawEdit> for Edit {
             "set_value" => {
                 check_fields("set_value", &["address", "value"], &raw)?;
                 Ok(Edit::SetValue {
-                    sheet: raw.sheet,
+                    sheet: require_sheet(&raw, "set_value")?,
                     address: require(raw.address, "address", "set_value")?,
                     value: require(raw.value, "value", "set_value")?,
                 })
@@ -1540,7 +2117,7 @@ impl TryFrom<RawEdit> for Edit {
             "set_formula" => {
                 check_fields("set_formula", &["address", "formula"], &raw)?;
                 Ok(Edit::SetFormula {
-                    sheet: raw.sheet,
+                    sheet: require_sheet(&raw, "set_formula")?,
                     address: require(raw.address, "address", "set_formula")?,
                     formula: require(raw.formula, "formula", "set_formula")?,
                 })
@@ -1548,7 +2125,7 @@ impl TryFrom<RawEdit> for Edit {
             "set_number_format" => {
                 check_fields("set_number_format", &["address", "format"], &raw)?;
                 Ok(Edit::SetNumberFormat {
-                    sheet: raw.sheet,
+                    sheet: require_sheet(&raw, "set_number_format")?,
                     address: require(raw.address, "address", "set_number_format")?,
                     format: require(raw.format, "format", "set_number_format")?,
                 })
@@ -1556,7 +2133,7 @@ impl TryFrom<RawEdit> for Edit {
             "set_column_width" => {
                 check_fields("set_column_width", &["column", "width"], &raw)?;
                 Ok(Edit::SetColumnWidth {
-                    sheet: raw.sheet,
+                    sheet: require_sheet(&raw, "set_column_width")?,
                     column: require(raw.column, "column", "set_column_width")?,
                     width: require(raw.width, "width", "set_column_width")?,
                 })
@@ -1564,12 +2141,149 @@ impl TryFrom<RawEdit> for Edit {
             "merge_cells" => {
                 check_fields("merge_cells", &["range"], &raw)?;
                 Ok(Edit::MergeCells {
-                    sheet: raw.sheet,
+                    sheet: require_sheet(&raw, "merge_cells")?,
                     range: require(raw.range, "range", "merge_cells")?,
                 })
             }
+            "set_cell_style" => {
+                check_fields(
+                    "set_cell_style",
+                    &[
+                        "range",
+                        "bold",
+                        "italic",
+                        "font_size",
+                        "font_color",
+                        "fill",
+                        "border",
+                        "align",
+                        "wrap",
+                    ],
+                    &raw,
+                )?;
+                if raw.bold.is_none()
+                    && raw.italic.is_none()
+                    && raw.font_size.is_none()
+                    && raw.font_color.is_none()
+                    && raw.fill.is_none()
+                    && raw.border.is_none()
+                    && raw.align.is_none()
+                    && raw.wrap.is_none()
+                {
+                    return Err("set_cell_style needs at least one style field".into());
+                }
+                Ok(Edit::SetCellStyle {
+                    sheet: require_sheet(&raw, "set_cell_style")?,
+                    range: require(raw.range, "range", "set_cell_style")?,
+                    bold: raw.bold,
+                    italic: raw.italic,
+                    font_size: raw.font_size,
+                    font_color: raw.font_color,
+                    fill: raw.fill,
+                    border: raw.border,
+                    align: raw.align,
+                    wrap: raw.wrap,
+                })
+            }
+            "set_row_height" => {
+                check_fields("set_row_height", &["row", "height"], &raw)?;
+                Ok(Edit::SetRowHeight {
+                    sheet: require_sheet(&raw, "set_row_height")?,
+                    row: require(raw.rows, "row", "set_row_height")?,
+                    height: require(raw.height, "height", "set_row_height")?,
+                })
+            }
+            "freeze_panes" => {
+                check_fields("freeze_panes", &["rows", "columns"], &raw)?;
+                Ok(Edit::FreezePanes {
+                    sheet: require_sheet(&raw, "freeze_panes")?,
+                    rows: raw.rows.unwrap_or(0),
+                    columns: raw.columns.unwrap_or(0),
+                })
+            }
+            "add_sheet" => {
+                check_fields("add_sheet", &["name"], &raw)?;
+                Ok(Edit::AddSheet {
+                    name: require(raw.name, "name", "add_sheet")?,
+                })
+            }
+            "rename_sheet" => {
+                check_fields("rename_sheet", &["name"], &raw)?;
+                Ok(Edit::RenameSheet {
+                    sheet: require_sheet(&raw, "rename_sheet")?,
+                    name: require(raw.name, "name", "rename_sheet")?,
+                })
+            }
+            "delete_sheet" => {
+                check_fields("delete_sheet", &[], &raw)?;
+                Ok(Edit::DeleteSheet {
+                    sheet: require_sheet(&raw, "delete_sheet")?,
+                })
+            }
+            "insert_rows" => {
+                check_fields("insert_rows", &["at", "count"], &raw)?;
+                Ok(Edit::InsertRows {
+                    sheet: require_sheet(&raw, "insert_rows")?,
+                    at: require(raw.at, "at", "insert_rows")?,
+                    count: require(raw.count, "count", "insert_rows")?,
+                })
+            }
+            "delete_rows" => {
+                check_fields("delete_rows", &["at", "count"], &raw)?;
+                Ok(Edit::DeleteRows {
+                    sheet: require_sheet(&raw, "delete_rows")?,
+                    at: require(raw.at, "at", "delete_rows")?,
+                    count: require(raw.count, "count", "delete_rows")?,
+                })
+            }
+            "insert_columns" => {
+                check_fields("insert_columns", &["at", "count"], &raw)?;
+                Ok(Edit::InsertColumns {
+                    sheet: require_sheet(&raw, "insert_columns")?,
+                    at: require(raw.at, "at", "insert_columns")?,
+                    count: require(raw.count, "count", "insert_columns")?,
+                })
+            }
+            "delete_columns" => {
+                check_fields("delete_columns", &["at", "count"], &raw)?;
+                Ok(Edit::DeleteColumns {
+                    sheet: require_sheet(&raw, "delete_columns")?,
+                    at: require(raw.at, "at", "delete_columns")?,
+                    count: require(raw.count, "count", "delete_columns")?,
+                })
+            }
+            "add_chart" => {
+                check_fields(
+                    "add_chart",
+                    &[
+                        "anchor",
+                        "kind",
+                        "title",
+                        "categories",
+                        "values",
+                        "series_name",
+                        "x_title",
+                        "y_title",
+                    ],
+                    &raw,
+                )?;
+                Ok(Edit::AddChart {
+                    sheet: require_sheet(&raw, "add_chart")?,
+                    anchor: require(raw.anchor, "anchor", "add_chart")?,
+                    kind: require(raw.kind, "kind", "add_chart")?,
+                    title: raw.title,
+                    categories: raw.categories,
+                    values: require(raw.values, "values", "add_chart")?,
+                    series_name: raw.series_name,
+                    x_title: raw.x_title,
+                    y_title: raw.y_title,
+                })
+            }
             other => Err(format!(
-                "unknown op '{other}'; use set_value, set_formula, set_number_format, set_column_width or merge_cells"
+                "unknown op '{other}'; use set_value, set_formula, set_number_format, \
+                 set_column_width, merge_cells, set_cell_style, set_row_height, freeze_panes, \
+                 add_sheet, rename_sheet, delete_sheet, insert_rows, delete_rows, \
+                 insert_columns, delete_columns or add_chart"
             )),
         }
     }
@@ -1579,7 +2293,17 @@ fn require<T>(field: Option<T>, name: &str, op: &str) -> std::result::Result<T, 
     field.ok_or_else(|| format!("{op} needs '{name}'"))
 }
 
+fn require_sheet(raw: &RawEdit, op: &str) -> std::result::Result<String, String> {
+    if raw.sheet.trim().is_empty() {
+        return Err(format!("{op} needs 'sheet'"));
+    }
+    Ok(raw.sheet.clone())
+}
+
 /// Which operation an edit without `op` means, judged by the field it carries.
+///
+/// Only the original five operations can be inferred; every newer operation
+/// needs an explicit `op`, because their fields overlap.
 fn infer_op(raw: &RawEdit) -> std::result::Result<String, String> {
     let mut found: Vec<&str> = Vec::new();
     if raw.value.is_some() {
@@ -1600,7 +2324,9 @@ fn infer_op(raw: &RawEdit) -> std::result::Result<String, String> {
     match found.as_slice() {
         [only] => Ok((*only).to_string()),
         [] => Err(
-            "edit needs an op (set_value, set_formula, set_number_format, set_column_width, merge_cells)"
+            "edit needs an op (set_value, set_formula, set_number_format, set_column_width, \
+             merge_cells, set_cell_style, set_row_height, freeze_panes, add_sheet, rename_sheet, \
+             delete_sheet, insert_rows, delete_rows, insert_columns, delete_columns, add_chart)"
                 .into(),
         ),
         _ => Err("edit mixes several operations; set op to choose one".into()),
@@ -1616,6 +2342,28 @@ fn check_fields(op: &str, allowed: &[&str], raw: &RawEdit) -> std::result::Resul
         ("column", raw.column.is_some()),
         ("width", raw.width.is_some()),
         ("range", raw.range.is_some()),
+        ("name", raw.name.is_some()),
+        ("rows", raw.rows.is_some()),
+        ("columns", raw.columns.is_some()),
+        ("at", raw.at.is_some()),
+        ("count", raw.count.is_some()),
+        ("height", raw.height.is_some()),
+        ("bold", raw.bold.is_some()),
+        ("italic", raw.italic.is_some()),
+        ("font_size", raw.font_size.is_some()),
+        ("font_color", raw.font_color.is_some()),
+        ("fill", raw.fill.is_some()),
+        ("border", raw.border.is_some()),
+        ("align", raw.align.is_some()),
+        ("wrap", raw.wrap.is_some()),
+        ("kind", raw.kind.is_some()),
+        ("title", raw.title.is_some()),
+        ("categories", raw.categories.is_some()),
+        ("values", raw.values.is_some()),
+        ("series_name", raw.series_name.is_some()),
+        ("x_title", raw.x_title.is_some()),
+        ("y_title", raw.y_title.is_some()),
+        ("anchor", raw.anchor.is_some()),
     ] {
         if present && !allowed.contains(&name) {
             return Err(format!("{op} does not take '{name}'"));
@@ -1641,17 +2389,17 @@ impl Tool for XlsxBuildTool {
         ToolSpec {
             name: "xlsx_build".into(),
             description:
-                "Build a deterministic .xlsx workbook from a bounded spec of literal values. \
-                 Sheets carry a header row and rows of text, number, or date cells. The spec has \
-                 no formula, macro, or link variant; nothing is ever calculated. Use xlsx_edit \
-                 to add formulas, number formats, widths, or merges to an existing workbook."
+                "Build a deterministic .xlsx workbook from a bounded spec. Sheets carry a header \
+                 row and rows of text, number, date, or formula cells. Formula text is stored and \
+                 never evaluated: Excel recalculates on open. Use xlsx_edit to add number formats, \
+                 widths, merges, styles, or charts to an existing workbook."
                     .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "spec": {
                         "type": "object",
-                        "description": "WorkbookSpec: title, optional language (it|fr|en), sheets[{name, header[text], rows[[{type: text|number|date, value}]]}]"
+                        "description": "WorkbookSpec: title, optional language (it|fr|en), sheets[{name, header[text], rows[[{type: text|number|date|formula, value}]]}]"
                     },
                     "filename": {"type": "string", "description": "Optional artifact filename ending in .xlsx"}
                 },
@@ -1736,10 +2484,11 @@ impl Tool for XlsxEditTool {
             description:
                 "Apply a bounded set of edits to an existing workbook artifact and store the \
                  result as a new artifact that records its source. Edits set literal values, \
-                 formula text (written as given, never evaluated), number formats, column \
-                 widths, or merged ranges. Styles, number formats, widths, heights, merges, \
-                 charts, and images are preserved; macros, external links, and embedded objects \
-                 are rejected."
+                 formula text (written as given, never evaluated), number formats, column widths, \
+                 merged ranges, cell styles, row heights, frozen panes, sheet add/rename/delete, \
+                 row and column insert/delete, and charts. Styles, number formats, widths, \
+                 heights, merges, charts, and images already in the file are preserved; macros, \
+                 external links, and embedded objects are rejected."
                     .into(),
             parameters: json!({
                 "type": "object",
@@ -1747,7 +2496,7 @@ impl Tool for XlsxEditTool {
                     "source_artifact": {"type": "string", "description": "Artifact hash of the workbook to edit"},
                     "edits": {
                         "type": "array",
-                        "description": "Bounded edits. {op: set_value, sheet, address, value:{type,value}} | {op: set_formula, sheet, address, formula} | {op: set_number_format, sheet, address, format} | {op: set_column_width, sheet, column, width} | {op: merge_cells, sheet, range}. The literal form {sheet, address, value} is accepted too.",
+                        "description": "Bounded edits. {op: set_value, sheet, address, value:{type,value}} | {op: set_formula, sheet, address, formula} | {op: set_number_format, sheet, address, format} | {op: set_column_width, sheet, column, width} | {op: merge_cells, sheet, range} | {op: set_cell_style, sheet, range, bold?, italic?, font_size?, font_color?, fill?, border?, align?, wrap?} | {op: set_row_height, sheet, row, height} | {op: freeze_panes, sheet, rows, columns} | {op: add_sheet, name} | {op: rename_sheet, sheet, name} | {op: delete_sheet, sheet} | {op: insert_rows, sheet, at, count} | {op: delete_rows, sheet, at, count} | {op: insert_columns, sheet, at, count} | {op: delete_columns, sheet, at, count} | {op: add_chart, sheet, anchor, kind, values, title?, categories?, series_name?, x_title?, y_title?}. The literal form {sheet, address, value} is accepted too.",
                         "items": {"type": "object"}
                     },
                     "filename": {"type": "string", "description": "Optional artifact filename ending in .xlsx"}
@@ -1888,6 +2637,153 @@ impl Tool for XlsxInspectTool {
             artifact_hash: Some(source.hash),
             filename: Some(source.filename),
             ..ToolOutput::default()
+        })
+    }
+}
+
+/// Bring an owner-supplied `.xlsx` into the artifact store.
+///
+/// `xlsx_analyze` reads an inbox workbook directly, but every editing tool
+/// addresses an artifact hash. Without this tool an owner's spreadsheet could
+/// be summarized and never inspected cell by cell or edited.
+pub struct XlsxImportTool {
+    artifacts: Arc<ArtifactStore>,
+    store: Store,
+    inbox: PathBuf,
+}
+
+impl XlsxImportTool {
+    pub fn new(
+        artifacts: Arc<ArtifactStore>,
+        store: Store,
+        inbox: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let inbox = inbox.into();
+        std::fs::create_dir_all(&inbox)?;
+        let inbox = inbox.canonicalize()?;
+        Ok(Self {
+            artifacts,
+            store,
+            inbox,
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for XlsxImportTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "xlsx_import".into(),
+            description:
+                "Import a .xlsx from the configured inbox (or re-check an existing artifact hash) \
+                 into the artifact store. Returns the sheet names, used ranges, and counts of \
+                 cells, formulas, images, and charts. Bounded to 32 MiB and 4096 package parts; \
+                 macros, external workbook links, and embedded objects are rejected. Styles, \
+                 charts, and images survive a later edit."
+                    .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path relative to the configured inbox"},
+                    "artifact": {"type": "string", "description": "Artifact hash of an already imported workbook"}
+                },
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: JsonValue, context: &ToolContext) -> Result<ToolOutput> {
+        reject_unknown_keys(&args, &["path", "artifact"])?;
+        let path = args
+            .get("path")
+            .and_then(JsonValue::as_str)
+            .map(str::to_owned);
+        let artifact = args
+            .get("artifact")
+            .and_then(JsonValue::as_str)
+            .map(str::to_owned);
+        let (hash, filename, summary, source) = match (path, artifact) {
+            (Some(path), None) => {
+                let artifacts = self.artifacts.clone();
+                let inbox = self.inbox.clone();
+                let (stored, summary) = tokio::task::spawn_blocking(move || {
+                    artifacts.ingest_inbox_file(&inbox, &path, &["xlsx"], MAX_INPUT_BYTES, import)
+                })
+                .await
+                .map_err(|error| SeraError::Internal(format!("workbook task failed: {error}")))??;
+                (stored.hash, stored.filename, summary, None)
+            }
+            (None, Some(hash)) => {
+                let stored = self.artifacts.load(&hash)?;
+                if !stored.filename.to_ascii_lowercase().ends_with(".xlsx") {
+                    return Err(SeraError::Validation(
+                        "artifact is not an .xlsx workbook".into(),
+                    ));
+                }
+                if stored.bytes.len() > MAX_INPUT_BYTES {
+                    return Err(SeraError::Validation(
+                        "workbook exceeds the 32 MiB limit".into(),
+                    ));
+                }
+                let bytes = stored.bytes;
+                let summary = tokio::task::spawn_blocking(move || import(&bytes))
+                    .await
+                    .map_err(|error| {
+                        SeraError::Internal(format!("workbook task failed: {error}"))
+                    })??;
+                (stored.hash, stored.filename, summary, Some(hash))
+            }
+            (Some(_), Some(_)) => {
+                return Err(SeraError::Validation(
+                    "provide either path or artifact, not both".into(),
+                ));
+            }
+            (None, None) => {
+                return Err(SeraError::Validation("path or artifact is required".into()));
+            }
+        };
+
+        self.store.record_audit(
+            &context.actor,
+            "workbook.imported",
+            Some("xlsx_import"),
+            context.task_id.as_deref(),
+            None,
+            None,
+            None,
+            Some(&json!({
+                "artifact_hash": hash.clone(),
+                "source_artifact": source,
+                "sheets": summary.sheets.len(),
+                "formulas": summary.formulas,
+                "charts": summary.charts,
+                "images": summary.images,
+            })),
+        )?;
+
+        let data = serde_json::to_value(&summary)?;
+        Ok(ToolOutput {
+            content: format!(
+                "sheets: {}\nformulas: {}\ncharts: {}\nimages: {}\nfilename: {}\nartifact: {}\n\n{}",
+                summary
+                    .sheets
+                    .iter()
+                    .map(|sheet| sheet.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                summary.formulas,
+                summary.charts,
+                summary.images,
+                filename,
+                hash,
+                serde_json::to_string_pretty(&summary)?,
+            ),
+            data: Some(data),
+            artifact_path: Some(format!("artifacts/{filename}")),
+            artifact_hash: Some(hash),
+            filename: Some(filename),
+            destination: None,
         })
     }
 }
@@ -2620,6 +3516,148 @@ mod tests {
     }
 
     #[test]
+    fn styles_a_range_and_adds_a_chart() {
+        let bytes = build(&spec()).unwrap();
+        let edited = apply_edits(
+            &bytes,
+            &[
+                Edit::SetCellStyle {
+                    sheet: "Summary".into(),
+                    range: "A1:C1".into(),
+                    bold: Some(true),
+                    italic: None,
+                    font_size: Some(12.0),
+                    font_color: None,
+                    fill: Some("#1F4E79".into()),
+                    border: Some("thin".into()),
+                    align: Some("center".into()),
+                    wrap: Some(true),
+                },
+                Edit::AddChart {
+                    sheet: "Summary".into(),
+                    anchor: "E2".into(),
+                    kind: "column".into(),
+                    title: Some("Synthetic chart".into()),
+                    categories: Some("Summary!A2:A3".into()),
+                    values: "Summary!B2:B3".into(),
+                    series_name: Some("Plan".into()),
+                    x_title: None,
+                    y_title: None,
+                },
+                Edit::FreezePanes {
+                    sheet: "Summary".into(),
+                    rows: 1,
+                    columns: 0,
+                },
+            ],
+        )
+        .unwrap();
+
+        let (workbook, _) = load(&edited).unwrap();
+        let sheet = workbook.sheet(0).unwrap();
+        let style = sheet.cells.get(CellRef::new(0, 0)).unwrap().style;
+        let style = workbook.styles.get(style);
+        assert!(style.font.bold);
+        assert_eq!(style.font.size, 12.0);
+        assert_eq!(style.align.h, HAlign::Center);
+        assert!(style.align.wrap);
+        assert_eq!(sheet.freeze, Some((1, 0)));
+        assert_eq!(sheet.charts.len(), 1);
+        assert_eq!(sheet.charts[0].kind, ChartKind::ColumnClustered);
+        assert_eq!(sheet.charts[0].series[0].values, "Summary!B2:B3");
+    }
+
+    #[test]
+    fn inserts_and_deletes_rows_and_columns() {
+        let bytes = build(&spec()).unwrap();
+        let edited = apply_edits(
+            &bytes,
+            &[
+                Edit::InsertRows {
+                    sheet: "Summary".into(),
+                    at: 2,
+                    count: 1,
+                },
+                Edit::InsertColumns {
+                    sheet: "Summary".into(),
+                    at: 1,
+                    count: 1,
+                },
+            ],
+        )
+        .unwrap();
+        let (workbook, _) = load(&edited).unwrap();
+        let sheet = workbook.sheet(0).unwrap();
+        // The old A1 header moved to B1 after the column insert.
+        assert_eq!(cell_text(&workbook, 0, "B1").as_deref(), Some("Region"));
+        // The old A2 value moved to B3 after the row insert.
+        assert_eq!(cell_text(&workbook, 0, "B3").as_deref(), Some("North"));
+        assert!(sheet.cells.get(CellRef::new(1, 0)).is_none());
+    }
+
+    #[test]
+    fn adds_renames_and_deletes_sheets() {
+        let bytes = build(&spec()).unwrap();
+        let added = apply_edits(
+            &bytes,
+            &[
+                Edit::AddSheet {
+                    name: "Notes".into(),
+                },
+                Edit::RenameSheet {
+                    sheet: "Notes".into(),
+                    name: "Appendix".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let (workbook, _) = load(&added).unwrap();
+        assert_eq!(
+            workbook
+                .sheets
+                .iter()
+                .map(|sheet| sheet.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Summary", "Appendix"]
+        );
+
+        let deleted = apply_edits(
+            &added,
+            &[Edit::DeleteSheet {
+                sheet: "Appendix".into(),
+            }],
+        )
+        .unwrap();
+        let (workbook, _) = load(&deleted).unwrap();
+        assert_eq!(workbook.sheets.len(), 1);
+        assert!(
+            apply_edits(
+                &deleted,
+                &[Edit::DeleteSheet {
+                    sheet: "Summary".into(),
+                }]
+            )
+            .is_err(),
+            "the last sheet cannot be deleted"
+        );
+    }
+
+    #[test]
+    fn build_accepts_a_formula_cell_without_evaluating_it() {
+        let mut spec = spec();
+        spec.sheets[0].rows[0][2] = CellValue::Formula("=B2*2".into());
+        let bytes = build(&spec).unwrap();
+        let (workbook, _) = load(&bytes).unwrap();
+        let cell = workbook.sheets[0]
+            .cells
+            .get(CellRef::new(1, 2))
+            .expect("the formula cell is stored");
+        let formula = cell.formula.as_deref().expect("formula text");
+        assert_eq!(formula.text, "B2*2");
+        assert_eq!(cell.value, Value::Empty, "no cached result is invented");
+    }
+
+    #[test]
     fn merges_a_range_and_rejects_overlaps() {
         let bytes = build(&spec()).unwrap();
         let merged = apply_edits(
@@ -3000,7 +4038,11 @@ mod tests {
                 "rows": [[{"type": "formula", "value": "=SUM(A1:A2)"}]]
             }]
         }"#;
-        assert!(serde_json::from_str::<WorkbookSpec>(raw).is_err());
+        let spec: WorkbookSpec = serde_json::from_str(raw).expect("a formula cell parses");
+        assert_eq!(
+            spec.sheets[0].rows[0][0],
+            CellValue::Formula("=SUM(A1:A2)".into())
+        );
     }
 
     #[test]
@@ -3013,14 +4055,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_brings_an_owner_workbook_into_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = Arc::new(ArtifactStore::new(dir.path().join("artifacts")).unwrap());
+        let store = Store::open_in_memory(384).unwrap();
+        let inbox = dir.path().join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let bytes = build(&spec()).unwrap();
+        std::fs::write(inbox.join("owner.xlsx"), &bytes).unwrap();
+
+        let tool = XlsxImportTool::new(artifacts.clone(), store, &inbox).unwrap();
+        let output = tool
+            .execute(json!({"path": "owner.xlsx"}), &context("xlsx_import"))
+            .await
+            .unwrap();
+        let hash = output.artifact_hash.unwrap();
+        assert!(output.content.contains("artifact:"), "{}", output.content);
+        let stored = artifacts.load(&hash).unwrap();
+        assert_eq!(stored.filename, "owner.xlsx");
+        assert_eq!(stored.bytes, bytes);
+    }
+
+    #[tokio::test]
     async fn build_tool_stores_an_artifact_and_edit_tool_records_its_source() {
         let dir = tempfile::tempdir().unwrap();
         let artifacts = Arc::new(ArtifactStore::new(dir.path()).unwrap());
         let store = Store::open_in_memory(384).unwrap();
         let mut registry = ToolRegistry::default();
-        crate::tools::register_workbook_tools(&mut registry, artifacts.clone(), store.clone())
-            .unwrap();
+        crate::tools::register_workbook_tools(
+            &mut registry,
+            artifacts.clone(),
+            store.clone(),
+            dir.path().join("inbox"),
+        )
+        .unwrap();
         assert!(registry.is_registered("xlsx_build"));
+        assert!(registry.is_registered("xlsx_import"));
         assert!(registry.is_registered("xlsx_edit"));
         assert!(registry.is_registered("xlsx_inspect"));
         assert!(registry.is_registered("xlsx_read"));

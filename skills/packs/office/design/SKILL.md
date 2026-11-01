@@ -1,4 +1,4 @@
-﻿---
+---
 name: Visual design for decks
 description: Apply brand, hierarchy, and page-budget rules inside a DeckSpec
 ---
