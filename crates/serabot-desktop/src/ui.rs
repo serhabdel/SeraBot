@@ -2225,8 +2225,10 @@ fn UpdateBanner(session: Signal<Session>) -> Element {
                 button {
                     class: "btn primary sm",
                     onclick: move |_| {
-                        if session.write().apply_update(&install).is_ok() {
-                            std::process::exit(0);
+                        let result = session.write().apply_update(&install);
+                        match result {
+                            Ok(()) => std::process::exit(0),
+                            Err(error) => session.write().update.error = Some(error),
                         }
                     },
                     "Install and restart"
@@ -6120,6 +6122,7 @@ fn SettingsView(session: Signal<Session>) -> Element {
     let version = session.read().state.version.clone();
     let update = session.read().update.info.clone();
     let update_error = session.read().update.error.clone();
+    let update_notice = session.read().update.notice.clone();
     let checking = session.read().update.checking;
     let audio_enabled = session.read().state.audio_enabled;
     let transcription = session
@@ -6667,8 +6670,11 @@ fn SettingsView(session: Signal<Session>) -> Element {
                     button {
                         class: "btn ghost",
                         disabled: checking,
-                        onclick: move |_| session.write().check_updates(),
+                        onclick: move |_| session.write().check_updates_manual(),
                         if checking { "Checking…" } else { "Check for updates" }
+                    }
+                    if let Some(message) = update_notice {
+                        p { class: "tiny", "{message}" }
                     }
                     if let Some(info) = update {
                         p { class: "accent", "v{info.version} available" }
@@ -6677,7 +6683,11 @@ fn SettingsView(session: Signal<Session>) -> Element {
                             onclick: {
                                 let info = info.clone();
                                 move |_| {
-                                    let _ = session.write().apply_update(&info);
+                                    let result = session.write().apply_update(&info);
+                                    match result {
+                                        Ok(()) => std::process::exit(0),
+                                        Err(error) => session.write().update.error = Some(error),
+                                    }
                                 }
                             },
                             "Install and restart"

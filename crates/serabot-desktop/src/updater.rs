@@ -591,14 +591,23 @@ pub fn helper_script(pid: u32, new_exe: &Path, current_exe: &Path, log: &Path) -
         "@echo off\r\n\
          setlocal\r\n\
          :wait\r\n\
+         set tries=0\r\n\
          powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"while (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 500 }}\" >> {log} 2>&1\r\n\
-         move /Y {new_exe} {current_exe} >> {log} 2>&1\r\n\
-         if errorlevel 1 goto failed\r\n\
+         :retry\r\n\
+         move /Y {new_exe} {current_exe} >nul 2>&1\r\n\
+         if not errorlevel 1 goto moved\r\n\
+         set /a tries+=1\r\n\
+         if %tries% GEQ 40 goto failed\r\n\
+         ping -n 2 127.0.0.1 >nul\r\n\
+         goto retry\r\n\
+         :moved\r\n\
          start \"\" {current_exe}\r\n\
          del \"%~f0\"\r\n\
          exit /b 0\r\n\
          :failed\r\n\
+         move /Y {new_exe} {current_exe} >> {log} 2>&1\r\n\
          echo Update failed. The previous executable was left in place. >> {log}\r\n\
+         start \"\" {current_exe}\r\n\
          del \"%~f0\"\r\n\
          exit /b 1\r\n"
     )
@@ -858,6 +867,13 @@ mod tests {
         assert!(script.contains("del \"%~f0\""));
         assert!(script.contains("exit /b 1"));
         assert!(script.contains("Update failed. The previous executable was left in place."));
+        assert!(script.contains("if %tries% GEQ 40 goto failed"));
+        assert!(script.contains("goto retry"));
+        let failed = script.split(":failed").nth(1).unwrap();
+        assert!(
+            failed.contains("start \"\" \"C:\\Program Files\\SeraBot\\serabot-desktop.exe\""),
+            "a failed update relaunches the previous executable"
+        );
 
         let escaped = helper_script(
             1,
