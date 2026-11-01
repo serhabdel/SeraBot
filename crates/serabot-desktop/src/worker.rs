@@ -3,7 +3,8 @@ use crate::{
     BotProfileUpdate, BotSummary, Catalog, ConnectorStatus, ConnectorTestResult, ConnectorUpdate,
     ConversationKind, ConversationPage, ConversationSummary, CreatedBot, CreatedConversation,
     CreatedSkill, Health, History, LibraryEntry, MemoryEntry, NewProvider, ProviderStatus, Scope,
-    Selection, SkillSummary, Task, Team, TeamMode, Transcription, UsageReport,
+    Selection, SkillSummary, Task, Team, TeamMode, Transcription, UsageReport, VoiceSettings,
+    VoiceUpdate,
 };
 use secrecy::SecretString;
 use std::sync::{
@@ -138,6 +139,10 @@ pub enum Operation {
         update: ConnectorUpdate,
     },
     AdminSetAudio(AudioUpdate),
+    /// Read the voice/OCR readiness surface.
+    VoiceSettings,
+    /// Write the voice/OCR settings (admin only).
+    AdminSetVoice(VoiceUpdate),
     TestConnector {
         id: String,
     },
@@ -209,6 +214,8 @@ impl Operation {
             | Self::AdminRemoveProvider(_)
             | Self::AdminSetConnector { .. }
             | Self::AdminSetAudio(_) => OperationKind::AdminWrite,
+            Self::VoiceSettings => OperationKind::Health,
+            Self::AdminSetVoice(_) => OperationKind::AdminWrite,
             Self::TestConnector { .. } => OperationKind::ConnectorTest,
             Self::OAuthSignIn { .. } => OperationKind::OAuthSignIn,
             Self::ConnectorOAuthSignIn { .. } => OperationKind::OAuthSignIn,
@@ -252,6 +259,8 @@ pub enum Reply {
         bytes: Vec<u8>,
     },
     Transcribed(Transcription),
+    /// Voice/OCR readiness from `GET /v1/settings/voice`.
+    Voice(VoiceSettings),
     AdminSaved,
     ConnectorTested(ConnectorTestResult),
     /// Sign-in finished (PKCE) or started (device, with the code to enter).
@@ -550,6 +559,10 @@ fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
         }
         Operation::AdminSetAudio(update) => {
             client.admin_set_audio(update).map(|_| Reply::AdminSaved)
+        }
+        Operation::VoiceSettings => client.voice_settings().map(Reply::Voice),
+        Operation::AdminSetVoice(update) => {
+            client.admin_set_voice(update).map(|_| Reply::AdminSaved)
         }
         Operation::AdminSetBotProfile { id, update } => client
             .admin_set_bot_profile(id, update)

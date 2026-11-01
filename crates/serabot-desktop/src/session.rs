@@ -7,7 +7,7 @@ use crate::{
     ApiError, ApprovalDecision, AudioUpdate, AuthProvider, BotConfigUpdate, BotProfileUpdate,
     ConnectorUpdate, ConversationKind, MAX_SKILL_BODY_BYTES, MAX_SKILL_DESCRIPTION_CHARS,
     MAX_USAGE_DAYS, Message, NewProvider, PublicApiClient, Role, SPECIALIST_TOOLS, Selection,
-    TaskStatus, TeamMode, TelegramLink, TelegramStatus,
+    TaskStatus, TeamMode, TelegramLink, TelegramStatus, VoiceSettings, VoiceUpdate,
     api::{
         MEMORY_KINDS, valid_auth_provider_id, valid_conversation_title, valid_credential,
         valid_memory_content, valid_memory_kind, valid_memory_source, valid_model_id,
@@ -254,6 +254,30 @@ pub struct AudioDraft {
     pub understanding_model: String,
 }
 
+/// Editable copy of the voice/OCR settings surface.
+///
+/// The `*_ready` and `*_detail` fields come from the server and are read-only:
+/// they say whether a feature can actually run and, if not, which setting is
+/// missing. The editable fields are saved with `save_voice`.
+#[derive(Default)]
+pub struct VoiceDraft {
+    pub loaded: bool,
+    pub loading: bool,
+    pub stt_model: String,
+    pub stt_ready: bool,
+    pub stt_detail: Option<String>,
+    pub tts_model: String,
+    pub tts_ready: bool,
+    pub tts_detail: Option<String>,
+    pub voice_id: String,
+    pub ocr_model: String,
+    pub ocr_ready: bool,
+    pub ocr_detail: Option<String>,
+    pub ocr_enabled: bool,
+    pub reply_mode: String,
+    pub max_speech_chars: usize,
+}
+
 #[derive(Default)]
 pub struct BotProfileDraft {
     pub id: String,
@@ -405,6 +429,8 @@ pub struct Session {
     pub provider: ProviderDraft,
     pub connector_drafts: BTreeMap<String, ConnectorDraft>,
     pub audio: AudioDraft,
+    /// Editable copy of the voice/OCR settings surface.
+    pub voice: VoiceDraft,
     pub selected_bot: Option<String>,
     pub bot_profile: BotProfileDraft,
     pub admin_notice: Option<String>,
@@ -489,6 +515,7 @@ impl Session {
             provider: ProviderDraft::default(),
             connector_drafts: BTreeMap::new(),
             audio: AudioDraft::default(),
+            voice: VoiceDraft::default(),
             selected_bot: None,
             bot_profile: BotProfileDraft::default(),
             admin_notice: None,
@@ -1943,6 +1970,7 @@ impl Session {
                             self.sign_in.clear_secrets();
                             self.sign_in.notice = None;
                             self.sync_audio_draft();
+                            self.sync_voice_draft();
                             if self.restarting {
                                 self.restarting = false;
                                 self.restart_pending = false;
@@ -2620,6 +2648,66 @@ impl Session {
         }));
     }
 
+    /// Ask the server for the current voice/OCR readiness.
+    pub fn load_voice(&mut self) {
+        if self.voice.loading {
+            return;
+        }
+        self.voice.loading = true;
+        self.start_request(Operation::VoiceSettings);
+    }
+
+    /// Save the editable voice/OCR fields. Admin only, like the other
+    /// configuration writes.
+    pub fn save_voice(&mut self) {
+        self.admin_error = None;
+        self.admin_notice = None;
+        let speech_model = self.voice.tts_model.trim().to_owned();
+        let ocr_model = self.voice.ocr_model.trim().to_owned();
+        if !speech_model.is_empty() && !valid_model_id(&speech_model) {
+            self.admin_error = Some("Check the speech model name.".into());
+            return;
+        }
+        if !ocr_model.is_empty() && !valid_model_id(&ocr_model) {
+            self.admin_error = Some("Check the OCR model name.".into());
+            return;
+        }
+        if self.voice.reply_mode == "voice" && self.voice.voice_id.trim().is_empty() {
+            self.admin_error = Some("Voice replies need a voice id.".into());
+            return;
+        }
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.start_request(Operation::AdminSetVoice(VoiceUpdate {
+            speech_model: (!speech_model.is_empty()).then_some(speech_model),
+            voice_id: Some(self.voice.voice_id.trim().to_owned()),
+            reply_mode: Some(self.voice.reply_mode.clone()),
+            ocr_enabled: Some(self.voice.ocr_enabled),
+            ocr_model: (!ocr_model.is_empty()).then_some(ocr_model),
+        }));
+    }
+
+    /// Apply `GET /v1/settings/voice` to the draft without clobbering a field
+    /// the operator is mid-edit on: only the read-only status is overwritten.
+    fn apply_voice_settings(&mut self, settings: VoiceSettings) {
+        self.voice.loaded = true;
+        self.voice.loading = false;
+        self.voice.stt_model = settings.stt.model;
+        self.voice.stt_ready = settings.stt.ready;
+        self.voice.stt_detail = settings.stt.detail;
+        self.voice.tts_model = settings.tts.model;
+        self.voice.tts_ready = settings.tts.ready;
+        self.voice.tts_detail = settings.tts.detail;
+        self.voice.voice_id = settings.tts.voice_id;
+        self.voice.ocr_model = settings.ocr.model;
+        self.voice.ocr_ready = settings.ocr.ready;
+        self.voice.ocr_detail = settings.ocr.detail;
+        self.voice.reply_mode = settings.reply_mode;
+        self.voice.max_speech_chars = settings.max_speech_chars;
+    }
+
     pub fn request_restart(&mut self) {
         if !self.can_admin() {
             self.admin_error = Some("Wait for the current request, then retry.".into());
@@ -2643,6 +2731,13 @@ impl Session {
             }
         }
         self.connector_drafts.retain(|id, _| seen.contains(id));
+    }
+
+    /// Apply a freshly fetched voice/OCR surface to the draft exactly once.
+    fn sync_voice_draft(&mut self) {
+        if let Some(settings) = self.state.voice.take() {
+            self.apply_voice_settings(settings);
+        }
     }
 
     fn sync_audio_draft(&mut self) {

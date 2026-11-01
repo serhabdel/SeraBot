@@ -5,6 +5,7 @@ import '../validation.dart';
 import 'approvals_tab.dart';
 import 'chat_tab.dart';
 import 'fleet_tab.dart';
+import 'voice_tab.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key, required this.session, required this.onDisconnect});
@@ -56,6 +57,7 @@ class _HomeScreenState extends State<HomeScreen> {
               setState(() => _index = 0);
             },
           ),
+          VoiceTab(session: widget.session),
         ],
       ),
       bottomNavigationBar: NavigationBar(
@@ -65,6 +67,7 @@ class _HomeScreenState extends State<HomeScreen> {
           NavigationDestination(icon: Icon(Icons.chat), label: 'Chat'),
           NavigationDestination(icon: Icon(Icons.gavel), label: 'Approvals'),
           NavigationDestination(icon: Icon(Icons.account_tree), label: 'Fleet'),
+          NavigationDestination(icon: Icon(Icons.graphic_eq), label: 'Voice'),
         ],
       ),
     );

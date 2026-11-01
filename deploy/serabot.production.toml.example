@@ -148,9 +148,22 @@ enabled = true
 provider = "default"
 transcription_model = "voxtral-mini-latest"
 understanding_model = "voxtral-small-latest"
+speech_model = "voxtral-mini-tts-2603"
+# Set a voice id to enable voice replies; empty keeps replies as text.
+voice_id = ""
+reply_mode = "text"
+max_speech_chars = 4000
 max_bytes = 52428800
 telegram_intake = true
 telegram_max_bytes = 20971520
+
+# OCR fallback for PDFs and images with no text layer.
+[ocr]
+enabled = true
+provider = "default"
+model = "mistral-ocr-latest"
+max_bytes = 20971520
+min_text_chars = 200
 
 # Leave disabled until `serabot secrets set` stores the named keys. No secret values here.
 [connectors.google_drive]

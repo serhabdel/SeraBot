@@ -12,6 +12,10 @@ pub struct State {
     pub version: String,
     pub audio_enabled: Option<bool>,
     pub audio_transcription_model: Option<String>,
+    /// Latest voice/OCR readiness from the server, applied to the session's
+    /// editable draft once.
+    #[allow(dead_code)]
+    pub voice: Option<crate::api::VoiceSettings>,
     pub audio_understanding_model: Option<String>,
     pub firecrawl_enabled: Option<bool>,
     pub telegram_enabled: Option<bool>,
@@ -85,6 +89,7 @@ impl Default for State {
             audio_enabled: None,
             audio_transcription_model: None,
             audio_understanding_model: None,
+            voice: None,
             firecrawl_enabled: None,
             telegram_enabled: None,
             catalog_fetch: None,
@@ -391,6 +396,10 @@ impl State {
             // The session applies the optimistic cache update and toast for
             // a saved bot config; the state only keeps the match exhaustive.
             Reply::BotConfigSaved { .. } => {}
+            // Applied by the session (it owns the editable draft).
+            Reply::Voice(settings) => {
+                self.voice = Some(settings);
+            }
             Reply::AdminSaved | Reply::BotProfileSaved | Reply::AdminRestarted => {}
         }
         true
