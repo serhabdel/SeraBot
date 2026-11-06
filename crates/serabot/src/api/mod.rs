@@ -140,6 +140,8 @@ pub struct ApiState {
     /// authenticated user share one `anonymous` bucket.
     rate: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
     rate_limit: usize,
+    user_rate_limit: usize,
+    poll_rate_limit: usize,
     admin: Option<AdminStore>,
     /// The OIDC sign-in service; `None` while `[auth] enabled = false`, so
     /// every sign-in endpoint fails closed.
@@ -184,6 +186,8 @@ impl ApiState {
             token_hash: config.api.token_hash.to_ascii_lowercase(),
             rate: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: config.server.rate_limit_per_minute.max(1) as usize,
+            user_rate_limit: config.server.user_rate_limit_per_minute.max(1) as usize,
+            poll_rate_limit: config.server.poll_rate_limit_per_minute.max(1) as usize,
             admin: AdminStore::open(&config).ok(),
             auth,
             oauth_inflight: Arc::default(),
@@ -538,11 +542,17 @@ fn unauthorized() -> Response {
 /// anonymous bucket. Buckets are pruned on every request, so idle sessions do
 /// not accumulate.
 async fn rate_limit(State(state): State<Arc<ApiState>>, request: Request, next: Next) -> Response {
-    let key = request
+    let user = request
         .extensions()
         .get::<ActingUser>()
-        .map(|user| user.id.clone())
-        .unwrap_or_else(|| "anonymous".to_owned());
+        .map(|u| u.id.clone());
+    let (key, limit) = match user {
+        Some(id) if is_poll_request(request.method(), request.uri().path()) => {
+            (format!("poll:{id}"), state.poll_rate_limit)
+        }
+        Some(id) => (id, state.user_rate_limit),
+        None => ("anonymous".to_owned(), state.rate_limit),
+    };
     {
         let mut buckets = state.rate.lock().await;
         let now = Instant::now();
@@ -557,10 +567,19 @@ async fn rate_limit(State(state): State<Arc<ApiState>>, request: Request, next: 
             !entries.is_empty()
         });
         let entries = buckets.entry(key).or_default();
-        if entries.len() >= state.rate_limit {
+        if entries.len() >= limit {
+            let retry = entries
+                .front()
+                .map(|oldest| {
+                    window
+                        .saturating_sub(now.duration_since(*oldest))
+                        .as_secs()
+                        .clamp(1, 60)
+                })
+                .unwrap_or(60);
             return (
                 StatusCode::TOO_MANY_REQUESTS,
-                [("retry-after", "60")],
+                [("retry-after", retry.to_string())],
                 Json(json!({"error": "rate limit exceeded"})),
             )
                 .into_response();
@@ -568,6 +587,21 @@ async fn rate_limit(State(state): State<Arc<ApiState>>, request: Request, next: 
         entries.push_back(now);
     }
     next.run(request).await
+}
+
+/// Cheap idempotent polling reads the desktop repeats every few seconds.
+/// They get their own bucket so polling can never starve real actions.
+fn is_poll_request(method: &axum::http::Method, path: &str) -> bool {
+    if method != axum::http::Method::GET {
+        return false;
+    }
+    matches!(
+        path,
+        "/v1/health" | "/v1/browser" | "/v1/browser/screenshot" | "/v1/events" | "/v1/approvals"
+    ) || path
+        .strip_prefix("/v1/conversations/")
+        .is_some_and(|rest| rest.ends_with("/messages") && rest.matches('/').count() == 1)
+        || path.starts_with("/v1/tasks/")
 }
 
 #[derive(Debug, Serialize)]

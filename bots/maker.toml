@@ -41,12 +41,5 @@ tools = [
   "elevenlabs_generate_image",
   "elevenlabs_generate_video",
 ]
-require_approval = [
-  "onedrive_upload",
-  "elevenlabs_text_to_speech",
-  "elevenlabs_sound_effect",
-  "elevenlabs_transcribe",
-  "elevenlabs_generate_image",
-  "elevenlabs_generate_video",
-]
+require_approval = ["onedrive_upload"]
 enabled = true

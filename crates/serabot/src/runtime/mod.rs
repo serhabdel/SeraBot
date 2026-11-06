@@ -341,13 +341,60 @@ pub(crate) fn estimate_prompt_chars(messages: &[LlmMessage]) -> usize {
 
 const TOOL_NOTICE_PREFIX: &str = "AVAILABLE TOOLS THIS TURN:";
 
+/// One-line description: the first sentence, capped in length.
+fn one_line(description: &str) -> String {
+    let first = description.split(". ").next().unwrap_or(description);
+    let flat = first.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = flat.trim_end_matches('.');
+    if flat.chars().count() > 160 {
+        let cut: String = flat.chars().take(157).collect();
+        format!("{cut}...")
+    } else {
+        flat.to_owned()
+    }
+}
+
+/// The per-turn notice body: every tool with a one-line description, browser
+/// tools and `vault_list` grouped under a short browser line.
+fn render_tool_list(tools: &[ToolSpec]) -> String {
+    let mut lines = Vec::new();
+    let browser: Vec<&str> = tools
+        .iter()
+        .filter(|tool| tool.name.starts_with("browser_") || tool.name == "vault_list")
+        .map(|tool| tool.name.as_str())
+        .collect();
+    if !browser.is_empty() {
+        lines.push(format!(
+            "- You can control a real web browser on the server: {}. Open pages with browser_navigate, read them with browser_snapshot, act with browser_click, browser_type and browser_press; vault_list names the owner's stored logins, which browser_type can fill without ever showing you the secret.",
+            browser.join(", ")
+        ));
+    }
+    for tool in tools {
+        if tool.name.starts_with("browser_") || tool.name == "vault_list" {
+            continue;
+        }
+        let gate = if tool.destructive() {
+            " [needs owner approval]"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "- {}: {}{gate}",
+            tool.name,
+            one_line(&tool.description)
+        ));
+    }
+    lines.join("\n")
+}
+
 /// Keeps exactly one authoritative tool-list notice in the conversation.
 /// An existing notice is refreshed in place so stale lists from earlier
 /// turns never survive; otherwise the notice is inserted after the first
 /// system message.
-fn upsert_tool_notice(messages: &mut Vec<LlmMessage>, tool_names: &str) {
+fn upsert_tool_notice(messages: &mut Vec<LlmMessage>, tools: &[ToolSpec]) {
+    let tool_list = render_tool_list(tools);
     let content = format!(
-        "{TOOL_NOTICE_PREFIX} {tool_names}. This list is authoritative for the current turn and overrides any earlier assistant statement in the conversation about which tools exist. If the owner asks which tools are available, answer only from this list. These tools are callable. If one requires owner approval, request the approval instead of saying the tool is unavailable."
+        "{TOOL_NOTICE_PREFIX}\n{tool_list}\nThis list is authoritative for the current turn and overrides any earlier assistant statement in the conversation about which tools exist. If the owner asks which tools are available, answer only from this list. These tools are callable now; use them on your own judgement. Only tools marked [needs owner approval] wait for the owner; for those, request the approval instead of saying the tool is unavailable."
     );
     if let Some(existing) = messages.iter_mut().find(|message| {
         message.role == Role::System

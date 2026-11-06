@@ -58,14 +58,5 @@ tools = [
   "browser_screenshot",
   "browser_close",
 ]
-require_approval = [
-  "firecrawl_crawl",
-  "firecrawl_search",
-  "tavily_search",
-  "elevenlabs_text_to_speech",
-  "elevenlabs_sound_effect",
-  "elevenlabs_transcribe",
-  "elevenlabs_generate_image",
-  "elevenlabs_generate_video",
-]
+require_approval = []
 enabled = true

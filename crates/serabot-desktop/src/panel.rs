@@ -30,6 +30,8 @@ use zeroize::{Zeroize, Zeroizing};
 /// `GET /v1/browser` while the app has focus.
 pub const STATUS_EVERY: Duration = Duration::from_secs(2);
 /// Screenshots are polled at most twice a second, and only while visible.
+/// Status poll interval while the window is unfocused (screenshots stop).
+pub const UNFOCUSED_STATUS_EVERY: Duration = Duration::from_secs(30);
 pub const SHOT_EVERY: Duration = Duration::from_millis(500);
 const MAX_QUEUED_INPUTS: usize = 64;
 const MAX_INPUTS_IN_FLIGHT: usize = 4;
@@ -403,6 +405,10 @@ pub struct PanelState {
     hidden: bool,
     status_inflight: bool,
     shot_inflight: bool,
+    /// Consecutive 429s on background polls; resets on any success.
+    rate_attempts: u32,
+    /// No background poll is sent before this instant (429 backoff).
+    poll_hold_until: Instant,
     next_status: Instant,
     next_shot: Instant,
     queue: VecDeque<PanelOp>,
@@ -425,6 +431,8 @@ impl PanelState {
             hidden: false,
             status_inflight: false,
             shot_inflight: false,
+            rate_attempts: 0,
+            poll_hold_until: now,
             next_status: now,
             next_shot: now,
             queue: VecDeque::new(),
@@ -617,15 +625,20 @@ impl PanelState {
                 return Some(op);
             }
         }
-        if !self.focused {
+        if now < self.poll_hold_until {
             return None;
         }
         if !self.status_inflight && now >= self.next_status {
             self.status_inflight = true;
-            self.next_status = now + STATUS_EVERY;
+            self.next_status = now
+                + if self.focused {
+                    STATUS_EVERY
+                } else {
+                    UNFOCUSED_STATUS_EVERY
+                };
             return Some(PanelOp::Status);
         }
-        if self.open() && !self.shot_inflight && now >= self.next_shot {
+        if self.focused && self.open() && !self.shot_inflight && now >= self.next_shot {
             self.shot_inflight = true;
             self.next_shot = now + SHOT_EVERY;
             return Some(PanelOp::Shot);
@@ -651,7 +664,12 @@ impl PanelState {
             _ => {}
         }
         match done.result {
-            Ok(reply) => self.apply_reply(reply, now),
+            Ok(reply) => {
+                if matches!(done.kind, PanelKind::Status | PanelKind::Shot) {
+                    self.rate_attempts = 0;
+                }
+                self.apply_reply(reply, now)
+            }
             Err(error) => self.apply_error(done.kind, error, now),
         }
         unauthorized
@@ -724,6 +742,17 @@ impl PanelState {
     }
 
     fn apply_error(&mut self, kind: PanelKind, error: ApiError, now: Instant) {
+        if error == ApiError::Http(429) && matches!(kind, PanelKind::Status | PanelKind::Shot) {
+            // A rate-limited background poll backs off quietly: no banner.
+            self.rate_attempts = self.rate_attempts.saturating_add(1);
+            self.poll_hold_until = now
+                + crate::api::poll_backoff(
+                    crate::api::last_retry_after_secs(),
+                    self.rate_attempts,
+                    crate::api::jitter_seed(),
+                );
+            return;
+        }
         let message = error.to_string();
         match kind {
             PanelKind::Status => {
@@ -913,8 +942,33 @@ mod tests {
             ),
             t0,
         );
+        // Blurred: the status poll slows to the unfocused interval.
         state.set_focused(false);
-        assert!(state.next_op(t0 + Duration::from_secs(60)).is_none());
+        assert!(matches!(
+            state.next_op(t0 + Duration::from_secs(60)),
+            Some(PanelOp::Status)
+        ));
+        state.apply(
+            done(
+                &state,
+                PanelKind::Status,
+                Ok(PanelReply::Status(info(false, BrowserController::Bot))),
+            ),
+            t0,
+        );
+        assert!(state.next_op(t0 + Duration::from_secs(70)).is_none());
+        assert!(matches!(
+            state.next_op(t0 + Duration::from_secs(91)),
+            Some(PanelOp::Status)
+        ));
+        state.apply(
+            done(
+                &state,
+                PanelKind::Status,
+                Ok(PanelReply::Status(info(false, BrowserController::Bot))),
+            ),
+            t0,
+        );
         state.set_focused(true);
         assert!(matches!(
             state.next_op(Instant::now() + Duration::from_millis(1)),
@@ -963,7 +1017,7 @@ mod tests {
             state.next_op(t1 + Duration::from_millis(501)),
             Some(PanelOp::Shot)
         ));
-        // Blurred: nothing is polled.
+        // Blurred: no screenshots.
         state.apply(
             done(
                 &state,
@@ -973,7 +1027,37 @@ mod tests {
             t1,
         );
         state.set_focused(false);
-        assert!(state.next_op(t1 + Duration::from_secs(30)).is_none());
+        assert!(!matches!(
+            state.next_op(t1 + Duration::from_secs(30)),
+            Some(PanelOp::Shot)
+        ));
+    }
+
+    #[test]
+    fn a_429_on_a_background_poll_backs_off_without_a_banner() {
+        let mut state = PanelState::new();
+        let t0 = Instant::now();
+        assert!(matches!(state.next_op(t0), Some(PanelOp::Status)));
+        state.apply(
+            done(&state, PanelKind::Status, Err(ApiError::Http(429))),
+            t0,
+        );
+        assert!(state.browser_error.is_none());
+        // Held for at least 2 s even though the 2 s interval has elapsed.
+        assert!(state.next_op(t0 + Duration::from_millis(2100)).is_none());
+        assert!(matches!(
+            state.next_op(t0 + Duration::from_secs(130)),
+            Some(PanelOp::Status)
+        ));
+    }
+
+    #[test]
+    fn poll_backoff_grows_honours_retry_after_and_is_capped() {
+        use crate::api::poll_backoff;
+        assert!(poll_backoff(1, 1, 0) >= Duration::from_secs(2));
+        assert!(poll_backoff(1, 3, 0) >= Duration::from_secs(8));
+        assert!(poll_backoff(30, 1, 0) >= Duration::from_secs(30));
+        assert!(poll_backoff(500, 9, 999) <= Duration::from_millis(150_000));
     }
 
     #[test]

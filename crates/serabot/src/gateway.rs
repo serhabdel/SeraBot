@@ -36,6 +36,29 @@ pub struct ToolSpec {
     pub external_effect: bool,
 }
 
+/// Tools that need owner approval: they delete or irreversibly overwrite
+/// user data, or send something to a third party that cannot be recalled.
+/// Every other tool runs on the model's judgement. Listed in
+/// `docs/approvals.md`; keep the two in sync.
+pub const DESTRUCTIVE_TOOLS: &[&str] = &[
+    "memory_delete",
+    "agentmail_send",
+    "telegram_send_document",
+    "onedrive_upload",
+];
+
+/// Risk class of a tool by name: true when it needs approval.
+pub fn is_destructive_tool(name: &str) -> bool {
+    DESTRUCTIVE_TOOLS.contains(&name)
+}
+
+impl ToolSpec {
+    /// True when the gateway requires approval before running this tool.
+    pub fn destructive(&self) -> bool {
+        is_destructive_tool(&self.name)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolContext {
     /// The acting user's id — the authoritative scope for every user-owned
@@ -177,6 +200,8 @@ pub struct Gateway {
     registry: ToolRegistry,
     approval_expiry: Duration,
     standing_consent: bool,
+    /// Honour bot `require_approval` lists for non-destructive tools.
+    respect_bot_lists: bool,
     /// Vault redaction source; `None` leaves tool output untouched.
     vault: Option<Arc<UserSecrets>>,
 }
@@ -195,8 +220,16 @@ impl Gateway {
             registry,
             approval_expiry: Duration::hours(approval_expiry_hours.max(1)),
             standing_consent,
+            respect_bot_lists: false,
             vault: None,
         }
+    }
+
+    /// Let bot `require_approval` lists add approval for non-destructive
+    /// tools (`approvals.respect_bot_lists`). Off by default.
+    pub fn with_respect_bot_lists(mut self, respect: bool) -> Self {
+        self.respect_bot_lists = respect;
+        self
     }
 
     /// Enable vault redaction: before tool output or a model request leaves
@@ -319,7 +352,8 @@ impl Gateway {
         let canonical = canonical_json(&args)?;
         let hash = canonical_hash(&args)?;
 
-        if spec.external_effect || context.require_approval.contains(name) {
+        if spec.destructive() || (self.respect_bot_lists && context.require_approval.contains(name))
+        {
             if let Some(output) = self.check_standing_grant(&spec, &args, &hash, context)? {
                 return self.dispatch(tool.as_ref(), args, context, output).await;
             }
@@ -856,7 +890,7 @@ mod tests {
     impl Tool for FakeExternal {
         fn spec(&self) -> ToolSpec {
             ToolSpec {
-                name: "upload".into(),
+                name: "onedrive_upload".into(),
                 description: "fake upload".into(),
                 parameters: serde_json::json!({"type": "object"}),
                 external_effect: true,
@@ -919,7 +953,7 @@ mod tests {
             task_id: Some(task.id),
             turn_id: None,
             conversation_id: None,
-            allowed_tools: ["upload".to_string()].into_iter().collect(),
+            allowed_tools: ["onedrive_upload".to_string()].into_iter().collect(),
             require_approval: HashSet::new(),
         };
         (gateway, calls, context)
@@ -929,7 +963,11 @@ mod tests {
     async fn external_tool_waits_for_approval() {
         let (gateway, calls, context) = setup();
         let outcome = gateway
-            .execute("upload", serde_json::json!({"dest": "folder"}), &context)
+            .execute(
+                "onedrive_upload",
+                serde_json::json!({"dest": "folder"}),
+                &context,
+            )
             .await
             .unwrap();
         assert!(matches!(outcome, ToolOutcome::PendingApproval { .. }));
@@ -940,7 +978,11 @@ mod tests {
     async fn once_approval_executes_and_cannot_be_reused() {
         let (gateway, calls, context) = setup();
         let outcome = gateway
-            .execute("upload", serde_json::json!({"dest": "folder"}), &context)
+            .execute(
+                "onedrive_upload",
+                serde_json::json!({"dest": "folder"}),
+                &context,
+            )
             .await
             .unwrap();
         let ToolOutcome::PendingApproval {
@@ -976,7 +1018,7 @@ mod tests {
             action_id,
             ..
         } = gateway
-            .execute("upload", args.clone(), &context)
+            .execute("onedrive_upload", args.clone(), &context)
             .await
             .unwrap()
         else {
@@ -989,10 +1031,17 @@ mod tests {
             .execute_approved(&action_id, &context)
             .await
             .unwrap();
-        let again = gateway.execute("upload", args, &context).await.unwrap();
+        let again = gateway
+            .execute("onedrive_upload", args, &context)
+            .await
+            .unwrap();
         assert!(matches!(again, ToolOutcome::Completed(_)));
         let changed = gateway
-            .execute("upload", serde_json::json!({"dest": "other"}), &context)
+            .execute(
+                "onedrive_upload",
+                serde_json::json!({"dest": "other"}),
+                &context,
+            )
             .await
             .unwrap();
         assert!(matches!(changed, ToolOutcome::PendingApproval { .. }));
@@ -1007,7 +1056,11 @@ mod tests {
             action_id,
             ..
         } = gateway
-            .execute("upload", serde_json::json!({"dest": "folder"}), &context)
+            .execute(
+                "onedrive_upload",
+                serde_json::json!({"dest": "folder"}),
+                &context,
+            )
             .await
             .unwrap()
         else {
@@ -1049,7 +1102,7 @@ mod tests {
             task_id: None,
             turn_id: None,
             conversation_id: None,
-            allowed_tools: ["upload".to_string()].into_iter().collect(),
+            allowed_tools: ["onedrive_upload".to_string()].into_iter().collect(),
             require_approval: HashSet::new(),
         };
         let ToolOutcome::PendingApproval {
@@ -1057,7 +1110,11 @@ mod tests {
             action_id,
             ..
         } = gateway
-            .execute("upload", serde_json::json!({"dest": "folder"}), &context)
+            .execute(
+                "onedrive_upload",
+                serde_json::json!({"dest": "folder"}),
+                &context,
+            )
             .await
             .unwrap()
         else {
@@ -1128,7 +1185,7 @@ mod tests {
         context.allowed_tools.clear();
         assert!(matches!(
             gateway
-                .execute("upload", serde_json::json!({}), &context)
+                .execute("onedrive_upload", serde_json::json!({}), &context)
                 .await,
             Err(SeraError::Forbidden(_))
         ));
@@ -1163,7 +1220,7 @@ mod tests {
             ..
         } = gateway
             .execute(
-                "upload",
+                "onedrive_upload",
                 serde_json::json!({"dest": "folder"}),
                 &admin_context,
             )
@@ -1179,7 +1236,7 @@ mod tests {
         // The member's identical call does not match the admin's grant...
         let member_outcome = gateway
             .execute(
-                "upload",
+                "onedrive_upload",
                 serde_json::json!({"dest": "folder"}),
                 &member_context,
             )
@@ -1247,7 +1304,7 @@ mod tests {
         };
         let ToolOutcome::PendingApproval { approval_id, .. } = gateway
             .execute(
-                "upload",
+                "onedrive_upload",
                 serde_json::json!({"dest": "member-folder"}),
                 &member_context,
             )
@@ -1293,7 +1350,11 @@ mod tests {
             action_id,
             ..
         } = gateway
-            .execute("upload", serde_json::json!({"dest": "folder"}), &context)
+            .execute(
+                "onedrive_upload",
+                serde_json::json!({"dest": "folder"}),
+                &context,
+            )
             .await
             .unwrap()
         else {
@@ -1323,7 +1384,11 @@ mod tests {
             action_id,
             ..
         } = gateway
-            .execute("upload", serde_json::json!({"dest": "folder"}), &context)
+            .execute(
+                "onedrive_upload",
+                serde_json::json!({"dest": "folder"}),
+                &context,
+            )
             .await
             .unwrap()
         else {
@@ -1380,7 +1445,7 @@ mod tests {
         };
         gateway
             .execute(
-                "upload",
+                "onedrive_upload",
                 serde_json::json!({"dest": "folder"}),
                 &member_context,
             )
@@ -1474,6 +1539,47 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_destructive_tools_skip_approval_unless_bot_lists_are_respected() {
+        let (gateway, _users, a, _b) = vault_gateway();
+        let mut context = vault_context(&a);
+        context.require_approval.insert("echo".into());
+        let outcome = gateway
+            .execute("echo", serde_json::json!({"text": "x"}), &context)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ToolOutcome::Completed(_)));
+        let strict = gateway.clone().with_respect_bot_lists(true);
+        let outcome = strict
+            .execute("echo", serde_json::json!({"text": "x"}), &context)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ToolOutcome::PendingApproval { .. }));
+    }
+
+    #[test]
+    fn destructive_classification_is_explicit() {
+        for name in [
+            "memory_delete",
+            "agentmail_send",
+            "telegram_send_document",
+            "onedrive_upload",
+        ] {
+            assert!(is_destructive_tool(name), "{name}");
+        }
+        for name in [
+            "browser_navigate",
+            "browser_click",
+            "browser_type",
+            "browser_press",
+            "firecrawl_search",
+            "memory_save",
+            "pdf_edit",
+        ] {
+            assert!(!is_destructive_tool(name), "{name}");
+        }
     }
 
     #[tokio::test]

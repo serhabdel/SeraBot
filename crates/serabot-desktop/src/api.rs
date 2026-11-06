@@ -16,6 +16,48 @@ pub use panel::*;
 
 const MAX_RESPONSE: u64 = 2 * 1024 * 1024;
 
+/// Seconds from the most recent `Retry-After` header on a 429 (0 = none seen).
+static LAST_RETRY_AFTER_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Remember the server's `Retry-After` when `response` is a 429.
+pub(crate) fn note_rate_limit(response: &reqwest::blocking::Response) {
+    if response.status().as_u16() != 429 {
+        return;
+    }
+    let secs = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    LAST_RETRY_AFTER_SECS.store(secs.min(300), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The `Retry-After` seconds from the latest 429, at least 1.
+pub fn last_retry_after_secs() -> u64 {
+    LAST_RETRY_AFTER_SECS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1)
+}
+
+/// Exponential backoff for background polls after a 429: the larger of the
+/// server's `Retry-After` and `2^attempt` seconds (cap 120 s), plus up to 25%
+/// jitter from `jitter_seed`.
+pub fn poll_backoff(retry_after_secs: u64, attempt: u32, jitter_seed: u64) -> Duration {
+    let exponential = 1u64 << attempt.clamp(1, 7);
+    let base = retry_after_secs.max(exponential).min(120);
+    let jitter_ms = (jitter_seed % 1000) * base * 250 / 1000;
+    Duration::from_millis(base * 1000 + jitter_ms)
+}
+
+/// A cheap jitter seed (sub-second clock noise); not security relevant.
+pub fn jitter_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApiError {
     Validation(&'static str),
@@ -52,9 +94,11 @@ impl fmt::Display for ApiError {
             Self::Http(422) => {
                 f.write_str("Rejected (422). The server did not accept the request.")
             }
-            Self::Http(429) => {
-                f.write_str("Rate limited (429). Wait at least one minute, then retry the read.")
-            }
+            Self::Http(429) => write!(
+                f,
+                "Too many requests right now. Trying again in {} seconds.",
+                last_retry_after_secs()
+            ),
             Self::Http(300..=399) => f.write_str(
                 "Server redirected the request. Redirects are disabled; check the server URL.",
             ),
@@ -1602,6 +1646,7 @@ impl ApiClient {
             request = request.json(body);
         }
         let response = request.send().map_err(|_| ApiError::Transport)?;
+        note_rate_limit(&response);
         let status = response.status();
         if !status.is_success() {
             return Err(ApiError::Http(status.as_u16()));
@@ -2883,6 +2928,7 @@ impl PublicApiClient {
             request = request.json(body);
         }
         let response = request.send().map_err(|_| ApiError::Transport)?;
+        note_rate_limit(&response);
         let status = response.status();
         if !status.is_success() {
             return Err(ApiError::Http(status.as_u16()));
