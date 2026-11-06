@@ -153,6 +153,7 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
 
     let mut editing = use_signal(|| false);
     let mut draft = use_signal(String::new);
+    let mut more_open = use_signal(|| false);
 
     let (open, in_control, busy, info, shot, error, bot_name) = {
         let s = session.read();
@@ -189,10 +190,13 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
         _ => ("pill", "idle"),
     };
     let control_text = match (active, controller) {
-        (true, Some(BrowserController::User)) => "You are in control".to_owned(),
-        (true, _) => format!("{bot_name} is in control"),
-        _ => "Nobody is in control".to_owned(),
+        (true, Some(BrowserController::User)) => {
+            "You're in control: click and type in the page. The bot is paused.".to_owned()
+        }
+        (true, _) => format!("{bot_name} is using the browser."),
+        _ => "Nobody is using the browser.".to_owned(),
     };
+    let has_shot = active && shot.is_some();
     let url_shown = if editing() { draft() } else { url.clone() };
     let url_text = if url.is_empty() {
         "No page open".to_owned()
@@ -208,8 +212,8 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
                 div { class: "dock-head",
                     strong { class: "dock-title", "Browser" }
                     span { class: "{pill_class}", role: "status", "{pill_label}" }
-                    span { class: "dock-control caption", "aria-live": "polite", "{control_text}" }
                 }
+                p { class: "dock-status caption", "aria-live": "polite", "{control_text}" }
                 if in_control {
                     div { class: "dock-url editable",
                         Icon { name: "globe", size: 14 }
@@ -250,7 +254,7 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
                 if let Some(title) = title.clone() {
                     div { class: "dock-title-line caption", title: "{title}", "{title}" }
                 }
-                div { class: "dock-view",
+                div { class: if has_shot { "dock-view has-shot" } else { "dock-view" },
                     if active && shot.is_some() {
                         div {
                             id: "dock-stage",
@@ -284,23 +288,54 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
                     div { class: "error-text dock-error", role: "alert", "{message}" }
                 }
                 div { class: "dock-foot",
-                    button {
-                        class: "btn primary",
-                        disabled: !active || in_control || busy,
-                        onclick: move |_| session.write().panel.take_over(),
-                        "Take over"
-                    }
-                    button {
-                        class: "btn",
-                        disabled: !in_control || busy,
-                        onclick: move |_| session.write().panel.hand_back(),
-                        "Hand back"
+                    if in_control {
+                        button {
+                            class: "btn primary",
+                            disabled: busy,
+                            onclick: move |_| session.write().panel.hand_back(),
+                            "Give control back"
+                        }
+                    } else {
+                        button {
+                            class: "btn primary",
+                            disabled: !active || busy,
+                            onclick: move |_| session.write().panel.take_over(),
+                            "Take control"
+                        }
                     }
                     button {
                         class: "btn ghost",
-                        disabled: !active,
-                        onclick: move |_| session.write().panel.close_browser(),
-                        "Close"
+                        title: "Hide this panel. The bot keeps working.",
+                        onclick: move |_| session.write().panel.hide(),
+                        "Hide panel"
+                    }
+                    div { class: "menu-wrap dock-more",
+                        button {
+                            class: "icon-btn",
+                            title: "More",
+                            "aria-label": "More",
+                            "aria-haspopup": "menu",
+                            "aria-expanded": if more_open() { "true" } else { "false" },
+                            onclick: move |_| more_open.set(!more_open()),
+                            Icon { name: "dots", size: 16 }
+                        }
+                        div {
+                            class: if more_open() { "menu top right open" } else { "menu top right" },
+                            onkeydown: move |event: KeyboardEvent| {
+                                if event.key() == Key::Escape {
+                                    more_open.set(false);
+                                }
+                            },
+                            button {
+                                class: "menu-item danger",
+                                disabled: !active,
+                                onclick: move |_| {
+                                    more_open.set(false);
+                                    session.write().panel.close_browser();
+                                },
+                                "End browser session"
+                            }
+                        }
                     }
                 }
             }

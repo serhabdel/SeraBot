@@ -44,6 +44,8 @@ pub enum PanelOp {
     Handback,
     Close,
     Input(BrowserInput),
+    OneDriveStart,
+    OneDriveDisconnect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +59,8 @@ pub enum PanelKind {
     Handback,
     Close,
     Input,
+    OneDriveStart,
+    OneDriveDisconnect,
 }
 
 impl PanelOp {
@@ -71,6 +75,8 @@ impl PanelOp {
             Self::Handback => PanelKind::Handback,
             Self::Close => PanelKind::Close,
             Self::Input(_) => PanelKind::Input,
+            Self::OneDriveStart => PanelKind::OneDriveStart,
+            Self::OneDriveDisconnect => PanelKind::OneDriveDisconnect,
         }
     }
 }
@@ -84,6 +90,8 @@ pub enum PanelReply {
     Control(BrowserInfo),
     Closed,
     Input(BrowserInfo),
+    OneDriveUrl(String),
+    OneDriveDisconnected,
 }
 
 pub struct PanelDone {
@@ -196,6 +204,10 @@ fn execute(job: &PanelJob, cache: &mut Option<ApiClient>) -> Result<PanelReply, 
         PanelOp::Handback => client.browser_handback().map(PanelReply::Control),
         PanelOp::Close => client.browser_close().map(|_| PanelReply::Closed),
         PanelOp::Input(input) => client.browser_input(input).map(PanelReply::Input),
+        PanelOp::OneDriveStart => client.onedrive_consent_start().map(PanelReply::OneDriveUrl),
+        PanelOp::OneDriveDisconnect => client
+            .onedrive_disconnect()
+            .map(|()| PanelReply::OneDriveDisconnected),
     }
 }
 
@@ -266,15 +278,15 @@ impl VaultForm {
             return true;
         }
         let Some(domain) = normalize_vault_domain(&draft) else {
-            self.domain_error = Some("Enter a host name such as example.com.".into());
+            self.domain_error = Some("Type just the site address, like example.com".into());
             return false;
         };
         if self.domains.contains(&domain) {
-            self.domain_error = Some("That domain is already listed.".into());
+            self.domain_error = Some("That site is already listed.".into());
             return false;
         }
         if self.domains.len() >= MAX_VAULT_DOMAINS {
-            self.domain_error = Some("At most 16 domains.".into());
+            self.domain_error = Some("You can list at most 16 sites.".into());
             return false;
         }
         self.domains.push(domain);
@@ -349,6 +361,30 @@ pub struct VaultView {
     want_list: bool,
 }
 
+/// The per-user OneDrive connect / disconnect flow behind the Connectors page.
+#[derive(Default)]
+pub struct OneDriveFlow {
+    /// A request is on its way.
+    pub busy: bool,
+    /// The consent page was opened; waiting for the user to finish there.
+    pub waiting: bool,
+    pub error: Option<String>,
+    pending_url: Option<String>,
+    refresh_due: bool,
+}
+
+impl OneDriveFlow {
+    /// The consent address to open in the system browser, once.
+    pub fn take_url(&mut self) -> Option<String> {
+        self.pending_url.take()
+    }
+
+    /// True once after a change the connector list should be re-read for.
+    pub fn take_refresh(&mut self) -> bool {
+        std::mem::take(&mut self.refresh_due)
+    }
+}
+
 // --------------------------------------------------------------- browser --
 
 pub struct PanelState {
@@ -359,8 +395,12 @@ pub struct PanelState {
     /// `data:` URI of the latest screenshot.
     pub shot: Option<String>,
     pub browser_error: Option<String>,
-    /// The user pressed Close; the dock stays shut until the session ends.
+    /// The user ended the session from the dock; it stays shut until the
+    /// session is gone.
     dismissed: bool,
+    /// The user hid the panel. The session keeps running; the header's
+    /// "Watch browser" button brings the panel back.
+    hidden: bool,
     status_inflight: bool,
     shot_inflight: bool,
     next_status: Instant,
@@ -369,6 +409,7 @@ pub struct PanelState {
     inputs_inflight: usize,
     pub control_busy: bool,
     pub vault: VaultView,
+    pub onedrive: OneDriveFlow,
 }
 
 impl PanelState {
@@ -381,6 +422,7 @@ impl PanelState {
             shot: None,
             browser_error: None,
             dismissed: false,
+            hidden: false,
             status_inflight: false,
             shot_inflight: false,
             next_status: now,
@@ -389,6 +431,7 @@ impl PanelState {
             inputs_inflight: 0,
             control_busy: false,
             vault: VaultView::default(),
+            onedrive: OneDriveFlow::default(),
         }
     }
 
@@ -399,9 +442,25 @@ impl PanelState {
         self.epoch = epoch;
     }
 
-    /// The dock is visible: the user's browser session is active.
-    pub fn open(&self) -> bool {
+    /// A browser session exists for the acting user (shown or hidden).
+    pub fn session_active(&self) -> bool {
         self.info.as_ref().is_some_and(|info| info.active) && !self.dismissed
+    }
+
+    /// The dock is visible: the session is active and the panel is not hidden.
+    pub fn open(&self) -> bool {
+        self.session_active() && !self.hidden
+    }
+
+    /// Hide the panel without touching the session.
+    pub fn hide(&mut self) {
+        self.hidden = true;
+    }
+
+    /// Bring the panel back and fetch a fresh frame at once.
+    pub fn show(&mut self) {
+        self.hidden = false;
+        self.next_shot = Instant::now();
     }
 
     pub fn user_in_control(&self) -> bool {
@@ -462,6 +521,26 @@ impl PanelState {
             return;
         }
         self.queue.push_back(PanelOp::Input(input));
+    }
+
+    /// Ask the server for the Microsoft consent page for the acting user.
+    pub fn connect_onedrive(&mut self) {
+        if self.onedrive.busy {
+            return;
+        }
+        self.onedrive.busy = true;
+        self.onedrive.error = None;
+        self.queue.push_back(PanelOp::OneDriveStart);
+    }
+
+    /// Forget the acting user's OneDrive on the server.
+    pub fn disconnect_onedrive(&mut self) {
+        if self.onedrive.busy {
+            return;
+        }
+        self.onedrive.busy = true;
+        self.onedrive.error = None;
+        self.queue.push_back(PanelOp::OneDriveDisconnect);
     }
 
     pub fn ask_vault_list(&mut self) {
@@ -568,6 +647,7 @@ impl PanelState {
                 self.inputs_inflight = self.inputs_inflight.saturating_sub(1);
             }
             PanelKind::Takeover | PanelKind::Handback => self.control_busy = false,
+            PanelKind::OneDriveStart | PanelKind::OneDriveDisconnect => self.onedrive.busy = false,
             _ => {}
         }
         match done.result {
@@ -585,6 +665,7 @@ impl PanelState {
         }
         if !info.active {
             self.dismissed = false;
+            self.hidden = false;
         }
         self.info = Some(info);
     }
@@ -606,6 +687,14 @@ impl PanelState {
                 if self.open() {
                     self.shot = Some(jpeg_data_uri(&bytes));
                 }
+            }
+            PanelReply::OneDriveUrl(url) => {
+                self.onedrive.pending_url = Some(url);
+                self.onedrive.waiting = true;
+            }
+            PanelReply::OneDriveDisconnected => {
+                self.onedrive.waiting = false;
+                self.onedrive.refresh_due = true;
             }
             PanelReply::VaultList(entries) => {
                 self.vault.entries = entries;
@@ -656,6 +745,9 @@ impl PanelState {
             PanelKind::Takeover | PanelKind::Handback | PanelKind::Input | PanelKind::Close => {
                 self.browser_error = Some(message);
                 self.next_status = now;
+            }
+            PanelKind::OneDriveStart | PanelKind::OneDriveDisconnect => {
+                self.onedrive.error = Some(message);
             }
             PanelKind::VaultList => {
                 self.vault.loading = false;
@@ -1188,6 +1280,120 @@ mod tests {
         assert_eq!(
             last_used_label(Some("2026-11-05T09:00:00Z")),
             "Last used 2026-11-05"
+        );
+    }
+
+    #[test]
+    fn hiding_the_panel_keeps_the_session_and_stops_the_picture() {
+        let mut state = PanelState::new();
+        let t0 = Instant::now();
+        state.apply(
+            done(
+                &state,
+                PanelKind::Status,
+                Ok(PanelReply::Status(info(true, BrowserController::Bot))),
+            ),
+            t0,
+        );
+        assert!(state.open() && state.session_active());
+        state.hide();
+        assert!(!state.open(), "the panel is hidden");
+        assert!(state.session_active(), "the session is still running");
+        // No screenshot is polled while hidden, and nothing is closed.
+        let later = t0 + Duration::from_secs(5);
+        let mut ops = Vec::new();
+        while let Some(op) = state.next_op(later) {
+            ops.push(op.kind());
+        }
+        assert!(!ops.contains(&PanelKind::Shot));
+        assert!(!ops.contains(&PanelKind::Close));
+        state.show();
+        assert!(state.open());
+        // A session that ends resets the hidden flag for the next one.
+        state.hide();
+        state.apply(
+            done(
+                &state,
+                PanelKind::Status,
+                Ok(PanelReply::Status(info(false, BrowserController::Bot))),
+            ),
+            later,
+        );
+        state.apply(
+            done(
+                &state,
+                PanelKind::Status,
+                Ok(PanelReply::Status(info(true, BrowserController::Bot))),
+            ),
+            later,
+        );
+        assert!(state.open(), "a fresh session opens the panel again");
+    }
+
+    #[test]
+    fn onedrive_connect_hands_back_one_consent_address() {
+        let mut state = PanelState::new();
+        let t0 = Instant::now();
+        state.connect_onedrive();
+        assert!(state.onedrive.busy);
+        state.connect_onedrive();
+        assert!(matches!(state.next_op(t0), Some(PanelOp::OneDriveStart)));
+        assert!(
+            !matches!(state.next_op(t0), Some(PanelOp::OneDriveStart)),
+            "a second click while busy queues nothing"
+        );
+        state.apply(
+            done(
+                &state,
+                PanelKind::OneDriveStart,
+                Ok(PanelReply::OneDriveUrl(
+                    "https://login.example.test/consent".into(),
+                )),
+            ),
+            t0,
+        );
+        assert!(!state.onedrive.busy && state.onedrive.waiting);
+        assert_eq!(
+            state.onedrive.take_url().as_deref(),
+            Some("https://login.example.test/consent")
+        );
+        assert_eq!(state.onedrive.take_url(), None, "opened once");
+    }
+
+    #[test]
+    fn onedrive_disconnect_asks_for_a_fresh_connector_list() {
+        let mut state = PanelState::new();
+        let t0 = Instant::now();
+        state.disconnect_onedrive();
+        assert!(matches!(
+            state.next_op(t0),
+            Some(PanelOp::OneDriveDisconnect)
+        ));
+        state.apply(
+            done(
+                &state,
+                PanelKind::OneDriveDisconnect,
+                Ok(PanelReply::OneDriveDisconnected),
+            ),
+            t0,
+        );
+        assert!(state.onedrive.take_refresh());
+        assert!(!state.onedrive.take_refresh());
+        state.apply(
+            done(&state, PanelKind::OneDriveStart, Err(ApiError::Http(403))),
+            t0,
+        );
+        assert!(state.onedrive.error.is_some() && !state.onedrive.busy);
+    }
+
+    #[test]
+    fn domain_errors_use_plain_words() {
+        let mut form = VaultForm::new();
+        form.domain_draft = "https://bad".into();
+        assert!(!form.commit_domain());
+        assert_eq!(
+            form.domain_error.as_deref(),
+            Some("Type just the site address, like example.com")
         );
     }
 }

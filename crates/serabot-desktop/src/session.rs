@@ -663,6 +663,12 @@ impl Session {
                 break;
             }
         }
+        if let Some(url) = self.panel.onedrive.take_url() {
+            self.open_in_browser(url);
+        }
+        if self.panel.onedrive.take_refresh() {
+            self.refresh_connectors();
+        }
         if unauthorized {
             self.reject_token();
         }
@@ -2669,6 +2675,21 @@ impl Session {
 
     pub fn refresh_connectors(&mut self) {
         self.start_request(Operation::Connectors);
+    }
+
+    /// The signed-in user is an administrator (developer fields stay hidden
+    /// from everyone else).
+    pub fn is_admin(&self) -> bool {
+        self.state
+            .user
+            .as_ref()
+            .is_some_and(|user| user.role == "admin")
+    }
+
+    /// Key-based connector: turn it on and save the pasted key in one step.
+    pub fn add_connector_key(&mut self, id: String) {
+        self.connector_drafts.entry(id.clone()).or_default().enabled = true;
+        self.save_connector(id);
     }
 
     pub fn can_admin(&self) -> bool {

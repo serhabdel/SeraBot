@@ -131,6 +131,26 @@ struct DeletedAck {
 }
 
 #[derive(Deserialize)]
+struct OneDriveStartAck {
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct OneDriveDisconnectAck {
+    #[serde(default)]
+    connected: bool,
+}
+
+/// The consent address must be a plain `https` URL of sane length.
+pub(crate) fn check_consent_url(raw: &str) -> Result<(), ApiError> {
+    let parsed = url::Url::parse(raw).map_err(|_| ApiError::InvalidResponse)?;
+    if raw.len() > 4096 || parsed.scheme() != "https" || parsed.host_str().is_none() {
+        return Err(ApiError::InvalidResponse);
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClosedAck {
     closed: bool,
@@ -494,5 +514,29 @@ impl ApiClient {
         let ack: ClosedAck =
             self.panel_json::<_, ()>(Method::POST, &["v1", "browser", "close"], None)?;
         Ok(ack.closed)
+    }
+
+    /// `POST /v1/connectors/onedrive/start`: the Microsoft consent page for
+    /// the acting user. Only an `https` address is accepted back; the caller
+    /// opens it in the system browser.
+    pub fn onedrive_consent_start(&self) -> Result<String, ApiError> {
+        let ack: OneDriveStartAck = self.panel_json::<_, ()>(
+            Method::POST,
+            &["v1", "connectors", "onedrive", "start"],
+            None,
+        )?;
+        check_consent_url(&ack.url)?;
+        Ok(ack.url)
+    }
+
+    /// `DELETE /v1/connectors/onedrive`: forget the acting user's OneDrive.
+    pub fn onedrive_disconnect(&self) -> Result<(), ApiError> {
+        let ack: OneDriveDisconnectAck =
+            self.panel_json::<_, ()>(Method::DELETE, &["v1", "connectors", "onedrive"], None)?;
+        if ack.connected {
+            Err(ApiError::InvalidResponse)
+        } else {
+            Ok(())
+        }
     }
 }

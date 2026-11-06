@@ -842,6 +842,7 @@ mod tests {
                 auth: None,
                 auth_modes: Vec::new(),
                 oauth: None,
+                connected: None,
             }]),
         );
         assert!(state.providers_loaded);
