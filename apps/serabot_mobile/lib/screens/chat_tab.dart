@@ -102,7 +102,7 @@ class _ChatTabState extends State<ChatTab> {
         setState(() => _trackedStatus = t.status);
       }
     } on ApiException catch (e) {
-      if (e.statusCode == 429) {
+      if (e.statusCode == 429 && mounted) {
         setState(() => _banner = e.messageForUser());
       }
     } catch (_) {
@@ -113,6 +113,9 @@ class _ChatTabState extends State<ChatTab> {
   Future<void> _loadHistory({bool silent = false}) async {
     try {
       await _throttle();
+      if (!mounted || !widget.session.connected) {
+        return;
+      }
       final items =
           await widget.session.client.history(widget.session.conversationId);
       if (!mounted) {
@@ -126,7 +129,7 @@ class _ChatTabState extends State<ChatTab> {
       });
       _scrollToEnd();
     } on ApiException catch (e) {
-      if (!silent) {
+      if (!silent && mounted) {
         setState(() => _banner = e.messageForUser());
       }
     }
@@ -135,6 +138,9 @@ class _ChatTabState extends State<ChatTab> {
   Future<void> _loadModels() async {
     try {
       await _throttle();
+      if (!mounted || !widget.session.connected) {
+        return;
+      }
       final catalog =
           await widget.session.client.models(widget.session.conversationId);
       if (!mounted) {
@@ -145,7 +151,9 @@ class _ChatTabState extends State<ChatTab> {
         _pendingSelection ??= catalog.selection;
       });
     } on ApiException catch (e) {
-      setState(() => _banner = e.messageForUser());
+      if (mounted) {
+        setState(() => _banner = e.messageForUser());
+      }
     }
   }
 
@@ -177,7 +185,7 @@ class _ChatTabState extends State<ChatTab> {
       setState(() {
         if (e.unknownOutcome) {
           _banner =
-              '${e.messageForUser()} Outcome unknown — check server history before resending.';
+              '${e.messageForUser()} Outcome unknown â€” check server history before resending.';
         } else {
           _banner = e.messageForUser();
         }
@@ -360,7 +368,7 @@ class _ChatTabState extends State<ChatTab> {
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
             child: Text(
-              'Task ${_trackedTaskId!.substring(0, 8)}… — ${_trackedStatus!.label}',
+              'Task ${_trackedTaskId!.substring(0, 8)}â€¦ â€” ${_trackedStatus!.label}',
               style: Theme.of(context).textTheme.bodySmall,
             ),
           ),

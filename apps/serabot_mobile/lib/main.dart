@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+﻿import 'package:flutter/material.dart';
 
 import 'screens/connect_screen.dart';
 import 'screens/home_screen.dart';
@@ -6,29 +6,57 @@ import 'session.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(const SeraBotMobileApp());
+  runApp(SeraBotMobileApp(session: OwnerSession()));
 }
 
 class SeraBotMobileApp extends StatefulWidget {
-  const SeraBotMobileApp({super.key});
+  const SeraBotMobileApp({super.key, required this.session});
+
+  final OwnerSession session;
 
   @override
   State<SeraBotMobileApp> createState() => _SeraBotMobileAppState();
 }
 
 class _SeraBotMobileAppState extends State<SeraBotMobileApp> {
-  final _session = OwnerSession();
-  bool _connected = false;
+  bool _restoring = true;
+
+  OwnerSession get _session => widget.session;
+
+  @override
+  void initState() {
+    super.initState();
+    _session.addListener(_onChanged);
+    _session.restore().whenComplete(() {
+      if (mounted) {
+        setState(() => _restoring = false);
+      }
+    });
+  }
+
+  void _onChanged() {
+    if (mounted) {
+      setState(() {});
+    }
+  }
 
   @override
   void dispose() {
-    _session.disconnect(notify: false);
+    _session.removeListener(_onChanged);
     _session.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final Widget home;
+    if (_restoring) {
+      home = const Scaffold(body: Center(child: CircularProgressIndicator()));
+    } else if (_session.connected) {
+      home = HomeScreen(session: _session);
+    } else {
+      home = ConnectScreen(session: _session);
+    }
     return MaterialApp(
       title: 'SeraBot',
       theme: ThemeData(
@@ -36,15 +64,7 @@ class _SeraBotMobileAppState extends State<SeraBotMobileApp> {
         useMaterial3: true,
         materialTapTargetSize: MaterialTapTargetSize.padded,
       ),
-      home: _connected
-          ? HomeScreen(
-              session: _session,
-              onDisconnect: () => setState(() => _connected = false),
-            )
-          : ConnectScreen(
-              session: _session,
-              onConnected: () => setState(() => _connected = true),
-            ),
+      home: home,
     );
   }
 }

@@ -8,10 +8,9 @@ import 'fleet_tab.dart';
 import 'voice_tab.dart';
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key, required this.session, required this.onDisconnect});
+  const HomeScreen({super.key, required this.session});
 
   final OwnerSession session;
-  final VoidCallback onDisconnect;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -20,17 +19,26 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   int _index = 0;
 
-  void _disconnect() {
-    widget.session.disconnect();
-    widget.onDisconnect();
-  }
+  Future<void> _signOut() => widget.session.signOut();
 
   @override
   Widget build(BuildContext context) {
     final version = widget.session.serverVersion;
+    final user = widget.session.user;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('SeraBot'),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('SeraBot'),
+            if (user != null)
+              Text(
+                user.label,
+                style: Theme.of(context).textTheme.bodySmall,
+                overflow: TextOverflow.ellipsis,
+              ),
+          ],
+        ),
         actions: [
           if (version != null && version.isNotEmpty)
             Center(
@@ -39,7 +47,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: Text('v$version', style: Theme.of(context).textTheme.bodySmall),
               ),
             ),
-          TextButton(onPressed: _disconnect, child: const Text('Disconnect')),
+          TextButton(onPressed: _signOut, child: const Text('Sign out')),
         ],
       ),
       body: IndexedStack(

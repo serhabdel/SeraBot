@@ -560,3 +560,34 @@ extension ApprovalDecisionX on ApprovalDecision {
     }
   }
 }
+
+/// The signed-in user, as returned by the handoff and GET /v1/me.
+class UserInfo {
+  const UserInfo({
+    required this.id,
+    required this.email,
+    required this.displayName,
+    required this.role,
+  });
+
+  factory UserInfo.fromJson(Map<String, dynamic> json) {
+    final id = json['id'];
+    if (id == null) {
+      throw const FormatException('user id missing');
+    }
+    return UserInfo(
+      id: id.toString(),
+      email: json['email'] as String? ?? '',
+      displayName: json['display_name'] as String? ?? '',
+      role: json['role'] as String? ?? '',
+    );
+  }
+
+  final String id;
+  final String email;
+  final String displayName;
+  final String role;
+
+  /// Name to show in the UI: display name, else email.
+  String get label => displayName.isNotEmpty ? displayName : email;
+}
