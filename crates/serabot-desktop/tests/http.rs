@@ -1352,3 +1352,229 @@ fn conversation_rows_carry_a_validated_last_message_preview() {
     let page = client.list_conversations(50, None, false).unwrap();
     assert!(page.conversations[0].last_message.is_none());
 }
+
+const SESSION: &str = r#"{"id":"work","profile_name":"Work","active":true,"url":"https://example.test/","title":"Example","controller":"bot","bot":"main","conversation_id":"dir:main","updated_at":"2026-11-06T12:00:00Z"}"#;
+
+#[test]
+fn browser_profiles_use_their_routes_and_bodies() {
+    let profile = r#"{"id":"work","name":"Work","is_default":false,"bots":["main"],"created_at":"2026-11-01T00:00:00Z"}"#;
+    let (client, handle) = server(vec![
+        (
+            200,
+            format!(
+                r#"{{"profiles":[{{"id":"default","name":"Default","is_default":true,"bots":[],"created_at":"t"}},{profile}]}}"#
+            ),
+        ),
+        (200, profile.into()),
+        (200, profile.into()),
+        (200, r#"{"deleted":true}"#.into()),
+        (
+            409,
+            r#"{"error":"the default profile cannot be deleted"}"#.into(),
+        ),
+    ]);
+    let profiles = client.browser_profiles().unwrap();
+    assert_eq!(profiles.len(), 2);
+    assert_eq!(serabot_desktop::profile_for_bot(&profiles, "main"), "work");
+    assert_eq!(client.browser_profile_create("  Work ").unwrap().id, "work");
+    assert_eq!(
+        client.browser_profile_rename("work", "Shop").unwrap().id,
+        "work"
+    );
+    client.browser_profile_delete("work").unwrap();
+    // Refused before the network: the default profile, bad ids and names.
+    assert!(matches!(
+        client.browser_profile_delete("default"),
+        Err(ApiError::Validation(_))
+    ));
+    assert!(matches!(
+        client.browser_profile_rename("../x", "Shop"),
+        Err(ApiError::Validation(_))
+    ));
+    assert!(matches!(
+        client.browser_profile_create("   "),
+        Err(ApiError::Validation(_))
+    ));
+    // The server's own refusal is shown as written.
+    assert_eq!(
+        client.browser_profile_rename("default", "x2"),
+        Err(ApiError::Rejected(
+            "the default profile cannot be deleted".into()
+        ))
+    );
+
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("GET /v1/browser/profiles "));
+    assert!(requests[1].starts_with("POST /v1/browser/profiles "));
+    assert_eq!(body_of(&requests[1]), serde_json::json!({"name":"Work"}));
+    assert!(requests[2].starts_with("PUT /v1/browser/profiles/work "));
+    assert_eq!(body_of(&requests[2]), serde_json::json!({"name":"Shop"}));
+    assert!(requests[3].starts_with("DELETE /v1/browser/profiles/work "));
+    assert!(requests[4].starts_with("PUT /v1/browser/profiles/default "));
+}
+
+#[test]
+fn browser_sessions_route_every_action_by_session_id() {
+    use serabot_desktop::{BrowserController, BrowserInput};
+    let user = SESSION.replace("\"controller\":\"bot\"", "\"controller\":\"user\"");
+    let (client, handle) = server(vec![
+        (200, format!(r#"{{"sessions":[{SESSION}]}}"#)),
+        (200, user.clone()),
+        (200, user.clone()),
+        (200, SESSION.into()),
+        (200, r#"{"closed":true}"#.into()),
+    ]);
+    let sessions = client.browser_sessions().unwrap();
+    assert_eq!(sessions[0].id, "work");
+    assert_eq!(sessions[0].conversation_id.as_deref(), Some("dir:main"));
+    assert_eq!(
+        client.browser_session_takeover("work").unwrap().controller,
+        BrowserController::User
+    );
+    client
+        .browser_session_input("work", &BrowserInput::Click { x: 1.0, y: 2.0 })
+        .unwrap();
+    assert_eq!(
+        client.browser_session_handback("work").unwrap().controller,
+        BrowserController::Bot
+    );
+    assert!(client.browser_session_close("work").unwrap());
+    // Bad ids never reach the network.
+    for bad in ["", "../default", "Work", "a b"] {
+        assert!(matches!(
+            client.browser_session_takeover(bad),
+            Err(ApiError::Validation(_))
+        ));
+        assert!(matches!(
+            client.browser_session_screenshot(bad),
+            Err(ApiError::Validation(_))
+        ));
+    }
+    let requests = handle.join().unwrap();
+    let routes = [
+        "GET /v1/browser/sessions ",
+        "POST /v1/browser/sessions/work/takeover ",
+        "POST /v1/browser/sessions/work/input ",
+        "POST /v1/browser/sessions/work/handback ",
+        "POST /v1/browser/sessions/work/close ",
+    ];
+    for (request, route) in requests.iter().zip(routes) {
+        assert!(request.starts_with(route), "{request}");
+    }
+    assert_eq!(
+        body_of(&requests[2]),
+        serde_json::json!({"type":"click","x":1.0,"y":2.0})
+    );
+}
+
+#[test]
+fn a_session_screenshot_is_jpeg_capped_and_per_session() {
+    let (client, handle) = raw_server(vec![
+        (200, "image/jpeg", vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3]),
+        (200, "image/png", vec![0x89, b'P', b'N', b'G']),
+        (
+            404,
+            "application/json",
+            br#"{"error":"no session"}"#.to_vec(),
+        ),
+    ]);
+    assert_eq!(client.browser_session_screenshot("work").unwrap().len(), 7);
+    assert_eq!(
+        client.browser_session_screenshot("work"),
+        Err(ApiError::InvalidResponse)
+    );
+    assert_eq!(
+        client.browser_session_screenshot("work"),
+        Err(ApiError::Http(404))
+    );
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("GET /v1/browser/sessions/work/screenshot "));
+}
+
+#[test]
+fn session_lists_with_unsafe_values_are_refused() {
+    let bad = SESSION.replace("\"id\":\"work\"", "\"id\":\"../work\"");
+    let (client, _handle) = server(vec![
+        (200, format!(r#"{{"sessions":[{bad}]}}"#)),
+        (
+            200,
+            format!(r#"{{"sessions":[{}]}}"#, [SESSION; 9].join(",")),
+        ),
+    ]);
+    assert_eq!(client.browser_sessions(), Err(ApiError::InvalidResponse));
+    assert_eq!(client.browser_sessions(), Err(ApiError::InvalidResponse));
+}
+
+#[test]
+fn bot_settings_save_sends_only_what_changed_and_null_for_defaults() {
+    use serabot_desktop::{BotSettingsUpdate, ModelPick};
+    let (client, handle) = server(vec![
+        (200, r#"{"ok":true}"#.into()),
+        (200, r#"{"ok":true}"#.into()),
+        (422, r#"{"error":"display_name is too long"}"#.into()),
+    ]);
+    client
+        .update_bot(
+            "main",
+            &BotSettingsUpdate {
+                display_name: Some("  Mia ".into()),
+                model: Some(Some(ModelPick {
+                    provider: "openai".into(),
+                    model: "gpt-x".into(),
+                })),
+                browser_profile: Some(Some("work".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    client
+        .update_bot(
+            "scribe",
+            &BotSettingsUpdate {
+                model: Some(None),
+                browser_profile: Some(None),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // Refused locally, before any request.
+    assert!(matches!(
+        client.update_bot(
+            "main",
+            &BotSettingsUpdate {
+                display_name: Some("x".repeat(49)),
+                ..Default::default()
+            }
+        ),
+        Err(ApiError::Validation(_))
+    ));
+    assert!(matches!(
+        client.update_bot("Bad Id", &BotSettingsUpdate::default()),
+        Err(ApiError::Validation(_))
+    ));
+    // A server refusal keeps its message.
+    assert_eq!(
+        client.update_bot(
+            "main",
+            &BotSettingsUpdate {
+                description: Some("ok".into()),
+                ..Default::default()
+            }
+        ),
+        Err(ApiError::Rejected("display_name is too long".into()))
+    );
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("PUT /v1/bots/main "));
+    assert_eq!(
+        body_of(&requests[0]),
+        serde_json::json!({
+            "display_name":"Mia",
+            "model":{"provider":"openai","model":"gpt-x"},
+            "browser_profile":"work"
+        })
+    );
+    assert_eq!(
+        body_of(&requests[1]),
+        serde_json::json!({"model":null,"browser_profile":null})
+    );
+}

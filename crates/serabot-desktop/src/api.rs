@@ -11,8 +11,10 @@ use std::{
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
+mod browser;
 mod panel;
 mod profiles;
+pub use browser::*;
 pub use panel::*;
 pub use profiles::*;
 
@@ -768,6 +770,9 @@ pub struct BotDetail {
     pub memory_count: i64,
     #[serde(default)]
     pub artifact_count: i64,
+    /// The browser profile this bot uses; `None` means the default profile.
+    #[serde(default)]
+    pub browser_profile: Option<String>,
 }
 
 /// Body of `PUT /v1/admin/bots/{id}/config`. Every field is optional; the
@@ -3413,7 +3418,11 @@ fn check_bot_detail(detail: BotDetail) -> Result<BotDetail, ApiError> {
             .iter()
             .any(|tool| !valid_speaker(tool) || !detail.tools.iter().any(|listed| listed == tool))
         || detail.memory_count < 0
-        || detail.artifact_count < 0;
+        || detail.artifact_count < 0
+        || detail
+            .browser_profile
+            .as_deref()
+            .is_some_and(|profile| !valid_profile_id(profile));
     if bad {
         return Err(ApiError::InvalidResponse);
     }

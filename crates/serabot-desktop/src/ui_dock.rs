@@ -1,7 +1,7 @@
 //! Right-hand dock (design B, contract section 3): the live server browser.
 //!
 //! The dock is always mounted so it can slide in from, and leave towards, the
-//! right edge. `PanelState` (see `panel.rs`) polls `GET /v1/browser` every two
+//! right edge. `PanelState` (see `panel.rs`) polls `GET /v1/browser/sessions` every two
 //! seconds while the window is focused, flips the dock open while the acting
 //! user has an active session, and polls the screenshot at most twice a
 //! second while the dock is visible. While the user holds control, clicks,
@@ -157,19 +157,26 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
 
     let (open, in_control, busy, info, shot, error, bot_name) = {
         let s = session.read();
-        let bot_name = s
-            .state
-            .listed_bots
-            .iter()
-            .find(|bot| bot.role == "orchestrator")
-            .map(|bot| s.bot_display_name(&bot.id))
+        let driving = s
+            .panel
+            .session(&s.panel.dock_profile)
+            .and_then(|session| session.bot.clone())
+            .or_else(|| {
+                s.state
+                    .listed_bots
+                    .iter()
+                    .find(|bot| bot.role == "orchestrator")
+                    .map(|bot| bot.id.clone())
+            });
+        let bot_name = driving
+            .map(|bot| s.bot_display_name(&bot))
             .unwrap_or_else(|| "The bot".to_owned());
         (
             s.panel.open(),
             s.panel.user_in_control(),
             s.panel.control_busy,
             s.panel.info.clone(),
-            s.panel.shot.clone(),
+            s.panel.dock_shot(),
             s.panel.browser_error.clone(),
             bot_name,
         )

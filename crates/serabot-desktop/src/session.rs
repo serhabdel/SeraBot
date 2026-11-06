@@ -4,10 +4,10 @@
 //! the worker and SSE threads, never on the UI thread.
 
 use crate::{
-    ApiClient, ApiError, ApprovalDecision, AudioUpdate, BotConfigUpdate, BotProfileUpdate,
-    ConnectorUpdate, ConversationKind, MAX_SKILL_BODY_BYTES, MAX_SKILL_DESCRIPTION_CHARS,
-    MAX_USAGE_DAYS, Message, NewGroup, NewProvider, Role, SPECIALIST_TOOLS, Selection, SignedIn,
-    TaskStatus, TeamMode, TelegramLink, TelegramStatus, VoiceSettings, VoiceUpdate,
+    ApiClient, ApiError, ApprovalDecision, AudioUpdate, BotConfigUpdate, ConnectorUpdate,
+    ConversationKind, MAX_SKILL_BODY_BYTES, MAX_SKILL_DESCRIPTION_CHARS, MAX_USAGE_DAYS, Message,
+    NewGroup, NewProvider, Role, SPECIALIST_TOOLS, Selection, SignedIn, TaskStatus, TeamMode,
+    TelegramLink, TelegramStatus, VoiceSettings, VoiceUpdate,
     api::{
         MEMORY_KINDS, valid_conversation_title, valid_credential, valid_memory_content,
         valid_memory_kind, valid_memory_source, valid_model_id, valid_provider_id,
@@ -24,8 +24,10 @@ use crate::{
     valid_text, valid_token, validate_bot_config_update, validate_team_members, validate_tool_list,
     worker::{Credentials, Job, Operation, OperationKind, Reply, Worker},
 };
+mod bot_settings;
 mod flows;
 
+pub use bot_settings::{BotDraft, BotSettings, SettingsTab, model_pick, model_value};
 use flows::AvatarOp;
 pub use flows::{ImageSlot, NewBotDraft, NewGroupDraft, OnboardingUi, PickedImage};
 use secrecy::ExposeSecret;
@@ -118,19 +120,21 @@ pub enum Section {
     Providers,
     Connectors,
     Approvals,
-    Fleet,
+    Browser,
+    Vault,
     Settings,
 }
 
 impl Section {
-    pub const NAV: [Self; 7] = [
+    pub const NAV: [Self; 8] = [
         Self::Chat,
         Self::Conversations,
+        Self::Browser,
         Self::Memory,
         Self::Providers,
         Self::Connectors,
         Self::Approvals,
-        Self::Fleet,
+        Self::Vault,
     ];
 
     pub fn label(self) -> &'static str {
@@ -141,7 +145,8 @@ impl Section {
             Self::Providers => "Providers",
             Self::Connectors => "Connectors",
             Self::Approvals => "Approvals",
-            Self::Fleet => "Fleet",
+            Self::Browser => "Browser",
+            Self::Vault => "Vault",
             Self::Settings => "Settings",
         }
     }
@@ -292,14 +297,6 @@ pub struct VoiceDraft {
     pub ocr_enabled: bool,
     pub reply_mode: String,
     pub max_speech_chars: usize,
-}
-
-#[derive(Default)]
-pub struct BotProfileDraft {
-    pub id: String,
-    pub display_name: String,
-    pub description: String,
-    pub avatar: String,
 }
 
 pub struct RenameDraft {
@@ -478,8 +475,8 @@ pub struct Session {
     pub audio: AudioDraft,
     /// Editable copy of the voice/OCR settings surface.
     pub voice: VoiceDraft,
-    pub selected_bot: Option<String>,
-    pub bot_profile: BotProfileDraft,
+    /// The bot settings panel (0.16).
+    pub bot_settings: BotSettings,
     pub admin_notice: Option<String>,
     /// Connector whose Test probe is in flight.
     pub connector_testing: Option<String>,
@@ -607,8 +604,7 @@ impl Session {
             connector_drafts: BTreeMap::new(),
             audio: AudioDraft::default(),
             voice: VoiceDraft::default(),
-            selected_bot: None,
-            bot_profile: BotProfileDraft::default(),
+            bot_settings: BotSettings::default(),
             admin_notice: None,
             connector_testing: None,
             oauth_signing_in: None,
@@ -684,6 +680,25 @@ impl Session {
         };
         let now = Instant::now();
         let mut unauthorized = false;
+        // Point the dock at the browser of the bot being talked to, and tell
+        // the scheduler whether the Browser page is on screen.
+        let chat_bot = self
+            .conversation
+            .strip_prefix("dir:")
+            .map(str::to_owned)
+            .or_else(|| {
+                self.state
+                    .listed_bots
+                    .iter()
+                    .find(|bot| bot.role == "orchestrator")
+                    .map(|bot| bot.id.clone())
+            });
+        if let Some(bot) = chat_bot {
+            let profile = crate::profile_for_bot(&self.panel.profiles, &bot);
+            self.panel.set_dock_profile(&profile);
+        }
+        self.panel.set_page_open(self.section == Section::Browser);
+        self.panel.ensure_profiles();
         while let Some(done) = worker.try_recv() {
             unauthorized |= self.panel.apply(done, now);
         }
@@ -809,8 +824,7 @@ impl Session {
             self.creating_named_bot = false;
             self.pending_open_group = None;
             crate::avatars::publish(&std::collections::BTreeMap::new());
-            self.selected_bot = None;
-            self.bot_profile = BotProfileDraft::default();
+            self.bot_settings = BotSettings::default();
             self.memory.content.zeroize();
             self.memory.delete_confirm = None;
         }
@@ -930,8 +944,9 @@ impl Session {
 
     pub fn open_section(&mut self, section: Section) {
         self.section = section;
-        if section != Section::Fleet {
-            self.selected_bot = None;
+        self.panel.set_page_open(section == Section::Browser);
+        if section == Section::Vault {
+            self.panel.ask_vault_list();
         }
         if section == Section::Settings {
             self.refresh_status();
@@ -1457,7 +1472,11 @@ impl Session {
         }
         self.conversation = id;
         self.section = Section::Chat;
-        self.selected_bot = None;
+        self.panel.set_page_open(false);
+        if self.bot_settings.open {
+            // The panel follows the chat; unsaved edits stay with the old bot.
+            self.open_settings_for_conversation();
+        }
         let has_models = !self.state.providers.is_empty()
             || self
                 .state
@@ -1476,32 +1495,6 @@ impl Session {
         // A dir: conversation is a one-to-one bot chat: load that bot's
         // detail right behind the transcript, like the catalog chain.
         self.schedule_open_bot_detail();
-    }
-
-    pub fn open_bot(&mut self, id: String) {
-        if !valid_id(&id) {
-            return;
-        }
-        self.selected_bot = Some(id.clone());
-        self.section = Section::Fleet;
-        self.bot_profile = match self.state.listed_bots.iter().find(|bot| bot.id == id) {
-            Some(bot) => BotProfileDraft {
-                id: bot.id.clone(),
-                display_name: self.bot_display_name(&bot.id),
-                description: bot.description.clone().unwrap_or_default(),
-                avatar: bot.avatar.clone().unwrap_or_default(),
-            },
-            None => BotProfileDraft {
-                id,
-                ..BotProfileDraft::default()
-            },
-        };
-        self.ensure_section_data();
-    }
-
-    pub fn close_bot(&mut self) {
-        self.selected_bot = None;
-        self.bot_profile = BotProfileDraft::default();
     }
 
     /// Schedule a detail load for the bot of the open `dir:` conversation,
@@ -1601,6 +1594,27 @@ impl Session {
         }
     }
 
+    /// Open the Browser page's focus view on one session, showing the
+    /// conversation of the bot that drives it next to the live page.
+    pub fn focus_browser(&mut self, id: &str) {
+        let conversation = self.panel.session(id).and_then(|session| {
+            session
+                .conversation_id
+                .clone()
+                .or_else(|| session.bot.as_ref().map(|bot| format!("dir:{bot}")))
+        });
+        if let Some(conversation) = conversation
+            && conversation != self.conversation
+            && valid_id(&conversation)
+        {
+            self.open_conversation(conversation);
+        }
+        // The chat opens in place: the page stays the Browser page.
+        self.section = Section::Browser;
+        self.panel.set_page_open(true);
+        self.panel.focus_session(id);
+    }
+
     pub fn open_bot_chat(&mut self, id: String) {
         if self.state.bot_chat_binding != Some(true) {
             self.state.error = Some(
@@ -1609,43 +1623,7 @@ impl Session {
             );
             return;
         }
-        self.selected_bot = None;
         self.open_conversation(format!("dir:{id}"));
-    }
-
-    pub fn save_bot_profile(&mut self) {
-        self.admin_error = None;
-        self.admin_notice = None;
-        let name = self.bot_profile.display_name.trim().to_owned();
-        if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
-            self.admin_error = Some("Bot display name must be 1–64 visible characters.".into());
-            return;
-        }
-        if self.bot_profile.avatar.chars().count() > 16
-            || self.bot_profile.avatar.chars().any(char::is_control)
-        {
-            self.admin_error = Some("Bot avatar must be a short label or emoji.".into());
-            return;
-        }
-        if self.state.bot_profiles != Some(true) {
-            self.admin_error = Some(
-                "This server does not store bot profiles. Update the server to 0.5.0 or later."
-                    .into(),
-            );
-            return;
-        }
-        if !self.can_admin() {
-            self.admin_error = Some("Wait for the current request, then retry.".into());
-            return;
-        }
-        self.start_request(Operation::AdminSetBotProfile {
-            id: self.bot_profile.id.clone(),
-            update: BotProfileUpdate {
-                display_name: name,
-                description: self.bot_profile.description.trim().to_owned(),
-                avatar: self.bot_profile.avatar.trim().to_owned(),
-            },
-        });
     }
 
     pub fn bot_display_name(&self, id: &str) -> String {
@@ -1878,6 +1856,7 @@ impl Session {
         self.poll_telegram();
         self.poll_download();
         self.poll_launches();
+        self.hydrate_bot_settings();
         self.pump_panel();
         if let Some(at) = self.reconnect_at {
             if Instant::now() >= at {
@@ -2114,6 +2093,13 @@ impl Session {
                 {
                     self.onboarding_failed(completion.kind, error.to_string());
                 }
+                Err(error) if completion.kind == OperationKind::BotLifecycle => {
+                    self.toast = Some(format!("Could not change that bot: {error}"));
+                    self.schedule(Operation::ListBots, Duration::ZERO);
+                }
+                Err(error) if completion.kind == OperationKind::BotSettingsWrite => {
+                    self.bot_settings_failed(&error);
+                }
                 Err(error) if completion.kind == OperationKind::ToolsWrite => {
                     self.toast = Some(format!("Could not change that: {error}"));
                     self.schedule(Operation::ListBots, Duration::ZERO);
@@ -2124,7 +2110,6 @@ impl Session {
                         OperationKind::AdminWrite
                             | OperationKind::ConnectorTest
                             | OperationKind::OAuthSignIn
-                            | OperationKind::AdminProfile
                             | OperationKind::AdminRestart
                     ) =>
                 {
@@ -2338,33 +2323,11 @@ impl Session {
                         }
                         OperationKind::CreateBot => {
                             if let Some(created) = self.state.created_bot.clone() {
-                                self.selected_bot = Some(created.id.clone());
-                                self.section = Section::Fleet;
-                                self.bot_profile = BotProfileDraft {
-                                    id: created.id.clone(),
-                                    display_name: humanize_label(&created.id),
-                                    description: self.fleet.bot_description.clone(),
-                                    avatar: String::new(),
-                                };
+                                self.open_bot_settings(created.id);
                             }
                             self.schedule(Operation::ListBots, Duration::ZERO);
                         }
                         OperationKind::ListBots => {
-                            if let Some(id) = self.selected_bot.clone()
-                                && let Some(bot) =
-                                    self.state.listed_bots.iter().find(|bot| bot.id == id)
-                            {
-                                if self.bot_profile.display_name.trim().is_empty() {
-                                    self.bot_profile.display_name = self.bot_display_name(&id);
-                                }
-                                if self.bot_profile.avatar.trim().is_empty() {
-                                    self.bot_profile.avatar =
-                                        bot.avatar.clone().unwrap_or_default();
-                                }
-                            }
-                            if self.section == Section::Fleet && !self.state.skills_loaded {
-                                self.schedule(Operation::ListSkills, Duration::ZERO);
-                            }
                             self.continue_after_bots();
                         }
                         OperationKind::Avatar => {
@@ -2405,23 +2368,8 @@ impl Session {
                         OperationKind::ToolsWrite => {
                             self.schedule(Operation::ListBots, Duration::ZERO);
                         }
-                        OperationKind::AdminProfile => {
-                            if let Some(bot) = self
-                                .state
-                                .listed_bots
-                                .iter_mut()
-                                .find(|bot| bot.id == self.bot_profile.id)
-                            {
-                                let name = self.bot_profile.display_name.trim().to_owned();
-                                let description = self.bot_profile.description.trim().to_owned();
-                                let avatar = self.bot_profile.avatar.trim().to_owned();
-                                bot.display_name = (!name.is_empty()).then_some(name);
-                                bot.description = (!description.is_empty()).then_some(description);
-                                bot.avatar = (!avatar.is_empty()).then_some(avatar);
-                            }
-                            self.admin_error = None;
-                            self.admin_notice = Some("Bot profile saved.".into());
-                        }
+                        OperationKind::BotSettingsWrite => self.bot_settings_saved(),
+                        OperationKind::BotLifecycle => self.bot_lifecycle_done(),
                         OperationKind::CreateConversation => {
                             self.fleet.conv_title.clear();
                             self.fleet.conv_slug.clear();
@@ -2665,16 +2613,7 @@ impl Session {
             Section::Providers => (!self.state.providers_loaded).then_some(Operation::Providers),
             Section::Connectors => (!self.state.connectors_loaded).then_some(Operation::Connectors),
             Section::Approvals => (!self.state.approvals_loaded).then_some(Operation::Approvals),
-            Section::Fleet => {
-                if !self.state.bots_loaded {
-                    Some(Operation::ListBots)
-                } else if !self.state.skills_loaded {
-                    Some(Operation::ListSkills)
-                } else {
-                    None
-                }
-            }
-            Section::Settings => None,
+            Section::Browser | Section::Vault | Section::Settings => None,
         }
     }
 
