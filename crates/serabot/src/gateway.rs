@@ -19,11 +19,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::domain::{Action, Approval, ApprovalState, Id};
+use crate::domain::{Action, Approval, ApprovalState, Id, LlmMessage};
 use crate::error::{Result, SeraError};
 use crate::policy::Policy;
 use crate::store::Store;
+use crate::user_secrets::UserSecrets;
 use crate::util::{canonical_hash, canonical_json, sha256_hex, truncate_chars};
+use crate::vault::Redactor;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -175,6 +177,8 @@ pub struct Gateway {
     registry: ToolRegistry,
     approval_expiry: Duration,
     standing_consent: bool,
+    /// Vault redaction source; `None` leaves tool output untouched.
+    vault: Option<Arc<UserSecrets>>,
 }
 
 impl Gateway {
@@ -191,7 +195,83 @@ impl Gateway {
             registry,
             approval_expiry: Duration::hours(approval_expiry_hours.max(1)),
             standing_consent,
+            vault: None,
         }
+    }
+
+    /// Enable vault redaction: before tool output or a model request leaves
+    /// the gateway, the acting user's vault values become `[vault:<name>]`.
+    pub fn with_vault(mut self, users: Arc<UserSecrets>) -> Self {
+        self.vault = Some(users);
+        self
+    }
+
+    /// Redact the acting user's vault values from `text`. Fails closed: if
+    /// the vault cannot be read, the text is not returned.
+    pub fn redact_text(&self, user_id: &str, text: &str) -> Result<String> {
+        match &self.vault {
+            Some(users) => Ok(Redactor::for_user(users, user_id)?.redact(text)),
+            None => Ok(text.to_owned()),
+        }
+    }
+
+    /// A copy of `messages` with the acting user's vault values redacted:
+    /// the form that may be sent to a model. Content, tool-call arguments and
+    /// names are all covered.
+    pub fn redact_messages(
+        &self,
+        user_id: &str,
+        messages: &[LlmMessage],
+    ) -> Result<Vec<LlmMessage>> {
+        let Some(users) = &self.vault else {
+            return Ok(messages.to_vec());
+        };
+        let redactor = Redactor::for_user(users, user_id)?;
+        if redactor.is_empty() {
+            return Ok(messages.to_vec());
+        }
+        Ok(messages
+            .iter()
+            .map(|message| {
+                let mut message = message.clone();
+                message.content = message.content.map(|text| redactor.redact(&text));
+                message.name = message.name.map(|text| redactor.redact(&text));
+                message.tool_call_id = message.tool_call_id.map(|text| redactor.redact(&text));
+                for call in &mut message.tool_calls {
+                    call.id = redactor.redact(&call.id);
+                    call.name = redactor.redact(&call.name);
+                    redactor.redact_json(&mut call.arguments);
+                }
+                message
+            })
+            .collect())
+    }
+
+    /// Redact a finished tool call's output before it is audited, scanned or
+    /// returned. This is the single hook every dispatch path goes through.
+    fn redact_output(
+        &self,
+        context: &ToolContext,
+        output: Result<ToolOutput>,
+    ) -> Result<ToolOutput> {
+        let Some(users) = &self.vault else {
+            return output;
+        };
+        let mut output = output?;
+        let redactor = Redactor::for_user(users, &context.user_id)?;
+        if redactor.is_empty() {
+            return Ok(output);
+        }
+        output.content = redactor.redact(&output.content);
+        if let Some(data) = output.data.as_mut() {
+            redactor.redact_json(data);
+        }
+        for field in [&mut output.filename, &mut output.destination] {
+            if let Some(text) = field.as_mut() {
+                *text = redactor.redact(text);
+            }
+        }
+        Ok(output)
     }
 
     pub fn registry(&self) -> &ToolRegistry {
@@ -249,7 +329,7 @@ impl Gateway {
         }
 
         let started = std::time::Instant::now();
-        let output = tool.execute(args, context).await;
+        let output = self.redact_output(context, tool.execute(args, context).await);
         self.finish_tool_call(tool.as_ref(), &output, context, started.elapsed())?;
         output.map(ToolOutcome::Completed)
     }
@@ -371,7 +451,7 @@ impl Gateway {
             )?;
         }
         let started = std::time::Instant::now();
-        let output = tool.execute(args, context).await;
+        let output = self.redact_output(context, tool.execute(args, context).await);
         self.finish_tool_call(tool, &output, context, started.elapsed())?;
         output.map(ToolOutcome::Completed)
     }
@@ -464,7 +544,7 @@ impl Gateway {
             ));
         }
         let started = std::time::Instant::now();
-        let output = tool.execute(args, context).await;
+        let output = self.redact_output(context, tool.execute(args, context).await);
         let succeeded = output.is_ok();
         self.finish_tool_call(tool.as_ref(), &output, context, started.elapsed())?;
         match output {
@@ -1324,5 +1404,160 @@ mod tests {
                 .any(|entry| entry.event == "approval.requested"),
             "the member's audit row must not appear under the admin"
         );
+    }
+
+    struct EchoTool;
+
+    #[async_trait]
+    impl Tool for EchoTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "echo".into(),
+                description: "echoes its argument".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                external_effect: false,
+            }
+        }
+
+        async fn execute(&self, args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+            let text = args["text"].as_str().unwrap_or_default().to_owned();
+            Ok(ToolOutput {
+                content: format!("page says: {text}"),
+                data: Some(serde_json::json!({"nested": [text.clone()]})),
+                ..ToolOutput::default()
+            })
+        }
+    }
+
+    fn vault_gateway() -> (Gateway, Arc<UserSecrets>, String, String) {
+        let store = Store::open_in_memory(384).unwrap();
+        let users = Arc::new(UserSecrets::with_master_key(store.clone(), [5u8; 32]).unwrap());
+        let a = store
+            .create_user("subject-a", "a@example.example", "A")
+            .unwrap()
+            .id;
+        let b = store
+            .create_user("subject-b", "b@example.example", "B")
+            .unwrap()
+            .id;
+        let mut registry = ToolRegistry::default();
+        registry.register(EchoTool).unwrap();
+        let gateway = Gateway::new(store, Arc::new(Policy::empty()), registry, 1, false)
+            .with_vault(users.clone());
+        (gateway, users, a, b)
+    }
+
+    fn vault_context(user: &str) -> ToolContext {
+        ToolContext {
+            user_id: user.into(),
+            actor: user.into(),
+            bot: "main".into(),
+            task_id: None,
+            turn_id: None,
+            conversation_id: None,
+            allowed_tools: HashSet::from(["echo".to_owned()]),
+            require_approval: HashSet::new(),
+        }
+    }
+
+    fn put_secret(users: &UserSecrets, user: &str, name: &str, value: &str) {
+        crate::vault::put(
+            users,
+            user,
+            name,
+            &crate::vault::VaultInput {
+                kind: crate::vault::VaultKind::ApiKey,
+                username: None,
+                value: zeroize::Zeroizing::new(value.into()),
+                domains: vec![],
+                note: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_output_is_redacted_for_the_owner_only() {
+        let (gateway, users, a, b) = vault_gateway();
+        put_secret(&users, &a, "site", "synthetic-secret-a");
+        let args = serde_json::json!({"text": "synthetic-secret-a"});
+        let ToolOutcome::Completed(own) = gateway
+            .execute("echo", args.clone(), &vault_context(&a))
+            .await
+            .unwrap()
+        else {
+            panic!("expected completion");
+        };
+        assert_eq!(own.content, "page says: [vault:site]");
+        assert_eq!(
+            own.data.unwrap(),
+            serde_json::json!({"nested": ["[vault:site]"]})
+        );
+        let ToolOutcome::Completed(other) = gateway
+            .execute("echo", args, &vault_context(&b))
+            .await
+            .unwrap()
+        else {
+            panic!("expected completion");
+        };
+        assert_eq!(other.content, "page says: synthetic-secret-a");
+    }
+
+    #[test]
+    fn model_requests_are_redacted_without_touching_the_original() {
+        use crate::domain::ToolCall;
+        let (gateway, users, a, b) = vault_gateway();
+        put_secret(&users, &a, "site", "synthetic-secret-a");
+        let messages = vec![
+            LlmMessage::user("my key is synthetic-secret-a"),
+            LlmMessage::assistant(
+                Some("typing synthetic-secret-a".into()),
+                vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "echo".into(),
+                    arguments: serde_json::json!({"text": "synthetic-secret-a"}),
+                }],
+            ),
+        ];
+        let redacted = gateway.redact_messages(&a, &messages).unwrap();
+        let wire = serde_json::to_string(&redacted).unwrap();
+        assert!(!wire.contains("synthetic-secret-a"));
+        assert!(wire.contains("[vault:site]"));
+        assert_eq!(
+            messages[0].content.as_deref(),
+            Some("my key is synthetic-secret-a")
+        );
+        // Another user's request is not scrubbed with A's values.
+        let other = gateway.redact_messages(&b, &messages).unwrap();
+        assert!(
+            serde_json::to_string(&other)
+                .unwrap()
+                .contains("synthetic-secret-a")
+        );
+        assert_eq!(
+            gateway.redact_text(&a, "x synthetic-secret-a").unwrap(),
+            "x [vault:site]"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gateway_without_a_vault_leaves_output_alone() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let mut registry = ToolRegistry::default();
+        registry.register(EchoTool).unwrap();
+        let gateway = Gateway::new(store, Arc::new(Policy::empty()), registry, 1, false);
+        let ToolOutcome::Completed(output) = gateway
+            .execute(
+                "echo",
+                serde_json::json!({"text": "plain"}),
+                &vault_context(&admin),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected completion");
+        };
+        assert_eq!(output.content, "page says: plain");
     }
 }

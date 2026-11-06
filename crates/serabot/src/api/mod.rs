@@ -60,6 +60,7 @@ mod skills;
 mod status;
 #[cfg(test)]
 mod tests;
+mod vault;
 
 use accounts::*;
 use admin::*;
@@ -71,6 +72,7 @@ use memories::*;
 use messages::*;
 use skills::*;
 use status::*;
+use vault::*;
 
 #[derive(Clone)]
 pub struct ApiNotifier {
@@ -213,6 +215,8 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/memories", get(list_memories).post(add_memory))
         .route("/v1/memories/{id}", delete(delete_memory))
+        .route("/v1/vault", get(list_vault))
+        .route("/v1/vault/{name}", put(put_vault).delete(delete_vault))
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/{id}/key", put(set_provider_key))
         .route("/v1/providers/{id}", delete(delete_provider_credential))

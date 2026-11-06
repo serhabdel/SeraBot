@@ -652,6 +652,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.clone(),
     ))?;
     serabot::tools::register_memory_tools(&mut registry, store.clone())?;
+    serabot::vault::register_vault_tools(&mut registry, users.clone())?;
     serabot::tools::register_pdf_tools(
         &mut registry,
         artifacts.clone(),
@@ -917,7 +918,8 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         registry,
         config.api.approval_expiry_hours,
         config.runtime.owner_standing_consent,
-    );
+    )
+    .with_vault(users.clone());
 
     let runtime = Runtime::with_fleet(
         config.clone(),
