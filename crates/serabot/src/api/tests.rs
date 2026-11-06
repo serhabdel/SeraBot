@@ -8,6 +8,7 @@ use axum::body::Body;
 use axum::http::Request;
 use tower::ServiceExt;
 
+mod browser_api;
 mod vault_http;
 
 /// The bootstrap admin's id â€” the acting user behind the config token
@@ -84,6 +85,26 @@ fn app_with_auth_stack(
     bots: Vec<LoadedBot>,
     auth_issuer: Option<&str>,
     rate_limit: Option<u32>,
+) -> (Router, Arc<Config>, Store) {
+    app_with_stack(
+        egress_approved,
+        policy,
+        base_dir,
+        bots,
+        auth_issuer,
+        rate_limit,
+        None,
+    )
+}
+
+fn app_with_stack(
+    egress_approved: bool,
+    policy: Policy,
+    base_dir: std::path::PathBuf,
+    bots: Vec<LoadedBot>,
+    auth_issuer: Option<&str>,
+    rate_limit: Option<u32>,
+    browser: Option<Arc<crate::browser::BrowserManager>>,
 ) -> (Router, Arc<Config>, Store) {
     let mut config = Config::default();
     config.api.enabled = true;
@@ -172,7 +193,8 @@ fn app_with_auth_stack(
         users,
         None,
     )
-    .unwrap();
+    .unwrap()
+    .with_browser(browser);
     if let Some(service) = auth {
         state.auth = Some(Arc::new(service));
     }
