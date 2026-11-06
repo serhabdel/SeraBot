@@ -244,7 +244,10 @@ pub(super) async fn list_connectors(
                     + crate::onedrive::CONSENT_CALLBACK_PATH,
                 "secrets": {
                     "refresh_token": {
-                        "name": "user credential",
+                        // Per-user sealed credential (user_secrets), not an
+                        // age-store name; kept to the secret-name charset the
+                        // clients validate.
+                        "name": "user_onedrive_refresh_token",
                         "configured": connected,
                     },
                 },

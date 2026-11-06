@@ -3168,13 +3168,13 @@ fn valid_secret_map(secrets: &BTreeMap<String, SecretStatus>) -> bool {
     secrets.len() <= 8
         && secrets.iter().all(|(key, secret)| {
             bounded_text(key, 64)
-                && secret.name.as_deref().is_none_or(|name| {
-                    name.len() <= 128
-                        && !name.is_empty()
-                        && name.bytes().all(|byte| {
-                            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
-                        })
-                })
+                // The name is display-only (the console never sends it back),
+                // so any bounded, control-free label is accepted. A stricter
+                // charset rejected the whole list over one label (0.13.0).
+                && secret
+                    .name
+                    .as_deref()
+                    .is_none_or(|name| bounded_text(name, 128))
         })
 }
 
@@ -3772,6 +3772,32 @@ mod tests {
         assert_eq!(validated[0].default_inbox_id, None);
         assert_eq!(validated[0].redirect_uri, None);
         assert_eq!(validated[0].api_base, None);
+    }
+
+    /// 0.13.0 regression: the server labelled the per-user OneDrive secret
+    /// "user credential" and the space rejected the whole connector list.
+    #[test]
+    fn connectors_accept_display_only_secret_labels() {
+        let raw = r#"{
+            "connectors": [{
+                "id": "onedrive",
+                "kind": "oauth",
+                "enabled": true,
+                "connected": true,
+                "group": "Productivity",
+                "redirect_uri": "https://bot.example.example/v1/connectors/onedrive/callback",
+                "secrets": {"refresh_token": {"name": "user credential", "configured": true}}
+            }]
+        }"#;
+        let envelope: ConnectorsEnvelope = serde_json::from_str(raw).unwrap();
+        let validated = ApiClient::normalize_and_validate_connectors(envelope)
+            .expect("a display label with a space is not a protocol error");
+        assert_eq!(validated[0].id, "onedrive");
+
+        let bad = r#"{"connectors": [{"id": "x", "kind": "oauth",
+            "secrets": {"k": {"name": "line\nbreak", "configured": false}}}]}"#;
+        let envelope: ConnectorsEnvelope = serde_json::from_str(bad).unwrap();
+        assert!(ApiClient::normalize_and_validate_connectors(envelope).is_err());
     }
 
     #[test]
