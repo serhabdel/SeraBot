@@ -1,4 +1,4 @@
-﻿# SeraBot — agent rules
+# SeraBot — agent rules
 
 ## Product boundary
 SeraBot is a small-circle, invitation-only multi-user agent (≤ ~10 users):
