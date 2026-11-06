@@ -788,12 +788,16 @@ pub(super) struct BotConfigRequest {
 }
 
 /// Tool list rules matching the desktop `validate_tool_list` semantics on top
-/// of the server's tool registry: at most 32 unique safe ids, `delegate` only
-/// for the orchestrator, and every other tool must be a registered tool.
+/// of the server's tool registry: unique safe ids, `delegate` only for the
+/// orchestrator, and every other tool must be a registered tool -- or one the
+/// bot already has (`kept`). A tool whose service is switched off (for example
+/// `tavily_search` while Tavily is disabled) is unregistered, and without the
+/// `kept` exception every later edit of that bot's tools was refused (0.14.0).
 pub(super) fn validate_bot_tool_list(
     state: &ApiState,
     tools: &[String],
     role: BotRole,
+    kept: &[String],
 ) -> Result<Vec<String>> {
     if tools.len() > MAX_BOT_CONFIG_TOOLS {
         return Err(SeraError::Validation(format!(
@@ -812,7 +816,10 @@ pub(super) fn validate_bot_tool_list(
                     "specialists cannot be granted delegate".into(),
                 ));
             }
-        } else if !state.runtime.gateway().registry().is_registered(tool) {
+        } else if !state.runtime.gateway().registry().is_registered(tool)
+            && !kept.iter().any(|existing| existing == tool)
+            && !crate::tools::known_tool_names().contains(&tool.as_str())
+        {
             return Err(SeraError::Validation(format!("unknown tool '{tool}'")));
         }
         if !seen.insert(tool.clone()) {
@@ -933,7 +940,9 @@ pub(super) async fn admin_update_bot_config(
         });
     let (current_tools, _, _) = bot_lists_with_override(&state, entry);
     let tools = match &request.tools {
-        Some(tools) => Some(validate_bot_tool_list(&state, tools, role).map_err(admin_error)?),
+        Some(tools) => {
+            Some(validate_bot_tool_list(&state, tools, role, &current_tools).map_err(admin_error)?)
+        }
         None => None,
     };
     let skills = match &request.skills {

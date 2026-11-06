@@ -367,7 +367,7 @@ pub(super) async fn update_bot(
         None => row.prompt.clone(),
     };
     let tools = match &request.tools {
-        Some(tools) => validate_bot_tool_list(&state, tools, config.role)?,
+        Some(tools) => validate_bot_tool_list(&state, tools, config.role, &config.tools)?,
         None => config.tools.clone(),
     };
     let skills = match &request.skills {

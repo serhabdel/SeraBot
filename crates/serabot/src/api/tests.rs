@@ -2603,6 +2603,58 @@ async fn providers_and_connectors_report_status_without_secret_values() {
     assert!(!connectors.to_string().contains("synthetic-test-key"));
 }
 
+/// 0.14.0 regression: a bot holding a tool whose service is switched off
+/// (unregistered, like `tavily_search` while Tavily is disabled) could not
+/// have its tool list edited at all. Kept tools pass; new unknown ones fail.
+#[tokio::test]
+async fn bot_tool_edits_keep_tools_whose_service_is_switched_off() {
+    let root = temp_base();
+    let mut notes = test_bot("notes", crate::orchestration::BotRole::Specialist);
+    notes.config.tools = vec!["switched_off_tool".into()];
+    notes.config.enabled = true;
+    notes.prompt = "Synthetic notes prompt.".into();
+    let (app, _, _) = app_with_fleet(
+        true,
+        Policy::empty(),
+        root.clone(),
+        vec![
+            test_bot("main", crate::orchestration::BotRole::Orchestrator),
+            notes,
+        ],
+    );
+    let kept = app
+        .clone()
+        .oneshot(request(
+            &app,
+            "PUT",
+            "/v1/bots/notes",
+            true,
+            Some(json!({"tools": ["switched_off_tool", "rag_search", "tavily_search"]})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(kept.status(), StatusCode::OK);
+    let body = read_json(kept).await;
+    assert_eq!(
+        body["bot"]["tools"],
+        json!(["switched_off_tool", "rag_search", "tavily_search"])
+    );
+
+    let added = app
+        .clone()
+        .oneshot(request(
+            &app,
+            "PUT",
+            "/v1/bots/notes",
+            true,
+            Some(json!({"tools": ["switched_off_tool", "another_unknown_tool"]})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(added.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[tokio::test]
 async fn provider_credentials_are_per_user_and_grants_are_admin_controlled() {
     let (app, _, store) = app();
