@@ -1,10 +1,10 @@
 use crate::{
-    ApiClient, ApiError, Approval, ApprovalDecision, AudioUpdate, BotConfigUpdate, BotDetail,
-    BotProfileUpdate, BotSummary, Catalog, ConnectorStatus, ConnectorTestResult, ConnectorUpdate,
-    ConversationKind, ConversationPage, ConversationSummary, CreatedBot, CreatedConversation,
-    CreatedSkill, Health, History, LibraryEntry, MemoryEntry, NewProvider, ProviderStatus, Scope,
-    Selection, SkillSummary, Task, Team, TeamMode, Transcription, UsageReport, VoiceSettings,
-    VoiceUpdate,
+    ApiClient, ApiError, Approval, ApprovalDecision, AudioUpdate, AuthUser, BotConfigUpdate,
+    BotDetail, BotProfileUpdate, BotSummary, Catalog, ConnectorStatus, ConnectorTestResult,
+    ConnectorUpdate, ConversationKind, ConversationPage, ConversationSummary, CreatedBot,
+    CreatedConversation, CreatedSkill, Health, History, LibraryEntry, MemoryEntry, NewProvider,
+    ProviderStatus, Scope, Selection, SkillSummary, Task, Team, TeamMode, Transcription,
+    UsageReport, VoiceSettings, VoiceUpdate,
 };
 use secrecy::SecretString;
 use std::sync::{
@@ -23,6 +23,7 @@ pub struct Credentials {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperationKind {
     Health,
+    Me,
     Catalog,
     History,
     Apply,
@@ -62,6 +63,8 @@ pub enum OperationKind {
 
 pub enum Operation {
     Health,
+    /// `GET /v1/me`: who the session token belongs to.
+    Me,
     Catalog,
     History,
     Apply(Selection),
@@ -183,6 +186,7 @@ impl Operation {
     pub fn kind(&self) -> OperationKind {
         match self {
             Self::Health => OperationKind::Health,
+            Self::Me => OperationKind::Me,
             Self::Catalog => OperationKind::Catalog,
             Self::History => OperationKind::History,
             Self::Apply(_) => OperationKind::Apply,
@@ -230,6 +234,7 @@ impl Operation {
 
 pub enum Reply {
     Health(Health),
+    Me(AuthUser),
     Catalog(Catalog),
     History(History),
     Selection(Selection),
@@ -449,6 +454,7 @@ fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
     let conversation = &job.scope.conversation;
     match &job.operation {
         Operation::Health => client.health().map(Reply::Health),
+        Operation::Me => client.me().map(Reply::Me),
         Operation::Catalog => client.models(conversation).map(Reply::Catalog),
         Operation::History => client.history(conversation).map(Reply::History),
         Operation::Apply(selection) => client.select(conversation, selection).map(Reply::Selection),

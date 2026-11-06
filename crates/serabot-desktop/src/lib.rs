@@ -9,6 +9,7 @@ pub mod events;
 pub mod oauth;
 pub mod provider_presets;
 pub mod session;
+pub mod signin;
 pub mod state;
 pub mod teams;
 pub mod updater;
@@ -95,8 +96,6 @@ mod tests {
             resolve_server_hint(Some("https://user:secret@owner.example"), Some("not a url")),
             ""
         );
-        assert_eq!(OWNER_TOKEN_SECRET_NAME, "SERABOT_OWNER_TOKEN");
-        assert!(!valid_token(OWNER_TOKEN_SECRET_NAME));
     }
 
     #[test]

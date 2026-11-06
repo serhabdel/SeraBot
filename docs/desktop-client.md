@@ -58,45 +58,40 @@ console.
   `SERABOT_OWNER_API_URL`, else the value compiled from the GitHub Actions
   secret of the same name. Invalid values are ignored. See
   [CI and secrets](ci-and-secrets.md).
-- **API token** — mint a device token on the server host:
+- **Sign in with Microsoft** - the only sign-in. The console starts a
+  loopback listener on `http://127.0.0.1:<port>/auth-done`, asks the server for
+  the Microsoft sign-in page (`POST /v1/auth/login/start` with a PKCE handoff
+  challenge and a random state), and opens it in the system browser. When the
+  browser returns, the console checks the state and trades the one-time handoff
+  code for a session token (`POST /v1/auth/handoff`), then reads the user
+  (`GET /v1/me`). The browser tab only shows "You can close this tab". See
+  [the sign-in contract](specs/native-signin-contract.md). Nothing is pasted.
+- **I have an invite code** - a link under the button opens an invite-code
+  field for a first sign-in. The code travels with `login/start` and is only
+  consumed by the server at the callback. Server error codes (`denied`,
+  `invite_required`, `invite_invalid`, `disabled`, `max_users`, `server`) show
+  as plain sentences.
 
-  ```bash
-  serabot token mint --label desktop-win
-  ```
-
-  The plaintext token is printed once; the server stores only its hash. Move it
-  over a secure channel (for example type it from an SSH session on the server,
-  or copy it through a password manager). Do not send it over chat or email and
-  do not commit it. Paste it into the masked field.
-- **Connect** — **Connect** or **Enter** (with a valid server URL and token)
-  starts the authenticated session read. The card stays up with
-  **Connecting…** until the first `/v1/health` reply succeeds.
-
-Only after that first authenticated reply is the origin written to
+Only after the first authenticated reply is the origin written to
 `%APPDATA%\SeraBot\settings.json` (non-secret; `SERABOT_SETTINGS_DIR` overrides
-the directory for development) and the token stored in Windows Credential
-Manager (service `SeraBot`, account `owner-api-token`). A rejected token or an
-unreachable server persists nothing. Later launches auto-connect from the saved
-origin and credential, so the card appears only when no credential exists or a
-token was cleared.
+the directory for development) and the session token stored in Windows
+Credential Manager (service `SeraBot`, account `owner-api-token`; the name is
+unchanged so a token saved by an earlier release keeps working). Later launches
+reconnect from the saved origin and credential.
 
-## Token lifecycle
+## Session lifecycle
 
-- **Disconnect** (Settings → Connection) ends the session and clears the
-  token, chat text, history, directory lists, and pending actions from memory.
-  The saved credential remains for the next launch.
-- **Forget token** deletes the Windows Credential Manager entry and clears the
-  masked field, keeping the server URL. Mint a new token to reconnect.
-- A **rejected or revoked** token (HTTP 401) is handled like **Forget token**:
-  the stored credential is deleted and the card reports "Token rejected or
-  revoked. Mint a new token on the server." A token the server no longer
-  accepts cannot stay cached.
-- Revoke unused tokens on the server with `serabot token list` and
-  `serabot token revoke <id>`.
-- **Debug builds only:** when the credential store has no token,
-  `SERABOT_OWNER_TOKEN` in the process environment seeds the masked field.
-  Release builds contain no code that reads it, and
-  `SERABOT_OWNER_TOKEN` is never compiled into the binary.
+- **Sign out** (Settings, Connection, or the account menu) calls
+  `POST /v1/auth/logout`, then deletes the Credential Manager entry and clears
+  chat text, history, directory lists and pending actions from memory. If the
+  server cannot be reached the device is still signed out.
+- Settings shows the signed-in name, email and role from `GET /v1/me`.
+- Any HTTP 401 deletes the stored token and returns to the sign-in screen with
+  "Your session ended. Sign in again."
+- An older install with a saved token stays signed in while the server still
+  accepts it; otherwise it lands on the Microsoft screen.
+- Operator device tokens (`serabot token mint`) are server-side break-glass
+  only. The console has no field for them.
 
 ## Behaviour
 

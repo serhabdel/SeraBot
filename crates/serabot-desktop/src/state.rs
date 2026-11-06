@@ -1,7 +1,8 @@
 use crate::{
-    ApiError, Approval, BotDetail, BotSummary, Catalog, ConnectorStatus, ConnectorTestResult,
-    ConversationSummary, CreatedBot, CreatedConversation, CreatedSkill, LibraryEntry, MemoryEntry,
-    Message, ProviderStatus, Scope, Selection, SkillSummary, Task, Team, UsageReport,
+    ApiError, Approval, AuthUser, BotDetail, BotSummary, Catalog, ConnectorStatus,
+    ConnectorTestResult, ConversationSummary, CreatedBot, CreatedConversation, CreatedSkill,
+    LibraryEntry, MemoryEntry, Message, ProviderStatus, Scope, Selection, SkillSummary, Task, Team,
+    UsageReport,
     worker::{OperationKind, Reply},
 };
 use std::collections::BTreeMap;
@@ -9,6 +10,8 @@ use std::collections::BTreeMap;
 pub struct State {
     pub scope: Scope,
     pub connected: bool,
+    /// The signed-in user from `GET /v1/me`; absent on an older server.
+    pub user: Option<AuthUser>,
     pub version: String,
     pub audio_enabled: Option<bool>,
     pub audio_transcription_model: Option<String>,
@@ -85,6 +88,7 @@ impl Default for State {
                 conversation: "windows-owner".into(),
             },
             connected: false,
+            user: None,
             version: String::new(),
             audio_enabled: None,
             audio_transcription_model: None,
@@ -144,6 +148,7 @@ impl Default for State {
 impl State {
     pub fn new_scope(&mut self, conversation: String, connected: bool) {
         let epoch = self.scope.epoch.wrapping_add(1);
+        let user = self.user.clone();
         let version = self.version.clone();
         let audio_enabled = self.audio_enabled;
         let audio_transcription_model = self.audio_transcription_model.clone();
@@ -179,6 +184,7 @@ impl State {
                 conversation,
             },
             connected,
+            user,
             version,
             audio_enabled,
             audio_transcription_model,
@@ -213,6 +219,7 @@ impl State {
 
     pub fn disconnect(&mut self) {
         self.new_scope(self.scope.conversation.clone(), false);
+        self.user = None;
         self.created_bot = None;
         self.created_conversation = None;
         self.created_skill = None;
@@ -266,6 +273,7 @@ impl State {
                     self.error = Some("Server is not ready. Retry the connection read.".into());
                 }
             }
+            Reply::Me(user) => self.user = Some(user),
             Reply::Catalog(catalog) => {
                 self.draft = catalog.selection.clone();
                 self.catalog = Some(catalog);

@@ -39,9 +39,7 @@ impl fmt::Display for ApiError {
         match self {
             Self::Validation(message) => f.write_str(message),
             Self::Rejected(message) => f.write_str(message),
-            Self::Http(401) => {
-                f.write_str("Unauthorized (401). Disconnect and check your API token.")
-            }
+            Self::Http(401) => f.write_str("Your session ended. Sign in again."),
             Self::Http(403) => f.write_str(
                 "Forbidden (403). Server policy or data-egress approval blocks this request.",
             ),
@@ -117,10 +115,6 @@ pub fn validate_endpoint(raw: &str) -> Result<Url, ApiError> {
     }
     Ok(url)
 }
-
-/// GitHub Actions secret *name* for the owner API token.
-/// Workflows document this name and do not compile the secret value.
-pub const OWNER_TOKEN_SECRET_NAME: &str = "SERABOT_OWNER_TOKEN";
 
 /// First valid server origin among a runtime value and a compile-time value.
 /// Empty and invalid strings are skipped. Tokens are never accepted here.
@@ -1030,44 +1024,82 @@ pub struct AdminRestart {
     pub restarting: bool,
 }
 
-/// One row of `GET /v1/auth/providers`. The list is public and ordered by the
-/// server; clients render it in that order and never invent a provider.
+/// The signed-in user: `GET /v1/me` and the `user` of a handoff response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct AuthProvider {
+pub struct AuthUser {
+    #[serde(default)]
     pub id: String,
     #[serde(default)]
-    pub enabled: bool,
+    pub email: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub role: String,
 }
 
-impl AuthProvider {
-    /// The button label for a known provider, else a humanized id.
+impl AuthUser {
+    /// The name to show: the display name, else the email, else a plain label.
     pub fn label(&self) -> String {
-        match self.id.as_str() {
-            "microsoft" => "Microsoft".into(),
-            "google" => "Google".into(),
-            "github" => "GitHub".into(),
-            other => humanize_provider_id(other),
+        if !self.display_name.trim().is_empty() {
+            self.display_name.trim().to_owned()
+        } else if !self.email.trim().is_empty() {
+            self.email.trim().to_owned()
+        } else {
+            "Signed in".to_owned()
         }
     }
-
-    /// Providers the server keeps visible but disabled in v1.
-    pub fn coming_soon(&self) -> bool {
-        matches!(self.id.as_str(), "google" | "github")
-    }
 }
 
-fn humanize_provider_id(id: &str) -> String {
-    id.split(['-', '_'])
-        .filter(|word| !word.is_empty())
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+/// A finished native sign-in: the session token and the user it belongs to.
+/// The token is a secret; this type has no `Debug` and no `Clone`.
+pub struct SignedIn {
+    pub token: SecretString,
+    pub expires_at: Option<String>,
+    pub user: AuthUser,
+}
+
+/// The loopback-handoff parameters of one native sign-in
+/// (see `docs/specs/native-signin-contract.md`).
+pub struct HandoffStart<'a> {
+    /// `http://127.0.0.1:<port>/auth-done`.
+    pub return_to: &'a str,
+    /// `base64url(sha256(verifier))`.
+    pub challenge: &'a str,
+    /// The random value echoed back on the redirect.
+    pub client_state: &'a str,
+}
+
+/// The loopback return address the server accepts for the desktop client.
+pub fn valid_handoff_return_to(raw: &str) -> bool {
+    let Ok(url) = Url::parse(raw) else {
+        return false;
+    };
+    url.scheme() == "http"
+        && url.host_str() == Some("127.0.0.1")
+        && url.port().is_some_and(|port| port >= 1024)
+        && url.path() == "/auth-done"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
+fn base64url_text(value: &str, min: usize, max: usize) -> bool {
+    (min..=max).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn check_auth_user(user: AuthUser) -> Result<AuthUser, ApiError> {
+    let fields = [&user.id, &user.email, &user.display_name, &user.role];
+    if fields
+        .iter()
+        .any(|field| field.chars().count() > 256 || field.chars().any(char::is_control))
+    {
+        return Err(ApiError::InvalidResponse);
+    }
+    Ok(user)
 }
 
 /// The acting user's Telegram binding: `GET /v1/telegram`. The bot token never
@@ -1573,6 +1605,30 @@ impl ApiClient {
 
     pub fn health(&self) -> Result<Health, ApiError> {
         self.get(&["v1", "health"], &[])
+    }
+    /// `GET /v1/me`: the user the session token belongs to.
+    pub fn me(&self) -> Result<AuthUser, ApiError> {
+        check_auth_user(self.get(&["v1", "me"], &[])?)
+    }
+    /// `POST /v1/auth/logout`: end the session on the server. The caller
+    /// deletes the stored token afterwards whatever this returns. A `401` means
+    /// the server already considers the session over, which is the goal.
+    pub fn logout(&self) -> Result<(), ApiError> {
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .map_err(|_| ApiError::InvalidResponse)?
+            .clear()
+            .extend(["v1", "auth", "logout"]);
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(self.token.expose_secret())
+            .send()
+            .map_err(|_| ApiError::Transport)?;
+        match response.status().as_u16() {
+            200..=299 | 401 => Ok(()),
+            code => Err(ApiError::Http(code)),
+        }
     }
     /// The live sandbox posture: pending work, pending approvals and the
     /// policy version the server enforces right now.
@@ -2783,10 +2839,6 @@ impl PublicApiClient {
         Ok(Self { client, endpoint })
     }
 
-    fn get<T: DeserializeOwned>(&self, route: &[&str]) -> Result<T, ApiError> {
-        self.request::<T, ()>(Method::GET, route, None)
-    }
-
     fn request<T: DeserializeOwned, B: Serialize + ?Sized>(
         &self,
         method: Method,
@@ -2824,24 +2876,15 @@ impl PublicApiClient {
         serde_json::from_slice(&bytes).map_err(|_| ApiError::InvalidResponse)
     }
 
-    /// `GET /v1/auth/providers`: the ordered provider list rendered by every
-    /// client. An older server that omits the route fails as `Http(404)`.
-    pub fn auth_providers(&self) -> Result<Vec<AuthProvider>, ApiError> {
-        #[derive(Deserialize)]
-        struct Envelope {
-            providers: Vec<AuthProvider>,
-        }
-        let response: Envelope = self.get(&["v1", "auth", "providers"])?;
-        check_auth_providers(response.providers)
-    }
-
     /// `POST /v1/auth/login/start`: start the browser flow and return the
-    /// provider's authorization URL. The invite code is optional and is only
-    /// consumed by the server at the callback.
+    /// provider's authorization URL. The loopback `return_to`, the PKCE
+    /// challenge and the client state travel together; the invite code is
+    /// optional and is only consumed by the server at the callback.
     pub fn auth_login_start(
         &self,
         provider: &str,
         invite_code: Option<&str>,
+        handoff: &HandoffStart<'_>,
     ) -> Result<String, ApiError> {
         if !valid_auth_provider_id(provider) {
             return Err(ApiError::Validation(
@@ -2854,11 +2897,23 @@ impl PublicApiClient {
                 "Invite codes are 1–256 characters, without control characters.",
             ));
         }
+        if !valid_handoff_return_to(handoff.return_to)
+            || !base64url_text(handoff.challenge, 43, 128)
+            || !(16..=128).contains(&handoff.client_state.len())
+            || !handoff.client_state.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return Err(ApiError::Validation(
+                "The sign-in request is not valid. Restart SeraBot.",
+            ));
+        }
         #[derive(Serialize)]
         struct Body<'a> {
             provider: &'a str,
             #[serde(skip_serializing_if = "Option::is_none")]
             invite_code: Option<&'a str>,
+            return_to: &'a str,
+            handoff_challenge: &'a str,
+            client_state: &'a str,
         }
         #[derive(Deserialize)]
         struct Start {
@@ -2870,9 +2925,62 @@ impl PublicApiClient {
             Some(&Body {
                 provider,
                 invite_code,
+                return_to: handoff.return_to,
+                handoff_challenge: handoff.challenge,
+                client_state: handoff.client_state,
             }),
         )?;
         check_login_url(&start.url)
+    }
+
+    /// `POST /v1/auth/handoff`: trade the one-time handoff code and the PKCE
+    /// verifier for the session token. A wrong verifier, a reused code and an
+    /// expired code all answer `400` and burn the handoff.
+    pub fn auth_handoff(&self, handoff: &str, verifier: &str) -> Result<SignedIn, ApiError> {
+        if !(1..=512).contains(&handoff.len()) || !handoff.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(ApiError::Validation(
+                "The sign-in redirect carried an invalid code. Start again.",
+            ));
+        }
+        if !base64url_text(verifier, 43, 128) {
+            return Err(ApiError::Validation(
+                "The sign-in request is not valid. Restart SeraBot.",
+            ));
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            handoff: &'a str,
+            verifier: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct Response {
+            token: String,
+            #[serde(default)]
+            expires_at: Option<String>,
+            user: AuthUser,
+        }
+        let mut response: Response = self.request(
+            Method::POST,
+            &["v1", "auth", "handoff"],
+            Some(&Body { handoff, verifier }),
+        )?;
+        let mut token = std::mem::take(&mut response.token);
+        let expiry_ok = response
+            .expires_at
+            .as_deref()
+            .is_none_or(|stamp| bounded_text(stamp, 64));
+        let user = check_auth_user(response.user);
+        match user {
+            Ok(user) if valid_token(&token) && expiry_ok => Ok(SignedIn {
+                token: SecretString::new(token),
+                expires_at: response.expires_at,
+                user,
+            }),
+            _ => {
+                token.zeroize();
+                Err(ApiError::InvalidResponse)
+            }
+        }
     }
 }
 
@@ -2884,19 +2992,6 @@ fn check_id(id: &str) -> Result<(), ApiError> {
             "IDs must be 1–128 ASCII letters, digits, underscores, colons or hyphens.",
         ))
     }
-}
-
-fn check_auth_providers(providers: Vec<AuthProvider>) -> Result<Vec<AuthProvider>, ApiError> {
-    if providers.len() > 8 {
-        return Err(ApiError::InvalidResponse);
-    }
-    let mut seen = HashSet::with_capacity(providers.len());
-    for provider in &providers {
-        if !valid_auth_provider_id(&provider.id) || !seen.insert(provider.id.as_str()) {
-            return Err(ApiError::InvalidResponse);
-        }
-    }
-    Ok(providers)
 }
 
 /// The browser leg must be a plain HTTPS page. The console opens it in the
@@ -3674,18 +3769,7 @@ mod tests {
     }
 
     #[test]
-    fn sign_in_providers_keep_the_server_order_and_reject_unsafe_ids() {
-        let providers: Vec<AuthProvider> = serde_json::from_str(
-            r#"[{"id":"microsoft","enabled":true},{"id":"google","enabled":false},{"id":"github","enabled":false}]"#,
-        )
-        .unwrap();
-        let checked = check_auth_providers(providers).unwrap();
-        assert_eq!(checked[0].id, "microsoft");
-        assert!(checked[0].enabled);
-        assert_eq!(checked[1].label(), "Google");
-        assert!(checked[1].coming_soon());
-        assert!(!checked[0].coming_soon());
-
+    fn sign_in_inputs_stay_on_the_documented_shapes() {
         assert!(valid_auth_provider_id("microsoft"));
         assert!(valid_auth_provider_id("okta-sso"));
         assert!(!valid_auth_provider_id("Microsoft"));
@@ -3693,16 +3777,46 @@ mod tests {
         assert!(!valid_auth_provider_id("a/b"));
         assert!(!valid_auth_provider_id(&"a".repeat(33)));
 
-        let duplicate: Vec<AuthProvider> = serde_json::from_str(
-            r#"[{"id":"microsoft","enabled":true},{"id":"microsoft","enabled":false}]"#,
-        )
-        .unwrap();
-        assert!(check_auth_providers(duplicate).is_err());
-        let unsafe_id: Vec<AuthProvider> =
-            serde_json::from_str(r#"[{"id":"../microsoft","enabled":true}]"#).unwrap();
-        assert!(check_auth_providers(unsafe_id).is_err());
+        assert!(valid_handoff_return_to("http://127.0.0.1:51121/auth-done"));
+        assert!(valid_handoff_return_to("http://127.0.0.1:1024/auth-done"));
+        for raw in [
+            "http://127.0.0.1:1023/auth-done",
+            "http://127.0.0.1/auth-done",
+            "http://localhost:51121/auth-done",
+            "https://127.0.0.1:51121/auth-done",
+            "http://127.0.0.1:51121/oauth-callback",
+            "http://127.0.0.1:51121/auth-done?x=1",
+            "http://127.0.0.1:51121/auth-done#x",
+            "http://user@127.0.0.1:51121/auth-done",
+            "serabot://auth",
+            "",
+        ] {
+            assert!(!valid_handoff_return_to(raw), "{raw}");
+        }
     }
 
+    #[test]
+    fn auth_users_are_bounded_and_labelled() {
+        let named = AuthUser {
+            id: "u1".into(),
+            email: "a@example.test".into(),
+            display_name: " Ada ".into(),
+            role: "member".into(),
+        };
+        assert_eq!(named.label(), "Ada");
+        let mut unnamed = named.clone();
+        unnamed.display_name = " ".into();
+        assert_eq!(unnamed.label(), "a@example.test");
+        unnamed.email.clear();
+        assert_eq!(unnamed.label(), "Signed in");
+        assert!(check_auth_user(named.clone()).is_ok());
+        let mut control = named.clone();
+        control.display_name = "a\u{0}b".into();
+        assert!(check_auth_user(control).is_err());
+        let mut long = named;
+        long.email = "a".repeat(257);
+        assert!(check_auth_user(long).is_err());
+    }
     #[test]
     fn login_urls_must_be_plain_https_pages() {
         assert!(check_login_url("https://login.microsoftonline.com/authorize?x=1").is_ok());
