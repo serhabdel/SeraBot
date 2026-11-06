@@ -1952,6 +1952,38 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// The newest user or assistant message of each listed conversation, as
+    /// `(role, content)` keyed by conversation id. Only the acting user's rows
+    /// are read; tool and system messages never preview.
+    pub fn last_message_previews(
+        &self,
+        user_id: &str,
+        conversation_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, (String, String)>> {
+        let mut previews = std::collections::HashMap::new();
+        if conversation_ids.is_empty() {
+            return Ok(previews);
+        }
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT m.role, m.content FROM messages m
+             WHERE m.conversation_id = ?1 AND m.user_id = ?2
+               AND m.role IN ('user', 'assistant')
+             ORDER BY m.rowid DESC LIMIT 1",
+        )?;
+        for id in conversation_ids {
+            let row = statement
+                .query_row(params![id, user_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .optional()?;
+            if let Some(row) = row {
+                previews.insert((*id).to_owned(), row);
+            }
+        }
+        Ok(previews)
+    }
+
     /// Returns false when the conversation does not exist or belongs to
     /// another user; the two cases are indistinguishable to the caller.
     pub fn rename_conversation(&self, user_id: &str, id: &str, title: &str) -> Result<bool> {

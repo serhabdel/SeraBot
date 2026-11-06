@@ -1252,9 +1252,6 @@ fn Shell(session: Signal<Session>) -> Element {
     let mut inspector_open = use_signal(|| false);
     let mut drawer_open = use_signal(|| false);
     let vault_open = use_signal(|| false);
-    // Browser dock flag (contract section 3). Hidden by default; the network
-    // follow-up raises it while the acting user has a live browser session.
-    let mut browser_open = use_signal(|| false);
     let mut toast = use_signal(|| Option::<(String, bool)>::None);
 
     rsx! {
@@ -1299,7 +1296,7 @@ fn Shell(session: Signal<Session>) -> Element {
                 }
                 Inspector { session, overlay, open: inspector_open }
             }
-            BrowserDock { open: browser_open(), on_close: move |_| browser_open.set(false) }
+            BrowserDock { session }
             {match overlay() {
                 Overlay::NewConversation => rsx! {
                     NewConversationSheet { session, overlay }
@@ -1566,7 +1563,7 @@ fn Sidebar(
             let mut rows = Vec::new();
             for child in &children {
                 let label = state.conversation_label(child);
-                let subtitle = state.conversation_subtitle(child);
+                let subtitle = state.conversation_list_subtitle(child);
                 if matches(&label, &subtitle) {
                     rows.push(RailItem::Thread {
                         id: child.id.clone(),
@@ -1585,7 +1582,7 @@ fn Sidebar(
                             && !bot_chats.contains(&conversation.id)
                     }) {
                         let label = state.conversation_label(grand);
-                        let subtitle = state.conversation_subtitle(grand);
+                        let subtitle = state.conversation_list_subtitle(grand);
                         if matches(&label, &subtitle) {
                             rows.push(RailItem::Thread {
                                 id: grand.id.clone(),
@@ -1640,7 +1637,7 @@ fn Sidebar(
         for conversation in roots {
             let is_room = conversation.normalized_kind() == "room";
             let label = state.conversation_label(conversation);
-            let subtitle = state.conversation_subtitle(conversation);
+            let subtitle = state.conversation_list_subtitle(conversation);
             if !matches(&label, &subtitle) {
                 continue;
             }
@@ -1690,7 +1687,7 @@ fn Sidebar(
                     items.push(RailItem::Thread {
                         id: conversation.id.clone(),
                         label: state.conversation_label(conversation),
-                        subtitle: state.conversation_subtitle(conversation),
+                        subtitle: state.conversation_list_subtitle(conversation),
                         depth: 0,
                         active: false,
                         unread: 0,
@@ -2149,7 +2146,7 @@ fn Topbar(
         .map(str::to_owned);
     let connected = session.read().state.connected;
     let task_status = session.read().state.task.as_ref().map(|task| task.status);
-    let (subtitle, avatar, bot_name) = {
+    let (subtitle, avatar) = {
         let state = session.read();
         let summary = state
             .state
@@ -2171,11 +2168,7 @@ fn Topbar(
             Some(bot) => state.bot_avatar(bot),
             None => initial_of(&title),
         };
-        let bot_name = match &active_bot {
-            Some(bot) => state.bot_display_name(bot),
-            None => title.clone(),
-        };
-        (subtitle, avatar, bot_name)
+        (subtitle, avatar)
     };
     let (pill_class, pill_label) = if !connected {
         ("pill danger", "offline")
@@ -2273,7 +2266,7 @@ fn Topbar(
                     },
                     Icon { name: "panel", size: 16 }
                 }
-                VaultSheet { open: vault_open, bot_name }
+                VaultSheet { open: vault_open, session }
             }
         }
     }

@@ -15,6 +15,7 @@ use crate::{
     },
     creds,
     events::{EventStream, EventUpdate},
+    panel::{PanelState, PanelWorker},
     signin::{self, SignInFailure},
     state::State,
     teams, updater, valid_bot_description, valid_bot_id, valid_conversation_parent, valid_id,
@@ -448,6 +449,9 @@ pub struct Session {
     pub credentials: Option<Arc<Credentials>>,
     pub events: Option<EventStream>,
     pub events_active: bool,
+    /// Browser dock and vault sheet state; its own worker thread.
+    pub panel: PanelState,
+    panel_worker: Option<PanelWorker>,
     events_dirty: bool,
     pub last_event_id: i64,
     last_event_kind: String,
@@ -617,6 +621,50 @@ impl Session {
             poll_history: false,
             poll_paused: false,
             poll_approvals: false,
+            panel: PanelState::new(),
+            panel_worker: None,
+        }
+    }
+
+    /// Drop the previous session's dock and vault state. Results still in
+    /// flight for the old epoch are discarded by the worker and the state.
+    fn reset_panel(&mut self) {
+        self.panel.reset();
+        if let Some(worker) = &self.panel_worker {
+            worker.set_epoch(self.panel.epoch);
+        }
+    }
+
+    /// Receive finished dock/vault requests and send the due ones.
+    fn pump_panel(&mut self) {
+        if !self.state.connected {
+            return;
+        }
+        let Some(credentials) = self.credentials.clone() else {
+            return;
+        };
+        if self.panel_worker.is_none() {
+            let worker = PanelWorker::start().ok();
+            if let Some(worker) = &worker {
+                worker.set_epoch(self.panel.epoch);
+            }
+            self.panel_worker = worker;
+        }
+        let Some(worker) = &self.panel_worker else {
+            return;
+        };
+        let now = Instant::now();
+        let mut unauthorized = false;
+        while let Some(done) = worker.try_recv() {
+            unauthorized |= self.panel.apply(done, now);
+        }
+        while let Some(op) = self.panel.next_op(now) {
+            if !worker.send(self.panel.epoch, Arc::clone(&credentials), op) {
+                break;
+            }
+        }
+        if unauthorized {
+            self.reject_token();
         }
     }
 
@@ -648,6 +696,7 @@ impl Session {
         }
         self.stop_events();
         self.reset_scope(false);
+        self.reset_panel();
         self.state.error = None;
         self.connect_error = None;
         self.connecting = true;
@@ -1068,6 +1117,7 @@ impl Session {
         let stored = creds::forget_token();
         self.stop_events();
         self.reset_scope(false);
+        self.reset_panel();
         self.sign_in.reset_transient();
         self.credentials = None;
         self.token.zeroize();
@@ -1618,6 +1668,21 @@ impl Session {
         }
     }
 
+    /// Row text under a title in the conversation list: the newest message
+    /// preview when the server sent one, otherwise the kind subtitle.
+    pub fn conversation_list_subtitle(&self, conversation: &crate::ConversationSummary) -> String {
+        match &conversation.last_message {
+            Some(last) if !last.text.trim().is_empty() => {
+                if last.role == "user" {
+                    format!("You: {}", last.text.trim())
+                } else {
+                    last.text.trim().to_owned()
+                }
+            }
+            _ => self.conversation_subtitle(conversation),
+        }
+    }
+
     pub fn conversation_subtitle(&self, conversation: &crate::ConversationSummary) -> String {
         if conversation.id == "windows-owner" {
             return "Your direct chat".into();
@@ -1767,6 +1832,7 @@ impl Session {
         self.poll_telegram();
         self.poll_download();
         self.poll_launches();
+        self.pump_panel();
         if let Some(at) = self.reconnect_at {
             if Instant::now() >= at {
                 self.reconnect_at = None;

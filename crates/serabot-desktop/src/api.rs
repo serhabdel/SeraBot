@@ -11,6 +11,9 @@ use std::{
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
+mod panel;
+pub use panel::*;
+
 const MAX_RESPONSE: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -239,10 +242,14 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
     "telegram_send_document",
     "onedrive_upload",
     "onedrive_list",
-    "browser_session_start",
-    "browser_session_stop",
     "browser_navigate",
     "browser_snapshot",
+    "browser_click",
+    "browser_type",
+    "browser_press",
+    "browser_screenshot",
+    "browser_close",
+    "vault_list",
     "google_drive_list",
     "google_sheets_read",
     "google_calendar_list_events",
@@ -786,6 +793,17 @@ pub struct ConversationSummary {
     #[serde(default)]
     pub unread_count: i64,
     pub accepts_turns: bool,
+    /// Newest user or assistant message, as a plain-text preview.
+    #[serde(default)]
+    pub last_message: Option<LastMessage>,
+}
+
+/// List preview of the newest message (`role`: user or assistant, `text`:
+/// plain text, at most 120 characters from the server).
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct LastMessage {
+    pub role: String,
+    pub text: String,
 }
 
 impl ConversationSummary {
@@ -3089,6 +3107,11 @@ fn check_conversation_summary(conversation: &ConversationSummary) -> Result<(), 
             .as_deref()
             .is_some_and(|stamp| !bounded_text(stamp, 64))
         || conversation.unread_count < 0
+        || conversation.last_message.as_ref().is_some_and(|last| {
+            !matches!(last.role.as_str(), "user" | "assistant")
+                || last.text.chars().count() > 200
+                || last.text.chars().any(char::is_control)
+        })
     {
         return Err(ApiError::InvalidResponse);
     }
@@ -3407,6 +3430,7 @@ mod tests {
             archived_at: None,
             unread_count: 0,
             accepts_turns,
+            last_message: None,
         }
     }
 
