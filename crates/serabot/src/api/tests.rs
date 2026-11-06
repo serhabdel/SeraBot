@@ -9,6 +9,7 @@ use axum::http::Request;
 use tower::ServiceExt;
 
 mod browser_api;
+mod profiles_api;
 mod vault_http;
 
 /// The bootstrap admin's id â€” the acting user behind the config token
@@ -194,7 +195,8 @@ fn app_with_stack(
         None,
     )
     .unwrap()
-    .with_browser(browser);
+    .with_browser(browser)
+    .with_onboarding_drafter(Some(Arc::new(profiles_api::ScriptedDrafter)));
     if let Some(service) = auth {
         state.auth = Some(Arc::new(service));
     }

@@ -57,6 +57,7 @@ mod connectors;
 mod conversations;
 mod memories;
 mod messages;
+mod profiles;
 mod skills;
 mod status;
 #[cfg(test)]
@@ -148,6 +149,9 @@ pub struct ApiState {
     oauth_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Per-user server browser; None while [browser] is off.
     browser: Option<Arc<crate::browser::BrowserManager>>,
+    /// Model call behind the onboarding interview; None uses the runtime.
+    /// Tests script it so no request leaves the process.
+    onboarding_drafter: Option<Arc<dyn crate::onboarding::Drafter>>,
 }
 
 impl ApiState {
@@ -188,8 +192,18 @@ impl ApiState {
             auth,
             oauth_inflight: Arc::default(),
             browser: None,
+            onboarding_drafter: None,
             config,
         })
+    }
+
+    /// Replace the model call used by the onboarding interview.
+    pub fn with_onboarding_drafter(
+        mut self,
+        drafter: Option<Arc<dyn crate::onboarding::Drafter>>,
+    ) -> Self {
+        self.onboarding_drafter = drafter;
+        self
     }
 
     /// Attach the per-user browser manager (owner live-view routes).
@@ -345,6 +359,7 @@ pub fn router(state: ApiState) -> Router {
     // user; an unknown token is rejected before it can create a bucket.
     let protected = protected
         .merge(audio)
+        .merge(profiles::routes())
         .layer(middleware::from_fn_with_state(shared.clone(), rate_limit))
         .layer(middleware::from_fn_with_state(shared.clone(), authorize));
     crate::web::router()

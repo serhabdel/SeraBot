@@ -191,6 +191,46 @@ impl Runtime {
         Ok(stored)
     }
 
+    /// One bounded model call with no tools, outside any turn: used by the
+    /// onboarding interview. It goes through the same gates as a turn: the
+    /// bot's effective route is pinned and re-checked, the request is policy
+    /// scanned and vault-redacted, and the call is audited. The reply is
+    /// returned as data; nothing here acts on it.
+    pub async fn bounded_completion(
+        &self,
+        user_id: &str,
+        bot: &str,
+        system: &str,
+        input: &str,
+    ) -> Result<String> {
+        let selection = self.effective_model_selection(user_id, &format!("dir:{bot}"), bot)?;
+        let route = Some(self.router.pin(&selection)?);
+        let route = self.checked_route(user_id, &route)?;
+        let messages = vec![LlmMessage::system(system), LlmMessage::user(input)];
+        self.scan_model_messages(user_id, &messages)?;
+        let outgoing = self.gateway.redact_messages(user_id, &messages)?;
+        let response = self
+            .router
+            .complete(user_id, route, &outgoing, &[], Some(0.2))
+            .await?;
+        self.store.record_audit(
+            user_id,
+            "model.used",
+            None,
+            None,
+            None,
+            None,
+            Some(self.gateway.policy().version()),
+            Some(&json!({
+                "provider": route.selection.provider,
+                "model": route.selection.model,
+                "usage": response.usage,
+                "purpose": "onboarding",
+            })),
+        )?;
+        Ok(response.message.content.unwrap_or_default())
+    }
+
     pub(super) fn checked_route<'a>(
         &self,
         user_id: &str,

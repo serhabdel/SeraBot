@@ -6,13 +6,14 @@
 use crate::{
     ApiClient, ApiError, ApprovalDecision, AudioUpdate, BotConfigUpdate, BotProfileUpdate,
     ConnectorUpdate, ConversationKind, MAX_SKILL_BODY_BYTES, MAX_SKILL_DESCRIPTION_CHARS,
-    MAX_USAGE_DAYS, Message, NewProvider, Role, SPECIALIST_TOOLS, Selection, SignedIn, TaskStatus,
-    TeamMode, TelegramLink, TelegramStatus, VoiceSettings, VoiceUpdate,
+    MAX_USAGE_DAYS, Message, NewGroup, NewProvider, Role, SPECIALIST_TOOLS, Selection, SignedIn,
+    TaskStatus, TeamMode, TelegramLink, TelegramStatus, VoiceSettings, VoiceUpdate,
     api::{
         MEMORY_KINDS, valid_conversation_title, valid_credential, valid_memory_content,
         valid_memory_kind, valid_memory_source, valid_model_id, valid_provider_id,
         valid_secret_name,
     },
+    avatars::AvatarTarget,
     creds,
     events::{EventStream, EventUpdate},
     panel::{PanelState, PanelWorker},
@@ -23,6 +24,10 @@ use crate::{
     valid_text, valid_token, validate_bot_config_update, validate_team_members, validate_tool_list,
     worker::{Credentials, Job, Operation, OperationKind, Reply, Worker},
 };
+mod flows;
+
+use flows::AvatarOp;
+pub use flows::{ImageSlot, NewBotDraft, NewGroupDraft, OnboardingUi, PickedImage};
 use secrecy::ExposeSecret;
 use std::{
     collections::BTreeMap,
@@ -506,6 +511,20 @@ pub struct Session {
     /// reported one this run. A restored token has no known expiry.
     session_expires: Option<u64>,
     pending: Option<OperationKind>,
+    /// The create-bot sheet draft.
+    pub new_bot: NewBotDraft,
+    /// The create-group sheet draft.
+    pub new_group: NewGroupDraft,
+    /// The onboarding chat that opens right after a bot is created.
+    pub onboarding_ui: OnboardingUi,
+    /// A picked image waiting for the bot or group it belongs to to exist.
+    avatar_upload: Option<(AvatarTarget, Vec<u8>)>,
+    /// The avatar request in flight, if any.
+    avatar_op: Option<AvatarOp>,
+    /// True while the create-bot request in flight came from the new sheet.
+    creating_named_bot: bool,
+    /// A freshly created group to open once its image (if any) is up.
+    pending_open_group: Option<String>,
     /// Bot id whose `GET /v1/bots/{id}` is in flight (dedup of loads).
     bot_detail_pending: Option<String>,
     /// The bot config write in flight: (bot id, update), kept so the cached
@@ -610,6 +629,13 @@ impl Session {
             launch_rx,
             session_expires: None,
             pending: None,
+            new_bot: NewBotDraft::default(),
+            new_group: NewGroupDraft::default(),
+            onboarding_ui: OnboardingUi::default(),
+            avatar_upload: None,
+            avatar_op: None,
+            creating_named_bot: false,
+            pending_open_group: None,
             bot_detail_pending: None,
             bot_config_pending: None,
             pending_team: None,
@@ -769,6 +795,14 @@ impl Session {
             self.state.connectors.clear();
             self.state.connectors_loaded = false;
             self.fleet = FleetDraft::default();
+            self.new_bot = NewBotDraft::default();
+            self.new_group = NewGroupDraft::default();
+            self.onboarding_ui = OnboardingUi::default();
+            self.avatar_upload = None;
+            self.avatar_op = None;
+            self.creating_named_bot = false;
+            self.pending_open_group = None;
+            crate::avatars::publish(&std::collections::BTreeMap::new());
             self.selected_bot = None;
             self.bot_profile = BotProfileDraft::default();
             self.memory.content.zeroize();
@@ -1987,6 +2021,12 @@ impl Session {
             Operation::UpdateBotConfig { id, update } => {
                 self.bot_config_pending = Some((id.clone(), update.clone()))
             }
+            Operation::AvatarFetch { target, version } => {
+                self.avatar_op = Some(AvatarOp::Fetch(target.clone(), version.clone()))
+            }
+            Operation::AvatarUpload { .. } | Operation::AvatarRemove { .. } => {
+                self.avatar_op = Some(AvatarOp::Write)
+            }
             _ => {}
         }
         let job = Job {
@@ -2037,6 +2077,38 @@ impl Session {
                     self.scheduled = None;
                     self.poll_paused = true;
                     self.reject_token();
+                }
+                // Images never stop the console: a failed download is
+                // remembered as "no image"; a failed upload is a toast.
+                Err(error) if completion.kind == OperationKind::Avatar => {
+                    match self.avatar_op.take() {
+                        Some(AvatarOp::Fetch(target, version)) => {
+                            self.state.avatars.insert(
+                                target.key(),
+                                crate::avatars::AvatarImage {
+                                    version,
+                                    data_url: None,
+                                },
+                            );
+                            self.schedule_next_avatar();
+                        }
+                        _ => {
+                            self.toast = Some(format!("Could not save the image: {error}"));
+                            self.schedule(Operation::ListBots, Duration::ZERO);
+                        }
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        completion.kind,
+                        OperationKind::OnboardingRead | OperationKind::OnboardingWrite
+                    ) =>
+                {
+                    self.onboarding_failed(completion.kind, error.to_string());
+                }
+                Err(error) if completion.kind == OperationKind::ToolsWrite => {
+                    self.toast = Some(format!("Could not change that: {error}"));
+                    self.schedule(Operation::ListBots, Duration::ZERO);
                 }
                 Err(error)
                     if matches!(
@@ -2154,6 +2226,10 @@ impl Session {
                         Reply::BotConfigSaved { restart_required } => Some(*restart_required),
                         _ => None,
                     };
+                    let avatar_saved = match &reply {
+                        Reply::AvatarSaved(target) => Some(target.clone()),
+                        _ => None,
+                    };
                     if !self.state.receive(&completion.scope, reply) {
                         continue;
                     }
@@ -2207,6 +2283,12 @@ impl Session {
                             },
                             Duration::ZERO,
                         ),
+                        OperationKind::ListConversations
+                            if self.pending_open_group.is_some()
+                                || self.avatar_upload.is_some() =>
+                        {
+                            self.continue_after_group_list();
+                        }
                         OperationKind::ListConversations if self.refreshing => {
                             self.refreshing = false;
                             self.ensure_section_data();
@@ -2215,7 +2297,9 @@ impl Session {
                             // Scheduled after ensure_section_data because a
                             // started request clears the scheduled slot.
                             self.schedule_open_bot_detail();
+                            self.schedule_next_avatar();
                         }
+                        OperationKind::ListConversations => self.schedule_next_avatar(),
                         OperationKind::Submit => {
                             self.poll_history = false;
                             self.schedule(Operation::History, Duration::ZERO);
@@ -2225,6 +2309,9 @@ impl Session {
                         }
                         OperationKind::CreateSkill => {
                             self.schedule(Operation::ListSkills, Duration::ZERO);
+                        }
+                        OperationKind::CreateBot if self.creating_named_bot => {
+                            self.bot_created();
                         }
                         OperationKind::CreateBot => {
                             if let Some(created) = self.state.created_bot.clone() {
@@ -2255,6 +2342,45 @@ impl Session {
                             if self.section == Section::Fleet && !self.state.skills_loaded {
                                 self.schedule(Operation::ListSkills, Duration::ZERO);
                             }
+                            self.continue_after_bots();
+                        }
+                        OperationKind::Avatar => {
+                            self.avatar_op = None;
+                            crate::avatars::publish(&self.state.avatars);
+                            if avatar_saved.is_some() {
+                                // A write: reread the lists so the new version
+                                // stamp reaches the cache.
+                                if matches!(avatar_saved, Some(AvatarTarget::Group(_))) {
+                                    self.schedule(
+                                        Operation::ListConversations {
+                                            include_archived: false,
+                                        },
+                                        Duration::ZERO,
+                                    );
+                                } else {
+                                    self.schedule(Operation::ListBots, Duration::ZERO);
+                                }
+                            } else {
+                                self.schedule_next_avatar();
+                            }
+                        }
+                        OperationKind::CreateGroup => self.group_created(),
+                        OperationKind::OnboardingRead | OperationKind::OnboardingWrite => {
+                            self.onboarding_ui.waiting = false;
+                            self.onboarding_ui.error = None;
+                            if self
+                                .state
+                                .onboarding
+                                .as_ref()
+                                .is_some_and(|current| current.done)
+                            {
+                                // The confirm enabled the bot and saved its
+                                // prompt; the lists show it.
+                                self.schedule(Operation::ListBots, Duration::ZERO);
+                            }
+                        }
+                        OperationKind::ToolsWrite => {
+                            self.schedule(Operation::ListBots, Duration::ZERO);
                         }
                         OperationKind::AdminProfile => {
                             if let Some(bot) = self
