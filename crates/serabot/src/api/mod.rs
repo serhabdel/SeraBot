@@ -241,6 +241,23 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/browser/handback", post(browser_handback))
         .route("/v1/browser/input", post(browser_input))
         .route("/v1/browser/close", post(browser_close))
+        .route("/v1/browser/sessions", get(sessions_list))
+        .route(
+            "/v1/browser/sessions/{id}/screenshot",
+            get(session_screenshot),
+        )
+        .route("/v1/browser/sessions/{id}/takeover", post(session_takeover))
+        .route("/v1/browser/sessions/{id}/handback", post(session_handback))
+        .route("/v1/browser/sessions/{id}/input", post(session_input))
+        .route("/v1/browser/sessions/{id}/close", post(session_close))
+        .route(
+            "/v1/browser/profiles",
+            get(profiles_list).post(profile_create),
+        )
+        .route(
+            "/v1/browser/profiles/{id}",
+            put(profile_rename).delete(profile_delete),
+        )
         .route("/v1/messages", post(send_message))
         .route("/v1/bots", get(list_bots).post(create_bot))
         .route(
@@ -635,10 +652,17 @@ fn is_poll_request(method: &axum::http::Method, path: &str) -> bool {
     }
     matches!(
         path,
-        "/v1/health" | "/v1/browser" | "/v1/browser/screenshot" | "/v1/events" | "/v1/approvals"
-    ) || path
-        .strip_prefix("/v1/conversations/")
-        .is_some_and(|rest| rest.ends_with("/messages") && rest.matches('/').count() == 1)
+        "/v1/health"
+            | "/v1/browser"
+            | "/v1/browser/screenshot"
+            | "/v1/browser/sessions"
+            | "/v1/browser/profiles"
+            | "/v1/events"
+            | "/v1/approvals"
+    ) || (path.starts_with("/v1/browser/sessions/") && path.ends_with("/screenshot"))
+        || path
+            .strip_prefix("/v1/conversations/")
+            .is_some_and(|rest| rest.ends_with("/messages") && rest.matches('/').count() == 1)
         || path.starts_with("/v1/tasks/")
 }
 

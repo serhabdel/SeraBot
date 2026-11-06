@@ -654,6 +654,13 @@ impl ModelRouter {
             .map(|provider| provider.id.clone())
     }
 
+    /// Whether the provider `provider` lists `model`.
+    pub fn provider_serves_model(&self, provider: &str, model: &str) -> bool {
+        self.providers
+            .values()
+            .any(|entry| entry.id == provider && entry.models.contains(model))
+    }
+
     /// Names of the logical routing classes whose model list contains `model`.
     pub fn classes_for_model(&self, model: &str) -> Vec<String> {
         self.classes

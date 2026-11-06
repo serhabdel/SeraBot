@@ -642,6 +642,10 @@ pub(super) async fn onboarding_confirm(
         tools: None,
         skills: None,
         require_approval: None,
+        display_name: None,
+        description: None,
+        model: None,
+        browser_profile: None,
     };
     let _saved = update_bot(
         State(state.clone()),

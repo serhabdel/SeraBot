@@ -1,4 +1,5 @@
 use super::*;
+use crate::browser_profiles::{MAX_BOT_DESCRIPTION_CHARS, MAX_BOT_DISPLAY_NAME_CHARS};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -155,10 +156,20 @@ pub(super) async fn list_bots(
 ) -> Result<Json<Value>> {
     let configured = state.runtime.fleet().configured(&user.id)?;
     let avatar_versions = state.store.bot_avatar_versions(&user.id)?;
+    let mut settings_by_bot = HashMap::new();
+    let mut profile_by_bot = HashMap::new();
+    for bot in &configured {
+        settings_by_bot.insert(bot.id.clone(), state.store.bot_settings(&user.id, &bot.id)?);
+        profile_by_bot.insert(
+            bot.id.clone(),
+            state.store.bot_browser_profile(&user.id, &bot.id)?,
+        );
+    }
     let bots = configured
         .into_iter()
         .map(|bot| {
             let id = bot.id.clone();
+            let settings = settings_by_bot.remove(&id).unwrap_or_default();
             let profile = if user.is_admin() {
                 state
                     .admin
@@ -182,8 +193,9 @@ pub(super) async fn list_bots(
                 "enabled": bot.enabled,
                 "live": state.runtime.bot_loaded(&user.id, &bot.id),
                 "model": bot.model,
-                "display_name": profile.as_ref().map(|p| p.display_name.clone()).filter(|name| !name.is_empty()),
-                "description": profile.as_ref().map(|p| p.description.clone()).filter(|text| !text.is_empty()),
+                "display_name": settings.display_name.clone().or_else(|| profile.as_ref().map(|p| p.display_name.clone()).filter(|name| !name.is_empty())),
+                "description": settings.description.clone().or_else(|| profile.as_ref().map(|p| p.description.clone()).filter(|text| !text.is_empty())),
+                "browser_profile": profile_by_bot.get(&id).cloned().unwrap_or_else(|| "default".into()),
                 "avatar": profile.as_ref().map(|p| p.avatar.clone()).filter(|avatar| !avatar.is_empty()),
                 "avatar_version": avatar_versions.get(&id),
                 "tools": tools,
@@ -268,16 +280,28 @@ pub(super) async fn bot_detail(
     };
     // The desktop detail record expects strings, so an absent profile falls
     // back to the bot id and empty text instead of null.
-    let display_name = profile
-        .as_ref()
-        .map(|p| p.display_name.clone())
-        .filter(|name| !name.is_empty())
+    let settings = state.store.bot_settings(&user.id, &id)?;
+    let display_name = settings
+        .display_name
+        .clone()
+        .or_else(|| {
+            profile
+                .as_ref()
+                .map(|p| p.display_name.clone())
+                .filter(|name| !name.is_empty())
+        })
         .unwrap_or_else(|| id.clone());
-    let description = profile
-        .as_ref()
-        .map(|p| p.description.clone())
-        .filter(|text| !text.is_empty())
+    let description = settings
+        .description
+        .clone()
+        .or_else(|| {
+            profile
+                .as_ref()
+                .map(|p| p.description.clone())
+                .filter(|text| !text.is_empty())
+        })
         .unwrap_or_default();
+    let browser_profile = state.store.bot_browser_profile(&user.id, &id)?;
     let avatar = profile
         .as_ref()
         .map(|p| p.avatar.clone())
@@ -319,6 +343,7 @@ pub(super) async fn bot_detail(
         "id": entry.id,
         "display_name": display_name,
         "role": entry.role,
+        "browser_profile": browser_profile,
         "description": description,
         "avatar": avatar,
         "enabled": entry.enabled,
@@ -354,6 +379,34 @@ pub(super) struct UpdateBotRequest {
     pub(super) skills: Option<Vec<String>>,
     #[serde(default)]
     pub(super) require_approval: Option<Vec<String>>,
+    /// 1-48 characters.
+    #[serde(default)]
+    pub(super) display_name: Option<String>,
+    /// 0-280 characters; empty clears it.
+    #[serde(default)]
+    pub(super) description: Option<String>,
+    /// `{"provider","model"}`, or `null` for the default model.
+    #[serde(default, deserialize_with = "double_option")]
+    pub(super) model: Option<Option<ModelChoice>>,
+    /// A browser profile id, or `null` for the default profile.
+    #[serde(default, deserialize_with = "double_option")]
+    pub(super) browser_profile: Option<Option<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ModelChoice {
+    provider: String,
+    model: String,
+}
+
+/// Distinguishes an absent field (`None`) from an explicit `null` (`Some(None)`).
+fn double_option<'de, T, D>(deserializer: D) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 /// `PUT /v1/bots/{id}` — update the session user's bot row. Enable/disable and
@@ -374,9 +427,13 @@ pub(super) async fn update_bot(
         && request.tools.is_none()
         && request.skills.is_none()
         && request.require_approval.is_none()
+        && request.display_name.is_none()
+        && request.description.is_none()
+        && request.model.is_none()
+        && request.browser_profile.is_none()
     {
         return Err(SeraError::Validation(
-            "at least one of enabled, prompt, tools, skills, require_approval is required".into(),
+            "at least one of enabled, prompt, tools, skills, require_approval, display_name, description, model, browser_profile is required".into(),
         ));
     }
     // Untrusted input is scanned before it is validated or stored.
@@ -394,6 +451,75 @@ pub(super) async fn update_bot(
         .row(&user.id, &id)?
         .ok_or_else(|| SeraError::NotFound(format!("bot {id}")))?;
     let mut config = parse_bot_config(&row)?;
+
+    // Owner-editable profile fields (0.16): validated and scanned before any write.
+    let mut settings = state.store.bot_settings(&user.id, &id)?;
+    let settings_changed = request.display_name.is_some()
+        || request.description.is_some()
+        || request.browser_profile.is_some();
+    if let Some(name) = &request.display_name {
+        let name = name.trim();
+        let count = name.chars().count();
+        if count == 0 || count > MAX_BOT_DISPLAY_NAME_CHARS || name.chars().any(char::is_control) {
+            return Err(SeraError::Validation(format!(
+                "display_name must be 1 to {MAX_BOT_DISPLAY_NAME_CHARS} characters"
+            )));
+        }
+        state.runtime.scan_owner_output(&user.id, name)?;
+        settings.display_name = Some(name.to_owned());
+    }
+    if let Some(description) = &request.description {
+        let description = description.trim();
+        if description.chars().count() > MAX_BOT_DESCRIPTION_CHARS
+            || description
+                .chars()
+                .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
+        {
+            return Err(SeraError::Validation(format!(
+                "description must be at most {MAX_BOT_DESCRIPTION_CHARS} characters"
+            )));
+        }
+        state.runtime.scan_owner_output(&user.id, description)?;
+        settings.description = (!description.is_empty()).then(|| description.to_owned());
+    }
+    if let Some(choice) = &request.browser_profile {
+        settings.browser_profile = match choice.as_deref() {
+            None | Some(crate::browser_profiles::DEFAULT_PROFILE) => None,
+            Some(profile) => {
+                if !crate::browser_profiles::valid_profile_id(profile)
+                    || state
+                        .store
+                        .get_browser_profile(&user.id, profile)?
+                        .is_none()
+                {
+                    return Err(SeraError::Validation("unknown browser profile".into()));
+                }
+                Some(profile.to_owned())
+            }
+        };
+    }
+    let model_changed = request.model.is_some();
+    if let Some(choice) = &request.model {
+        config.model = match choice {
+            None => None,
+            Some(choice) => {
+                state
+                    .runtime
+                    .scan_owner_output(&user.id, &choice.provider)?;
+                state.runtime.scan_owner_output(&user.id, &choice.model)?;
+                if !state
+                    .runtime
+                    .router()
+                    .provider_serves_model(&choice.provider, &choice.model)
+                {
+                    return Err(SeraError::Validation(
+                        "unknown model for that provider".into(),
+                    ));
+                }
+                Some(choice.model.clone())
+            }
+        };
+    }
 
     let prompt_changed = request.prompt.is_some();
     let prompt = match request.prompt {
@@ -447,6 +573,7 @@ pub(super) async fn update_bot(
     bot.config.tools = tools.clone();
     bot.config.skills = skills.clone();
     bot.config.require_approval = require_approval.clone();
+    bot.config.model = config.model.clone();
     bot.prompt = prompt.clone();
     crate::fleet::FleetRegistry::validate_fleet(&candidate)?;
 
@@ -455,12 +582,16 @@ pub(super) async fn update_bot(
     config.skills = skills.clone();
     config.require_approval = require_approval.clone();
     let role = config.role.as_str().to_owned();
+    let config_model = config.model.clone();
     let config = serde_json::to_value(&config)?;
     if !state
         .store
         .update_bot(&user.id, &id, &config, &prompt, enabled)?
     {
         return Err(SeraError::NotFound(format!("bot {id}")));
+    }
+    if settings_changed {
+        state.store.put_bot_settings(&user.id, &id, &settings)?;
     }
     state.runtime.fleet().invalidate(&user.id);
     state.store.record_audit(
@@ -479,6 +610,8 @@ pub(super) async fn update_bot(
             "tools_changed": request.tools.is_some(),
             "skills_changed": request.skills.is_some(),
             "require_approval_changed": request.require_approval.is_some(),
+            "profile_changed": settings_changed,
+            "model_changed": model_changed,
         })),
     )?;
     Ok(Json(json!({
@@ -490,6 +623,13 @@ pub(super) async fn update_bot(
             "tools": tools,
             "skills": skills,
             "require_approval": require_approval,
+            "display_name": settings.display_name,
+            "description": settings.description,
+            "model": config_model,
+            "browser_profile": settings
+                .browser_profile
+                .clone()
+                .unwrap_or_else(|| crate::browser_profiles::DEFAULT_PROFILE.to_owned()),
         }
     })))
 }

@@ -5,6 +5,7 @@
 //! user id from the model or from a request body.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -48,7 +49,7 @@ pub trait BrowserBackend: Send + Sync {
 
 #[async_trait]
 pub trait BrowserLauncher: Send + Sync {
-    async fn launch(&self, user_id: &str) -> Result<Arc<dyn BrowserBackend>>;
+    async fn launch(&self, user_id: &str, profile_id: &str) -> Result<Arc<dyn BrowserBackend>>;
 }
 
 /// Resolves a vault secret for typing. Production: `vault::resolve_for_browser`.
@@ -78,6 +79,25 @@ pub struct BrowserInfo {
     pub title: Option<String>,
     pub controller: Controller,
     pub updated_at: String,
+    /// Bot that last drove this session (sessions API only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot: Option<String>,
+    /// Conversation of the last bot turn that used this session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+}
+
+/// Which bot (and conversation) is driving a session.
+#[derive(Debug, Clone, Copy)]
+pub struct Driver<'a> {
+    pub bot: &'a str,
+    pub conversation_id: Option<&'a str>,
+}
+
+type SessionKey = (String, String);
+
+fn key(user_id: &str, profile_id: &str) -> SessionKey {
+    (user_id.to_owned(), profile_id.to_owned())
 }
 
 impl BrowserInfo {
@@ -88,6 +108,8 @@ impl BrowserInfo {
             title: None,
             controller: Controller::Bot,
             updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            bot: None,
+            conversation_id: None,
         }
     }
 
@@ -101,6 +123,8 @@ struct SessionState {
     last_used: Instant,
     updated_at: DateTime<Utc>,
     secrets: Vec<(String, Zeroizing<String>)>,
+    bot: Option<String>,
+    conversation_id: Option<String>,
 }
 
 pub struct Session {
@@ -119,6 +143,8 @@ impl Session {
                 last_used: Instant::now(),
                 updated_at: Utc::now(),
                 secrets: Vec::new(),
+                bot: None,
+                conversation_id: None,
             }),
             op: Arc::new(Mutex::new(())),
         }
@@ -201,8 +227,10 @@ pub struct BrowserManager {
     launcher: Arc<dyn BrowserLauncher>,
     max_sessions: usize,
     idle_timeout: Duration,
-    sessions: Mutex<HashMap<String, Arc<Session>>>,
+    sessions: Mutex<HashMap<SessionKey, Arc<Session>>>,
     launch_gate: Mutex<()>,
+    /// Base of `<user_id>/<profile_id>` Chrome directories, when known.
+    base_dir: Option<PathBuf>,
 }
 
 impl BrowserManager {
@@ -217,38 +245,54 @@ impl BrowserManager {
             idle_timeout,
             sessions: Mutex::new(HashMap::new()),
             launch_gate: Mutex::new(()),
+            base_dir: None,
         }
     }
 
-    async fn existing(&self, user_id: &str) -> Option<Arc<Session>> {
-        self.sessions.lock().await.get(user_id).cloned()
+    /// Where profile directories live; needed to delete a profile's data.
+    pub fn with_base_dir(mut self, base_dir: PathBuf) -> Self {
+        self.base_dir = Some(base_dir);
+        self
     }
 
-    async fn drop_dead(&self, user_id: &str, session: &Arc<Session>) {
+    pub fn base_dir(&self) -> Option<&Path> {
+        self.base_dir.as_deref()
+    }
+
+    async fn existing(&self, user_id: &str, profile_id: &str) -> Option<Arc<Session>> {
+        self.sessions
+            .lock()
+            .await
+            .get(&key(user_id, profile_id))
+            .cloned()
+    }
+
+    async fn drop_dead(&self, user_id: &str, profile_id: &str, session: &Arc<Session>) {
         let mut map = self.sessions.lock().await;
+        let k = key(user_id, profile_id);
         if map
-            .get(user_id)
+            .get(&k)
             .is_some_and(|current| Arc::ptr_eq(current, session))
         {
-            map.remove(user_id);
+            map.remove(&k);
         }
         drop(map);
         session.backend.shutdown().await;
     }
 
-    async fn live_session(&self, user_id: &str) -> Option<Arc<Session>> {
-        let session = self.existing(user_id).await?;
+    async fn live_session(&self, user_id: &str, profile_id: &str) -> Option<Arc<Session>> {
+        let session = self.existing(user_id, profile_id).await?;
         if session.backend.is_alive().await {
             Some(session)
         } else {
-            self.drop_dead(user_id, &session).await;
+            self.drop_dead(user_id, profile_id, &session).await;
             None
         }
     }
 
-    async fn launch(&self, user_id: &str) -> Result<Arc<Session>> {
+    async fn launch(&self, user_id: &str, profile_id: &str) -> Result<Arc<Session>> {
         let _gate = self.launch_gate.lock().await;
-        if let Some(session) = self.live_session(user_id).await {
+        if let Some(session) = self.live_session(user_id, profile_id).await {
             return Ok(session);
         }
         self.reap_idle().await;
@@ -257,12 +301,12 @@ impl BrowserManager {
                 "browser capacity reached; try again when another session has closed".into(),
             ));
         }
-        let backend = self.launcher.launch(user_id).await?;
+        let backend = self.launcher.launch(user_id, profile_id).await?;
         let session = Arc::new(Session::new(backend));
         self.sessions
             .lock()
             .await
-            .insert(user_id.to_owned(), session.clone());
+            .insert(key(user_id, profile_id), session.clone());
         Ok(session)
     }
 
@@ -275,12 +319,19 @@ impl BrowserManager {
         }
     }
 
-    /// Lease for a bot tool. `launch` creates a session when none exists
-    /// (navigate only); fails while the user holds control.
-    pub async fn bot_lease(&self, user_id: &str, launch: bool) -> Result<Lease> {
-        let session = match self.live_session(user_id).await {
+    /// Lease for a bot tool on one profile's session. `launch` creates a
+    /// session when none exists (navigate only); fails while the user holds
+    /// control. The driving bot and conversation are recorded on the session.
+    pub async fn bot_lease(
+        &self,
+        user_id: &str,
+        profile_id: &str,
+        launch: bool,
+        driver: Option<Driver<'_>>,
+    ) -> Result<Lease> {
+        let session = match self.live_session(user_id, profile_id).await {
             Some(session) => session,
-            None if launch => self.launch(user_id).await?,
+            None if launch => self.launch(user_id, profile_id).await?,
             None => {
                 return Err(SeraError::Validation(
                     "no browser session is open; call browser_navigate first".into(),
@@ -295,13 +346,19 @@ impl BrowserManager {
         if lease.session.controller() == Controller::User {
             return Err(user_in_control());
         }
+        if let Some(driver) = driver {
+            lease.session.with_state(|state| {
+                state.bot = Some(driver.bot.to_owned());
+                state.conversation_id = driver.conversation_id.map(str::to_owned);
+            });
+        }
         Ok(lease)
     }
 
     /// Lease for owner input; only while the user holds control.
-    pub async fn user_lease(&self, user_id: &str) -> Result<Lease> {
+    pub async fn user_lease(&self, user_id: &str, profile_id: &str) -> Result<Lease> {
         let session = self
-            .live_session(user_id)
+            .live_session(user_id, profile_id)
             .await
             .ok_or_else(|| SeraError::NotFound("no browser session".into()))?;
         let lease = Self::lease(session).await;
@@ -313,33 +370,71 @@ impl BrowserManager {
         Ok(lease)
     }
 
-    pub async fn info(&self, user_id: &str) -> BrowserInfo {
-        let Some(session) = self.live_session(user_id).await else {
-            return BrowserInfo::inactive();
-        };
+    async fn info_of(session: &Arc<Session>) -> BrowserInfo {
         let page = session.backend.info().await.unwrap_or_default();
-        let (controller, updated_at) =
-            session.with_state(|state| (state.controller, state.updated_at));
+        let (controller, updated_at, bot, conversation_id) = session.with_state(|state| {
+            (
+                state.controller,
+                state.updated_at,
+                state.bot.clone(),
+                state.conversation_id.clone(),
+            )
+        });
         BrowserInfo {
             active: true,
             url: Some(page.url),
             title: Some(page.title),
             controller,
             updated_at: updated_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+            bot,
+            conversation_id,
         }
     }
 
-    pub async fn screenshot(&self, user_id: &str) -> Result<Vec<u8>> {
+    pub async fn info(&self, user_id: &str, profile_id: &str) -> BrowserInfo {
+        match self.live_session(user_id, profile_id).await {
+            Some(session) => Self::info_of(&session).await,
+            None => BrowserInfo::inactive(),
+        }
+    }
+
+    /// Live sessions of one user: `(profile id, info)`. Never lists another
+    /// user's sessions.
+    pub async fn user_sessions(&self, user_id: &str) -> Vec<(String, BrowserInfo)> {
+        let profiles: Vec<String> = self
+            .sessions
+            .lock()
+            .await
+            .keys()
+            .filter(|(user, _)| user == user_id)
+            .map(|(_, profile)| profile.clone())
+            .collect();
+        let mut out = Vec::new();
+        for profile in profiles {
+            if let Some(session) = self.live_session(user_id, &profile).await {
+                out.push((profile, Self::info_of(&session).await));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    pub async fn screenshot(&self, user_id: &str, profile_id: &str) -> Result<Vec<u8>> {
         let session = self
-            .live_session(user_id)
+            .live_session(user_id, profile_id)
             .await
             .ok_or_else(|| SeraError::NotFound("no browser session".into()))?;
         session.backend.screenshot_jpeg().await
     }
 
-    pub async fn set_controller(&self, user_id: &str, controller: Controller) -> Result<()> {
+    pub async fn set_controller(
+        &self,
+        user_id: &str,
+        profile_id: &str,
+        controller: Controller,
+    ) -> Result<()> {
         let session = self
-            .live_session(user_id)
+            .live_session(user_id, profile_id)
             .await
             .ok_or_else(|| SeraError::NotFound("no browser session".into()))?;
         session.with_state(|state| {
@@ -350,9 +445,9 @@ impl BrowserManager {
         Ok(())
     }
 
-    /// Close the user's session. Returns whether one existed.
-    pub async fn close(&self, user_id: &str) -> bool {
-        let removed = self.sessions.lock().await.remove(user_id);
+    /// Close one profile's session. Returns whether one existed.
+    pub async fn close(&self, user_id: &str, profile_id: &str) -> bool {
+        let removed = self.sessions.lock().await.remove(&key(user_id, profile_id));
         match removed {
             Some(session) => {
                 session.backend.shutdown().await;
@@ -371,22 +466,19 @@ impl BrowserManager {
 
     /// Close sessions idle for longer than the configured timeout.
     pub async fn reap_idle(&self) -> usize {
-        let expired: Vec<(String, Arc<Session>)> = {
+        let expired: Vec<Arc<Session>> = {
             let mut map = self.sessions.lock().await;
-            let stale: Vec<String> = map
+            let stale: Vec<SessionKey> = map
                 .iter()
                 .filter(|(_, session)| {
                     session.with_state(|state| state.last_used.elapsed() >= self.idle_timeout)
                 })
-                .map(|(user, _)| user.clone())
+                .map(|(k, _)| k.clone())
                 .collect();
-            stale
-                .into_iter()
-                .filter_map(|user| map.remove(&user).map(|session| (user, session)))
-                .collect()
+            stale.into_iter().filter_map(|k| map.remove(&k)).collect()
         };
         let count = expired.len();
-        for (_, session) in expired {
+        for session in expired {
             session.backend.shutdown().await;
         }
         count
@@ -423,18 +515,20 @@ mod tests {
     use super::super::testing::{FakeLauncher, manager_with};
     use super::*;
 
+    const D: &str = "default";
+
     #[tokio::test]
     async fn bot_lease_requires_launch_and_is_per_user() {
         let (manager, launcher) = manager_with(4, Duration::from_secs(600));
-        assert!(manager.bot_lease("alice", false).await.is_err());
-        drop(manager.bot_lease("alice", true).await.unwrap());
-        drop(manager.bot_lease("bob", true).await.unwrap());
+        assert!(manager.bot_lease("alice", D, false, None).await.is_err());
+        drop(manager.bot_lease("alice", D, true, None).await.unwrap());
+        drop(manager.bot_lease("bob", D, true, None).await.unwrap());
         assert_eq!(launcher.launches(), vec!["alice", "bob"]);
-        assert!(manager.info("alice").await.active);
-        assert!(!manager.info("carol").await.active);
-        assert!(manager.close("alice").await);
-        assert!(!manager.info("alice").await.active);
-        assert!(manager.info("bob").await.active);
+        assert!(manager.info("alice", D).await.active);
+        assert!(!manager.info("carol", D).await.active);
+        assert!(manager.close("alice", D).await);
+        assert!(!manager.info("alice", D).await.active);
+        assert!(manager.info("bob", D).await.active);
     }
 
     #[tokio::test]
@@ -442,41 +536,45 @@ mod tests {
         let (manager, _) = manager_with(4, Duration::from_secs(600));
         assert!(
             manager
-                .set_controller("alice", Controller::User)
+                .set_controller("alice", D, Controller::User)
                 .await
                 .is_err()
         );
-        drop(manager.bot_lease("alice", true).await.unwrap());
+        drop(manager.bot_lease("alice", D, true, None).await.unwrap());
         // User input is refused until takeover.
-        assert!(manager.user_lease("alice").await.is_err());
+        assert!(manager.user_lease("alice", D).await.is_err());
         manager
-            .set_controller("alice", Controller::User)
+            .set_controller("alice", D, Controller::User)
             .await
             .unwrap();
-        assert_eq!(manager.info("alice").await.controller, Controller::User);
-        let err = manager.bot_lease("alice", true).await.err().unwrap();
+        assert_eq!(manager.info("alice", D).await.controller, Controller::User);
+        let err = manager
+            .bot_lease("alice", D, true, None)
+            .await
+            .err()
+            .unwrap();
         assert!(err.to_string().contains("user is in control"), "{err}");
-        drop(manager.user_lease("alice").await.unwrap());
+        drop(manager.user_lease("alice", D).await.unwrap());
         // Another user is unaffected.
-        drop(manager.bot_lease("bob", true).await.unwrap());
-        assert!(manager.user_lease("bob").await.is_err());
+        drop(manager.bot_lease("bob", D, true, None).await.unwrap());
+        assert!(manager.user_lease("bob", D).await.is_err());
         manager
-            .set_controller("alice", Controller::Bot)
+            .set_controller("alice", D, Controller::Bot)
             .await
             .unwrap();
-        drop(manager.bot_lease("alice", false).await.unwrap());
-        assert!(manager.user_lease("alice").await.is_err());
+        drop(manager.bot_lease("alice", D, false, None).await.unwrap());
+        assert!(manager.user_lease("alice", D).await.is_err());
     }
 
     #[tokio::test]
     async fn capacity_and_idle_reaping() {
         let (manager, launcher) = manager_with(1, Duration::from_millis(50));
-        drop(manager.bot_lease("alice", true).await.unwrap());
-        let err = manager.bot_lease("bob", true).await.err().unwrap();
+        drop(manager.bot_lease("alice", D, true, None).await.unwrap());
+        let err = manager.bot_lease("bob", D, true, None).await.err().unwrap();
         assert!(err.to_string().contains("capacity"), "{err}");
         tokio::time::sleep(Duration::from_millis(80)).await;
         // The idle session is reaped to make room.
-        drop(manager.bot_lease("bob", true).await.unwrap());
+        drop(manager.bot_lease("bob", D, true, None).await.unwrap());
         assert_eq!(launcher.shutdowns(), 1);
         assert_eq!(manager.session_count().await, 1);
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -487,17 +585,17 @@ mod tests {
     #[tokio::test]
     async fn dead_backend_is_replaced() {
         let (manager, launcher) = manager_with(2, Duration::from_secs(600));
-        drop(manager.bot_lease("alice", true).await.unwrap());
+        drop(manager.bot_lease("alice", D, true, None).await.unwrap());
         launcher.kill_all();
-        assert!(!manager.info("alice").await.active);
-        drop(manager.bot_lease("alice", true).await.unwrap());
+        assert!(!manager.info("alice", D).await.active);
+        drop(manager.bot_lease("alice", D, true, None).await.unwrap());
         assert_eq!(launcher.launches().len(), 2);
     }
 
     #[tokio::test]
     async fn secrets_are_redacted_from_later_text() {
         let (manager, _) = manager_with(2, Duration::from_secs(600));
-        let lease = manager.bot_lease("alice", true).await.unwrap();
+        let lease = manager.bot_lease("alice", D, true, None).await.unwrap();
         lease.remember_secret("bank", &Zeroizing::new("hunter2-pass".to_owned()));
         assert_eq!(
             lease.redact("field value=\"hunter2-pass\" and hunter2-pass"),
