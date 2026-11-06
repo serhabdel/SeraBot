@@ -3783,3 +3783,291 @@ html[data-reduce-transparency="true"] .chat-header {
   max-width: 30ch;
 }
 
+
+/* ------------------------------------------- vault list and form (0.14) --- */
+
+.vault-sheet {
+  width: 400px;
+  max-height: min(640px, calc(100vh - 96px));
+  overflow-y: auto;
+}
+
+.vault-sub {
+  margin: -4px 0 0;
+  color: var(--label-3);
+}
+
+.vault-error {
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  background: var(--danger-soft);
+}
+
+.vault-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: var(--r-sm);
+  background: var(--ok-soft);
+  color: var(--ok);
+  font-size: var(--fs-caption);
+}
+
+.vault-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.vault-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--hairline);
+  background: var(--surface-2);
+  transition: opacity var(--dur-2) var(--ease), background var(--dur-2) var(--ease);
+}
+
+.vault-row.busy {
+  opacity: 0.5;
+}
+
+.vault-kind {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-sm);
+  background: var(--active);
+  color: var(--label-2);
+}
+
+.vault-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.vault-name {
+  font-family: var(--font-mono);
+  font-size: var(--fs-body);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vault-meta,
+.vault-used {
+  color: var(--label-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vault-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.vault-actions,
+.vault-confirm {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.vault-foot,
+.vault-form-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.vault-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.vault-form-title {
+  margin: 0;
+  font-size: var(--fs-body);
+  font-weight: 650;
+}
+
+.vault-hint {
+  color: var(--label-3);
+}
+
+.seg {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--hairline);
+}
+
+.seg-btn {
+  flex: 1;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: calc(var(--r-sm) - 2px);
+  background: transparent;
+  color: var(--label-2);
+  font: inherit;
+  font-size: var(--fs-caption);
+  cursor: pointer;
+  transition: background var(--dur-2) var(--ease), color var(--dur-2) var(--ease);
+}
+
+.seg-btn:active {
+  transform: scale(0.97);
+}
+
+.seg-btn.active {
+  background: var(--active);
+  color: var(--label-1);
+  font-weight: 600;
+}
+
+.vault-chips.editable {
+  align-items: center;
+  padding: 5px 6px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hairline);
+  background: var(--surface-2);
+}
+
+.vault-chips.editable:focus-within {
+  border-color: var(--accent);
+}
+
+.chip.removable {
+  padding-right: 3px;
+}
+
+.chip-x {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.chip-x:hover {
+  background: var(--active);
+}
+
+.chip-input {
+  flex: 1;
+  min-width: 90px;
+  padding: 2px 4px;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--label-1);
+  font: inherit;
+  font-size: var(--fs-caption);
+}
+
+.input[readonly] {
+  opacity: 0.7;
+}
+
+/* --------------------------------------------- browser dock live view --- */
+
+.dock-url.editable {
+  padding: 0 0 0 10px;
+}
+
+.dock-url-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dock-address {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px 6px 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--label-1);
+  font: inherit;
+  font-size: var(--fs-caption);
+}
+
+.dock-title-line {
+  margin-top: -4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--label-3);
+}
+
+.dock-stage {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  overflow: auto;
+  outline: none;
+}
+
+.dock-stage.control {
+  cursor: crosshair;
+  box-shadow: inset 0 0 0 2px var(--accent);
+  border-radius: var(--r-md);
+}
+
+.dock-stage.control:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--accent), 0 0 0 3px var(--accent-soft);
+}
+
+.dock-shot {
+  display: block;
+  width: 100%;
+  height: auto;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.dock-error {
+  padding: 6px 10px;
+  border-radius: var(--r-sm);
+  background: var(--danger-soft);
+  font-size: var(--fs-caption);
+}
+
+.dock-view .skeleton {
+  border-radius: 0;
+}
+.vault-form-foot {
+  position: sticky;
+  bottom: -16px;
+  margin: 0 -16px -16px;
+  padding: 10px 16px 16px;
+  background: var(--glass-sheet);
+  border-top: 1px solid var(--hairline);
+}

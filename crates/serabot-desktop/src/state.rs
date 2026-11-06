@@ -695,6 +695,7 @@ mod tests {
             archived_at: None,
             unread_count: 0,
             accepts_turns: matches!(kind, "direct" | "room"),
+            last_message: None,
         }
     }
 

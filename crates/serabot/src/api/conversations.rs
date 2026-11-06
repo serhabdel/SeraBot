@@ -395,14 +395,45 @@ pub(super) async fn list_conversations(
     } else {
         None
     };
+    let ids = records
+        .iter()
+        .map(|record| record.id.as_str())
+        .collect::<Vec<_>>();
+    let previews = state.store.last_message_previews(&user.id, &ids)?;
     let conversations = records
         .iter()
-        .map(conversation_view)
+        .map(|record| {
+            let mut view = conversation_view(record)?;
+            if let Some((role, content)) = previews.get(&record.id) {
+                // Same policy scan as the transcript: a blocked message never
+                // leaks through the list.
+                let text = if state.runtime.scan_owner_output(&user.id, content).is_ok() {
+                    preview_text(content)
+                } else {
+                    "[Content withheld by policy]".to_owned()
+                };
+                if !text.is_empty() {
+                    view["last_message"] = json!({"role": role, "text": text});
+                }
+            }
+            Ok(view)
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok(Json(json!({
         "conversations": conversations,
         "next_cursor": next_cursor,
     })))
+}
+
+/// Plain-text list preview: whitespace collapsed, control characters and
+/// markdown emphasis marks dropped, at most 120 characters.
+pub(super) fn preview_text(content: &str) -> String {
+    let cleaned: String = content
+        .chars()
+        .filter(|c| !matches!(c, '*' | '`' | '#') && (!c.is_control() || c.is_whitespace()))
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.chars().take(120).collect()
 }
 
 pub(super) fn conversation_view(record: &StoredConversation) -> Result<Value> {
