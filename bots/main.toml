@@ -49,6 +49,14 @@ tools = [
   "elevenlabs_transcribe",
   "elevenlabs_generate_image",
   "elevenlabs_generate_video",
+  "vault_list",
+  "browser_navigate",
+  "browser_snapshot",
+  "browser_click",
+  "browser_type",
+  "browser_press",
+  "browser_screenshot",
+  "browser_close",
 ]
 require_approval = [
   "firecrawl_crawl",
