@@ -1026,8 +1026,11 @@ fn raw_server(
                     "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
-                stream.write_all(head.as_bytes()).unwrap();
-                stream.write_all(&body).unwrap();
+                // A client that refuses an oversized body hangs up early; a
+                // broken pipe here is expected, not a test failure.
+                let _ = stream
+                    .write_all(head.as_bytes())
+                    .and_then(|()| stream.write_all(&body));
                 req
             })
             .collect()

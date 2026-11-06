@@ -8,8 +8,8 @@
 
 use dioxus::prelude::*;
 use serabot_desktop::{
-    ApprovalDecision, BotConfigUpdate, ConversationKind, MAX_TEAM_MEMBERS, Role, SPECIALIST_TOOLS,
-    Selection, TaskStatus, Team, TeamMember, TeamMode,
+    ApprovalDecision, BotConfigUpdate, ConnectorStatus, ConversationKind, MAX_TEAM_MEMBERS, Role,
+    SPECIALIST_TOOLS, Selection, TaskStatus, Team, TeamMember, TeamMode,
     audio_capture::MicRecorder,
     branding, parse_skill_list, provider_presets,
     session::{Section, Session, SignInPhase, Theme, humanize_label},
@@ -362,6 +362,78 @@ fn capability_label(tool: &str) -> Option<&'static str> {
     }
 }
 
+/// The host part of the first `http(s)` URL in `text`, if any.
+fn host_in(text: &str) -> Option<String> {
+    let start = text.find("://")? + 3;
+    let rest = &text[start..];
+    let end = rest
+        .find(|c: char| c == '/' || c == '?' || c == '#' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    let host = rest[..end].trim_start_matches("www.");
+    (!host.is_empty()).then(|| host.to_owned())
+}
+
+/// The vault entry name quoted as `secret 'name'` in a tool summary.
+fn secret_in(text: &str) -> Option<String> {
+    let start = text.find("secret '")? + "secret '".len();
+    let end = text[start..].find('\'')?;
+    let name = &text[start..start + end];
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// A plain sentence for a tool the owner is likely to see, or `None` for a
+/// tool without one (the caller falls back to the tool's own label).
+/// `done` picks the past tense for finished work and the "wants to" form for a
+/// request that waits on the owner.
+fn tool_sentence(tool: &str, summary: &str, done: bool) -> Option<String> {
+    let sentence = match tool {
+        "browser_type" if secret_in(summary).is_some() => {
+            let name = secret_in(summary)?;
+            if done {
+                format!("Signed in with your saved login \"{name}\". The bot never saw it.")
+            } else {
+                format!("Wants to sign in with your saved login \"{name}\". The bot never sees it.")
+            }
+        }
+        "browser_navigate" => {
+            let site = host_in(summary).unwrap_or_else(|| "a web page".to_owned());
+            if done {
+                format!("Opened {site}")
+            } else {
+                format!("Wants to open {site}")
+            }
+        }
+        "browser_click" => if done {
+            "Clicked on the page"
+        } else {
+            "Wants to click on the page"
+        }
+        .to_owned(),
+        "browser_type" => if done {
+            "Typed into the page"
+        } else {
+            "Wants to type into the page"
+        }
+        .to_owned(),
+        "browser_press" => if done {
+            "Pressed a key"
+        } else {
+            "Wants to press a key"
+        }
+        .to_owned(),
+        "browser_snapshot" | "browser_screenshot" => "Looked at the page".to_owned(),
+        "browser_close" => if done {
+            "Closed the browser"
+        } else {
+            "Wants to close the browser"
+        }
+        .to_owned(),
+        "vault_list" => "Checked which saved logins exist".to_owned(),
+        _ => return None,
+    };
+    Some(sentence)
+}
+
 /// The `@mention` query being typed at the end of `text`, if any: the last
 /// `@` whose tail contains no whitespace, is at most 32 chars and matches
 /// `[a-z0-9-_]*`. A bare `@` yields `Some("")`.
@@ -580,7 +652,7 @@ pub(crate) fn Icon(name: String, #[props(default = 20)] size: u32) -> Element {
         }
         "image" => "M4 5h16v14H4zM4 16l5-5 4 4 3-3 4 4M9 9.5a1 1 0 1 1-2 0 1 1 0 0 1 2 0z",
         "settings" => {
-            "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zM12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"
+            "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM12.2 2h-.4a2 2 0 0 0-2 2v.2a2 2 0 0 1-1 1.7l-.4.3a2 2 0 0 1-2 0l-.2-.1a2 2 0 0 0-2.7.7l-.2.4a2 2 0 0 0 .7 2.7l.2.1a2 2 0 0 1 1 1.7v.5a2 2 0 0 1-1 1.7l-.2.1a2 2 0 0 0-.7 2.7l.2.4a2 2 0 0 0 2.7.7l.2-.1a2 2 0 0 1 2 0l.4.3a2 2 0 0 1 1 1.7v.2a2 2 0 0 0 2 2h.4a2 2 0 0 0 2-2v-.2a2 2 0 0 1 1-1.7l.4-.3a2 2 0 0 1 2 0l.2.1a2 2 0 0 0 2.7-.7l.2-.4a2 2 0 0 0-.7-2.7l-.2-.1a2 2 0 0 1-1-1.7v-.5a2 2 0 0 1 1-1.7l.2-.1a2 2 0 0 0 .7-2.7l-.2-.4a2 2 0 0 0-2.7-.7l-.2.1a2 2 0 0 1-2 0l-.4-.3a2 2 0 0 1-1-1.7V4a2 2 0 0 0-2-2z"
         }
         "users" => {
             "M9 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM3 19a6 6 0 0 1 12 0M17 11a3 3 0 0 0 0-6M16 14a5 5 0 0 1 5 5"
@@ -618,7 +690,7 @@ pub(crate) fn Icon(name: String, #[props(default = 20)] size: u32) -> Element {
         "threads" => "M4 5h11v9H4zM9 9h11v9H9z",
         "memory" => "M12 3c-4 0-7 2-7 5s3 5 7 5 7-2 7-5-3-5-7-5zM5 8v8c0 3 3 5 7 5s7-2 7-5V8",
         "providers" => "M4 6h16M4 12h16M4 18h10",
-        "connectors" => "M8 12a4 4 0 1 1 4 4M16 12a4 4 0 1 1-4-4",
+        "connectors" => "M9 2v6M15 2v6M6 8h12v4a6 6 0 0 1-12 0V8zM12 18v4",
         "approvals" => "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM8 12l3 3 5-6",
         "fleet" => "M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z",
         "lock" => "M6 11h12v9H6zM8 11V8a4 4 0 0 1 8 0v3",
@@ -1315,6 +1387,7 @@ fn Shell(session: Signal<Session>) -> Element {
                     button {
                         class: "icon-btn escape-close",
                         title: "Dismiss",
+                        "aria-label": "Dismiss",
                         onclick: move |_| toast.set(None),
                         Icon { name: "x", size: 16 }
                     }
@@ -1333,24 +1406,24 @@ fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> 
     let section = session.read().section;
     let pending = session.read().state.approvals.len();
     let destinations: [(Section, &str, &str); 6] = [
-        (Section::Chat, "chat", "Chat"),
+        (Section::Chat, "chat", "Chats"),
         (Section::Fleet, "robot", "Bots"),
         (Section::Approvals, "approvals", "Approvals"),
         (Section::Memory, "memory", "Memory"),
         (Section::Connectors, "connectors", "Connectors"),
-        (Section::Providers, "providers", "AI providers"),
+        (Section::Providers, "providers", "AI keys"),
     ];
     rsx! {
         nav { class: "rail", "aria-label": "Main navigation",
             for (target, icon, label) in destinations {
                 button {
                     key: "{label}",
-                    class: if section == target { "rail-btn on" } else { "rail-btn" },
-                    "data-tip": if target == Section::Approvals && pending > 0 { format!("{label} ({pending})") } else { label.to_owned() },
+                    class: if section == target { "rail-btn labeled on" } else { "rail-btn labeled" },
                     "aria-label": if target == Section::Approvals && pending > 0 { format!("{label}, {pending} pending") } else { label.to_owned() },
                     "aria-current": if section == target { "page" } else { "false" },
                     onclick: move |_| session.write().open_section(target),
                     Icon { name: icon, size: 18 }
+                    span { class: "rail-label", "{label}" }
                     if target == Section::Approvals && pending > 0 {
                         span { class: "rail-badge", if pending > 99 { "99+" } else { "{pending}" } }
                     }
@@ -1358,52 +1431,116 @@ fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> 
             }
             div { class: "rail-spacer" }
             button {
-                class: if section == Section::Settings { "rail-btn on" } else { "rail-btn" },
-                "data-tip": "Settings",
+                class: if section == Section::Settings { "rail-btn labeled on" } else { "rail-btn labeled" },
+                title: "Settings",
                 "aria-label": "Settings",
+                "aria-current": if section == Section::Settings { "page" } else { "false" },
                 onclick: move |_| session.write().open_section(Section::Settings),
                 Icon { name: "settings", size: 18 }
+                span { class: "rail-label", "Settings" }
             }
             UserMenu { session, toast }
         }
     }
 }
 
-/// The "+" menu shared by the sidebar head and the chat column head.
+/// The new-chat menu shared by the sidebar head (a labelled "New chat"
+/// button) and the composer row (a "+" icon). It opens on a "Choose a bot"
+/// list; creating groups, folders and bots sits underneath.
 #[component]
 fn NewMenu(
     session: Signal<Session>,
     overlay: Signal<Overlay>,
     #[props(default = false)] right: bool,
+    #[props(default = false)] labelled: bool,
 ) -> Element {
     let mut overlay = overlay;
     let mut open = use_signal(|| false);
     let align = if right { " right" } else { "" };
+    let bots: Vec<(String, String, String, String)> = {
+        let state = session.read();
+        state
+            .state
+            .listed_bots
+            .iter()
+            .filter(|bot| bot.enabled)
+            .map(|bot| {
+                (
+                    bot.id.clone(),
+                    state.bot_display_name(&bot.id),
+                    state.bot_avatar(&bot.id),
+                    bot.role.clone(),
+                )
+            })
+            .collect()
+    };
     rsx! {
         div { class: "menu-wrap",
-            button {
-                class: "icon-btn primary menu-trigger",
-                title: "New",
-                onclick: move |_| open.set(!open()),
-                Icon { name: "plus", size: 18 }
+            if labelled {
+                button {
+                    class: "btn primary sm new-chat-btn menu-trigger",
+                    "aria-haspopup": "menu",
+                    "aria-expanded": if open() { "true" } else { "false" },
+                    onclick: move |_| open.set(!open()),
+                    Icon { name: "plus", size: 14 }
+                    "New chat"
+                }
+            } else {
+                button {
+                    class: "icon-btn primary menu-trigger",
+                    title: "New chat, group or bot",
+                    "aria-label": "New chat, group or bot",
+                    "aria-haspopup": "menu",
+                    "aria-expanded": if open() { "true" } else { "false" },
+                    onclick: move |_| open.set(!open()),
+                    Icon { name: "plus", size: 18 }
+                }
             }
             div {
-                class: if open() { format!("menu open{align}") } else { format!("menu{align}") },
+                class: if open() { format!("menu new-chat-menu open{align}") } else { format!("menu new-chat-menu{align}") },
                 onkeydown: move |event: KeyboardEvent| {
                     if event.key() == Key::Escape {
                         open.set(false);
                     }
                 },
-                div { class: "menu-label", "Create" }
+                div { class: "menu-label", "Choose a bot" }
+                div { class: "menu-scroll",
+                    if bots.is_empty() {
+                        span { class: "menu-empty caption", "No bots are available yet." }
+                    }
+                    for (id, name, avatar, role) in bots {
+                        button {
+                            key: "{id}",
+                            class: "menu-item menu-bot",
+                            onclick: {
+                                let id = id.clone();
+                                move |_| {
+                                    open.set(false);
+                                    session.write().open_bot_chat(id.clone());
+                                }
+                            },
+                            span { class: "avatar sm bot", style: avatar_style(&id), "{avatar}" }
+                            span { class: "menu-bot-copy",
+                                span { class: "menu-bot-name", "{name}" }
+                                span { class: "menu-bot-role", "{role}" }
+                            }
+                        }
+                    }
+                }
+                div { class: "menu-sep" }
+                div { class: "menu-label", "Or create" }
+                // A team lives on a room: the room is created first and its
+                // team is written in the same step (docs/desktop-redesign.md
+                // §3.8).
                 button {
                     class: "menu-item",
                     onclick: move |_| {
                         open.set(false);
-                        session.write().fleet.conv_kind = ConversationKind::Direct;
+                        session.write().fleet.conv_kind = ConversationKind::Room;
                         overlay.set(Overlay::NewConversation);
                     },
-                    Icon { name: "chat", size: 16 }
-                    "New chat"
+                    Icon { name: "shield", size: 16 }
+                    "New group chat"
                 }
                 button {
                     class: "menu-item",
@@ -1425,7 +1562,6 @@ fn NewMenu(
                     Icon { name: "folder", size: 16 }
                     "New section"
                 }
-                div { class: "menu-sep" }
                 button {
                     class: "menu-item",
                     onclick: move |_| {
@@ -1435,24 +1571,10 @@ fn NewMenu(
                     Icon { name: "robot", size: 16 }
                     "New bot"
                 }
-                // A team lives on a room: the room is created first and its
-                // team is written in the same step (docs/desktop-redesign.md
-                // §3.8).
-                button {
-                    class: "menu-item",
-                    onclick: move |_| {
-                        open.set(false);
-                        session.write().fleet.conv_kind = ConversationKind::Room;
-                        overlay.set(Overlay::NewConversation);
-                    },
-                    Icon { name: "shield", size: 16 }
-                    "New group chat"
-                }
             }
         }
     }
 }
-
 /// Inline SVG pin button: toggles a bot id or conversation id in the pin
 /// list. Stops propagation so it never triggers the surrounding row.
 #[component]
@@ -1461,6 +1583,7 @@ fn PinToggle(session: Signal<Session>, id: String, pinned: bool) -> Element {
         button {
             class: if pinned { "pin-toggle pinned" } else { "pin-toggle" },
             title: if pinned { "Unpin" } else { "Pin" },
+            "aria-label": if pinned { "Unpin" } else { "Pin" },
             onclick: move |event| {
                 event.stop_propagation();
                 session.write().toggle_pin(id.clone());
@@ -1707,7 +1830,7 @@ fn Sidebar(
             "aria-label": "Conversations",
             div { class: "sidebar-head",
                 h2 { class: "list-title", "Chats" }
-                NewMenu { session, overlay }
+                NewMenu { session, overlay, labelled: true }
             }
             div { class: "sidebar-search",
                 span { class: "search-glyph", Icon { name: "search", size: 15 } }
@@ -1851,6 +1974,7 @@ fn Sidebar(
                                             button {
                                                 class: "icon-btn",
                                                 title: "Save name",
+                                                "aria-label": "Save name",
                                                 onclick: {
                                                     let id = id.clone();
                                                     move |_| {
@@ -2034,43 +2158,7 @@ fn UserMenu(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> 
                         session.write().open_section(Section::Settings);
                     },
                     Icon { name: "settings", size: 16 }
-                    "Profile and settings"
-                }
-                button {
-                    class: "menu-item",
-                    onclick: move |_| {
-                        open.set(false);
-                        session.write().open_section(Section::Fleet);
-                    },
-                    Icon { name: "robot", size: 16 }
-                    "Bots"
-                }
-                button {
-                    class: "menu-item",
-                    onclick: move |_| {
-                        open.set(false);
-                        session.write().open_section(Section::Memory);
-                    },
-                    Icon { name: "bolt", size: 16 }
-                    "Memory"
-                }
-                button {
-                    class: "menu-item",
-                    onclick: move |_| {
-                        open.set(false);
-                        session.write().open_section(Section::Approvals);
-                    },
-                    Icon { name: "shield", size: 16 }
-                    "Approvals"
-                }
-                button {
-                    class: "menu-item",
-                    onclick: move |_| {
-                        open.set(false);
-                        session.write().open_section(Section::Providers);
-                    },
-                    Icon { name: "grid", size: 16 }
-                    "Providers"
+                    "Settings"
                 }
                 button {
                     class: "menu-item",
@@ -2079,25 +2167,7 @@ fn UserMenu(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> 
                         session.write().open_section(Section::Conversations);
                     },
                     Icon { name: "threads", size: 16 }
-                    "Conversations"
-                }
-                button {
-                    class: "menu-item",
-                    onclick: move |_| {
-                        open.set(false);
-                        session.write().refresh();
-                    },
-                    Icon { name: "refresh", size: 16 }
-                    "Refresh"
-                }
-                button {
-                    class: "menu-item",
-                    onclick: move |_| {
-                        open.set(false);
-                        session.write().open_section(Section::Connectors);
-                    },
-                    Icon { name: "external", size: 16 }
-                    "Connectors"
+                    "All chats"
                 }
                 div { class: "menu-sep" }
                 button {
@@ -2145,6 +2215,10 @@ fn Topbar(
         .strip_prefix("dir:")
         .map(str::to_owned);
     let connected = session.read().state.connected;
+    let (browser_active, browser_open) = {
+        let state = session.read();
+        (state.panel.session_active(), state.panel.open())
+    };
     let task_status = session.read().state.task.as_ref().map(|task| task.status);
     let (subtitle, avatar) = {
         let state = session.read();
@@ -2238,8 +2312,8 @@ fn Topbar(
                 }
                 button {
                     class: "avatar-stack",
-                    title: "Group members",
-                    "aria-label": "Group members",
+                    title: "Bots in this chat",
+                    "aria-label": "Bots in this chat",
                     onclick: move |_| {
                         session.write().refresh_team();
                         overlay.set(Overlay::Team);
@@ -2250,21 +2324,39 @@ fn Topbar(
                 }
                 button {
                     class: "icon-btn",
-                    title: "Refresh",
-                    "aria-label": "Refresh",
+                    title: "Reload",
+                    "aria-label": "Reload",
                     onclick: move |_| session.write().refresh(),
                     Icon { name: "refresh", size: 16 }
                 }
+                if browser_active {
+                    button {
+                        class: if browser_open { "btn sm watch-btn active" } else { "btn sm watch-btn" },
+                        title: if browser_open { "Hide the browser panel" } else { "Watch the bot's browser live" },
+                        "aria-label": "Watch browser",
+                        "aria-pressed": if browser_open { "true" } else { "false" },
+                        onclick: move |_| {
+                            if browser_open {
+                                session.write().panel.hide();
+                            } else {
+                                session.write().panel.show();
+                            }
+                        },
+                        Icon { name: "globe", size: 15 }
+                        span { class: "btn-label", "Watch browser" }
+                    }
+                }
                 button {
-                    class: "icon-btn",
-                    title: "Details",
-                    "aria-label": "Toggle details panel",
+                    class: "btn ghost sm details-btn",
+                    title: "Show or hide chat details",
+                    "aria-label": "Details",
                     "aria-pressed": if inspector_open() { "true" } else { "false" },
                     onclick: move |_| {
                         let next = !inspector_open();
                         inspector_open.set(next);
                     },
-                    Icon { name: "panel", size: 16 }
+                    Icon { name: "panel", size: 15 }
+                    span { class: "btn-label", "Details" }
                 }
                 VaultSheet { open: vault_open, session }
             }
@@ -2816,8 +2908,12 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                     for (approval_id, tool, summary) in waiting {
                         div { class: "tool-row", key: "{approval_id}",
                             Icon { name: "lock", size: 14 }
-                            span { class: "tool-name", "{tool}" }
-                            span { class: "tool-detail", "{summary}" }
+                            if let Some(sentence) = tool_sentence(&tool, &summary, false) {
+                                span { class: "tool-name", "{sentence}" }
+                            } else {
+                                span { class: "tool-name", "{humanize_label(&tool)}" }
+                                span { class: "tool-detail", "{summary}" }
+                            }
                             span { class: "pill warn", "awaiting approval" }
                             button {
                                 class: "btn ghost sm",
@@ -2952,6 +3048,7 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                             div { class: "composer-actions",
                                 button {
                                     title: if recording() { "Stop recording" } else { "Record a voice note" },
+                                    "aria-label": if recording() { "Stop recording" } else { "Record a voice note" },
                                     class: if recording() { "composer-mic recording" } else { "composer-mic" },
                                     onclick: move |_| async move {
                                         if recording() {
@@ -2993,6 +3090,7 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                                 button {
                                     class: "composer-mic",
                                     title: "Attachments are not available yet",
+                                    "aria-label": "Attachments are not available yet",
                                     disabled: true,
                                     Icon { name: "paperclip", size: 16 }
                                 }
@@ -3964,6 +4062,7 @@ fn Inspector(session: Signal<Session>, overlay: Signal<Overlay>, open: Signal<bo
                 button {
                     class: "icon-btn",
                     title: "Hide inspector",
+                    "aria-label": "Hide inspector",
                     onclick: move |_| open.set(false),
                     Icon { name: "x", size: 16 }
                 }
@@ -4186,6 +4285,7 @@ fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
                 button {
                     class: "icon-btn escape-close",
                     title: "Close",
+                    "aria-label": "Close",
                     onclick: move |_| overlay.set(Overlay::None),
                     Icon { name: "x", size: 16 }
                 }
@@ -4467,12 +4567,14 @@ fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                     button {
                         class: "icon-btn",
                         title: "Refresh members",
+                        "aria-label": "Refresh members",
                         onclick: move |_| session.write().refresh_team(),
                         Icon { name: "refresh", size: 16 }
                     }
                     button {
                         class: "icon-btn escape-close",
                         title: "Close",
+                        "aria-label": "Close",
                         onclick: move |_| overlay.set(Overlay::None),
                         Icon { name: "x", size: 16 }
                     }
@@ -5152,7 +5254,7 @@ fn ApprovalsView(session: Signal<Session>) -> Element {
                         div { class: "empty",
                             div { class: "empty-icon", Icon { name: "shield", size: 20 } }
                             h3 { class: "empty-title", "Nothing pending" }
-                            p { class: "empty-text", "Gateway requests appear here." }
+                            p { class: "empty-text", "Requests that need your OK appear here." }
                         }
                     }
                 }
@@ -5202,6 +5304,7 @@ fn AddProviderSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Eleme
                 button {
                     class: "icon-btn escape-close",
                     title: "Close",
+                    "aria-label": "Close",
                     onclick: move |_| overlay.set(Overlay::None),
                     Icon { name: "x", size: 16 }
                 }
@@ -5805,21 +5908,120 @@ fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element 
     }
 }
 
+/// What a connector card offers as its one main action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ConnectorAction {
+    ConnectOneDrive,
+    DisconnectOneDrive,
+    SignIn,
+    Authorize(String),
+    AddKey,
+    ReplaceKey,
+}
+
+/// The single primary action for a connector in its current state, or `None`
+/// when there is nothing the owner can do from the card.
+fn connector_action(
+    connector: &ConnectorStatus,
+    connected: bool,
+    auth_mode: &str,
+) -> Option<ConnectorAction> {
+    if connector.id == "onedrive" {
+        return Some(if connected {
+            ConnectorAction::DisconnectOneDrive
+        } else {
+            ConnectorAction::ConnectOneDrive
+        });
+    }
+    if connector.oauth.is_some()
+        && auth_mode == "oauth"
+        && connector.auth_modes.iter().any(|mode| mode == "oauth")
+    {
+        return Some(ConnectorAction::SignIn);
+    }
+    // A pasted API key beats a sign-in page: those pages only help you find one.
+    let takes_key = connector.secrets.keys().any(|role| role == "api_key");
+    if !takes_key
+        && let Some(url) = connector_auth_url(&connector.id, connector.redirect_uri.as_deref())
+    {
+        return Some(ConnectorAction::Authorize(url));
+    }
+    if !connector.secrets.is_empty() {
+        return Some(if connected {
+            ConnectorAction::ReplaceKey
+        } else {
+            ConnectorAction::AddKey
+        });
+    }
+    None
+}
+
+fn connector_title(id: &str) -> String {
+    match id {
+        "onedrive" => "OneDrive",
+        "google_drive" => "Google Drive",
+        "google_sheets" => "Google Sheets",
+        "google_calendar" => "Google Calendar",
+        "gmail" => "Gmail",
+        "outlook" => "Outlook",
+        "outlook_calendar" => "Outlook Calendar",
+        "notion" => "Notion",
+        "agentmail" => "AgentMail",
+        "tavily" => "Tavily Search",
+        "firecrawl" => "Firecrawl",
+        "elevenlabs" => "ElevenLabs",
+        other => return humanize_label(other),
+    }
+    .to_owned()
+}
+
+fn connector_blurb(id: &str) -> &'static str {
+    match id {
+        "onedrive" => "Save and read files in your OneDrive.",
+        "google_drive" => "Files in your Google Drive.",
+        "google_sheets" => "Your Google spreadsheets.",
+        "google_calendar" => "Your Google calendar.",
+        "gmail" => "Read and send email.",
+        "outlook" => "Read and send email.",
+        "outlook_calendar" => "Your Outlook calendar.",
+        "notion" => "Your notes and pages.",
+        "agentmail" => "A mailbox for your bots.",
+        "tavily" | "firecrawl" => "Let bots search and read the web.",
+        "elevenlabs" => "Voices and sound.",
+        _ => "",
+    }
+}
+
+/// A key field name in everyday words ("api_key" becomes "API key").
+fn secret_label(role: &str) -> String {
+    let words = role.replace(['_', '-'], " ");
+    let mut text = words.trim().to_lowercase();
+    if let Some(rest) = text.strip_prefix("api ") {
+        text = format!("API {rest}");
+    }
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => "Key".to_owned(),
+    }
+}
+
 #[component]
 fn ConnectorsView(session: Signal<Session>) -> Element {
     let connectors = session.read().state.connectors.clone();
     let loaded = session.read().state.connectors_loaded;
-    let can_save = session.read().can_admin();
     rsx! {
         div { class: "pane",
             div { class: "pane-head",
                 div {
                     h1 { class: "pane-title", "Connectors" }
-                    p { class: "muted", "Enable Google, Microsoft, Notion, AgentMail and web research, and store their credentials." }
+                    p { class: "muted", "Let your bots use your accounts and tools." }
                 }
                 button {
                     class: "btn ghost",
+                    title: "Check for changes",
                     onclick: move |_| session.write().refresh_connectors(),
+                    Icon { name: "refresh", size: 15 }
                     "Refresh"
                 }
             }
@@ -5843,16 +6045,16 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
                     }
                 }
                 for (suite_title, suite_ids) in [
-                    ("Google Workspace", &["google_drive", "google_sheets", "google_calendar", "gmail"][..]),
-                    ("Microsoft 365", &["outlook", "outlook_calendar"][..]),
-                    ("Knowledge & Email", &["notion", "agentmail"][..]),
-                    ("Web Research", &["tavily", "firecrawl"][..]),
-                    ("Voice & Media", &["elevenlabs"][..]),
+                    ("Microsoft", &["onedrive", "outlook", "outlook_calendar"][..]),
+                    ("Google", &["google_drive", "google_sheets", "google_calendar", "gmail"][..]),
+                    ("Notes and email", &["notion", "agentmail"][..]),
+                    ("Web search", &["tavily", "firecrawl"][..]),
+                    ("Voice", &["elevenlabs"][..]),
                 ] {
                     {
-                        let suite_connectors: Vec<_> = connectors
+                        let suite_connectors: Vec<_> = suite_ids
                             .iter()
-                            .filter(|c| suite_ids.contains(&c.id.as_str()))
+                            .filter_map(|id| connectors.iter().find(|c| c.id == *id))
                             .cloned()
                             .collect();
                         if !suite_connectors.is_empty() {
@@ -5860,197 +6062,7 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
                                 h2 { class: "connector-suite-title", "{suite_title}" }
                                 div { class: "card-grid",
                                     for connector in suite_connectors {
-                                        {
-                                            let id = connector.id.clone();
-                                            let is_connected = connector.secrets.values().any(|s| s.configured);
-                                            let display_title = match id.as_str() {
-                                                "google_drive" => "Google Drive",
-                                                "google_sheets" => "Google Sheets",
-                                                "google_calendar" => "Google Calendar",
-                                                "gmail" => "Gmail",
-                                                "outlook" => "Microsoft Outlook",
-                                                "outlook_calendar" => "Outlook Calendar",
-                                                "notion" => "Notion",
-                                                "agentmail" => "AgentMail",
-                                                "tavily" => "Tavily Search",
-                                                "firecrawl" => "Firecrawl",
-                                                "elevenlabs" => "ElevenLabs",
-                                                _ => &id,
-                                            };
-                                            let enabled = session
-                                                .read()
-                                                .connector_drafts
-                                                .get(&id)
-                                                .map(|draft| draft.enabled)
-                                                .unwrap_or(connector.enabled);
-                                            let testing = session.read().connector_testing.as_deref() == Some(id.as_str());
-                                            let signing_in = session.read().oauth_signing_in.as_deref() == Some(id.as_str());
-                                            let auth_mode = session
-                                                .read()
-                                                .connector_drafts
-                                                .get(&id)
-                                                .and_then(|draft| draft.auth.clone())
-                                                .or_else(|| connector.auth.clone())
-                                                .unwrap_or_default();
-                                            let test_result = session.read().state.connector_tests.get(&id).cloned();
-                                            let values = session
-                                                .read()
-                                                .connector_drafts
-                                                .get(&id)
-                                                .map(|draft| draft.values.clone())
-                                                .unwrap_or_default();
-                                            rsx! {
-                                                div { class: "card", key: "{id}",
-                                                    div { class: "card-head",
-                                                        div { style: "display: flex; align-items: center; gap: 10px;",
-                                                            BrandLogo { brand: id.clone(), size: 28 }
-                                                            div {
-                                                                h3 { class: "card-title", "{display_title}" }
-                                                                span { class: "card-sub", "{connector.kind}" }
-                                                            }
-                                                        }
-                                                        div { style: "display: flex; align-items: center; gap: 6px;",
-                                                            span {
-                                                                class: if is_connected { "status-pill connected" } else { "status-pill disconnected" },
-                                                                if is_connected { "Connected" } else { "Not connected" }
-                                                            }
-                                                            span { class: if enabled { "chip ok" } else { "chip muted" },
-                                                                if enabled { "enabled" } else { "disabled" }
-                                                            }
-                                                        }
-                                                    }
-                                                    if let Some(uri) = connector.redirect_uri.clone() {
-                                                        code { class: "tiny", "{uri}" }
-                                                    }
-                                                    div { class: "chips",
-                                                        for (role, secret) in &connector.secrets {
-                                                            if secret.configured || secret.name.as_deref().is_some_and(|n| !n.is_empty()) {
-                                                                span { class: if secret.configured { "chip mono accent" } else { "chip mono warn" },
-                                                                    "{role}: {secret.name.clone().unwrap_or_default()}"
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    if connector.auth_modes.len() > 1 {
-                                                        div { class: "field",
-                                                            label { class: "field-label", "auth mode" }
-                                                            select {
-                                                                class: "input",
-                                                                value: "{auth_mode}",
-                                                                title: "How this connector authenticates",
-                                                                onchange: {
-                                                                    let id = id.clone();
-                                                                    move |event| session.write().set_connector_auth(&id, event.value())
-                                                                },
-                                                                for mode in &connector.auth_modes {
-                                                                    option { value: "{mode}", "{mode}" }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    div { class: "form-grid",
-                                                        for (role, secret) in &connector.secrets {
-                                                            {
-                                                                let role = role.clone();
-                                                                let name = secret.name.clone().unwrap_or_default();
-                                                                let value = values.get(&role).cloned().unwrap_or_default();
-                                                                rsx! {
-                                                                    div { class: "field",
-                                                                        label { class: "field-label", "{role}" }
-                                                                        input {
-                                                                            class: "input",
-                                                                            "type": "password",
-                                                                            value: "{value}",
-                                                                            placeholder: if secret.configured { format!("replace {name}") } else { format!("set {name}") },
-                                                                            oninput: {
-                                                                                let id = id.clone();
-                                                                                let role = role.clone();
-                                                                                move |event| session.write().set_connector_value(&id, &role, event.value())
-                                                                            },
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    p { class: "tiny",
-                                                        "Enabling makes the connector available; grant its tools to a bot in Fleet. Reads and sends stay approval-gated."
-                                                    }
-                                                    if connector_auth_url(&id, connector.redirect_uri.as_deref()).is_some() {
-                                                        p { class: "tiny",
-                                                            "Connect opens the provider's consent page in your browser. Register the redirect URI above with the client id the server stores, then paste the refresh token here."
-                                                        }
-                                                    }
-                                                    if let Some(result) = test_result {
-                                                        p { class: if result.ok { "banner ok" } else { "banner err" },
-                                                            "{result.message}"
-                                                        }
-                                                    }
-                                                    div { class: "card-actions",
-                                                        if let Some(url) = connector_auth_url(&id, connector.redirect_uri.as_deref()) {
-                                                            button {
-                                                                class: "btn ghost sm",
-                                                                title: "Open the provider's authorization page in your browser",
-                                                                onclick: {
-                                                                    let url = url.clone();
-                                                                    move |_| {
-                                                                        session.write().open_in_browser(url.clone());
-                                                                    }
-                                                                },
-                                                                Icon { name: "external", size: 14 }
-                                                                "Connect"
-                                                            }
-                                                        }
-                                                        button {
-                                                            class: if enabled { "btn ghost sm" } else { "btn primary sm" },
-                                                            onclick: {
-                                                                let id = id.clone();
-                                                                move |_| session.write().toggle_connector(&id)
-                                                            },
-                                                            if enabled { "Disable" } else { "Enable" }
-                                                        }
-                                                        button {
-                                                            class: "btn ghost sm",
-                                                            disabled: !can_save,
-                                                            onclick: {
-                                                                let id = id.clone();
-                                                                move |_| session.write().save_connector(id.clone())
-                                                            },
-                                                            "Save connector"
-                                                        }
-                                                        if connector.oauth.is_some()
-                                                            && connector.auth_modes.iter().any(|m| m == "oauth")
-                                                        {
-                                                            button {
-                                                                class: "btn ghost sm",
-                                                                title: "Sign in with your ElevenLabs account in your browser (PKCE)",
-                                                                disabled: signing_in || !can_save,
-                                                                onclick: {
-                                                                    let id = id.clone();
-                                                                    let callback_uri = connector
-                                                                        .oauth
-                                                                        .as_ref()
-                                                                        .and_then(|o| o.callback_uri.clone())
-                                                                        .unwrap_or_default();
-                                                                    move |_| session.write().sign_in_connector(id.clone(), callback_uri.clone())
-                                                                },
-                                                                if signing_in { "Signing in…" } else { "Sign in" }
-                                                            }
-                                                        }
-                                                        button {
-                                                            class: "btn ghost sm",
-                                                            title: "Run a read-only check of the saved credentials",
-                                                            disabled: !can_save || testing,
-                                                            onclick: {
-                                                                let id = id.clone();
-                                                                move |_| session.write().test_connector(id.clone())
-                                                            },
-                                                            if testing { "Testing…" } else { "Test" }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
+                                        ConnectorCard { key: "{connector.id}", session, connector }
                                     }
                                 }
                             }
@@ -6064,6 +6076,278 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
     }
 }
 
+/// One connector: its state, one main action that fits that state, and the
+/// developer fields behind "Advanced" for administrators.
+#[component]
+fn ConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> Element {
+    let mut session = session;
+    let can_save = session.read().can_admin();
+    let is_admin = session.read().is_admin();
+    let id = connector.id.clone();
+    let connected = connector
+        .connected
+        .unwrap_or_else(|| connector.secrets.values().any(|s| s.configured));
+    let title = connector_title(&id);
+    let blurb = connector_blurb(&id);
+    let enabled = session
+        .read()
+        .connector_drafts
+        .get(&id)
+        .map(|draft| draft.enabled)
+        .unwrap_or(connector.enabled);
+    let testing = session.read().connector_testing.as_deref() == Some(id.as_str());
+    let signing_in = session.read().oauth_signing_in.as_deref() == Some(id.as_str());
+    let auth_mode = session
+        .read()
+        .connector_drafts
+        .get(&id)
+        .and_then(|draft| draft.auth.clone())
+        .or_else(|| connector.auth.clone())
+        .unwrap_or_default();
+    let test_result = session.read().state.connector_tests.get(&id).cloned();
+    let values = session
+        .read()
+        .connector_drafts
+        .get(&id)
+        .map(|draft| draft.values.clone())
+        .unwrap_or_default();
+    let (od_busy, od_waiting, od_error) = {
+        let state = session.read();
+        let flow = &state.panel.onedrive;
+        (flow.busy, flow.waiting, flow.error.clone())
+    };
+    let action = connector_action(&connector, connected, &auth_mode);
+    let key_inputs = matches!(
+        action,
+        Some(ConnectorAction::AddKey | ConnectorAction::ReplaceKey)
+    ) && is_admin;
+    let needs_admin = !is_admin
+        && matches!(
+            action,
+            Some(
+                ConnectorAction::SignIn
+                    | ConnectorAction::Authorize(_)
+                    | ConnectorAction::AddKey
+                    | ConnectorAction::ReplaceKey
+            )
+        );
+    let has_values = values.values().any(|value| !value.trim().is_empty());
+    rsx! {
+        div { class: "card connector-card",
+            div { class: "card-head",
+                div { class: "connector-id",
+                    BrandLogo { brand: id.clone(), size: 28 }
+                    div {
+                        h3 { class: "card-title", "{title}" }
+                        if !blurb.is_empty() {
+                            span { class: "card-sub", "{blurb}" }
+                        }
+                    }
+                }
+                span {
+                    class: if connected { "status-pill connected" } else { "status-pill disconnected" },
+                    if connected { "Connected" } else { "Not connected" }
+                }
+            }
+            if key_inputs {
+                div { class: "form-grid",
+                    for (role, secret) in &connector.secrets {
+                        {
+                            let role = role.clone();
+                            let label = secret_label(&role);
+                            let value = values.get(&role).cloned().unwrap_or_default();
+                            rsx! {
+                                div { class: "field", key: "{role}",
+                                    label { class: "field-label", "{label}" }
+                                    input {
+                                        class: "input",
+                                        "type": "password",
+                                        value: "{value}",
+                                        autocomplete: "off",
+                                        placeholder: if secret.configured { "Paste a new one to replace it" } else { "Paste it here" },
+                                        oninput: {
+                                            let id = id.clone();
+                                            let role = role.clone();
+                                            move |event| session.write().set_connector_value(&id, &role, event.value())
+                                        },
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if od_waiting && id == "onedrive" && !connected {
+                p { class: "tiny", role: "status",
+                    "Finish signing in with Microsoft in your browser, then press Refresh."
+                }
+            }
+            if id == "onedrive" {
+                if let Some(message) = od_error {
+                    p { class: "banner err", role: "alert", "{message}" }
+                }
+            }
+            if needs_admin && !connected {
+                p { class: "tiny", "Your admin sets this one up." }
+            }
+            if let Some(result) = test_result {
+                p { class: if result.ok { "banner ok" } else { "banner err" }, "{result.message}" }
+            }
+            div { class: "card-actions",
+                {match action.clone() {
+                    Some(ConnectorAction::ConnectOneDrive) => rsx! {
+                        button {
+                            class: "btn primary",
+                            disabled: od_busy,
+                            onclick: move |_| session.write().panel.connect_onedrive(),
+                            if od_busy { "Opening…" } else { "Connect OneDrive" }
+                        }
+                    },
+                    Some(ConnectorAction::DisconnectOneDrive) => rsx! {
+                        button {
+                            class: "btn ghost",
+                            disabled: od_busy,
+                            onclick: move |_| session.write().panel.disconnect_onedrive(),
+                            "Disconnect"
+                        }
+                    },
+                    Some(ConnectorAction::SignIn) if is_admin => {
+                        let callback_uri = connector
+                            .oauth
+                            .as_ref()
+                            .and_then(|o| o.callback_uri.clone())
+                            .unwrap_or_default();
+                        let id = id.clone();
+                        rsx! {
+                            button {
+                                class: if connected { "btn ghost" } else { "btn primary" },
+                                title: "Sign in with your account in your browser",
+                                disabled: signing_in || !can_save,
+                                onclick: move |_| session.write().sign_in_connector(id.clone(), callback_uri.clone()),
+                                if signing_in { "Signing in…" } else if connected { "Sign in again" } else { "Sign in" }
+                            }
+                        }
+                    },
+                    Some(ConnectorAction::Authorize(url)) if is_admin => rsx! {
+                        button {
+                            class: if connected { "btn ghost" } else { "btn primary" },
+                            title: "Open the sign-in page in your browser",
+                            onclick: move |_| session.write().open_in_browser(url.clone()),
+                            Icon { name: "external", size: 14 }
+                            if connected { "Reconnect" } else { "Connect" }
+                        }
+                    },
+                    Some(ConnectorAction::AddKey | ConnectorAction::ReplaceKey) if is_admin => {
+                        let id = id.clone();
+                        let key_page = connector_auth_url(&id, connector.redirect_uri.as_deref());
+                        rsx! {
+                            button {
+                                class: if connected { "btn ghost" } else { "btn primary" },
+                                disabled: !can_save || !has_values,
+                                title: if has_values { "Save the key" } else { "Paste the key first" },
+                                onclick: move |_| session.write().add_connector_key(id.clone()),
+                                if connected { "Replace key" } else { "Add key" }
+                            }
+                            if let Some(url) = key_page {
+                                button {
+                                    class: "btn ghost",
+                                    title: "Open the provider's site to get a key",
+                                    onclick: move |_| session.write().open_in_browser(url.clone()),
+                                    Icon { name: "external", size: 14 }
+                                    "Get a key"
+                                }
+                            }
+                        }
+                    },
+                    _ => rsx! {},
+                }}
+            }
+            if is_admin {
+                details { class: "advanced",
+                    summary { "Advanced" }
+                    div { class: "advanced-body",
+                        div { class: "chips",
+                            span { class: "chip mono", "{connector.kind}" }
+                            span { class: if enabled { "chip ok" } else { "chip muted" },
+                                if enabled { "enabled" } else { "disabled" }
+                            }
+                            if let Some(oauth) = connector.oauth.as_ref() {
+                                span { class: "chip mono accent", "client_id: {oauth.client_id}" }
+                            }
+                            for (role, secret) in &connector.secrets {
+                                if secret.configured || secret.name.as_deref().is_some_and(|n| !n.is_empty()) {
+                                    span {
+                                        key: "{role}",
+                                        class: if secret.configured { "chip mono accent" } else { "chip mono warn" },
+                                        "{role}: {secret.name.clone().unwrap_or_default()}"
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(uri) = connector.redirect_uri.clone() {
+                            code { class: "tiny", "{uri}" }
+                        }
+                        if connector.auth_modes.len() > 1 {
+                            div { class: "field",
+                                label { class: "field-label", "How it signs in" }
+                                select {
+                                    class: "input",
+                                    value: "{auth_mode}",
+                                    onchange: {
+                                        let id = id.clone();
+                                        move |event| session.write().set_connector_auth(&id, event.value())
+                                    },
+                                    for mode in &connector.auth_modes {
+                                        option { value: "{mode}", "{mode}" }
+                                    }
+                                }
+                            }
+                        }
+                        if id != "onedrive" {
+                            p { class: "tiny",
+                                "Turning a connector on makes it available. Give its tools to a bot in Bots. Reading and sending still ask you first."
+                            }
+                            if connector_auth_url(&id, connector.redirect_uri.as_deref()).is_some() {
+                                p { class: "tiny",
+                                    "Connect opens the provider's sign-in page. Register the address above with the client id the server stores, then paste the refresh token."
+                                }
+                            }
+                            div { class: "card-actions",
+                                button {
+                                    class: if enabled { "btn ghost sm" } else { "btn primary sm" },
+                                    onclick: {
+                                        let id = id.clone();
+                                        move |_| session.write().toggle_connector(&id)
+                                    },
+                                    if enabled { "Turn off" } else { "Turn on" }
+                                }
+                                button {
+                                    class: "btn ghost sm",
+                                    disabled: !can_save,
+                                    onclick: {
+                                        let id = id.clone();
+                                        move |_| session.write().save_connector(id.clone())
+                                    },
+                                    "Save settings"
+                                }
+                                button {
+                                    class: "btn ghost sm",
+                                    title: "Run a read-only check of the saved credentials",
+                                    disabled: !can_save || testing,
+                                    onclick: {
+                                        let id = id.clone();
+                                        move |_| session.write().test_connector(id.clone())
+                                    },
+                                    if testing { "Testing…" } else { "Test" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 #[component]
 fn MemoryView(session: Signal<Session>) -> Element {
     let memories = session.read().state.memories.clone();
@@ -6296,7 +6580,7 @@ fn ConversationsView(session: Signal<Session>) -> Element {
                             }
                             if slug_invalid {
                                 p { class: "field-error", role: "alert",
-                                    "Start with a lowercase letter, then letters, digits or - (32 characters at most)."
+                                    "Use lowercase letters, numbers and dashes only, starting with a letter (32 at most)."
                                 }
                             }
                         }
@@ -6527,7 +6811,7 @@ fn SettingsView(session: Signal<Session>) -> Element {
         let gated = map
             .into_iter()
             .map(|(tool, bots)| {
-                let label = format!("{tool} · {}", bots.join(", "));
+                let label = format!("{} · {}", humanize_label(&tool), bots.join(", "));
                 (tool, label)
             })
             .collect::<Vec<_>>();
@@ -6545,9 +6829,9 @@ fn SettingsView(session: Signal<Session>) -> Element {
                     (
                         provider.id.clone(),
                         if provider.data_egress_approved {
-                            "approved".to_string()
+                            "allowed".to_string()
                         } else {
-                            "blocked".to_string()
+                            "not allowed".to_string()
                         },
                         provider.data_egress_approved,
                     )
@@ -6562,31 +6846,31 @@ fn SettingsView(session: Signal<Session>) -> Element {
             div { class: "pane-head",
                 div {
                     h1 { class: "pane-title", "Settings" }
-                    p { class: "muted", "Connection, capabilities, appearance and updates." }
+                    p { class: "muted", "Your account, Telegram, safety checks, voice, appearance and updates." }
                 }
             }
             div { class: "pane-body",
                 div { class: "card",
                     div { class: "card-head",
-                        h3 { class: "card-title", "Connection" }
+                        h3 { class: "card-title", "Your account" }
                     }
                     p { class: "card-sub", "{server}" }
                     if !version.is_empty() {
                         p { class: "tiny", "Server {version}" }
                     }
                     if let Some(user) = &signed_in_user {
-                        div { class: "kv",
+                        div { class: "kv-row",
                             span { class: "kv-key", "Signed in as" }
                             span { class: "kv-val", "{user.label()}" }
                         }
                         if !user.email.is_empty() && user.email != user.label() {
-                            div { class: "kv",
+                            div { class: "kv-row",
                                 span { class: "kv-key", "Email" }
                                 span { class: "kv-val", "{user.email}" }
                             }
                         }
                         if !user.role.is_empty() {
-                            div { class: "kv",
+                            div { class: "kv-row",
                                 span { class: "kv-key", "Role" }
                                 span { class: "kv-val", "{user.role}" }
                             }
@@ -6624,13 +6908,13 @@ fn SettingsView(session: Signal<Session>) -> Element {
                         }
                     }
                     p { class: "card-sub",
-                        "Link your Telegram account to this console. Messages from the linked chat use your bots, memory and approvals."
+                        "Link Telegram to chat with your bots from your phone. They use the same memory and ask you first, just like here."
                     }
                     if let Some(status) = telegram_status {
                         div { class: "chips",
                             span {
                                 class: if status.enabled { "chip ok" } else { "chip muted" },
-                                if status.enabled { "bot enabled" } else { "bot disabled" }
+                                if status.enabled { "Telegram on" } else { "Telegram off" }
                             }
                             span {
                                 class: if status.linked { "chip ok" } else { "chip muted" },
@@ -6645,7 +6929,7 @@ fn SettingsView(session: Signal<Session>) -> Element {
                         }
                         if !status.enabled {
                             p { class: "tiny",
-                                "Telegram is disabled on the server ([telegram] enabled = false)."
+                                "Telegram is turned off on the server. Ask your admin to turn it on."
                             }
                         }
                         if status.linked {
@@ -6713,7 +6997,7 @@ fn SettingsView(session: Signal<Session>) -> Element {
                 }
                 div { class: "card",
                     div { class: "card-head",
-                        h3 { class: "card-title", "Sandbox" }
+                        h3 { class: "card-title", "Safety checks" }
                         div { class: "row",
                             if status_loading {
                                 span { class: "spinner", title: "Reading the server posture" }
@@ -6722,44 +7006,32 @@ fn SettingsView(session: Signal<Session>) -> Element {
                                 class: "btn ghost sm",
                                 onclick: move |_| session.write().refresh_status(),
                                 Icon { name: "refresh", size: 14 }
-                                "Refresh posture"
+                                "Refresh"
                             }
                         }
                     }
-                    p { class: "card-sub", "Read-only view of what the server enforces right now." }
+                    p { class: "card-sub", "What the server checks before your bots act." }
                     div { class: "chips",
-                        span { class: "chip", "policy: {policy_version}" }
-                        span { class: "chip", "pending tasks: {pending_tasks}" }
-                        span { class: "chip", "pending approvals: {pending_approvals}" }
+                        span { class: "chip", "Safety rules: {policy_version}" }
+                        span { class: "chip", "Tasks waiting: {pending_tasks}" }
+                        span { class: "chip", "Waiting for your OK: {pending_approvals}" }
                         span {
                             class: if restart_pending { "chip warn" } else { "chip ok" },
-                            if restart_pending { "restart pending" } else { "no restart pending" }
-                        }
-                        span {
-                            class: match audio_enabled { Some(true) => "chip ok", Some(false) => "chip warn", None => "chip muted" },
-                            match audio_enabled { Some(true) => "Audio on", Some(false) => "Audio off", None => "Audio unknown" }
-                        }
-                        span {
-                            class: match firecrawl_enabled { Some(true) => "chip ok", Some(false) => "chip muted", None => "chip muted" },
-                            match firecrawl_enabled { Some(true) => "Firecrawl on", Some(false) => "Firecrawl off", None => "Firecrawl unknown" }
-                        }
-                        span {
-                            class: match telegram_enabled { Some(true) => "chip ok", Some(false) => "chip muted", None => "chip muted" },
-                            match telegram_enabled { Some(true) => "Telegram on", Some(false) => "Telegram off", None => "Telegram unknown" }
+                            if restart_pending { "Restart needed" } else { "Up to date" }
                         }
                     }
                     if let Some(error) = status_error {
                         div { class: "banner err", span { "{error}" } }
                     }
                     div { class: "field",
-                        label { class: "field-label", "Owner approval required" }
+                        label { class: "field-label", "Bots ask you first before using" }
                         if bots_loaded {
                             div { class: "chips",
                                 for (_tool, label) in gated_tools {
                                     span { class: "chip warn", "{label}" }
                                 }
                                 if gated_empty {
-                                    span { class: "chip muted", "no tool needs approval" }
+                                    span { class: "chip muted", "Nothing needs your OK" }
                                 }
                             }
                         } else {
@@ -6777,7 +7049,7 @@ fn SettingsView(session: Signal<Session>) -> Element {
                         }
                     }
                     div { class: "field",
-                        label { class: "field-label", "Data egress consent" }
+                        label { class: "field-label", "Sending data to AI providers" }
                         if providers_loaded {
                             div { class: "chips",
                                 for (provider_id, egress_state, approved) in egress {
@@ -6786,7 +7058,7 @@ fn SettingsView(session: Signal<Session>) -> Element {
                                     }
                                 }
                                 if egress_empty {
-                                    span { class: "chip muted", "no provider" }
+                                    span { class: "chip muted", "No AI provider yet" }
                                 }
                             }
                         } else {
@@ -6796,7 +7068,7 @@ fn SettingsView(session: Signal<Session>) -> Element {
                 }
                 div { class: "card",
                     div { class: "card-head",
-                        h3 { class: "card-title", "Capabilities" }
+                        h3 { class: "card-title", "What's turned on" }
                     }
                     div { class: "chips",
                         span {
@@ -6813,50 +7085,50 @@ fn SettingsView(session: Signal<Session>) -> Element {
                         }
                         span {
                             class: match catalog_fetch { Some(true) => "chip ok", Some(false) => "chip warn", None => "chip muted" },
-                            match catalog_fetch { Some(true) => "Model catalogs live", Some(false) => "Model catalogs static", None => "Model catalogs unknown" }
+                            match catalog_fetch { Some(true) => "Model lists update themselves", Some(false) => "Model lists are fixed", None => "Model lists unknown" }
                         }
                     }
                     if audio_enabled == Some(true) {
                         p { class: "tiny",
-                            "Transcription: {transcription}. Understanding: {understanding}."
+                            "Speech-to-text: {transcription}. Audio understanding: {understanding}."
                         }
                         p { class: "tiny",
-                            "Voice notes sent to the bot's Telegram intake are transcribed with the configured Mistral audio model before the turn runs."
+                            "Voice notes you send on Telegram are turned into text before the bot answers."
                         }
                     } else if audio_enabled == Some(false) {
-                        p { class: "tiny", "Audio is disabled on the server (audio.enabled = false)." }
+                        p { class: "tiny", "Audio is turned off on the server." }
                     } else {
                         p { class: "tiny",
-                            "This server build does not report capabilities. Update the server to see live status."
+                            "This server is too old to report what is turned on. Update it to see live status."
                         }
                     }
                     if catalog_fetch == Some(false) {
                         p { class: "tiny",
-                            "Enable catalog_fetch in [llm] and use Fetch models on the Providers page to pull live model lists."
+                            "Ask your admin to turn on live model lists, then use Fetch models on the AI keys page."
                         }
                     }
                     div { class: "form-grid",
                         div { class: "field",
-                            label { class: "field-label", "Transcription model" }
+                            label { class: "field-label", "Speech-to-text model" }
                             input {
                                 class: "input",
                                 value: "{audio_transcription}",
-                                placeholder: "transcription model",
+                                placeholder: "speech-to-text model",
                                 oninput: move |event| session.write().audio.transcription_model = event.value(),
                             }
                         }
                         div { class: "field",
-                            label { class: "field-label", "Understanding model" }
+                            label { class: "field-label", "Audio understanding model" }
                             input {
                                 class: "input",
                                 value: "{audio_understanding}",
-                                placeholder: "understanding model",
+                                placeholder: "audio understanding model",
                                 oninput: move |event| session.write().audio.understanding_model = event.value(),
                             }
                         }
                     }
                     p { class: "tiny",
-                        "Audio uses the Mistral credentials already stored for the provider. Add a separate audio key in serabot.toml only if you need one."
+                        "Audio uses the Mistral key you already saved under AI keys."
                     }
                     label { class: "check",
                         input {
@@ -6864,7 +7136,7 @@ fn SettingsView(session: Signal<Session>) -> Element {
                             checked: audio_on,
                             onchange: move |event| session.write().audio.enabled = event.checked(),
                         }
-                        span { "Enable audio transcription and understanding" }
+                        span { "Turn on audio transcription and understanding" }
                     }
                     button {
                         class: "btn primary",
@@ -6875,7 +7147,7 @@ fn SettingsView(session: Signal<Session>) -> Element {
                 }
                 div { class: "card",
                     div { class: "card-head",
-                        h3 { class: "card-title", "Voice and OCR" }
+                        h3 { class: "card-title", "Voice and scanned pages" }
                         if voice_loading {
                             span { class: "chip muted", "Loading" }
                         }
@@ -6883,7 +7155,7 @@ fn SettingsView(session: Signal<Session>) -> Element {
                     div { class: "card-actions",
                         span {
                             class: if voice_stt_ready { "chip ok" } else { "chip warn" },
-                            if voice_stt_ready { "Speech to text ready" } else { "Speech to text off" }
+                            if voice_stt_ready { "Speech-to-text ready" } else { "Speech-to-text off" }
                         }
                         span {
                             class: if voice_tts_ready { "chip ok" } else { "chip warn" },
@@ -6891,12 +7163,12 @@ fn SettingsView(session: Signal<Session>) -> Element {
                         }
                         span {
                             class: if voice_ocr_ready { "chip ok" } else { "chip warn" },
-                            if voice_ocr_ready { "OCR ready" } else { "OCR off" }
+                            if voice_ocr_ready { "Scanned pages ready" } else { "Scanned pages off" }
                         }
                     }
                     if !voice_loaded {
                         p { class: "tiny",
-                            "Load the settings to see whether speech-to-text, voice replies, and OCR can run on this server."
+                            "Load the settings to see whether speech-to-text, voice replies and scanned-page reading can run on this server."
                         }
                         button {
                             class: "btn ghost",
@@ -6906,7 +7178,7 @@ fn SettingsView(session: Signal<Session>) -> Element {
                         }
                     } else {
                         p { class: "tiny",
-                            "Scanned PDFs and images fall back to OCR when the built-in extractor finds no text. Voice replies send a Telegram voice note instead of text."
+                            "Scanned PDFs and images are read with OCR when they have no text. Voice replies send a Telegram voice note instead of text."
                         }
                         if let Some(detail) = voice_stt_detail.clone() {
                             p { class: "tiny", "Speech to text: {detail}" }
@@ -6915,7 +7187,7 @@ fn SettingsView(session: Signal<Session>) -> Element {
                             p { class: "tiny", "Voice replies: {detail}" }
                         }
                         if let Some(detail) = voice_ocr_detail.clone() {
-                            p { class: "tiny", "OCR: {detail}" }
+                            p { class: "tiny", "Scanned pages: {detail}" }
                         }
                         div { class: "form-grid",
                             div { class: "field",
@@ -6928,7 +7200,7 @@ fn SettingsView(session: Signal<Session>) -> Element {
                                 }
                             }
                             div { class: "field",
-                                label { class: "field-label", "Text-to-speech model" }
+                                label { class: "field-label", "Voice reply model" }
                                 input {
                                     class: "input",
                                     value: "{voice_tts}",
@@ -6937,16 +7209,16 @@ fn SettingsView(session: Signal<Session>) -> Element {
                                 }
                             }
                             div { class: "field",
-                                label { class: "field-label", "Voice id" }
+                                label { class: "field-label", "Voice" }
                                 input {
                                     class: "input",
                                     value: "{voice_id}",
-                                    placeholder: "voice id from the provider",
+                                    placeholder: "voice name from your provider",
                                     oninput: move |event| session.write().voice.voice_id = event.value(),
                                 }
                             }
                             div { class: "field",
-                                label { class: "field-label", "OCR model" }
+                                label { class: "field-label", "Scanned-page model" }
                                 input {
                                     class: "input",
                                     value: "{voice_ocr}",
@@ -6961,7 +7233,7 @@ fn SettingsView(session: Signal<Session>) -> Element {
                                 checked: voice_ocr_enabled,
                                 onchange: move |event| session.write().voice.ocr_enabled = event.checked(),
                             }
-                            span { "Use OCR when a PDF or image has no text layer" }
+                            span { "Read scanned PDFs and images when they have no text" }
                         }
                         div { class: "card-actions",
                             for mode in ["text", "voice"] {
@@ -6976,7 +7248,7 @@ fn SettingsView(session: Signal<Session>) -> Element {
                             }
                         }
                         p { class: "tiny",
-                            "Voice replies are capped at {voice_max_chars} characters. In Telegram, /voice and /text switch the mode for that chat."
+                            "Voice replies stop at {voice_max_chars} characters. In Telegram, /voice and /text switch the style for that chat."
                         }
                         button {
                             class: "btn primary",
@@ -7303,5 +7575,95 @@ mod tests {
             }
             other => panic!("expected Table, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn known_tools_get_plain_sentences() {
+        assert_eq!(
+            tool_sentence(
+                "browser_type",
+                "Type vault secret 'venue-portal' (password) into e1 on the current page",
+                true
+            )
+            .as_deref(),
+            Some("Signed in with your saved login \"venue-portal\". The bot never saw it.")
+        );
+        assert_eq!(
+            tool_sentence(
+                "browser_navigate",
+                "Open https://www.portal.example.com/calendar?m=12 in the server browser",
+                true
+            )
+            .as_deref(),
+            Some("Opened portal.example.com")
+        );
+        assert_eq!(
+            tool_sentence(
+                "browser_navigate",
+                "Open https://a.example/ in the server browser",
+                false
+            )
+            .as_deref(),
+            Some("Wants to open a.example")
+        );
+        assert_eq!(
+            tool_sentence("browser_click", "", true).as_deref(),
+            Some("Clicked on the page")
+        );
+        assert_eq!(tool_sentence("deck_build", "x", false), None);
+    }
+
+    fn connector(id: &str) -> ConnectorStatus {
+        ConnectorStatus {
+            id: id.into(),
+            kind: "api_key".into(),
+            enabled: false,
+            redirect_uri: None,
+            api_base: None,
+            default_inbox_id: None,
+            secrets: BTreeMap::new(),
+            auth: None,
+            auth_modes: Vec::new(),
+            oauth: None,
+            connected: None,
+        }
+    }
+
+    #[test]
+    fn each_connector_shows_one_action_that_fits_its_state() {
+        let onedrive = connector("onedrive");
+        assert_eq!(
+            connector_action(&onedrive, false, ""),
+            Some(ConnectorAction::ConnectOneDrive)
+        );
+        assert_eq!(
+            connector_action(&onedrive, true, ""),
+            Some(ConnectorAction::DisconnectOneDrive)
+        );
+        let mut notion = connector("notion");
+        notion.secrets.insert(
+            "api_key".into(),
+            serabot_desktop::SecretStatus {
+                name: Some("notion_key".into()),
+                configured: false,
+            },
+        );
+        assert_eq!(
+            connector_action(&notion, false, ""),
+            Some(ConnectorAction::AddKey)
+        );
+        assert_eq!(
+            connector_action(&notion, true, ""),
+            Some(ConnectorAction::ReplaceKey)
+        );
+        let gmail = connector("gmail");
+        assert!(matches!(
+            connector_action(&gmail, false, ""),
+            Some(ConnectorAction::Authorize(_))
+        ));
+        assert_eq!(connector_action(&connector("unknown"), false, ""), None);
+        assert_eq!(secret_label("api_key"), "API key");
+        assert_eq!(secret_label("refresh_token"), "Refresh token");
+        assert_eq!(connector_title("onedrive"), "OneDrive");
     }
 }
