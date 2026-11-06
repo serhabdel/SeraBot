@@ -14,8 +14,8 @@ name: deploy-ovh
 #   (id-token: write) and exchanges it at the VPS CA broker for a 10-minute
 #   SSH certificate whose only permitted command is the deploy script.
 #   Fork PRs cannot obtain environment secrets or OIDC tokens for this env.
-# - The build job runs on pinned ubuntu-24.04 (the VPS runs Ubuntu 24.04,
-#   glibc 2.39) and fails if the binary requires a newer glibc. The deploy
+# - The build job runs on pinned ubuntu-24.04 (glibc 2.39, at or below the
+#   VPS glibc; the VPS runs Ubuntu 26.04 / glibc 2.43) and fails if the binary requires a newer glibc. The deploy
 #   script re-verifies the release SHA256SUMS and the host glibc before
 #   swapping, and rolls back automatically if the service does not come up.
 # - The deploy touches only /opt/serabot/serabot, /var/lib/serabot/releases
@@ -34,7 +34,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04  # pinned: VPS is Ubuntu 24.04, glibc 2.39
+    runs-on: ubuntu-24.04  # pinned: glibc 2.39 floor (VPS has 2.43)
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,7 +59,7 @@ jobs:
         shell: bash
         run: |
           MAX=$(objdump -T target/release/serabot | grep -o 'GLIBC_2\.[0-9]*' | sort -uV | tail -1)
-          echo "highest required glibc symbol: $MAX (VPS has 2.39)"
+          echo "highest required glibc symbol: $MAX (ceiling 2.39)"
           if [[ "$MAX" > "GLIBC_2.39" ]]; then
             echo "binary requires newer glibc than the VPS; aborting" >&2
             exit 1
@@ -118,9 +118,15 @@ jobs:
           echo "cert minted for principal deploy (valid 10m, forced command only)"
       - name: Run the deploy (forced command on the VPS, port 2222)
         shell: bash
+        env:
+          # Pinned host key line(s) for [<VPS_IP>]:2222, kept in a repository
+          # variable so the server address stays out of the public tree.
+          OVH_DEPLOY_KNOWN_HOSTS: ${{ vars.OVH_DEPLOY_KNOWN_HOSTS }}
         run: |
+          [ -n "$OVH_DEPLOY_KNOWN_HOSTS" ] || { echo "vars.OVH_DEPLOY_KNOWN_HOSTS is not set" >&2; exit 1; }
+          printf '%s\n' "$OVH_DEPLOY_KNOWN_HOSTS" > /tmp/known_hosts.deploy
           ssh -p 2222 -i /tmp/deploy_key -o CertificateFile=/tmp/deploy_key-cert.pub \
-            -o UserKnownHostsFile=deploy/known_hosts.deploy -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=/tmp/known_hosts.deploy -o StrictHostKeyChecking=yes \
             -o ConnectTimeout=15 \
             deploy@${{ vars.OVH_VPS_IP }} "deploy ${{ inputs.tag }}"
       - name: Post-deploy smoke (public, no token)

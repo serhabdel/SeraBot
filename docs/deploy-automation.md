@@ -17,8 +17,8 @@ report the new build.
 
 ## How auth works
 
-1. The `build` job runs on pinned `ubuntu-24.04` (the VPS runs 24.04 /
-   glibc 2.39), builds `-p serabot --locked` with `SERABOT_RELEASES_REPO` and
+1. The `build` job runs on pinned `ubuntu-24.04` (glibc 2.39, at or below the VPS:
+   Ubuntu 26.04 / glibc 2.43), builds `-p serabot --locked` with `SERABOT_RELEASES_REPO` and
    `SERABOT_BUILD_SHA=<tag sha>`, **fails if the binary needs
    `GLIBC_2.x > 2.39`**, and attaches `serabot-linux-x64` plus a dedicated
    `serabot-linux-x64.sha256` asset to the GitHub Release (the shared
@@ -42,9 +42,9 @@ report the new build.
    verifies `serabot-linux-x64.sha256`, re-checks host glibc, stages, backs up, swaps
    `/opt/serabot/serabot`, restarts **only `serabot.service`**, verifies
    `/healthz` reports the deployed sha, and rolls back automatically on
-   failure. Host key is pinned via `deploy/known_hosts.deploy`.
+   failure. Host key is pinned via the `OVH_DEPLOY_KNOWN_HOSTS` repository variable.
 
-Repo variables needed: `OVH_VPS_IP` (repository variable, not a secret).
+Repo variables needed: `OVH_VPS_IP` and `OVH_DEPLOY_KNOWN_HOSTS` (the `ssh-keyscan -p 2222` line), repository variables kept out of the public tree.
 No secrets are needed at all — that is the point of OIDC.
 
 ## One-time VPS setup (additive; nothing existing is modified or restarted)
@@ -66,7 +66,7 @@ NEW  /etc/sudoers.d/serabot-deploy                0440 root:root  (deploy runs o
 RUN  systemctl daemon-reload && systemctl enable --now serabot-deploy-ca serabot-deploy-sshd
 RUN  ufw allow 2222/tcp   # deploy sshd
 RUN  ufw allow 8788/tcp   # CA broker (JWT is the only auth; rate-limited)
-RUN  ssh-keyscan -p 2222 <VPS_IP> > deploy/known_hosts.deploy   (commit the pin)
+RUN  gh variable set OVH_DEPLOY_KNOWN_HOSTS --body "$(ssh-keyscan -t ed25519 -p 2222 <VPS_IP>)"
 UNTOUCHED: sshd:22 (no reload/restart), serabot.service, cloudflared.service,
            cloudflared-bot.service, docker, onedrive-mcp.service,
            /etc/serabot, /var/lib/serabot (except files deploy.sh writes)
@@ -97,7 +97,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now serabot-deploy-ca serabot-deploy-sshd
 sudo ufw allow 2222/tcp
 sudo ufw allow 8788/tcp
-ssh-keyscan -p 2222 <VPS_IP>   # pin into deploy/known_hosts.deploy
+gh variable set OVH_DEPLOY_KNOWN_HOSTS --body "$(ssh-keyscan -t ed25519 -p 2222 <VPS_IP>)"
 ```
 
 ### Known limitation: the CA broker speaks plain HTTP

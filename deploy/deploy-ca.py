@@ -24,6 +24,7 @@ import base64
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -110,8 +111,13 @@ def verify_jwt(token: str) -> dict:
         raise ValueError("expired")
     if payload.get("repository") != EXPECTED_REPO:
         raise ValueError("bad repository")
-    if payload.get("workflow") != EXPECTED_WORKFLOW:
-        raise ValueError("bad workflow")
+    # `workflow` is the workflow NAME ("deploy-ovh"); the file path lives in
+    # `workflow_ref` as "<owner>/<repo>/<path>@<ref>". Checking `workflow`
+    # against a path never matches, so pin the path out of `workflow_ref`
+    # instead, which also proves the token came from this repository.
+    workflow_ref = payload.get("workflow_ref", "")
+    if not workflow_ref.startswith(f"{EXPECTED_REPO}/{EXPECTED_WORKFLOW}@"):
+        raise ValueError("bad workflow_ref")
     if payload.get("environment") != EXPECTED_ENV:
         raise ValueError("bad environment")
     if payload.get("event_name") != "workflow_dispatch":
@@ -146,7 +152,9 @@ def sign_pubkey(pubkey: str, payload: dict) -> str:
             check=True,
             stdout=subprocess.DEVNULL,
         )
-        with open(keyfile + "-cert.pub") as fh:
+        # ssh-keygen strips the ".pub" suffix before appending "-cert.pub", so
+        # signing key.pub writes key-cert.pub (not key.pub-cert.pub).
+        with open(os.path.join(tmp, "key-cert.pub")) as fh:
             cert = fh.read().strip()
     with _lock:
         with open(PENDING_TAG, "w") as fh:
@@ -199,7 +207,14 @@ class Handler(BaseHTTPRequestHandler):
             cert = sign_pubkey(req["pubkey"], payload)
             body = json.dumps({"cert": cert}).encode()
             self.send_response(200)
-        except Exception:
+        except Exception as error:
+            # Log why to the journal; the client only ever sees "rejected" so a
+            # probe cannot learn which check failed.
+            print(
+                f"sign rejected: {type(error).__name__}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
             body = json.dumps({"error": "rejected"}).encode()
             self.send_response(403)
         self.send_header("Content-Type", "application/json")
