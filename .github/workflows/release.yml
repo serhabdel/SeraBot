@@ -116,8 +116,7 @@ jobs:
           flutter build apk --release \
             --build-name="${TAG#v}" \
             --build-number="${{ github.run_number }}" \
-            --dart-define=SERABOT_DEFAULT_SERVER_URL="${SERABOT_OWNER_API_URL}" \
-            --dart-define=SERABOT_OWNER_TOKEN_SECRET_NAME=SERABOT_OWNER_TOKEN
+            --dart-define=SERABOT_DEFAULT_SERVER_URL="${SERABOT_OWNER_API_URL}"
           cp build/app/outputs/flutter-apk/app-release.apk "serabot-mobile-${TAG}.apk"
           cp build/app/outputs/flutter-apk/app-release.apk "serabot-mobile-latest.apk"
       - name: Build release app bundle
@@ -126,8 +125,7 @@ jobs:
           flutter build appbundle --release \
             --build-name="${TAG#v}" \
             --build-number="${{ github.run_number }}" \
-            --dart-define=SERABOT_DEFAULT_SERVER_URL="${SERABOT_OWNER_API_URL}" \
-            --dart-define=SERABOT_OWNER_TOKEN_SECRET_NAME=SERABOT_OWNER_TOKEN
+            --dart-define=SERABOT_DEFAULT_SERVER_URL="${SERABOT_OWNER_API_URL}"
           cp build/app/outputs/bundle/release/app-release.aab "serabot-mobile-${TAG}.aab"
           cp build/app/outputs/bundle/release/app-release.aab "serabot-mobile-latest.aab"
       - name: Upload artifact
