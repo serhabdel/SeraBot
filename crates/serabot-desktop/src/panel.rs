@@ -1241,8 +1241,9 @@ mod tests {
             t0,
         );
         assert!(state.browser_error.is_none());
-        // Held for at least 2 s even though the 2 s interval has elapsed.
-        assert!(state.next_op(t0 + Duration::from_millis(2100)).is_none());
+        // Held for the 2 s backoff floor. The jitter adds 0-25 % on top, so
+        // only a time below the floor is deterministic (2.1 s was flaky).
+        assert!(state.next_op(t0 + Duration::from_millis(1900)).is_none());
         assert!(matches!(
             state.next_op(t0 + Duration::from_secs(130)),
             Some(PanelOp::Status)
