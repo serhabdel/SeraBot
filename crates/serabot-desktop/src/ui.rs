@@ -364,7 +364,7 @@ fn capability_label(tool: &str) -> Option<&'static str> {
 /// `[a-z0-9-_]*`. A bare `@` yields `Some("")`.
 fn mention_query(text: &str) -> Option<String> {
     let at = text.rfind('@')?;
-    let tail = &text[at + 1..];
+    let tail = text.get(at + 1..)?;
     if tail.len() > 32 || tail.chars().any(char::is_whitespace) {
         return None;
     }
@@ -391,7 +391,7 @@ fn slash_query(text: &str) -> Option<String> {
 /// Replace the trailing `@query` in `text` with `@id `.
 fn insert_mention_text(text: &str, id: &str) -> String {
     match text.rfind('@') {
-        Some(at) => format!("{}@{} ", &text[..at], id),
+        Some(at) => format!("{}@{} ", text.get(..at).unwrap_or_default(), id),
         None => format!("{}@{} ", text, id),
     }
 }
@@ -399,7 +399,7 @@ fn insert_mention_text(text: &str, id: &str) -> String {
 /// Replace the `/query` at the start of the last line of `text` with `id `.
 fn insert_slash_text(text: &str, id: &str) -> String {
     let line_start = text.rfind('\n').map(|i| i + 1).unwrap_or(0);
-    format!("{}{} ", &text[..line_start], id)
+    format!("{}{} ", text.get(..line_start).unwrap_or_default(), id)
 }
 
 /// Bots matching a mention query: `(id, display name, avatar)`.
@@ -743,13 +743,13 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
         // Heading
         if trimmed.starts_with('#') {
             let hash_count = trimmed.chars().take_while(|c| *c == '#').count();
-            if hash_count <= 6 && trimmed[hash_count..].starts_with(' ') {
-                let rest = trimmed[hash_count..].trim();
-                let title = if rest.starts_with("**") && rest.ends_with("**") && rest.len() >= 4 {
-                    &rest[2..rest.len() - 2]
-                } else {
-                    rest
-                };
+            let after_hashes = trimmed.get(hash_count..).unwrap_or_default();
+            if hash_count <= 6 && after_hashes.starts_with(' ') {
+                let rest = after_hashes.trim();
+                let title = rest
+                    .strip_prefix("**")
+                    .and_then(|inner| inner.strip_suffix("**"))
+                    .unwrap_or(rest);
                 blocks.push(MdBlock::Heading {
                     level: hash_count,
                     text: title.trim().to_owned(),
@@ -818,7 +818,13 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
                 if l_trim.starts_with("- ") || l_trim.starts_with("* ") || l_trim.starts_with("• ")
                 {
                     let marker_len = if l_trim.starts_with("• ") { 3 } else { 2 };
-                    items.push(l_trim[marker_len..].trim().to_owned());
+                    items.push(
+                        l_trim
+                            .get(marker_len..)
+                            .unwrap_or_default()
+                            .trim()
+                            .to_owned(),
+                    );
                     i += 1;
                 } else if !l_trim.is_empty()
                     && (lines[i].starts_with("  ") || lines[i].starts_with('\t'))
@@ -851,7 +857,7 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
                 let fw = l_trim.split_whitespace().next().unwrap_or("");
                 if fw.ends_with('.') && fw.trim_end_matches('.').chars().all(|c| c.is_ascii_digit())
                 {
-                    let item_text = l_trim[fw.len()..].trim().to_owned();
+                    let item_text = l_trim.get(fw.len()..).unwrap_or_default().trim().to_owned();
                     items.push(item_text);
                     i += 1;
                 } else if !l_trim.is_empty()
@@ -5761,10 +5767,7 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
                                                                 onclick: {
                                                                     let url = url.clone();
                                                                     move |_| {
-                                                                        if let Err(error) = webbrowser::open(&url) {
-                                                                            session.write().state.error =
-                                                                                Some(format!("Could not open the browser: {error}"));
-                                                                        }
+                                                                        session.write().open_in_browser(url.clone());
                                                                     }
                                                                 },
                                                                 Icon { name: "external", size: 14 }

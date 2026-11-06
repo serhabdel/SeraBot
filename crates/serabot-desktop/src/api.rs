@@ -105,7 +105,7 @@ pub fn validate_endpoint(raw: &str) -> Result<Url, ApiError> {
     if scheme == "http" {
         let host = if authority.starts_with('[') {
             let end = authority.find(']').ok_or_else(|| invalid.clone())?;
-            &authority[..=end]
+            authority.get(..=end).ok_or_else(|| invalid.clone())?
         } else {
             authority.split(':').next().ok_or_else(|| invalid.clone())?
         };
@@ -1549,6 +1549,12 @@ impl ApiClient {
             endpoint,
             token,
         })
+    }
+
+    /// True when this client already targets `endpoint` with `token`, so a
+    /// caller can keep one client (and its connection pool) across requests.
+    pub fn targets(&self, endpoint: &Url, token: &SecretString) -> bool {
+        self.endpoint == *endpoint && self.token.expose_secret() == token.expose_secret()
     }
 
     fn request<T: DeserializeOwned, B: Serialize + ?Sized>(

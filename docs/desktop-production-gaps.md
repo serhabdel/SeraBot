@@ -9,9 +9,11 @@ the sign-in pass touched or read, not a full audit.
 - The sign-in path is tested against a scripted server that follows
   `specs/native-signin-contract.md`. It has not run against the real Microsoft
   tenant or the deployed server; treat it as unverified until it does.
-- `expires_at` from the handoff response is validated but not used. The console
-  finds an expired session only when a request answers 401. A "session expires
-  soon" hint or a silent re-sign-in is not built.
+- Fixed: `expires_at` from the handoff response now ends the session cleanly
+  ("Your session ended. Sign in again.") when it passes. Still open: the expiry
+  is held in memory only, so a token restored after a restart has no known
+  expiry and relies on the 401 path; there is no "expires soon" hint or silent
+  re-sign-in.
 - A saved token from an older release that is an operator device token may not
   be accepted by `GET /v1/me`. The console tolerates a failed `/v1/me` and lets
   the next read (the model catalog) decide, but this was not checked against a
@@ -27,16 +29,27 @@ the sign-in pass touched or read, not a full audit.
 
 ## Panics, threads and I/O
 
-- Non-test `unwrap()` and `expect()` were removed (three sites). Indexing and
-  slicing (`[..]`, `[i]`) was not audited.
-- `webbrowser::open`, `explorer` and `xdg-open` spawns, and the connector
-  "Connect" button's browser open, run on the UI thread. They return quickly but
-  are not off-thread.
-- `save_ui_settings` ignores write errors (pins and theme silently fail to
-  persist).
-- `ApiClient::new` builds a fresh `reqwest` client on every worker job, so TLS
-  setup repeats per request.
-- The updater (`updater.rs`) was not reviewed in this pass.
+- Non-test `unwrap()` and `expect()` were removed (three sites).
+- Fixed: slicing in `session.rs`, `api.rs` and the markdown, mention and slash
+  helpers in `ui.rs` now uses `.get()`/`strip_prefix`. The audit found no
+  reachable panic; the old sites were guarded by ASCII or `find` results. Plain
+  `lines[i]` and byte-scan indexing in the markdown block parser and
+  `teams.rs` stay: each is bounded by an explicit length check.
+- Fixed: `webbrowser::open`, `explorer` and `xdg-open` launches, including the
+  connector "Connect" button, now run on a helper thread and report by toast.
+- Fixed: `save_ui_settings` shows a toast when the write fails (the change
+  still applies for this run).
+- Fixed: the HTTP worker keeps one `ApiClient` per endpoint and token, so the
+  connection pool and TLS sessions are reused. (Sign-out and sign-in still use
+  their own short-lived clients.)
+- Updater reviewed. No non-test `unwrap`/`expect`; downloads are size-capped,
+  streamed to `.part`, hashed while writing and renamed only on a match, and
+  the hash is re-checked before install. Fixed: redirects are followed only
+  over HTTPS, and stale executables and `.part` files are pruned. Left open:
+  the checksum comes from the same GitHub release as the binary, so there is no
+  independent signature (Authenticode or a signed manifest) and the helper
+  script cannot be tested without a real install; the update path has not run
+  against a real release.
 
 ## Tests
 
