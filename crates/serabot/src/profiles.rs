@@ -125,6 +125,10 @@ impl Store {
             "DELETE FROM bot_onboarding WHERE user_id = ?1 AND bot = ?2",
             params![user_id, bot],
         )?;
+        connection.execute(
+            "DELETE FROM bot_settings WHERE user_id = ?1 AND bot = ?2",
+            params![user_id, bot],
+        )?;
         Ok(())
     }
 

@@ -92,21 +92,6 @@ fn which_available(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Only plain ids become directory names.
-pub fn profile_dir(base: &Path, user_id: &str) -> Result<PathBuf> {
-    let ok = !user_id.is_empty()
-        && user_id.len() <= 64
-        && user_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-    if !ok {
-        return Err(SeraError::Validation(
-            "invalid user id for browser profile".into(),
-        ));
-    }
-    Ok(base.join(user_id))
-}
-
 pub fn chromium_args(profile: &Path, no_sandbox: bool) -> Vec<String> {
     let mut args = vec![
         "--headless=new".to_owned(),
@@ -162,8 +147,8 @@ impl ChromiumLauncher {
 
 #[async_trait]
 impl BrowserLauncher for ChromiumLauncher {
-    async fn launch(&self, user_id: &str) -> Result<Arc<dyn BrowserBackend>> {
-        let profile = profile_dir(&self.base_dir, user_id)?;
+    async fn launch(&self, user_id: &str, profile_id: &str) -> Result<Arc<dyn BrowserBackend>> {
+        let profile = crate::browser_profiles::profile_dir(&self.base_dir, user_id, profile_id)?;
         std::fs::create_dir_all(&profile)?;
         let port_file = profile.join("DevToolsActivePort");
         let _ = std::fs::remove_file(&port_file);
@@ -669,19 +654,6 @@ mod tests {
     }
 
     #[test]
-    fn profile_dirs_reject_traversal() {
-        let base = Path::new("/b");
-        assert!(profile_dir(base, "0190-abcd_EF").is_ok());
-        for bad in ["", "..", "../x", "a/b", "a\\b", "a b", &"x".repeat(65)] {
-            assert!(profile_dir(base, bad).is_err(), "{bad}");
-        }
-        assert_ne!(
-            profile_dir(base, "alice").unwrap(),
-            profile_dir(base, "bob").unwrap()
-        );
-    }
-
-    #[test]
     fn configured_executable_wins() {
         assert_eq!(
             resolve_chromium_executable("/snap/bin/chromium").unwrap(),
@@ -700,7 +672,7 @@ mod tests {
         };
         let base = std::env::temp_dir().join(format!("serabot-live-{}", uuid::Uuid::new_v4()));
         let launcher = ChromiumLauncher::new(&config, base.clone()).unwrap();
-        let backend = launcher.launch("live-user").await.unwrap();
+        let backend = launcher.launch("live-user", "default").await.unwrap();
         backend
             .navigate("data:text/html,<h1>Hi</h1><button onclick=\"document.title='clicked'\">Go</button><input aria-label=name>")
             .await

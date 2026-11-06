@@ -15,6 +15,7 @@ pub(crate) const FAKE_SECRET: &str = "s3cr3t-value-123";
 
 pub(crate) struct FakeBackend {
     pub user: String,
+    pub profile: String,
     pub calls: std::sync::Mutex<Vec<String>>,
     pub alive: AtomicBool,
     pub shutdown_count: Arc<AtomicUsize>,
@@ -78,6 +79,10 @@ impl BrowserBackend for FakeBackend {
         // JPEG magic + the owning user, so isolation tests can tell sessions apart.
         let mut bytes = vec![0xff, 0xd8, 0xff, 0xe0];
         bytes.extend_from_slice(self.user.as_bytes());
+        if self.profile != "default" {
+            bytes.push(b'/');
+            bytes.extend_from_slice(self.profile.as_bytes());
+        }
         Ok(bytes)
     }
     async fn info(&self) -> Result<PageInfo> {
@@ -98,6 +103,7 @@ impl BrowserBackend for FakeBackend {
 #[derive(Default)]
 pub(crate) struct FakeLauncher {
     launches: std::sync::Mutex<Vec<String>>,
+    profile_launches: std::sync::Mutex<Vec<(String, String)>>,
     backends: std::sync::Mutex<Vec<Arc<FakeBackend>>>,
     shutdowns: Arc<AtomicUsize>,
 }
@@ -105,6 +111,10 @@ pub(crate) struct FakeLauncher {
 impl FakeLauncher {
     pub fn launches(&self) -> Vec<String> {
         self.launches.lock().unwrap().clone()
+    }
+    /// `(user, profile)` per launch, in order.
+    pub fn profile_launches(&self) -> Vec<(String, String)> {
+        self.profile_launches.lock().unwrap().clone()
     }
     pub fn shutdowns(&self) -> usize {
         self.shutdowns.load(Ordering::SeqCst)
@@ -123,14 +133,28 @@ impl FakeLauncher {
             .flat_map(|backend| backend.calls.lock().unwrap().clone())
             .collect()
     }
+    pub fn calls_for_profile(&self, user: &str, profile: &str) -> Vec<String> {
+        self.backends
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|backend| backend.user == user && backend.profile == profile)
+            .flat_map(|backend| backend.calls.lock().unwrap().clone())
+            .collect()
+    }
 }
 
 #[async_trait]
 impl BrowserLauncher for FakeLauncher {
-    async fn launch(&self, user_id: &str) -> Result<Arc<dyn BrowserBackend>> {
+    async fn launch(&self, user_id: &str, profile_id: &str) -> Result<Arc<dyn BrowserBackend>> {
         self.launches.lock().unwrap().push(user_id.to_owned());
+        self.profile_launches
+            .lock()
+            .unwrap()
+            .push((user_id.to_owned(), profile_id.to_owned()));
         let backend = Arc::new(FakeBackend {
             user: user_id.to_owned(),
+            profile: profile_id.to_owned(),
             calls: Default::default(),
             alive: AtomicBool::new(true),
             shutdown_count: self.shutdowns.clone(),
@@ -147,6 +171,18 @@ pub(crate) fn manager_with(
 ) -> (Arc<BrowserManager>, Arc<FakeLauncher>) {
     let launcher = Arc::new(FakeLauncher::default());
     let manager = Arc::new(BrowserManager::new(launcher.clone(), max_sessions, idle));
+    (manager, launcher)
+}
+
+/// Like [`manager_with`], with a profile base directory (for delete tests).
+pub(crate) fn manager_with_base(
+    max_sessions: usize,
+    idle: Duration,
+    base: std::path::PathBuf,
+) -> (Arc<BrowserManager>, Arc<FakeLauncher>) {
+    let launcher = Arc::new(FakeLauncher::default());
+    let manager =
+        Arc::new(BrowserManager::new(launcher.clone(), max_sessions, idle).with_base_dir(base));
     (manager, launcher)
 }
 

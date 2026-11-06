@@ -7,6 +7,7 @@ pub mod auth;
 pub mod avatar;
 pub mod brief;
 pub mod browser;
+pub mod browser_profiles;
 pub mod cloud_code;
 pub mod config;
 pub mod connectors;

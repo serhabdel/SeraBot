@@ -207,8 +207,18 @@ to `main.delegates` yourself if `main` should hand work to it.
 `display_name`, `role`, `description`, `avatar`, `enabled`, `provider`, `model`,
 `fallback_provider`, `fallback_model`, `routing_classes`, `instructions`
 (prompt body, capped at 32 KB), `instructions_bytes`, `skills`, `tools`,
-`require_approval`, `memory_count`, `artifact_count`. No secrets or secret
-values are returned. Unknown bots get `404`.
+`require_approval`, `browser_profile` (profile id, `default` when unassigned),
+`memory_count`, `artifact_count`. No secrets or secret values are returned.
+Unknown bots get `404`.
+
+`PUT /v1/bots/{id}` accepts `enabled`, `prompt`, `tools`, `skills`,
+`require_approval` and, since 0.16, `display_name` (1-48 characters),
+`description` (0-280; empty clears), `model` (`{"provider","model"}` — the
+provider must list the model — or `null` for the default model) and
+`browser_profile` (an id from `GET /v1/browser/profiles`, or `null` for
+`default`). At least one field is required; invalid values are `422` and change
+nothing. The response's `bot` carries `display_name`, `description`, `model`
+(model id or `null`) and `browser_profile`.
 
 `PUT /v1/admin/bots/{id}/config` (owner token) updates `tools`, `skills`, and/or
 `require_approval` for an existing bot:
