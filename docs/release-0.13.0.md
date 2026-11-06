@@ -19,6 +19,16 @@
 - On start the server sends `SeraBot <version> started` to the admin's
   Telegram chat.
 
+- Desktop: session expiry ends the session cleanly, browser/Explorer
+  launches run off the UI thread, one pooled HTTP client, HTTPS-only update
+  redirects, stale update files pruned.
+- Code layout: `api.rs` and `runtime.rs` are now the `api/` and `runtime/`
+  module directories (pure moves, no behaviour change).
+- Deploy targets the new VPS through the `OVH_VPS_IP` and
+  `OVH_DEPLOY_KNOWN_HOSTS` repository variables; no server address or host
+  key in the tree. `deploy.sh` creates its release dirs and keeps 3 staged
+  binaries and 5 DB backups.
+
 ## New
 - `POST /v1/auth/handoff`, `GET /v1/me`, migration `0014_auth_handoffs.sql`.
 - `[auth] admin_email`: the first Microsoft sign-in with this email claims the
