@@ -129,6 +129,14 @@ Cloudflare tunnel publishes it at `https://bot.seradyx.tech` together with the
 public client downloads. The existing dashboard-managed `cloudflared.service`
 and `/etc/cloudflared/token` are not read, edited, restarted, or removed.
 
+The binary itself serves the public pages, all static, script-free and
+embedded at build time (no files on the host): `/` (landing + downloads),
+`/privacy`, `/terms`, `/login`, `/healthz`, and the brand images
+(`/brand/serabot.webp`, `/favicon.png`, `/apple-touch-icon.png`). Editing a page
+means editing `crates/serabot/assets/*.html` and shipping a release through
+`deploy-ovh`. The marketing page on the main site lives in the separate
+`seradyx-website` repository (`/apps/serabot`).
+
 Exact remote manifest (present it before any change):
 
 ```text

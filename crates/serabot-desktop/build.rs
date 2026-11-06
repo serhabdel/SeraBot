@@ -4,12 +4,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SERABOT_RELEASES_REPO");
     println!("cargo:rerun-if-env-changed=SERABOT_BUILD_SHA");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=assets/serabot.ico");
     #[cfg(windows)]
     embed_windows_metadata();
 }
 
 /// Version metadata and a per-monitor-v2 DPI manifest for the Windows exe.
-/// The window icon itself is generated at runtime in `main.rs`.
+/// The exe icon is embedded here; the window icon is set in `ui.rs`.
 #[cfg(windows)]
 fn embed_windows_metadata() {
     let mut resource = winresource::WindowsResource::new();
@@ -20,6 +21,7 @@ fn embed_windows_metadata() {
         .set("FileVersion", env!("CARGO_PKG_VERSION"))
         .set("OriginalFilename", "serabot-desktop.exe")
         .set("LegalCopyright", "SeraBot")
+        .set_icon("assets/serabot.ico")
         .set_manifest(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">

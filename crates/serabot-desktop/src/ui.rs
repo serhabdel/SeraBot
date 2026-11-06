@@ -537,6 +537,14 @@ fn set_model_draft(session: &mut Session, raw: &str) {
     session.state.draft = parse_model_value(raw);
 }
 
+/// Taskbar / title-bar icon: a 64x64 RGBA bitmap generated from the brand
+/// mascot (see `assets/icon-64.rgba`). `None` falls back to the default icon.
+#[cfg(windows)]
+fn window_icon() -> Option<dioxus::desktop::tao::window::Icon> {
+    const RGBA: &[u8] = include_bytes!("../assets/icon-64.rgba");
+    dioxus::desktop::tao::window::Icon::from_rgba(RGBA.to_vec(), 64, 64).ok()
+}
+
 pub fn run() {
     #[cfg(windows)]
     {
@@ -559,6 +567,7 @@ pub fn run() {
             .with_window(
                 dioxus::desktop::WindowBuilder::new()
                     .with_title("SeraBot Owner")
+                    .with_window_icon(window_icon())
                     .with_inner_size(dioxus::desktop::LogicalSize::new(1280.0, 820.0))
                     .with_min_inner_size(dioxus::desktop::LogicalSize::new(920.0, 620.0)),
             );

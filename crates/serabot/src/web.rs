@@ -5,9 +5,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde_json::{Value, json};
 
-/// Strict policy for the embedded landing page: inline CSS only, no scripts,
-/// no external origins, and no form or frame surface.
-pub(crate) const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+/// Strict policy for the embedded pages: inline CSS only, no scripts, images
+/// only from this origin, no external origins, and no form or frame surface.
+pub(crate) const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 pub(crate) const APK_ASSET: &str = "serabot-mobile-latest.apk";
 pub(crate) const SHA256SUMS_ASSET: &str = "SHA256SUMS";
@@ -18,6 +18,16 @@ const DOWNLOADS_UNCONFIGURED: &str =
     "<p class=\"meta\">Client downloads are not configured for this server build.</p>";
 const APP_HTML: &str = include_str!("../assets/app.html");
 const LOGIN_HTML: &str = include_str!("../assets/login.html");
+const PRIVACY_HTML: &str = include_str!("../assets/privacy.html");
+const TERMS_HTML: &str = include_str!("../assets/terms.html");
+const SITE_CSS: &str = include_str!("../assets/site.css");
+const CSS_PLACEHOLDER: &str = "{{CSS}}";
+
+// Brand assets embedded in the binary; served from this origin so the CSP
+// never needs an external image host.
+const LOGO_WEBP: &[u8] = include_bytes!("../assets/brand/serabot-logo-512.webp");
+const FAVICON_PNG: &[u8] = include_bytes!("../assets/brand/favicon-32.png");
+const TOUCH_ICON_PNG: &[u8] = include_bytes!("../assets/brand/apple-touch-icon-180.png");
 
 pub(crate) fn build_sha() -> &'static str {
     option_env!("SERABOT_BUILD_SHA").unwrap_or("dev")
@@ -85,8 +95,12 @@ fn downloads_markup(repo: Option<&str>) -> String {
     )
 }
 
+fn with_site_css(template: &str) -> String {
+    template.replace(CSS_PLACEHOLDER, SITE_CSS)
+}
+
 fn render_landing(repo: Option<&str>) -> String {
-    APP_HTML.replace(DOWNLOADS_PLACEHOLDER, &downloads_markup(repo))
+    with_site_css(APP_HTML).replace(DOWNLOADS_PLACEHOLDER, &downloads_markup(repo))
 }
 
 /// Public, unauthenticated routes served next to the Owner API.
@@ -98,6 +112,12 @@ where
         .route("/", get(landing))
         .route("/app", get(landing))
         .route("/login", get(login))
+        .route("/privacy", get(privacy))
+        .route("/terms", get(terms))
+        .route("/brand/serabot.webp", get(logo))
+        .route("/favicon.png", get(favicon))
+        .route("/favicon.ico", get(favicon))
+        .route("/apple-touch-icon.png", get(touch_icon))
         .route("/app/latest.apk", get(latest_apk))
         .route("/app/SHA256SUMS", get(sha256sums))
         .route("/healthz", get(healthz))
@@ -149,6 +169,52 @@ async fn login() -> Response {
         LOGIN_HTML,
     )
         .into_response()
+}
+
+fn static_page(page: String) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CONTENT_SECURITY_POLICY, CSP),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        page,
+    )
+        .into_response()
+}
+
+/// Public legal pages: static, script-free, no state.
+async fn privacy() -> Response {
+    static_page(with_site_css(PRIVACY_HTML))
+}
+
+async fn terms() -> Response {
+    static_page(with_site_css(TERMS_HTML))
+}
+
+fn image_response(content_type: &'static str, bytes: &'static [u8]) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+async fn logo() -> Response {
+    image_response("image/webp", LOGO_WEBP)
+}
+
+async fn favicon() -> Response {
+    image_response("image/png", FAVICON_PNG)
+}
+
+async fn touch_icon() -> Response {
+    image_response("image/png", TOUCH_ICON_PNG)
 }
 
 async fn latest_apk() -> Response {
@@ -219,7 +285,9 @@ mod tests {
         assert!(!unconfigured.contains("<script"));
         assert!(!unconfigured.contains(DOWNLOADS_PLACEHOLDER));
         assert!(unconfigured.contains("SeraBot"));
-        assert!(unconfigured.contains("private single-operator deployment"));
+        assert!(unconfigured.contains("Invitation-only"));
+        assert!(!unconfigured.contains(CSS_PLACEHOLDER));
+        assert!(unconfigured.contains("/privacy") && unconfigured.contains("/terms"));
         assert!(!unconfigured.contains("releases/latest/download"));
 
         let configured = render_landing(Some("owner/repo"));
@@ -238,6 +306,53 @@ mod tests {
 
         let invalid = render_landing(Some("owner/repo/extra"));
         assert!(invalid.contains(DOWNLOADS_UNCONFIGURED));
+    }
+
+    #[tokio::test]
+    async fn legal_pages_are_static_script_free_and_cross_linked() {
+        for (response, title) in [
+            (privacy().await, "Privacy policy"),
+            (terms().await, "Terms of service"),
+        ] {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_SECURITY_POLICY)
+                    .and_then(|value| value.to_str().ok()),
+                Some(CSP)
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let page = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(page.contains(title));
+            assert!(!page.contains("<script"));
+            assert!(!page.contains(CSS_PLACEHOLDER));
+            assert!(page.contains(r#"href="/privacy""#) && page.contains(r#"href="/terms""#));
+        }
+    }
+
+    #[tokio::test]
+    async fn brand_images_are_served_with_the_right_types() {
+        for (response, kind, magic) in [
+            (logo().await, "image/webp", &b"RIFF"[..]),
+            (favicon().await, "image/png", &b"\x89PNG"[..]),
+            (touch_icon().await, "image/png", &b"\x89PNG"[..]),
+        ] {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some(kind)
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            assert!(bytes.starts_with(magic));
+        }
     }
 
     #[tokio::test]
