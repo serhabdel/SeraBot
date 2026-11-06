@@ -45,7 +45,7 @@ class ApiException implements Exception {
       case ApiErrorKind.http:
         final c = statusCode ?? 0;
         if (c == 401) {
-          return 'Unauthorized (401). Disconnect and check your API token.';
+          return 'Your session has expired. Sign in again.';
         }
         if (c == 403) {
           return 'Forbidden (403). Server policy or data-egress approval blocks this request.';
@@ -70,62 +70,23 @@ class ApiException implements Exception {
   String toString() => messageForUser();
 }
 
-/// One sign-in provider offered by the server.
-///
-/// The server reports every provider it knows in a fixed order; only the
-/// enabled ones can actually serve a sign-in. Google and GitHub are reported
-/// disabled until they are configured, and the connect screen renders them
-/// visibly disabled rather than hiding them.
-class AuthProvider {
-  const AuthProvider({required this.id, required this.enabled});
-
-  final String id;
-  final bool enabled;
-
-  /// Human label for the button; unknown ids fall back to the raw id.
-  String get label {
-    switch (id) {
-      case 'microsoft':
-        return 'Microsoft';
-      case 'google':
-        return 'Google';
-      case 'github':
-        return 'GitHub';
-      default:
-        return id;
-    }
-  }
-
-  static List<AuthProvider> listFromJson(Map<String, dynamic> json) {
-    final raw = json['providers'];
-    if (raw is! List) {
-      throw ApiException(ApiErrorKind.invalidResponse);
-    }
-    final providers = <AuthProvider>[];
-    for (final entry in raw) {
-      if (entry is! Map<String, dynamic>) {
-        throw ApiException(ApiErrorKind.invalidResponse);
-      }
-      final id = entry['id'];
-      final enabled = entry['enabled'];
-      if (id is! String || !validId(id) || enabled is! bool) {
-        throw ApiException(ApiErrorKind.invalidResponse);
-      }
-      providers.add(AuthProvider(id: id, enabled: enabled));
-    }
-    return providers;
-  }
-}
-
 /// Owner API client. Token is held in memory only; never logged.
 class ApiClient {
-  ApiClient._(this._base, this._token, this._http);
+  ApiClient._(this._base, this._token, this._http, this._onUnauthorized);
 
   final String _base;
   final String _token;
   final http.Client _http;
+  final void Function()? _onUnauthorized;
 
-  static ApiClient connect(String endpointRaw, String token) {
+  /// [onUnauthorized] runs on every HTTP 401 so the session can drop the
+  /// stored token and return to the sign-in screen. [httpClient] is for tests.
+  static ApiClient connect(
+    String endpointRaw,
+    String token, {
+    http.Client? httpClient,
+    void Function()? onUnauthorized,
+  }) {
     final base = validateEndpoint(endpointRaw);
     if (!validToken(token)) {
       throw ApiException(
@@ -134,124 +95,11 @@ class ApiClient {
             'API token must contain 32–512 visible ASCII characters, without spaces.',
       );
     }
-    final client = http.Client();
-    return ApiClient._(base, token, client);
+    return ApiClient._(base, token, httpClient ?? http.Client(), onUnauthorized);
   }
 
   void close() {
     _http.close();
-  }
-
-  /// The sign-in providers the server offers, fetched without a token: this
-  /// runs before a session exists. The endpoint is public by design.
-  static Future<List<AuthProvider>> authProviders(String endpointRaw) async {
-    final base = validateEndpoint(endpointRaw);
-    final http.Client client = http.Client();
-    try {
-      final response = await client
-          .get(
-            Uri.parse('$base/v1/auth/providers'),
-            headers: const {'Accept': 'application/json'},
-          )
-          .timeout(const Duration(seconds: 20));
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw ApiException(ApiErrorKind.http, statusCode: response.statusCode);
-      }
-      final bytes = response.bodyBytes;
-      if (bytes.length > _maxResponseBytes) {
-        throw ApiException(ApiErrorKind.tooLarge);
-      }
-      final decoded = jsonDecode(utf8.decode(bytes));
-      if (decoded is! Map<String, dynamic>) {
-        throw ApiException(ApiErrorKind.invalidResponse);
-      }
-      return AuthProvider.listFromJson(decoded);
-    } on ApiException {
-      rethrow;
-    } catch (_) {
-      throw ApiException(ApiErrorKind.transport);
-    } finally {
-      client.close();
-    }
-  }
-
-  /// Start a browser sign-in and return the provider's authorize URL.
-  ///
-  /// The URL must be HTTPS (or loopback HTTP for a development server): the
-  /// caller opens it in the system browser, and the browser shows the session
-  /// token exactly once for pasting into the connect screen.
-  static Future<String> startSignIn(
-    String endpointRaw, {
-    required String provider,
-    String? inviteCode,
-  }) async {
-    final base = validateEndpoint(endpointRaw);
-    if (!validId(provider)) {
-      throw ApiException(ApiErrorKind.validation, detail: 'Unknown provider.');
-    }
-    final code = inviteCode?.trim();
-    if (code != null &&
-        code.isNotEmpty &&
-        (code.length > 256 || code.codeUnits.any((unit) => unit < 0x20 || unit == 0x7f))) {
-      throw ApiException(
-        ApiErrorKind.validation,
-        detail: 'Invite code must be 1–256 characters without control characters.',
-      );
-    }
-    final http.Client client = http.Client();
-    try {
-      final response = await client
-          .post(
-            Uri.parse('$base/v1/auth/login/start'),
-            headers: const {
-              'Accept': 'application/json',
-              'Content-Type': 'application/json',
-            },
-            body: jsonEncode({
-              'provider': provider,
-              if (code != null && code.isNotEmpty) 'invite_code': code,
-            }),
-          )
-          .timeout(const Duration(seconds: 20));
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw ApiException(ApiErrorKind.http, statusCode: response.statusCode);
-      }
-      final bytes = response.bodyBytes;
-      if (bytes.length > _maxResponseBytes) {
-        throw ApiException(ApiErrorKind.tooLarge);
-      }
-      final decoded = jsonDecode(utf8.decode(bytes));
-      if (decoded is! Map<String, dynamic>) {
-        throw ApiException(ApiErrorKind.invalidResponse);
-      }
-      final url = decoded['url'];
-      if (url is! String || !_isSafeSignInUrl(url)) {
-        throw ApiException(ApiErrorKind.invalidResponse);
-      }
-      return url;
-    } on ApiException {
-      rethrow;
-    } catch (_) {
-      throw ApiException(ApiErrorKind.transport);
-    } finally {
-      client.close();
-    }
-  }
-
-  /// Only HTTPS, or loopback HTTP for a local development server.
-  static bool _isSafeSignInUrl(String value) {
-    final uri = Uri.tryParse(value);
-    if (uri == null || !uri.hasAuthority) {
-      return false;
-    }
-    if (uri.scheme == 'https') {
-      return true;
-    }
-    if (uri.scheme != 'http') {
-      return false;
-    }
-    final host = uri.host;
-    return host == 'localhost' || host == '127.0.0.1' || host == '::1';
   }
 
   Uri _uri(List<String> segments, [Map<String, String>? query]) {
@@ -299,6 +147,10 @@ class ApiClient {
       throw ApiException(ApiErrorKind.transport);
     }
 
+    if (response.statusCode == 401) {
+      _onUnauthorized?.call();
+      throw ApiException(ApiErrorKind.http, statusCode: 401);
+    }
     if (response.statusCode >= 300 && response.statusCode < 400) {
       throw ApiException(ApiErrorKind.http, statusCode: response.statusCode);
     }
@@ -340,6 +192,19 @@ class ApiClient {
       throw ApiException(ApiErrorKind.invalidResponse);
     }
     return task;
+  }
+
+  /// The signed-in user.
+  Future<UserInfo> me() async {
+    final json = await _request('GET', ['v1', 'me']);
+    final raw = json['user'] is Map<String, dynamic> ? json['user'] : json;
+    return UserInfo.fromJson(raw as Map<String, dynamic>);
+  }
+
+  /// Revoke the session on the server. Callers delete the local token
+  /// regardless of the outcome.
+  Future<void> logout() async {
+    await _request('POST', ['v1', 'auth', 'logout'], body: const {});
   }
 
   Future<HealthInfo> health() async {

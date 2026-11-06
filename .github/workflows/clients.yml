@@ -13,8 +13,6 @@ permissions:
 #   SERABOT_OWNER_API_URL — HTTPS origin (synthetic example: https://owner.example).
 #     Desktop compiles and reads this name. Mobile receives it as
 #     --dart-define=SERABOT_DEFAULT_SERVER_URL.
-#   SERABOT_OWNER_TOKEN — owner API token. This workflow does not read it.
-#     Clients compile only the placeholder name SERABOT_OWNER_TOKEN.
 
 jobs:
   desktop:
@@ -75,14 +73,12 @@ jobs:
         working-directory: apps/serabot_mobile
         run: |
           flutter test \
-            --dart-define=SERABOT_DEFAULT_SERVER_URL="${SERABOT_OWNER_API_URL}" \
-            --dart-define=SERABOT_OWNER_TOKEN_SECRET_NAME=SERABOT_OWNER_TOKEN
+            --dart-define=SERABOT_DEFAULT_SERVER_URL="${SERABOT_OWNER_API_URL}"
       - name: Build debug APK
         working-directory: apps/serabot_mobile
         run: |
           flutter build apk --debug \
-            --dart-define=SERABOT_DEFAULT_SERVER_URL="${SERABOT_OWNER_API_URL}" \
-            --dart-define=SERABOT_OWNER_TOKEN_SECRET_NAME=SERABOT_OWNER_TOKEN
+            --dart-define=SERABOT_DEFAULT_SERVER_URL="${SERABOT_OWNER_API_URL}"
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:

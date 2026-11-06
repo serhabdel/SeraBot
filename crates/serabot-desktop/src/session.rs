@@ -4,17 +4,18 @@
 //! the worker and SSE threads, never on the UI thread.
 
 use crate::{
-    ApiError, ApprovalDecision, AudioUpdate, AuthProvider, BotConfigUpdate, BotProfileUpdate,
+    ApiClient, ApiError, ApprovalDecision, AudioUpdate, BotConfigUpdate, BotProfileUpdate,
     ConnectorUpdate, ConversationKind, MAX_SKILL_BODY_BYTES, MAX_SKILL_DESCRIPTION_CHARS,
-    MAX_USAGE_DAYS, Message, NewProvider, PublicApiClient, Role, SPECIALIST_TOOLS, Selection,
-    TaskStatus, TeamMode, TelegramLink, TelegramStatus, VoiceSettings, VoiceUpdate,
+    MAX_USAGE_DAYS, Message, NewProvider, Role, SPECIALIST_TOOLS, Selection, SignedIn, TaskStatus,
+    TeamMode, TelegramLink, TelegramStatus, VoiceSettings, VoiceUpdate,
     api::{
-        MEMORY_KINDS, valid_auth_provider_id, valid_conversation_title, valid_credential,
-        valid_memory_content, valid_memory_kind, valid_memory_source, valid_model_id,
-        valid_provider_id, valid_secret_name,
+        MEMORY_KINDS, valid_conversation_title, valid_credential, valid_memory_content,
+        valid_memory_kind, valid_memory_source, valid_model_id, valid_provider_id,
+        valid_secret_name,
     },
     creds,
     events::{EventStream, EventUpdate},
+    signin::{self, SignInFailure},
     state::State,
     teams, updater, valid_bot_description, valid_bot_id, valid_conversation_parent, valid_id,
     valid_new_skill_id, valid_skill_body, valid_skill_description, valid_slug, valid_speaker,
@@ -24,7 +25,10 @@ use crate::{
 use secrecy::ExposeSecret;
 use std::{
     collections::BTreeMap,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use zeroize::Zeroize;
@@ -32,6 +36,12 @@ use zeroize::Zeroize;
 pub const REQUEST_GAP: Duration = Duration::from_millis(60);
 pub const POLL_GAP: Duration = Duration::from_millis(750);
 pub const POLL_SAFETY: Duration = Duration::from_secs(4);
+
+/// Shown on the sign-in screen after any 401.
+pub const SESSION_ENDED: &str = "Your session ended. Sign in again.";
+const SETTINGS_NOT_SAVED: &str =
+    "Could not save your settings. They apply until you close SeraBot.";
+const SIGNED_OUT_OFFLINE: &str = "You are signed out on this device. The server could not be reached to end the session; it expires on its own.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Theme {
@@ -316,39 +326,52 @@ pub struct StatusUi {
     rx: Option<std::sync::mpsc::Receiver<Result<crate::ServerStatus, String>>>,
 }
 
-type ProvidersReceiver = std::sync::mpsc::Receiver<(String, Result<Vec<AuthProvider>, String>)>;
+/// Where the native sign-in stands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SignInPhase {
+    #[default]
+    Idle,
+    /// Asking the server for the sign-in page and opening the browser.
+    Starting,
+    /// The browser is open; the console waits for it to come back.
+    Waiting,
+}
 
-/// The sign-in section of the connect screen: the public provider list and the
-/// browser flow. The token field stays the fallback for the operator and for
-/// existing installs, so a failed provider read only hides the buttons.
+/// The connect screen's sign-in state: one "Sign in with Microsoft" run, an
+/// optional invite code, and the last outcome.
 #[derive(Default)]
 pub struct SignInUi {
-    pub providers: Vec<AuthProvider>,
-    pub loaded: bool,
-    pub loading: bool,
-    /// A provider read has been attempted for the current server field.
-    pub attempted: bool,
+    pub phase: SignInPhase,
     pub error: Option<String>,
     pub notice: Option<String>,
     pub invite_code: String,
-    pub starting: bool,
-    /// The server origin the current provider list belongs to.
-    loaded_for: Option<String>,
-    providers_rx: Option<ProvidersReceiver>,
-    start_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    /// The invite-code field is open ("I have an invite code").
+    pub show_invite: bool,
+    cancel: Option<Arc<AtomicBool>>,
+    rx: Option<std::sync::mpsc::Receiver<SignInMsg>>,
+}
+
+enum SignInMsg {
+    Waiting,
+    Finished(Result<SignedIn, SignInFailure>),
 }
 
 impl SignInUi {
-    /// Drop the invite code and any in-flight result. The provider list is
-    /// server-scoped and survives a disconnect so the next connect screen
-    /// does not flash an empty section.
+    pub fn busy(&self) -> bool {
+        self.phase != SignInPhase::Idle
+    }
+
+    /// Drop the invite code and any in-flight run. A run that is still going
+    /// is told to stop so its loopback listener closes.
     fn reset_transient(&mut self) {
-        self.providers_rx = None;
-        self.start_rx = None;
-        self.loading = false;
-        self.starting = false;
+        if let Some(cancel) = self.cancel.take() {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        self.rx = None;
+        self.phase = SignInPhase::Idle;
         self.error = None;
         self.notice = None;
+        self.show_invite = false;
         self.clear_secrets();
     }
 
@@ -361,7 +384,18 @@ impl SignInUi {
 impl Drop for SignInUi {
     fn drop(&mut self) {
         self.invite_code.zeroize();
+        if let Some(cancel) = self.cancel.take() {
+            cancel.store(true, Ordering::SeqCst);
+        }
     }
+}
+
+/// Sign-out in flight: `POST /v1/auth/logout` runs off the UI thread; the
+/// stored token is deleted when it answers, whatever the answer was.
+#[derive(Default)]
+pub struct SignOutUi {
+    pub in_flight: bool,
+    rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -453,6 +487,7 @@ pub struct Session {
     pub update: UpdateUi,
     pub status: StatusUi,
     pub sign_in: SignInUi,
+    pub sign_out: SignOutUi,
     pub telegram: TelegramUi,
     pub toast: Option<String>,
     /// Artifact download in flight (worker) or file write in flight (thread).
@@ -460,6 +495,12 @@ pub struct Session {
     download_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// What to do with the saved file once the download completes.
     pending_open: Option<PendingOpen>,
+    /// Toast text from browser/Explorer launches, which run on a helper thread.
+    launch_tx: std::sync::mpsc::Sender<String>,
+    launch_rx: std::sync::mpsc::Receiver<String>,
+    /// Unix seconds at which the signed-in session ends, when the server
+    /// reported one this run. A restored token has no known expiry.
+    session_expires: Option<u64>,
     pending: Option<OperationKind>,
     /// Bot id whose `GET /v1/bots/{id}` is in flight (dedup of loads).
     bot_detail_pending: Option<String>,
@@ -496,7 +537,28 @@ impl Session {
             .map(|token| token.expose_secret().to_owned())
             .unwrap_or_default();
         let worker = Worker::start().ok();
-        let mut session = Self {
+        let mut session = Self::assemble(server, theme, pins, token, worker);
+        if session.worker.is_some()
+            && !session.server.trim().is_empty()
+            && valid_token(&session.token)
+        {
+            session.connect_now();
+        }
+        session.check_updates();
+        session
+    }
+
+    /// The initial session value, with no I/O: tests build it without a
+    /// worker, a connection or an update check.
+    fn assemble(
+        server: String,
+        theme: Theme,
+        pins: Vec<String>,
+        token: String,
+        worker: Option<Worker>,
+    ) -> Self {
+        let (launch_tx, launch_rx) = std::sync::mpsc::channel();
+        Self {
             state: State::default(),
             worker,
             credentials: None,
@@ -534,11 +596,15 @@ impl Session {
             update: UpdateUi::default(),
             status: StatusUi::default(),
             sign_in: SignInUi::default(),
+            sign_out: SignOutUi::default(),
             telegram: TelegramUi::default(),
             toast: None,
             downloading: false,
             download_rx: None,
             pending_open: None,
+            launch_tx,
+            launch_rx,
+            session_expires: None,
             pending: None,
             bot_detail_pending: None,
             bot_config_pending: None,
@@ -551,15 +617,7 @@ impl Session {
             poll_history: false,
             poll_paused: false,
             poll_approvals: false,
-        };
-        if session.worker.is_some()
-            && !session.server.trim().is_empty()
-            && valid_token(&session.token)
-        {
-            session.connect_now();
         }
-        session.check_updates();
-        session
     }
 
     pub fn ready(&self) -> bool {
@@ -579,8 +637,7 @@ impl Session {
             }
         };
         if !valid_token(&self.token) {
-            self.connect_error =
-                Some("Paste the token minted on the server (32–512 characters).".into());
+            self.connect_error = Some("Sign in with Microsoft to continue.".into());
             self.connecting = false;
             return;
         }
@@ -602,63 +659,18 @@ impl Session {
         self.start_request(Operation::Health);
     }
 
-    pub fn disconnect(&mut self) {
-        self.stop_events();
-        self.reset_scope(false);
-        self.sign_in.reset_transient();
-        self.credentials = None;
-        self.token.zeroize();
-        self.connecting = false;
-        self.connect_error = None;
-        self.state.error = None;
-        self.reconnect_at = None;
-        self.admin_notice = None;
-        self.admin_error = None;
-        self.restart_pending = false;
-        self.restarting = false;
-    }
-
-    pub fn forget_token(&mut self) {
-        let origin = self
-            .credentials
-            .as_ref()
-            .map(|credentials| credentials.endpoint.origin().ascii_serialization())
-            .unwrap_or_else(|| self.server.clone());
-        let result = creds::forget_token();
-        self.stop_events();
-        self.reset_scope(false);
-        self.sign_in.reset_transient();
-        self.credentials = None;
-        self.token.zeroize();
-        self.connecting = false;
-        self.reconnect_at = None;
-        if !origin.is_empty() {
-            self.server = origin;
-        }
-        self.connect_error = result.err();
-        self.state.error = None;
-    }
-
+    /// The server answered 401: the session is over. Delete the stored token
+    /// and return to the sign-in screen.
     pub fn reject_token(&mut self) {
-        let origin = self
-            .credentials
-            .as_ref()
-            .map(|credentials| credentials.endpoint.origin().ascii_serialization())
-            .unwrap_or_else(|| self.server.clone());
-        let _ = creds::forget_token();
-        self.stop_events();
-        self.reset_scope(false);
-        self.sign_in.reset_transient();
-        self.credentials = None;
-        self.token.zeroize();
-        self.connecting = false;
-        self.reconnect_at = None;
-        if !origin.is_empty() {
-            self.server = origin;
+        self.connect_error = self.clear_session().err();
+        self.sign_in.notice = Some(SESSION_ENDED.into());
+    }
+    /// Sign the user out cleanly once the session expiry the server reported
+    /// has passed, instead of waiting for a request to answer 401.
+    fn check_session_expiry(&mut self) {
+        if self.session_expires.is_some_and(|at| unix_now() >= at) {
+            self.reject_token();
         }
-        self.connect_error =
-            Some("Token rejected or revoked. Mint a new token on the server.".into());
-        self.state.error = None;
     }
 
     fn reset_scope(&mut self, connected: bool) {
@@ -725,10 +737,12 @@ impl Session {
     }
 
     /// Persist theme and pins next to the server origin, like the credential
-    /// save does. Failures are ignored: pins are a UI convenience.
-    fn save_ui_settings(&self) {
-        if let Some(settings) = self.ui_settings_snapshot() {
-            let _ = creds::save_settings(&settings);
+    /// save does. A failed write keeps the change for this run and says so.
+    fn save_ui_settings(&mut self) {
+        if let Some(settings) = self.ui_settings_snapshot()
+            && creds::save_settings(&settings).is_err()
+        {
+            self.toast = Some(SETTINGS_NOT_SAVED.into());
         }
     }
 
@@ -885,146 +899,194 @@ impl Session {
         }
     }
 
-    /// Read the public sign-in provider list for the server in the field.
+    /// Start "Sign in with Microsoft" for the server in the field.
     ///
-    /// The read runs off the UI thread and needs no token: sign-in is the way
-    /// to obtain one. A server that is unreachable, older, or has sign-in
-    /// disabled simply leaves the token field as the way in.
-    pub fn load_auth_providers(&mut self) {
-        if self.sign_in.loading {
-            return;
-        }
-        let server = self.server.trim().to_owned();
-        if self.sign_in.loaded_for.as_deref() == Some(server.as_str()) {
-            return;
-        }
-        self.sign_in.attempted = true;
-        // A list from another origin is never shown against this one.
-        self.sign_in.loaded = false;
-        self.sign_in.providers.clear();
-        let Ok(endpoint) = crate::validate_endpoint(&server) else {
-            return;
-        };
-        let (sender, receiver) = std::sync::mpsc::channel();
-        self.sign_in.providers_rx = Some(receiver);
-        self.sign_in.loading = true;
-        let request_server = server.clone();
-        if std::thread::Builder::new()
-            .name("serabot-auth-providers".into())
-            .spawn(move || {
-                let result = PublicApiClient::new(endpoint)
-                    .and_then(|client| client.auth_providers())
-                    .map_err(sign_in_error);
-                let _ = sender.send((request_server, result));
-            })
-            .is_err()
-        {
-            self.sign_in.providers_rx = None;
-            self.sign_in.loading = false;
-        }
-    }
-
-    /// Start a browser sign-in for one provider. The browser shows the new
-    /// session token once; the token field below stays the way to connect.
-    pub fn start_sign_in(&mut self, provider: String) {
-        if self.sign_in.starting {
-            return;
-        }
-        if !valid_auth_provider_id(&provider) {
-            self.sign_in.error = Some("Choose a sign-in provider from the server list.".into());
+    /// The whole loopback handoff (listener, server call, browser, wait,
+    /// token exchange) runs on its own thread; the UI polls the result.
+    pub fn start_sign_in(&mut self) {
+        if self.sign_in.busy() {
             return;
         }
         let Ok(endpoint) = crate::validate_endpoint(self.server.trim()) else {
-            self.sign_in.error = Some("Enter the server origin first.".into());
+            self.sign_in.error = Some("Enter the server address first.".into());
             return;
         };
-        let invite = self.sign_in.invite_code.trim().to_owned();
-        if !invite.is_empty() && (invite.len() > 256 || invite.chars().any(char::is_control)) {
-            self.sign_in.error =
-                Some("Invite codes are 1–256 characters, without control characters.".into());
-            return;
-        }
-        let invite = (!invite.is_empty()).then_some(invite);
+        let invite = match signin::clean_invite(&self.sign_in.invite_code) {
+            Ok(invite) => invite,
+            Err(message) => {
+                self.sign_in.error = Some(message.into());
+                return;
+            }
+        };
         let (sender, receiver) = std::sync::mpsc::channel();
-        self.sign_in.start_rx = Some(receiver);
-        self.sign_in.starting = true;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let thread_cancel = Arc::clone(&cancel);
         self.sign_in.error = None;
         self.sign_in.notice = None;
-        if std::thread::Builder::new()
-            .name("serabot-auth-start".into())
+        self.connect_error = None;
+        self.sign_in.phase = SignInPhase::Starting;
+        self.sign_in.rx = Some(receiver);
+        self.sign_in.cancel = Some(cancel);
+        let spawned = std::thread::Builder::new()
+            .name("serabot-signin".into())
             .spawn(move || {
-                let result = PublicApiClient::new(endpoint)
-                    .and_then(|client| client.auth_login_start(&provider, invite.as_deref()))
-                    .and_then(|url| {
-                        webbrowser::open(&url).map_err(|_| {
-                            ApiError::Validation("Could not open the browser for sign-in.")
-                        })
-                    })
-                    .map_err(sign_in_error);
-                let _ = sender.send(result);
-            })
-            .is_err()
-        {
-            self.sign_in.start_rx = None;
-            self.sign_in.starting = false;
+                let waiting = sender.clone();
+                let result = signin::run(
+                    endpoint,
+                    invite.as_deref(),
+                    &thread_cancel,
+                    signin::SIGN_IN_TIMEOUT,
+                    &|url| webbrowser::open(url).is_ok(),
+                    &|| {
+                        let _ = waiting.send(SignInMsg::Waiting);
+                    },
+                );
+                let _ = sender.send(SignInMsg::Finished(result));
+            });
+        if spawned.is_err() {
+            self.sign_in.rx = None;
+            self.sign_in.cancel = None;
+            self.sign_in.phase = SignInPhase::Idle;
             self.sign_in.error = Some("Could not start the browser sign-in.".into());
         }
     }
 
-    /// Drain the provider read and the browser start independently: the two
-    /// can overlap when the server field blurs into a provider click.
-    fn poll_sign_in(&mut self) {
-        self.poll_auth_providers();
-        self.poll_sign_in_start();
+    /// Stop a sign-in that is waiting for the browser.
+    pub fn cancel_sign_in(&mut self) {
+        if let Some(cancel) = self.sign_in.cancel.take() {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        self.sign_in.rx = None;
+        self.sign_in.phase = SignInPhase::Idle;
+        self.sign_in.error = None;
+        self.sign_in.notice = Some("Sign-in cancelled.".into());
     }
 
-    fn poll_auth_providers(&mut self) {
-        let Some(receiver) = &self.sign_in.providers_rx else {
+    fn poll_sign_in(&mut self) {
+        self.poll_sign_in_run();
+        self.poll_sign_out();
+    }
+
+    fn poll_sign_in_run(&mut self) {
+        let Some(receiver) = &self.sign_in.rx else {
             return;
         };
-        let Ok((server, result)) = receiver.try_recv() else {
+        let mut finished = None;
+        while let Ok(message) = receiver.try_recv() {
+            match message {
+                SignInMsg::Waiting => self.sign_in.phase = SignInPhase::Waiting,
+                SignInMsg::Finished(result) => finished = Some(result),
+            }
+        }
+        let Some(result) = finished else {
             return;
         };
-        self.sign_in.providers_rx = None;
-        self.sign_in.loading = false;
+        self.sign_in.rx = None;
+        self.sign_in.cancel = None;
+        self.sign_in.phase = SignInPhase::Idle;
         match result {
-            Ok(providers) if self.server.trim() == server => {
-                self.sign_in.providers = providers;
-                self.sign_in.loaded = true;
-                self.sign_in.loaded_for = Some(server);
-            }
-            // A server edited while the read was in flight does not inherit
-            // the old list: read the new origin right away.
-            _ => {
-                self.sign_in.loaded = false;
-                self.sign_in.loaded_for = None;
-                if self.server.trim() != server {
-                    self.load_auth_providers();
-                }
-            }
+            Ok(signed_in) => self.complete_sign_in(signed_in),
+            Err(SignInFailure::Cancelled) => {}
+            Err(SignInFailure::Message(message)) => self.sign_in.error = Some(message),
         }
     }
 
-    fn poll_sign_in_start(&mut self) {
-        let Some(receiver) = &self.sign_in.start_rx else {
+    /// A handoff was redeemed: keep the session token in the OS credential
+    /// store, show the user at once and connect with the new token.
+    fn complete_sign_in(&mut self, signed_in: SignedIn) {
+        let mut token = signed_in.token.expose_secret().to_owned();
+        // A store failure is reported by persist_credentials once connected.
+        let _ = creds::save_token(&token);
+        self.token.zeroize();
+        self.token = token.clone();
+        token.zeroize();
+        self.session_expires = signed_in.expires_at.as_deref().and_then(parse_rfc3339_unix);
+        self.state.user = Some(signed_in.user);
+        self.sign_in.clear_secrets();
+        self.sign_in.show_invite = false;
+        self.connect_now();
+    }
+
+    /// Sign out: end the session on the server, then delete the stored token.
+    /// The server call runs off the UI thread. A server that cannot be
+    /// reached still signs this device out.
+    pub fn sign_out(&mut self) {
+        if self.sign_out.in_flight {
+            return;
+        }
+        let Some(credentials) = self.credentials.clone() else {
+            self.finish_sign_out(None);
+            return;
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.sign_out.in_flight = true;
+        self.sign_out.rx = Some(receiver);
+        let spawned = std::thread::Builder::new()
+            .name("serabot-signout".into())
+            .spawn(move || {
+                let result =
+                    ApiClient::new(credentials.endpoint.clone(), credentials.token.clone())
+                        .and_then(|client| client.logout())
+                        .map_err(|error| error.to_string());
+                let _ = sender.send(result);
+            });
+        if spawned.is_err() {
+            self.sign_out.in_flight = false;
+            self.sign_out.rx = None;
+            self.finish_sign_out(Some(SIGNED_OUT_OFFLINE.into()));
+        }
+    }
+
+    fn poll_sign_out(&mut self) {
+        let Some(receiver) = &self.sign_out.rx else {
             return;
         };
         let Ok(result) = receiver.try_recv() else {
             return;
         };
-        self.sign_in.start_rx = None;
-        self.sign_in.starting = false;
-        match result {
-            Ok(()) => {
-                self.sign_in.clear_secrets();
-                self.sign_in.notice = Some(
-                    "Browser opened. After signing in, paste the session token shown there into the token field below."
-                        .into(),
-                );
-                self.sign_in.error = None;
-            }
-            Err(message) => self.sign_in.error = Some(message),
+        self.sign_out.rx = None;
+        self.sign_out.in_flight = false;
+        self.finish_sign_out(result.err().map(|_| SIGNED_OUT_OFFLINE.into()));
+    }
+
+    /// Drop the session on this device: stop streams, delete the stored token
+    /// and return to the sign-in screen with `notice`.
+    fn finish_sign_out(&mut self, notice: Option<String>) {
+        let stored = self.clear_session();
+        self.connect_error = stored.err();
+        self.sign_in.notice = notice.or_else(|| Some("You are signed out.".into()));
+    }
+
+    /// Forget the session locally: the single place that deletes the stored
+    /// token and returns the console to the sign-in screen.
+    fn clear_session(&mut self) -> Result<(), String> {
+        let origin = self
+            .credentials
+            .as_ref()
+            .map(|credentials| credentials.endpoint.origin().ascii_serialization())
+            .unwrap_or_else(|| self.server.clone());
+        let stored = creds::forget_token();
+        self.stop_events();
+        self.reset_scope(false);
+        self.sign_in.reset_transient();
+        self.credentials = None;
+        self.token.zeroize();
+        self.token.clear();
+        self.state.user = None;
+        self.session_expires = None;
+        self.connecting = false;
+        self.reconnect_at = None;
+        if !origin.is_empty() {
+            self.server = origin;
         }
+        self.state.error = None;
+        stored
+    }
+
+    /// True when a saved session exists, so a failed connect can be retried
+    /// without signing in again.
+    pub fn has_saved_session(&self) -> bool {
+        valid_token(&self.token)
     }
 
     /// Read the acting user's Telegram binding: `GET /v1/telegram`.
@@ -1230,6 +1292,34 @@ impl Session {
         }
     }
 
+    /// Run a browser or Explorer launch off the UI thread. `job` returns the
+    /// toast text, which `poll_launches` shows when it arrives.
+    fn launch(&mut self, job: impl FnOnce() -> String + Send + 'static) {
+        let sender = self.launch_tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("serabot-launch".into())
+            .spawn(move || {
+                let _ = sender.send(job());
+            });
+        if spawned.is_err() {
+            self.toast = Some("Could not start the launcher.".into());
+        }
+    }
+
+    /// Open `url` in the default browser without blocking the UI thread.
+    pub fn open_in_browser(&mut self, url: String) {
+        self.launch(move || match webbrowser::open(&url) {
+            Ok(()) => "Opened your browser.".to_owned(),
+            Err(error) => format!("Could not open the browser: {error}"),
+        });
+    }
+
+    fn poll_launches(&mut self) {
+        while let Ok(message) = self.launch_rx.try_recv() {
+            self.toast = Some(message);
+        }
+    }
+
     /// Drain the artifact file write, if one is running.
     fn poll_download(&mut self) {
         let Some(receiver) = &self.download_rx else {
@@ -1242,20 +1332,20 @@ impl Session {
         self.downloading = false;
         match result {
             Ok(path) => match self.pending_open.take() {
-                Some(PendingOpen::Open) => match open_with_default_app(&path) {
-                    Ok(()) => self.toast = Some(format!("Opened {path}")),
-                    Err(error) => {
-                        self.toast =
-                            Some(format!("Saved to {path}, but could not open it: {error}"))
-                    }
-                },
-                Some(PendingOpen::Reveal) => match reveal_in_explorer(&path) {
-                    Ok(()) => self.toast = Some(format!("Showing {path}")),
-                    Err(error) => {
-                        self.toast =
-                            Some(format!("Saved to {path}, but could not reveal it: {error}"))
-                    }
-                },
+                Some(PendingOpen::Open) => {
+                    self.toast = Some(format!("Saved to {path}"));
+                    self.launch(move || match open_with_default_app(&path) {
+                        Ok(()) => format!("Opened {path}"),
+                        Err(error) => format!("Saved to {path}, but could not open it: {error}"),
+                    });
+                }
+                Some(PendingOpen::Reveal) => {
+                    self.toast = Some(format!("Saved to {path}"));
+                    self.launch(move || match reveal_in_explorer(&path) {
+                        Ok(()) => format!("Showing {path}"),
+                        Err(error) => format!("Saved to {path}, but could not reveal it: {error}"),
+                    });
+                }
                 None => self.toast = Some(format!("Saved to {path}")),
             },
             Err(error) => {
@@ -1514,7 +1604,10 @@ impl Session {
             .map(|(_, slug)| slug)
             .unwrap_or(&conversation.id);
         if conversation.id.chars().all(|c| c.is_ascii_digit()) {
-            let tail = &conversation.id[conversation.id.len().saturating_sub(4)..];
+            let tail = conversation
+                .id
+                .get(conversation.id.len().saturating_sub(4)..)
+                .unwrap_or(&conversation.id);
             return format!("Chat {tail}");
         }
         match kind {
@@ -1664,6 +1757,7 @@ impl Session {
 
     /// Called from the UI timer. Drains completions and advances scheduled work.
     pub fn tick(&mut self) {
+        self.check_session_expiry();
         self.poll_events();
         self.receive();
         self.flush_events();
@@ -1672,6 +1766,7 @@ impl Session {
         self.poll_sign_in();
         self.poll_telegram();
         self.poll_download();
+        self.poll_launches();
         if let Some(at) = self.reconnect_at {
             if Instant::now() >= at {
                 self.reconnect_at = None;
@@ -1858,6 +1953,13 @@ impl Session {
                 self.connecting = false;
             }
             match completion.result {
+                // Who-am-I is a nicety: an older server, or a saved token the
+                // /v1/me route does not know, still signs in. The next read
+                // (the catalog) decides whether the session is alive.
+                Err(_) if completion.kind == OperationKind::Me => {
+                    self.state.user = None;
+                    self.schedule(Operation::Catalog, Duration::ZERO);
+                }
                 Err(ApiError::Http(401)) => {
                     self.refreshing = false;
                     self.scheduled = None;
@@ -1987,6 +2089,7 @@ impl Session {
                         OperationKind::Health if self.state.connected => {
                             self.connect_error = None;
                             self.sign_in.clear_secrets();
+                            self.sign_in.error = None;
                             self.sign_in.notice = None;
                             self.sync_audio_draft();
                             self.sync_voice_draft();
@@ -1998,6 +2101,9 @@ impl Session {
                             }
                             self.persist_credentials();
                             self.start_events();
+                            self.schedule(Operation::Me, Duration::ZERO);
+                        }
+                        OperationKind::Me => {
                             self.schedule(Operation::Catalog, Duration::ZERO);
                         }
                         OperationKind::Health => {
@@ -3257,18 +3363,6 @@ impl Drop for Session {
 
 /// The server deliberately returns generic error bodies. Map the statuses the
 /// sign-in routes use to the one sentence that tells the person what to do.
-fn sign_in_error(error: ApiError) -> String {
-    match error {
-        ApiError::Http(403) => {
-            "Sign-in is not enabled on this deployment, or that provider is disabled.".into()
-        }
-        ApiError::Http(404) => "This server does not support sign-in. Update the server.".into(),
-        ApiError::Http(409) => "That invite code is not valid or has already been used.".into(),
-        ApiError::Http(422) => "Check the invite code and try again.".into(),
-        other => other.to_string(),
-    }
-}
-
 /// The Telegram routes fail closed with a 403 when the feature is off and a 404
 /// on an older server; both deserve a specific sentence instead of "Forbidden".
 fn telegram_error(error: ApiError) -> String {
@@ -3400,10 +3494,68 @@ fn model_csv(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Current time as Unix seconds. A clock before 1970 reads as 0.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// Parse an RFC 3339 timestamp (`2026-11-06T11:54:00Z`, optional fraction,
+/// `Z` or `+HH:MM` offset) into Unix seconds. Anything else is `None`.
+fn parse_rfc3339_unix(stamp: &str) -> Option<u64> {
+    let stamp = stamp.trim();
+    let (date, rest) = stamp.split_once(['T', 't', ' '])?;
+    let mut date = date.split('-');
+    let year: i64 = date.next()?.parse().ok()?;
+    let month: i64 = date.next()?.parse().ok()?;
+    let day: i64 = date.next()?.parse().ok()?;
+    if date.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let split = rest.find(['Z', 'z', '+', '-'])?;
+    let (clock, zone) = rest.split_at(split);
+    let clock = clock.split_once('.').map_or(clock, |(whole, _)| whole);
+    let mut clock = clock.split(':');
+    let hour: i64 = clock.next()?.parse().ok()?;
+    let minute: i64 = clock.next()?.parse().ok()?;
+    let second: i64 = clock.next()?.parse().ok()?;
+    if clock.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let offset = if matches!(zone, "Z" | "z") {
+        0
+    } else {
+        let sign = if zone.starts_with('-') { -1 } else { 1 };
+        let (hours, minutes) = zone.get(1..)?.split_once(':')?;
+        let hours: i64 = hours.parse().ok()?;
+        let minutes: i64 = minutes.parse().ok()?;
+        if hours > 23 || minutes > 59 {
+            return None;
+        }
+        sign * (hours * 3600 + minutes * 60)
+    };
+    // Days from civil (proleptic Gregorian), Howard Hinnant's algorithm.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let seconds = days * 86_400 + hour * 3600 + minute * 60 + second - offset;
+    u64::try_from(seconds).ok()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{EventRefresh, SignInUi, event_refresh, sign_in_error, telegram_error};
+    use super::{
+        AtomicBool, Duration, EventRefresh, Instant, Ordering, Session, SignInPhase, SignInUi,
+        Theme, event_refresh, telegram_error,
+    };
     use crate::ApiError;
+    use std::sync::Arc;
 
     #[test]
     fn a_team_event_refreshes_the_team_only_in_a_room() {
@@ -3438,18 +3590,6 @@ mod tests {
     }
 
     #[test]
-    fn sign_in_errors_name_the_next_action() {
-        assert!(sign_in_error(ApiError::Http(403)).contains("not enabled"));
-        assert!(sign_in_error(ApiError::Http(404)).contains("Update the server"));
-        assert!(sign_in_error(ApiError::Http(409)).contains("invite code"));
-        assert!(sign_in_error(ApiError::Http(422)).contains("invite code"));
-        assert_eq!(
-            sign_in_error(ApiError::Http(500)),
-            ApiError::Http(500).to_string()
-        );
-    }
-
-    #[test]
     fn telegram_errors_name_the_next_action() {
         assert!(telegram_error(ApiError::Http(403)).contains("not enabled"));
         assert!(telegram_error(ApiError::Http(404)).contains("Update the server"));
@@ -3461,23 +3601,162 @@ mod tests {
     }
 
     #[test]
-    fn resetting_sign_in_drops_the_invite_and_keeps_the_provider_list() {
+    fn resetting_sign_in_drops_the_invite_and_stops_a_running_attempt() {
         let mut ui = SignInUi::default();
-        ui.providers.push(crate::AuthProvider {
-            id: "microsoft".into(),
-            enabled: true,
-        });
-        ui.loaded = true;
+        let cancel = Arc::new(AtomicBool::new(false));
+        ui.cancel = Some(Arc::clone(&cancel));
+        ui.phase = SignInPhase::Waiting;
+        ui.show_invite = true;
         ui.invite_code = "synthetic-invite".into();
         ui.error = Some("old error".into());
+        ui.notice = Some("old notice".into());
+        assert!(ui.busy());
         ui.reset_transient();
         assert!(
-            ui.providers
-                .iter()
-                .any(|provider| provider.id == "microsoft")
+            cancel.load(Ordering::SeqCst),
+            "the loopback wait is told to stop"
         );
-        assert!(ui.loaded);
+        assert!(!ui.busy());
+        assert!(!ui.show_invite);
         assert!(ui.invite_code.is_empty());
         assert!(ui.error.is_none());
+        assert!(ui.notice.is_none());
+    }
+
+    #[test]
+    fn a_rejected_session_returns_to_sign_in_with_a_plain_message() {
+        let _guard = crate::creds::test_lock();
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.token = "synthetic-session-token-0123456789abcdef".into();
+        session.state.user = Some(crate::AuthUser {
+            id: "u1".into(),
+            email: "ada@example.test".into(),
+            display_name: "Ada".into(),
+            role: "member".into(),
+        });
+        session.server = "http://127.0.0.1:9".into();
+        session.reject_token();
+        assert_eq!(
+            session.sign_in.notice.as_deref(),
+            Some("Your session ended. Sign in again.")
+        );
+        assert!(session.token.is_empty());
+        assert!(session.state.user.is_none());
+        assert!(!session.state.connected);
+        assert!(!session.has_saved_session());
+        assert_eq!(session.server, "http://127.0.0.1:9", "the server stays");
+    }
+
+    #[test]
+    fn signing_out_without_a_connection_clears_the_device() {
+        let _guard = crate::creds::test_lock();
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.token = "synthetic-session-token-0123456789abcdef".into();
+        crate::creds::save_token(&session.token).unwrap();
+        session.sign_out();
+        assert!(!session.sign_out.in_flight);
+        assert!(session.token.is_empty());
+        assert!(crate::creds::load_token().is_none_or(|token| {
+            secrecy::ExposeSecret::expose_secret(&token)
+                != "synthetic-session-token-0123456789abcdef"
+        }));
+        assert_eq!(
+            session.sign_in.notice.as_deref(),
+            Some("You are signed out.")
+        );
+    }
+
+    #[test]
+    fn an_unreachable_server_still_signs_this_device_out() {
+        let _guard = crate::creds::test_lock();
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.token = "synthetic-session-token-0123456789abcdef".into();
+        // Nothing listens on port 9, so the logout call fails fast.
+        let endpoint = crate::validate_endpoint("http://127.0.0.1:9").unwrap();
+        session.credentials = Some(Arc::new(crate::worker::Credentials {
+            endpoint,
+            token: secrecy::SecretString::new(session.token.clone()),
+        }));
+        session.sign_out();
+        assert!(session.sign_out.in_flight);
+        let started = Instant::now();
+        while session.sign_out.in_flight && started.elapsed() < Duration::from_secs(25) {
+            session.poll_sign_out();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!session.sign_out.in_flight);
+        assert!(session.token.is_empty());
+        assert!(
+            session
+                .sign_in
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("could not be reached"))
+        );
+    }
+
+    #[test]
+    fn rfc3339_timestamps_parse_to_unix_seconds() {
+        use super::parse_rfc3339_unix;
+        assert_eq!(parse_rfc3339_unix("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_rfc3339_unix("2026-11-06T11:54:00Z"),
+            Some(1_793_966_040)
+        );
+        assert_eq!(
+            parse_rfc3339_unix("2026-11-06T11:54:00.250+02:00"),
+            Some(1_793_966_040 - 7200)
+        );
+        assert_eq!(
+            parse_rfc3339_unix("2026-11-06T11:54:00-01:30"),
+            Some(1_793_966_040 + 5400)
+        );
+        for bad in [
+            "",
+            "soon",
+            "2026-13-01T00:00:00Z",
+            "2026-11-06T25:00:00Z",
+            "2026-11-06",
+        ] {
+            assert_eq!(parse_rfc3339_unix(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_expired_session_signs_the_user_out_with_a_plain_message() {
+        let _guard = crate::creds::test_lock();
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.token = "synthetic-session-token-0123456789abcdef".into();
+        session.session_expires = Some(super::unix_now() + 3600);
+        session.check_session_expiry();
+        assert!(
+            session.has_saved_session(),
+            "a future expiry keeps the session"
+        );
+        session.session_expires = Some(super::unix_now().saturating_sub(1));
+        session.check_session_expiry();
+        assert_eq!(
+            session.sign_in.notice.as_deref(),
+            Some("Your session ended. Sign in again.")
+        );
+        assert!(!session.has_saved_session());
+        assert!(session.session_expires.is_none());
+    }
+
+    #[test]
+    fn a_launch_result_reaches_the_toast_from_its_helper_thread() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.launch(|| "launched".to_owned());
+        let started = Instant::now();
+        while session.toast.is_none() && started.elapsed() < Duration::from_secs(5) {
+            session.poll_launches();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(session.toast.as_deref(), Some("launched"));
     }
 }

@@ -1,10 +1,10 @@
 use crate::{
-    ApiClient, ApiError, Approval, ApprovalDecision, AudioUpdate, BotConfigUpdate, BotDetail,
-    BotProfileUpdate, BotSummary, Catalog, ConnectorStatus, ConnectorTestResult, ConnectorUpdate,
-    ConversationKind, ConversationPage, ConversationSummary, CreatedBot, CreatedConversation,
-    CreatedSkill, Health, History, LibraryEntry, MemoryEntry, NewProvider, ProviderStatus, Scope,
-    Selection, SkillSummary, Task, Team, TeamMode, Transcription, UsageReport, VoiceSettings,
-    VoiceUpdate,
+    ApiClient, ApiError, Approval, ApprovalDecision, AudioUpdate, AuthUser, BotConfigUpdate,
+    BotDetail, BotProfileUpdate, BotSummary, Catalog, ConnectorStatus, ConnectorTestResult,
+    ConnectorUpdate, ConversationKind, ConversationPage, ConversationSummary, CreatedBot,
+    CreatedConversation, CreatedSkill, Health, History, LibraryEntry, MemoryEntry, NewProvider,
+    ProviderStatus, Scope, Selection, SkillSummary, Task, Team, TeamMode, Transcription,
+    UsageReport, VoiceSettings, VoiceUpdate,
 };
 use secrecy::SecretString;
 use std::sync::{
@@ -23,6 +23,7 @@ pub struct Credentials {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperationKind {
     Health,
+    Me,
     Catalog,
     History,
     Apply,
@@ -62,6 +63,8 @@ pub enum OperationKind {
 
 pub enum Operation {
     Health,
+    /// `GET /v1/me`: who the session token belongs to.
+    Me,
     Catalog,
     History,
     Apply(Selection),
@@ -183,6 +186,7 @@ impl Operation {
     pub fn kind(&self) -> OperationKind {
         match self {
             Self::Health => OperationKind::Health,
+            Self::Me => OperationKind::Me,
             Self::Catalog => OperationKind::Catalog,
             Self::History => OperationKind::History,
             Self::Apply(_) => OperationKind::Apply,
@@ -230,6 +234,7 @@ impl Operation {
 
 pub enum Reply {
     Health(Health),
+    Me(AuthUser),
     Catalog(Catalog),
     History(History),
     Selection(Selection),
@@ -303,13 +308,16 @@ impl Worker {
         std::thread::Builder::new()
             .name("serabot-http".into())
             .spawn(move || {
+                // One client (and connection pool) serves every job for the
+                // same endpoint and token; it is rebuilt when either changes.
+                let mut client: Option<ApiClient> = None;
                 while let Ok(job) = jobs.recv() {
                     if current.load(Ordering::SeqCst) != job.scope.epoch {
                         continue;
                     }
                     let kind = job.operation.kind();
                     // Blocking client construction, I/O and destruction stay off UI.
-                    let result = execute(&job, &current);
+                    let result = execute(&job, &current, &mut client);
                     // Wipe/drop stale content here, not just when UI eventually polls.
                     if current.load(Ordering::SeqCst) != job.scope.epoch {
                         continue;
@@ -436,11 +444,27 @@ fn connector_oauth_sign_in(
     })
 }
 
-fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
-    let client = ApiClient::new(
-        job.credentials.endpoint.clone(),
-        job.credentials.token.clone(),
-    )?;
+/// The client for `credentials`, reusing `cache` when it targets the same
+/// endpoint and token.
+fn client_for<'a>(
+    cache: &'a mut Option<ApiClient>,
+    credentials: &Credentials,
+) -> Result<&'a ApiClient, ApiError> {
+    let reusable = cache
+        .as_ref()
+        .is_some_and(|client| client.targets(&credentials.endpoint, &credentials.token));
+    if !reusable {
+        *cache = None;
+        *cache = Some(ApiClient::new(
+            credentials.endpoint.clone(),
+            credentials.token.clone(),
+        )?);
+    }
+    cache.as_ref().ok_or(ApiError::Transport)
+}
+
+fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Result<Reply, ApiError> {
+    let client = client_for(cache, &job.credentials)?;
     // A queued action invalidated by disconnect/conversation switch is never sent.
     // An already in-flight HTTP request cannot be recalled or safely replayed.
     if epoch.load(Ordering::SeqCst) != job.scope.epoch {
@@ -449,6 +473,7 @@ fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
     let conversation = &job.scope.conversation;
     match &job.operation {
         Operation::Health => client.health().map(Reply::Health),
+        Operation::Me => client.me().map(Reply::Me),
         Operation::Catalog => client.models(conversation).map(Reply::Catalog),
         Operation::History => client.history(conversation).map(Reply::History),
         Operation::Apply(selection) => client.select(conversation, selection).map(Reply::Selection),
@@ -550,9 +575,9 @@ fn execute(job: &Job, epoch: &AtomicU64) -> Result<Reply, ApiError> {
         Operation::AdminSetConnector { id, update } => client
             .admin_set_connector(id, update)
             .map(|_| Reply::AdminSaved),
-        Operation::OAuthSignIn { id, kind } => oauth_sign_in(&client, id, kind),
+        Operation::OAuthSignIn { id, kind } => oauth_sign_in(client, id, kind),
         Operation::ConnectorOAuthSignIn { id, callback_uri } => {
-            connector_oauth_sign_in(&client, id, callback_uri)
+            connector_oauth_sign_in(client, id, callback_uri)
         }
         Operation::TestConnector { id } => {
             client.admin_test_connector(id).map(Reply::ConnectorTested)
@@ -692,6 +717,64 @@ mod tests {
         assert_eq!(result.scope, new);
         assert!(matches!(result.result, Ok(Reply::Health(_))));
         assert!(worker.completion().is_none());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn one_client_and_connection_serve_consecutive_jobs() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint =
+            crate::validate_endpoint(&format!("http://{}", listener.local_addr().unwrap()))
+                .unwrap();
+        // The mock accepts exactly one connection and serves two keep-alive
+        // requests on it. A rebuilt client would open a second connection that
+        // is never accepted, and the second job would fail.
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            for _ in 0..2 {
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                let body = r#"{"ok":true,"version":"synthetic"}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let credentials = Arc::new(Credentials {
+            endpoint,
+            token: SecretString::new("synthetic-token-for-worker-test-0000".into()),
+        });
+        let worker = Worker::start().unwrap();
+        let scope = Scope {
+            epoch: 1,
+            conversation: "reuse".into(),
+        };
+        worker.set_epoch(scope.epoch);
+        for _ in 0..2 {
+            worker
+                .sender
+                .send(Job {
+                    scope: scope.clone(),
+                    credentials: Arc::clone(&credentials),
+                    operation: Operation::Health,
+                })
+                .unwrap();
+            let done = worker
+                .receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            assert!(matches!(done.result, Ok(Reply::Health(_))));
+        }
         server.join().unwrap();
     }
 }

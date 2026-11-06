@@ -5,9 +5,9 @@
 # the only way in, and this script is the only command it can run.
 #
 # Exact manifest (nothing else is touched):
-#   NEW   /var/lib/serabot/releases/serabot-<tag>-<sha>     (staged binary)
-#   NEW   /var/lib/serabot/releases/serabot-pre-<tag>       (backup of old binary)
-#   NEW   /var/lib/serabot/backups/serabot-db-pre-<tag>.db (SQLite online backup)
+#   NEW   /var/lib/serabot/releases/serabot-<tag>-<sha>     (staged binary; 3 newest kept)
+#   REPL  /opt/serabot/serabot.prev                         (single rollback copy; serabot.bak-* removed)
+#   NEW   /var/lib/serabot/backups/serabot-db-pre-<tag>.db (SQLite online backup; 5 newest kept)
 #   REPL  /opt/serabot/serabot                              (after SHA-256 + glibc check)
 #   RUN   systemctl restart serabot                         (only this service)
 #   VERIFY healthz build == deployed sha; journal clean; else ROLLBACK.
@@ -20,7 +20,7 @@ SHA=$(cat "$DEPLOY_DIR/pending-sha")
 REPO=serhabdel/SeraBot
 SHORT=${SHA:0:7}
 STAGED=/var/lib/serabot/releases/serabot-${TAG}-${SHORT}
-BACKUP=/var/lib/serabot/releases/serabot-pre-${TAG}
+PREV=/opt/serabot/serabot.prev
 DBBACKUP=/var/lib/serabot/backups/serabot-db-pre-${TAG}.db
 ASSET_URL="https://github.com/${REPO}/releases/download/${TAG}"
 
@@ -29,7 +29,7 @@ echo "deploy: tag=${TAG} sha=${SHA}"
 echo "== preflight =="
 systemctl is-active serabot
 df -h /
-ldd --version | head -1
+ldd --version | sed -n 1p  # not head -1: SIGPIPE + pipefail gives exit 141
 
 echo "== download release binary + checksum asset and verify =="
 TMP=$(mktemp -d)
@@ -46,11 +46,15 @@ echo "binary needs ${MAXGLIBC}"
 [ "$MAXGLIBC" \< "GLIBC_2.40" ] || { echo "glibc too new for this host"; exit 1; }
 
 echo "== stage =="
+install -d -m 0750 -o serabot -g serabot /var/lib/serabot/releases /var/lib/serabot/backups
 install -m 0755 "$TMP/serabot-linux-x64" "$STAGED"
 [ "$(sha256sum "$STAGED" | cut -d' ' -f1)" = "$EXPECTED" ] || { echo "staged SHA mismatch"; exit 1; }
 
 echo "== backups =="
-cp -a /opt/serabot/serabot "$BACKUP"
+# Exactly one rollback copy: replace serabot.prev atomically, drop legacy backups.
+cp -a /opt/serabot/serabot "$PREV.new"
+mv -f "$PREV.new" "$PREV"
+rm -f /opt/serabot/serabot.bak-*
 # Use Python's sqlite3 module rather than the sqlite3 CLI: the CLI is not
 # installed on the VPS, and the online backup API is identical.
 python3 -c 'import sqlite3, sys
@@ -82,12 +86,15 @@ sys.exit(0 if ok else 1)
 
 if verify; then
   echo "== deployed OK =="
+  # Bound disk use: keep the 3 newest staged binaries and 5 newest DB backups.
+  ls -1t /var/lib/serabot/releases/serabot-* 2>/dev/null | tail -n +4 | xargs -r rm -f --
+  ls -1t /var/lib/serabot/backups/serabot-db-pre-*.db 2>/dev/null | tail -n +6 | xargs -r rm -f --
   journalctl -u serabot -n 15 --no-pager
   exit 0
 fi
 
 echo "== VERIFY FAILED: rolling back =="
-install -m 0755 "$BACKUP" /opt/serabot/serabot
+install -m 0755 "$PREV" /opt/serabot/serabot
 systemctl restart serabot
 sleep 4
 systemctl is-active serabot

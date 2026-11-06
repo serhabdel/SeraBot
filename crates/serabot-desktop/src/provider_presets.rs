@@ -326,11 +326,6 @@ pub fn preset_for(id: &str) -> Option<&'static ProviderPreset> {
     PRESETS.iter().find(|preset| preset.id == id)
 }
 
-/// The preset that leaves the base URL to the owner.
-pub fn custom_preset() -> &'static ProviderPreset {
-    preset_for("custom").expect("the custom preset is always present")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,7 +368,7 @@ mod tests {
 
     #[test]
     fn the_custom_preset_has_no_base_url() {
-        let custom = custom_preset();
+        let custom = preset_for("custom").expect("custom preset");
         assert_eq!(custom.id, "custom");
         assert!(custom.base_url.is_empty());
         for preset in presets() {

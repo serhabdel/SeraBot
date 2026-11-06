@@ -39,6 +39,11 @@ base_url = "https://bot.example.example"
 session_ttl_hours = 720
 invite_ttl_hours = 48
 max_users = 10
+# Optional: your own Microsoft account email. The first sign-in with this
+# verified email (case-insensitive) claims the bootstrap admin row while it has
+# no Microsoft subject yet: no invite needed, backfilled data stays with admin.
+# tenant = "consumers" | "common" | "organizations" | a tenant id all work.
+admin_email = "operator@example.example"
 
 [users]
 # Daily task budget per user (enforced from phase 5).

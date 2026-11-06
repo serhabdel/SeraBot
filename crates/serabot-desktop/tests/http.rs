@@ -628,14 +628,22 @@ fn a_library_response_with_an_unshaped_hash_is_rejected() {
     handle.join().unwrap();
 }
 
+const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+const STATE: &str = "synthetic-client-state-0123456789";
+const RETURN_TO: &str = "http://127.0.0.1:51121/auth-done";
+const SESSION_TOKEN: &str = "synthetic-session-token-0123456789abcdef";
+
+fn handoff_start() -> serabot_desktop::HandoffStart<'static> {
+    serabot_desktop::HandoffStart {
+        return_to: RETURN_TO,
+        challenge: CHALLENGE,
+        client_state: STATE,
+    }
+}
+
 #[test]
-fn public_sign_in_lists_providers_in_order_and_starts_the_flow() {
+fn public_sign_in_starts_the_handoff_flow_without_a_bearer_token() {
     let (client, handle) = public_server(vec![
-        (
-            200,
-            r#"{"providers":[{"id":"microsoft","enabled":true},{"id":"google","enabled":false},{"id":"github","enabled":false}]}"#
-                .into(),
-        ),
         (
             200,
             r#"{"url":"https://login.example/authorize?client_id=test&state=s"}"#.into(),
@@ -645,39 +653,24 @@ fn public_sign_in_lists_providers_in_order_and_starts_the_flow() {
             r#"{"url":"https://login.example/authorize?state=noinvite"}"#.into(),
         ),
     ]);
-    let providers = client.auth_providers().unwrap();
-    assert_eq!(
-        providers
-            .iter()
-            .map(|provider| provider.id.as_str())
-            .collect::<Vec<_>>(),
-        ["microsoft", "google", "github"]
-    );
-    assert!(providers[0].enabled);
-    assert_eq!(providers[0].label(), "Microsoft");
-    assert!(!providers[1].enabled);
-    assert!(providers[1].coming_soon());
-    assert!(!providers[2].enabled);
-    assert!(providers[2].coming_soon());
-
     let url = client
-        .auth_login_start("microsoft", Some("invite-code-123"))
+        .auth_login_start("microsoft", Some("invite-code-123"), &handoff_start())
         .unwrap();
     assert_eq!(
         url,
         "https://login.example/authorize?client_id=test&state=s"
     );
-    let url = client.auth_login_start("microsoft", None).unwrap();
+    let url = client
+        .auth_login_start("microsoft", Some("  "), &handoff_start())
+        .unwrap();
     assert_eq!(url, "https://login.example/authorize?state=noinvite");
 
     let requests = handle.join().unwrap();
-    let routes = [
-        "GET /v1/auth/providers ",
-        "POST /v1/auth/login/start ",
-        "POST /v1/auth/login/start ",
-    ];
-    for (request, route) in requests.iter().zip(routes) {
-        assert!(request.starts_with(route), "wrong route: {request}");
+    for request in &requests {
+        assert!(
+            request.starts_with("POST /v1/auth/login/start "),
+            "wrong route: {request}"
+        );
         assert!(
             !request.to_lowercase().contains("authorization:"),
             "the public sign-in routes must not carry a bearer token: {request}"
@@ -687,12 +680,23 @@ fn public_sign_in_lists_providers_in_order_and_starts_the_flow() {
         serde_json::from_str(requests[index].split("\r\n\r\n").nth(1).unwrap()).unwrap()
     };
     assert_eq!(
-        body(1),
-        serde_json::json!({"provider": "microsoft", "invite_code": "invite-code-123"})
+        body(0),
+        serde_json::json!({
+            "provider": "microsoft",
+            "invite_code": "invite-code-123",
+            "return_to": RETURN_TO,
+            "handoff_challenge": CHALLENGE,
+            "client_state": STATE,
+        })
     );
     assert_eq!(
-        body(2),
-        serde_json::json!({"provider": "microsoft"}),
+        body(1),
+        serde_json::json!({
+            "provider": "microsoft",
+            "return_to": RETURN_TO,
+            "handoff_challenge": CHALLENGE,
+            "client_state": STATE,
+        }),
         "an empty invite code is omitted"
     );
 }
@@ -702,35 +706,32 @@ fn public_sign_in_errors_stay_numeric_and_unsafe_urls_are_rejected() {
     let (client, handle) = public_server(vec![
         (403, r#"{"error":"forbidden"}"#.into()),
         (409, r#"{"error":"invalid_state"}"#.into()),
-        (
-            200,
-            r#"{"url":"http://login.example/authorize"}"#.into(),
-        ),
+        (200, r#"{"url":"http://login.example/authorize"}"#.into()),
         (200, r#"{"url":"javascript:alert(1)"}"#.into()),
-        (
-            200,
-            r#"{"providers":[{"id":"microsoft","enabled":true},{"id":"microsoft","enabled":false}]}"#
-                .into(),
-        ),
     ]);
+    let start = handoff_start();
     assert_eq!(
-        client.auth_login_start("microsoft", None).unwrap_err(),
+        client
+            .auth_login_start("microsoft", None, &start)
+            .unwrap_err(),
         ApiError::Http(403)
     );
     assert_eq!(
-        client.auth_login_start("microsoft", None).unwrap_err(),
+        client
+            .auth_login_start("microsoft", None, &start)
+            .unwrap_err(),
         ApiError::Http(409)
     );
     assert_eq!(
-        client.auth_login_start("microsoft", None).unwrap_err(),
+        client
+            .auth_login_start("microsoft", None, &start)
+            .unwrap_err(),
         ApiError::InvalidResponse
     );
     assert_eq!(
-        client.auth_login_start("microsoft", None).unwrap_err(),
-        ApiError::InvalidResponse
-    );
-    assert_eq!(
-        client.auth_providers().unwrap_err(),
+        client
+            .auth_login_start("microsoft", None, &start)
+            .unwrap_err(),
         ApiError::InvalidResponse
     );
     handle.join().unwrap();
@@ -738,22 +739,170 @@ fn public_sign_in_errors_stay_numeric_and_unsafe_urls_are_rejected() {
     // Local validation happens before any socket is opened.
     let client = PublicApiClient::new(validate_endpoint("http://127.0.0.1:9").unwrap()).unwrap();
     assert!(matches!(
-        client.auth_login_start("Microsoft", None),
+        client.auth_login_start("Microsoft", None, &start),
         Err(ApiError::Validation(_))
     ));
     assert!(matches!(
-        client.auth_login_start("", None),
+        client.auth_login_start("", None, &start),
         Err(ApiError::Validation(_))
     ));
     assert!(matches!(
-        client.auth_login_start("microsoft", Some("bad\ncode")),
+        client.auth_login_start("microsoft", Some("bad\ncode"), &start),
         Err(ApiError::Validation(_))
     ));
     let long = "a".repeat(257);
     assert!(matches!(
-        client.auth_login_start("microsoft", Some(long.as_str())),
+        client.auth_login_start("microsoft", Some(long.as_str()), &start),
         Err(ApiError::Validation(_))
     ));
+    for bad in [
+        serabot_desktop::HandoffStart {
+            return_to: "https://evil.example/auth-done",
+            ..handoff_start()
+        },
+        serabot_desktop::HandoffStart {
+            return_to: "http://127.0.0.1:80/auth-done",
+            ..handoff_start()
+        },
+        serabot_desktop::HandoffStart {
+            challenge: "short",
+            ..handoff_start()
+        },
+        serabot_desktop::HandoffStart {
+            client_state: "tiny",
+            ..handoff_start()
+        },
+    ] {
+        assert!(matches!(
+            client.auth_login_start("microsoft", None, &bad),
+            Err(ApiError::Validation(_))
+        ));
+    }
+}
+
+#[test]
+fn handoff_returns_the_session_and_its_user() {
+    use secrecy::ExposeSecret;
+    let (client, handle) = public_server(vec![(
+        200,
+        format!(
+            r#"{{"token":"{SESSION_TOKEN}","expires_at":"2099-01-01T00:00:00Z","user":{{"id":"u1","email":"ada@example.test","display_name":"Ada","role":"member"}}}}"#
+        ),
+    )]);
+    let verifier = "v".repeat(43);
+    let signed_in = client.auth_handoff("one-time-code", &verifier).unwrap();
+    assert_eq!(signed_in.token.expose_secret(), SESSION_TOKEN);
+    assert_eq!(
+        signed_in.expires_at.as_deref(),
+        Some("2099-01-01T00:00:00Z")
+    );
+    assert_eq!(signed_in.user.email, "ada@example.test");
+    assert_eq!(signed_in.user.label(), "Ada");
+
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("POST /v1/auth/handoff "));
+    assert!(!requests[0].to_lowercase().contains("authorization:"));
+    let body: serde_json::Value =
+        serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"handoff": "one-time-code", "verifier": verifier})
+    );
+}
+
+#[test]
+fn a_burned_or_malformed_handoff_never_yields_a_session() {
+    let (client, handle) = public_server(vec![
+        (400, r#"{"error":"invalid handoff"}"#.into()),
+        // A token that is too short to be a session token.
+        (
+            200,
+            r#"{"token":"short","user":{"id":"u1","email":"a@example.test"}}"#.into(),
+        ),
+        // A user with a control character.
+        (
+            200,
+            format!(
+                r#"{{"token":"{SESSION_TOKEN}","user":{{"id":"u1","display_name":"a\u0000b"}}}}"#
+            ),
+        ),
+        // No user at all.
+        (200, format!(r#"{{"token":"{SESSION_TOKEN}"}}"#)),
+    ]);
+    let verifier = "v".repeat(43);
+    assert_eq!(
+        client.auth_handoff("code", &verifier).err().unwrap(),
+        ApiError::Http(400)
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            client.auth_handoff("code", &verifier).err().unwrap(),
+            ApiError::InvalidResponse
+        );
+    }
+    handle.join().unwrap();
+
+    // Local validation happens before any socket is opened.
+    let client = PublicApiClient::new(validate_endpoint("http://127.0.0.1:9").unwrap()).unwrap();
+    assert!(matches!(
+        client.auth_handoff("", &verifier).err().unwrap(),
+        ApiError::Validation(_)
+    ));
+    assert!(matches!(
+        client.auth_handoff("co de", &verifier).err().unwrap(),
+        ApiError::Validation(_)
+    ));
+    assert!(matches!(
+        client.auth_handoff("code", "short").err().unwrap(),
+        ApiError::Validation(_)
+    ));
+}
+
+#[test]
+fn me_and_logout_use_the_session_token() {
+    let (client, handle) = server(vec![
+        (
+            200,
+            r#"{"id":"u1","email":"ada@example.test","display_name":"Ada","role":"admin"}"#.into(),
+        ),
+        (204, String::new()),
+        (401, String::new()),
+        (500, String::new()),
+        (401, String::new()),
+    ]);
+    let user = client.me().unwrap();
+    assert_eq!(user.display_name, "Ada");
+    assert_eq!(user.role, "admin");
+    client.logout().unwrap();
+    client
+        .logout()
+        .expect("a 401 means the session is already over");
+    assert_eq!(client.logout().unwrap_err(), ApiError::Http(500));
+    assert_eq!(client.me().unwrap_err(), ApiError::Http(401));
+    let requests = handle.join().unwrap();
+    for (request, route) in requests.iter().zip([
+        "GET /v1/me ",
+        "POST /v1/auth/logout ",
+        "POST /v1/auth/logout ",
+        "POST /v1/auth/logout ",
+        "GET /v1/me ",
+    ]) {
+        assert!(request.starts_with(route), "wrong route: {request}");
+        assert!(
+            request
+                .to_lowercase()
+                .contains(&format!("authorization: bearer {TOKEN}\r\n")),
+            "missing bearer: {request}"
+        );
+    }
+}
+
+#[test]
+fn a_401_reads_as_an_ended_session() {
+    assert_eq!(
+        ApiError::Http(401).to_string(),
+        "Your session ended. Sign in again."
+    );
 }
 
 #[test]

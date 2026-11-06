@@ -12,7 +12,7 @@ use serabot_desktop::{
     Selection, TaskStatus, Team, TeamMember, TeamMode,
     audio_capture::MicRecorder,
     branding, parse_skill_list, provider_presets,
-    session::{Section, Session, Theme, humanize_label},
+    session::{Section, Session, SignInPhase, Theme, humanize_label},
     teams, valid_skill_id,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -364,7 +364,7 @@ fn capability_label(tool: &str) -> Option<&'static str> {
 /// `[a-z0-9-_]*`. A bare `@` yields `Some("")`.
 fn mention_query(text: &str) -> Option<String> {
     let at = text.rfind('@')?;
-    let tail = &text[at + 1..];
+    let tail = text.get(at + 1..)?;
     if tail.len() > 32 || tail.chars().any(char::is_whitespace) {
         return None;
     }
@@ -391,7 +391,7 @@ fn slash_query(text: &str) -> Option<String> {
 /// Replace the trailing `@query` in `text` with `@id `.
 fn insert_mention_text(text: &str, id: &str) -> String {
     match text.rfind('@') {
-        Some(at) => format!("{}@{} ", &text[..at], id),
+        Some(at) => format!("{}@{} ", text.get(..at).unwrap_or_default(), id),
         None => format!("{}@{} ", text, id),
     }
 }
@@ -399,7 +399,7 @@ fn insert_mention_text(text: &str, id: &str) -> String {
 /// Replace the `/query` at the start of the last line of `text` with `id `.
 fn insert_slash_text(text: &str, id: &str) -> String {
     let line_start = text.rfind('\n').map(|i| i + 1).unwrap_or(0);
-    format!("{}{} ", &text[..line_start], id)
+    format!("{}{} ", text.get(..line_start).unwrap_or_default(), id)
 }
 
 /// Bots matching a mention query: `(id, display name, avatar)`.
@@ -743,13 +743,13 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
         // Heading
         if trimmed.starts_with('#') {
             let hash_count = trimmed.chars().take_while(|c| *c == '#').count();
-            if hash_count <= 6 && trimmed[hash_count..].starts_with(' ') {
-                let rest = trimmed[hash_count..].trim();
-                let title = if rest.starts_with("**") && rest.ends_with("**") && rest.len() >= 4 {
-                    &rest[2..rest.len() - 2]
-                } else {
-                    rest
-                };
+            let after_hashes = trimmed.get(hash_count..).unwrap_or_default();
+            if hash_count <= 6 && after_hashes.starts_with(' ') {
+                let rest = after_hashes.trim();
+                let title = rest
+                    .strip_prefix("**")
+                    .and_then(|inner| inner.strip_suffix("**"))
+                    .unwrap_or(rest);
                 blocks.push(MdBlock::Heading {
                     level: hash_count,
                     text: title.trim().to_owned(),
@@ -818,15 +818,22 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
                 if l_trim.starts_with("- ") || l_trim.starts_with("* ") || l_trim.starts_with("• ")
                 {
                     let marker_len = if l_trim.starts_with("• ") { 3 } else { 2 };
-                    items.push(l_trim[marker_len..].trim().to_owned());
+                    items.push(
+                        l_trim
+                            .get(marker_len..)
+                            .unwrap_or_default()
+                            .trim()
+                            .to_owned(),
+                    );
                     i += 1;
                 } else if !l_trim.is_empty()
                     && (lines[i].starts_with("  ") || lines[i].starts_with('\t'))
                     && !items.is_empty()
                 {
-                    let last = items.last_mut().unwrap();
-                    last.push(' ');
-                    last.push_str(l_trim);
+                    if let Some(last) = items.last_mut() {
+                        last.push(' ');
+                        last.push_str(l_trim);
+                    }
                     i += 1;
                 } else {
                     break;
@@ -850,16 +857,17 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
                 let fw = l_trim.split_whitespace().next().unwrap_or("");
                 if fw.ends_with('.') && fw.trim_end_matches('.').chars().all(|c| c.is_ascii_digit())
                 {
-                    let item_text = l_trim[fw.len()..].trim().to_owned();
+                    let item_text = l_trim.get(fw.len()..).unwrap_or_default().trim().to_owned();
                     items.push(item_text);
                     i += 1;
                 } else if !l_trim.is_empty()
                     && (lines[i].starts_with("  ") || lines[i].starts_with('\t'))
                     && !items.is_empty()
                 {
-                    let last = items.last_mut().unwrap();
-                    last.push(' ');
-                    last.push_str(l_trim);
+                    if let Some(last) = items.last_mut() {
+                        last.push(' ');
+                        last.push_str(l_trim);
+                    }
                     i += 1;
                 } else {
                     break;
@@ -1098,157 +1106,107 @@ fn RenderSpan(span: InlineSpan) -> Element {
 #[component]
 fn ConnectView(session: Signal<Session>) -> Element {
     let server = session.read().server.clone();
-    let token = session.read().token.clone();
     let error = session.read().connect_error.clone();
     let connecting = session.read().connecting;
+    let can_retry = session.read().has_saved_session();
     let theme = session.read().theme;
     let version = env!("CARGO_PKG_VERSION");
-    let providers = session.read().sign_in.providers.clone();
-    let providers_loaded = session.read().sign_in.loaded;
-    let providers_loading = session.read().sign_in.loading;
-    let providers_attempted = session.read().sign_in.attempted;
+    let phase = session.read().sign_in.phase;
+    let busy = session.read().sign_in.busy() || connecting;
     let sign_in_error = session.read().sign_in.error.clone();
     let sign_in_notice = session.read().sign_in.notice.clone();
     let invite_code = session.read().sign_in.invite_code.clone();
-    let starting = session.read().sign_in.starting;
-    let any_enabled = providers.iter().any(|provider| provider.enabled);
-    // The provider list is public and needs no token. Read it once when the
-    // screen mounts; the server field's blur re-reads it after an edit.
-    let mut asked = use_signal(|| false);
-    use_effect(move || {
-        if asked() {
-            return;
-        }
-        asked.set(true);
-        session.write().load_auth_providers();
-    });
+    let show_invite = session.read().sign_in.show_invite;
+    let server_empty = server.trim().is_empty();
     rsx! {
         div { class: "connect",
             div { class: "connect-card",
                 div { class: "brand brand-lg", "S" }
                 h1 { "SeraBot" }
-                p { class: "muted", "Owner console · connect to your host" }
+                p { class: "muted", "Sign in to continue" }
                 div { class: "field",
                     label { class: "field-label", "Server" }
                     input {
                         class: "input",
                         value: "{server}",
                         placeholder: "https://bot.seradyx.tech",
+                        disabled: busy,
                         oninput: move |event| session.write().server = event.value(),
-                        onblur: move |_| session.write().load_auth_providers(),
                     }
                 }
-                div { class: "signin",
-                    div { class: "signin-head",
-                        span { class: "field-label", "Sign in" }
-                        if providers_loading {
-                            span { class: "spinner", title: "Checking sign-in providers" }
-                        }
-                    }
-                    if providers_loaded && !providers.is_empty() {
-                        for provider in providers {
-                            {
-                                let id = provider.id.clone();
-                                let label = provider.label();
-                                let enabled = provider.enabled;
-                                let coming_soon = provider.coming_soon();
-                                let is_microsoft = id == "microsoft";
-                                let click_id = id.clone();
-                                let button_label = format!("Sign in with {label}");
-                                let title = if enabled {
-                                    format!("Open the {label} sign-in page in your browser")
-                                } else if coming_soon {
-                                    "Coming soon".to_owned()
-                                } else {
-                                    "Sign-in is not enabled on this server".to_owned()
-                                };
-                                rsx! {
-                                    div { class: "signin-provider", key: "{id}",
-                                        if enabled {
-                                            button {
-                                                class: "btn primary",
-                                                disabled: starting,
-                                                title: "{title}",
-                                                onclick: move |_| session.write().start_sign_in(click_id.clone()),
-                                                if starting { "Opening browser…" } else { "{button_label}" }
-                                            }
-                                        } else {
-                                            button {
-                                                class: "btn ghost",
-                                                disabled: true,
-                                                "aria-disabled": "true",
-                                                title: "{title}",
-                                                "{button_label}"
-                                            }
-                                            span { class: "chip muted",
-                                                if coming_soon { "coming soon" } else { "not enabled" }
-                                            }
-                                        }
-                                    }
-                                    if is_microsoft {
-                                        div { class: "field",
-                                            label { class: "field-label", "Invite code (new members)" }
-                                            input {
-                                                class: "input",
-                                                value: "{invite_code}",
-                                                placeholder: "leave empty if you already have an account",
-                                                disabled: starting,
-                                                oninput: move |event| session.write().sign_in.invite_code = event.value(),
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if any_enabled {
-                            p { class: "tiny",
-                                "After signing in, the browser shows a session token once. Paste it below and press Connect."
-                            }
-                        } else {
-                            p { class: "tiny",
-                                "Sign-in is not enabled on this server. Paste a session token below."
-                            }
-                        }
-                    } else if providers_loading {
-                        p { class: "tiny", "Checking sign-in providers…" }
-                    } else if server.trim().is_empty() {
-                        p { class: "tiny", "Enter the server origin to sign in." }
-                    } else if providers_attempted {
-                        p { class: "tiny",
-                            "Sign-in is unavailable from this server. Paste a session token below."
-                        }
-                    } else {
-                        p { class: "tiny", "Checking sign-in providers…" }
-                    }
-                    if let Some(message) = sign_in_notice {
-                        div { class: "banner info", span { "{message}" } }
-                    }
-                    if let Some(message) = sign_in_error {
-                        div { class: "banner err", span { "{message}" } }
+                if connecting && phase == SignInPhase::Idle {
+                    div { class: "row",
+                        span { class: "spinner", title: "Checking your saved session" }
+                        p { class: "tiny", "Checking your saved session…" }
                     }
                 }
-                div { class: "field",
-                    label { class: "field-label", "Token" }
-                    input {
-                        class: "input",
-                        "type": "password",
-                        value: "{token}",
-                        placeholder: "token minted on the server",
-                        oninput: move |event| session.write().token = event.value(),
+                if phase == SignInPhase::Waiting {
+                    div { class: "banner info",
+                        span { class: "spinner", title: "Waiting for the browser" }
+                        span { "Finish signing in in your browser, then come back here." }
                     }
+                }
+                if let Some(message) = sign_in_notice {
+                    div { class: "banner info", span { "{message}" } }
+                }
+                if let Some(message) = sign_in_error {
+                    div { class: "banner err", span { "{message}" } }
                 }
                 if let Some(message) = error {
                     div { class: "banner err", span { "{message}" } }
                 }
+                if show_invite {
+                    div { class: "field",
+                        label { class: "field-label", "Invite code" }
+                        input {
+                            class: "input",
+                            value: "{invite_code}",
+                            placeholder: "only needed the first time",
+                            disabled: busy,
+                            oninput: move |event| session.write().sign_in.invite_code = event.value(),
+                        }
+                    }
+                }
                 div { class: "row",
                     button {
                         class: "btn primary",
-                        disabled: connecting,
-                        onclick: move |_| session.write().connect_now(),
-                        if connecting { "Connecting…" } else { "Connect" }
+                        disabled: busy || server_empty,
+                        title: "Open the Microsoft sign-in page in your browser",
+                        onclick: move |_| session.write().start_sign_in(),
+                        match phase {
+                            SignInPhase::Starting => "Opening browser…",
+                            SignInPhase::Waiting => "Waiting for browser…",
+                            SignInPhase::Idle => "Sign in with Microsoft",
+                        }
                     }
+                    if phase != SignInPhase::Idle {
+                        button {
+                            class: "btn ghost",
+                            onclick: move |_| session.write().cancel_sign_in(),
+                            "Cancel"
+                        }
+                    }
+                    if can_retry && !connecting && phase == SignInPhase::Idle {
+                        button {
+                            class: "btn ghost",
+                            onclick: move |_| session.write().connect_now(),
+                            "Try again"
+                        }
+                    }
+                }
+                if server_empty && !busy {
+                    p { class: "tiny", "Enter the server address to sign in." }
+                }
+                if !show_invite && !busy {
                     button {
-                        class: "btn ghost",
+                        class: "btn ghost sm",
+                        onclick: move |_| session.write().sign_in.show_invite = true,
+                        "I have an invite code"
+                    }
+                }
+                div { class: "row",
+                    button {
+                        class: "btn ghost sm",
                         onclick: move |_| {
                             let next = session.read().theme.toggled();
                             session.write().set_theme(next);
@@ -1257,7 +1215,7 @@ fn ConnectView(session: Signal<Session>) -> Element {
                     }
                 }
                 p { class: "tiny",
-                    "The token is kept in Windows Credential Manager. Only the server origin and theme are written to settings.json."
+                    "Your session is kept in Windows Credential Manager. Only the server address and theme are written to settings.json."
                 }
             }
             p { class: "tiny", "v{version}" }
@@ -2025,11 +1983,11 @@ fn UserMenu(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> 
                     class: "menu-item danger",
                     onclick: move |_| {
                         open.set(false);
-                        session.write().disconnect();
-                        toast.set(Some(("Disconnected.".into(), false)));
+                        session.write().sign_out();
+                        toast.set(Some(("Signing out…".into(), false)));
                     },
                     Icon { name: "x", size: 16 }
-                    "Disconnect"
+                    "Sign out"
                 }
             }
         }
@@ -5809,10 +5767,7 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
                                                                 onclick: {
                                                                     let url = url.clone();
                                                                     move |_| {
-                                                                        if let Err(error) = webbrowser::open(&url) {
-                                                                            session.write().state.error =
-                                                                                Some(format!("Could not open the browser: {error}"));
-                                                                        }
+                                                                        session.write().open_in_browser(url.clone());
                                                                     }
                                                                 },
                                                                 Icon { name: "external", size: 14 }
@@ -6220,6 +6175,8 @@ fn ConversationsView(session: Signal<Session>) -> Element {
 #[component]
 fn SettingsView(session: Signal<Session>) -> Element {
     let theme = session.read().theme;
+    let signed_in_user = session.read().state.user.clone();
+    let signing_out = session.read().sign_out.in_flight;
     let server = session.read().server.clone();
     let version = session.read().state.version.clone();
     let update = session.read().update.info.clone();
@@ -6359,16 +6316,36 @@ fn SettingsView(session: Signal<Session>) -> Element {
                     if !version.is_empty() {
                         p { class: "tiny", "Server {version}" }
                     }
+                    if let Some(user) = &signed_in_user {
+                        div { class: "kv",
+                            span { class: "kv-key", "Signed in as" }
+                            span { class: "kv-val", "{user.label()}" }
+                        }
+                        if !user.email.is_empty() && user.email != user.label() {
+                            div { class: "kv",
+                                span { class: "kv-key", "Email" }
+                                span { class: "kv-val", "{user.email}" }
+                            }
+                        }
+                        if !user.role.is_empty() {
+                            div { class: "kv",
+                                span { class: "kv-key", "Role" }
+                                span { class: "kv-val", "{user.role}" }
+                            }
+                        }
+                    } else {
+                        p { class: "tiny", "Signed in with a saved session." }
+                    }
                     div { class: "card-actions",
                         button {
-                            class: "btn ghost",
-                            onclick: move |_| session.write().forget_token(),
-                            "Forget token"
-                        }
-                        button {
                             class: "btn danger",
-                            onclick: move |_| session.write().disconnect(),
-                            "Disconnect"
+                            disabled: signing_out,
+                            title: "End this session on the server and remove it from this device",
+                            onclick: move |_| session.write().sign_out(),
+                            if signing_out { "Signing out…" } else { "Sign out" }
+                        }
+                        if signing_out {
+                            span { class: "spinner", title: "Signing out" }
                         }
                     }
                 }

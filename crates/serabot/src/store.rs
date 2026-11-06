@@ -57,6 +57,7 @@ const MIGRATION_10: &str = include_str!("../migrations/0010_user_fleet.sql");
 const MIGRATION_11: &str = include_str!("../migrations/0011_user_secrets.sql");
 const MIGRATION_12: &str = include_str!("../migrations/0012_user_telegram.sql");
 const MIGRATION_13: &str = include_str!("../migrations/0013_conversation_artifacts.sql");
+const MIGRATION_14: &str = include_str!("../migrations/0014_auth_handoffs.sql");
 
 /// Fixed admin id written by migration 0008 and mirrored in
 /// `kv['admin_user_id']`. Code resolves the admin through the kv entry (the
@@ -496,6 +497,11 @@ impl Store {
         if version < 13 {
             connection.execute_batch(MIGRATION_13)?;
             connection.pragma_update(None, "user_version", 13)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 14 {
+            connection.execute_batch(MIGRATION_14)?;
+            connection.pragma_update(None, "user_version", 14)?;
         }
         let stored_dimension: Option<String> = connection
             .query_row(
@@ -1055,6 +1061,31 @@ impl Store {
         invite_code_hash: Option<&str>,
         max_users: usize,
     ) -> Result<LoginOutcome> {
+        self.complete_login_claiming(
+            provider_subject,
+            email,
+            display_name,
+            invite_code_hash,
+            max_users,
+            None,
+        )
+    }
+
+    /// [`Self::complete_login`] plus the one-time admin claim: when the
+    /// subject is new, the bootstrap admin row still carries its placeholder
+    /// `local:` subject, and the verified `email` equals `admin_email`
+    /// (case-insensitive), that subject is linked to the existing admin row
+    /// instead of creating a user. No invite is needed and no user cap
+    /// applies, so the backfilled data stays with the admin account.
+    pub fn complete_login_claiming(
+        &self,
+        provider_subject: &str,
+        email: &str,
+        display_name: &str,
+        invite_code_hash: Option<&str>,
+        max_users: usize,
+        admin_email: Option<&str>,
+    ) -> Result<LoginOutcome> {
         validate_user_fields(provider_subject, email, display_name)?;
         if max_users == 0 {
             return Err(SeraError::InvalidState(
@@ -1085,6 +1116,39 @@ impl Store {
                 },
                 created: false,
             });
+        }
+        if let Some(admin_email) = admin_email.map(str::trim).filter(|e| !e.is_empty())
+            && !email.is_empty()
+            && email.eq_ignore_ascii_case(admin_email)
+        {
+            let admin_id: Option<String> = transaction
+                .query_row(
+                    "SELECT value FROM kv WHERE key = 'admin_user_id'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(admin_id) = admin_id {
+                let changed = transaction.execute(
+                    "UPDATE users SET provider_subject = ?2, email = ?3, display_name = ?4
+                     WHERE id = ?1 AND role = 'admin' AND status = 'active'
+                       AND provider_subject LIKE 'local:%'",
+                    params![admin_id, provider_subject, email, display_name],
+                )?;
+                if changed == 1 {
+                    let admin = transaction.query_row(
+                        "SELECT id, provider_subject, email, display_name, role, status, created_at
+                         FROM users WHERE id = ?1",
+                        params![admin_id],
+                        user_from_row,
+                    )?;
+                    transaction.commit()?;
+                    return Ok(LoginOutcome {
+                        user: admin,
+                        created: false,
+                    });
+                }
+            }
         }
         let count: i64 =
             transaction.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
@@ -1182,6 +1246,72 @@ impl Store {
             ],
         )?;
         Ok(token)
+    }
+
+    /// Upper bound on live (unredeemed, unexpired) handoff codes.
+    pub const MAX_PENDING_HANDOFFS: i64 = 256;
+
+    /// Persist a one-time sign-in handoff: only the SHA-256 hash of the code
+    /// is stored, bound to the client's PKCE `challenge` and the signed-in
+    /// user. Expired rows are pruned first; at the live-row cap the call
+    /// fails closed.
+    pub fn create_handoff(
+        &self,
+        code_hash: &str,
+        challenge: &str,
+        user_id: &str,
+        ttl: chrono::Duration,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        let transaction = connection.unchecked_transaction()?;
+        let now = now_string();
+        transaction.execute(
+            "DELETE FROM auth_handoffs WHERE expires_at <= ?1",
+            params![now],
+        )?;
+        let live: i64 =
+            transaction.query_row("SELECT COUNT(*) FROM auth_handoffs", [], |row| row.get(0))?;
+        if live >= Self::MAX_PENDING_HANDOFFS {
+            return Err(SeraError::InvalidState(
+                "too many sign-in handoffs are pending; try again shortly".into(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO auth_handoffs(code_hash, challenge, user_id, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                code_hash,
+                challenge,
+                user_id,
+                now,
+                to_string(utc_now() + ttl)
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically consume a handoff: the row is deleted whether or not it is
+    /// still valid, so a code can be tried exactly once. Returns the bound
+    /// `(challenge, user_id, unexpired)`; `None` for an unknown code.
+    pub fn take_handoff(&self, code_hash: &str) -> Result<Option<(String, String, bool)>> {
+        let connection = self.connection()?;
+        let transaction = connection.unchecked_transaction()?;
+        let row: Option<(String, String, String)> = transaction
+            .query_row(
+                "SELECT challenge, user_id, expires_at FROM auth_handoffs WHERE code_hash = ?1",
+                params![code_hash],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        transaction.execute(
+            "DELETE FROM auth_handoffs WHERE code_hash = ?1",
+            params![code_hash],
+        )?;
+        transaction.commit()?;
+        Ok(row.map(|(challenge, user_id, expires_at)| {
+            (challenge, user_id, parse_datetime(&expires_at) > utc_now())
+        }))
     }
 
     /// Resolve a session token hash to its active user. Fails closed: no
@@ -4317,7 +4447,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -4382,7 +4512,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -4451,7 +4581,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -4582,7 +4712,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -4737,7 +4867,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.
