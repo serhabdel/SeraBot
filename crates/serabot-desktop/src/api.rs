@@ -12,7 +12,9 @@ use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
 mod panel;
+mod profiles;
 pub use panel::*;
+pub use profiles::*;
 
 const MAX_RESPONSE: u64 = 2 * 1024 * 1024;
 
@@ -723,6 +725,9 @@ pub struct BotSummary {
     pub description: Option<String>,
     #[serde(default)]
     pub avatar: Option<String>,
+    /// Version stamp of the uploaded image, when the bot has one.
+    #[serde(default)]
+    pub avatar_version: Option<String>,
     pub tools: Vec<String>,
     pub skills: Vec<String>,
     #[serde(default)]
@@ -840,6 +845,9 @@ pub struct ConversationSummary {
     /// Newest user or assistant message, as a plain-text preview.
     #[serde(default)]
     pub last_message: Option<LastMessage>,
+    /// Version stamp of the group image, when it has one.
+    #[serde(default)]
+    pub avatar_version: Option<String>,
 }
 
 /// List preview of the newest message (`role`: user or assistant, `text`:
@@ -3530,6 +3538,7 @@ mod tests {
             unread_count: 0,
             accepts_turns,
             last_message: None,
+            avatar_version: None,
         }
     }
 

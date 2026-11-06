@@ -11,12 +11,15 @@ use serabot_desktop::{
     ApprovalDecision, BotConfigUpdate, ConversationKind, MAX_TEAM_MEMBERS, Role, SPECIALIST_TOOLS,
     Selection, TaskStatus, Team, TeamMember, TeamMode,
     audio_capture::MicRecorder,
-    branding, parse_skill_list, provider_presets,
-    session::{Section, Session, SignInPhase, Theme, humanize_label},
+    branding, provider_presets,
+    session::{ImageSlot, Section, Session, SignInPhase, Theme, humanize_label},
     teams, valid_skill_id,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use crate::ui_bots::{
+    AvatarPicker, CapabilityToggles, NewBotSheet, NewGroupSheet, OnboardingView, capability_chips,
+};
 use crate::ui_connectors::ConnectorsView;
 use crate::ui_dock::BrowserDock;
 use crate::ui_vault::VaultSheet;
@@ -201,8 +204,12 @@ fn civil_from_days(days: i64) -> String {
 
 /// Overlay surfaces that sit above the shell.
 #[derive(Clone, Copy, PartialEq)]
-enum Overlay {
+pub(crate) enum Overlay {
     None,
+    /// The create-bot sheet: name, picture, model, group.
+    NewBot,
+    /// The create-group sheet: name, picture, members, rules, model.
+    NewGroup,
     /// The new-conversation sheet. The kind lives in the session draft, so
     /// the menu, the sheet and the Threads form always agree.
     NewConversation,
@@ -231,7 +238,6 @@ struct BotCard {
     model: Option<String>,
     tools: Vec<String>,
     skills: Vec<String>,
-    require_approval: Vec<String>,
 }
 
 fn avatar_hue(id: &str) -> u16 {
@@ -243,11 +249,32 @@ fn avatar_hue(id: &str) -> u16 {
 }
 
 /// Only the hue travels to the DOM; the colors themselves are CSS tokens.
-fn avatar_style(id: &str) -> String {
-    format!("--avatar-hue: {};", avatar_hue(id))
+pub(crate) fn avatar_style(id: &str) -> String {
+    serabot_desktop::avatars::tile_style(
+        &serabot_desktop::avatars::css_key("bot", id),
+        avatar_hue(id),
+    )
 }
 
-fn human_model(model: &str) -> String {
+/// Tile style for a conversation row: a direct chat wears its bot's picture,
+/// a group its own, anything else the hue only.
+fn conversation_avatar_style(id: &str) -> String {
+    if id.starts_with("room:") {
+        group_avatar_style(id)
+    } else {
+        avatar_style(id.strip_prefix("dir:").unwrap_or(id))
+    }
+}
+
+/// Same for a group (room) tile; `id` is the room conversation id.
+pub(crate) fn group_avatar_style(id: &str) -> String {
+    serabot_desktop::avatars::tile_style(
+        &serabot_desktop::avatars::css_key("grp", id),
+        avatar_hue(id),
+    )
+}
+
+pub(crate) fn human_model(model: &str) -> String {
     let base = model.strip_suffix("-latest").unwrap_or(model);
     base.split(['-', '_'])
         .filter(|word| !word.is_empty())
@@ -262,7 +289,7 @@ fn human_model(model: &str) -> String {
         .join(" ")
 }
 
-fn human_provider(provider: &str) -> String {
+pub(crate) fn human_provider(provider: &str) -> String {
     if provider == "default" {
         "Default provider".into()
     } else {
@@ -1261,8 +1288,12 @@ fn Shell(session: Signal<Session>) -> Element {
     let mut drawer_open = use_signal(|| false);
     let vault_open = use_signal(|| false);
     let mut toast = use_signal(|| Option::<(String, bool)>::None);
+    let onboarding_open = chat && session.read().onboarding_ui.open;
+    // One stylesheet defines every avatar image; tiles only reference it.
+    let avatar_css = serabot_desktop::avatars::stylesheet(&session.read().state.avatars);
 
     rsx! {
+        style { "{avatar_css}" }
         div { class: "app-shell",
             IconRail { session, toast }
             if chat {
@@ -1273,11 +1304,14 @@ fn Shell(session: Signal<Session>) -> Element {
                 }
             }
             main { class: "main",
-                if chat {
+                if chat && !onboarding_open {
                     Topbar { session, overlay, inspector_open, drawer_open, vault_open }
                 }
                 StatusBanner { session }
                 UpdateBanner { session }
+                if onboarding_open {
+                    OnboardingView { session }
+                } else {
                 div { class: "pane",
                     {match section {
                         Section::Chat => rsx! { ChatView { session, overlay } },
@@ -1290,11 +1324,12 @@ fn Shell(session: Signal<Session>) -> Element {
                             if session.read().selected_bot.is_some() {
                                 rsx! { BotProfileView { session } }
                             } else {
-                                rsx! { FleetView { session } }
+                                rsx! { FleetView { session, overlay } }
                             }
                         }
                         Section::Settings => rsx! { SettingsView { session } },
                     }}
+                }
                 }
             }
             if chat {
@@ -1308,6 +1343,12 @@ fn Shell(session: Signal<Session>) -> Element {
             {match overlay() {
                 Overlay::NewConversation => rsx! {
                     NewConversationSheet { session, overlay }
+                },
+                Overlay::NewBot => rsx! {
+                    NewBotSheet { session, overlay }
+                },
+                Overlay::NewGroup => rsx! {
+                    NewGroupSheet { session, overlay }
                 },
                 Overlay::AddProvider => rsx! {
                     AddProviderSheet { session, overlay }
@@ -1472,8 +1513,7 @@ fn NewMenu(
                     class: "menu-item",
                     onclick: move |_| {
                         open.set(false);
-                        session.write().fleet.conv_kind = ConversationKind::Room;
-                        overlay.set(Overlay::NewConversation);
+                        overlay.set(Overlay::NewGroup);
                     },
                     Icon { name: "shield", size: 16 }
                     "New group chat"
@@ -1502,7 +1542,7 @@ fn NewMenu(
                     class: "menu-item",
                     onclick: move |_| {
                         open.set(false);
-                        session.write().open_section(Section::Fleet);
+                        overlay.set(Overlay::NewBot);
                     },
                     Icon { name: "robot", size: 16 }
                     "New bot"
@@ -1849,7 +1889,7 @@ fn Sidebar(
                                                 session.write().open_bot_chat(bot);
                                             }
                                         },
-                                        span { class: "avatar bot", style: avatar_style(&id), "{avatar}" }
+                                        span { class: "avatar bot", style: conversation_avatar_style(&id), "{avatar}" }
                                         div { class: "thread-copy",
                                             span { class: "thread-title", "{label}" }
                                             span { class: "thread-meta", if enabled { "{role}" } else { "{role} · disabled" } }
@@ -1935,7 +1975,7 @@ fn Sidebar(
                                                 let id = id.clone();
                                                 move |_| session.write().open_conversation(id.clone())
                                             },
-                                            span { class: "avatar bot", style: avatar_style(&id), "{initial_of(&label)}" }
+                                            span { class: "avatar bot", style: conversation_avatar_style(&id), "{initial_of(&label)}" }
                                             div { class: "thread-copy",
                                                 span { class: "thread-title", "{label}" }
                                                 span { class: "thread-meta", "{subtitle}" }
@@ -3541,17 +3581,7 @@ fn Inspector(session: Signal<Session>, overlay: Signal<Overlay>, open: Signal<bo
                 })
                 .collect();
             let skills_full = attached_skills.len() >= MAX_BOT_SKILLS;
-            let tool_rows: Vec<(String, bool, Option<&'static str>)> = detail
-                .tools
-                .iter()
-                .map(|tool| {
-                    (
-                        tool.clone(),
-                        detail.require_approval.iter().any(|item| item == tool),
-                        capability_label(tool),
-                    )
-                })
-                .collect();
+            let tool_rows: Vec<String> = detail.tools.clone();
             let instructions = detail.instructions.clone();
             let instruction_preview = instructions.as_ref().map(|text| {
                 let truncated: String = text.chars().take(8000).collect();
@@ -3744,25 +3774,27 @@ fn Inspector(session: Signal<Session>, overlay: Signal<Overlay>, open: Signal<bo
                 }
                 div { class: "card",
                     div { class: "card-head",
-                        h3 { class: "card-title", "Tools" }
-                        span { class: "chip muted", "{detail.tools.len()}" }
+                        h3 { class: "card-title", "What it can do" }
                     }
                     if tool_rows.is_empty() {
-                        p { class: "hint", "No tools enabled." }
+                        p { class: "hint", "Nothing switched on." }
                     } else {
                         div { class: "chips",
-                            for (tool, needs_approval, _cap) in tool_rows.clone() {
-                                span {
-                                    class: if needs_approval { "chip warn" } else { "chip" },
-                                    title: if needs_approval { "Requires approval" } else { "Enabled tool" },
-                                    "{tool}"
-                                }
+                            for label in capability_chips(&detail.tools) {
+                                span { class: "chip", "{label}" }
                             }
                         }
-                        div { class: "row",
-                            for (tool, _needs_approval, cap) in tool_rows {
-                                if let Some(label) = cap {
-                                    span { class: "tiny", "{tool}: {label}" }
+                    }
+                    p { class: "approval-note",
+                        Icon { name: "shield", size: 14 }
+                        "Asks before deleting or sending anything"
+                    }
+                    details { class: "advanced",
+                        summary { "Advanced" }
+                        div { class: "advanced-body",
+                            div { class: "chips",
+                                for tool in tool_rows {
+                                    span { class: "chip mono", "{tool}" }
                                 }
                             }
                         }
@@ -4240,7 +4272,7 @@ fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
                             session.write().fleet.conv_kind = next;
                             session.write().fleet.conv_parent.clear();
                         },
-                        for candidate in ConversationKind::ALL {
+                        for candidate in ConversationKind::ALL.into_iter().filter(|kind| *kind != ConversationKind::Room) {
                             option { value: "{candidate.as_str()}", "{candidate.label()}" }
                         }
                     }
@@ -4255,15 +4287,20 @@ fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
                         oninput: move |event| session.write().fleet.conv_title = event.value(),
                     }
                 }
-                div { class: "field",
-                    label { class: "field-label", "Id" }
-                    input {
-                        class: "input",
-                        value: "{slug}",
-                        placeholder: "id (lowercase slug)",
-                        oninput: move |event| session.write().fleet.conv_slug = event.value(),
+                details { class: "advanced",
+                    summary { "Advanced" }
+                    div { class: "advanced-body",
+                        div { class: "field",
+                            label { class: "field-label", "Id" }
+                            input {
+                                class: "input",
+                                value: "{slug}",
+                                placeholder: "made from the name",
+                                oninput: move |event| session.write().fleet.conv_slug = event.value(),
+                            }
+                            span { class: "hint", "Leave empty to make it from the name." }
+                        }
                     }
-                    span { class: "hint", "The server assigns the id prefix (sec:, grp:, dir:, room:)." }
                 }
                 if kind != ConversationKind::Section {
                     div { class: "field",
@@ -4377,8 +4414,13 @@ fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
                     class: "btn primary",
                     onclick: move |_| {
                         let kind = session.read().fleet.conv_kind;
-                        let slug = session.read().fleet.conv_slug.clone();
                         let title = session.read().fleet.conv_title.clone();
+                        let slug = session.read().fleet.conv_slug.clone();
+                        let slug = if slug.trim().is_empty() {
+                            serabot_desktop::preview_id(&title, "item")
+                        } else {
+                            slug
+                        };
                         let parent = session.read().fleet.conv_parent.trim().to_owned();
                         let parent = (!parent.is_empty()).then_some(parent);
                         let members = picked();
@@ -4651,7 +4693,8 @@ fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
 }
 
 #[component]
-fn FleetView(session: Signal<Session>) -> Element {
+fn FleetView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
+    let mut overlay = overlay;
     let bots: Vec<BotCard> = {
         let state = session.read();
         state
@@ -4669,16 +4712,12 @@ fn FleetView(session: Signal<Session>) -> Element {
                 model: bot.model.clone(),
                 tools: bot.tools.clone(),
                 skills: bot.skills.clone(),
-                require_approval: bot.require_approval.clone(),
             })
             .collect()
     };
     let bots_empty = bots.is_empty();
     let bots_loaded = session.read().state.bots_loaded;
     let bot_binding = session.read().state.bot_chat_binding == Some(true);
-    let mut bot_id = use_signal(String::new);
-    let mut bot_desc = use_signal(String::new);
-    let mut bot_skills = use_signal(String::new);
     let mut skill_id = use_signal(String::new);
     let mut skill_desc = use_signal(String::new);
     let mut skill_body = use_signal(String::new);
@@ -4687,13 +4726,21 @@ fn FleetView(session: Signal<Session>) -> Element {
             div { class: "pane-head",
                 div {
                     h1 { class: "pane-title", "Fleet" }
-                    p { class: "muted", "Specialists, tools, and approval rules." }
+                    p { class: "muted", "Your bots and what they can do." }
                 }
-                button {
-                    class: "btn ghost",
-                    onclick: move |_| session.write().refresh_bots(),
-                    Icon { name: "refresh", size: 16 }
-                    "Refresh"
+                div { class: "row",
+                    button {
+                        class: "btn ghost",
+                        onclick: move |_| session.write().refresh_bots(),
+                        Icon { name: "refresh", size: 16 }
+                        "Refresh"
+                    }
+                    button {
+                        class: "btn primary",
+                        onclick: move |_| overlay.set(Overlay::NewBot),
+                        Icon { name: "plus", size: 16 }
+                        "New bot"
+                    }
                 }
             }
             div { class: "pane-body",
@@ -4703,74 +4750,6 @@ fn FleetView(session: Signal<Session>) -> Element {
                     }
                 }
                 div { class: "pane-section",
-                details { class: "card",
-                    summary { "New specialist" }
-                    div { class: "form-grid",
-                        div { class: "field",
-                            label { class: "field-label", "Bot id" }
-                            input {
-                                class: "input",
-                                value: "{bot_id}",
-                                placeholder: "bot id (lowercase slug)",
-                                oninput: move |event| bot_id.set(event.value()),
-                            }
-                        }
-                        div { class: "field",
-                            label { class: "field-label", "Skills" }
-                            input {
-                                class: "input",
-                                value: "{bot_skills}",
-                                placeholder: "skills: ask, notes",
-                                oninput: move |event| bot_skills.set(event.value()),
-                            }
-                        }
-                    }
-                    div { class: "field",
-                        label { class: "field-label", "Description" }
-                        textarea {
-                            class: "textarea",
-                            value: "{bot_desc}",
-                            placeholder: "What this specialist is for",
-                            oninput: move |event| bot_desc.set(event.value()),
-                        }
-                    }
-                    details {
-                        summary { class: "tiny", "Tools" }
-                        div { class: "form-grid",
-                            for (index, name) in SPECIALIST_TOOLS.iter().enumerate() {
-                                label { key: "{index}", class: "check",
-                                    input {
-                                        "type": "checkbox",
-                                        checked: session.read().fleet.bot_tools.get(index).copied().unwrap_or(false),
-                                        onchange: move |event| {
-                                            if let Some(flag) = session.write().fleet.bot_tools.get_mut(index) {
-                                                *flag = event.checked();
-                                            }
-                                        },
-                                    }
-                                    "{name}"
-                                }
-                            }
-                        }
-                    }
-                    button {
-                        class: "btn primary",
-                        onclick: move |_| {
-                            match parse_skill_list(&bot_skills()) {
-                                Ok(skills) => {
-                                    let tools = session.read().selected_tools();
-                                    session.write().create_bot(bot_id(), bot_desc(), tools, skills);
-                                    bot_id.set(String::new());
-                                    bot_desc.set(String::new());
-                                    bot_skills.set(String::new());
-                                }
-                                Err(error) => session.write().state.error = Some(error.to_string()),
-                            }
-                        },
-                        "Create disabled bot"
-                    }
-                    p { class: "tiny", "The bot stays disabled until serabot.service restarts." }
-                }
                 details { class: "card",
                     summary { "New skill pack" }
                     div { class: "form-grid",
@@ -4834,7 +4813,7 @@ fn FleetView(session: Signal<Session>) -> Element {
                                 }
                                 div { class: "chips",
                                     span { class: if bot.enabled { "chip ok" } else { "chip muted" }, if bot.enabled { "enabled" } else { "disabled" } }
-                                    if !bot.live {
+                                    if bot.enabled && !bot.live {
                                         span { class: "chip warn", "restart required" }
                                     }
                                 }
@@ -4846,14 +4825,18 @@ fn FleetView(session: Signal<Session>) -> Element {
                                 span { class: "chip", if let Some(model) = bot.model.clone() { "Model: {human_model(&model)}" } else { "Model: conversation route" } }
                             }
                             div { class: "chips",
-                                for tool in bot.tools {
-                                    span { class: if bot.require_approval.contains(&tool) { "chip warn" } else { "chip" }, "{tool}" }
+                                for label in capability_chips(&bot.tools) {
+                                    span { class: "chip", "{label}" }
                                 }
                             }
                             div { class: "chips",
                                 for skill in bot.skills {
                                     span { class: "chip accent", "{skill}" }
                                 }
+                            }
+                            p { class: "approval-note",
+                                Icon { name: "shield", size: 14 }
+                                "Asks before deleting or sending anything"
                             }
                             div { class: "card-actions",
                                 button {
@@ -4872,6 +4855,16 @@ fn FleetView(session: Signal<Session>) -> Element {
                                         move |_| session.write().open_bot(id.clone())
                                     },
                                     "Open profile"
+                                }
+                                if !bot.enabled && bot.role != "orchestrator" {
+                                    button {
+                                        class: "btn ghost sm",
+                                        onclick: {
+                                            let id = bot.id.clone();
+                                            move |_| session.write().open_onboarding(id.clone())
+                                        },
+                                        "Finish setup"
+                                    }
                                 }
                             }
                         }
@@ -5025,7 +5018,23 @@ fn BotProfileView(session: Signal<Session>) -> Element {
                             h3 { class: "card-title", "Profile" }
                         }
                         p { class: "tiny", "Display name, avatar and description belong to the console. Behavior, tools and model stay in the bot file." }
-                        p { class: "tiny", "Use an emoji or initials for the avatar. Image uploads are not supported yet." }
+                        div { class: "field",
+                            label { class: "field-label", "Picture" }
+                            AvatarPicker {
+                                preview: None,
+                                letter: avatar.clone(),
+                                style: avatar_style(&bot.id),
+                                has_image: bot.avatar_version.is_some(),
+                                on_pick: {
+                                    let id = bot.id.clone();
+                                    move |bytes: Vec<u8>| session.write().pick_image(ImageSlot::Bot(id.clone()), bytes)
+                                },
+                                on_clear: {
+                                    let id = bot.id.clone();
+                                    move |_| session.write().clear_image(ImageSlot::Bot(id.clone()))
+                                },
+                            }
+                        }
                         div { class: "form-grid",
                             div { class: "field",
                                 label { class: "field-label", "Display name" }
@@ -5080,6 +5089,12 @@ fn BotProfileView(session: Signal<Session>) -> Element {
                                 }
                             }
                         }
+                    }
+                    div { class: "card",
+                        div { class: "card-head",
+                            h3 { class: "card-title", "What it can do" }
+                        }
+                        CapabilityToggles { session, bot: bot.id.clone() }
                     }
                     div { class: "card",
                         div { class: "card-head",

@@ -341,7 +341,7 @@ impl ApiClient {
     /// One request with a bounded body. `400`/`409`/`422`/`404` keep the
     /// server's short message when it is safe to show; anything else stays a
     /// bare status so the session's token and back-off paths still work.
-    fn panel_exchange<B: Serialize + ?Sized>(
+    pub(super) fn panel_exchange<B: Serialize + ?Sized>(
         &self,
         method: Method,
         route: &[&str],
@@ -385,7 +385,7 @@ impl ApiClient {
         Ok(bytes)
     }
 
-    fn panel_json<T: DeserializeOwned, B: Serialize + ?Sized>(
+    pub(super) fn panel_json<T: DeserializeOwned, B: Serialize + ?Sized>(
         &self,
         method: Method,
         route: &[&str],

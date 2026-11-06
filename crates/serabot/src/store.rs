@@ -59,6 +59,7 @@ const MIGRATION_12: &str = include_str!("../migrations/0012_user_telegram.sql");
 const MIGRATION_13: &str = include_str!("../migrations/0013_conversation_artifacts.sql");
 const MIGRATION_14: &str = include_str!("../migrations/0014_auth_handoffs.sql");
 const MIGRATION_15: &str = include_str!("../migrations/0015_vault.sql");
+const MIGRATION_17: &str = include_str!("../migrations/0017_bot_profiles_onboarding.sql");
 const MIGRATION_18: &str = include_str!("../migrations/0018_conversation_origin.sql");
 
 /// Fixed admin id written by migration 0008 and mirrored in
@@ -509,6 +510,12 @@ impl Store {
         if version < 15 {
             connection.execute_batch(MIGRATION_15)?;
             connection.pragma_update(None, "user_version", 15)?;
+        }
+        // 0016 belongs to a parallel branch; the numbers only need to rise.
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 17 {
+            connection.execute_batch(MIGRATION_17)?;
+            connection.pragma_update(None, "user_version", 17)?;
         }
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version < 18 {

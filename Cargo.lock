@@ -7031,6 +7031,7 @@ dependencies = [
  "gridcraft-xlsx",
  "hex",
  "http-body-util",
+ "image",
  "jsonwebtoken",
  "lopdf 0.34.0",
  "openidconnect",
@@ -7075,6 +7076,7 @@ dependencies = [
 name = "serabot-desktop"
 version = "0.14.1"
 dependencies = [
+ "base64 0.22.1",
  "dioxus",
  "keyring",
  "reqwest",

@@ -47,6 +47,10 @@ gridcraft-core = { git = "https://github.com/storytold/gridcraft", rev = "a2cc4b
 gridcraft-model = { git = "https://github.com/storytold/gridcraft", rev = "a2cc4b42cac6e2c41bae71fba4607300755a0b47" }
 gridcraft-xlsx = { git = "https://github.com/storytold/gridcraft", rev = "a2cc4b42cac6e2c41bae71fba4607300755a0b47" }
 hex = "0.4"
+# Avatar upload: decode png/jpeg/webp, resize, re-encode to a clean PNG. Already
+# in Cargo.lock (0.25.x) through the document renderers; only the three codecs
+# the avatar route accepts are enabled here, so no new crate enters the tree.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 lopdf = "0.34"
 # OIDC code flow + JWKS verification for multi-user sign-in (Microsoft in v1).
 # No built-in HTTP client feature: discovery, the token exchange, and JWKS

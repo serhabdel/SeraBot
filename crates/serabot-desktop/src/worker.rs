@@ -2,9 +2,9 @@ use crate::{
     ApiClient, ApiError, Approval, ApprovalDecision, AudioUpdate, AuthUser, BotConfigUpdate,
     BotDetail, BotProfileUpdate, BotSummary, Catalog, ConnectorStatus, ConnectorTestResult,
     ConnectorUpdate, ConversationKind, ConversationPage, ConversationSummary, CreatedBot,
-    CreatedConversation, CreatedSkill, Health, History, LibraryEntry, MemoryEntry, NewProvider,
-    ProviderStatus, Scope, Selection, SkillSummary, Task, Team, TeamMode, Transcription,
-    UsageReport, VoiceSettings, VoiceUpdate,
+    CreatedConversation, CreatedGroup, CreatedSkill, Health, History, LibraryEntry, MemoryEntry,
+    NewGroup, NewProvider, Onboarding, ProviderStatus, Scope, Selection, SkillSummary, Task, Team,
+    TeamMode, Transcription, UsageReport, VoiceSettings, VoiceUpdate, avatars::AvatarTarget,
 };
 use secrecy::SecretString;
 use std::sync::{
@@ -59,6 +59,11 @@ pub enum OperationKind {
     BotDetail,
     BotConfigWrite,
     Usage,
+    Avatar,
+    CreateGroup,
+    OnboardingRead,
+    OnboardingWrite,
+    ToolsWrite,
 }
 
 impl OperationKind {
@@ -188,6 +193,42 @@ pub enum Operation {
         bot: Option<String>,
         conversation: Option<String>,
     },
+    /// `POST /v1/bots` with a name; the server derives the id.
+    CreateNamedBot {
+        name: String,
+        model: Option<String>,
+        group: Option<String>,
+    },
+    /// Download one avatar. `version` is the server stamp it is fetched for.
+    AvatarFetch {
+        target: AvatarTarget,
+        version: Option<String>,
+    },
+    AvatarUpload {
+        target: AvatarTarget,
+        bytes: Vec<u8>,
+    },
+    AvatarRemove {
+        target: AvatarTarget,
+    },
+    CreateGroup(NewGroup),
+    OnboardingLoad {
+        id: String,
+    },
+    OnboardingStart {
+        id: String,
+    },
+    OnboardingReply {
+        id: String,
+        text: Zeroizing<String>,
+    },
+    OnboardingConfirm {
+        id: String,
+    },
+    SetBotTools {
+        id: String,
+        tools: Vec<String>,
+    },
 }
 
 impl Operation {
@@ -236,6 +277,16 @@ impl Operation {
             Self::BotDetail { .. } => OperationKind::BotDetail,
             Self::UpdateBotConfig { .. } => OperationKind::BotConfigWrite,
             Self::Usage { .. } => OperationKind::Usage,
+            Self::CreateNamedBot { .. } => OperationKind::CreateBot,
+            Self::AvatarFetch { .. } | Self::AvatarUpload { .. } | Self::AvatarRemove { .. } => {
+                OperationKind::Avatar
+            }
+            Self::CreateGroup(_) => OperationKind::CreateGroup,
+            Self::OnboardingLoad { .. } => OperationKind::OnboardingRead,
+            Self::OnboardingStart { .. }
+            | Self::OnboardingReply { .. }
+            | Self::OnboardingConfirm { .. } => OperationKind::OnboardingWrite,
+            Self::SetBotTools { .. } => OperationKind::ToolsWrite,
         }
     }
 }
@@ -288,6 +339,16 @@ pub enum Reply {
         restart_required: bool,
     },
     Usage(UsageReport),
+    /// A fetched avatar as a `data:` URL; `None` when the bot has no image.
+    AvatarImage {
+        target: AvatarTarget,
+        version: Option<String>,
+        data_url: Option<String>,
+    },
+    AvatarSaved(AvatarTarget),
+    CreatedGroup(CreatedGroup),
+    Onboarding(Onboarding),
+    ToolsSaved,
 }
 
 pub struct Job {
@@ -622,6 +683,46 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         } => client
             .usage(*days, bot.as_deref(), conversation.as_deref())
             .map(Reply::Usage),
+        Operation::CreateNamedBot { name, model, group } => client
+            .create_named_bot(name, model.as_deref(), group.as_deref())
+            .map(Reply::CreatedBot),
+        Operation::AvatarFetch { target, version } => {
+            let bytes = match target {
+                AvatarTarget::Bot(id) => client.bot_avatar(id)?,
+                AvatarTarget::Group(id) => client.group_avatar(id)?,
+            };
+            Ok(Reply::AvatarImage {
+                target: target.clone(),
+                version: version.clone(),
+                data_url: bytes.map(|bytes| crate::avatars::png_data_url(&bytes)),
+            })
+        }
+        Operation::AvatarUpload { target, bytes } => {
+            match target {
+                AvatarTarget::Bot(id) => client.set_bot_avatar(id, bytes)?,
+                AvatarTarget::Group(id) => client.set_group_avatar(id, bytes)?,
+            }
+            Ok(Reply::AvatarSaved(target.clone()))
+        }
+        Operation::AvatarRemove { target } => {
+            match target {
+                AvatarTarget::Bot(id) => client.remove_bot_avatar(id)?,
+                AvatarTarget::Group(_) => {
+                    return Err(ApiError::Validation("Group images cannot be removed yet."));
+                }
+            }
+            Ok(Reply::AvatarSaved(target.clone()))
+        }
+        Operation::CreateGroup(group) => client.create_group(group).map(Reply::CreatedGroup),
+        Operation::OnboardingLoad { id } => client.onboarding(id).map(Reply::Onboarding),
+        Operation::OnboardingStart { id } => client.onboarding_start(id).map(Reply::Onboarding),
+        Operation::OnboardingReply { id, text } => {
+            client.onboarding_reply(id, text).map(Reply::Onboarding)
+        }
+        Operation::OnboardingConfirm { id } => client.onboarding_confirm(id).map(Reply::Onboarding),
+        Operation::SetBotTools { id, tools } => {
+            client.set_bot_tools(id, tools).map(|_| Reply::ToolsSaved)
+        }
     }
 }
 

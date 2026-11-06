@@ -3,6 +3,8 @@
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui;
 #[cfg(any(windows, feature = "ui-check"))]
+mod ui_bots;
+#[cfg(any(windows, feature = "ui-check"))]
 mod ui_connectors;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_dock;

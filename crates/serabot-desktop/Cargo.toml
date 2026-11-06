@@ -11,6 +11,7 @@ publish = false
 ui-check = ["dep:dioxus"]
 
 [dependencies]
+base64 = "0.22"
 dioxus = { version = "0.7", optional = true, default-features = false, features = ["macro", "html", "hooks", "signals", "document"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 secrecy = "0.8"
