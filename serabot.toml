@@ -280,13 +280,20 @@ min_text_chars = 200
 
 [browser]
 enabled = false
-provider = "spawn_cdp"
+# "spawn": a headless Chromium per active user (loopback CDP, random port).
+provider = "spawn"
+# Empty = auto-detect chromium, chromium-browser, /snap/bin/chromium, google-chrome.
 chromium_executable = ""
 remote_debugging_host = "127.0.0.1"
 remote_debugging_port = 9222
 browseros_neo_base = "http://127.0.0.1:7333"
+# Base directory for per-user profiles (<dir>/<user_id>); empty = <database dir>/browser.
 user_data_dir = ""
 request_timeout_secs = 30
+max_sessions = 2
+idle_timeout_secs = 600
+# Only for a root service user or a host without user namespaces.
+no_sandbox = false
 
 # OAuth connectors stay off until the age store has the named keys.
 # redirect_uri, when set, must be loopback http://127.0.0.1:<port>/<path>.
