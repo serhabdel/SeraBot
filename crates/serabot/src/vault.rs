@@ -21,5 +21,7 @@ pub fn resolve_for_browser(
     host: &str,
 ) -> Result<Zeroizing<String>> {
     let _ = (users, user_id, name, host);
-    Err(SeraError::Validation("the vault is not available yet".into()))
+    Err(SeraError::Validation(
+        "the vault is not available yet".into(),
+    ))
 }

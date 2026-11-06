@@ -293,6 +293,9 @@ collapsible release notes, **Install and restart**, **Later**, and
   footer and **Settings → Updates** show a developer build. Forks that publish
   their own releases can set the variable when building.
 
+## Layout (0.14, design B)
+
+A 58 px icon rail (Chat, Bots, Approvals with a pending count, Memory, Connectors, AI providers; Settings and the account menu at the bottom), a 250 px conversation list (Chat only), and the chat column with its header (bot avatar, status pill, Vault button). The details inspector and the browser dock slide in from the right and leave the same way. `ui_vault.rs` (`VaultSheet`) and `ui_dock.rs` (`BrowserDock`) are placeholders for the vault and server-browser work: the dock stays hidden behind a state flag in `Shell`, and the sheet shows an empty state with a disabled "Add secret". Motion follows `prefers-reduced-motion` (cross-fades) and `prefers-reduced-transparency` (solid surfaces).
 ## Known limitations
 
 - The desktop client cannot cancel work already accepted by the server when it
