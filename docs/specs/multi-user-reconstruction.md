@@ -219,8 +219,9 @@ scanning, WAL store) changes.
   `role=admin`. SSE streams filter by user.
 - **Console login**: the existing `web.rs` public pages gain `/login` — a
   minimal page with a "Sign in with Microsoft" link that starts the OIDC
-  flow; after the callback the page shows the new session token once for
-  pasting into the desktop/mobile clients (same UX as `serabot token` today).
+  flow; native clients receive their session through the PKCE-bound handoff
+  (see `native-signin-contract.md`), and the web page only confirms sign-in:
+  no token is ever displayed or pasted.
   No new frontend framework.
 - **Telegram is per-user linkable, configured from the desktop app.** The
   server keeps one bot token (age store, admin-managed, unchanged). A

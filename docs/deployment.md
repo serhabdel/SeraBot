@@ -249,12 +249,25 @@ closed while it is off, so an upgrade changes nothing until you opt in.
    printf '%s' "$CLIENT_ID" | runuser -u serabot -- /opt/serabot/serabot --config /etc/serabot/serabot.toml secrets set auth_client_id
    ```
 3. Set `[auth] enabled = true`, `base_url` to the public HTTPS origin, and
-   `max_users`. Keep `providers = ["microsoft"]`; Google and GitHub are
+   `max_users`. `tenant = "consumers"` (personal accounts), `common`, and
+   `organizations` all work: `consumers` is mapped to Microsoft's consumer
+   tenant GUID for discovery, and for `common`/`organizations` each id_token's
+   `iss` must equal `https://login.microsoftonline.com/<its tid>/v2.0`.
+   Optionally set `admin_email` to your own Microsoft account email: the first
+   sign-in with that verified email claims the existing admin row (keeping all
+   backfilled data, no invite needed) while that row has no Microsoft subject
+   yet. Use it only with a tenant whose email claims you trust (`consumers` or
+   your own tenant). Keep `providers = ["microsoft"]`; Google and GitHub are
    accepted in config but reported disabled until they are implemented.
 4. Restart the service. The bootstrap admin account already exists (created by
    migration 0008) and the operator's existing API and CLI tokens keep working
    as the admin's sessions — nothing is re-issued.
-5. Mint an invite for each member and send them the code out of band:
+5. Desktop and mobile apps sign in with the handoff flow
+   (`docs/specs/native-signin-contract.md`); users never see or paste a token.
+   On start the service sends `SeraBot <version> started` to the admin's linked
+   Telegram chat (through the normal notifier path; logged, not fatal, if it
+   cannot be delivered).
+6. Mint an invite for each member and send them the code out of band:
    ```bash
    curl -sS -X POST -H "Authorization: Bearer $TOKEN" \
      -H 'Content-Type: application/json' -d '{"uses":1}' \

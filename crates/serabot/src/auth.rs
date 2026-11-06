@@ -28,8 +28,9 @@
 //! # Secrets
 //!
 //! The OAuth client id comes from the age store at startup and is never
-//! logged; `Debug` redacts it. Session tokens are 32 random bytes shown to
-//! the user exactly once and stored only as SHA-256 hex — the same shape as
+//! logged; `Debug` redacts it. Session tokens are 32 random bytes handed to
+//! the client exactly once (over the PKCE-bound handoff, never displayed to
+//! the user) and stored only as SHA-256 hex — the same shape as
 //! the operator CLI device tokens, which remain valid and now belong to the
 //! admin. IdP-returned tokens are used in memory and never persisted.
 //!
@@ -49,6 +50,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures::StreamExt;
 use openidconnect::core::{
     CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreIdTokenClaims, CoreIdTokenVerifier,
@@ -71,8 +74,8 @@ use crate::config::{AuthConfig, Config, KNOWN_AUTH_PROVIDERS};
 use crate::error::{Result, SeraError};
 use crate::fleet::FleetRegistry;
 use crate::secrets::SharedSecrets;
-use crate::store::{Store, User};
-use crate::util::{sha256_hex, truncate_chars};
+use crate::store::{Store, User, UserStatus};
+use crate::util::{constant_time_eq, sha256_hex, truncate_chars};
 
 /// A pending browser login, alive only until the callback or this TTL.
 pub const LOGIN_STATE_TTL: Duration = Duration::from_secs(10 * 60);
@@ -88,6 +91,206 @@ const MAX_CODE_CHARS: usize = 2048;
 const INVITE_CODE_BYTES: usize = 32;
 /// Redirect path the IdP returns the browser to, relative to `base_url`.
 const CALLBACK_PATH: &str = "/v1/auth/callback";
+/// Microsoft's consumer (personal account) tenant. Its discovery document
+/// reports this GUID as the issuer, never the `consumers` alias.
+pub const CONSUMERS_TENANT_ID: &str = "9188040d-6c67-4c5b-b112-36a304b66dad";
+/// Issuer shape for the multi-tenant aliases: Microsoft publishes the literal
+/// `{tenantid}` placeholder in discovery, and each id_token carries the real
+/// tenant in `iss`.
+const MICROSOFT_ISSUER_TEMPLATE: &str = "https://login.microsoftonline.com/{tenantid}/v2.0";
+/// How long a one-time handoff code stays redeemable.
+pub const HANDOFF_TTL: chrono::Duration = chrono::Duration::seconds(120);
+/// Fixed mobile redirect for the handoff.
+const MOBILE_RETURN_TO: &str = "serabot://auth";
+
+/// Where discovery happens and how id_token issuers are checked for a
+/// configured Microsoft tenant: `(issuer URL, templated)`.
+///
+/// `consumers` maps to the consumer tenant GUID (what Microsoft reports as
+/// the issuer). `common` and `organizations` publish a `{tenantid}` template,
+/// so the discovered issuer cannot equal the configured URL and each token's
+/// `iss` is matched against its own `tid` claim instead. Any other value is a
+/// concrete tenant id whose issuer is exact.
+fn microsoft_issuer(tenant: &str) -> (String, bool) {
+    let tenant = tenant.trim();
+    if tenant.eq_ignore_ascii_case("consumers") {
+        (
+            format!("https://login.microsoftonline.com/{CONSUMERS_TENANT_ID}/v2.0"),
+            false,
+        )
+    } else if tenant.eq_ignore_ascii_case("common") || tenant.eq_ignore_ascii_case("organizations")
+    {
+        (
+            format!(
+                "https://login.microsoftonline.com/{}/v2.0",
+                tenant.to_ascii_lowercase()
+            ),
+            true,
+        )
+    } else {
+        (
+            format!("https://login.microsoftonline.com/{tenant}/v2.0"),
+            false,
+        )
+    }
+}
+
+/// A native client's handoff request, validated: where to send the browser
+/// back, the S256 challenge the later redemption must satisfy, and the
+/// client's own anti-CSRF state echoed on the redirect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoffRequest {
+    pub return_to: String,
+    pub challenge: String,
+    pub client_state: String,
+}
+
+impl HandoffRequest {
+    /// Validate the optional trio from `login/start`. All three or none:
+    /// `Ok(None)` is the legacy web page flow; a partial set, a `return_to`
+    /// outside the allowlist, or malformed values are rejected.
+    pub fn parse(
+        return_to: Option<&str>,
+        challenge: Option<&str>,
+        client_state: Option<&str>,
+    ) -> Result<Option<Self>> {
+        match (return_to, challenge, client_state) {
+            (None, None, None) => Ok(None),
+            (Some(return_to), Some(challenge), Some(client_state)) => {
+                let return_to = return_to.trim();
+                validate_return_to(return_to)?;
+                let challenge = challenge.trim();
+                if challenge.len() != 43 || !challenge.chars().all(is_base64url) {
+                    return Err(SeraError::Validation(
+                        "handoff_challenge must be a 43-character base64url SHA-256 digest".into(),
+                    ));
+                }
+                let client_state = client_state.trim();
+                if client_state.len() < 8
+                    || client_state.len() > 128
+                    || !client_state
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || "-._~+/=".contains(c))
+                {
+                    return Err(SeraError::Validation(
+                        "client_state must be 8-128 URL-safe characters".into(),
+                    ));
+                }
+                Ok(Some(Self {
+                    return_to: return_to.to_owned(),
+                    challenge: challenge.to_owned(),
+                    client_state: client_state.to_owned(),
+                }))
+            }
+            _ => Err(SeraError::Validation(
+                "return_to, handoff_challenge, and client_state must be given together".into(),
+            )),
+        }
+    }
+}
+
+fn is_base64url(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
+
+/// The strict `return_to` allowlist: the mobile scheme, or the desktop
+/// loopback listener on a non-privileged port. Nothing else, no query.
+pub fn validate_return_to(value: &str) -> Result<()> {
+    if value == MOBILE_RETURN_TO {
+        return Ok(());
+    }
+    let reject = || SeraError::Validation("return_to is not an allowed redirect".into());
+    let url = Url::parse(value).map_err(|_| reject())?;
+    let port = url.port().ok_or_else(reject)?;
+    if url.scheme() != "http"
+        || url.host_str() != Some("127.0.0.1")
+        || !(1024..=65535).contains(&port)
+        || url.path() != "/auth-done"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || value != format!("http://127.0.0.1:{port}/auth-done")
+    {
+        return Err(reject());
+    }
+    Ok(())
+}
+
+/// Why a sign-in could not complete, as the short code appended to the
+/// client's `return_to` (`?error=<code>`). Carries no provider detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignInFailure {
+    Denied,
+    InviteRequired,
+    InviteInvalid,
+    Disabled,
+    MaxUsers,
+    Server,
+}
+
+impl SignInFailure {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Denied => "denied",
+            Self::InviteRequired => "invite_required",
+            Self::InviteInvalid => "invite_invalid",
+            Self::Disabled => "disabled",
+            Self::MaxUsers => "max_users",
+            Self::Server => "server",
+        }
+    }
+
+    fn classify(error: &SeraError) -> Self {
+        match error {
+            SeraError::Forbidden(message) if message.contains("invitation is required") => {
+                Self::InviteRequired
+            }
+            SeraError::Forbidden(_) => Self::Denied,
+            SeraError::InvalidState(message) if message.contains("invitation") => {
+                Self::InviteInvalid
+            }
+            SeraError::InvalidState(message) if message.contains("user limit") => Self::MaxUsers,
+            SeraError::InvalidState(message) if message.contains("disabled") => Self::Disabled,
+            _ => Self::Server,
+        }
+    }
+}
+
+/// What the browser is told after the callback.
+#[derive(Debug)]
+pub struct CallbackResult {
+    /// The native client's handoff request, when the sign-in carried one.
+    pub handoff: Option<HandoffRequest>,
+    pub outcome: std::result::Result<User, (SignInFailure, SeraError)>,
+}
+
+/// A redeemed handoff: a freshly minted session for the signed-in user.
+#[derive(Debug)]
+pub struct HandoffGrant {
+    pub token: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub user: User,
+}
+
+/// Build the `302` target for a native client: `return_to` plus either the
+/// one-time `handoff` code or a short `error` code, and the client's `state`.
+pub fn handoff_redirect(
+    request: &HandoffRequest,
+    result: std::result::Result<&str, SignInFailure>,
+) -> String {
+    let mut url = Url::parse(&request.return_to)
+        .unwrap_or_else(|_| Url::parse(MOBILE_RETURN_TO).expect("static url"));
+    {
+        let mut query = url.query_pairs_mut();
+        match result {
+            Ok(code) => query.append_pair("handoff", code),
+            Err(failure) => query.append_pair("error", failure.code()),
+        };
+        query.append_pair("state", &request.client_state);
+    }
+    url.to_string()
+}
 
 /// One row of the public providers list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -117,6 +320,7 @@ struct PendingLogin {
     nonce: Nonce,
     verifier: PkceCodeVerifier,
     invite_hash: Option<String>,
+    handoff: Option<HandoffRequest>,
     created: Instant,
 }
 
@@ -163,6 +367,11 @@ pub struct AuthService {
     invite_ttl: chrono::Duration,
     max_users: usize,
     issuer_url: IssuerUrl,
+    /// `Some(template)` for the multi-tenant aliases (`common`,
+    /// `organizations`): the discovery document publishes this literal
+    /// template and tokens are matched against their own `tid` claim.
+    issuer_template: Option<String>,
+    admin_email: Option<String>,
     login_ttl: Duration,
     pending: Mutex<HashMap<String, PendingLogin>>,
     provider_cache: Mutex<Option<ProviderSnapshot>>,
@@ -211,10 +420,10 @@ impl AuthService {
             ));
         }
         let tenant = auth.tenant.trim().to_owned();
-        let issuer_url = IssuerUrl::new(format!("https://login.microsoftonline.com/{tenant}/v2.0"))
-            .map_err(|_| {
-                SeraError::Config("auth tenant does not form a valid issuer URL".into())
-            })?;
+        let (issuer, templated) = microsoft_issuer(&tenant);
+        let issuer_url = IssuerUrl::new(issuer).map_err(|_| {
+            SeraError::Config("auth tenant does not form a valid issuer URL".into())
+        })?;
         let base = auth.base_url.trim().trim_end_matches('/');
         let redirect_url = RedirectUrl::new(format!("{base}{CALLBACK_PATH}")).map_err(|_| {
             SeraError::Config("auth.base_url does not form a valid redirect".into())
@@ -236,6 +445,8 @@ impl AuthService {
             invite_ttl: chrono::Duration::hours(auth.invite_ttl_hours as i64),
             max_users: auth.max_users,
             issuer_url,
+            issuer_template: templated.then(|| MICROSOFT_ISSUER_TEMPLATE.to_owned()),
+            admin_email: Some(auth.admin_email.trim().to_owned()).filter(|email| !email.is_empty()),
             login_ttl: LOGIN_STATE_TTL,
             pending: Mutex::new(HashMap::new()),
             provider_cache: Mutex::new(None),
@@ -309,6 +520,19 @@ impl AuthService {
     /// here; it is consumed at the callback, inside the transaction that
     /// creates the user, so a failed or abandoned login never burns it.
     pub async fn login_start(&self, provider: &str, invite_code: Option<&str>) -> Result<String> {
+        self.login_start_with_handoff(provider, invite_code, None)
+            .await
+    }
+
+    /// [`Self::login_start`] for a native client: the validated
+    /// [`HandoffRequest`] rides with the pending login so the callback can
+    /// answer the browser with a redirect back to the app.
+    pub async fn login_start_with_handoff(
+        &self,
+        provider: &str,
+        invite_code: Option<&str>,
+        handoff: Option<HandoffRequest>,
+    ) -> Result<String> {
         if !self.enabled {
             return Err(SeraError::Forbidden("sign-in is disabled".into()));
         }
@@ -370,6 +594,7 @@ impl AuthService {
             nonce,
             verifier: pkce_verifier,
             invite_hash,
+            handoff,
             created: now,
         };
         if pending.insert(state.clone(), login).is_some() {
@@ -385,6 +610,47 @@ impl AuthService {
     /// a session. Returns the user and the raw session token — shown to the
     /// user exactly once, never stored in the clear.
     pub async fn callback(&self, state: &str, code: &str) -> Result<(User, String)> {
+        let result = self.callback_login(state, code).await;
+        let user = result.outcome.map_err(|(_, error)| error)?;
+        let token = self.store.mint_session(&user.id, self.session_ttl)?;
+        Ok((user, token))
+    }
+
+    /// Complete a browser sign-in without issuing a session. The account is
+    /// verified, created or refreshed (consuming an invite when new), and
+    /// audited; the caller decides what the browser sees. A native client's
+    /// [`HandoffRequest`] is returned even on failure so the browser can be
+    /// sent back with a short error code.
+    pub async fn callback_login(&self, state: &str, code: &str) -> CallbackResult {
+        let pending = match self.take_pending(state).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                return CallbackResult {
+                    handoff: None,
+                    outcome: Err((SignInFailure::classify(&error), error)),
+                };
+            }
+        };
+        let handoff = pending.handoff.clone();
+        let outcome = self
+            .finish_login(pending, code)
+            .await
+            .map_err(|error| (SignInFailure::classify(&error), error));
+        CallbackResult { handoff, outcome }
+    }
+
+    /// The provider redirected back with an error instead of a code (the
+    /// user declined, or consent failed). Consumes the pending login and
+    /// returns the native client's handoff request, if any, so the browser
+    /// can be sent back with `error=denied`.
+    pub async fn callback_denied(&self, state: &str) -> Option<HandoffRequest> {
+        self.take_pending(state)
+            .await
+            .ok()
+            .and_then(|pending| pending.handoff)
+    }
+
+    async fn take_pending(&self, state: &str) -> Result<PendingLogin> {
         if !self.enabled {
             return Err(SeraError::Forbidden("sign-in is disabled".into()));
         }
@@ -394,25 +660,25 @@ impl AuthService {
                 "unknown or expired sign-in state".into(),
             ));
         }
+        let mut pending = self.pending.lock().await;
+        let login = pending
+            .remove(state)
+            .ok_or_else(|| SeraError::InvalidState("unknown or expired sign-in state".into()))?;
+        if Instant::now().duration_since(login.created) > self.login_ttl {
+            return Err(SeraError::InvalidState(
+                "unknown or expired sign-in state".into(),
+            ));
+        }
+        Ok(login)
+    }
+
+    async fn finish_login(&self, pending: PendingLogin, code: &str) -> Result<User> {
         let code = code.trim();
         if code.is_empty() || code.len() > MAX_CODE_CHARS || code.chars().any(char::is_control) {
             return Err(SeraError::Validation(
                 "the authorization code is invalid".into(),
             ));
         }
-        let pending = {
-            let mut pending = self.pending.lock().await;
-            let login = pending.remove(state).ok_or_else(|| {
-                SeraError::InvalidState("unknown or expired sign-in state".into())
-            })?;
-            if Instant::now().duration_since(login.created) > self.login_ttl {
-                return Err(SeraError::InvalidState(
-                    "unknown or expired sign-in state".into(),
-                ));
-            }
-            login
-        };
-
         let snapshot = self.provider_snapshot().await?;
         let client = snapshot.client(&self.client_id, &self.redirect_url);
         let token_response = client
@@ -473,13 +739,19 @@ impl AuthService {
         let email = sanitize_profile(email, 320);
         let display_name = sanitize_profile(name, 200);
 
-        let outcome = self.store.complete_login(
+        let outcome = self.store.complete_login_claiming(
             &provider_subject,
             &email,
             &display_name,
             pending.invite_hash.as_deref(),
             self.max_users,
+            self.admin_email.as_deref(),
         )?;
+        if outcome.user.status != UserStatus::Active {
+            return Err(SeraError::InvalidState(
+                "this account is disabled; sign-in was refused".into(),
+            ));
+        }
         // Post-login hook: a brand-new account gets the default fleet in the
         // same request. A failure is logged and left to the registry's lazy
         // seed, so a seeding problem never locks the new user out.
@@ -508,10 +780,93 @@ impl AuthService {
         ) {
             warn!(%error, "login audit write failed");
         }
-        let token = self
+        Ok(outcome.user)
+    }
+
+    /// Issue the one-time handoff code for a verified sign-in: 32 random
+    /// bytes (base64url), only the SHA-256 hash persisted, bound to the
+    /// client's challenge and the user, valid for [`HANDOFF_TTL`].
+    pub fn issue_handoff(&self, user: &User, request: &HandoffRequest) -> Result<String> {
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        let code = URL_SAFE_NO_PAD.encode(bytes);
+        self.store.create_handoff(
+            &sha256_hex(&code),
+            &request.challenge,
+            &user.id,
+            HANDOFF_TTL,
+        )?;
+        self.audit(&user.id, "auth.handoff.issued", json!({}));
+        Ok(code)
+    }
+
+    /// Redeem a handoff code with the client's verifier. The code is burned
+    /// on every attempt; a wrong verifier, expiry, reuse, an unknown code, or
+    /// a since-disabled account all return the same generic
+    /// [`SeraError::Validation`] and mint nothing.
+    pub fn redeem_handoff(&self, code: &str, verifier: &str) -> Result<HandoffGrant> {
+        let invalid = || SeraError::Validation("invalid handoff".into());
+        if !self.enabled {
+            return Err(SeraError::Forbidden("sign-in is disabled".into()));
+        }
+        if code.is_empty() || code.len() > 256 {
+            self.audit(
+                "anonymous",
+                "auth.handoff.failed",
+                json!({"reason": "shape"}),
+            );
+            return Err(invalid());
+        }
+        // Burn first: whatever happens next, this code can never be tried again.
+        let Some((challenge, user_id, unexpired)) = self.store.take_handoff(&sha256_hex(code))?
+        else {
+            self.audit(
+                "anonymous",
+                "auth.handoff.failed",
+                json!({"reason": "unknown"}),
+            );
+            return Err(invalid());
+        };
+        let digest =
+            URL_SAFE_NO_PAD.encode(<sha2::Sha256 as sha2::Digest>::digest(verifier.as_bytes()));
+        let verified = (43..=128).contains(&verifier.len())
+            && verifier
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c))
+            && constant_time_eq(&digest, &challenge);
+        if !unexpired || !verified {
+            let reason = if unexpired { "verifier" } else { "expired" };
+            self.audit(&user_id, "auth.handoff.failed", json!({"reason": reason}));
+            return Err(invalid());
+        }
+        let user = match self.store.get_user(&user_id)? {
+            Some(user) if user.status == UserStatus::Active => user,
+            _ => {
+                self.audit(&user_id, "auth.handoff.failed", json!({"reason": "user"}));
+                return Err(invalid());
+            }
+        };
+        let token = self.store.mint_session(&user.id, self.session_ttl)?;
+        let expires_at = self
             .store
-            .mint_session(&outcome.user.id, self.session_ttl)?;
-        Ok((outcome.user, token))
+            .device_token_by_hash(&sha256_hex(&token))?
+            .and_then(|record| record.expires_at)
+            .unwrap_or_else(|| chrono::Utc::now() + self.session_ttl);
+        self.audit(&user.id, "auth.handoff.redeemed", json!({}));
+        Ok(HandoffGrant {
+            token,
+            expires_at,
+            user,
+        })
+    }
+
+    fn audit(&self, actor: &str, event: &str, details: serde_json::Value) {
+        if let Err(error) =
+            self.store
+                .record_audit(actor, event, None, None, None, None, None, Some(&details))
+        {
+            warn!(%error, event, "auth audit write failed");
+        }
     }
 
     /// Verify the id_token claims: signature via the cached JWKS, plus the
@@ -527,8 +882,14 @@ impl AuthService {
         let verifier = {
             let client_id = ClientId::new(self.client_id.clone());
             let issuer = snapshot.issuer();
+            // Templated tenants (`common`, `organizations`) carry a
+            // different `iss` per tenant, so the library's single-issuer
+            // comparison is replaced by the explicit `tid`-bound check
+            // below; it is never simply switched off.
+            let strict = self.issuer_template.is_none();
             move |jwks: CoreJsonWebKeySet| {
                 CoreIdTokenVerifier::new_public_client(client_id.clone(), issuer.clone(), jwks)
+                    .require_issuer_match(strict)
             }
         };
         let claims = match id_token.claims(&verifier(snapshot.jwks()), nonce) {
@@ -550,6 +911,12 @@ impl AuthService {
                     .map_err(map_verification_error)?
             }
         };
+        if let Some(template) = &self.issuer_template {
+            let tid = serde_json::to_value(id_token)
+                .ok()
+                .and_then(|value| value.as_str().and_then(jwt_string_claim_tid));
+            check_templated_issuer(template, Some(claims.issuer().as_str()), tid.as_deref())?;
+        }
         Ok(claims)
     }
 
@@ -562,15 +929,42 @@ impl AuthService {
         if let Some(snapshot) = cache.as_ref() {
             return Ok(snapshot.clone());
         }
-        let issuer_url = self.issuer_url.clone();
-        let metadata = CoreProviderMetadata::discover_async(issuer_url, |request| async {
-            self.execute(request).await
-        })
-        .await
+        let discovery_url = format!(
+            "{}/.well-known/openid-configuration",
+            self.issuer_url.as_str().trim_end_matches('/')
+        );
+        let request = HttpRequest {
+            url: Url::parse(&discovery_url)
+                .map_err(|_| SeraError::Config("discovery URL is not valid".into()))?,
+            method: openidconnect::http::Method::GET,
+            headers: [(
+                openidconnect::http::header::ACCEPT,
+                HeaderValue::from_static("application/json"),
+            )]
+            .into_iter()
+            .collect(),
+            body: Vec::new(),
+        };
+        let response = self.execute(request).await?;
+        let metadata = parse_discovery(
+            response.status_code,
+            &response.body,
+            &self.issuer_url,
+            self.issuer_template.as_deref(),
+        )
         .map_err(|error| {
             warn!(%error, "openid discovery failed");
             SeraError::External("identity provider discovery failed".into())
         })?;
+        let jwks = CoreJsonWebKeySet::fetch_async(metadata.jwks_uri(), |request| async {
+            self.execute(request).await
+        })
+        .await
+        .map_err(|error| {
+            warn!(%error, "openid discovery failed fetching keys");
+            SeraError::External("identity provider discovery failed".into())
+        })?;
+        let metadata = metadata.set_jwks(jwks);
         let snapshot = ProviderSnapshot {
             jwks_url: metadata.jwks_uri().clone(),
             metadata,
@@ -668,6 +1062,80 @@ fn map_verification_error(error: ClaimsVerificationError) -> SeraError {
     SeraError::Forbidden("sign-in could not be verified".into())
 }
 
+/// Parse and validate a discovery response. A fixed tenant must report
+/// exactly the expected issuer; a templated tenant (`common`,
+/// `organizations`) must report exactly the published template, which is then
+/// swapped for the configured URL so the metadata is internally consistent.
+/// Per-token issuers are enforced separately by [`check_templated_issuer`].
+fn parse_discovery(
+    status: StatusCode,
+    body: &[u8],
+    expected: &IssuerUrl,
+    template: Option<&str>,
+) -> Result<CoreProviderMetadata> {
+    if status != StatusCode::OK {
+        return Err(SeraError::External(format!(
+            "discovery returned HTTP status {status}"
+        )));
+    }
+    let mut document: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| SeraError::External("discovery document is not valid JSON".into()))?;
+    let issuer = document
+        .get("issuer")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| SeraError::External("discovery document has no issuer".into()))?
+        .to_owned();
+    match template {
+        Some(template) => {
+            if issuer != template {
+                return Err(SeraError::External(format!(
+                    "unexpected issuer URI `{issuer}` (expected `{template}`)"
+                )));
+            }
+            document["issuer"] = json!(expected.as_str());
+        }
+        None => {
+            if issuer != expected.as_str() {
+                return Err(SeraError::External(format!(
+                    "unexpected issuer URI `{issuer}` (expected `{}`)",
+                    expected.as_str()
+                )));
+            }
+        }
+    }
+    serde_json::from_value::<CoreProviderMetadata>(document)
+        .map_err(|error| SeraError::External(format!("discovery document is invalid: {error}")))
+}
+
+/// Read the `tid` (tenant id) claim from a compact JWT's payload. Only used
+/// after the signature has been verified; it never grants trust on its own.
+fn jwt_string_claim_tid(jwt: &str) -> Option<String> {
+    let payload = jwt.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value.get("tid")?.as_str().map(str::to_owned)
+}
+
+/// For templated tenants the token's `iss` must be the template filled with
+/// the token's own `tid` claim — never skipped, never a different tenant's.
+fn check_templated_issuer(template: &str, iss: Option<&str>, tid: Option<&str>) -> Result<()> {
+    let denied = || SeraError::Forbidden("sign-in could not be verified".into());
+    let tid = tid.ok_or_else(denied)?;
+    if tid.is_empty()
+        || tid.len() > 64
+        || !tid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        warn!("id_token tid claim is malformed");
+        return Err(denied());
+    }
+    let expected = template.replace("{tenantid}", tid);
+    if iss != Some(expected.as_str()) {
+        warn!("id_token issuer does not match its tenant id");
+        return Err(denied());
+    }
+    Ok(())
+}
+
 /// Require HTTPS, except for loopback hosts used by the test mock provider.
 /// Credentials, queries, and fragments are always rejected.
 fn validate_issuer(value: &str) -> Result<IssuerUrl> {
@@ -736,12 +1204,21 @@ pub(crate) mod test_idp {
     }
 
     pub(crate) async fn mock_idp() -> MockIdp {
+        mock_idp_with_doc_issuer(None).await
+    }
+
+    /// Like [`mock_idp`], but the discovery document reports `doc_issuer`
+    /// (e.g. Microsoft's `{tenantid}` template) instead of the server URL.
+    pub(crate) async fn mock_idp_with_doc_issuer(doc_issuer: Option<&str>) -> MockIdp {
         let server = MockServer::start().await;
         let issuer = server.uri();
+        let doc_issuer = doc_issuer
+            .map(str::to_owned)
+            .unwrap_or_else(|| issuer.clone());
         Mock::given(method("GET"))
             .and(path("/.well-known/openid-configuration"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "issuer": issuer,
+                "issuer": doc_issuer,
                 "authorization_endpoint": format!("{issuer}/authorize"),
                 "token_endpoint": format!("{issuer}/token"),
                 "jwks_uri": format!("{issuer}/jwks"),
@@ -787,8 +1264,18 @@ pub(crate) mod test_idp {
     /// Sign a synthetic id_token with the test key. The nonce and issuer must
     /// match what the service expects, exactly like a real provider.
     pub(crate) fn synthetic_id_token(issuer: &str, nonce: &str, subject: &str) -> String {
+        synthetic_id_token_with_tid(issuer, nonce, subject, None)
+    }
+
+    /// [`synthetic_id_token`] with an optional Microsoft-style `tid` claim.
+    pub(crate) fn synthetic_id_token_with_tid(
+        issuer: &str,
+        nonce: &str,
+        subject: &str,
+        tid: Option<&str>,
+    ) -> String {
         let now = chrono::Utc::now().timestamp();
-        let claims = json!({
+        let mut claims = json!({
             "iss": issuer,
             "sub": subject,
             "aud": TEST_CLIENT_ID,
@@ -798,6 +1285,9 @@ pub(crate) mod test_idp {
             "email": "member@example.example",
             "name": "Synthetic Member",
         });
+        if let Some(tid) = tid {
+            claims["tid"] = json!(tid);
+        }
         let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
         header.kid = Some(TEST_KEY_ID.into());
         jsonwebtoken::encode(
@@ -1247,5 +1737,530 @@ mod tests {
         }
         let error = service.login_start("microsoft", None).await.unwrap_err();
         assert!(error.to_string().contains("in flight"));
+    }
+
+    // ---- tenant / issuer handling (synthetic, no network) ----
+
+    const TID_A: &str = "11111111-2222-4333-8444-555555555555";
+    const TID_B: &str = "66666666-7777-4888-8999-000000000000";
+
+    fn discovery_doc(issuer: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "issuer": issuer,
+            "authorization_endpoint": "https://idp.example/authorize",
+            "token_endpoint": "https://idp.example/token",
+            "jwks_uri": "https://idp.example/jwks",
+            "response_types_supported": ["code"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["RS256"],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn tenant_aliases_map_to_the_right_issuer_mode() {
+        let consumers = format!("https://login.microsoftonline.com/{CONSUMERS_TENANT_ID}/v2.0");
+        assert_eq!(microsoft_issuer("consumers"), (consumers.clone(), false));
+        assert_eq!(microsoft_issuer(" Consumers "), (consumers, false));
+        assert_eq!(
+            microsoft_issuer("common"),
+            ("https://login.microsoftonline.com/common/v2.0".into(), true)
+        );
+        assert_eq!(
+            microsoft_issuer("organizations"),
+            (
+                "https://login.microsoftonline.com/organizations/v2.0".into(),
+                true
+            )
+        );
+        assert_eq!(
+            microsoft_issuer(TID_A),
+            (
+                format!("https://login.microsoftonline.com/{TID_A}/v2.0"),
+                false
+            )
+        );
+        // The prod config (`consumers`) now discovers at the tenant GUID.
+        let service = service(&test_config(), test_store());
+        assert_eq!(
+            service.issuer_url.as_str(),
+            format!("https://login.microsoftonline.com/{CONSUMERS_TENANT_ID}/v2.0")
+        );
+        assert!(service.issuer_template.is_none());
+    }
+
+    #[test]
+    fn consumers_discovery_reporting_the_tenant_guid_is_accepted() {
+        // Reproduces the production failure: Microsoft reports the consumer
+        // tenant GUID as issuer. The old alias-based expectation rejected it.
+        let guid_issuer = format!("https://login.microsoftonline.com/{CONSUMERS_TENANT_ID}/v2.0");
+        let body = discovery_doc(&guid_issuer);
+        let alias =
+            IssuerUrl::new("https://login.microsoftonline.com/consumers/v2.0".into()).unwrap();
+        let error = parse_discovery(StatusCode::OK, &body, &alias, None).unwrap_err();
+        assert!(error.to_string().contains("unexpected issuer"));
+
+        let expected = IssuerUrl::new(guid_issuer.clone()).unwrap();
+        let metadata = parse_discovery(StatusCode::OK, &body, &expected, None).unwrap();
+        assert_eq!(metadata.issuer().as_str(), guid_issuer);
+        // A different tenant's document is still rejected.
+        let other =
+            IssuerUrl::new(format!("https://login.microsoftonline.com/{TID_A}/v2.0")).unwrap();
+        assert!(parse_discovery(StatusCode::OK, &body, &other, None).is_err());
+        // Non-200 and non-JSON bodies fail closed.
+        assert!(parse_discovery(StatusCode::NOT_FOUND, &body, &expected, None).is_err());
+        assert!(parse_discovery(StatusCode::OK, b"<html>", &expected, None).is_err());
+    }
+
+    #[test]
+    fn templated_discovery_requires_the_exact_microsoft_template() {
+        let expected =
+            IssuerUrl::new("https://login.microsoftonline.com/common/v2.0".into()).unwrap();
+        let body = discovery_doc(MICROSOFT_ISSUER_TEMPLATE);
+        let metadata = parse_discovery(
+            StatusCode::OK,
+            &body,
+            &expected,
+            Some(MICROSOFT_ISSUER_TEMPLATE),
+        )
+        .unwrap();
+        assert_eq!(metadata.issuer().as_str(), expected.as_str());
+        // A concrete tenant issuer in a templated authority is not accepted.
+        let concrete = discovery_doc(&format!("https://login.microsoftonline.com/{TID_A}/v2.0"));
+        assert!(
+            parse_discovery(
+                StatusCode::OK,
+                &concrete,
+                &expected,
+                Some(MICROSOFT_ISSUER_TEMPLATE)
+            )
+            .is_err()
+        );
+        // And the template is not accepted by a fixed-tenant service.
+        assert!(parse_discovery(StatusCode::OK, &body, &expected, None).is_err());
+    }
+
+    #[test]
+    fn templated_issuer_is_bound_to_the_tokens_own_tenant() {
+        let template = MICROSOFT_ISSUER_TEMPLATE;
+        let iss_a = format!("https://login.microsoftonline.com/{TID_A}/v2.0");
+        assert!(check_templated_issuer(template, Some(&iss_a), Some(TID_A)).is_ok());
+        // Issuer from a different tenant than the tid claim.
+        assert!(check_templated_issuer(template, Some(&iss_a), Some(TID_B)).is_err());
+        // Missing tid, missing iss, malformed tid, foreign host.
+        assert!(check_templated_issuer(template, Some(&iss_a), None).is_err());
+        assert!(check_templated_issuer(template, None, Some(TID_A)).is_err());
+        assert!(check_templated_issuer(template, Some(&iss_a), Some("")).is_err());
+        assert!(check_templated_issuer(template, Some(&iss_a), Some("../x")).is_err());
+        assert!(
+            check_templated_issuer(
+                template,
+                Some(&format!("https://attacker.example/{TID_A}/v2.0")),
+                Some(TID_A)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn tid_is_read_from_the_jwt_payload() {
+        let token = test_idp::synthetic_id_token_with_tid(
+            "https://login.microsoftonline.com/x/v2.0",
+            "n",
+            "s",
+            Some(TID_A),
+        );
+        assert_eq!(jwt_string_claim_tid(&token).as_deref(), Some(TID_A));
+        let none = test_idp::synthetic_id_token("https://x.example", "n", "s");
+        assert_eq!(jwt_string_claim_tid(&none), None);
+        assert_eq!(jwt_string_claim_tid("not-a-jwt"), None);
+    }
+
+    async fn templated_service(store: Store) -> (AuthService, test_idp::MockIdp) {
+        let idp = test_idp::mock_idp_with_doc_issuer(Some(MICROSOFT_ISSUER_TEMPLATE)).await;
+        let mut config = test_config();
+        config.auth.tenant = "common".into();
+        let mut service = service(&config, store);
+        assert!(service.issuer_template.is_some());
+        service.set_issuer_url(&idp.issuer).unwrap();
+        (service, idp)
+    }
+
+    async fn templated_sign_in(
+        service: &AuthService,
+        idp: &test_idp::MockIdp,
+        subject: &str,
+        iss: &str,
+        tid: Option<&str>,
+    ) -> Result<(User, String)> {
+        let admin = service.store.admin_user_id()?;
+        let invite = service.mint_invite(1, &admin)?;
+        let url = service.login_start("microsoft", Some(&invite)).await?;
+        let (state, nonce) = url_params(&url);
+        let code = format!("synthetic-code-{subject}-{state}");
+        let id_token = test_idp::synthetic_id_token_with_tid(iss, &nonce, subject, tid);
+        stub_token(&idp.server, &code, &id_token).await;
+        service.callback(&state, &code).await
+    }
+
+    #[tokio::test]
+    async fn common_and_organizations_accept_matching_tenant_issuers_only() {
+        let store = test_store();
+        let (service, idp) = templated_service(store.clone()).await;
+        let iss_a = format!("https://login.microsoftonline.com/{TID_A}/v2.0");
+        let iss_b = format!("https://login.microsoftonline.com/{TID_B}/v2.0");
+
+        // Discovery works against the templated document and a token whose
+        // issuer matches its own tid is accepted.
+        let (user, _) = templated_sign_in(&service, &idp, "tenant-user", &iss_a, Some(TID_A))
+            .await
+            .unwrap();
+        assert_eq!(user.provider_subject, "microsoft:tenant-user");
+
+        // iss for tenant B but tid says A, no tid at all, or an unrelated
+        // issuer: all rejected and nothing is created.
+        for (subject, iss, tid) in [
+            ("evil-mismatch", iss_b.as_str(), Some(TID_A)),
+            ("evil-no-tid", iss_a.as_str(), None),
+            ("evil-host", "https://attacker.example/v2.0", Some(TID_A)),
+        ] {
+            assert!(
+                templated_sign_in(&service, &idp, subject, iss, tid)
+                    .await
+                    .is_err(),
+                "{subject}"
+            );
+            assert!(
+                store
+                    .get_user_by_subject(&format!("microsoft:{subject}"))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    // ---- handoff ----
+
+    fn challenge_for(verifier: &str) -> String {
+        URL_SAFE_NO_PAD.encode(<sha2::Sha256 as sha2::Digest>::digest(verifier.as_bytes()))
+    }
+
+    fn handoff_request(verifier: &str) -> HandoffRequest {
+        HandoffRequest {
+            return_to: "http://127.0.0.1:51121/auth-done".into(),
+            challenge: challenge_for(verifier),
+            client_state: "client-state-0123456789".into(),
+        }
+    }
+
+    #[test]
+    fn handoff_request_validation_is_strict_and_all_or_none() {
+        let challenge = challenge_for(&"a".repeat(43));
+        let state = "client-state-0123456789";
+        assert_eq!(HandoffRequest::parse(None, None, None).unwrap(), None);
+        for return_to in [
+            "http://127.0.0.1:1024/auth-done",
+            "http://127.0.0.1:65535/auth-done",
+            "serabot://auth",
+        ] {
+            let parsed = HandoffRequest::parse(Some(return_to), Some(&challenge), Some(state))
+                .unwrap()
+                .unwrap();
+            assert_eq!(parsed.return_to, return_to);
+        }
+        for return_to in [
+            "http://127.0.0.1:1023/auth-done",
+            "http://127.0.0.1:65536/auth-done",
+            "http://127.0.0.1:051121/auth-done",
+            "https://127.0.0.1:51121/auth-done",
+            "http://127.0.0.1/auth-done",
+            "http://127.0.0.1:51121/auth-done/",
+            "http://127.0.0.1:51121/auth-done#x",
+            "http://[::1]:51121/auth-done",
+            "serabot://auth?x=1",
+            "serabot://auth/",
+            "",
+        ] {
+            assert!(
+                HandoffRequest::parse(Some(return_to), Some(&challenge), Some(state)).is_err(),
+                "{return_to}"
+            );
+        }
+        assert!(HandoffRequest::parse(Some("serabot://auth"), None, None).is_err());
+        assert!(HandoffRequest::parse(None, Some(&challenge), Some(state)).is_err());
+        assert!(HandoffRequest::parse(Some("serabot://auth"), Some("short"), Some(state)).is_err());
+        assert!(
+            HandoffRequest::parse(
+                Some("serabot://auth"),
+                Some(&challenge),
+                Some("a b c d e f g h")
+            )
+            .is_err()
+        );
+        assert!(
+            HandoffRequest::parse(
+                Some("serabot://auth"),
+                Some(&challenge),
+                Some(&"s".repeat(200))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn handoff_redirects_carry_code_or_error_plus_state() {
+        let request = handoff_request(&"a".repeat(43));
+        assert_eq!(
+            handoff_redirect(&request, Ok("CODE_1-x")),
+            "http://127.0.0.1:51121/auth-done?handoff=CODE_1-x&state=client-state-0123456789"
+        );
+        assert_eq!(
+            handoff_redirect(&request, Err(SignInFailure::InviteRequired)),
+            "http://127.0.0.1:51121/auth-done?error=invite_required&state=client-state-0123456789"
+        );
+        let mobile = HandoffRequest {
+            return_to: "serabot://auth".into(),
+            ..request
+        };
+        assert_eq!(
+            handoff_redirect(&mobile, Ok("C")),
+            "serabot://auth?handoff=C&state=client-state-0123456789"
+        );
+        for (failure, code) in [
+            (SignInFailure::Denied, "denied"),
+            (SignInFailure::InviteRequired, "invite_required"),
+            (SignInFailure::InviteInvalid, "invite_invalid"),
+            (SignInFailure::Disabled, "disabled"),
+            (SignInFailure::MaxUsers, "max_users"),
+            (SignInFailure::Server, "server"),
+        ] {
+            assert_eq!(failure.code(), code);
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_is_single_use_pkce_bound_and_stores_only_a_hash() {
+        let store = test_store();
+        let service = service(&test_config(), store.clone());
+        let admin = store
+            .get_user(&store.admin_user_id().unwrap())
+            .unwrap()
+            .unwrap();
+        let verifier = "v".repeat(43);
+        let request = handoff_request(&verifier);
+
+        let code = service.issue_handoff(&admin, &request).unwrap();
+        assert!(code.len() >= 43 && code.chars().all(is_base64url));
+        let raw = std::fs::read(store.path()).unwrap();
+        assert!(!String::from_utf8_lossy(&raw).contains(&code));
+        let grant = service.redeem_handoff(&code, &verifier).unwrap();
+        assert_eq!(grant.user.id, admin.id);
+        assert_eq!(grant.token.len(), Store::SESSION_TOKEN_BYTES * 2);
+        assert!(grant.expires_at > chrono::Utc::now());
+        assert!(
+            store
+                .session_user(&sha256_hex(&grant.token))
+                .unwrap()
+                .is_some()
+        );
+        // Reuse fails.
+        assert!(service.redeem_handoff(&code, &verifier).is_err());
+
+        // A wrong verifier fails and burns the code.
+        let code = service.issue_handoff(&admin, &request).unwrap();
+        assert!(service.redeem_handoff(&code, &"w".repeat(43)).is_err());
+        assert!(service.redeem_handoff(&code, &verifier).is_err());
+
+        // A too-short verifier fails and burns too.
+        let code = service.issue_handoff(&admin, &request).unwrap();
+        assert!(service.redeem_handoff(&code, "short").is_err());
+        assert!(service.redeem_handoff(&code, &verifier).is_err());
+
+        // Expired codes fail even with the right verifier.
+        store
+            .create_handoff(
+                &sha256_hex("expired-code"),
+                &request.challenge,
+                &admin.id,
+                chrono::Duration::seconds(-1),
+            )
+            .unwrap();
+        assert!(service.redeem_handoff("expired-code", &verifier).is_err());
+        // Unknown and oversized codes fail.
+        assert!(service.redeem_handoff("nope", &verifier).is_err());
+        assert!(service.redeem_handoff(&"x".repeat(300), &verifier).is_err());
+    }
+
+    #[tokio::test]
+    async fn handoff_for_a_disabled_user_is_refused() {
+        let store = test_store();
+        let idp = mock_idp().await;
+        let mut service = service(&test_config(), store.clone());
+        service.set_issuer_url(&idp.issuer).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let invite = service.mint_invite(1, &admin).unwrap();
+        let (user, _) = complete_sign_in(&service, &idp, "subject-off", Some(&invite))
+            .await
+            .unwrap();
+        let verifier = "v".repeat(43);
+        let code = service
+            .issue_handoff(&user, &handoff_request(&verifier))
+            .unwrap();
+        store
+            .set_user_status(&user.id, UserStatus::Disabled)
+            .unwrap();
+        assert!(service.redeem_handoff(&code, &verifier).is_err());
+        // Signing in again reports `disabled` rather than minting anything.
+        let url = service.login_start("microsoft", None).await.unwrap();
+        let (state, nonce) = url_params(&url);
+        let code = "synthetic-code-disabled-again";
+        let id_token = synthetic_id_token(&idp.issuer, &nonce, "subject-off");
+        stub_token(&idp.server, code, &id_token).await;
+        let result = service.callback_login(&state, code).await;
+        let (failure, _) = result.outcome.unwrap_err();
+        assert_eq!(failure, SignInFailure::Disabled);
+    }
+
+    #[tokio::test]
+    async fn callback_failures_map_to_short_codes_and_keep_the_handoff() {
+        let mut config = test_config();
+        config.auth.max_users = 2;
+        let store = test_store();
+        let idp = mock_idp().await;
+        let mut service = service(&config, store.clone());
+        service.set_issuer_url(&idp.issuer).unwrap();
+        let request = handoff_request(&"a".repeat(43));
+
+        async fn run(
+            service: &AuthService,
+            idp: &MockIdp,
+            subject: &str,
+            invite: Option<&str>,
+            request: &HandoffRequest,
+        ) -> CallbackResult {
+            let url = service
+                .login_start_with_handoff("microsoft", invite, Some(request.clone()))
+                .await
+                .unwrap();
+            let (state, nonce) = url_params(&url);
+            let code = format!("synthetic-code-{subject}-{state}");
+            let id_token = synthetic_id_token(&idp.issuer, &nonce, subject);
+            stub_token(&idp.server, &code, &id_token).await;
+            service.callback_login(&state, &code).await
+        }
+
+        let result = run(&service, &idp, "no-invite", None, &request).await;
+        assert_eq!(result.handoff.as_ref(), Some(&request));
+        assert_eq!(result.outcome.unwrap_err().0, SignInFailure::InviteRequired);
+
+        let admin = store.admin_user_id().unwrap();
+        let invite = service.mint_invite(5, &admin).unwrap();
+        let ok = run(&service, &idp, "first", Some(&invite), &request).await;
+        assert!(ok.outcome.is_ok());
+        let full = run(&service, &idp, "second", Some(&invite), &request).await;
+        assert_eq!(full.outcome.unwrap_err().0, SignInFailure::MaxUsers);
+
+        // Unknown state: no handoff, so the web error page is used.
+        let unknown = service.callback_login("bogus", "code").await;
+        assert!(unknown.handoff.is_none());
+        assert!(unknown.outcome.is_err());
+
+        // A declined provider redirect consumes the pending login.
+        let url = service
+            .login_start_with_handoff("microsoft", None, Some(request.clone()))
+            .await
+            .unwrap();
+        let (state, _) = url_params(&url);
+        assert_eq!(service.callback_denied(&state).await, Some(request));
+        assert!(service.callback_denied(&state).await.is_none());
+    }
+
+    // ---- admin claim ----
+
+    #[tokio::test]
+    async fn admin_email_claims_the_unlinked_admin_row_without_an_invite() {
+        let mut config = test_config();
+        config.auth.admin_email = "Member@EXAMPLE.example".into();
+        let store = test_store();
+        let idp = mock_idp().await;
+        let mut service = service(&config, store.clone());
+        service.set_issuer_url(&idp.issuer).unwrap();
+        let admin_id = store.admin_user_id().unwrap();
+        let before = store.get_user(&admin_id).unwrap().unwrap();
+        assert!(before.provider_subject.starts_with("local:"));
+        let users_before = store.user_count().unwrap();
+
+        // The synthetic token's email is member@example.example: it matches
+        // case-insensitively, links the subject, and creates no user.
+        let (user, token) = complete_sign_in(&service, &idp, "operator", None)
+            .await
+            .unwrap();
+        assert_eq!(user.id, admin_id);
+        assert_eq!(user.role, UserRole::Admin);
+        assert_eq!(user.provider_subject, "microsoft:operator");
+        assert_eq!(store.user_count().unwrap(), users_before);
+        assert_eq!(
+            store.session_user(&sha256_hex(&token)).unwrap().unwrap().id,
+            admin_id
+        );
+        let linked = store
+            .get_user_by_subject("microsoft:operator")
+            .unwrap()
+            .unwrap();
+        assert_eq!(linked.id, admin_id);
+
+        // Signing in again is an ordinary existing-subject login.
+        let again = complete_sign_in(&service, &idp, "operator", None)
+            .await
+            .unwrap();
+        assert_eq!(again.0.id, admin_id);
+
+        // The claim is one-shot: another subject with the same email gets no
+        // admin and, without an invite, no account.
+        let error = complete_sign_in(&service, &idp, "impostor", None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invitation"));
+        assert!(
+            store
+                .get_user_by_subject("microsoft:impostor")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_claim_needs_a_matching_email_and_configuration() {
+        let idp = mock_idp().await;
+        // Different email configured: no claim, invite still required.
+        let mut config = test_config();
+        config.auth.admin_email = "someone.else@example.example".into();
+        let store = test_store();
+        let mut service = service(&config, store.clone());
+        service.set_issuer_url(&idp.issuer).unwrap();
+        assert!(
+            complete_sign_in(&service, &idp, "no-match", None)
+                .await
+                .is_err()
+        );
+        let admin = store
+            .get_user(&store.admin_user_id().unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(admin.provider_subject.starts_with("local:"));
+
+        // No admin_email at all: no claim.
+        let store = test_store();
+        let mut service = service_for(&test_config(), store.clone());
+        service.set_issuer_url(&idp.issuer).unwrap();
+        assert!(
+            complete_sign_in(&service, &idp, "no-config", None)
+                .await
+                .is_err()
+        );
+    }
+
+    fn service_for(config: &Config, store: Store) -> AuthService {
+        service(config, store)
     }
 }

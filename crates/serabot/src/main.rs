@@ -511,6 +511,40 @@ fn check(config_path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Tell the admin's linked Telegram chat that the service came up. Goes
+/// through the same [`Notifier`] path every system message uses (no direct
+/// Bot API call), after the same blocklist scan as other outgoing text, and
+/// is audited. Best effort: failure is logged and never stops startup.
+async fn send_startup_notice(
+    notifier: &dyn Notifier,
+    policy: &Policy,
+    store: &serabot::store::Store,
+    admin_user_id: &str,
+) {
+    let text = format!("SeraBot {} started", env!("CARGO_PKG_VERSION"));
+    if !policy.is_allowed(&text) {
+        tracing::warn!("startup notice blocked by the content policy");
+        return;
+    }
+    match notifier.send_text(admin_user_id, "system", &text).await {
+        Ok(()) => {
+            if let Err(error) = store.record_audit(
+                admin_user_id,
+                "system.started",
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&serde_json::json!({"version": env!("CARGO_PKG_VERSION")})),
+            ) {
+                tracing::warn!(%error, "startup audit write failed");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "startup notice was not delivered"),
+    }
+}
+
 async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     let (config, bots) = load(config_path)?;
     let secrets = SharedSecrets::new(SecretStore::open(&config).context("open secret store")?);
@@ -876,6 +910,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     ))?;
     let notifier = Arc::new(CompositeNotifier::new(notifiers));
 
+    let startup_policy = policy.clone();
     let gateway = Gateway::new(
         store.clone(),
         policy,
@@ -926,7 +961,13 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         let store = store.clone();
         let artifacts = artifacts.clone();
         let shutdown_telegram = shutdown.clone();
+        let startup_policy = startup_policy.clone();
+        let startup_admin = admin_user_id.clone();
         services.push(tokio::spawn(async move {
+            // One-line "started" notice through the existing notifier path
+            // (admin's linked chat only; blocklist-scanned like any outgoing
+            // text). Best effort: a failure is logged, never fatal.
+            send_startup_notice(client.as_ref(), &startup_policy, &store, &startup_admin).await;
             client
                 .run_polling(runtime, store, Some(artifacts), shutdown_telegram)
                 .await;
