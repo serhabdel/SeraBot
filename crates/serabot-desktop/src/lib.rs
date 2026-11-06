@@ -7,6 +7,7 @@ pub mod branding;
 pub mod creds;
 pub mod events;
 pub mod oauth;
+pub mod panel;
 pub mod provider_presets;
 pub mod session;
 pub mod signin;

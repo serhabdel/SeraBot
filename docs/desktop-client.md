@@ -178,13 +178,19 @@ materials, motion, and the shared class contract — is specified in
   entry, so the owner normally only pastes the key. Anthropic's native
   Messages API is not a transport yet; an OpenAI-compatible gateway in front
   of Anthropic works.
-- **Connectors** — all configured connectors are listed with enabled state,
-  redirect URI, and secret names. **Connect** opens the provider's
-  authorization URL in the system browser (never an embedded webview), the
-  owner pastes the resulting client id, client secret, refresh token, or
-  AgentMail key, then saves. OAuth authorization itself still happens out of
-  band; the app stores the refresh token. Enabling a connector only makes its
-  tools available; grant them to a bot in **Fleet**.
+- **Connectors** - "Let your bots use your accounts and tools." Microsoft
+  comes first, with **OneDrive** on top: OneDrive is per user, so every member
+  sees **Connect OneDrive** (`POST /v1/connectors/onedrive/start`, the
+  returned `https` consent page opens in the system browser, never an
+  embedded webview) and, once connected, **Disconnect**
+  (`DELETE /v1/connectors/onedrive`). Every other card shows one main action
+  that fits its state: **Connect** / **Reconnect** (opens the provider's
+  authorization page), **Sign in** (ElevenLabs PKCE), or **Add key** /
+  **Replace key** with a paste field and a **Get a key** link. Developer
+  details (kind, enabled state, client id, redirect URI, secret names, auth
+  mode, Turn on/off, Save settings, Test) sit behind an **Advanced**
+  disclosure that only administrators see. Turning a connector on only makes
+  its tools available; grant them to a bot in **Bots**.
 - **Settings → Capabilities** — reads the authenticated health payload and
   shows Audio (on/off with the configured transcription and understanding
   models), Firecrawl, Telegram, and whether model catalogs are live or static.
@@ -293,6 +299,9 @@ collapsible release notes, **Install and restart**, **Later**, and
   footer and **Settings → Updates** show a developer build. Forks that publish
   their own releases can set the variable when building.
 
+## Layout (0.14, design B)
+
+A 72 px icon rail with a small text label under every icon (Chats, Bots, Approvals with a pending count, Memory, Connectors with a plug icon, AI keys; Settings with a gear and the account menu at the bottom, which holds Settings, All chats, the theme switch and Sign out), a 250 px conversation list (Chat only) whose head has a labelled **New chat** button that opens a "Choose a bot" list, and the chat column with its header (bot avatar, status pill, Bots in this chat, Reload, **Watch browser** only while a browser session is active, Details, **Passwords & keys**). When the chat column is narrow the header buttons keep their icon, tooltip and accessible name and drop the text. The details inspector and the browser dock slide in from the right and leave the same way. The dock shows one control button at a time (**Take control** / **Give control back**), a status line ("You're in control: click and type in the page. The bot is paused." or "<Bot> is using the browser."), **Hide panel** (hides only; the session keeps running and Watch browser brings it back) and an overflow menu with **End browser session**. The screenshot fills the panel width at its own aspect ratio. Chat tool rows use plain sentences for known tools (for example "Signed in with your saved login "venue-portal". The bot never saw it." or "Opened example.com"). Every icon-only button has a tooltip and an accessible name. Motion follows `prefers-reduced-motion` (cross-fades) and `prefers-reduced-transparency` (solid surfaces).
 ## Known limitations
 
 - The desktop client cannot cancel work already accepted by the server when it

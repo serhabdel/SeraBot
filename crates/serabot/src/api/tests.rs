@@ -8,6 +8,9 @@ use axum::body::Body;
 use axum::http::Request;
 use tower::ServiceExt;
 
+mod browser_api;
+mod vault_http;
+
 /// The bootstrap admin's id â€” the acting user behind the config token
 /// the tests use.
 fn admin(store: &Store) -> String {
@@ -82,6 +85,26 @@ fn app_with_auth_stack(
     bots: Vec<LoadedBot>,
     auth_issuer: Option<&str>,
     rate_limit: Option<u32>,
+) -> (Router, Arc<Config>, Store) {
+    app_with_stack(
+        egress_approved,
+        policy,
+        base_dir,
+        bots,
+        auth_issuer,
+        rate_limit,
+        None,
+    )
+}
+
+fn app_with_stack(
+    egress_approved: bool,
+    policy: Policy,
+    base_dir: std::path::PathBuf,
+    bots: Vec<LoadedBot>,
+    auth_issuer: Option<&str>,
+    rate_limit: Option<u32>,
+    browser: Option<Arc<crate::browser::BrowserManager>>,
 ) -> (Router, Arc<Config>, Store) {
     let mut config = Config::default();
     config.api.enabled = true;
@@ -170,7 +193,8 @@ fn app_with_auth_stack(
         users,
         None,
     )
-    .unwrap();
+    .unwrap()
+    .with_browser(browser);
     if let Some(service) = auth {
         state.auth = Some(Arc::new(service));
     }
@@ -4382,4 +4406,95 @@ async fn member_bots_and_skills_are_isolated_and_validate_per_user() {
         .await
         .unwrap();
     assert_eq!(delete_main.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn conversation_list_carries_a_plain_last_message_preview_for_the_acting_user_only() {
+    let (app, _, store) = app_with_policy(true, Policy::from_text("synthetic blocked phrase"));
+    let admin_id = admin(&store);
+    store
+        .create_conversation(&admin_id, "dir:analyst", "direct", None)
+        .unwrap();
+    store
+        .create_conversation(&admin_id, "dir:maker", "direct", None)
+        .unwrap();
+    store
+        .append_message(
+            &admin_id,
+            "dir:analyst",
+            None,
+            crate::domain::Role::User,
+            "first",
+        )
+        .unwrap();
+    let long = format!("**Bold** `code`\n\n# heading {}", "x".repeat(300));
+    store
+        .append_message(
+            &admin_id,
+            "dir:analyst",
+            None,
+            crate::domain::Role::Assistant,
+            &long,
+        )
+        .unwrap();
+    store
+        .append_message(
+            &admin_id,
+            "dir:maker",
+            None,
+            crate::domain::Role::User,
+            "synthetic blocked phrase",
+        )
+        .unwrap();
+
+    // Another user's chat with the same id never shows up for the admin.
+    let member = store
+        .create_user("microsoft:preview", "p@example.example", "P")
+        .unwrap();
+    store
+        .create_conversation(&member.id, "dir:other", "direct", None)
+        .unwrap();
+    store
+        .append_message(
+            &member.id,
+            "dir:other",
+            None,
+            crate::domain::Role::User,
+            "member secret chatter",
+        )
+        .unwrap();
+
+    let body = read_json(
+        app.clone()
+            .oneshot(request(&app, "GET", "/v1/conversations", true, None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let rows = body["conversations"].as_array().unwrap();
+    let row = |id: &str| rows.iter().find(|row| row["id"] == id).unwrap();
+    let analyst = &row("dir:analyst")["last_message"];
+    assert_eq!(analyst["role"], "assistant");
+    let text = analyst["text"].as_str().unwrap();
+    assert_eq!(text.chars().count(), 120);
+    assert!(text.starts_with("Bold code heading x"));
+    assert!(!text.contains(['*', '`', '#', '\n']));
+    assert_eq!(
+        row("dir:maker")["last_message"]["text"],
+        "[Content withheld by policy]"
+    );
+    assert!(!body.to_string().contains("member secret chatter"));
+
+    let token = store
+        .mint_session(&member.id, chrono::Duration::hours(1))
+        .unwrap();
+    let theirs = read_json(
+        app.clone()
+            .oneshot(request_with_token("GET", "/v1/conversations", &token, None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(theirs.to_string().contains("member secret chatter"));
+    assert!(!theirs.to_string().contains("Bold code"));
 }

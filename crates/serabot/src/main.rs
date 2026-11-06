@@ -10,7 +10,7 @@ use serabot::api::{ApiNotifier, ApiState};
 use serabot::audio::{
     AudioTranscribeTool, AudioUnderstandTool, MistralAudioClient, resolve_audio_provider,
 };
-use serabot::browser::{BrowserSession, register_browser_tools};
+use serabot::browser::{BrowserToolDeps, VaultResolver, register_browser_tools};
 use serabot::config::{Config, ElevenLabsAuth, load_bots};
 use serabot::connectors::register_connector_tools;
 use serabot::deck::Brand;
@@ -652,6 +652,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.clone(),
     ))?;
     serabot::tools::register_memory_tools(&mut registry, store.clone())?;
+    serabot::vault::register_vault_tools(&mut registry, users.clone())?;
     serabot::tools::register_pdf_tools(
         &mut registry,
         artifacts.clone(),
@@ -841,9 +842,18 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             TavilyLimits::from_config(&config.tavily),
         ))?;
     }
+    let mut browser_manager = None;
     if config.browser.enabled {
-        let session = Arc::new(BrowserSession::new(config.browser.clone())?);
-        register_browser_tools(&mut registry, session)?;
+        let manager = serabot::browser::build_manager(&config)?;
+        register_browser_tools(
+            &mut registry,
+            BrowserToolDeps {
+                manager: manager.clone(),
+                resolver: Arc::new(VaultResolver::new(users.clone())),
+                artifacts: Some(artifacts.clone()),
+            },
+        )?;
+        browser_manager = Some(manager);
     }
     if config.connectors.any_enabled() {
         let connector_http = reqwest::Client::builder()
@@ -917,7 +927,8 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         registry,
         config.api.approval_expiry_hours,
         config.runtime.owner_standing_consent,
-    );
+    )
+    .with_vault(users.clone());
 
     let runtime = Runtime::with_fleet(
         config.clone(),
@@ -941,7 +952,12 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             secrets.clone(),
             users.clone(),
             onedrive_registry.clone(),
-        )?;
+        )?
+        .with_browser(browser_manager.clone());
+        if let Some(manager) = &browser_manager {
+            // Closes idle sessions, and every session on shutdown.
+            let _reaper = manager.spawn_reaper(shutdown.clone());
+        }
         let app = serabot::api::router(state);
         let listener = tokio::net::TcpListener::bind(&config.server.bind)
             .await

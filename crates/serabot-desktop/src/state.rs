@@ -695,6 +695,7 @@ mod tests {
             archived_at: None,
             unread_count: 0,
             accepts_turns: matches!(kind, "direct" | "room"),
+            last_message: None,
         }
     }
 
@@ -841,6 +842,7 @@ mod tests {
                 auth: None,
                 auth_modes: Vec::new(),
                 oauth: None,
+                connected: None,
             }]),
         );
         assert!(state.providers_loaded);

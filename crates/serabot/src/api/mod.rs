@@ -52,6 +52,7 @@ mod accounts;
 mod admin;
 mod approvals;
 mod bots;
+mod browser;
 mod connectors;
 mod conversations;
 mod memories;
@@ -60,17 +61,20 @@ mod skills;
 mod status;
 #[cfg(test)]
 mod tests;
+mod vault;
 
 use accounts::*;
 use admin::*;
 use approvals::*;
 use bots::*;
+use browser::*;
 use connectors::*;
 use conversations::*;
 use memories::*;
 use messages::*;
 use skills::*;
 use status::*;
+use vault::*;
 
 #[derive(Clone)]
 pub struct ApiNotifier {
@@ -142,6 +146,8 @@ pub struct ApiState {
     auth: Option<Arc<AuthService>>,
     /// Providers with a device sign-in still running in the background.
     oauth_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Per-user server browser; None while [browser] is off.
+    browser: Option<Arc<crate::browser::BrowserManager>>,
 }
 
 impl ApiState {
@@ -181,8 +187,15 @@ impl ApiState {
             admin: AdminStore::open(&config).ok(),
             auth,
             oauth_inflight: Arc::default(),
+            browser: None,
             config,
         })
+    }
+
+    /// Attach the per-user browser manager (owner live-view routes).
+    pub fn with_browser(mut self, browser: Option<Arc<crate::browser::BrowserManager>>) -> Self {
+        self.browser = browser;
+        self
     }
 }
 
@@ -192,6 +205,12 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
         .route("/v1/usage", get(usage))
+        .route("/v1/browser", get(browser_status))
+        .route("/v1/browser/screenshot", get(browser_screenshot))
+        .route("/v1/browser/takeover", post(browser_takeover))
+        .route("/v1/browser/handback", post(browser_handback))
+        .route("/v1/browser/input", post(browser_input))
+        .route("/v1/browser/close", post(browser_close))
         .route("/v1/messages", post(send_message))
         .route("/v1/bots", get(list_bots).post(create_bot))
         .route(
@@ -213,6 +232,8 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/memories", get(list_memories).post(add_memory))
         .route("/v1/memories/{id}", delete(delete_memory))
+        .route("/v1/vault", get(list_vault))
+        .route("/v1/vault/{name}", put(put_vault).delete(delete_vault))
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/{id}/key", put(set_provider_key))
         .route("/v1/providers/{id}", delete(delete_provider_credential))

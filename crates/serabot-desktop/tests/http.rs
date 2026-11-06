@@ -1010,3 +1010,345 @@ fn dropped_submit_response_is_unknown_and_never_resent() {
     listener.set_nonblocking(true).unwrap();
     assert!(listener.accept().is_err());
 }
+
+fn raw_server(
+    replies: Vec<(u16, &'static str, Vec<u8>)>,
+) -> (ApiClient, thread::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let handle = thread::spawn(move || {
+        replies
+            .into_iter()
+            .map(|(status, content_type, body)| {
+                let (mut stream, _) = listener.accept().unwrap();
+                let req = request(&mut stream);
+                let head = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                // A client that refuses an oversized body hangs up early; a
+                // broken pipe here is expected, not a test failure.
+                let _ = stream
+                    .write_all(head.as_bytes())
+                    .and_then(|()| stream.write_all(&body));
+                req
+            })
+            .collect()
+    });
+    let client = ApiClient::new(
+        validate_endpoint(&url).unwrap(),
+        SecretString::new(TOKEN.into()),
+    )
+    .unwrap();
+    (client, handle)
+}
+
+fn body_of(request: &str) -> serde_json::Value {
+    serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+}
+
+const ENTRY: &str = r#"{"name":"portal","kind":"password","username":"me@example.test","domains":["example.test"],"created_at":"2026-11-01T10:00:00Z","updated_at":"2026-11-01T10:00:00Z"}"#;
+
+#[test]
+fn vault_routes_validate_and_never_echo_a_value() {
+    use serabot_desktop::{VaultKind, VaultPut};
+    use zeroize::Zeroizing;
+    let (client, handle) = server(vec![
+        (200, format!(r#"{{"entries":[{ENTRY}]}}"#)),
+        (200, ENTRY.into()),
+        (200, r#"{"deleted":true}"#.into()),
+        // A server that echoes the value is refused, not displayed.
+        (200, r#"{"entries":[{"name":"portal","kind":"note","domains":[],"value":"leak","created_at":"t","updated_at":"t"}]}"#.into()),
+        (422, r#"{"error":"a domain is not a valid host name"}"#.into()),
+        (404, r#"{"error":"vault entry gone not found"}"#.into()),
+        (500, r#"{"error":"secret detail"}"#.into()),
+    ]);
+    let entries = client.vault_list().unwrap();
+    assert_eq!(entries[0].name, "portal");
+    assert_eq!(entries[0].kind, VaultKind::Password);
+    assert_eq!(entries[0].domains, ["example.test"]);
+
+    let put = VaultPut {
+        kind: VaultKind::Password,
+        username: Some(" me@example.test ".into()),
+        value: Zeroizing::new("synthetic-pass".into()),
+        domains: vec!["example.test".into()],
+        note: Some("  ".into()),
+    };
+    assert_eq!(client.vault_put("portal", &put).unwrap().name, "portal");
+    client.vault_delete("portal").unwrap();
+    assert_eq!(client.vault_list(), Err(ApiError::InvalidResponse));
+    assert_eq!(
+        client.vault_put("portal", &put),
+        Err(ApiError::Rejected(
+            "a domain is not a valid host name".into()
+        ))
+    );
+    assert_eq!(
+        client.vault_delete("gone"),
+        Err(ApiError::Rejected("vault entry gone not found".into()))
+    );
+    // Other failures stay a bare status: no server text reaches the UI.
+    assert_eq!(client.vault_list(), Err(ApiError::Http(500)));
+
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("GET /v1/vault "));
+    assert!(requests[1].starts_with("PUT /v1/vault/portal "));
+    assert!(requests[2].starts_with("DELETE /v1/vault/portal "));
+    for r in &requests {
+        assert!(
+            r.to_lowercase()
+                .contains(&format!("authorization: bearer {TOKEN}\r\n"))
+        );
+    }
+    assert_eq!(
+        body_of(&requests[1]),
+        serde_json::json!({
+            "kind": "password",
+            "username": "me@example.test",
+            "value": "synthetic-pass",
+            "domains": ["example.test"]
+        })
+    );
+}
+
+#[test]
+fn vault_writes_are_validated_before_the_network() {
+    use serabot_desktop::{VaultKind, VaultPut, normalize_vault_domain, valid_vault_name};
+    use zeroize::Zeroizing;
+    // No server is bound: any request would fail as Transport, not Validation.
+    let (client, handle) = server(vec![]);
+    let put = |value: &str, domains: &[&str]| VaultPut {
+        kind: VaultKind::ApiKey,
+        username: None,
+        value: Zeroizing::new(value.into()),
+        domains: domains.iter().map(|d| (*d).to_owned()).collect(),
+        note: None,
+    };
+    for (name, input) in [
+        ("Bad Name", put("v", &[])),
+        ("ok", put("", &[])),
+        ("ok", put("bad\u{7}", &[])),
+        ("ok", put(&"x".repeat(8193), &[])),
+        ("ok", put("v", &["https://example.test/path"])),
+        ("ok", put("v", &["Example.TEST"])),
+    ] {
+        assert!(matches!(
+            client.vault_put(name, &input),
+            Err(ApiError::Validation(_))
+        ));
+    }
+    assert!(
+        client
+            .vault_put("ok", &put("v\nw\tz", &["a.test"]))
+            .is_err()
+    );
+    drop(handle);
+
+    assert!(valid_vault_name("a-1"));
+    assert!(!valid_vault_name("-a"));
+    assert!(!valid_vault_name("A"));
+    assert!(!valid_vault_name(&"a".repeat(49)));
+    assert_eq!(
+        normalize_vault_domain(" Example.COM. ").as_deref(),
+        Some("example.com")
+    );
+    for bad in [
+        "",
+        "a b",
+        "*.example.com",
+        "https://a.test",
+        "a.test/x",
+        "a.test:80",
+        "u@a.test",
+    ] {
+        assert_eq!(normalize_vault_domain(bad), None, "{bad}");
+    }
+}
+
+#[test]
+fn browser_routes_use_their_contract_shapes() {
+    use serabot_desktop::{BrowserController, BrowserInput};
+    let info = |controller: &str| {
+        format!(
+            r#"{{"active":true,"url":"https://example.test/","title":"Example","controller":"{controller}","updated_at":"2026-11-06T12:00:00Z"}}"#
+        )
+    };
+    let (client, handle) = server(vec![
+        (
+            200,
+            r#"{"active":false,"controller":"bot","updated_at":"2026-11-06T12:00:00Z"}"#.into(),
+        ),
+        (200, info("bot")),
+        (200, info("user")),
+        (200, info("user")),
+        (200, info("user")),
+        (200, info("user")),
+        (200, info("bot")),
+        (200, r#"{"closed":true}"#.into()),
+        (
+            200,
+            r#"{"active":true,"controller":"robot","updated_at":"t"}"#.into(),
+        ),
+        (409, r#"{"error":"the user is not in control"}"#.into()),
+    ]);
+    let idle = client.browser_status().unwrap();
+    assert!(!idle.active && idle.url.is_none());
+    assert_eq!(
+        client.browser_status().unwrap().title.as_deref(),
+        Some("Example")
+    );
+    assert_eq!(
+        client.browser_takeover().unwrap().controller,
+        BrowserController::User
+    );
+    for input in [
+        BrowserInput::Click { x: 10.5, y: 20.0 },
+        BrowserInput::Text { text: "hi".into() },
+        BrowserInput::Key {
+            key: "Enter".into(),
+        },
+    ] {
+        client.browser_input(&input).unwrap();
+    }
+    assert_eq!(
+        client.browser_handback().unwrap().controller,
+        BrowserController::Bot
+    );
+    assert!(client.browser_close().unwrap());
+    assert_eq!(client.browser_status(), Err(ApiError::InvalidResponse));
+    assert_eq!(
+        client.browser_input(&BrowserInput::Scroll { dy: 120.0 }),
+        Err(ApiError::Rejected("the user is not in control".into()))
+    );
+
+    let requests = handle.join().unwrap();
+    let routes = [
+        "GET /v1/browser ",
+        "GET /v1/browser ",
+        "POST /v1/browser/takeover ",
+        "POST /v1/browser/input ",
+        "POST /v1/browser/input ",
+        "POST /v1/browser/input ",
+        "POST /v1/browser/handback ",
+        "POST /v1/browser/close ",
+        "GET /v1/browser ",
+        "POST /v1/browser/input ",
+    ];
+    for (request, route) in requests.iter().zip(routes) {
+        assert!(request.starts_with(route), "{request}");
+    }
+    assert_eq!(
+        body_of(&requests[3]),
+        serde_json::json!({"type":"click","x":10.5,"y":20.0})
+    );
+    assert_eq!(
+        body_of(&requests[4]),
+        serde_json::json!({"type":"text","text":"hi"})
+    );
+    assert_eq!(
+        body_of(&requests[5]),
+        serde_json::json!({"type":"key","key":"Enter"})
+    );
+    assert_eq!(
+        body_of(&requests[9]),
+        serde_json::json!({"type":"scroll","dy":120.0})
+    );
+}
+
+#[test]
+fn browser_input_is_validated_before_the_network() {
+    use serabot_desktop::{BrowserInput, validate_browser_input};
+    for bad in [
+        BrowserInput::Click { x: -1.0, y: 0.0 },
+        BrowserInput::Click {
+            x: f64::NAN,
+            y: 0.0,
+        },
+        BrowserInput::Click { x: 0.0, y: 4001.0 },
+        BrowserInput::Text {
+            text: String::new(),
+        },
+        BrowserInput::Text {
+            text: "x".repeat(2001),
+        },
+        BrowserInput::Key { key: "a b".into() },
+        BrowserInput::Scroll { dy: 5001.0 },
+        BrowserInput::Navigate {
+            url: "javascript:alert(1)".into(),
+        },
+        BrowserInput::Navigate {
+            url: "https://a.test/ x".into(),
+        },
+    ] {
+        assert!(validate_browser_input(&bad).is_err(), "{bad:?}");
+    }
+    for good in [
+        BrowserInput::Click { x: 0.0, y: 4000.0 },
+        BrowserInput::Navigate {
+            url: "https://example.test/a?b=1".into(),
+        },
+    ] {
+        assert!(validate_browser_input(&good).is_ok());
+    }
+}
+
+#[test]
+fn screenshots_are_capped_jpeg_only_and_a_missing_session_is_a_404() {
+    use serabot_desktop::MAX_SCREENSHOT_BYTES;
+    let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+    jpeg.extend_from_slice(&[1; 100]);
+    let mut oversized = jpeg.clone();
+    oversized.resize(MAX_SCREENSHOT_BYTES + 1, 0);
+    let mut at_cap = jpeg.clone();
+    at_cap.resize(MAX_SCREENSHOT_BYTES, 0);
+    let (client, handle) = raw_server(vec![
+        (200, "image/jpeg", jpeg.clone()),
+        (200, "image/jpeg", at_cap.clone()),
+        (200, "image/jpeg", oversized),
+        (200, "image/png", jpeg.clone()),
+        (200, "image/jpeg", b"not a jpeg".to_vec()),
+        (
+            404,
+            "application/json",
+            br#"{"error":"no browser session"}"#.to_vec(),
+        ),
+    ]);
+    assert_eq!(client.browser_screenshot().unwrap(), jpeg);
+    assert_eq!(
+        client.browser_screenshot().unwrap().len(),
+        MAX_SCREENSHOT_BYTES
+    );
+    assert_eq!(client.browser_screenshot(), Err(ApiError::TooLarge));
+    assert_eq!(client.browser_screenshot(), Err(ApiError::InvalidResponse));
+    assert_eq!(client.browser_screenshot(), Err(ApiError::InvalidResponse));
+    assert_eq!(client.browser_screenshot(), Err(ApiError::Http(404)));
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("GET /v1/browser/screenshot "));
+}
+
+#[test]
+fn conversation_rows_carry_a_validated_last_message_preview() {
+    let row = |extra: &str| {
+        format!(
+            r#"{{"conversations":[{{"id":"dir:main","kind":"direct","created_at":"t","updated_at":"t","accepts_turns":true{extra}}}]}}"#
+        )
+    };
+    let (client, _handle) = server(vec![
+        (
+            200,
+            row(r#","last_message":{"role":"assistant","text":"14 Dec is open"}"#),
+        ),
+        (200, row(r#","last_message":{"role":"tool","text":"x"}"#)),
+        (200, row("")),
+    ]);
+    let page = client.list_conversations(50, None, false).unwrap();
+    let last = page.conversations[0].last_message.as_ref().unwrap();
+    assert_eq!(
+        (last.role.as_str(), last.text.as_str()),
+        ("assistant", "14 Dec is open")
+    );
+    assert!(client.list_conversations(50, None, false).is_err());
+    let page = client.list_conversations(50, None, false).unwrap();
+    assert!(page.conversations[0].last_message.is_none());
+}

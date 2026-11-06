@@ -27,7 +27,9 @@ ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-RestrictNamespaces=yes
+# Chrome's sandbox for the server browser needs user, pid, net and mount
+# namespaces; every other namespace type stays blocked.
+RestrictNamespaces=user pid net mnt
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
@@ -37,9 +39,10 @@ UMask=0077
 ReadWritePaths=/var/lib/serabot
 ReadOnlyPaths=/opt/serabot /etc/serabot
 
-MemoryMax=1400M
+# Headroom for headless Chrome sessions ([browser] max_sessions = 2).
+MemoryMax=2200M
 CPUQuota=180%
-TasksMax=128
+TasksMax=512
 
 [Install]
 WantedBy=multi-user.target

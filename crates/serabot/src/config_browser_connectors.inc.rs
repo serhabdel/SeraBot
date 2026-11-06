@@ -16,6 +16,16 @@ pub struct BrowserConfig {
     pub user_data_dir: String,
     #[serde(default = "default_browser_timeout")]
     pub request_timeout_secs: u64,
+    /// Most concurrent per-user browser sessions (`provider = "spawn"`).
+    #[serde(default = "default_browser_max_sessions")]
+    pub max_sessions: usize,
+    /// A session idle for this long is closed.
+    #[serde(default = "default_browser_idle_timeout")]
+    pub idle_timeout_secs: u64,
+    /// Pass `--no-sandbox` to Chromium. Off by default; needed only when the
+    /// service runs as root or on a host that blocks user namespaces.
+    #[serde(default)]
+    pub no_sandbox: bool,
 }
 
 impl Default for BrowserConfig {
@@ -29,6 +39,9 @@ impl Default for BrowserConfig {
             browseros_neo_base: default_browser_neo_base(),
             user_data_dir: String::new(),
             request_timeout_secs: default_browser_timeout(),
+            max_sessions: default_browser_max_sessions(),
+            idle_timeout_secs: default_browser_idle_timeout(),
+            no_sandbox: false,
         }
     }
 }
@@ -42,6 +55,16 @@ impl BrowserConfig {
         if self.remote_debugging_port < 1024 {
             return Err(SeraError::Config(
                 "browser.remote_debugging_port must be >= 1024".into(),
+            ));
+        }
+        if !(1..=16).contains(&self.max_sessions) {
+            return Err(SeraError::Config(
+                "browser.max_sessions must be between 1 and 16".into(),
+            ));
+        }
+        if !(30..=86_400).contains(&self.idle_timeout_secs) {
+            return Err(SeraError::Config(
+                "browser.idle_timeout_secs must be between 30 and 86400".into(),
             ));
         }
         Ok(())
@@ -380,7 +403,13 @@ impl AgentMailConnectorConfig {
 }
 
 fn default_browser_provider() -> String {
-    "remote_cdp".into()
+    "spawn".into()
+}
+fn default_browser_max_sessions() -> usize {
+    2
+}
+fn default_browser_idle_timeout() -> u64 {
+    600
 }
 fn default_browser_debug_host() -> String {
     "127.0.0.1".into()
