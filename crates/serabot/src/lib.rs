@@ -51,6 +51,7 @@ pub mod token_cli;
 pub mod tools;
 pub mod user_secrets;
 pub mod util;
+pub mod vault;
 pub mod watcher;
 pub mod web;
 pub mod workbooks;
