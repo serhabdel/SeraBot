@@ -88,6 +88,13 @@ reconnect from the saved origin and credential.
 - Settings shows the signed-in name, email and role from `GET /v1/me`.
 - Any HTTP 401 deletes the stored token and returns to the sign-in screen with
   "Your session ended. Sign in again."
+- When the sign-in response carries `expires_at`, the console signs out with
+  the same message once that time passes, without waiting for a 401. A token
+  restored from the Credential Manager has no known expiry and relies on the
+  401 path.
+- Browser and Explorer launches run on a helper thread; a failure shows as a
+  toast. The HTTP worker keeps one client (connection pool) per endpoint and
+  token.
 - An older install with a saved token stays signed in while the server still
   accepts it; otherwise it lands on the Microsoft screen.
 - Operator device tokens (`serabot token mint`) are server-side break-glass
@@ -272,7 +279,9 @@ collapsible release notes, **Install and restart**, **Later**, and
 - Only `serabot-desktop-latest-windows-x64.exe` is considered. It is downloaded
   with its `SHA256SUMS` entry to `%LOCALAPPDATA%\SeraBot\updates`, and the
   SHA-256 is verified before the file is kept or used. A mismatch aborts the
-  update and deletes the partial download.
+  update and deletes the partial download. Redirects are followed only over
+  HTTPS, and older downloads and abandoned `.part` files are removed after a
+  new update is verified.
 - **Install and restart** launches the verified copy through a detached, hidden
   `cmd` helper that waits for this process to exit, replaces the running exe,
   restarts it, and removes itself. A failed replacement keeps the old exe and

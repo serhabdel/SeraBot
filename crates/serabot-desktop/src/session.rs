@@ -39,6 +39,8 @@ pub const POLL_SAFETY: Duration = Duration::from_secs(4);
 
 /// Shown on the sign-in screen after any 401.
 pub const SESSION_ENDED: &str = "Your session ended. Sign in again.";
+const SETTINGS_NOT_SAVED: &str =
+    "Could not save your settings. They apply until you close SeraBot.";
 const SIGNED_OUT_OFFLINE: &str = "You are signed out on this device. The server could not be reached to end the session; it expires on its own.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -493,6 +495,12 @@ pub struct Session {
     download_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// What to do with the saved file once the download completes.
     pending_open: Option<PendingOpen>,
+    /// Toast text from browser/Explorer launches, which run on a helper thread.
+    launch_tx: std::sync::mpsc::Sender<String>,
+    launch_rx: std::sync::mpsc::Receiver<String>,
+    /// Unix seconds at which the signed-in session ends, when the server
+    /// reported one this run. A restored token has no known expiry.
+    session_expires: Option<u64>,
     pending: Option<OperationKind>,
     /// Bot id whose `GET /v1/bots/{id}` is in flight (dedup of loads).
     bot_detail_pending: Option<String>,
@@ -549,6 +557,7 @@ impl Session {
         token: String,
         worker: Option<Worker>,
     ) -> Self {
+        let (launch_tx, launch_rx) = std::sync::mpsc::channel();
         Self {
             state: State::default(),
             worker,
@@ -593,6 +602,9 @@ impl Session {
             downloading: false,
             download_rx: None,
             pending_open: None,
+            launch_tx,
+            launch_rx,
+            session_expires: None,
             pending: None,
             bot_detail_pending: None,
             bot_config_pending: None,
@@ -653,6 +665,14 @@ impl Session {
         self.connect_error = self.clear_session().err();
         self.sign_in.notice = Some(SESSION_ENDED.into());
     }
+    /// Sign the user out cleanly once the session expiry the server reported
+    /// has passed, instead of waiting for a request to answer 401.
+    fn check_session_expiry(&mut self) {
+        if self.session_expires.is_some_and(|at| unix_now() >= at) {
+            self.reject_token();
+        }
+    }
+
     fn reset_scope(&mut self, connected: bool) {
         self.state.new_scope(self.conversation.clone(), connected);
         if let Some(worker) = &self.worker {
@@ -717,10 +737,12 @@ impl Session {
     }
 
     /// Persist theme and pins next to the server origin, like the credential
-    /// save does. Failures are ignored: pins are a UI convenience.
-    fn save_ui_settings(&self) {
-        if let Some(settings) = self.ui_settings_snapshot() {
-            let _ = creds::save_settings(&settings);
+    /// save does. A failed write keeps the change for this run and says so.
+    fn save_ui_settings(&mut self) {
+        if let Some(settings) = self.ui_settings_snapshot()
+            && creds::save_settings(&settings).is_err()
+        {
+            self.toast = Some(SETTINGS_NOT_SAVED.into());
         }
     }
 
@@ -978,6 +1000,7 @@ impl Session {
         self.token.zeroize();
         self.token = token.clone();
         token.zeroize();
+        self.session_expires = signed_in.expires_at.as_deref().and_then(parse_rfc3339_unix);
         self.state.user = Some(signed_in.user);
         self.sign_in.clear_secrets();
         self.sign_in.show_invite = false;
@@ -1050,6 +1073,7 @@ impl Session {
         self.token.zeroize();
         self.token.clear();
         self.state.user = None;
+        self.session_expires = None;
         self.connecting = false;
         self.reconnect_at = None;
         if !origin.is_empty() {
@@ -1268,6 +1292,34 @@ impl Session {
         }
     }
 
+    /// Run a browser or Explorer launch off the UI thread. `job` returns the
+    /// toast text, which `poll_launches` shows when it arrives.
+    fn launch(&mut self, job: impl FnOnce() -> String + Send + 'static) {
+        let sender = self.launch_tx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("serabot-launch".into())
+            .spawn(move || {
+                let _ = sender.send(job());
+            });
+        if spawned.is_err() {
+            self.toast = Some("Could not start the launcher.".into());
+        }
+    }
+
+    /// Open `url` in the default browser without blocking the UI thread.
+    pub fn open_in_browser(&mut self, url: String) {
+        self.launch(move || match webbrowser::open(&url) {
+            Ok(()) => "Opened your browser.".to_owned(),
+            Err(error) => format!("Could not open the browser: {error}"),
+        });
+    }
+
+    fn poll_launches(&mut self) {
+        while let Ok(message) = self.launch_rx.try_recv() {
+            self.toast = Some(message);
+        }
+    }
+
     /// Drain the artifact file write, if one is running.
     fn poll_download(&mut self) {
         let Some(receiver) = &self.download_rx else {
@@ -1280,20 +1332,20 @@ impl Session {
         self.downloading = false;
         match result {
             Ok(path) => match self.pending_open.take() {
-                Some(PendingOpen::Open) => match open_with_default_app(&path) {
-                    Ok(()) => self.toast = Some(format!("Opened {path}")),
-                    Err(error) => {
-                        self.toast =
-                            Some(format!("Saved to {path}, but could not open it: {error}"))
-                    }
-                },
-                Some(PendingOpen::Reveal) => match reveal_in_explorer(&path) {
-                    Ok(()) => self.toast = Some(format!("Showing {path}")),
-                    Err(error) => {
-                        self.toast =
-                            Some(format!("Saved to {path}, but could not reveal it: {error}"))
-                    }
-                },
+                Some(PendingOpen::Open) => {
+                    self.toast = Some(format!("Saved to {path}"));
+                    self.launch(move || match open_with_default_app(&path) {
+                        Ok(()) => format!("Opened {path}"),
+                        Err(error) => format!("Saved to {path}, but could not open it: {error}"),
+                    });
+                }
+                Some(PendingOpen::Reveal) => {
+                    self.toast = Some(format!("Saved to {path}"));
+                    self.launch(move || match reveal_in_explorer(&path) {
+                        Ok(()) => format!("Showing {path}"),
+                        Err(error) => format!("Saved to {path}, but could not reveal it: {error}"),
+                    });
+                }
                 None => self.toast = Some(format!("Saved to {path}")),
             },
             Err(error) => {
@@ -1552,7 +1604,10 @@ impl Session {
             .map(|(_, slug)| slug)
             .unwrap_or(&conversation.id);
         if conversation.id.chars().all(|c| c.is_ascii_digit()) {
-            let tail = &conversation.id[conversation.id.len().saturating_sub(4)..];
+            let tail = conversation
+                .id
+                .get(conversation.id.len().saturating_sub(4)..)
+                .unwrap_or(&conversation.id);
             return format!("Chat {tail}");
         }
         match kind {
@@ -1702,6 +1757,7 @@ impl Session {
 
     /// Called from the UI timer. Drains completions and advances scheduled work.
     pub fn tick(&mut self) {
+        self.check_session_expiry();
         self.poll_events();
         self.receive();
         self.flush_events();
@@ -1710,6 +1766,7 @@ impl Session {
         self.poll_sign_in();
         self.poll_telegram();
         self.poll_download();
+        self.poll_launches();
         if let Some(at) = self.reconnect_at {
             if Instant::now() >= at {
                 self.reconnect_at = None;
@@ -3437,6 +3494,60 @@ fn model_csv(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Current time as Unix seconds. A clock before 1970 reads as 0.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// Parse an RFC 3339 timestamp (`2026-11-06T11:54:00Z`, optional fraction,
+/// `Z` or `+HH:MM` offset) into Unix seconds. Anything else is `None`.
+fn parse_rfc3339_unix(stamp: &str) -> Option<u64> {
+    let stamp = stamp.trim();
+    let (date, rest) = stamp.split_once(['T', 't', ' '])?;
+    let mut date = date.split('-');
+    let year: i64 = date.next()?.parse().ok()?;
+    let month: i64 = date.next()?.parse().ok()?;
+    let day: i64 = date.next()?.parse().ok()?;
+    if date.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let split = rest.find(['Z', 'z', '+', '-'])?;
+    let (clock, zone) = rest.split_at(split);
+    let clock = clock.split_once('.').map_or(clock, |(whole, _)| whole);
+    let mut clock = clock.split(':');
+    let hour: i64 = clock.next()?.parse().ok()?;
+    let minute: i64 = clock.next()?.parse().ok()?;
+    let second: i64 = clock.next()?.parse().ok()?;
+    if clock.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let offset = if matches!(zone, "Z" | "z") {
+        0
+    } else {
+        let sign = if zone.starts_with('-') { -1 } else { 1 };
+        let (hours, minutes) = zone.get(1..)?.split_once(':')?;
+        let hours: i64 = hours.parse().ok()?;
+        let minutes: i64 = minutes.parse().ok()?;
+        if hours > 23 || minutes > 59 {
+            return None;
+        }
+        sign * (hours * 3600 + minutes * 60)
+    };
+    // Days from civil (proleptic Gregorian), Howard Hinnant's algorithm.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let seconds = days * 86_400 + hour * 3600 + minute * 60 + second - offset;
+    u64::try_from(seconds).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3585,5 +3696,67 @@ mod tests {
                 .as_deref()
                 .is_some_and(|notice| notice.contains("could not be reached"))
         );
+    }
+
+    #[test]
+    fn rfc3339_timestamps_parse_to_unix_seconds() {
+        use super::parse_rfc3339_unix;
+        assert_eq!(parse_rfc3339_unix("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_rfc3339_unix("2026-11-06T11:54:00Z"),
+            Some(1_793_966_040)
+        );
+        assert_eq!(
+            parse_rfc3339_unix("2026-11-06T11:54:00.250+02:00"),
+            Some(1_793_966_040 - 7200)
+        );
+        assert_eq!(
+            parse_rfc3339_unix("2026-11-06T11:54:00-01:30"),
+            Some(1_793_966_040 + 5400)
+        );
+        for bad in [
+            "",
+            "soon",
+            "2026-13-01T00:00:00Z",
+            "2026-11-06T25:00:00Z",
+            "2026-11-06",
+        ] {
+            assert_eq!(parse_rfc3339_unix(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_expired_session_signs_the_user_out_with_a_plain_message() {
+        let _guard = crate::creds::test_lock();
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.token = "synthetic-session-token-0123456789abcdef".into();
+        session.session_expires = Some(super::unix_now() + 3600);
+        session.check_session_expiry();
+        assert!(
+            session.has_saved_session(),
+            "a future expiry keeps the session"
+        );
+        session.session_expires = Some(super::unix_now().saturating_sub(1));
+        session.check_session_expiry();
+        assert_eq!(
+            session.sign_in.notice.as_deref(),
+            Some("Your session ended. Sign in again.")
+        );
+        assert!(!session.has_saved_session());
+        assert!(session.session_expires.is_none());
+    }
+
+    #[test]
+    fn a_launch_result_reaches_the_toast_from_its_helper_thread() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.launch(|| "launched".to_owned());
+        let started = Instant::now();
+        while session.toast.is_none() && started.elapsed() < Duration::from_secs(5) {
+            session.poll_launches();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(session.toast.as_deref(), Some("launched"));
     }
 }

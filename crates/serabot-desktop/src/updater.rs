@@ -314,6 +314,15 @@ impl Updater {
             .user_agent(format!("serabot-desktop/{}", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(10))
             .timeout(API_TIMEOUT)
+            // Release assets redirect to GitHub's CDN; never follow a hop
+            // that leaves HTTPS, and stop a redirect loop early.
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.url().scheme() == "https" && attempt.previous().len() < 5 {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            }))
             .build()
             .ok()?;
         Some(Self {
@@ -382,6 +391,7 @@ impl Updater {
         };
         // A cache failure does not invalidate an otherwise verified update.
         let _ = self.write_cache(&info);
+        self.prune_stale(&info.exe_path);
         Ok(Some(info))
     }
 
@@ -477,6 +487,25 @@ impl Updater {
             UpdateError::Storage
         })?;
         Ok(total)
+    }
+
+    /// Remove older downloaded executables and abandoned `.part` files so the
+    /// updates folder does not grow. Best effort; `keep` is never touched.
+    fn prune_stale(&self, keep: &Path) {
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let ours = name.starts_with("serabot-desktop-")
+                && (name.ends_with(".exe") || name.ends_with(".exe.part"));
+            if ours && path != keep && path.is_file() {
+                let _ = fs::remove_file(&path);
+            }
+        }
     }
 
     fn write_cache(&self, info: &UpdateInfo) -> Result<(), UpdateError> {
@@ -847,6 +876,27 @@ mod tests {
         // Tampering with the cached executable invalidates it.
         fs::write(&exe, b"tampered").unwrap();
         assert!(updater.cached().is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pruning_keeps_the_new_update_and_drops_stale_downloads() {
+        let dir = temp_dir("prune");
+        let keep = dir.join("serabot-desktop-2.0.0.exe");
+        for name in [
+            "serabot-desktop-2.0.0.exe",
+            "serabot-desktop-1.0.0.exe",
+            "serabot-desktop-1.5.0.exe.part",
+            "update.log",
+        ] {
+            fs::write(dir.join(name), b"x").unwrap();
+        }
+        let updater = Updater::new("owner/repo", Version::new(1, 0, 0), &dir).unwrap();
+        updater.prune_stale(&keep);
+        assert!(keep.exists());
+        assert!(dir.join("update.log").exists());
+        assert!(!dir.join("serabot-desktop-1.0.0.exe").exists());
+        assert!(!dir.join("serabot-desktop-1.5.0.exe.part").exists());
         fs::remove_dir_all(dir).unwrap();
     }
 
