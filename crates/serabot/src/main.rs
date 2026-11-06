@@ -866,6 +866,12 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             .context("build connector HTTP client")?;
         register_connector_tools(&mut registry, &config.connectors, &secrets, connector_http)?;
     }
+    let personal_connectors = Arc::new(serabot::personal::PersonalConnectors::new(
+        &config,
+        &secrets,
+        users.clone(),
+    )?);
+    serabot::personal::register_personal_tools(&mut registry, &config, &personal_connectors)?;
     let mut onedrive_registry: Option<Arc<serabot::onedrive::OneDriveRegistry>> = None;
     if config.onedrive.enabled {
         if serabot::onedrive::import_global_refresh_token(
@@ -954,6 +960,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             users.clone(),
             onedrive_registry.clone(),
         )?
+        .with_personal(personal_connectors.clone())
         .with_browser(browser_manager.clone());
         if let Some(manager) = &browser_manager {
             // Closes idle sessions, and every session on shutdown.

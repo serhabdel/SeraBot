@@ -918,7 +918,7 @@ pub struct ProviderStatus {
 }
 
 /// Read-only connector view from `GET /v1/connectors`.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct ConnectorStatus {
     pub id: String,
     pub kind: String,
@@ -944,6 +944,33 @@ pub struct ConnectorStatus {
     /// their own account. `None` for server-wide connectors.
     #[serde(default)]
     pub connected: Option<bool>,
+    /// Per-user products (Outlook, Google, Notion): this account's own state.
+    #[serde(default)]
+    pub personal: Option<PersonalStatus>,
+}
+
+/// One account's state for a per-user connector (`personal` in the list).
+///
+/// `state` is `not_set_up` (an admin has to configure the provider),
+/// `ready` (this account can connect) or `connected`. Links and help text
+/// are fixed in the console, never taken from the server.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct PersonalStatus {
+    pub state: String,
+    #[serde(default)]
+    pub account: Option<String>,
+    /// Short admin-facing note, shown when `state` is `not_set_up`.
+    #[serde(default)]
+    pub hint: Option<String>,
+    /// How this account can connect: `oauth` and/or `token`.
+    #[serde(default)]
+    pub methods: Vec<String>,
+    /// The redirect address an admin registers with the provider.
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
+    /// `google` when an admin can set the provider up from the console.
+    #[serde(default)]
+    pub admin_setup: Option<String>,
 }
 
 /// OAuth sign-in metadata for a connector (ElevenLabs CIMD flow).
@@ -2399,6 +2426,28 @@ impl ApiClient {
                     .as_deref()
                     .is_some_and(|inbox| !bounded_text(inbox, 256))
                 || !valid_secret_map(&connector.secrets)
+                || connector.personal.as_ref().is_some_and(|personal| {
+                    !matches!(
+                        personal.state.as_str(),
+                        "not_set_up" | "ready" | "connected"
+                    ) || personal
+                        .account
+                        .as_deref()
+                        .is_some_and(|account| !bounded_text(account, 256))
+                        || personal
+                            .hint
+                            .as_deref()
+                            .is_some_and(|hint| !bounded_text(hint, 512))
+                        || personal
+                            .redirect_uri
+                            .as_deref()
+                            .is_some_and(|uri| !bounded_text(uri, 2_048))
+                        || personal.methods.len() > 4
+                        || personal
+                            .methods
+                            .iter()
+                            .any(|method| !matches!(method.as_str(), "oauth" | "token"))
+                })
             {
                 return Err(ApiError::InvalidResponse);
             }

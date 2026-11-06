@@ -41,6 +41,7 @@ use crate::onedrive::{
 use crate::orchestration::{
     BotRole, ConversationKind, safe_bot_label, scoped_conversation_id, validate_conversation_id,
 };
+use crate::personal::PersonalConnectors;
 use crate::runtime::{ApprovalNotice, Notifier, Runtime};
 use crate::secrets::SharedSecrets;
 use crate::skills::create_user_skill;
@@ -134,6 +135,8 @@ pub struct ApiState {
     onedrive: Option<Arc<OneDriveRegistry>>,
     /// OneDrive consent (auth code + PKCE); `None` while `[onedrive]` is off.
     onedrive_consent: Option<Arc<OneDriveConsent>>,
+    /// Per-user Outlook, Google, and Notion connections.
+    personal: Arc<PersonalConnectors>,
     token_hash: String,
     /// Per-user request buckets for the per-minute limit. Keyed by the
     /// acting user id (never a token); public sign-in routes without an
@@ -175,6 +178,7 @@ impl ApiState {
         };
         let onedrive_consent =
             OneDriveConsent::new(&config, &secrets, users.clone())?.map(Arc::new);
+        let personal = Arc::new(PersonalConnectors::new(&config, &secrets, users.clone())?);
         Ok(Self {
             runtime,
             store,
@@ -183,6 +187,7 @@ impl ApiState {
             users,
             onedrive,
             onedrive_consent,
+            personal,
             token_hash: config.api.token_hash.to_ascii_lowercase(),
             rate: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: config.server.rate_limit_per_minute.max(1) as usize,
@@ -194,6 +199,13 @@ impl ApiState {
             browser: None,
             config,
         })
+    }
+
+    /// Share the per-user connector service the tools already use, so a
+    /// disconnect also drops the tools' cached access tokens.
+    pub fn with_personal(mut self, personal: Arc<PersonalConnectors>) -> Self {
+        self.personal = personal;
+        self
     }
 
     /// Attach the per-user browser manager (owner live-view routes).
@@ -247,6 +259,9 @@ pub fn router(state: ApiState) -> Router {
             delete(revoke_grant_endpoint),
         )
         .route("/v1/connectors/onedrive", delete(disconnect_onedrive))
+        .route("/v1/connectors/{id}", delete(disconnect_personal))
+        .route("/v1/connectors/{id}/start", post(start_personal_consent))
+        .route("/v1/connectors/{id}/token", put(set_personal_token))
         .route(
             "/v1/connectors/onedrive/start",
             post(start_onedrive_consent),
@@ -341,6 +356,14 @@ pub fn router(state: ApiState) -> Router {
         // Microsoft: no session exists, and the `state` value binds it to the
         // user exactly like the sign-in callback.
         .route(CONSENT_CALLBACK_PATH, get(onedrive_callback))
+        .route(
+            crate::personal::GOOGLE_CALLBACK_PATH,
+            get(personal_callback),
+        )
+        .route(
+            crate::personal::NOTION_CALLBACK_PATH,
+            get(personal_callback),
+        )
         .layer(RequestBodyLimitLayer::new(
             shared.config.server.body_limit_bytes,
         ))
