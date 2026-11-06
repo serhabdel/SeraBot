@@ -1,10 +1,10 @@
-//! Non-secret settings and secure token storage for the owner console.
+//! Non-secret settings and secure session-token storage for the console.
 //!
-//! The server origin lives in `%APPDATA%\SeraBot\settings.json`. The API token
+//! The server origin lives in `%APPDATA%\SeraBot\settings.json`. The session token
 //! never touches that file: on Windows it is stored in the Windows Credential
 //! Manager through the `keyring` crate. Non-Windows builds (WSL tests) keep the
 //! token in a process-local map only. No token is ever logged or written to
-//! disk, and release builds do not read token environment variables.
+//! disk, and no environment variable can supply one.
 
 use crate::{default_server_url, valid_id, valid_speaker, valid_token, validate_endpoint};
 use secrecy::SecretString;
@@ -17,10 +17,9 @@ use zeroize::Zeroize;
 
 /// Windows Credential Manager service name. Never holds the token itself.
 pub const CREDENTIAL_SERVICE: &str = "SeraBot";
-/// Windows Credential Manager account name for the owner API token.
+/// Windows Credential Manager account name for the session token. The name is
+/// kept from earlier releases so an existing saved token keeps working.
 pub const CREDENTIAL_ACCOUNT: &str = "owner-api-token";
-/// Debug-only fallback. The value is read at run time, never compiled in.
-pub const TOKEN_ENV_FALLBACK: &str = "SERABOT_OWNER_TOKEN";
 
 const SETTINGS_FILE: &str = "settings.json";
 const TEMP_SETTINGS_FILE: &str = "settings.json.tmp";
@@ -181,23 +180,12 @@ pub fn save_settings_to(dir: &Path, settings: &Settings) -> Result<(), String> {
     })
 }
 
-/// Load the stored owner token.
-///
-/// Order: the platform credential store, then (debug builds only) the
-/// `SERABOT_OWNER_TOKEN` process environment. Release builds contain no code
-/// that reads the environment variable.
+/// Load the stored session token from the platform credential store.
 pub fn load_token() -> Option<SecretString> {
-    if let Some(token) = stored_token() {
-        return Some(token);
-    }
-    #[cfg(debug_assertions)]
-    if let Some(token) = environment_token() {
-        return Some(token);
-    }
-    None
+    stored_token()
 }
 
-/// Persist the owner token in the platform credential store.
+/// Persist the session token in the platform credential store.
 pub fn save_token(token: &str) -> Result<(), String> {
     if !valid_token(token) {
         return Err(
@@ -207,7 +195,7 @@ pub fn save_token(token: &str) -> Result<(), String> {
     store_token(token)
 }
 
-/// Remove the stored owner token. Missing entries are not an error.
+/// Remove the stored session token. Missing entries are not an error.
 pub fn forget_token() -> Result<(), String> {
     delete_token()
 }
@@ -221,18 +209,7 @@ pub fn prefill_server(settings: &Settings) -> String {
     }
 }
 
-#[cfg(debug_assertions)]
-fn environment_token() -> Option<SecretString> {
-    let value = std::env::var(TOKEN_ENV_FALLBACK).ok()?;
-    let trimmed = value.trim();
-    if valid_token(trimmed) {
-        Some(SecretString::new(trimmed.to_owned()))
-    } else {
-        None
-    }
-}
-
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn stored_token() -> Option<SecretString> {
     let entry = keyring::Entry::new(CREDENTIAL_SERVICE, CREDENTIAL_ACCOUNT).ok()?;
     match entry.get_password() {
@@ -249,7 +226,7 @@ fn stored_token() -> Option<SecretString> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn store_token(token: &str) -> Result<(), String> {
     keyring::Entry::new(CREDENTIAL_SERVICE, CREDENTIAL_ACCOUNT)
         .map_err(|_| credential_error())?
@@ -257,7 +234,7 @@ fn store_token(token: &str) -> Result<(), String> {
         .map_err(|_| credential_error())
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn delete_token() -> Result<(), String> {
     let entry = keyring::Entry::new(CREDENTIAL_SERVICE, CREDENTIAL_ACCOUNT)
         .map_err(|_| credential_error())?;
@@ -267,18 +244,18 @@ fn delete_token() -> Result<(), String> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn credential_error() -> String {
     "Windows Credential Manager is unavailable or refused the request.".to_owned()
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 fn memory_token() -> &'static std::sync::Mutex<Option<String>> {
     static TOKEN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
     &TOKEN
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 fn lock_memory_token() -> std::sync::MutexGuard<'static, Option<String>> {
     memory_token()
         .lock()
@@ -286,7 +263,7 @@ fn lock_memory_token() -> std::sync::MutexGuard<'static, Option<String>> {
 }
 
 /// Test/WSL builds: process-local memory only. Never a file.
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 fn stored_token() -> Option<SecretString> {
     let guard = lock_memory_token();
     guard
@@ -295,7 +272,7 @@ fn stored_token() -> Option<SecretString> {
         .map(|token| SecretString::new(token.clone()))
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 fn store_token(token: &str) -> Result<(), String> {
     let mut guard = lock_memory_token();
     if let Some(mut previous) = guard.replace(token.to_owned()) {
@@ -304,7 +281,7 @@ fn store_token(token: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 fn delete_token() -> Result<(), String> {
     let mut guard = lock_memory_token();
     if let Some(mut previous) = guard.take() {
@@ -314,9 +291,14 @@ fn delete_token() -> Result<(), String> {
 }
 
 #[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(not(windows))]
     use secrecy::ExposeSecret;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -517,9 +499,9 @@ mod tests {
         assert_eq!(prefill_server(&settings), default_server_url());
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn memory_token_store_round_trips_and_clears() {
+        let _guard = test_lock();
         let token = "synthetic-desktop-token-000000000000";
         assert!(save_token("too-short").is_err());
         forget_token().unwrap();
@@ -536,7 +518,6 @@ mod tests {
     fn credential_names_are_stable_and_not_tokens() {
         assert_eq!(CREDENTIAL_SERVICE, "SeraBot");
         assert_eq!(CREDENTIAL_ACCOUNT, "owner-api-token");
-        assert_eq!(TOKEN_ENV_FALLBACK, "SERABOT_OWNER_TOKEN");
         assert!(!valid_token(CREDENTIAL_SERVICE));
     }
 }

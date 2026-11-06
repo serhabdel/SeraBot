@@ -7,12 +7,15 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 pub const CALLBACK_PATH: &str = "/oauth-callback";
+/// Where the server sends the browser after a native sign-in.
+pub const AUTH_DONE_PATH: &str = "/auth-done";
 const PREFERRED_PORT: u16 = 51121;
 const MAX_REQUEST_HEAD: usize = 8 * 1024;
 
@@ -26,6 +29,8 @@ pub enum OAuthError {
     Denied,
     /// The redirect did not carry the state this sign-in started with.
     StateMismatch,
+    /// The user cancelled the sign-in from the console.
+    Cancelled,
 }
 
 impl std::fmt::Display for OAuthError {
@@ -35,6 +40,7 @@ impl std::fmt::Display for OAuthError {
             Self::TimedOut => "Sign-in timed out. Start it again.",
             Self::Denied => "Sign-in was cancelled or refused.",
             Self::StateMismatch => "Sign-in redirect did not match this request. Start it again.",
+            Self::Cancelled => "Sign-in was cancelled.",
         })
     }
 }
@@ -46,7 +52,7 @@ pub struct Pkce {
     pub state: String,
 }
 
-fn base64url(bytes: &[u8]) -> String {
+pub(crate) fn base64url(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -134,16 +140,15 @@ pub fn wait_for_callback(
 fn respond(stream: &mut TcpStream, status: &str, body: &str) {
     let _ = write!(
         stream,
-        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = stream.flush();
 }
 
-fn handle_connection(
-    mut stream: TcpStream,
-    expected_state: &str,
-) -> Option<Result<Zeroizing<String>, OAuthError>> {
+/// Read the request head of one loopback connection and return its target as
+/// a URL. Anything that is not a well-formed `GET` is answered 400.
+fn read_request_url(stream: &mut TcpStream) -> Option<url::Url> {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let mut buffer = vec![0u8; MAX_REQUEST_HEAD];
@@ -167,13 +172,123 @@ fn handle_connection(
         .and_then(|line| line.strip_prefix("GET "))
         .and_then(|rest| rest.split(' ').next());
     let Some(target) = target else {
-        respond(&mut stream, "400 Bad Request", "Bad request");
+        respond(stream, "400 Bad Request", "Bad request");
         return None;
     };
     let Ok(url) = url::Url::parse(&format!("http://127.0.0.1{target}")) else {
-        respond(&mut stream, "400 Bad Request", "Bad request");
+        respond(stream, "400 Bad Request", "Bad request");
         return None;
     };
+    Some(url)
+}
+
+/// What the browser brought back to `/auth-done`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AuthDone {
+    /// The one-time handoff code; the PKCE verifier redeems it.
+    Handoff(Zeroizing<String>),
+    /// The server's short error code (`denied`, `invite_required`, ...).
+    Failed(String),
+}
+
+/// The loopback return address for one native sign-in.
+pub fn handoff_return_to(port: u16) -> String {
+    format!("http://127.0.0.1:{port}{AUTH_DONE_PATH}")
+}
+
+/// Wait for the browser to come back to `/auth-done`. Other paths get 404; a
+/// request whose `state` is not this sign-in's is answered with the failure
+/// page and ignored, so a stray local request cannot end the wait. The wait
+/// also ends when `cancel` is set.
+pub fn wait_for_auth_done(
+    listener: &TcpListener,
+    expected_state: &str,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<AuthDone, OAuthError> {
+    listener
+        .set_nonblocking(true)
+        .map_err(|_| OAuthError::Listen)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(OAuthError::Cancelled);
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if let Some(done) = handle_auth_done(stream, expected_state) {
+                    return Ok(done);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(OAuthError::TimedOut);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return Err(OAuthError::Listen),
+        }
+    }
+}
+
+const SERVER_ERROR_CODES: [&str; 6] = [
+    "denied",
+    "invite_required",
+    "invite_invalid",
+    "disabled",
+    "max_users",
+    "server",
+];
+
+fn handle_auth_done(mut stream: TcpStream, expected_state: &str) -> Option<AuthDone> {
+    let url = read_request_url(&mut stream)?;
+    if url.path() != AUTH_DONE_PATH {
+        respond(&mut stream, "404 Not Found", "Not found");
+        return None;
+    }
+    let mut handoff = None;
+    let mut state = None;
+    let mut error = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "handoff" => handoff = Some(Zeroizing::new(value.into_owned())),
+            "state" => state = Some(value.into_owned()),
+            "error" => error = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    let state_ok = state.as_deref().is_some_and(|got| got == expected_state);
+    let done = if !state_ok {
+        None
+    } else if let Some(code) = error {
+        let code = if SERVER_ERROR_CODES.contains(&code.as_str()) {
+            code
+        } else {
+            "server".to_owned()
+        };
+        Some(AuthDone::Failed(code))
+    } else {
+        match handoff {
+            Some(code) if !code.is_empty() && code.len() <= 512 => Some(AuthDone::Handoff(code)),
+            _ => Some(AuthDone::Failed("server".to_owned())),
+        }
+    };
+    let page = match &done {
+        Some(AuthDone::Handoff(_)) => PAGE_SIGNED_IN,
+        _ => PAGE_FAILED,
+    };
+    respond(&mut stream, "200 OK", page);
+    done
+}
+
+const PAGE_SIGNED_IN: &str = "<!doctype html><meta charset=\"utf-8\"><title>SeraBot</title><body style=\"font-family:system-ui;margin:3rem\"><h2>You are signed in</h2><p>You can close this tab and return to SeraBot.</p></body>";
+const PAGE_FAILED: &str = "<!doctype html><meta charset=\"utf-8\"><title>SeraBot</title><body style=\"font-family:system-ui;margin:3rem\"><h2>Sign-in did not finish</h2><p>You can close this tab. Return to SeraBot to see what happened.</p></body>";
+
+fn handle_connection(
+    mut stream: TcpStream,
+    expected_state: &str,
+) -> Option<Result<Zeroizing<String>, OAuthError>> {
+    let url = read_request_url(&mut stream)?;
     if url.path() != CALLBACK_PATH {
         respond(&mut stream, "404 Not Found", "Not found");
         return None;
@@ -294,6 +409,97 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(error, OAuthError::TimedOut);
+    }
+
+    fn wait_done(listener: &TcpListener, cancel: &AtomicBool) -> Result<AuthDone, OAuthError> {
+        wait_for_auth_done(listener, "expected-state", Duration::from_secs(5), cancel)
+    }
+
+    #[test]
+    fn auth_done_returns_the_handoff_and_ignores_other_paths_and_wrong_state() {
+        let (listener, port) = bind_loopback().unwrap();
+        let client = std::thread::spawn(move || {
+            get(port, "/favicon.ico");
+            get(port, "/oauth-callback?handoff=nope&state=expected-state");
+            get(port, "/auth-done?handoff=stray&state=other");
+            get(
+                port,
+                "/auth-done?handoff=synthetic-handoff&state=expected-state",
+            );
+        });
+        let done = wait_done(&listener, &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            done,
+            AuthDone::Handoff(Zeroizing::new("synthetic-handoff".into()))
+        );
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn auth_done_reports_known_server_errors_and_folds_unknown_ones() {
+        for (query, expected) in [
+            ("error=denied&state=expected-state", "denied"),
+            (
+                "error=invite_required&state=expected-state",
+                "invite_required",
+            ),
+            (
+                "error=invite_invalid&state=expected-state",
+                "invite_invalid",
+            ),
+            ("error=disabled&state=expected-state", "disabled"),
+            ("error=max_users&state=expected-state", "max_users"),
+            ("error=server&state=expected-state", "server"),
+            ("error=%3Cscript%3E&state=expected-state", "server"),
+            ("state=expected-state", "server"),
+        ] {
+            let (listener, port) = bind_loopback().unwrap();
+            let target = format!("/auth-done?{query}");
+            let client = std::thread::spawn(move || get(port, &target));
+            let done = wait_done(&listener, &AtomicBool::new(false)).unwrap();
+            assert_eq!(done, AuthDone::Failed(expected.into()), "{query}");
+            client.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn auth_done_page_says_the_tab_can_be_closed_and_stops_referrers() {
+        let (listener, port) = bind_loopback().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            write!(
+                stream,
+                "GET /auth-done?handoff=h&state=expected-state HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            )
+            .unwrap();
+            let mut reply = String::new();
+            let _ = stream.read_to_string(&mut reply);
+            reply
+        });
+        wait_done(&listener, &AtomicBool::new(false)).unwrap();
+        let reply = client.join().unwrap();
+        assert!(reply.contains("You can close this tab"));
+        assert!(reply.contains("Referrer-Policy: no-referrer"));
+    }
+
+    #[test]
+    fn auth_done_can_be_cancelled_and_times_out() {
+        let (listener, _) = bind_loopback().unwrap();
+        let cancel = AtomicBool::new(true);
+        assert_eq!(wait_done(&listener, &cancel), Err(OAuthError::Cancelled));
+        let error = wait_for_auth_done(
+            &listener,
+            "s",
+            Duration::from_millis(200),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(error, Err(OAuthError::TimedOut));
+    }
+
+    #[test]
+    fn handoff_return_to_is_the_loopback_auth_done_address() {
+        assert_eq!(handoff_return_to(51121), "http://127.0.0.1:51121/auth-done");
+        assert!(crate::valid_handoff_return_to(&handoff_return_to(51121)));
     }
 
     #[test]
