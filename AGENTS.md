@@ -55,7 +55,7 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot/src/auth.rs` — OIDC sign-in, invites, sessions (phase 1 of the reconstruction).
 - `crates/serabot/src/user_secrets.rs` — per-user envelope encryption (phase 4).
 - `crates/serabot/src/gateway.rs` — tool allowlist, approvals, policy, audit.
-- `crates/serabot/src/runtime.rs` — per-user bot routing, durable turn loop, schedules.
+- `crates/serabot/src/runtime/` — per-user bot routing, durable turn loop, schedules.
 - `crates/serabot/src/telegram.rs`, `api.rs` — user transports; Telegram links per user.
 - `crates/serabot-desktop` — Windows owner console (Rust + Dioxus Desktop / WebView2); talks to the API only.
 - `crates/serabot/src/documents.rs`, `retrieval.rs`, `embeddings.rs` — cited RAG, per user.
