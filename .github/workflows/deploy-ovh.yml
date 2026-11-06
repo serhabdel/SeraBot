@@ -73,6 +73,13 @@ jobs:
           cat serabot-linux-x64.sha256
           # Dedicated checksum asset: release.yml's publish job rewrites the
           # shared SHA256SUMS, so the server binary must not rely on it.
+          # release.yml is dispatched at the same moment and creates the
+          # release; wait for it (up to 30 minutes) instead of racing it.
+          for i in $(seq 1 60); do
+            gh release view "${{ inputs.tag }}" >/dev/null 2>&1 && break
+            echo "release ${{ inputs.tag }} not created yet; waiting ($i/60)"
+            sleep 30
+          done
           gh release upload "${{ inputs.tag }}" serabot-linux-x64 serabot-linux-x64.sha256 --clobber
 
   deploy:
