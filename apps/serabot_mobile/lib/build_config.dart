@@ -8,12 +8,6 @@ class BuildConfig {
     defaultValue: '',
   );
 
-  /// GitHub Actions secret *name* for the owner token. Never a token value.
-  static const ownerTokenSecretName = String.fromEnvironment(
-    'SERABOT_OWNER_TOKEN_SECRET_NAME',
-    defaultValue: 'SERABOT_OWNER_TOKEN',
-  );
-
   static String initialServerUrl() => initialServerUrlFrom(defaultServerUrl);
 
   /// Valid origins are prefilled. Empty and invalid hints stay on the generic field.

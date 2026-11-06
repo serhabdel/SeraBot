@@ -50,11 +50,6 @@ void main() {
         'https://',
       );
     });
-
-    test('token secret name is a placeholder, not a token', () {
-      expect(BuildConfig.ownerTokenSecretName, 'SERABOT_OWNER_TOKEN');
-      expect(validToken(BuildConfig.ownerTokenSecretName), isFalse);
-    });
   });
 
   group('validToken', () {
@@ -153,7 +148,7 @@ void main() {
       expect(conversationNodeId(ConversationKind.section, 'Finance'), isNull);
       expect(validBotDescription('line\nok\t'), isTrue);
       expect(validBotDescription('a\u0000b'), isFalse);
-      expect(validBotDescription('é' * 2001), isFalse);
+      expect(validBotDescription('ÃƒÂ©' * 2001), isFalse);
     });
 
     test('new skill ids, descriptions, and bodies', () {
