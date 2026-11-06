@@ -426,7 +426,7 @@ impl State {
             Reply::Voice(settings) => {
                 self.voice = Some(settings);
             }
-            Reply::AdminSaved | Reply::BotProfileSaved | Reply::AdminRestarted => {}
+            Reply::AdminSaved | Reply::BotSettingsSaved | Reply::AdminRestarted => {}
             Reply::AvatarImage {
                 target,
                 version,

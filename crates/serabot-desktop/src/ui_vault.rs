@@ -1,8 +1,7 @@
-//! Floating "Passwords & keys" sheet (design B, contract section 3).
+//! The Vault page (design B, contract section 3; a rail item since 0.16).
 //!
-//! One vault per user, shared by all of that user's bots. The sheet is
-//! anchored to the Vault button in the chat header. It lists entries (never a
-//! value), adds or replaces one through a form whose value field is
+//! One vault per user, shared by all of that user's bots. The page lists
+//! entries (never a value), adds or replaces one through a form whose value field is
 //! write-only, and deletes after a confirm step. Requests run on the panel
 //! worker (`panel.rs`); this file only draws and forwards clicks.
 
@@ -21,13 +20,13 @@ fn kind_icon(kind: VaultKind) -> &'static str {
     }
 }
 
-/// The Vault button plus its sheet. `open` is owned by the caller so the
-/// header and keyboard shortcuts can drive it too.
+/// The Vault page: the passwords and keys list, or the add / replace form.
+/// One vault per user, shared by all of that user's bots; the page lists
+/// entries (never a value), adds or replaces one through a form whose value
+/// field is write-only, and deletes after a confirm step.
 #[component]
-pub fn VaultSheet(open: Signal<bool>, session: Signal<Session>) -> Element {
-    let mut open = open;
+pub fn VaultPage(session: Signal<Session>) -> Element {
     let mut session = session;
-    let is_open = open();
 
     let (loaded, loading, error, notice, entries, has_form) = {
         let s = session.read();
@@ -44,116 +43,75 @@ pub fn VaultSheet(open: Signal<bool>, session: Signal<Session>) -> Element {
 
     rsx! {
         div {
-            class: "vault-anchor",
+            class: "pane vault-page",
             onkeydown: move |event: KeyboardEvent| {
-                if event.key() == Key::Escape && open() {
+                if event.key() == Key::Escape && session.read().panel.vault.form.is_some() {
                     event.stop_propagation();
-                    let in_form = session.read().panel.vault.form.is_some();
-                    if in_form {
-                        session.write().panel.close_form();
-                    } else {
-                        open.set(false);
-                        let _ = dioxus::document::eval(
-                            "document.getElementById('vault-trigger')?.focus();",
-                        );
-                    }
+                    session.write().panel.close_form();
                 }
             },
-            button {
-                id: "vault-trigger",
-                class: if is_open { "btn vault-btn active" } else { "btn vault-btn" },
-                "aria-haspopup": "dialog",
-                "aria-expanded": if is_open { "true" } else { "false" },
-                title: "Passwords & keys",
-                "aria-label": "Passwords & keys",
-                onclick: move |_| {
-                    let next = !open();
-                    open.set(next);
-                    if next {
-                        session.write().panel.ask_vault_list();
-                        let _ = dioxus::document::eval(
-                            "setTimeout(() => document.getElementById('vault-sheet')?.focus(), 30);",
-                        );
+            div { class: "pane-head",
+                div {
+                    h1 { class: "pane-title", "Vault" }
+                    p { class: "muted",
+                        "Passwords and keys your bots can use. They never see the values."
                     }
-                },
-                Icon { name: "lock", size: 15 }
-                span { class: "btn-label", "Passwords & keys" }
-            }
-            div {
-                class: if is_open { "vault-scrim open" } else { "vault-scrim" },
-                onclick: move |_| open.set(false),
-            }
-            div {
-                id: "vault-sheet",
-                class: if is_open { "vault-sheet open" } else { "vault-sheet" },
-                role: "dialog",
-                "aria-label": "Passwords & keys",
-                tabindex: -1,
-                div { class: "vault-head",
-                    Icon { name: "lock", size: 15 }
-                    strong { class: "vault-title", "Passwords & keys" }
+                }
+                if !has_form && loaded && !entries.is_empty() {
                     button {
-                        class: "icon-btn vault-close",
-                        title: "Close",
-                        "aria-label": "Close passwords & keys",
-                        onclick: move |_| open.set(false),
-                        Icon { name: "x", size: 15 }
+                        class: "btn primary",
+                        onclick: move |_| session.write().panel.open_add_form(),
+                        Icon { name: "plus", size: 15 }
+                        "Add"
                     }
                 }
-                p { class: "vault-sub caption",
-                    "Your bots can use these to sign in for you. They never see the actual value."
-                }
-                if let Some(message) = error {
-                    div { class: "error-text vault-error", role: "alert", "{message}" }
-                }
-                if has_form {
-                    VaultFormView { session }
-                } else {
-                    if let Some(message) = notice {
-                        div { class: "vault-notice", role: "status",
-                            Icon { name: "check", size: 14 }
-                            span { "{message}" }
-                        }
+            }
+            div { class: "pane-body",
+                div { class: "vault-panel",
+                    if let Some(message) = error {
+                        div { class: "error-text vault-error", role: "alert", "{message}" }
                     }
-                    if loading && !loaded {
-                        div { class: "vault-list", "aria-busy": "true",
-                            div { class: "skeleton row", " " }
-                            div { class: "skeleton row", " " }
-                        }
-                    } else if loaded && entries.is_empty() {
-                        div { class: "vault-empty",
-                            div { class: "empty-icon", Icon { name: "key", size: 20 } }
-                            h2 { class: "empty-title", "Nothing saved yet" }
-                            p { class: "empty-text",
-                                "Add a login or an API key. Your bots can use it to sign in for you, but never see the actual value."
-                            }
-                            button {
-                                class: "btn primary",
-                                onclick: move |_| session.write().panel.open_add_form(),
-                                "Add"
-                            }
-                        }
-                    } else if !loaded {
-                        // The first load failed: say so, offer a retry.
-                        div { class: "vault-empty",
-                            button {
-                                class: "btn",
-                                onclick: move |_| session.write().panel.ask_vault_list(),
-                                "Try again"
-                            }
-                        }
+                    if has_form {
+                        VaultFormView { session }
                     } else {
-                        ul { class: "vault-list", role: "list",
-                            for entry in entries {
-                                VaultRow { key: "{entry.name}", session, entry }
+                        if let Some(message) = notice {
+                            div { class: "vault-notice", role: "status",
+                                Icon { name: "check", size: 14 }
+                                span { "{message}" }
                             }
                         }
-                        div { class: "vault-foot",
-                            button {
-                                class: "btn primary",
-                                onclick: move |_| session.write().panel.open_add_form(),
-                                Icon { name: "plus", size: 15 }
-                                "Add"
+                        if loading && !loaded {
+                            div { class: "vault-list", "aria-busy": "true",
+                                div { class: "skeleton row", " " }
+                                div { class: "skeleton row", " " }
+                            }
+                        } else if loaded && entries.is_empty() {
+                            div { class: "vault-empty",
+                                div { class: "empty-icon", Icon { name: "key", size: 20 } }
+                                h2 { class: "empty-title", "Nothing saved yet" }
+                                p { class: "empty-text",
+                                    "Add a login or an API key. Your bots can use it to sign in for you, but never see the actual value."
+                                }
+                                button {
+                                    class: "btn primary",
+                                    onclick: move |_| session.write().panel.open_add_form(),
+                                    "Add"
+                                }
+                            }
+                        } else if !loaded {
+                            // The first load failed: say so, offer a retry.
+                            div { class: "vault-empty",
+                                button {
+                                    class: "btn",
+                                    onclick: move |_| session.write().panel.ask_vault_list(),
+                                    "Try again"
+                                }
+                            }
+                        } else {
+                            ul { class: "vault-list", role: "list",
+                                for entry in entries {
+                                    VaultRow { key: "{entry.name}", session, entry }
+                                }
                             }
                         }
                     }

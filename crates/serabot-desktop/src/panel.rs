@@ -12,12 +12,13 @@
 
 use crate::worker::Credentials;
 use crate::{
-    ApiClient, ApiError, BrowserController, BrowserInfo, BrowserInput, ConnectorUpdate,
-    MAX_VAULT_DOMAINS, MAX_VAULT_NOTE_CHARS, MAX_VAULT_USERNAME_CHARS, VaultEntry, VaultKind,
-    VaultPut, normalize_vault_domain, valid_vault_name, validate_vault_put,
+    ApiClient, ApiError, BrowserController, BrowserInfo, BrowserInput, BrowserProfile,
+    BrowserSessionInfo, ConnectorUpdate, DEFAULT_PROFILE, MAX_VAULT_DOMAINS, MAX_VAULT_NOTE_CHARS,
+    MAX_VAULT_USERNAME_CHARS, VaultEntry, VaultKind, VaultPut, normalize_vault_domain,
+    valid_vault_name, validate_vault_put,
 };
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -27,12 +28,16 @@ use std::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-/// `GET /v1/browser` while the app has focus.
+/// `GET /v1/browser/sessions` while the app has focus.
 pub const STATUS_EVERY: Duration = Duration::from_secs(2);
-/// Screenshots are polled at most twice a second, and only while visible.
 /// Status poll interval while the window is unfocused (screenshots stop).
 pub const UNFOCUSED_STATUS_EVERY: Duration = Duration::from_secs(30);
+/// One live view (the dock or a focused browser): at most twice a second.
 pub const SHOT_EVERY: Duration = Duration::from_millis(500);
+/// The Browser page grid shares this budget: each card is refreshed about
+/// once a second, and the request rate never goes past 3 per second.
+pub const GRID_SHOT_EVERY: Duration = Duration::from_millis(1000);
+pub const GRID_SHOT_FLOOR: Duration = Duration::from_millis(330);
 const MAX_QUEUED_INPUTS: usize = 64;
 const MAX_INPUTS_IN_FLIGHT: usize = 4;
 
@@ -46,11 +51,18 @@ pub enum PanelOp {
         name: String,
     },
     Status,
-    Shot,
-    Takeover,
-    Handback,
-    Close,
-    Input(BrowserInput),
+    Shot(String),
+    Takeover(String),
+    Handback(String),
+    Close(String),
+    Input(String, BrowserInput),
+    ProfilesList,
+    ProfileCreate(String),
+    ProfileRename {
+        id: String,
+        name: String,
+    },
+    ProfileDelete(String),
     OneDriveStart,
     OneDriveDisconnect,
     /// Open the consent page of a per-user connector.
@@ -79,6 +91,8 @@ pub enum PanelKind {
     Handback,
     Close,
     Input,
+    ProfilesList,
+    ProfileChange,
     OneDriveStart,
     OneDriveDisconnect,
     ConnectorStart,
@@ -94,11 +108,15 @@ impl PanelOp {
             Self::VaultPut { .. } => PanelKind::VaultPut,
             Self::VaultDelete { .. } => PanelKind::VaultDelete,
             Self::Status => PanelKind::Status,
-            Self::Shot => PanelKind::Shot,
-            Self::Takeover => PanelKind::Takeover,
-            Self::Handback => PanelKind::Handback,
-            Self::Close => PanelKind::Close,
-            Self::Input(_) => PanelKind::Input,
+            Self::Shot(_) => PanelKind::Shot,
+            Self::Takeover(_) => PanelKind::Takeover,
+            Self::Handback(_) => PanelKind::Handback,
+            Self::Close(_) => PanelKind::Close,
+            Self::Input(..) => PanelKind::Input,
+            Self::ProfilesList => PanelKind::ProfilesList,
+            Self::ProfileCreate(_) | Self::ProfileRename { .. } | Self::ProfileDelete(_) => {
+                PanelKind::ProfileChange
+            }
             Self::OneDriveStart => PanelKind::OneDriveStart,
             Self::OneDriveDisconnect => PanelKind::OneDriveDisconnect,
             Self::ConnectorStart(_) => PanelKind::ConnectorStart,
@@ -113,11 +131,13 @@ pub enum PanelReply {
     VaultList(Vec<VaultEntry>),
     VaultSaved(VaultEntry),
     VaultDeleted(String),
-    Status(BrowserInfo),
-    Shot(Vec<u8>),
-    Control(BrowserInfo),
+    Sessions(Vec<BrowserSessionInfo>),
+    Shot(String, Vec<u8>),
+    Control(BrowserSessionInfo),
     Closed,
-    Input(BrowserInfo),
+    Input(BrowserSessionInfo),
+    Profiles(Vec<BrowserProfile>),
+    ProfileChanged(String),
     OneDriveUrl(String),
     OneDriveDisconnected,
     ConnectorUrl(String),
@@ -229,12 +249,28 @@ fn execute(job: &PanelJob, cache: &mut Option<ApiClient>) -> Result<PanelReply, 
         PanelOp::VaultDelete { name } => client
             .vault_delete(name)
             .map(|()| PanelReply::VaultDeleted(name.clone())),
-        PanelOp::Status => client.browser_status().map(PanelReply::Status),
-        PanelOp::Shot => client.browser_screenshot().map(PanelReply::Shot),
-        PanelOp::Takeover => client.browser_takeover().map(PanelReply::Control),
-        PanelOp::Handback => client.browser_handback().map(PanelReply::Control),
-        PanelOp::Close => client.browser_close().map(|_| PanelReply::Closed),
-        PanelOp::Input(input) => client.browser_input(input).map(PanelReply::Input),
+        PanelOp::Status => client.browser_sessions().map(PanelReply::Sessions),
+        PanelOp::Shot(id) => client
+            .browser_session_screenshot(id)
+            .map(|bytes| PanelReply::Shot(id.clone(), bytes)),
+        PanelOp::Takeover(id) => client.browser_session_takeover(id).map(PanelReply::Control),
+        PanelOp::Handback(id) => client.browser_session_handback(id).map(PanelReply::Control),
+        PanelOp::Close(id) => client.browser_session_close(id).map(|_| PanelReply::Closed),
+        PanelOp::Input(id, input) => client
+            .browser_session_input(id, input)
+            .map(PanelReply::Input),
+        PanelOp::ProfilesList => client.browser_profiles().map(PanelReply::Profiles),
+        PanelOp::ProfileCreate(name) => client.browser_profile_create(name).map(|profile| {
+            PanelReply::ProfileChanged(format!("Added \u{201c}{}\u{201d}.", profile.name))
+        }),
+        PanelOp::ProfileRename { id, name } => {
+            client.browser_profile_rename(id, name).map(|profile| {
+                PanelReply::ProfileChanged(format!("Renamed to \u{201c}{}\u{201d}.", profile.name))
+            })
+        }
+        PanelOp::ProfileDelete(id) => client
+            .browser_profile_delete(id)
+            .map(|()| PanelReply::ProfileChanged("Profile deleted.".to_owned())),
         PanelOp::OneDriveStart => client.onedrive_consent_start().map(PanelReply::OneDriveUrl),
         PanelOp::OneDriveDisconnect => client
             .onedrive_disconnect()
@@ -479,6 +515,26 @@ impl ConnectorFlow {
     }
 }
 
+/// The next picture is due after this long. One live view gets the full
+/// rate; the grid spreads about one refresh a second over its cards.
+fn shot_interval(targets: usize, grid: bool) -> Duration {
+    if !grid {
+        return SHOT_EVERY;
+    }
+    let n = u32::try_from(targets.max(1)).unwrap_or(u32::MAX);
+    (GRID_SHOT_EVERY / n).max(GRID_SHOT_FLOOR)
+}
+
+fn profile_error_text(error: &ApiError) -> String {
+    match error {
+        ApiError::Http(409) => {
+            "That can't be done: the default profile stays, and names must be different.".into()
+        }
+        ApiError::Http(404) => "That profile is gone. The list was refreshed.".into(),
+        other => other.to_string(),
+    }
+}
+
 /// What went wrong, in everyday words.
 fn connector_error_text(error: &ApiError) -> String {
     match error {
@@ -497,9 +553,28 @@ pub struct PanelState {
     pub epoch: u64,
     /// The app window has focus. Polling stops while it does not.
     pub focused: bool,
+    /// The dock's own browser (the session of the current bot's profile).
     pub info: Option<BrowserInfo>,
-    /// `data:` URI of the latest screenshot.
-    pub shot: Option<String>,
+    /// Every browser the server reports, one per profile.
+    pub sessions: Vec<BrowserSessionInfo>,
+    pub sessions_loaded: bool,
+    /// The profile (= session id) the dock watches.
+    pub dock_profile: String,
+    /// `data:` URI of the latest screenshot per session id.
+    pub shots: HashMap<String, String>,
+    /// The Browser page is the section on screen.
+    pub page_open: bool,
+    /// The session in the Browser page's focus view.
+    pub focus: Option<String>,
+    pub profiles: Vec<BrowserProfile>,
+    pub profiles_loaded: bool,
+    pub profiles_busy: bool,
+    pub profiles_error: Option<String>,
+    pub profiles_notice: Option<String>,
+    want_profiles: bool,
+    profiles_requested: bool,
+    shot_inflight_id: Option<String>,
+    shot_cursor: usize,
     pub browser_error: Option<String>,
     /// The user ended the session from the dock; it stays shut until the
     /// session is gone.
@@ -530,7 +605,21 @@ impl PanelState {
             epoch: 0,
             focused: true,
             info: None,
-            shot: None,
+            sessions: Vec::new(),
+            sessions_loaded: false,
+            dock_profile: DEFAULT_PROFILE.to_owned(),
+            shots: HashMap::new(),
+            page_open: false,
+            focus: None,
+            profiles: Vec::new(),
+            profiles_loaded: false,
+            profiles_busy: false,
+            profiles_error: None,
+            profiles_notice: None,
+            want_profiles: false,
+            profiles_requested: false,
+            shot_inflight_id: None,
+            shot_cursor: 0,
             browser_error: None,
             dismissed: false,
             hidden: false,
@@ -561,9 +650,129 @@ impl PanelState {
         self.info.as_ref().is_some_and(|info| info.active) && !self.dismissed
     }
 
-    /// The dock is visible: the session is active and the panel is not hidden.
+    /// The dock is visible: the session is active and the panel is not
+    /// hidden. The Browser page shows the same picture larger, so the dock
+    /// steps aside while that page is open.
     pub fn open(&self) -> bool {
-        self.session_active() && !self.hidden
+        self.session_active() && !self.hidden && !self.page_open
+    }
+
+    pub fn session(&self, id: &str) -> Option<&BrowserSessionInfo> {
+        self.sessions.iter().find(|session| session.id == id)
+    }
+
+    /// Sessions with a browser actually open.
+    pub fn active_sessions(&self) -> Vec<&BrowserSessionInfo> {
+        self.sessions.iter().filter(|s| s.active).collect()
+    }
+
+    /// The session the user's buttons act on: the focused one on the
+    /// Browser page, else the dock's.
+    pub fn control_target(&self) -> Option<String> {
+        if self.page_open {
+            return self.focus.clone();
+        }
+        (self.session_active() && !self.hidden).then(|| self.dock_profile.clone())
+    }
+
+    /// Which browsers need a picture right now. Nothing unless the window is
+    /// focused: the grid asks for every open browser, the focus view for one,
+    /// the dock for its own.
+    pub fn shot_targets(&self) -> Vec<String> {
+        if !self.focused {
+            return Vec::new();
+        }
+        if self.page_open {
+            return match &self.focus {
+                Some(id) => self
+                    .session(id)
+                    .filter(|s| s.active)
+                    .map(|s| vec![s.id.clone()])
+                    .unwrap_or_default(),
+                None => self
+                    .active_sessions()
+                    .iter()
+                    .map(|s| s.id.clone())
+                    .collect(),
+            };
+        }
+        if self.open() {
+            vec![self.dock_profile.clone()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The dock's latest picture.
+    pub fn dock_shot(&self) -> Option<String> {
+        self.shots.get(&self.dock_profile).cloned()
+    }
+
+    /// Point the dock at another profile's browser.
+    pub fn set_dock_profile(&mut self, id: &str) {
+        if self.dock_profile != id {
+            self.dock_profile = id.to_owned();
+            self.refresh_dock_info();
+            self.next_shot = Instant::now();
+        }
+    }
+
+    fn refresh_dock_info(&mut self) {
+        let info = self
+            .session(&self.dock_profile)
+            .map(BrowserSessionInfo::as_info)
+            .unwrap_or(BrowserInfo {
+                active: false,
+                url: None,
+                title: None,
+                controller: BrowserController::Bot,
+                updated_at: String::new(),
+            });
+        self.set_info(info);
+    }
+
+    /// Open the focus view on one browser.
+    pub fn focus_session(&mut self, id: &str) {
+        self.focus = Some(id.to_owned());
+        self.browser_error = None;
+        self.next_shot = Instant::now();
+    }
+
+    /// Back to the grid.
+    pub fn clear_focus(&mut self) {
+        self.focus = None;
+        self.browser_error = None;
+        self.next_shot = Instant::now();
+    }
+
+    /// The Browser page came on or went off screen.
+    pub fn set_page_open(&mut self, open: bool) {
+        if open == self.page_open {
+            return;
+        }
+        self.page_open = open;
+        let now = Instant::now();
+        if open {
+            self.next_status = now;
+            self.next_shot = now;
+            self.ask_profiles();
+        } else {
+            self.focus = None;
+        }
+    }
+
+    /// Re-read the profile list (the page opened, a bot's profile changed).
+    pub fn ask_profiles(&mut self) {
+        self.want_profiles = true;
+        self.profiles_requested = true;
+    }
+
+    /// Read the profile list once per connection, so the dock knows which
+    /// browser belongs to the bot being talked to.
+    pub fn ensure_profiles(&mut self) {
+        if !self.profiles_requested {
+            self.ask_profiles();
+        }
     }
 
     /// Hide the panel without touching the session.
@@ -578,9 +787,9 @@ impl PanelState {
     }
 
     pub fn user_in_control(&self) -> bool {
-        self.info
-            .as_ref()
-            .is_some_and(|info| info.active && info.controller == BrowserController::User)
+        self.control_target()
+            .and_then(|id| self.session(&id))
+            .is_some_and(|s| s.active && s.controller == BrowserController::User)
     }
 
     pub fn set_focused(&mut self, focused: bool) {
@@ -596,26 +805,39 @@ impl PanelState {
     // ---- user actions -------------------------------------------------
 
     pub fn take_over(&mut self) {
-        if self.open() && !self.control_busy {
+        if let Some(id) = self.control_target()
+            && !self.control_busy
+        {
             self.control_busy = true;
             self.browser_error = None;
-            self.queue.push_back(PanelOp::Takeover);
+            self.queue.push_back(PanelOp::Takeover(id));
         }
     }
 
     pub fn hand_back(&mut self) {
-        if self.open() && !self.control_busy {
+        if let Some(id) = self.control_target()
+            && !self.control_busy
+        {
             self.control_busy = true;
             self.browser_error = None;
-            self.queue.push_back(PanelOp::Handback);
+            self.queue.push_back(PanelOp::Handback(id));
         }
     }
 
-    /// Close the session on the server and shut the dock right away.
+    /// Close the session on the server. From the dock the panel shuts right
+    /// away; on the Browser page the card disappears with the next refresh.
     pub fn close_browser(&mut self) {
-        self.dismissed = true;
+        let Some(id) = self
+            .control_target()
+            .or_else(|| (!self.page_open).then(|| self.dock_profile.clone()))
+        else {
+            return;
+        };
+        if !self.page_open {
+            self.dismissed = true;
+        }
         self.browser_error = None;
-        self.queue.push_back(PanelOp::Close);
+        self.queue.push_back(PanelOp::Close(id));
     }
 
     /// Queue an input for the page. Ignored unless the user holds control.
@@ -623,10 +845,14 @@ impl PanelState {
         if !self.user_in_control() {
             return;
         }
+        let Some(id) = self.control_target() else {
+            return;
+        };
         if let (
             BrowserInput::Scroll { dy },
-            Some(PanelOp::Input(BrowserInput::Scroll { dy: last })),
+            Some(PanelOp::Input(last_id, BrowserInput::Scroll { dy: last })),
         ) = (&input, self.queue.back_mut())
+            && *last_id == id
         {
             *last = (*last + dy).clamp(-5000.0, 5000.0);
             return;
@@ -634,7 +860,59 @@ impl PanelState {
         if self.queue.len() >= MAX_QUEUED_INPUTS {
             return;
         }
-        self.queue.push_back(PanelOp::Input(input));
+        self.queue.push_back(PanelOp::Input(id, input));
+    }
+
+    // ---- browser profiles ---------------------------------------------
+
+    pub fn create_profile(&mut self, name: &str) {
+        if self.profiles_busy {
+            return;
+        }
+        if !crate::valid_profile_name(name) {
+            self.profiles_error = Some("Give the profile a name of up to 40 characters.".into());
+            return;
+        }
+        if self.profiles.len() >= crate::MAX_BROWSER_PROFILES {
+            self.profiles_error = Some("You can have up to 8 profiles. Delete one first.".into());
+            return;
+        }
+        self.profiles_busy = true;
+        self.profiles_error = None;
+        self.profiles_notice = None;
+        self.queue
+            .push_back(PanelOp::ProfileCreate(name.trim().to_owned()));
+    }
+
+    pub fn rename_profile(&mut self, id: &str, name: &str) {
+        if self.profiles_busy {
+            return;
+        }
+        if !crate::valid_profile_name(name) {
+            self.profiles_error = Some("Give the profile a name of up to 40 characters.".into());
+            return;
+        }
+        self.profiles_busy = true;
+        self.profiles_error = None;
+        self.profiles_notice = None;
+        self.queue.push_back(PanelOp::ProfileRename {
+            id: id.to_owned(),
+            name: name.trim().to_owned(),
+        });
+    }
+
+    pub fn delete_profile(&mut self, id: &str) {
+        if self.profiles_busy {
+            return;
+        }
+        if id == DEFAULT_PROFILE {
+            self.profiles_error = Some("The default profile cannot be deleted.".into());
+            return;
+        }
+        self.profiles_busy = true;
+        self.profiles_error = None;
+        self.profiles_notice = None;
+        self.queue.push_back(PanelOp::ProfileDelete(id.to_owned()));
     }
 
     /// Ask the server for the Microsoft consent page for the acting user.
@@ -787,7 +1065,7 @@ impl PanelState {
             return Some(PanelOp::VaultList);
         }
         if let Some(front) = self.queue.front() {
-            let is_input = matches!(front, PanelOp::Input(_));
+            let is_input = matches!(front, PanelOp::Input(..));
             if !is_input || self.inputs_inflight < MAX_INPUTS_IN_FLIGHT {
                 let op = self.queue.pop_front()?;
                 if is_input {
@@ -809,10 +1087,21 @@ impl PanelState {
                 };
             return Some(PanelOp::Status);
         }
-        if self.focused && self.open() && !self.shot_inflight && now >= self.next_shot {
-            self.shot_inflight = true;
-            self.next_shot = now + SHOT_EVERY;
-            return Some(PanelOp::Shot);
+        if self.want_profiles && !self.profiles_busy {
+            self.want_profiles = false;
+            return Some(PanelOp::ProfilesList);
+        }
+        if !self.shot_inflight && now >= self.next_shot {
+            let targets = self.shot_targets();
+            if !targets.is_empty() {
+                let id = targets[self.shot_cursor % targets.len()].clone();
+                self.shot_cursor = self.shot_cursor.wrapping_add(1);
+                self.shot_inflight = true;
+                self.shot_inflight_id = Some(id.clone());
+                self.next_shot =
+                    now + shot_interval(targets.len(), self.page_open && self.focus.is_none());
+                return Some(PanelOp::Shot(id));
+            }
         }
         None
     }
@@ -826,11 +1115,14 @@ impl PanelState {
         let unauthorized = matches!(done.result, Err(ApiError::Http(401)));
         match done.kind {
             PanelKind::Status => self.status_inflight = false,
-            PanelKind::Shot => self.shot_inflight = false,
+            PanelKind::Shot => {
+                self.shot_inflight = false;
+            }
             PanelKind::Input => {
                 self.inputs_inflight = self.inputs_inflight.saturating_sub(1);
             }
             PanelKind::Takeover | PanelKind::Handback => self.control_busy = false,
+            PanelKind::ProfileChange => self.profiles_busy = false,
             PanelKind::OneDriveStart | PanelKind::OneDriveDisconnect => self.onedrive.busy = false,
             PanelKind::GoogleSetup => self.connectors.google_busy = false,
             _ => {}
@@ -848,11 +1140,6 @@ impl PanelState {
     }
 
     fn set_info(&mut self, info: BrowserInfo) {
-        let was_active = self.info.as_ref().is_some_and(|i| i.active);
-        if info.active && !was_active {
-            // A fresh session: never show the previous one's last frame.
-            self.shot = None;
-        }
         if !info.active {
             self.dismissed = false;
             self.hidden = false;
@@ -860,23 +1147,57 @@ impl PanelState {
         self.info = Some(info);
     }
 
+    /// Fold a fresh session list in: drop pictures of browsers that ended or
+    /// restarted, then re-derive the dock's view.
+    fn set_sessions(&mut self, sessions: Vec<BrowserSessionInfo>) {
+        let previous = std::mem::take(&mut self.sessions);
+        self.shots.retain(|id, _| {
+            sessions.iter().any(|s| &s.id == id && s.active)
+                && previous.iter().any(|s| &s.id == id && s.active)
+        });
+        self.sessions = sessions;
+        self.sessions_loaded = true;
+        if let Some(focus) = &self.focus
+            && self.session(focus).is_none()
+        {
+            self.focus = None;
+        }
+        self.refresh_dock_info();
+    }
+
     fn apply_reply(&mut self, reply: PanelReply, now: Instant) {
         match reply {
-            PanelReply::Status(info) => {
+            PanelReply::Sessions(sessions) => {
                 self.browser_error = None;
-                self.set_info(info);
+                self.set_sessions(sessions);
             }
-            PanelReply::Control(info) | PanelReply::Input(info) => {
+            PanelReply::Control(session) | PanelReply::Input(session) => {
                 self.browser_error = None;
-                self.set_info(info);
+                match self.sessions.iter_mut().find(|s| s.id == session.id) {
+                    Some(existing) => *existing = session,
+                    None => self.sessions.push(session),
+                }
+                self.refresh_dock_info();
             }
             PanelReply::Closed => {
                 self.next_status = now;
             }
-            PanelReply::Shot(bytes) => {
-                if self.open() {
-                    self.shot = Some(jpeg_data_uri(&bytes));
+            PanelReply::Shot(id, bytes) => {
+                self.shot_inflight_id = None;
+                if self.session(&id).is_some_and(|s| s.active) {
+                    self.shots.insert(id, jpeg_data_uri(&bytes));
                 }
+            }
+            PanelReply::Profiles(profiles) => {
+                self.profiles = profiles;
+                self.profiles_loaded = true;
+                self.profiles_error = None;
+            }
+            PanelReply::ProfileChanged(notice) => {
+                self.profiles_notice = Some(notice);
+                self.profiles_error = None;
+                self.want_profiles = true;
+                self.next_status = now;
             }
             PanelReply::OneDriveUrl(url) => {
                 self.onedrive.pending_url = Some(url);
@@ -949,13 +1270,22 @@ impl PanelState {
                 }
             }
             PanelKind::Shot => {
+                let id = self.shot_inflight_id.take();
                 if error == ApiError::Http(404) {
                     // The session ended between the two polls.
-                    self.shot = None;
+                    if let Some(id) = id {
+                        self.shots.remove(&id);
+                    }
                     self.next_status = now;
-                } else if self.open() {
+                } else if self.open() || self.focus.is_some() {
                     self.browser_error = Some(message);
                 }
+            }
+            PanelKind::ProfilesList => {
+                self.profiles_error = Some(message);
+            }
+            PanelKind::ProfileChange => {
+                self.profiles_error = Some(profile_error_text(&error));
             }
             PanelKind::Takeover | PanelKind::Handback | PanelKind::Input | PanelKind::Close => {
                 self.browser_error = Some(message);
@@ -1049,6 +1379,22 @@ pub fn address_to_url(raw: &str) -> Option<String> {
     (url.chars().count() <= 2048).then_some(url)
 }
 
+/// The site a card shows: the host of the address, or a plain fallback.
+pub fn host_label(url: Option<&str>) -> String {
+    url.and_then(|raw| url::Url::parse(raw).ok())
+        .and_then(|parsed| {
+            parsed
+                .host_str()
+                .map(|h| h.trim_start_matches("www.").to_owned())
+        })
+        .unwrap_or_else(|| "No page open".to_owned())
+}
+
+/// The bots that browse with this profile.
+pub fn profile_users(profile: &BrowserProfile) -> &[String] {
+    &profile.bots
+}
+
 /// Short, plain label for a vault entry's last-used stamp.
 pub fn last_used_label(stamp: Option<&str>) -> String {
     match stamp.and_then(|s| s.get(..10)) {
@@ -1061,12 +1407,20 @@ pub fn last_used_label(stamp: Option<&str>) -> String {
 mod tests {
     use super::*;
 
-    fn info(active: bool, controller: BrowserController) -> BrowserInfo {
-        BrowserInfo {
+    fn info(active: bool, controller: BrowserController) -> BrowserSessionInfo {
+        session("default", active, controller)
+    }
+
+    fn session(id: &str, active: bool, controller: BrowserController) -> BrowserSessionInfo {
+        BrowserSessionInfo {
+            id: id.into(),
+            profile_name: id.into(),
             active,
             url: active.then(|| "https://example.test/".into()),
             title: active.then(|| "Example".into()),
             controller,
+            bot: Some("main".into()),
+            conversation_id: Some("dir:main".into()),
             updated_at: "2026-11-06T12:00:00Z".into(),
         }
     }
@@ -1123,7 +1477,10 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Status(info(false, BrowserController::Bot))),
+                Ok(PanelReply::Sessions(vec![info(
+                    false,
+                    BrowserController::Bot,
+                )])),
             ),
             t0,
         );
@@ -1136,7 +1493,10 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Status(info(false, BrowserController::Bot))),
+                Ok(PanelReply::Sessions(vec![info(
+                    false,
+                    BrowserController::Bot,
+                )])),
             ),
             t0,
         );
@@ -1150,7 +1510,10 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Status(info(false, BrowserController::Bot))),
+                Ok(PanelReply::Sessions(vec![info(
+                    false,
+                    BrowserController::Bot,
+                )])),
             ),
             t0,
         );
@@ -1163,7 +1526,10 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Status(info(false, BrowserController::Bot))),
+                Ok(PanelReply::Sessions(vec![info(
+                    false,
+                    BrowserController::Bot,
+                )])),
             ),
             t0,
         );
@@ -1183,7 +1549,10 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Status(info(false, BrowserController::Bot))),
+                Ok(PanelReply::Sessions(vec![info(
+                    false,
+                    BrowserController::Bot,
+                )])),
             ),
             t0,
         );
@@ -1193,41 +1562,50 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Status(info(true, BrowserController::Bot))),
+                Ok(PanelReply::Sessions(vec![info(
+                    true,
+                    BrowserController::Bot,
+                )])),
             ),
             t0,
         );
         assert!(state.open());
         let t1 = t0 + Duration::from_millis(700);
-        assert!(matches!(state.next_op(t1), Some(PanelOp::Shot)));
+        assert!(matches!(state.next_op(t1), Some(PanelOp::Shot(_))));
         assert!(state.next_op(t1 + Duration::from_millis(100)).is_none());
         state.apply(
             done(
                 &state,
                 PanelKind::Shot,
-                Ok(PanelReply::Shot(vec![0xFF, 0xD8, 0xFF, 0])),
+                Ok(PanelReply::Shot(
+                    "default".into(),
+                    vec![0xFF, 0xD8, 0xFF, 0],
+                )),
             ),
             t1,
         );
-        assert!(state.shot.is_some());
+        assert!(state.dock_shot().is_some());
         assert!(state.next_op(t1 + Duration::from_millis(400)).is_none());
         assert!(matches!(
             state.next_op(t1 + Duration::from_millis(501)),
-            Some(PanelOp::Shot)
+            Some(PanelOp::Shot(_))
         ));
         // Blurred: no screenshots.
         state.apply(
             done(
                 &state,
                 PanelKind::Shot,
-                Ok(PanelReply::Shot(vec![0xFF, 0xD8, 0xFF, 0])),
+                Ok(PanelReply::Shot(
+                    "default".into(),
+                    vec![0xFF, 0xD8, 0xFF, 0],
+                )),
             ),
             t1,
         );
         state.set_focused(false);
         assert!(!matches!(
             state.next_op(t1 + Duration::from_secs(30)),
-            Some(PanelOp::Shot)
+            Some(PanelOp::Shot(_))
         ));
     }
 
@@ -1267,7 +1645,10 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Status(info(true, BrowserController::Bot))),
+                Ok(PanelReply::Sessions(vec![info(
+                    true,
+                    BrowserController::Bot,
+                )])),
             ),
             t0,
         );
@@ -1275,20 +1656,26 @@ mod tests {
             done(
                 &state,
                 PanelKind::Shot,
-                Ok(PanelReply::Shot(vec![0xFF, 0xD8, 0xFF, 0])),
+                Ok(PanelReply::Shot(
+                    "default".into(),
+                    vec![0xFF, 0xD8, 0xFF, 0],
+                )),
             ),
             t0,
         );
-        assert!(state.shot.is_some());
+        assert!(state.dock_shot().is_some());
         state.close_browser();
         assert!(!state.open());
-        assert!(matches!(state.next_op(t0), Some(PanelOp::Close)));
+        assert!(matches!(state.next_op(t0), Some(PanelOp::Close(_))));
         // Still reported active for a moment: the dock stays shut.
         state.apply(
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Status(info(true, BrowserController::Bot))),
+                Ok(PanelReply::Sessions(vec![info(
+                    true,
+                    BrowserController::Bot,
+                )])),
             ),
             t0,
         );
@@ -1297,7 +1684,10 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Status(info(false, BrowserController::Bot))),
+                Ok(PanelReply::Sessions(vec![info(
+                    false,
+                    BrowserController::Bot,
+                )])),
             ),
             t0,
         );
@@ -1305,12 +1695,15 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Status(info(true, BrowserController::Bot))),
+                Ok(PanelReply::Sessions(vec![info(
+                    true,
+                    BrowserController::Bot,
+                )])),
             ),
             t0,
         );
         assert!(state.open());
-        assert!(state.shot.is_none());
+        assert!(state.dock_shot().is_none());
     }
 
     #[test]
@@ -1321,14 +1714,17 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Status(info(true, BrowserController::Bot))),
+                Ok(PanelReply::Sessions(vec![info(
+                    true,
+                    BrowserController::Bot,
+                )])),
             ),
             t0,
         );
         state.send_input(BrowserInput::Click { x: 1.0, y: 2.0 });
         assert!(state.queue.is_empty());
         state.take_over();
-        assert!(matches!(state.next_op(t0), Some(PanelOp::Takeover)));
+        assert!(matches!(state.next_op(t0), Some(PanelOp::Takeover(_))));
         state.take_over(); // busy: ignored
         assert!(state.queue.is_empty());
         state.apply(
@@ -1344,7 +1740,7 @@ mod tests {
         state.send_input(BrowserInput::Scroll { dy: 50.0 });
         assert_eq!(state.queue.len(), 1);
         match state.next_op(t0) {
-            Some(PanelOp::Input(BrowserInput::Scroll { dy })) => assert_eq!(dy, 150.0),
+            Some(PanelOp::Input(_, BrowserInput::Scroll { dy })) => assert_eq!(dy, 150.0),
             _ => panic!("expected the merged scroll"),
         }
         // At most four inputs in flight.
@@ -1355,7 +1751,7 @@ mod tests {
             });
         }
         let mut sent = 1; // the scroll above is still in flight
-        while let Some(PanelOp::Input(_)) = state.next_op(t0) {
+        while let Some(PanelOp::Input(..)) = state.next_op(t0) {
             sent += 1;
         }
         assert_eq!(sent, MAX_INPUTS_IN_FLIGHT);
@@ -1371,10 +1767,9 @@ mod tests {
         assert!(!state.user_in_control());
         state.send_input(BrowserInput::Click { x: 1.0, y: 2.0 });
         assert!(
-            !state
-                .queue
-                .iter()
-                .any(|op| matches!(op, PanelOp::Input(BrowserInput::Click { x, .. }) if *x == 1.0))
+            !state.queue.iter().any(
+                |op| matches!(op, PanelOp::Input(_, BrowserInput::Click { x, .. }) if *x == 1.0)
+            )
         );
     }
 
@@ -1385,7 +1780,10 @@ mod tests {
         let mut old = done(
             &state,
             PanelKind::Status,
-            Ok(PanelReply::Status(info(true, BrowserController::Bot))),
+            Ok(PanelReply::Sessions(vec![info(
+                true,
+                BrowserController::Bot,
+            )])),
         );
         state.reset();
         old.epoch = 0;
@@ -1406,7 +1804,10 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Status(info(true, BrowserController::Bot))),
+                Ok(PanelReply::Sessions(vec![info(
+                    true,
+                    BrowserController::Bot,
+                )])),
             ),
             t0,
         );
@@ -1414,12 +1815,16 @@ mod tests {
             done(
                 &state,
                 PanelKind::Shot,
-                Ok(PanelReply::Shot(vec![0xFF, 0xD8, 0xFF, 0])),
+                Ok(PanelReply::Shot(
+                    "default".into(),
+                    vec![0xFF, 0xD8, 0xFF, 0],
+                )),
             ),
             t0,
         );
+        state.shot_inflight_id = Some("default".into());
         state.apply(done(&state, PanelKind::Shot, Err(ApiError::Http(404))), t0);
-        assert!(state.shot.is_none());
+        assert!(state.dock_shot().is_none());
         assert!(state.browser_error.is_none());
     }
 
@@ -1574,7 +1979,10 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Status(info(true, BrowserController::Bot))),
+                Ok(PanelReply::Sessions(vec![info(
+                    true,
+                    BrowserController::Bot,
+                )])),
             ),
             t0,
         );
@@ -1598,7 +2006,10 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Status(info(false, BrowserController::Bot))),
+                Ok(PanelReply::Sessions(vec![info(
+                    false,
+                    BrowserController::Bot,
+                )])),
             ),
             later,
         );
@@ -1606,7 +2017,10 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Status(info(true, BrowserController::Bot))),
+                Ok(PanelReply::Sessions(vec![info(
+                    true,
+                    BrowserController::Bot,
+                )])),
             ),
             later,
         );
@@ -1678,5 +2092,335 @@ mod tests {
             form.domain_error.as_deref(),
             Some("Type just the site address, like example.com")
         );
+    }
+
+    // ---- 0.16: sessions, profiles, the Browser page -----------------------
+
+    fn sessions(list: Vec<BrowserSessionInfo>) -> Result<PanelReply, ApiError> {
+        Ok(PanelReply::Sessions(list))
+    }
+
+    fn feed(
+        state: &mut PanelState,
+        kind: PanelKind,
+        result: Result<PanelReply, ApiError>,
+        now: Instant,
+    ) {
+        let done = done(state, kind, result);
+        state.apply(done, now);
+    }
+
+    fn drain_ops(state: &mut PanelState, now: Instant) -> Vec<PanelOp> {
+        let mut ops = Vec::new();
+        while let Some(op) = state.next_op(now) {
+            ops.push(op);
+        }
+        ops
+    }
+
+    #[test]
+    fn the_grid_asks_for_every_open_browser_in_turn_and_never_faster_than_the_floor() {
+        let mut state = PanelState::new();
+        state.set_page_open(true);
+        let t0 = Instant::now();
+        // First pump: sessions list and profile list.
+        let ops = drain_ops(&mut state, t0);
+        assert!(ops.iter().any(|op| matches!(op, PanelOp::Status)));
+        assert!(ops.iter().any(|op| matches!(op, PanelOp::ProfilesList)));
+        feed(
+            &mut state,
+            PanelKind::Status,
+            sessions(vec![
+                session("default", true, BrowserController::Bot),
+                session("work", true, BrowserController::User),
+                session("idle", false, BrowserController::Bot),
+            ]),
+            t0,
+        );
+        // Two open browsers: one picture request at a time, alternating.
+        let t1 = t0 + Duration::from_millis(10);
+        let first = match state.next_op(t1) {
+            Some(PanelOp::Shot(id)) => id,
+            _ => panic!("expected a shot"),
+        };
+        assert!(state.next_op(t1).is_none(), "one in flight at a time");
+        feed(
+            &mut state,
+            PanelKind::Shot,
+            Ok(PanelReply::Shot(first.clone(), vec![0xFF, 0xD8, 0xFF, 0])),
+            t1,
+        );
+        // Not before the grid interval (1 s shared by 2 cards = 500 ms).
+        assert!(state.next_op(t1 + Duration::from_millis(400)).is_none());
+        let second = match state.next_op(t1 + Duration::from_millis(520)) {
+            Some(PanelOp::Shot(id)) => id,
+            _ => panic!("expected the second card"),
+        };
+        assert_ne!(first, second);
+        assert!(["default", "work"].contains(&second.as_str()));
+        assert!(state.shots.contains_key(&first));
+        // The closed browser never gets a request.
+        assert!(!state.shot_targets().contains(&"idle".to_owned()));
+    }
+
+    #[test]
+    fn the_grid_rate_never_passes_three_requests_a_second() {
+        assert_eq!(shot_interval(1, true), GRID_SHOT_EVERY);
+        assert_eq!(shot_interval(2, true), Duration::from_millis(500));
+        assert_eq!(shot_interval(8, true), GRID_SHOT_FLOOR);
+        assert_eq!(shot_interval(1, false), SHOT_EVERY);
+        assert_eq!(shot_interval(8, false), SHOT_EVERY);
+    }
+
+    #[test]
+    fn pictures_stop_when_the_window_loses_focus_and_the_dock_yields_to_the_page() {
+        let mut state = PanelState::new();
+        state.set_page_open(true);
+        let t0 = Instant::now();
+        drain_ops(&mut state, t0);
+        feed(
+            &mut state,
+            PanelKind::Status,
+            sessions(vec![session("default", true, BrowserController::Bot)]),
+            t0,
+        );
+        assert_eq!(state.shot_targets(), vec!["default".to_owned()]);
+        state.set_focused(false);
+        assert!(state.shot_targets().is_empty());
+        assert!(!matches!(
+            state.next_op(t0 + Duration::from_secs(5)),
+            Some(PanelOp::Shot(_))
+        ));
+        state.set_focused(true);
+        // Leaving the page: the dock (open, not hidden) takes over the picture.
+        state.set_page_open(false);
+        assert!(state.open());
+        assert_eq!(state.shot_targets(), vec!["default".to_owned()]);
+        state.hide();
+        assert!(
+            state.shot_targets().is_empty(),
+            "a hidden dock needs no picture"
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_holds_every_background_request() {
+        let mut state = PanelState::new();
+        state.set_page_open(true);
+        let t0 = Instant::now();
+        drain_ops(&mut state, t0);
+        feed(
+            &mut state,
+            PanelKind::Status,
+            sessions(vec![session("default", true, BrowserController::Bot)]),
+            t0,
+        );
+        let t1 = t0 + Duration::from_millis(10);
+        assert!(matches!(state.next_op(t1), Some(PanelOp::Shot(_))));
+        feed(&mut state, PanelKind::Shot, Err(ApiError::Http(429)), t1);
+        state.ask_profiles();
+        // Held: neither pictures nor the profile list nor a status poll go
+        // out until the back-off is over.
+        assert!(state.next_op(t1 + Duration::from_millis(100)).is_none());
+        assert!(state.browser_error.is_none(), "429 backs off quietly");
+        // Far enough in the future everything resumes.
+        assert!(state.next_op(t1 + Duration::from_secs(600)).is_some());
+    }
+
+    #[test]
+    fn the_focus_view_pictures_and_controls_target_the_focused_session() {
+        let mut state = PanelState::new();
+        state.set_page_open(true);
+        let t0 = Instant::now();
+        drain_ops(&mut state, t0);
+        feed(
+            &mut state,
+            PanelKind::Status,
+            sessions(vec![
+                session("default", true, BrowserController::Bot),
+                session("work", true, BrowserController::Bot),
+            ]),
+            t0,
+        );
+        state.focus_session("work");
+        assert_eq!(state.shot_targets(), vec!["work".to_owned()]);
+        assert_eq!(state.control_target().as_deref(), Some("work"));
+        state.take_over();
+        match state.next_op(t0 + Duration::from_millis(5)) {
+            Some(PanelOp::Takeover(id)) => assert_eq!(id, "work"),
+            _ => panic!("expected a takeover of the focused session"),
+        }
+        feed(
+            &mut state,
+            PanelKind::Takeover,
+            Ok(PanelReply::Control(session(
+                "work",
+                true,
+                BrowserController::User,
+            ))),
+            t0,
+        );
+        assert!(state.user_in_control());
+        state.send_input(BrowserInput::Click { x: 3.0, y: 4.0 });
+        match state.next_op(t0 + Duration::from_millis(6)) {
+            Some(PanelOp::Input(id, _)) => assert_eq!(id, "work"),
+            _ => panic!("expected the click to go to the focused session"),
+        }
+        state.hand_back();
+        state.close_browser();
+        let ops = drain_ops(&mut state, t0 + Duration::from_millis(7));
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, PanelOp::Handback(id) if id == "work"))
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, PanelOp::Close(id) if id == "work"))
+        );
+        // The dock is not told it was dismissed by a page-side close.
+        assert!(!state.dismissed);
+        state.clear_focus();
+        assert!(state.control_target().is_none());
+    }
+
+    #[test]
+    fn the_dock_follows_the_profile_of_the_current_bot() {
+        let mut state = PanelState::new();
+        let t0 = Instant::now();
+        drain_ops(&mut state, t0);
+        feed(
+            &mut state,
+            PanelKind::Status,
+            sessions(vec![
+                session("default", true, BrowserController::Bot),
+                session("work", true, BrowserController::User),
+            ]),
+            t0,
+        );
+        assert!(state.open());
+        assert!(!state.user_in_control());
+        state.set_dock_profile("work");
+        assert!(state.user_in_control());
+        assert_eq!(state.shot_targets(), vec!["work".to_owned()]);
+        state.set_dock_profile("idle");
+        assert!(
+            !state.session_active(),
+            "a profile without a browser is idle"
+        );
+        assert!(!state.open());
+        // On the Browser page the dock steps aside.
+        state.set_dock_profile("default");
+        assert!(state.open());
+        state.set_page_open(true);
+        assert!(!state.open());
+    }
+
+    #[test]
+    fn a_restarted_browser_never_shows_the_old_frame_and_a_gone_focus_returns_to_the_grid() {
+        let mut state = PanelState::new();
+        state.set_page_open(true);
+        let t0 = Instant::now();
+        drain_ops(&mut state, t0);
+        feed(
+            &mut state,
+            PanelKind::Status,
+            sessions(vec![session("default", true, BrowserController::Bot)]),
+            t0,
+        );
+        state.focus_session("default");
+        feed(
+            &mut state,
+            PanelKind::Shot,
+            Ok(PanelReply::Shot(
+                "default".into(),
+                vec![0xFF, 0xD8, 0xFF, 0],
+            )),
+            t0,
+        );
+        assert!(state.shots.contains_key("default"));
+        feed(
+            &mut state,
+            PanelKind::Status,
+            sessions(vec![session("default", false, BrowserController::Bot)]),
+            t0,
+        );
+        assert!(state.shots.is_empty());
+        feed(&mut state, PanelKind::Status, sessions(vec![]), t0);
+        assert!(state.focus.is_none(), "the session vanished");
+    }
+
+    #[test]
+    fn profile_actions_validate_first_and_refresh_the_list_after() {
+        let mut state = PanelState::new();
+        let t0 = Instant::now();
+        drain_ops(&mut state, t0);
+        state.create_profile("   ");
+        assert!(state.profiles_error.is_some());
+        assert!(drain_ops(&mut state, t0).is_empty());
+        state.delete_profile("default");
+        assert!(state.profiles_error.as_deref().unwrap().contains("default"));
+        state.create_profile(" Work ");
+        assert!(matches!(
+            state.next_op(t0),
+            Some(PanelOp::ProfileCreate(name)) if name == "Work"
+        ));
+        // One change at a time.
+        state.rename_profile("work", "Shop");
+        assert!(state.next_op(t0).is_none());
+        feed(
+            &mut state,
+            PanelKind::ProfileChange,
+            Ok(PanelReply::ProfileChanged("Added.".into())),
+            t0,
+        );
+        assert_eq!(state.profiles_notice.as_deref(), Some("Added."));
+        assert!(matches!(state.next_op(t0), Some(PanelOp::ProfilesList)));
+        // A conflict from the server is shown in words, not as a status code.
+        state.delete_profile("work");
+        let _ = drain_ops(&mut state, t0);
+        feed(
+            &mut state,
+            PanelKind::ProfileChange,
+            Err(ApiError::Http(409)),
+            t0,
+        );
+        assert!(
+            state
+                .profiles_error
+                .as_deref()
+                .unwrap()
+                .contains("default profile")
+        );
+        assert!(!state.profiles_busy);
+    }
+
+    #[test]
+    fn the_profile_cap_is_enforced_before_asking_the_server() {
+        let mut state = PanelState::new();
+        state.profiles = (0..crate::MAX_BROWSER_PROFILES)
+            .map(|n| BrowserProfile {
+                id: format!("p{n}"),
+                name: format!("P{n}"),
+                is_default: n == 0,
+                bots: vec![],
+                created_at: None,
+                last_used_at: None,
+            })
+            .collect();
+        let t0 = Instant::now();
+        drain_ops(&mut state, t0);
+        state.create_profile("One more");
+        assert!(state.profiles_error.as_deref().unwrap().contains('8'));
+        assert!(drain_ops(&mut state, t0).is_empty());
+    }
+
+    #[test]
+    fn card_labels_are_plain() {
+        assert_eq!(
+            host_label(Some("https://www.example.com/a?b=1")),
+            "example.com"
+        );
+        assert_eq!(host_label(Some("not a url")), "No page open");
+        assert_eq!(host_label(None), "No page open");
     }
 }
