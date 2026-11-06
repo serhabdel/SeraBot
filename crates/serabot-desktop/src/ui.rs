@@ -17,6 +17,9 @@ use serabot_desktop::{
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use crate::ui_dock::BrowserDock;
+use crate::ui_vault::VaultSheet;
+
 /// Cap for the skills array of one bot config. Mirrors
 /// `MAX_SCAFFOLD_SKILLS` in `api.rs`, which is crate-private.
 const MAX_BOT_SKILLS: usize = 16;
@@ -565,7 +568,7 @@ fn App() -> Element {
 
 /// Inline SVG icon set. No image assets ship with the console.
 #[component]
-fn Icon(name: String, #[props(default = 20)] size: u32) -> Element {
+pub(crate) fn Icon(name: String, #[props(default = 20)] size: u32) -> Element {
     let path = match name.as_str() {
         "chat" => "M4 5h16v11H8l-4 4V5z",
         "search" => "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM20 20l-4-4",
@@ -618,6 +621,12 @@ fn Icon(name: String, #[props(default = 20)] size: u32) -> Element {
         "connectors" => "M8 12a4 4 0 1 1 4 4M16 12a4 4 0 1 1-4-4",
         "approvals" => "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM8 12l3 3 5-6",
         "fleet" => "M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z",
+        "lock" => "M6 11h12v9H6zM8 11V8a4 4 0 0 1 8 0v3",
+        "globe" => {
+            "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"
+        }
+        "key" => "M14.5 9.5a4 4 0 1 1-1.2-2.8L21 14.4V18h-3.6v-2h-2v-2h-2z",
+        "panel" => "M4 5h16v14H4zM15 5v14",
         "theme" => {
             "M12 4v2M12 18v2M4 12h2M18 12h2M6.3 6.3l1.4 1.4M16.3 16.3l1.4 1.4M17.7 6.3l-1.4 1.4M7.7 16.3l-1.4 1.4M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0z"
         }
@@ -1118,6 +1127,9 @@ fn ConnectView(session: Signal<Session>) -> Element {
     let invite_code = session.read().sign_in.invite_code.clone();
     let show_invite = session.read().sign_in.show_invite;
     let server_empty = server.trim().is_empty();
+    // Same check the session runs on connect, shown as the user types.
+    let server_invalid =
+        !server_empty && serabot_desktop::validate_endpoint(server.trim()).is_err();
     rsx! {
         div { class: "connect",
             div { class: "connect-card",
@@ -1125,13 +1137,20 @@ fn ConnectView(session: Signal<Session>) -> Element {
                 h1 { "SeraBot" }
                 p { class: "muted", "Sign in to continue" }
                 div { class: "field",
-                    label { class: "field-label", "Server" }
+                    label { class: "field-label", r#for: "server-input", "Server" }
                     input {
-                        class: "input",
+                        class: if server_invalid { "input invalid" } else { "input" },
+                        id: "server-input",
                         value: "{server}",
                         placeholder: "https://bot.seradyx.tech",
                         disabled: busy,
+                        "aria-invalid": if server_invalid { "true" } else { "false" },
                         oninput: move |event| session.write().server = event.value(),
+                    }
+                    if server_invalid {
+                        p { class: "field-error", role: "alert",
+                            "Use an https:// address. Plain http works only for localhost."
+                        }
                     }
                 }
                 if connecting && phase == SignInPhase::Idle {
@@ -1227,19 +1246,31 @@ fn ConnectView(session: Signal<Session>) -> Element {
 fn Shell(session: Signal<Session>) -> Element {
     let section = session.read().section;
     let overlay = use_signal(|| Overlay::None);
-    let mut inspector_open = use_signal(|| true);
+    let chat = section == Section::Chat;
+    // The inspector is a summoned panel in the three-pane layout: closed
+    // until the header's Details button asks for it.
+    let mut inspector_open = use_signal(|| false);
     let mut drawer_open = use_signal(|| false);
+    let vault_open = use_signal(|| false);
+    // Browser dock flag (contract section 3). Hidden by default; the network
+    // follow-up raises it while the acting user has a live browser session.
+    let mut browser_open = use_signal(|| false);
     let mut toast = use_signal(|| Option::<(String, bool)>::None);
 
     rsx! {
         div { class: "app-shell",
-            Sidebar { session, overlay, drawer_open, toast, inspector_open }
-            div {
-                class: if drawer_open() { "scrim drawer-scrim open" } else { "scrim drawer-scrim" },
-                onclick: move |_| drawer_open.set(false),
+            IconRail { session, toast }
+            if chat {
+                Sidebar { session, overlay, drawer_open, toast }
+                div {
+                    class: if drawer_open() { "scrim drawer-scrim open" } else { "scrim drawer-scrim" },
+                    onclick: move |_| drawer_open.set(false),
+                }
             }
             main { class: "main",
-                Topbar { session, overlay, inspector_open, drawer_open }
+                if chat {
+                    Topbar { session, overlay, inspector_open, drawer_open, vault_open }
+                }
                 StatusBanner { session }
                 UpdateBanner { session }
                 div { class: "pane",
@@ -1261,11 +1292,14 @@ fn Shell(session: Signal<Session>) -> Element {
                     }}
                 }
             }
-            div {
-                class: if inspector_open() { "scrim inspector-scrim open" } else { "scrim inspector-scrim" },
-                onclick: move |_| inspector_open.set(false),
+            if chat {
+                div {
+                    class: if inspector_open() { "scrim inspector-scrim open" } else { "scrim inspector-scrim" },
+                    onclick: move |_| inspector_open.set(false),
+                }
+                Inspector { session, overlay, open: inspector_open }
             }
-            Inspector { session, overlay, open: inspector_open }
+            BrowserDock { open: browser_open(), on_close: move |_| browser_open.set(false) }
             {match overlay() {
                 Overlay::NewConversation => rsx! {
                     NewConversationSheet { session, overlay }
@@ -1289,6 +1323,51 @@ fn Shell(session: Signal<Session>) -> Element {
                     }
                 }
             }
+        }
+    }
+}
+
+/// The 58 px icon rail: primary destinations on top, Settings and the account
+/// at the bottom. Labels live in tooltips that show on hover and on keyboard
+/// focus; the count on Approvals is the number of pending requests.
+#[component]
+fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> Element {
+    let mut session = session;
+    let section = session.read().section;
+    let pending = session.read().state.approvals.len();
+    let destinations: [(Section, &str, &str); 6] = [
+        (Section::Chat, "chat", "Chat"),
+        (Section::Fleet, "robot", "Bots"),
+        (Section::Approvals, "approvals", "Approvals"),
+        (Section::Memory, "memory", "Memory"),
+        (Section::Connectors, "connectors", "Connectors"),
+        (Section::Providers, "providers", "AI providers"),
+    ];
+    rsx! {
+        nav { class: "rail", "aria-label": "Main navigation",
+            for (target, icon, label) in destinations {
+                button {
+                    key: "{label}",
+                    class: if section == target { "rail-btn on" } else { "rail-btn" },
+                    "data-tip": if target == Section::Approvals && pending > 0 { format!("{label} ({pending})") } else { label.to_owned() },
+                    "aria-label": if target == Section::Approvals && pending > 0 { format!("{label}, {pending} pending") } else { label.to_owned() },
+                    "aria-current": if section == target { "page" } else { "false" },
+                    onclick: move |_| session.write().open_section(target),
+                    Icon { name: icon, size: 18 }
+                    if target == Section::Approvals && pending > 0 {
+                        span { class: "rail-badge", if pending > 99 { "99+" } else { "{pending}" } }
+                    }
+                }
+            }
+            div { class: "rail-spacer" }
+            button {
+                class: if section == Section::Settings { "rail-btn on" } else { "rail-btn" },
+                "data-tip": "Settings",
+                "aria-label": "Settings",
+                onclick: move |_| session.write().open_section(Section::Settings),
+                Icon { name: "settings", size: 18 }
+            }
+            UserMenu { session, toast }
         }
     }
 }
@@ -1410,12 +1489,9 @@ fn Sidebar(
     overlay: Signal<Overlay>,
     drawer_open: Signal<bool>,
     toast: Signal<Option<(String, bool)>>,
-    inspector_open: Signal<bool>,
 ) -> Element {
     let mut overlay = overlay;
     let mut toast = toast;
-    let mut inspector_open = inspector_open;
-    let connected = session.read().state.connected;
     let mut search = use_signal(String::new);
     let mut collapsed = use_signal(HashSet::<String>::new);
     let mut renaming = use_signal(|| Option::<(String, String)>::None);
@@ -1626,21 +1702,15 @@ fn Sidebar(
         }
         items
     };
+    let list_empty = items.is_empty();
+    let searching = !needle.is_empty();
     rsx! {
-        aside { class: if drawer_open() { "sidebar glass open" } else { "sidebar glass" },
+        aside {
+            class: if drawer_open() { "sidebar open" } else { "sidebar" },
+            "aria-label": "Conversations",
             div { class: "sidebar-head",
-                span { class: "brand", "S" }
-                span { class: "brand-name", "SeraBot" }
+                h2 { class: "list-title", "Chats" }
                 NewMenu { session, overlay }
-            }
-            button {
-                class: "btn primary block",
-                onclick: move |_| {
-                    session.write().fleet.conv_kind = ConversationKind::Direct;
-                    overlay.set(Overlay::NewConversation);
-                },
-                Icon { name: "plus", size: 16 }
-                "New chat"
             }
             div { class: "sidebar-search",
                 span { class: "search-glyph", Icon { name: "search", size: 15 } }
@@ -1648,14 +1718,40 @@ fn Sidebar(
                     class: "input",
                     id: "global-search",
                     value: "{search}",
-                    placeholder: "Search chats and bots",
+                    placeholder: "Search chats",
+                    "aria-label": "Search chats and bots",
                     oninput: move |event| search.set(event.value()),
                 }
             }
             div { class: "thread-list",
                 if !loaded {
-                    div { class: "skeleton", " " }
-                    div { class: "skeleton", " " }
+                    div { class: "skeleton row", " " }
+                    div { class: "skeleton row", " " }
+                    div { class: "skeleton row", " " }
+                    div { class: "skeleton row", " " }
+                }
+                if loaded && list_empty {
+                    div { class: "empty compact",
+                        h2 { class: "empty-title",
+                            if searching { "No chats match" } else { "No chats yet" }
+                        }
+                        p { class: "empty-text",
+                            if searching { "Try a different word, or clear the search." } else { "Start a conversation with one of your bots." }
+                        }
+                        if searching {
+                            button { class: "btn", onclick: move |_| search.set(String::new()), "Clear search" }
+                        } else {
+                            button {
+                                class: "btn primary",
+                                onclick: move |_| {
+                                    session.write().fleet.conv_kind = ConversationKind::Direct;
+                                    overlay.set(Overlay::NewConversation);
+                                },
+                                Icon { name: "plus", size: 16 }
+                                "New chat"
+                            }
+                        }
+                    }
                 }
                 for item in items {
                     {match item {
@@ -1695,11 +1791,9 @@ fn Sidebar(
                                             move |_| {
                                                 let bot = id.strip_prefix("dir:").unwrap_or(&id).to_owned();
                                                 session.write().open_bot_chat(bot);
-                                                // A bot click also reveals its profile in the inspector.
-                                                inspector_open.set(true);
                                             }
                                         },
-                                        span { class: "avatar sm bot", style: avatar_style(&id), "{avatar}" }
+                                        span { class: "avatar bot", style: avatar_style(&id), "{avatar}" }
                                         div { class: "thread-copy",
                                             span { class: "thread-title", "{label}" }
                                             span { class: "thread-meta", if enabled { "{role}" } else { "{role} · disabled" } }
@@ -1779,13 +1873,16 @@ fn Sidebar(
                                         }
                                     } else {
                                         button {
-                                            class: "thread-main",
+                                            class: "thread-main thread-bot",
                                             onclick: {
                                                 let id = id.clone();
                                                 move |_| session.write().open_conversation(id.clone())
                                             },
-                                            span { class: "thread-title", "{label}" }
-                                            span { class: "thread-meta", "{subtitle}" }
+                                            span { class: "avatar bot", style: avatar_style(&id), "{initial_of(&label)}" }
+                                            div { class: "thread-copy",
+                                                span { class: "thread-title", "{label}" }
+                                                span { class: "thread-meta", "{subtitle}" }
+                                            }
                                             if !archived && unread > 0 {
                                                 span { class: "unread-badge", "{unread}" }
                                             }
@@ -1847,17 +1944,27 @@ fn Sidebar(
                     }}
                 }
             }
-            div { class: "sidebar-foot",
-                // Nominal connection state is silent; only the exception
-                // (offline) gets a surface. A permanent green chip trains the
-                // eye to ignore the one moment it matters.
-                if !connected {
-                    span { class: "chip danger", "Offline" }
-                }
-                UserMenu { session, toast }
-            }
         }
     }
+}
+
+/// Pill tone for a task row.
+fn tool_pill_class(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Running => "pill ok",
+        TaskStatus::AwaitingApproval => "pill warn",
+        TaskStatus::Failed => "pill danger",
+        _ => "pill",
+    }
+}
+
+/// First letter of a label, upper-cased, for avatar tiles.
+fn initial_of(label: &str) -> String {
+    label
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_else(|| "C".to_owned())
 }
 
 enum RailItem {
@@ -1898,23 +2005,31 @@ fn UserMenu(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> 
     let mut toast = toast;
     let mut open = use_signal(|| false);
     let theme = session.read().theme;
+    let offline = !session.read().state.connected;
     rsx! {
-        div { class: "menu-wrap grow",
+        div { class: "menu-wrap rail-account",
             button {
-                class: "user-chip menu-trigger",
+                class: "rail-btn rail-avatar menu-trigger",
+                "data-tip": if offline { "Account (offline)" } else { "Account" },
+                "aria-label": if offline { "Account menu, offline" } else { "Account menu" },
+                "aria-haspopup": "menu",
+                "aria-expanded": if open() { "true" } else { "false" },
                 onclick: move |_| open.set(!open()),
-                span { class: "avatar sm user", "Y" }
-                span { class: "user-chip-name", "Owner" }
-                Icon { name: if open() { "chevron-down" } else { "chevron-up" }, size: 14 }
+                span { class: "avatar user", "Y" }
+                // Nominal connection state is silent; only the exception
+                // (offline) gets a surface.
+                if offline {
+                    span { class: "rail-badge rail-dot", title: "Offline" }
+                }
             }
             div {
-                class: if open() { "menu open top right" } else { "menu top right" },
+                class: if open() { "menu rail-menu open" } else { "menu rail-menu" },
                 onkeydown: move |event: KeyboardEvent| {
                     if event.key() == Key::Escape {
                         open.set(false);
                     }
                 },
-                div { class: "menu-label", "Owner" }
+                div { class: "menu-label", if offline { "Owner · offline" } else { "Owner" } }
                 button {
                     class: "menu-item",
                     onclick: move |_| {
@@ -1964,6 +2079,24 @@ fn UserMenu(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> 
                     class: "menu-item",
                     onclick: move |_| {
                         open.set(false);
+                        session.write().open_section(Section::Conversations);
+                    },
+                    Icon { name: "threads", size: 16 }
+                    "Conversations"
+                }
+                button {
+                    class: "menu-item",
+                    onclick: move |_| {
+                        open.set(false);
+                        session.write().refresh();
+                    },
+                    Icon { name: "refresh", size: 16 }
+                    "Refresh"
+                }
+                button {
+                    class: "menu-item",
+                    onclick: move |_| {
+                        open.set(false);
                         session.write().open_section(Section::Connectors);
                     },
                     Icon { name: "external", size: 16 }
@@ -1994,32 +2127,65 @@ fn UserMenu(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> 
     }
 }
 
+/// The chat header: bot avatar, name and a one-line subtitle, the status
+/// pill, the team stack and the Vault button. Only the chat shows it; every
+/// other section carries its own large title.
 #[component]
 fn Topbar(
     session: Signal<Session>,
     overlay: Signal<Overlay>,
     inspector_open: Signal<bool>,
     drawer_open: Signal<bool>,
+    vault_open: Signal<bool>,
 ) -> Element {
     let mut overlay = overlay;
     let mut inspector_open = inspector_open;
     let mut drawer_open = drawer_open;
-    let section = session.read().section;
-    let title = if section == Section::Chat {
-        session.read().conversation_title()
-    } else {
-        section.label().to_owned()
-    };
-    let kind = session.read().conversation_kind().map(str::to_owned);
+    let title = session.read().conversation_title();
     let active_bot = session
         .read()
         .conversation
         .strip_prefix("dir:")
         .map(str::to_owned);
     let connected = session.read().state.connected;
-    let bots = session.read().state.listed_bots.len();
-    let bots_loaded = session.read().state.bots_loaded;
-    let theme = session.read().theme;
+    let task_status = session.read().state.task.as_ref().map(|task| task.status);
+    let (subtitle, avatar, bot_name) = {
+        let state = session.read();
+        let summary = state
+            .state
+            .conversations
+            .iter()
+            .find(|conversation| conversation.id == state.conversation);
+        let subtitle = match (&active_bot, summary) {
+            (Some(bot), _) => state
+                .state
+                .listed_bots
+                .iter()
+                .find(|item| &item.id == bot)
+                .map(|item| item.role.clone())
+                .unwrap_or_else(|| "Bot".to_owned()),
+            (None, Some(summary)) => state.conversation_subtitle(summary),
+            (None, None) => "Your direct chat".to_owned(),
+        };
+        let avatar = match &active_bot {
+            Some(bot) => state.bot_avatar(bot),
+            None => initial_of(&title),
+        };
+        let bot_name = match &active_bot {
+            Some(bot) => state.bot_display_name(bot),
+            None => title.clone(),
+        };
+        (subtitle, avatar, bot_name)
+    };
+    let (pill_class, pill_label) = if !connected {
+        ("pill danger", "offline")
+    } else {
+        match task_status {
+            Some(TaskStatus::Running | TaskStatus::Queued) => ("pill ok", "working"),
+            Some(TaskStatus::AwaitingApproval) => ("pill warn", "awaiting approval"),
+            _ => ("pill", "idle"),
+        }
+    };
     let team = {
         let state = session.read();
         let team_members = state
@@ -2035,37 +2201,42 @@ fn Topbar(
                 .iter()
                 .filter(|bot| bot.enabled)
                 .map(|bot| bot.id.clone())
-                .take(5)
+                .take(4)
                 .collect::<Vec<_>>()
         } else {
             team_members
         };
         source
             .into_iter()
-            .map(|id| {
-                (
-                    id.clone(),
-                    state.bot_display_name(&id),
-                    state.bot_avatar(&id),
-                )
-            })
+            .map(|id| (id.clone(), state.bot_avatar(&id)))
             .collect::<Vec<_>>()
     };
     rsx! {
-        header { class: "topbar glass",
-            div { class: "topbar-title",
-                button {
-                    class: "icon-btn drawer-toggle",
-                    title: "Open navigation",
-                    onclick: move |_| drawer_open.set(true),
-                    Icon { name: "list", size: 16 }
-                }
+        header { class: "topbar chat-header",
+            button {
+                class: "icon-btn drawer-toggle",
+                title: "Show chats",
+                "aria-label": "Show chats",
+                onclick: move |_| drawer_open.set(true),
+                Icon { name: "list", size: 16 }
+            }
+            span {
+                class: "avatar bot",
+                style: active_bot.as_deref().map(avatar_style).unwrap_or_else(|| avatar_style(&title)),
+                "{avatar}"
+            }
+            div { class: "chat-header-copy",
                 strong { "{title}" }
-                if let Some(kind) = kind {
-                    span { class: "chip muted", "{kind}" }
+                span { "{subtitle}" }
+            }
+            span { class: "{pill_class}", role: "status",
+                if pill_label == "working" {
+                    span { class: "pill-dot live" }
                 }
+                "{pill_label}"
+            }
+            div { class: "chat-header-actions",
                 if let Some(bot) = active_bot.clone() {
-                    span { class: "chip accent", "bot chat" }
                     button {
                         class: "btn ghost sm",
                         onclick: move |_| session.write().open_bot(bot.clone()),
@@ -2075,60 +2246,38 @@ fn Topbar(
                 button {
                     class: "avatar-stack",
                     title: "Group members",
+                    "aria-label": "Group members",
                     onclick: move |_| {
                         session.write().refresh_team();
                         overlay.set(Overlay::Team);
                     },
-                    for (id, _name, avatar) in team {
+                    for (id, avatar) in team {
                         span { key: "{id}", class: "avatar sm bot", style: avatar_style(&id), "{avatar}" }
                     }
-                }
-            }
-            div { class: "topbar-actions",
-                if session.read().state.task.is_some() {
-                    span { class: "spinner", title: "A turn is running" }
-                }
-                button {
-                    class: "icon-btn",
-                    title: if theme == Theme::Dark { "Light theme" } else { "Dark theme" },
-                    onclick: move |_| {
-                        let next = session.read().theme.toggled();
-                        session.write().set_theme(next);
-                    },
-                    Icon { name: if theme == Theme::Dark { "sun" } else { "moon" }, size: 16 }
                 }
                 button {
                     class: "icon-btn",
                     title: "Refresh",
+                    "aria-label": "Refresh",
                     onclick: move |_| session.write().refresh(),
                     Icon { name: "refresh", size: 16 }
                 }
                 button {
                     class: "icon-btn",
-                    title: "Inspector",
+                    title: "Details",
+                    "aria-label": "Toggle details panel",
+                    "aria-pressed": if inspector_open() { "true" } else { "false" },
                     onclick: move |_| {
                         let next = !inspector_open();
                         inspector_open.set(next);
                     },
-                    Icon { name: "dots", size: 16 }
+                    Icon { name: "panel", size: 16 }
                 }
-                if section == Section::Chat {
-                    button {
-                        class: "btn ghost sm",
-                        onclick: move |_| session.write().open_section(Section::Fleet),
-                        if bots_loaded { "Bots {bots}" } else { "Bots" }
-                    }
-                }
-                // Same rule as the sidebar foot: show the chip only when
-                // offline, never as a permanent "Online" assertion.
-                if !connected {
-                    span { class: "chip danger", "Offline" }
-                }
+                VaultSheet { open: vault_open, bot_name }
             }
         }
     }
 }
-
 #[component]
 fn StatusBanner(session: Signal<Session>) -> Element {
     let error = session.read().state.error.clone();
@@ -2345,6 +2494,39 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
         .task
         .as_ref()
         .map(|task| (task.status, task.status.label().to_owned()));
+    let live_task: Option<(TaskStatus, String, String)> = {
+        let state = session.read();
+        state.state.task.as_ref().and_then(|task| {
+            (!task.status.terminal()).then(|| {
+                (
+                    task.status,
+                    task.kind.clone(),
+                    state.bot_display_name(&task.bot),
+                )
+            })
+        })
+    };
+    let waiting: Vec<(String, String, String)> = if matches!(
+        live_task.as_ref().map(|task| task.0),
+        Some(TaskStatus::AwaitingApproval)
+    ) {
+        session
+            .read()
+            .state
+            .approvals
+            .iter()
+            .take(3)
+            .map(|approval| {
+                (
+                    approval.id.clone(),
+                    approval.tool.clone(),
+                    approval.summary.clone(),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let composer = session.read().composer.clone();
     let can_send = session.read().state.can_send();
     let accepts = session.read().conversation_accepts_turns();
@@ -2501,17 +2683,13 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
     rsx! {
         div { class: "pane-body chat-body",
             div { class: "chat-column",
-                div { class: "chat-head",
-                    div { class: "row",
-                        span { class: "micro", "Conversation" }
-                        // The model selector only applies to one-to-one bot
-                        // chats; rooms and the owner chat stay auto-routed
-                        // (the Providers page keeps the full ModelBar).
-                        if is_one_to_one {
-                            ModelBar { session }
-                        }
+                // The model selector only applies to one-to-one bot chats; rooms
+                // and the owner chat stay auto-routed (the Providers page keeps
+                // the full ModelBar).
+                if is_one_to_one {
+                    div { class: "chat-head",
+                        ModelBar { session }
                     }
-                    NewMenu { session, overlay, right: true }
                 }
                 if let Some((status, label)) = task {
                     if status == TaskStatus::AwaitingApproval {
@@ -2525,7 +2703,7 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                         }
                     }
                 }
-                div { class: "messages", id: "messages",
+                div { class: if group_like { "messages group" } else { "messages" }, id: "messages",
                     if empty {
                         div { class: "empty",
                             div {
@@ -2621,9 +2799,37 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                                         span { class: "team-chip", "peer bot" }
                                     }
                                 }
-                                div { class: "msg-body",
+                                div { class: "msg-body", title: "{stamp}",
                                     MarkdownBody { content: content.clone() }
                                 }
+                            }
+                        }
+                    }
+                    // Work in flight shows as compact tool rows, not as chat
+                    // bubbles: what is running, and what waits on the owner.
+                    if let Some((status, kind, bot)) = live_task {
+                        div { class: "tool-row", role: "status",
+                            Icon { name: "bolt", size: 14 }
+                            span { class: "tool-name", "{kind}" }
+                            span { class: "tool-detail", "{bot}" }
+                            span { class: tool_pill_class(status),
+                                if status == TaskStatus::Running {
+                                    span { class: "pill-dot live" }
+                                }
+                                "{status.label()}"
+                            }
+                        }
+                    }
+                    for (approval_id, tool, summary) in waiting {
+                        div { class: "tool-row", key: "{approval_id}",
+                            Icon { name: "lock", size: 14 }
+                            span { class: "tool-name", "{tool}" }
+                            span { class: "tool-detail", "{summary}" }
+                            span { class: "pill warn", "awaiting approval" }
+                            button {
+                                class: "btn ghost sm",
+                                onclick: move |_| session.write().open_section(Section::Approvals),
+                                "Review"
                             }
                         }
                     }
@@ -2636,6 +2842,8 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                         textarea {
                             class: "composer-input",
                             id: "composer-input",
+                            rows: 1,
+                            "aria-label": "Message",
                             value: "{composer}",
                             placeholder: if accepts { format!("Message {active_name}…") } else { "This node does not accept turns".into() },
                             disabled: !accepts,
@@ -2796,11 +3004,12 @@ fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                                     Icon { name: "paperclip", size: 16 }
                                 }
                                 button {
-                                    class: "btn primary",
+                                    class: "btn primary send-btn",
+                                    title: "Send",
+                                    "aria-label": "Send message",
                                     disabled: !can_send || composer.trim().is_empty(),
                                     onclick: move |_| session.write().submit(),
                                     Icon { name: "send", size: 16 }
-                                    "Send"
                                 }
                             }
                         }
@@ -5303,6 +5512,19 @@ fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element 
                         div { class: "skeleton block" }
                     }
                 }
+                if loaded && provider_rows.is_empty() {
+                    div { class: "empty",
+                        div { class: "empty-icon", Icon { name: "providers", size: 20 } }
+                        h2 { class: "empty-title", "No AI providers yet" }
+                        p { class: "empty-text", "Add a provider and an API key so your bots can answer." }
+                        button {
+                            class: "btn primary",
+                            onclick: move |_| overlay.set(Overlay::AddProvider),
+                            Icon { name: "plus", size: 16 }
+                            "Add provider"
+                        }
+                    }
+                }
                 div { class: "card-grid",
                     for (provider_id, provider_kind, managed, catalog_verified, catalog_fetch, egress, models, routing, secrets, is_oauth, signed_in) in provider_rows {
                         {
@@ -5613,6 +5835,18 @@ fn ConnectorsView(session: Signal<Session>) -> Element {
                     div { class: "card",
                         div { class: "skeleton title" }
                         div { class: "skeleton block" }
+                    }
+                }
+                if loaded && connectors.is_empty() {
+                    div { class: "empty",
+                        div { class: "empty-icon", Icon { name: "connectors", size: 20 } }
+                        h2 { class: "empty-title", "No connectors available" }
+                        p { class: "empty-text", "The server did not list any connectors. Check the connection and try again." }
+                        button {
+                            class: "btn primary",
+                            onclick: move |_| session.write().refresh_connectors(),
+                            "Refresh"
+                        }
                     }
                 }
                 for (suite_title, suite_ids) in [
@@ -6006,6 +6240,12 @@ fn ConversationsView(session: Signal<Session>) -> Element {
     let slug = session.read().fleet.conv_slug.clone();
     let parent = session.read().fleet.conv_parent.clone();
     let editing = rename();
+    let loaded = session.read().state.conversations_loaded;
+    let list_empty = items.is_empty();
+    // Inline validation with the same rule the session enforces on create.
+    // Shown once the owner has typed something.
+    let slug_invalid = !slug.is_empty() && !serabot_desktop::valid_slug(&slug);
+    let can_create = serabot_desktop::valid_slug(&slug);
     rsx! {
         div { class: "pane",
             div { class: "pane-head",
@@ -6055,10 +6295,16 @@ fn ConversationsView(session: Signal<Session>) -> Element {
                         div { class: "field",
                             label { class: "field-label", "Id" }
                             input {
-                                class: "input",
+                                class: if slug_invalid { "input invalid" } else { "input" },
                                 value: "{slug}",
                                 placeholder: "id (lowercase slug)",
+                                "aria-invalid": if slug_invalid { "true" } else { "false" },
                                 oninput: move |event| session.write().fleet.conv_slug = event.value(),
+                            }
+                            if slug_invalid {
+                                p { class: "field-error", role: "alert",
+                                    "Start with a lowercase letter, then letters, digits or - (32 characters at most)."
+                                }
                             }
                         }
                         if kind != ConversationKind::Section {
@@ -6079,6 +6325,7 @@ fn ConversationsView(session: Signal<Session>) -> Element {
                     div { class: "card-actions",
                         button {
                             class: "btn primary",
+                            disabled: !can_create,
                             onclick: move |_| {
                                 let kind = session.read().fleet.conv_kind;
                                 let slug = session.read().fleet.conv_slug.clone();
@@ -6092,6 +6339,24 @@ fn ConversationsView(session: Signal<Session>) -> Element {
                                 );
                             },
                             "Create"
+                        }
+                    }
+                }
+                if !loaded {
+                    div { class: "card",
+                        div { class: "skeleton title" }
+                        div { class: "skeleton block" }
+                    }
+                }
+                if loaded && list_empty {
+                    div { class: "empty",
+                        div { class: "empty-icon", Icon { name: "threads", size: 20 } }
+                        h2 { class: "empty-title", "No conversations yet" }
+                        p { class: "empty-text", "Create a section, a group or a direct thread above, or start a chat from the Chat tab." }
+                        button {
+                            class: "btn primary",
+                            onclick: move |_| session.write().open_section(Section::Chat),
+                            "Go to Chat"
                         }
                     }
                 }
