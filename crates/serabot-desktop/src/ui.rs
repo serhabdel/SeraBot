@@ -8,25 +8,21 @@
 
 use dioxus::prelude::*;
 use serabot_desktop::{
-    ApprovalDecision, BotConfigUpdate, ConversationKind, MAX_TEAM_MEMBERS, Role, SPECIALIST_TOOLS,
-    Selection, TaskStatus, Team, TeamMember, TeamMode,
+    ApprovalDecision, ConversationKind, MAX_TEAM_MEMBERS, Role, SPECIALIST_TOOLS, Selection,
+    TaskStatus, Team, TeamMember, TeamMode,
     audio_capture::MicRecorder,
     branding, provider_presets,
-    session::{ImageSlot, Section, Session, SignInPhase, Theme, humanize_label},
-    teams, valid_skill_id,
+    session::{Section, Session, SignInPhase, Theme, humanize_label},
+    teams,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::ui_bots::{
-    AvatarPicker, CapabilityToggles, NewBotSheet, NewGroupSheet, OnboardingView, capability_chips,
-};
+use crate::ui_bots::{NewBotSheet, NewGroupSheet, OnboardingView};
+use crate::ui_browser::BrowserView;
 use crate::ui_connectors::ConnectorsView;
 use crate::ui_dock::BrowserDock;
-use crate::ui_vault::VaultSheet;
-
-/// Cap for the skills array of one bot config. Mirrors
-/// `MAX_SCAFFOLD_SKILLS` in `api.rs`, which is crate-private.
-const MAX_BOT_SKILLS: usize = 16;
+use crate::ui_settings::SettingsPanel;
+use crate::ui_vault::VaultPage;
 
 const CSS: &str = include_str!("../assets/app.css");
 
@@ -142,7 +138,7 @@ const GLOBAL_KEYS_JS: &str = r#"(function () {
   });
 })();"#;
 
-fn stamp(raw: &str) -> String {
+pub(crate) fn stamp(raw: &str) -> String {
     raw.chars().take(16).collect::<String>().replace('T', " ")
 }
 
@@ -216,28 +212,6 @@ pub(crate) enum Overlay {
     /// The guided "Add provider" sheet.
     AddProvider,
     Team,
-}
-
-/// The chat inspector panes: details, the artifact library, and group members.
-#[derive(Clone, Copy, PartialEq)]
-enum InspectorTab {
-    Details,
-    Library,
-    Members,
-}
-
-#[derive(Clone)]
-struct BotCard {
-    id: String,
-    role: String,
-    enabled: bool,
-    live: bool,
-    display_name: String,
-    description: String,
-    avatar: String,
-    model: Option<String>,
-    tools: Vec<String>,
-    skills: Vec<String>,
 }
 
 fn avatar_hue(id: &str) -> u16 {
@@ -637,6 +611,9 @@ pub(crate) fn Icon(name: String, #[props(default = 20)] size: u32) -> Element {
         "chevron-down" => "M6 9l6 6 6-6",
         "chevron-up" => "M6 15l6-6 6 6",
         "chevron-right" => "M9 6l6 6-6 6",
+        "chevron-left" => "M15 6l-6 6 6 6",
+        "maximize" => "M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5",
+        "minimize" => "M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5",
         "undo" => "M9 14l-5-5 5-5M4 9h11a5 5 0 0 1 0 10h-2",
         "dots" => "M6 12h.01M12 12h.01M18 12h.01",
         "sparkles" => {
@@ -1289,15 +1266,13 @@ fn ConnectView(session: Signal<Session>) -> Element {
 #[component]
 fn Shell(session: Signal<Session>) -> Element {
     let section = session.read().section;
+    let mut session = session;
     let overlay = use_signal(|| Overlay::None);
     let chat = section == Section::Chat;
-    // The inspector is a summoned panel in the three-pane layout: closed
-    // until the header's Details button asks for it.
-    let mut inspector_open = use_signal(|| false);
     let mut drawer_open = use_signal(|| false);
-    let vault_open = use_signal(|| false);
     let mut toast = use_signal(|| Option::<(String, bool)>::None);
     let onboarding_open = chat && session.read().onboarding_ui.open;
+    let settings_open = session.read().bot_settings.open;
     // One stylesheet defines every avatar image; tiles only reference it.
     let avatar_css = serabot_desktop::avatars::stylesheet(&session.read().state.avatars);
 
@@ -1314,7 +1289,7 @@ fn Shell(session: Signal<Session>) -> Element {
             }
             main { class: "main",
                 if chat && !onboarding_open {
-                    Topbar { session, overlay, inspector_open, drawer_open, vault_open }
+                    Topbar { session, overlay, drawer_open }
                 }
                 StatusBanner { session }
                 UpdateBanner { session }
@@ -1329,13 +1304,8 @@ fn Shell(session: Signal<Session>) -> Element {
                         Section::Providers => rsx! { ProvidersView { session, overlay } },
                         Section::Connectors => rsx! { ConnectorsView { session } },
                         Section::Approvals => rsx! { ApprovalsView { session } },
-                        Section::Fleet => {
-                            if session.read().selected_bot.is_some() {
-                                rsx! { BotProfileView { session } }
-                            } else {
-                                rsx! { FleetView { session, overlay } }
-                            }
-                        }
+                        Section::Browser => rsx! { BrowserView { session, overlay } },
+                        Section::Vault => rsx! { VaultPage { session } },
                         Section::Settings => rsx! { SettingsView { session } },
                     }}
                 }
@@ -1343,10 +1313,10 @@ fn Shell(session: Signal<Session>) -> Element {
             }
             if chat {
                 div {
-                    class: if inspector_open() { "scrim inspector-scrim open" } else { "scrim inspector-scrim" },
-                    onclick: move |_| inspector_open.set(false),
+                    class: if settings_open { "scrim inspector-scrim open" } else { "scrim inspector-scrim" },
+                    onclick: move |_| session.write().close_bot_settings(),
                 }
-                Inspector { session, overlay, open: inspector_open }
+                SettingsPanel { session, overlay }
             }
             BrowserDock { session }
             {match overlay() {
@@ -1391,12 +1361,13 @@ fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> 
     let mut session = session;
     let section = session.read().section;
     let pending = session.read().state.approvals.len();
-    let destinations: [(Section, &str, &str); 6] = [
+    let destinations: [(Section, &str, &str); 7] = [
         (Section::Chat, "chat", "Chats"),
-        (Section::Fleet, "robot", "Bots"),
+        (Section::Browser, "globe", "Browser"),
         (Section::Approvals, "approvals", "Approvals"),
         (Section::Memory, "memory", "Memory"),
         (Section::Connectors, "connectors", "Connectors"),
+        (Section::Vault, "lock", "Vault"),
         (Section::Providers, "providers", "AI keys"),
     ];
     rsx! {
@@ -1563,7 +1534,7 @@ fn NewMenu(
 /// Inline SVG pin button: toggles a bot id or conversation id in the pin
 /// list. Stops propagation so it never triggers the surrounding row.
 #[component]
-fn PinToggle(session: Signal<Session>, id: String, pinned: bool) -> Element {
+pub(crate) fn PinToggle(session: Signal<Session>, id: String, pinned: bool) -> Element {
     rsx! {
         button {
             class: if pinned { "pin-toggle pinned" } else { "pin-toggle" },
@@ -1887,6 +1858,7 @@ fn Sidebar(
                         },
                         RailItem::Bot { id, label, role, avatar, active, enabled, live, unread, pinned } => {
                             let pin_id = id.strip_prefix("dir:").unwrap_or(&id).to_owned();
+                            let removable = serabot_desktop::can_remove_bot(&pin_id, &role);
                             rsx! {
                                 div { key: "{id}", class: if active { "thread active" } else { "thread" },
                                     button {
@@ -1913,7 +1885,53 @@ fn Sidebar(
                                     if !live {
                                         span { class: "thread-dot off", title: "restart required" }
                                     }
-                                    PinToggle { session, id: pin_id, pinned }
+                                    div { class: "thread-actions",
+                                        if !enabled && role != "orchestrator" {
+                                            button {
+                                                class: "btn icon",
+                                                title: "Finish setting up",
+                                                "aria-label": "Finish setting up {label}",
+                                                onclick: {
+                                                    let bot = pin_id.clone();
+                                                    move |_| session.write().open_onboarding(bot.clone())
+                                                },
+                                                Icon { name: "sparkles", size: 15 }
+                                            }
+                                        }
+                                        if removable {
+                                            button {
+                                                class: "btn icon",
+                                                title: if enabled { "Switch off" } else { "Switch on" },
+                                                "aria-label": if enabled { "Switch off {label}" } else { "Switch on {label}" },
+                                                onclick: {
+                                                    let bot = pin_id.clone();
+                                                    move |_| session.write().set_bot_enabled(bot.clone(), !enabled)
+                                                },
+                                                Icon { name: "bolt", size: 15 }
+                                            }
+                                            button {
+                                                class: "btn icon",
+                                                title: "Delete bot",
+                                                "aria-label": "Delete {label}",
+                                                onclick: {
+                                                    let bot = pin_id.clone();
+                                                    move |_| session.write().ask_delete_bot(bot.clone())
+                                                },
+                                                Icon { name: "trash", size: 15 }
+                                            }
+                                        }
+                                        button {
+                                            class: "btn icon",
+                                            title: "Bot settings",
+                                            "aria-label": "Settings for {label}",
+                                            onclick: {
+                                                let bot = pin_id.clone();
+                                                move |_| session.write().open_bot_settings(bot.clone())
+                                            },
+                                            Icon { name: "settings", size: 15 }
+                                        }
+                                        PinToggle { session, id: pin_id.clone(), pinned }
+                                    }
                                 }
                             }
                         },
@@ -2186,12 +2204,9 @@ fn UserMenu(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> 
 fn Topbar(
     session: Signal<Session>,
     overlay: Signal<Overlay>,
-    inspector_open: Signal<bool>,
     drawer_open: Signal<bool>,
-    vault_open: Signal<bool>,
 ) -> Element {
     let mut overlay = overlay;
-    let mut inspector_open = inspector_open;
     let mut drawer_open = drawer_open;
     let title = session.read().conversation_title();
     let active_bot = session
@@ -2199,6 +2214,8 @@ fn Topbar(
         .conversation
         .strip_prefix("dir:")
         .map(str::to_owned);
+    let is_bot_chat = active_bot.is_some();
+    let settings_open = session.read().bot_settings.open;
     let connected = session.read().state.connected;
     let (browser_active, browser_open) = {
         let state = session.read();
@@ -2288,13 +2305,6 @@ fn Topbar(
                 "{pill_label}"
             }
             div { class: "chat-header-actions",
-                if let Some(bot) = active_bot.clone() {
-                    button {
-                        class: "btn ghost sm",
-                        onclick: move |_| session.write().open_bot(bot.clone()),
-                        "Profile"
-                    }
-                }
                 button {
                     class: "avatar-stack",
                     title: "Bots in this chat",
@@ -2332,18 +2342,20 @@ fn Topbar(
                     }
                 }
                 button {
-                    class: "btn ghost sm details-btn",
-                    title: "Show or hide chat details",
-                    "aria-label": "Details",
-                    "aria-pressed": if inspector_open() { "true" } else { "false" },
+                    class: if settings_open { "btn sm details-btn active" } else { "btn ghost sm details-btn" },
+                    title: if is_bot_chat { "Change this bot's name, picture and abilities" } else { "Members and files" },
+                    "aria-label": if is_bot_chat { "Bot settings" } else { "Chat settings" },
+                    "aria-pressed": if settings_open { "true" } else { "false" },
                     onclick: move |_| {
-                        let next = !inspector_open();
-                        inspector_open.set(next);
+                        if session.read().bot_settings.open {
+                            session.write().close_bot_settings();
+                        } else {
+                            session.write().open_settings_for_conversation();
+                        }
                     },
                     Icon { name: "panel", size: 15 }
-                    span { class: "btn-label", "Details" }
+                    span { class: "btn-label", if is_bot_chat { "Bot settings" } else { "Settings" } }
                 }
-                VaultSheet { open: vault_open, session }
             }
         }
     }
@@ -2497,7 +2509,7 @@ fn UpdateBanner(session: Signal<Session>) -> Element {
 }
 
 #[component]
-fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
+pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
     let conversation_kind = session.read().conversation_kind().map(str::to_owned);
     let group_like = matches!(conversation_kind.as_deref(), Some("group") | Some("room"));
     let orchestrator = session
@@ -3424,719 +3436,6 @@ fn ModelBar(session: Signal<Session>) -> Element {
 /// Contextual right pane: bot profile, conversation details, provider and
 /// connector summaries.
 #[component]
-fn Inspector(session: Signal<Session>, overlay: Signal<Overlay>, open: Signal<bool>) -> Element {
-    let mut open = open;
-    let section = session.read().section;
-    let conversation = session.read().conversation.clone();
-    let kind = session.read().conversation_kind().map(str::to_owned);
-    let accepts = session.read().conversation_accepts_turns();
-    let title = session.read().conversation_title();
-    let selected_bot = session.read().selected_bot.clone();
-    let providers = session.read().state.providers.clone();
-    let connectors = session.read().state.connectors.clone();
-    let roster = {
-        let state = session.read();
-        state
-            .state
-            .listed_bots
-            .iter()
-            .map(|bot| {
-                (
-                    bot.id.clone(),
-                    state.bot_display_name(&bot.id),
-                    state.bot_avatar(&bot.id),
-                    bot.role.clone(),
-                    bot.enabled,
-                    bot.live,
-                    bot.model.clone(),
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-    let fleet_bot = roster
-        .iter()
-        .find(|(id, _, _, _, _, _, _)| Some(id.clone()) == selected_bot)
-        .cloned();
-    let is_room = teams::is_room(&conversation);
-    let mut tab = use_signal(|| InspectorTab::Details);
-    let library = session.read().state.library.clone();
-    let library_loaded = session.read().state.library_loaded;
-    let library_loading = session.read().state.library_loading;
-    let library_error = session.read().state.library_error.clone();
-    let downloading = session.read().downloading;
-    let rules_draft = session.read().team_rules_draft.clone();
-    let (team_members, team_loaded, team_loading) = {
-        let state = session.read();
-        let members = state
-            .state
-            .team
-            .as_ref()
-            .map(teams::member_ids)
-            .unwrap_or_default();
-        (members, state.state.team_loaded, state.state.team_loading)
-    };
-    // A dir: conversation is a one-to-one bot chat: the Details tab shows
-    // that bot's profile (from the cached GET /v1/bots/{id}) next to the
-    // conversation card.
-    let chat_bot_id = conversation.strip_prefix("dir:").map(str::to_owned);
-    let bot_detail = chat_bot_id
-        .as_deref()
-        .and_then(|id| session.read().state.bot_details.get(id).cloned());
-    let bot_live = chat_bot_id.as_deref().and_then(|id| {
-        session
-            .read()
-            .state
-            .listed_bots
-            .iter()
-            .find(|bot| bot.id == id)
-            .map(|bot| bot.live)
-    });
-    let pins = session.read().pins.clone();
-    let listed_skills = session.read().state.listed_skills.clone();
-    let mut skill_query = use_signal(String::new);
-    // Skills card: "add a skill" filter + the tiny saved caption after a write.
-    let mut add_query = use_signal(String::new);
-    let mut skills_saved = use_signal(|| false);
-    let pins_view = {
-        let rows: Vec<(String, String, String, bool)> = pins
-            .iter()
-            .map(|pin| {
-                let state = session.read();
-                (
-                    pin.clone(),
-                    state.pin_label(pin),
-                    state.pin_avatar(pin),
-                    state.pin_is_bot(pin),
-                )
-            })
-            .collect();
-        rsx! {
-            if !rows.is_empty() {
-                div { class: "pins",
-                    for (pin, label, avatar, is_bot) in rows {
-                        div {
-                            key: "{pin}",
-                            class: "pin-row",
-                            title: "Open {label}",
-                            onclick: {
-                                let pin = pin.clone();
-                                move |_| session.write().open_pin(pin.clone())
-                            },
-                            if is_bot {
-                                span { class: "avatar sm bot", style: avatar_style(&pin), "{avatar}" }
-                            } else {
-                                span { class: "avatar sm user", "{avatar}" }
-                            }
-                            span { class: "thread-title", "{label}" }
-                            PinToggle { session, id: pin.clone(), pinned: true }
-                        }
-                    }
-                }
-            }
-        }
-    };
-    let bot_profile_view = if let Some(bot_id) = chat_bot_id.clone() {
-        if let Some(detail) = bot_detail.clone() {
-            let avatar = if detail.avatar.trim().is_empty() {
-                session.read().bot_avatar(&detail.id)
-            } else {
-                detail.avatar.clone()
-            };
-            let fallback_provider = detail
-                .fallback_provider
-                .as_deref()
-                .map(human_provider)
-                .unwrap_or_else(|| "—".to_owned());
-            let fallback_model = detail
-                .fallback_model
-                .as_deref()
-                .map(human_model)
-                .unwrap_or_else(|| "—".to_owned());
-            let pinned_route = session
-                .read()
-                .state
-                .catalog
-                .as_ref()
-                .map(|catalog| catalog.selection.clone());
-            let skill_needle = skill_query().trim().to_lowercase();
-            let skill_chips: Vec<String> = detail
-                .skills
-                .iter()
-                .filter(|skill| {
-                    skill_needle.is_empty() || skill.to_lowercase().contains(&skill_needle)
-                })
-                .cloned()
-                .collect();
-            // Skills the owner can still attach: valid ids, not already on the
-            // bot, matching the add-filter.
-            let attached_skills = detail.skills.clone();
-            let skills_bot_id = detail.id.clone();
-            let add_needle = add_query().trim().to_lowercase();
-            let addable_skills: Vec<(String, String, String)> = listed_skills
-                .iter()
-                .filter(|skill| valid_skill_id(&skill.id))
-                .filter(|skill| !attached_skills.iter().any(|s| s == &skill.id))
-                .filter(|skill| {
-                    add_needle.is_empty()
-                        || skill.id.to_lowercase().contains(&add_needle)
-                        || skill.name.to_lowercase().contains(&add_needle)
-                })
-                .map(|skill| {
-                    (
-                        skill.id.clone(),
-                        skill.name.clone(),
-                        skill.description.clone(),
-                    )
-                })
-                .collect();
-            let skills_full = attached_skills.len() >= MAX_BOT_SKILLS;
-            let tool_rows: Vec<String> = detail.tools.clone();
-            let instructions = detail.instructions.clone();
-            let instruction_preview = instructions.as_ref().map(|text| {
-                let truncated: String = text.chars().take(8000).collect();
-                let cut = text.chars().count() > 8000;
-                (truncated, if cut { "…" } else { "" })
-            });
-            rsx! {
-                div { class: "card",
-                    div { class: "card-head",
-                        h3 { class: "card-title", "{detail.display_name}" }
-                        span { class: "chip", "{detail.role}" }
-                    }
-                    div { class: "row",
-                        span { class: "avatar lg bot", style: avatar_style(&detail.id), "{avatar}" }
-                        div { class: "chips",
-                            span {
-                                class: if detail.enabled { "chip ok" } else { "chip warn" },
-                                if detail.enabled { "enabled" } else { "disabled" }
-                            }
-                            if let Some(live) = bot_live {
-                                span {
-                                    class: if live { "chip ok" } else { "chip warn" },
-                                    if live { "live" } else { "restart required" }
-                                }
-                            }
-                        }
-                    }
-                    if !detail.description.trim().is_empty() {
-                        p { class: "card-sub", "{detail.description}" }
-                    }
-                }
-                div { class: "card",
-                    div { class: "card-head",
-                        h3 { class: "card-title", "Routing" }
-                    }
-                    div { class: "kv-row",
-                        span { class: "kv-key", "Provider" }
-                        span { class: "kv-val", "{human_provider(&detail.provider)}" }
-                    }
-                    div { class: "kv-row",
-                        span { class: "kv-key", "Model" }
-                        span { class: "kv-val", "{human_model(&detail.model)}" }
-                    }
-                    div { class: "kv-row",
-                        span { class: "kv-key", "Fallback provider" }
-                        span { class: "kv-val", "{fallback_provider}" }
-                    }
-                    div { class: "kv-row",
-                        span { class: "kv-key", "Fallback model" }
-                        span { class: "kv-val", "{fallback_model}" }
-                    }
-                    if !detail.routing_classes.is_empty() {
-                        div { class: "chips",
-                            for class in detail.routing_classes.clone() {
-                                span { class: "chip muted", "{class}" }
-                            }
-                        }
-                        p { class: "hint", "Routing classes this bot accepts." }
-                    }
-                    if let Some(selection) = pinned_route {
-                        if !selection.is_auto()
-                            && (selection.provider != detail.provider || selection.model != detail.model)
-                        {
-                            p { class: "hint",
-                                "This conversation is pinned to {human_model(&selection.model)} via {human_provider(&selection.provider)} in the chat head."
-                            }
-                        }
-                    }
-                }
-                div { class: "card",
-                    div { class: "card-head",
-                        h3 { class: "card-title", "Skills" }
-                        span { class: "chip muted", "{detail.skills.len()} / {MAX_BOT_SKILLS}" }
-                        if skills_saved() {
-                            span { class: "caption", "saved" }
-                        }
-                    }
-                    div { class: "skill-row",
-                        input {
-                            class: "input grow",
-                            placeholder: "Filter skills…",
-                            value: "{skill_query}",
-                            oninput: move |event| skill_query.set(event.value()),
-                        }
-                    }
-                    if detail.skills.is_empty() {
-                        p { class: "hint", "No skills attached." }
-                    } else if skill_chips.is_empty() {
-                        p { class: "hint", "No skill matches the filter." }
-                    } else {
-                        div { class: "chips",
-                            for skill in skill_chips {
-                                {
-                                    let bot_id = skills_bot_id.clone();
-                                    let attached = attached_skills.clone();
-                                    let skill_id = skill.clone();
-                                    rsx! {
-                                        span { class: "chip accent",
-                                            "{skill}"
-                                            button {
-                                                class: "team-chip remove",
-                                                title: "Remove {skill}",
-                                                onclick: move |_| {
-                                                    let mut next: Vec<String> = attached
-                                                        .iter()
-                                                        .filter(|s| **s != skill_id)
-                                                        .cloned()
-                                                        .collect();
-                                                    next.retain(|s| valid_skill_id(s));
-                                                    session.write().save_bot_config(
-                                                        bot_id.clone(),
-                                                        BotConfigUpdate {
-                                                            skills: Some(next),
-                                                            ..Default::default()
-                                                        },
-                                                    );
-                                                    skills_saved.set(true);
-                                                },
-                                                Icon { name: "x", size: 12 }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    div { class: "skill-row",
-                        input {
-                            class: "input grow",
-                            placeholder: "Add a skill…",
-                            value: "{add_query}",
-                            oninput: move |event| {
-                                add_query.set(event.value());
-                                skills_saved.set(false);
-                            },
-                        }
-                    }
-                    if !addable_skills.is_empty() {
-                        div {
-                            class: "pop-list",
-                            style: "max-height: 180px; margin-top: 6px; border: 1px solid var(--hairline); border-radius: var(--r-xs);",
-                            for (id, name, description) in addable_skills {
-                                {
-                                    let bot_id = skills_bot_id.clone();
-                                    let attached = attached_skills.clone();
-                                    let pick_id = id.clone();
-                                    rsx! {
-                                        button {
-                                            key: "{id}",
-                                            class: "pop-item",
-                                            disabled: skills_full,
-                                            title: if skills_full { "Skill cap reached ({MAX_BOT_SKILLS})" } else { "Attach {id}" },
-                                            onclick: move |_| {
-                                                if !valid_skill_id(&pick_id) || attached.len() >= MAX_BOT_SKILLS {
-                                                    return;
-                                                }
-                                                let mut next = attached.clone();
-                                                if next.contains(&pick_id) {
-                                                    return;
-                                                }
-                                                next.push(pick_id.clone());
-                                                session.write().save_bot_config(
-                                                    bot_id.clone(),
-                                                    BotConfigUpdate {
-                                                        skills: Some(next),
-                                                        ..Default::default()
-                                                    },
-                                                );
-                                                skills_saved.set(true);
-                                                add_query.set(String::new());
-                                            },
-                                            div { style: "display: flex; flex-direction: column; align-items: flex-start; gap: 1px; min-width: 0;",
-                                                span { "{name}" }
-                                                if !description.trim().is_empty() {
-                                                    span { class: "caption", "{description}" }
-                                                }
-                                                span { class: "micro", "{id}" }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } else if !add_query().trim().is_empty() {
-                        p { class: "hint", "No unattached skill matches." }
-                    }
-                    if skills_full {
-                        p { class: "hint", "A bot carries at most {MAX_BOT_SKILLS} skills." }
-                    }
-                }
-                div { class: "card",
-                    div { class: "card-head",
-                        h3 { class: "card-title", "What it can do" }
-                    }
-                    if tool_rows.is_empty() {
-                        p { class: "hint", "Nothing switched on." }
-                    } else {
-                        div { class: "chips",
-                            for label in capability_chips(&detail.tools) {
-                                span { class: "chip", "{label}" }
-                            }
-                        }
-                    }
-                    p { class: "approval-note",
-                        Icon { name: "shield", size: 14 }
-                        "Asks before deleting or sending anything"
-                    }
-                    details { class: "advanced",
-                        summary { "Advanced" }
-                        div { class: "advanced-body",
-                            div { class: "chips",
-                                for tool in tool_rows {
-                                    span { class: "chip mono", "{tool}" }
-                                }
-                            }
-                        }
-                    }
-                }
-                div { class: "card",
-                    div { class: "card-head",
-                        h3 { class: "card-title", "Instructions" }
-                        span { class: "chip muted", "{detail.instructions_bytes} bytes" }
-                    }
-                    if let Some((preview, ellipsis)) = instruction_preview {
-                        details {
-                            summary { "Preview prompt" }
-                            pre {
-                                style: "max-height: 240px; overflow: auto; margin: 8px 0 0; white-space: pre-wrap;",
-                                "{preview}{ellipsis}"
-                            }
-                        }
-                        p { class: "hint", "{detail.instructions_bytes} bytes total; shown truncated to 8,000 characters." }
-                    } else {
-                        p { class: "hint", "No custom instructions; the role prompt applies." }
-                    }
-                }
-                div { class: "card",
-                    div { class: "card-head",
-                        h3 { class: "card-title", "Memory & Library" }
-                    }
-                    div { class: "kv-row",
-                        span { class: "kv-key", "Memories" }
-                        span { class: "kv-val", "{detail.memory_count}" }
-                    }
-                    div { class: "kv-row",
-                        span { class: "kv-key", "Artifacts" }
-                        span { class: "kv-val", "{detail.artifact_count}" }
-                    }
-                    div { class: "row",
-                        button {
-                            class: "btn ghost sm",
-                            onclick: {
-                                let id = detail.id.clone();
-                                move |_| session.write().open_bot(id.clone())
-                            },
-                            "Open in Fleet"
-                        }
-                        button {
-                            class: "btn ghost sm",
-                            onclick: move |_| session.write().open_section(Section::Memory),
-                            "Open Memory"
-                        }
-                    }
-                }
-            }
-        } else {
-            rsx! {
-                div { class: "card",
-                    div { class: "card-head",
-                        h3 { class: "card-title", "Bot profile" }
-                        span { class: "spinner", title: "Loading bot record" }
-                    }
-                    div { class: "skeleton", " " }
-                    p { class: "hint", "Loading the bot record from the server…" }
-                    div { class: "row",
-                        button {
-                            class: "btn ghost sm",
-                            onclick: {
-                                let bot_id = bot_id.clone();
-                                move |_| session.write().load_bot_detail(bot_id.clone())
-                            },
-                            Icon { name: "refresh", size: 14 }
-                            "Refresh"
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        rsx! {}
-    };
-    let details_view = rsx! {
-        div { class: "card",
-            div { class: "card-head",
-                h3 { class: "card-title", "{title}" }
-                if let Some(kind) = kind.clone() {
-                    span { class: "chip muted", "{kind}" }
-                }
-            }
-            p { class: "card-sub", "{conversation}" }
-            div { class: "chips",
-                span {
-                    class: if accepts { "chip ok" } else { "chip warn" },
-                    if accepts { "accepts turns" } else { "read only" }
-                }
-            }
-        }
-    };
-    let library_view = rsx! {
-        div { class: "card",
-            div { class: "card-head",
-                h3 { class: "card-title", "Library" }
-                if library_loading || downloading {
-                    span { class: "spinner", title: "Working" }
-                }
-            }
-            if let Some(error) = library_error.clone() {
-                p { class: "hint", "{error}" }
-            }
-            if !library_loaded {
-                p { class: "hint", "The library loads with the transcript." }
-            } else if library.is_empty() {
-                p { class: "hint", "No files yet. Approved decks and documents appear here." }
-            } else {
-                div { class: "roster",
-                    for entry in library.clone() {
-                        div { key: "{entry.action_id}", class: "roster-row",
-                            div { class: "thread-copy",
-                                span { class: "thread-title",
-                                    "{entry.title.clone().or(entry.filename.clone()).unwrap_or_else(|| entry.hash.clone())}"
-                                }
-                                span { class: "thread-meta",
-                                    "{humanize_label(&entry.tool)} · {stamp(&entry.created_at)}"
-                                }
-                            }
-                            button {
-                                class: "btn icon",
-                                title: "Open with the default app",
-                                disabled: downloading,
-                                onclick: {
-                                    let hash = entry.hash.clone();
-                                    move |_| session.write().open_artifact(hash.clone())
-                                },
-                                Icon { name: "external", size: 15 }
-                            }
-                            button {
-                                class: "btn icon",
-                                title: "Show in Explorer",
-                                disabled: downloading,
-                                onclick: {
-                                    let hash = entry.hash.clone();
-                                    move |_| session.write().reveal_artifact(hash.clone())
-                                },
-                                Icon { name: "folder", size: 15 }
-                            }
-                            button {
-                                class: "btn icon",
-                                title: "Download to Downloads",
-                                disabled: downloading,
-                                onclick: {
-                                    let hash = entry.hash.clone();
-                                    move |_| session.write().download_artifact(hash.clone())
-                                },
-                                Icon { name: "download", size: 15 }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    };
-    let members_view = rsx! {
-        div { class: "card",
-            div { class: "card-head",
-                h3 { class: "card-title", "Members" }
-                button {
-                    class: "btn ghost sm",
-                    onclick: move |_| {
-                        session.write().refresh_team();
-                        overlay.set(Overlay::Team);
-                    },
-                    "Manage"
-                }
-            }
-            if is_room && !team_loaded && !team_loading {
-                button {
-                    class: "btn ghost sm",
-                    onclick: move |_| session.write().refresh_team(),
-                    "Load members"
-                }
-            } else if team_members.is_empty() {
-                p { class: "hint", "No members yet. Every enabled bot answers when no members are set." }
-            } else {
-                div { class: "roster",
-                    for id in team_members.clone() {
-                        {
-                            let found = roster.iter().find(|(bot, ..)| bot == &id).cloned();
-                            match found {
-                                Some((_, name, avatar, role, enabled, live, model)) => rsx! {
-                                    div { key: "{id}", class: "roster-row",
-                                        span { class: "avatar sm bot", style: avatar_style(&id), "{avatar}" }
-                                        span { class: "thread-title", "{name}" }
-                                        span { class: "thread-meta", "{role}" }
-                                        span {
-                                            class: if enabled && live { "chip ok" } else { "chip warn" },
-                                            if enabled && live { "live" } else { "offline" }
-                                        }
-                                        if let Some(model) = model {
-                                            span { class: "tiny", "{human_model(&model)}" }
-                                        }
-                                    }
-                                },
-                                None => rsx! {},
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if is_room {
-            div { class: "card",
-                div { class: "card-head",
-                    h3 { class: "card-title", "Group instructions" }
-                }
-                p { class: "hint", "Standing rules every member reads before answering in this group." }
-                textarea {
-                    class: "textarea",
-                    value: "{rules_draft}",
-                    placeholder: "For example: answer in English, cite sources, keep updates short…",
-                    oninput: move |event| session.write().team_rules_draft = event.value(),
-                }
-                div { class: "row",
-                    button {
-                        class: "btn primary sm",
-                        onclick: move |_| session.write().save_team_rules(),
-                        "Save instructions"
-                    }
-                }
-            }
-        }
-    };
-    rsx! {
-        aside { class: if open() { "inspector open" } else { "inspector" },
-            div { class: "inspector-head",
-                h2 { class: "inspector-title", "Inspector" }
-                button {
-                    class: "icon-btn",
-                    title: "Hide inspector",
-                    "aria-label": "Hide inspector",
-                    onclick: move |_| open.set(false),
-                    Icon { name: "x", size: 16 }
-                }
-            }
-            div { class: "inspector-body",
-                if section == Section::Chat {
-                    {pins_view}
-                    div { class: "inspector-tabs",
-                        button {
-                            class: if tab() == InspectorTab::Details { "tab active" } else { "tab" },
-                            onclick: move |_| tab.set(InspectorTab::Details),
-                            "Details"
-                        }
-                        button {
-                            class: if tab() == InspectorTab::Library { "tab active" } else { "tab" },
-                            onclick: move |_| tab.set(InspectorTab::Library),
-                            "Library"
-                        }
-                        if is_room {
-                            button {
-                                class: if tab() == InspectorTab::Members { "tab active" } else { "tab" },
-                                onclick: move |_| tab.set(InspectorTab::Members),
-                                "Members"
-                            }
-                        }
-                    }
-                    {match tab() {
-                        InspectorTab::Details => rsx! {
-                            {details_view}
-                            {bot_profile_view}
-                        },
-                        InspectorTab::Library => library_view,
-                        InspectorTab::Members => members_view,
-                    }}
-                } else if section == Section::Fleet && selected_bot.is_some() {
-                    div { class: "card",
-                        if let Some((id, name, avatar, role, enabled, live, model)) = fleet_bot {
-                            div { class: "row",
-                                span { class: "avatar lg bot", style: avatar_style(&id), "{avatar}" }
-                                div {
-                                    h3 { class: "card-title", "{name}" }
-                                    span { class: "card-sub", "{role}" }
-                                }
-                            }
-                            div { class: "chips",
-                                span {
-                                    class: if enabled && live { "chip ok" } else { "chip warn" },
-                                    if enabled && live { "live" } else { "not live" }
-                                }
-                                if let Some(model) = model {
-                                    span { class: "chip", "Model: {human_model(&model)}" }
-                                }
-                            }
-                        }
-                        button {
-                            class: "btn ghost sm",
-                            onclick: move |_| {
-                                if let Some(id) = selected_bot.clone() {
-                                    session.write().open_bot(id);
-                                }
-                            },
-                            "Open profile"
-                        }
-                    }
-                } else if section == Section::Providers {
-                    div { class: "card",
-                        h3 { class: "card-title", "Providers" }
-                        for provider in providers {
-                            div { key: "{provider.id}", class: "stack-row",
-                                span { "{provider.id}" }
-                                span { class: "tiny", "{provider.kind}" }
-                            }
-                        }
-                    }
-                } else if section == Section::Connectors {
-                    div { class: "card",
-                        h3 { class: "card-title", "Connectors" }
-                        for connector in connectors {
-                            div { key: "{connector.id}", class: "stack-row",
-                                span { "{connector.id}" }
-                                span { class: "tiny", "{connector.kind}" }
-                            }
-                        }
-                    }
-                } else {
-                    div { class: "empty",
-                        div { class: "empty-icon", Icon { name: "dots", size: 20 } }
-                        h3 { class: "empty-title", "Nothing to inspect" }
-                        p { class: "empty-text", "Open a chat, a bot profile, or a provider to see details here." }
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[component]
 fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
     let mut overlay = overlay;
     // The kind the sheet works with. The caller sets it when the sheet
@@ -4695,441 +3994,6 @@ fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                     class: "btn ghost",
                     onclick: move |_| overlay.set(Overlay::None),
                     "Close"
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn FleetView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
-    let mut overlay = overlay;
-    let bots: Vec<BotCard> = {
-        let state = session.read();
-        state
-            .state
-            .listed_bots
-            .iter()
-            .map(|bot| BotCard {
-                id: bot.id.clone(),
-                role: bot.role.clone(),
-                enabled: bot.enabled,
-                live: bot.live,
-                display_name: state.bot_display_name(&bot.id),
-                description: bot.description.clone().unwrap_or_default(),
-                avatar: state.bot_avatar(&bot.id),
-                model: bot.model.clone(),
-                tools: bot.tools.clone(),
-                skills: bot.skills.clone(),
-            })
-            .collect()
-    };
-    let bots_empty = bots.is_empty();
-    let bots_loaded = session.read().state.bots_loaded;
-    let bot_binding = session.read().state.bot_chat_binding == Some(true);
-    let mut skill_id = use_signal(String::new);
-    let mut skill_desc = use_signal(String::new);
-    let mut skill_body = use_signal(String::new);
-    rsx! {
-        div { class: "pane",
-            div { class: "pane-head",
-                div {
-                    h1 { class: "pane-title", "Fleet" }
-                    p { class: "muted", "Your bots and what they can do." }
-                }
-                div { class: "row",
-                    button {
-                        class: "btn ghost",
-                        onclick: move |_| session.write().refresh_bots(),
-                        Icon { name: "refresh", size: 16 }
-                        "Refresh"
-                    }
-                    button {
-                        class: "btn primary",
-                        onclick: move |_| overlay.set(Overlay::NewBot),
-                        Icon { name: "plus", size: 16 }
-                        "New bot"
-                    }
-                }
-            }
-            div { class: "pane-body",
-                if !bot_binding {
-                    div { class: "banner warn",
-                        span { "This server does not route one-to-one bot chats yet. Update the server to 0.5.0 or later." }
-                    }
-                }
-                div { class: "pane-section",
-                details { class: "card",
-                    summary { "New skill pack" }
-                    div { class: "form-grid",
-                        div { class: "field",
-                            label { class: "field-label", "Skill id" }
-                            input {
-                                class: "input",
-                                value: "{skill_id}",
-                                placeholder: "skill id",
-                                oninput: move |event| skill_id.set(event.value()),
-                            }
-                        }
-                        div { class: "field",
-                            label { class: "field-label", "Description" }
-                            input {
-                                class: "input",
-                                value: "{skill_desc}",
-                                placeholder: "One-line description",
-                                oninput: move |event| skill_desc.set(event.value()),
-                            }
-                        }
-                    }
-                    div { class: "field",
-                        label { class: "field-label", "Body" }
-                        textarea {
-                            class: "textarea",
-                            value: "{skill_body}",
-                            placeholder: "Optional markdown body",
-                            oninput: move |event| skill_body.set(event.value()),
-                        }
-                    }
-                    button {
-                        class: "btn primary",
-                        onclick: move |_| {
-                            session.write().create_skill(skill_id(), skill_desc(), skill_body());
-                            skill_id.set(String::new());
-                            skill_desc.set(String::new());
-                            skill_body.set(String::new());
-                        },
-                        "Create skill"
-                    }
-                }
-                }
-                div { class: "card-grid",
-                    if !bots_loaded {
-                        div { class: "card",
-                            div { class: "skeleton title" }
-                            div { class: "skeleton" }
-                            div { class: "skeleton block" }
-                        }
-                    }
-                    for bot in bots {
-                        div { class: "card", key: "{bot.id}",
-                            div { class: "card-head",
-                                div { class: "row",
-                                    span { class: "avatar lg bot", style: avatar_style(&bot.id), "{bot.avatar}" }
-                                    div {
-                                        h3 { class: "card-title", "{bot.display_name}" }
-                                        span { class: "card-sub", "{bot.id} · {bot.role}" }
-                                    }
-                                }
-                                div { class: "chips",
-                                    span { class: if bot.enabled { "chip ok" } else { "chip muted" }, if bot.enabled { "enabled" } else { "disabled" } }
-                                    if bot.enabled && !bot.live {
-                                        span { class: "chip warn", "restart required" }
-                                    }
-                                }
-                            }
-                            if !bot.description.is_empty() {
-                                p { class: "card-sub", "{bot.description}" }
-                            }
-                            div { class: "chips",
-                                span { class: "chip", if let Some(model) = bot.model.clone() { "Model: {human_model(&model)}" } else { "Model: conversation route" } }
-                            }
-                            div { class: "chips",
-                                for label in capability_chips(&bot.tools) {
-                                    span { class: "chip", "{label}" }
-                                }
-                            }
-                            div { class: "chips",
-                                for skill in bot.skills {
-                                    span { class: "chip accent", "{skill}" }
-                                }
-                            }
-                            p { class: "approval-note",
-                                Icon { name: "shield", size: 14 }
-                                "Asks before deleting or sending anything"
-                            }
-                            div { class: "card-actions",
-                                button {
-                                    class: "btn primary sm",
-                                    disabled: !bot.enabled || !bot_binding,
-                                    onclick: {
-                                        let id = bot.id.clone();
-                                        move |_| session.write().open_bot_chat(id.clone())
-                                    },
-                                    "1:1 chat"
-                                }
-                                button {
-                                    class: "btn ghost sm",
-                                    onclick: {
-                                        let id = bot.id.clone();
-                                        move |_| session.write().open_bot(id.clone())
-                                    },
-                                    "Open profile"
-                                }
-                                if !bot.enabled && bot.role != "orchestrator" {
-                                    button {
-                                        class: "btn ghost sm",
-                                        onclick: {
-                                            let id = bot.id.clone();
-                                            move |_| session.write().open_onboarding(id.clone())
-                                        },
-                                        "Finish setup"
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if bots_loaded && bots_empty {
-                        div { class: "empty",
-                            div { class: "empty-icon", Icon { name: "robot", size: 20 } }
-                            h3 { class: "empty-title", "No bots loaded yet" }
-                            p { class: "empty-text", "Refresh, or create a specialist on the server." }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn BotProfileView(session: Signal<Session>) -> Element {
-    let Some(id) = session.read().selected_bot.clone() else {
-        return rsx! {};
-    };
-    let bot = session
-        .read()
-        .state
-        .listed_bots
-        .iter()
-        .find(|bot| bot.id == id)
-        .cloned();
-    let Some(bot) = bot else {
-        return rsx! {
-            div { class: "pane",
-                div { class: "pane-head",
-                    div {
-                        h1 { class: "pane-title", "Bot profile" }
-                        p { class: "muted", "Loading {id}…" }
-                    }
-                    button {
-                        class: "btn ghost",
-                        onclick: move |_| session.write().close_bot(),
-                        "Back to fleet"
-                    }
-                }
-                div { class: "pane-body",
-                    div { class: "empty",
-                        div { class: "empty-icon", Icon { name: "robot", size: 20 } }
-                        h3 { class: "empty-title", "This bot is not in the roster yet." }
-                    }
-                }
-            }
-        };
-    };
-    let display_name = session.read().bot_display_name(&bot.id);
-    let avatar = session.read().bot_avatar(&bot.id);
-    let bot_description = bot.description.clone().unwrap_or_default();
-    let bot_model = bot.model.clone();
-    let bot_binding = session.read().state.bot_chat_binding == Some(true);
-    let draft_name = session.read().bot_profile.display_name.clone();
-    let draft_description = session.read().bot_profile.description.clone();
-    let draft_avatar = session.read().bot_profile.avatar.clone();
-    let can_save = session.read().can_admin();
-    let skills = {
-        let state = session.read();
-        bot.skills
-            .iter()
-            .map(|id| {
-                let summary = state
-                    .state
-                    .listed_skills
-                    .iter()
-                    .find(|skill| &skill.id == id);
-                (
-                    summary
-                        .map(|skill| skill.name.clone())
-                        .unwrap_or_else(|| id.clone()),
-                    summary
-                        .map(|skill| skill.description.clone())
-                        .unwrap_or_default(),
-                )
-            })
-            .collect::<Vec<_>>()
-    };
-    let capabilities = {
-        let mut labels = bot
-            .tools
-            .iter()
-            .filter_map(|tool| capability_label(tool))
-            .collect::<Vec<_>>();
-        labels.sort_unstable();
-        labels.dedup();
-        labels
-    };
-    let is_watcher = bot.role == "watcher" || bot.id == "watcher";
-    rsx! {
-        div { class: "pane",
-            div { class: "pane-head",
-                div {
-                    h1 { class: "pane-title", "{display_name}" }
-                    p { class: "muted", "{bot.id} · {bot.role}" }
-                }
-                div { class: "row",
-                    button {
-                        class: "btn ghost",
-                        onclick: move |_| session.write().close_bot(),
-                        "Back to fleet"
-                    }
-                    button {
-                        class: "btn primary",
-                        disabled: !bot.enabled || !bot_binding,
-                        onclick: {
-                            let id = bot.id.clone();
-                            move |_| session.write().open_bot_chat(id.clone())
-                        },
-                        "Open 1:1 chat"
-                    }
-                }
-            }
-            div { class: "pane-body",
-                div { class: "card-grid",
-                    div { class: "card",
-                        div { class: "row",
-                            span { class: "avatar lg bot", style: avatar_style(&bot.id), "{avatar}" }
-                            div {
-                                h3 { class: "card-title", "{display_name}" }
-                                span { class: "card-sub", "{bot.id} · {bot.role}" }
-                            }
-                        }
-                        div { class: "chips",
-                            span { class: if bot.enabled { "chip ok" } else { "chip muted" }, if bot.enabled { "enabled" } else { "disabled" } }
-                            span { class: if bot.live { "chip ok" } else { "chip warn" }, if bot.live { "live" } else { "restart required" } }
-                            span { class: "chip accent", "{bot.role}" }
-                        }
-                        if !bot_description.is_empty() {
-                            p { class: "card-sub", "{bot_description}" }
-                        } else {
-                            p { class: "tiny", "No description yet. Add one below so the roster explains itself." }
-                        }
-                        if !bot.enabled {
-                            p { class: "tiny", "This bot is disabled in its bot file. Enable it there and restart the server before chatting." }
-                        }
-                        if !bot_binding {
-                            p { class: "tiny", "This server does not route one-to-one bot chats yet. Update the server to 0.5.0 or later." }
-                        }
-                        div { class: "chips",
-                            span { class: "chip", if let Some(model) = bot_model.clone() { "Model: {human_model(&model)}" } else { "Model: conversation route" } }
-                        }
-                        p { class: "tiny", "Fallback models are not available yet; each turn uses the conversation route." }
-                    }
-                    div { class: "card",
-                        div { class: "card-head",
-                            h3 { class: "card-title", "Profile" }
-                        }
-                        p { class: "tiny", "Display name, avatar and description belong to the console. Behavior, tools and model stay in the bot file." }
-                        div { class: "field",
-                            label { class: "field-label", "Picture" }
-                            AvatarPicker {
-                                preview: None,
-                                letter: avatar.clone(),
-                                style: avatar_style(&bot.id),
-                                has_image: bot.avatar_version.is_some(),
-                                on_pick: {
-                                    let id = bot.id.clone();
-                                    move |bytes: Vec<u8>| session.write().pick_image(ImageSlot::Bot(id.clone()), bytes)
-                                },
-                                on_clear: {
-                                    let id = bot.id.clone();
-                                    move |_| session.write().clear_image(ImageSlot::Bot(id.clone()))
-                                },
-                            }
-                        }
-                        div { class: "form-grid",
-                            div { class: "field",
-                                label { class: "field-label", "Display name" }
-                                input {
-                                    class: "input",
-                                    value: "{draft_name}",
-                                    placeholder: "Display name",
-                                    oninput: move |event| session.write().bot_profile.display_name = event.value(),
-                                }
-                            }
-                            div { class: "field",
-                                label { class: "field-label", "Avatar" }
-                                input {
-                                    class: "input",
-                                    value: "{draft_avatar}",
-                                    placeholder: "Avatar emoji or initials",
-                                    oninput: move |event| session.write().bot_profile.avatar = event.value(),
-                                }
-                            }
-                        }
-                        div { class: "field",
-                            label { class: "field-label", "Description" }
-                            textarea {
-                                class: "textarea",
-                                value: "{draft_description}",
-                                placeholder: "What this bot is for",
-                                oninput: move |event| session.write().bot_profile.description = event.value(),
-                            }
-                        }
-                        button {
-                            class: "btn primary",
-                            disabled: !can_save,
-                            onclick: move |_| session.write().save_bot_profile(),
-                            "Save profile"
-                        }
-                    }
-                    div { class: "card",
-                        div { class: "card-head",
-                            h3 { class: "card-title", "Skills" }
-                        }
-                        if skills.is_empty() {
-                            p { class: "tiny", "No skills attached to this bot." }
-                        } else {
-                            div { class: "stack",
-                                for (name, description) in skills {
-                                    div { class: "stack-row",
-                                        strong { "{name}" }
-                                        if !description.is_empty() {
-                                            span { class: "tiny", "{description}" }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    div { class: "card",
-                        div { class: "card-head",
-                            h3 { class: "card-title", "What it can do" }
-                        }
-                        CapabilityToggles { session, bot: bot.id.clone() }
-                    }
-                    div { class: "card",
-                        div { class: "card-head",
-                            h3 { class: "card-title", "Can produce" }
-                        }
-                        if capabilities.is_empty() {
-                            p { class: "tiny", "No output tools are attached to this bot." }
-                        } else {
-                            div { class: "chips",
-                                for label in capabilities {
-                                    span { class: "chip accent", "{label}" }
-                                }
-                            }
-                            p { class: "tiny", "Generated decks and media are downloadable from their approvals and artifact links; per-bot generation history is not indexed yet." }
-                        }
-                    }
-                    div { class: "card",
-                        div { class: "card-head",
-                            h3 { class: "card-title", "Routines" }
-                        }
-                        if is_watcher {
-                            p { class: "tiny", "The watcher runs the morning brief and watched-source checks from the server schedule." }
-                        } else {
-                            p { class: "tiny", "No per-bot routine yet. Routines currently run on the Watcher schedule only." }
-                        }
-                    }
                 }
             }
         }

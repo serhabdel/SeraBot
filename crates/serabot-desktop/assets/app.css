@@ -110,7 +110,7 @@
   --rail-w: 72px;
   --list-w: 250px;
   --sidebar-w: var(--list-w);
-  --inspector-w: 300px;
+  --inspector-w: 380px;
   --dock-w: 400px;
   --chat-w: 760px;
 
@@ -2403,7 +2403,6 @@ body {
   .inspector,
   .dock,
   .dock-slot,
-  .vault-sheet,
   .menu,
   .pop,
   .sheet,
@@ -3424,93 +3423,6 @@ button:not(:disabled):active,
 
 /* ------------------------------------------------------------- vault ----- */
 
-.vault-anchor {
-  position: relative;
-  display: inline-flex;
-}
-
-.vault-btn {
-  gap: 7px;
-  padding: 7px 14px;
-  background: var(--surface-2);
-  border-color: var(--hairline);
-  font-weight: 600;
-}
-
-.vault-btn.active {
-  background: var(--active);
-  border-color: var(--hairline-strong);
-}
-
-.vault-scrim {
-  position: fixed;
-  inset: 0;
-  z-index: 84;
-  display: none;
-  background: var(--clear);
-}
-
-.vault-scrim.open {
-  display: block;
-}
-
-.vault-sheet {
-  position: absolute;
-  top: calc(100% + 10px);
-  right: 0;
-  z-index: 85;
-  width: 360px;
-  max-width: calc(100vw - 32px);
-  padding: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  border-radius: 16px;
-  background: var(--glass-sheet);
-  backdrop-filter: blur(28px) saturate(170%);
-  -webkit-backdrop-filter: blur(28px) saturate(170%);
-  border: 1px solid var(--glass-edge);
-  box-shadow: var(--shadow-3), inset 0 1px 0 var(--glass-highlight);
-  opacity: 0;
-  visibility: hidden;
-  pointer-events: none;
-  transform: translateY(-8px) scale(0.96);
-  transform-origin: top right;
-  transition: opacity var(--dur-fade) var(--ease), transform var(--dur-2) var(--spring),
-    visibility 0s linear var(--dur-2);
-}
-
-.vault-sheet:focus {
-  outline: none;
-}
-
-.vault-sheet.open {
-  opacity: 1;
-  visibility: visible;
-  pointer-events: auto;
-  transform: none;
-  transition: opacity var(--dur-fade) var(--ease), transform var(--dur-3) var(--spring-pop),
-    visibility 0s;
-}
-
-.vault-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--label-2);
-}
-
-.vault-title {
-  flex: 1;
-  min-width: 0;
-  color: var(--label-1);
-  font-size: var(--fs-body);
-  font-weight: 650;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 .vault-empty {
   display: flex;
   flex-direction: column;
@@ -3751,7 +3663,6 @@ button:not(:disabled):active,
 
 @media (prefers-reduced-transparency: reduce) {
   .rail-btn::after,
-  .vault-sheet,
   .dock,
   .sidebar,
   .composer,
@@ -3764,7 +3675,6 @@ button:not(:disabled):active,
 }
 
 html[data-reduce-transparency="true"] .rail-btn::after,
-html[data-reduce-transparency="true"] .vault-sheet,
 html[data-reduce-transparency="true"] .dock,
 html[data-reduce-transparency="true"] .sidebar,
 html[data-reduce-transparency="true"] .composer,
@@ -3774,8 +3684,7 @@ html[data-reduce-transparency="true"] .chat-header {
   -webkit-backdrop-filter: none;
 }
 
-/* Header must not blur: a backdrop-filter would trap the vault scrim (fixed)
-   inside the header box. Nothing scrolls under it, so nothing is lost. */
+/* Header must not blur: nothing scrolls under it, so nothing is lost. */
 .topbar.chat-header {
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
@@ -3825,17 +3734,6 @@ html[data-reduce-transparency="true"] .chat-header {
 
 
 /* ------------------------------------------- vault list and form (0.14) --- */
-
-.vault-sheet {
-  width: 400px;
-  max-height: min(780px, calc(100vh - 80px));
-  overflow-y: auto;
-}
-
-.vault-sub {
-  margin: -4px 0 0;
-  color: var(--label-3);
-}
 
 .vault-error {
   padding: 8px 10px;
@@ -3928,7 +3826,6 @@ html[data-reduce-transparency="true"] .chat-header {
   gap: 4px;
 }
 
-.vault-foot,
 .vault-form-foot {
   display: flex;
   justify-content: flex-end;
@@ -4105,10 +4002,6 @@ html[data-reduce-transparency="true"] .chat-header {
 }
 /* The form body scrolls on its own; the footer sits below it instead of
    floating over the last field. */
-.vault-sheet {
-  overflow: hidden;
-}
-
 .vault-form {
   flex: 1 1 auto;
   min-height: 0;
@@ -4299,8 +4192,7 @@ html[data-reduce-transparency="true"] .chat-header {
   }
 
   .chat-header .watch-btn,
-  .chat-header .details-btn,
-  .chat-header .vault-btn {
+  .chat-header .details-btn {
     padding-left: 9px;
     padding-right: 9px;
   }
@@ -4536,5 +4428,410 @@ html[data-reduce-transparency="true"] .chat-header {
   .switch::after,
   .check-row {
     transition: none;
+  }
+}
+
+/* ----------------------------------------------------------------- 0.16 ---
+   Bot settings panel, Browser page, Vault page. Tokens only. */
+
+/* Bot settings: the old inspector slot, now a form with a sticky footer. */
+.settings-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px 10px;
+}
+
+.settings-head-copy {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-head-copy .inspector-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-tabs {
+  margin: 0 16px 8px;
+}
+
+.settings-form {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.settings-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.settings-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--hairline);
+  background: var(--surface);
+}
+
+.settings-status {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-caption);
+}
+
+.settings-saved {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ok);
+}
+
+.textarea.tall {
+  min-height: 140px;
+  resize: vertical;
+}
+
+.skill-pop {
+  max-height: 180px;
+  margin-top: 6px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-xs);
+}
+
+.settings-panel .advanced-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.details-btn.active {
+  background: var(--active);
+  border-color: var(--hairline-strong);
+}
+
+.btn.danger-text {
+  color: var(--danger);
+}
+
+/* Browser page: a grid of live cards. */
+.browser-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+}
+
+.browser-card {
+  border-radius: var(--r-md);
+  border: 1px solid var(--hairline);
+  background: var(--card-bg);
+  box-shadow: var(--shadow-1);
+  overflow: hidden;
+  transition: transform var(--dur-press) var(--ease), border-color var(--dur-1) var(--ease),
+    box-shadow var(--dur-1) var(--ease);
+}
+
+.browser-card:hover {
+  border-color: var(--hairline-strong);
+  box-shadow: var(--shadow-2);
+}
+
+.browser-card:active {
+  transform: scale(var(--press-scale));
+}
+
+.browser-card-main {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: var(--clear);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.browser-card-main:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+}
+
+.browser-thumb {
+  display: flex;
+  aspect-ratio: 16 / 10;
+  overflow: hidden;
+  background: var(--code-bg);
+  border-bottom: 1px solid var(--hairline);
+}
+
+.browser-thumb .skeleton {
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
+}
+
+.browser-shot {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: top left;
+  user-select: none;
+}
+
+.browser-card-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px 14px;
+}
+
+.browser-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.browser-profile {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-body);
+  font-weight: 600;
+}
+
+.browser-host {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--label-2);
+  font-size: var(--fs-body-2);
+}
+
+.browser-bot {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+}
+
+.skeleton-card {
+  min-height: 220px;
+  padding: 12px;
+}
+
+.browser-empty {
+  margin: 8px 0 8px;
+}
+
+.profiles-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 720px;
+  margin-top: 36px;
+}
+
+.profiles-sub {
+  margin: -4px 0 4px;
+}
+
+.profile-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--card-bg);
+  overflow: hidden;
+}
+
+.profile-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+}
+
+.profile-row + .profile-row {
+  border-top: 1px solid var(--hairline);
+}
+
+.profile-copy {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.profile-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.profile-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.profile-add {
+  display: flex;
+  gap: 8px;
+}
+
+.profile-add .input {
+  flex: 1;
+}
+
+/* Focus view: the browser large on the left, the bot's chat on the right. */
+.browser-focus {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 400px);
+}
+
+.browser-focus.full {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  grid-template-columns: minmax(0, 1fr);
+  background: var(--bg);
+}
+
+.browser-focus.full .focus-chat {
+  display: none;
+}
+
+.focus-stage {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+  padding: 16px;
+}
+
+.focus-bar,
+.focus-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.focus-name {
+  font-weight: 650;
+}
+
+.focus-spacer {
+  flex: 1;
+}
+
+.focus-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: var(--r-md);
+  border: 1px solid var(--hairline-strong);
+  background: var(--surface);
+}
+
+.focus-view .dock-stage {
+  height: 100%;
+  align-items: center;
+  overflow: hidden;
+}
+
+.focus-view .dock-shot {
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 100%;
+}
+
+.focus-view .skeleton {
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
+}
+
+.focus-chat {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border-left: 1px solid var(--hairline);
+  background: var(--surface);
+}
+
+.focus-chat-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.focus-chat > .pane-body,
+.focus-chat > .chat-body {
+  flex: 1;
+  min-height: 0;
+}
+
+@media (max-width: 900px) {
+  .browser-focus {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 3fr) minmax(0, 2fr);
+  }
+
+  .focus-chat {
+    border-left: 0;
+    border-top: 1px solid var(--hairline);
+  }
+}
+
+/* Vault page. */
+.vault-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 640px;
+}
+
+.vault-page .vault-form {
+  padding: 16px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--hairline);
+  background: var(--card-bg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .browser-card {
+    transition: none;
+  }
+
+  .browser-card:active {
+    transform: none;
   }
 }

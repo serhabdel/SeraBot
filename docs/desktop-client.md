@@ -112,8 +112,8 @@ materials, motion, and the shared class contract — is specified in
 `crates/serabot-desktop/assets/app.css`.
 
 - **Sidebar** — brand mark, **New chat**, a search field that filters labels
-  and assistant names (`Cmd/Ctrl+K`), the nav list (Chat, Conversations,
-  Memory, Providers, Connectors, Approvals, Fleet, Settings), the connection
+  and assistant names (`Cmd/Ctrl+K`), the nav list (Chats, Browser, Approvals,
+  Memory, Connectors, Vault, AI keys, Settings), the connection
   status chip, and the owner chip. Thread rows reveal new-message, rename and
   archive actions on hover.
 - **Appearance** — a Light/Dark switch sits on the connect card, in the
@@ -130,13 +130,19 @@ materials, motion, and the shared class contract — is specified in
   a hairline accent border in that bot's hue. An empty conversation shows the
   bot roster, and a group shows its team roster with a one-tap add action.
   Chat history is capped at the server's recent window (100 messages).
-- **Bot profiles** — open a profile from a Fleet card or from a bot chat header.
-  The page shows the avatar, display name, description, role, live state,
-  configured model, attached skills, and a "Can produce" summary. Display name,
-  avatar (emoji or initials), and description are editable and saved in the
-  admin overlay; tools, prompts, and model stay in the bot file. **Open 1:1
-  chat** opens `dir:<bot>`, which the server routes to that bot rather than the
-  orchestrator.
+- **Bot settings** — since 0.16 there is no separate Bots screen and no
+  "Inspector". Open **Bot settings** from the chat header, or from the gear on a
+  bot's row in the Chats sidebar. The panel slides in from the right: the
+  header is the bot's picture and name; one form holds the picture
+  (upload/remove, saved at once), name (1–48), description (up to 280),
+  "How it should behave" (the instructions, multi-line), model (grouped by
+  provider; **Default** follows the chat), browser profile (**Default profile**
+  or one from the Browser page) and the plain-language abilities (saved at
+  once). **Save** sends only what changed in one `PUT /v1/bots/{id}`; **Cancel**
+  drops the edits. Problems show inline and keep Save off. Skills, the bot's id,
+  status, routing and memory counts sit under **Advanced**. **Files** is the
+  second tab (the old Library); in a group the first tab lists members and the
+  group rules.
 - **Composer** — a floating capsule with a gradient scrim so text scrolls
   under it. **Enter** sends, **Shift+Enter** adds a line, **Esc** closes the
   topmost sheet or menu. **Send** is enabled only when the catalog selection
@@ -208,9 +214,13 @@ materials, motion, and the shared class contract — is specified in
   and is the only path when the stream is unavailable. Team events
   (`team.member_set`, `team.asked`, `team.replied`, `team.turn_completed`)
   arrive on the same stream, so an open group sheet stays current.
-- **Fleet** — opening the screen loads the bot roster and skill packs
-  automatically. Every tool is shown; tools that require owner approval are
-  highlighted amber (for example Firecrawl search/crawl).
+- **Bots** — the roster loads with the Chats sidebar. New bot and New group
+  are in the sidebar's **New chat** menu. A switched-off bot has **Finish
+  setting up** on its row. Each row (and Bot settings) can **Switch off/on**
+  (`PUT /v1/bots/{id}` with `enabled`) or **Delete** (`DELETE /v1/bots/{id}`,
+  after a confirm step); the orchestrator can do neither. The instructions go
+  to the server as `prompt`. Tools that require owner approval are listed under
+  Advanced in the bot's settings.
 - Approvals load from `GET /v1/approvals`. Once / Always / Deny call
   `POST /v1/approvals/{id}/decide` with the same semantics as Telegram. Decisions
   still bind canonical arguments, destination, artifact hash, policy version,
@@ -246,9 +256,11 @@ banner. Bot display profiles are read at request time and apply immediately.
   out of band), the server logs it, keeps the base configuration, and stays
   reachable so the console can repair it.
 
-## Fleet
+## Bots and skills
 
-**Fleet** calls the owner API on demand. Each submit uses the same 3-second gap
+The bot calls below are made from the Chats sidebar (**New chat** menu) and the
+Bot settings panel; there is no separate Fleet screen on the desktop since 0.16
+(the mobile client keeps its Fleet tab). Each submit uses the same 3-second gap
 as other requests and is not retried if the outcome is unknown.
 
 - **New specialist** — `POST /v1/bots` with a lowercase bot id, a description
@@ -267,8 +279,7 @@ as other requests and is not retried if the outcome is unknown.
   `live: false`. Restart, then add the id to a bot's skills list before that
   bot can load it. **Refresh skills** calls `GET /v1/skills` for on-disk
   summaries. Bodies are not returned.
-- Conversation nodes are created in **Conversations**; the Fleet header links
-  there.
+- Conversation nodes are created in **Conversations**.
 
 The mobile Fleet tab calls the specialist, skill, and conversation endpoints. See
 [Mobile client](mobile-client.md).
@@ -301,7 +312,32 @@ collapsible release notes, **Install and restart**, **Later**, and
 
 ## Layout (0.14, design B)
 
-A 72 px icon rail with a small text label under every icon (Chats, Bots, Approvals with a pending count, Memory, Connectors with a plug icon, AI keys; Settings with a gear and the account menu at the bottom, which holds Settings, All chats, the theme switch and Sign out), a 250 px conversation list (Chat only) whose head has a labelled **New chat** button that opens a "Choose a bot" list, and the chat column with its header (bot avatar, status pill, Bots in this chat, Reload, **Watch browser** only while a browser session is active, Details, **Passwords & keys**). When the chat column is narrow the header buttons keep their icon, tooltip and accessible name and drop the text. The details inspector and the browser dock slide in from the right and leave the same way. The dock shows one control button at a time (**Take control** / **Give control back**), a status line ("You're in control: click and type in the page. The bot is paused." or "<Bot> is using the browser."), **Hide panel** (hides only; the session keeps running and Watch browser brings it back) and an overflow menu with **End browser session**. The screenshot fills the panel width at its own aspect ratio. Chat tool rows use plain sentences for known tools (for example "Signed in with your saved login "venue-portal". The bot never saw it." or "Opened example.com"). Every icon-only button has a tooltip and an accessible name. Motion follows `prefers-reduced-motion` (cross-fades) and `prefers-reduced-transparency` (solid surfaces).
+A 72 px icon rail with a small text label under every icon (Chats, Browser, Approvals with a pending count, Memory, Connectors with a plug icon, Vault, AI keys; Settings with a gear and the account menu at the bottom, which holds Settings, All chats, the theme switch and Sign out), a 250 px conversation list (Chat only) whose head has a labelled **New chat** button that opens a "Choose a bot" list, and the chat column with its header (bot avatar, status pill, Bots in this chat, Reload, **Watch browser** only while a browser session is active, **Bot settings**). When the chat column is narrow the header buttons keep their icon, tooltip and accessible name and drop the text. The settings panel and the browser dock slide in from the right and leave the same way. The dock shows one control button at a time (**Take control** / **Give control back**), a status line ("You're in control: click and type in the page. The bot is paused." or "<Bot> is using the browser."), **Hide panel** (hides only; the session keeps running and Watch browser brings it back) and an overflow menu with **End browser session**. The screenshot fills the panel width at its own aspect ratio. The dock shows the browser of the bot you are talking to (its profile); on the Browser page it steps aside. Chat tool rows use plain sentences for known tools (for example "Signed in with your saved login "venue-portal". The bot never saw it." or "Opened example.com"). Every icon-only button has a tooltip and an accessible name. Motion follows `prefers-reduced-motion` (cross-fades) and `prefers-reduced-transparency` (solid surfaces).
+## Browser page, profiles and Vault (0.16)
+
+Contract: [`specs/browser-profiles-contract.md`](specs/browser-profiles-contract.md).
+
+- **Browser** (rail) — a grid with one card per open browser: a live picture,
+  the profile name, the site, the bot driving it and a pill (**Bot is driving**
+  / **You're driving**). With nothing open it says "No browser open. Ask a bot
+  to open a website." Pictures come from
+  `GET /v1/browser/sessions/{id}/screenshot`, about once a second per card
+  (never more than three requests a second), only while the page is on screen
+  and the window has focus. A rate limit (429) pauses all background polling
+  with the same Retry-After back-off as the rest of the app.
+- **Focus view** — click a card. The browser is large on the left; the
+  conversation of the bot that last drove it is on the right (the normal chat,
+  with its composer). **Take control** / **Give control back**, **Hide**
+  (back to the grid), **End session** (asks first) and a **full window** toggle
+  (`Esc` leaves it). While you hold control, clicks, the wheel and typing on the
+  picture go to `POST /v1/browser/sessions/{id}/input`.
+- **Profiles** (below the grid) — list, add, rename, delete (asks first; the
+  default stays) with the bots that use each. At most 8. A bot picks its
+  profile in its settings.
+- **Vault** (rail) — the passwords and keys list and form, moved out of the
+  chat header. "Passwords and keys your bots can use. They never see the
+  values."
+
 ## Known limitations
 
 - The desktop client cannot cancel work already accepted by the server when it
@@ -326,7 +362,15 @@ A 72 px icon rail with a small text label under every icon (Chats, Bots, Approva
   its own pinned model through the Model bar.
 - Routines are global and run as the Watcher; per-bot routines have no schema or
   UI yet.
-- Bot avatars are emoji or initials. Image upload/storage is not implemented.
+- Per-bot fallback models are not implemented. A bot's 1:1 conversation keeps
+  its own pinned model through the Model bar.
+- Routines are global and run as the Watcher; per-bot routines have no schema or
+  UI yet.
+- There is no client route to switch a bot off or delete it: the server
+  contract has no such endpoint yet (a bot is switched on by finishing its
+  setup). The instructions field is sent as `instructions` on
+  `PUT /v1/bots/{id}`; the 0.16 contract does not list it, so a server that
+  ignores it will keep the old text.
 - Generated decks and media are downloadable from approvals and artifact links,
   but there is no per-bot generation history index yet.
 - No live provider or Telegram verification is implied by the synthetic tests.

@@ -74,7 +74,7 @@ pub fn AvatarPicker(
 }
 
 /// Model options grouped by provider, from the live catalog.
-fn model_groups(session: &Session) -> Vec<(String, Vec<String>)> {
+pub(crate) fn model_groups(session: &Session) -> Vec<(String, Vec<String>)> {
     session
         .state
         .catalog
@@ -656,9 +656,4 @@ pub fn CapabilityToggles(session: Signal<Session>, bot: String) -> Element {
             }
         }
     }
-}
-
-/// Short chips naming what a bot can do, for the Bots cards.
-pub fn capability_chips(tools: &[String]) -> Vec<&'static str> {
-    capabilities::labels(tools)
 }

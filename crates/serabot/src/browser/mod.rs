@@ -25,7 +25,7 @@ use crate::config::Config;
 use crate::error::{Result, SeraError};
 use crate::user_secrets::UserSecrets;
 
-pub use manager::{BrowserInfo, BrowserManager, Controller, SecretResolver};
+pub use manager::{BrowserInfo, BrowserManager, Controller, Driver, SecretResolver};
 pub use tools::{BrowserToolDeps, register_browser_tools};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,12 +92,15 @@ pub fn build_manager(config: &Config) -> Result<Arc<BrowserManager>> {
         config.path(&browser.user_data_dir)
     };
     std::fs::create_dir_all(&base)?;
-    let launcher = chromium::ChromiumLauncher::new(browser, base)?;
-    Ok(Arc::new(BrowserManager::new(
-        Arc::new(launcher),
-        browser.max_sessions,
-        Duration::from_secs(browser.idle_timeout_secs),
-    )))
+    let launcher = chromium::ChromiumLauncher::new(browser, base.clone())?;
+    Ok(Arc::new(
+        BrowserManager::new(
+            Arc::new(launcher),
+            browser.max_sessions,
+            Duration::from_secs(browser.idle_timeout_secs),
+        )
+        .with_base_dir(base),
+    ))
 }
 
 #[cfg(test)]

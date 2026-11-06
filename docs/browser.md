@@ -1,6 +1,6 @@
 # Server browser (per user)
 
-SeraBot can run **one headless Chromium per active user** on the server. Bots drive it
+SeraBot can run **one headless Chromium per active user profile** on the server. Bots drive it
 through gateway tools; the owner watches and can take over from the desktop browser dock.
 Page content is **untrusted data** and is scanned like any other tool output.
 
@@ -50,12 +50,40 @@ when you must run as root.
 While the owner has taken over (`controller = user`) every bot tool, including
 `browser_close`, fails with "the user is in control of the browser".
 
+## Profiles and sessions (0.16)
+
+A profile is a named, per-user Chrome user-data directory
+`<browser base>/<user_id>/<profile_id>` with its own cookies and logins. Every user has a
+`default` profile (created on first use, cannot be deleted) and at most 8 profiles in total.
+Profile ids are generated from the name (`^[a-z0-9][a-z0-9-]{0,31}$`). One Chrome runs per
+(user, profile); `max_sessions` is the server-wide cap on concurrent Chromes.
+
+A bot's browser tools use the profile assigned with `PUT /v1/bots/{id}`
+`{"browser_profile": "<id>"|null}` (null = `default`). Each session records the bot, and the
+conversation, of the last bot tool call that used it.
+
+Upgrading from 0.14/0.15: the previous single profile lived directly in `<base>/<user_id>`;
+the new `default` profile starts empty in `<base>/<user_id>/default` (logins must be redone).
+
 ## Owner API
 
-`GET /v1/browser`, `GET /v1/browser/screenshot` (JPEG, 1280 px wide, at most 512 KiB, 404
-without a session), `POST /v1/browser/takeover`, `/handback`, `/input`
-(`click{x,y}`, `text{text}`, `key{key}`, `scroll{dy}`, `navigate{url}`; 409 unless the
-user holds control), `/close`. All act on the authenticated user's session only.
+Profiles: `GET /v1/browser/profiles` → `{"profiles":[{"id","name","is_default","bots":[bot
+ids],"created_at","last_used_at"?}]}`; `POST /v1/browser/profiles` `{"name"}` → one profile
+(`409` past 8); `PUT /v1/browser/profiles/{id}` `{"name"}` → rename; `DELETE
+/v1/browser/profiles/{id}` → `{"deleted":true,"id","reassigned_bots":[...]}` after closing its
+session, deleting its directory and reassigning its bots to `default` (`default` → `409`).
+
+Sessions: `GET /v1/browser/sessions` → `{"sessions":[{"id"(= profile id),"profile_name",
+"active","url"?,"title"?,"controller":"bot"|"user","bot"?,"conversation_id"?,"updated_at"}]}`,
+one entry per profile (`active:false` when no Chrome is running). Per session:
+`GET /v1/browser/sessions/{id}/screenshot` (JPEG, 1280 px wide, at most 512 KiB, 404 without a
+session) and `POST /v1/browser/sessions/{id}/takeover`, `/handback`, `/input`
+(`click{x,y}`, `text{text}`, `key{key}`, `scroll{dy}`, `navigate{url}`; 409 unless the user
+holds control), `/close`. An unknown profile id is `404`.
+
+The 0.14 routes `GET /v1/browser`, `GET /v1/browser/screenshot`, `POST /v1/browser/takeover`,
+`/handback`, `/input`, `/close` are aliases for the `default` profile's session. All routes act
+on the authenticated user's profiles and sessions only.
 
 ## Navigation guard and its limits
 

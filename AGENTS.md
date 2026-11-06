@@ -52,6 +52,7 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 
 ## Layout
 - `crates/serabot/src/store.rs` — SQLite/WAL, users, sessions, tasks, approvals, audit, events.
+- `crates/serabot/src/browser_profiles.rs` — per-user browser profiles, bot settings, profile directory safety (0.16).
 - `crates/serabot/src/auth.rs` — OIDC sign-in, invites, sessions (phase 1 of the reconstruction).
 - `crates/serabot/src/user_secrets.rs` — per-user envelope encryption (phase 4).
 - `crates/serabot/src/gateway.rs` — tool allowlist, approvals, policy, audit.

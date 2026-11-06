@@ -221,7 +221,6 @@ impl Session {
         self.avatar_upload = draft
             .avatar
             .map(|image| (AvatarTarget::Bot(created.id.clone()), image.bytes));
-        self.selected_bot = None;
         self.section = Section::Chat;
         self.onboarding_ui = OnboardingUi {
             open: true,
@@ -327,7 +326,6 @@ impl Session {
             return;
         }
         self.section = Section::Chat;
-        self.selected_bot = None;
         self.onboarding_ui = OnboardingUi {
             open: true,
             bot: id.clone(),

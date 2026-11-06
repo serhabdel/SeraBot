@@ -1,6 +1,6 @@
 use crate::{
     ApiClient, ApiError, Approval, ApprovalDecision, AudioUpdate, AuthUser, BotConfigUpdate,
-    BotDetail, BotProfileUpdate, BotSummary, Catalog, ConnectorStatus, ConnectorTestResult,
+    BotDetail, BotSettingsUpdate, BotSummary, Catalog, ConnectorStatus, ConnectorTestResult,
     ConnectorUpdate, ConversationKind, ConversationPage, ConversationSummary, CreatedBot,
     CreatedConversation, CreatedGroup, CreatedSkill, Health, History, LibraryEntry, MemoryEntry,
     NewGroup, NewProvider, Onboarding, ProviderStatus, Scope, Selection, SkillSummary, Task, Team,
@@ -54,7 +54,8 @@ pub enum OperationKind {
     AdminWrite,
     ConnectorTest,
     OAuthSignIn,
-    AdminProfile,
+    BotSettingsWrite,
+    BotLifecycle,
     AdminRestart,
     BotDetail,
     BotConfigWrite,
@@ -173,9 +174,19 @@ pub enum Operation {
         id: String,
         callback_uri: String,
     },
-    AdminSetBotProfile {
+    /// `PUT /v1/bots/{id}`: name, description, instructions, model, profile.
+    UpdateBot {
         id: String,
-        update: BotProfileUpdate,
+        update: BotSettingsUpdate,
+    },
+    /// `PUT /v1/bots/{id}` with `enabled` only.
+    SetBotEnabled {
+        id: String,
+        enabled: bool,
+    },
+    /// `DELETE /v1/bots/{id}`.
+    DeleteBot {
+        id: String,
     },
     AdminRestart,
     /// `GET /v1/bots/{id}`: the full record of one bot.
@@ -272,7 +283,8 @@ impl Operation {
             Self::TestConnector { .. } => OperationKind::ConnectorTest,
             Self::OAuthSignIn { .. } => OperationKind::OAuthSignIn,
             Self::ConnectorOAuthSignIn { .. } => OperationKind::OAuthSignIn,
-            Self::AdminSetBotProfile { .. } => OperationKind::AdminProfile,
+            Self::UpdateBot { .. } => OperationKind::BotSettingsWrite,
+            Self::SetBotEnabled { .. } | Self::DeleteBot { .. } => OperationKind::BotLifecycle,
             Self::AdminRestart => OperationKind::AdminRestart,
             Self::BotDetail { .. } => OperationKind::BotDetail,
             Self::UpdateBotConfig { .. } => OperationKind::BotConfigWrite,
@@ -332,7 +344,7 @@ pub enum Reply {
         id: String,
         device_code: Option<String>,
     },
-    BotProfileSaved,
+    BotSettingsSaved,
     AdminRestarted,
     BotDetail(BotDetail),
     BotConfigSaved {
@@ -658,9 +670,19 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::AdminSetVoice(update) => {
             client.admin_set_voice(update).map(|_| Reply::AdminSaved)
         }
-        Operation::AdminSetBotProfile { id, update } => client
-            .admin_set_bot_profile(id, update)
-            .map(|_| Reply::BotProfileSaved),
+        Operation::SetBotEnabled { id, enabled } => client
+            .update_bot(
+                id,
+                &BotSettingsUpdate {
+                    enabled: Some(*enabled),
+                    ..Default::default()
+                },
+            )
+            .map(|()| Reply::BotSettingsSaved),
+        Operation::DeleteBot { id } => client.delete_bot(id).map(|()| Reply::BotSettingsSaved),
+        Operation::UpdateBot { id, update } => client
+            .update_bot(id, update)
+            .map(|()| Reply::BotSettingsSaved),
         Operation::AdminRestart => client.admin_restart().map(|ack| {
             if ack.restarting {
                 Reply::AdminRestarted
