@@ -764,6 +764,12 @@ pub struct AuthConfig {
     /// growth with an explicit error.
     #[serde(default = "default_auth_max_users")]
     pub max_users: usize,
+    /// Optional email of the operator. While the bootstrap admin row has no
+    /// Microsoft subject yet, the first sign-in whose verified email equals
+    /// this (case-insensitive) claims that admin row: no invite needed, all
+    /// backfilled data stays with the admin. Empty = no claim.
+    #[serde(default)]
+    pub admin_email: String,
 }
 
 impl Default for AuthConfig {
@@ -777,6 +783,7 @@ impl Default for AuthConfig {
             session_ttl_hours: default_auth_session_ttl(),
             invite_ttl_hours: default_auth_invite_ttl(),
             max_users: default_auth_max_users(),
+            admin_email: String::new(),
         }
     }
 }
@@ -863,6 +870,18 @@ impl AuthConfig {
         if self.max_users == 0 || self.max_users > 50 {
             return Err(SeraError::Config(
                 "auth.max_users must be between 1 and 50".into(),
+            ));
+        }
+        let admin_email = self.admin_email.trim();
+        if !admin_email.is_empty()
+            && (admin_email.len() > 320
+                || !admin_email.contains('@')
+                || admin_email
+                    .chars()
+                    .any(|c| c.is_control() || c.is_whitespace()))
+        {
+            return Err(SeraError::Config(
+                "auth.admin_email must be an email address".into(),
             ));
         }
         if self.enabled && self.effective_providers().is_empty() {
@@ -2468,6 +2487,14 @@ enabled = false
         assert_eq!(config.session_ttl_hours, 720);
         assert_eq!(config.invite_ttl_hours, 48);
         assert_eq!(config.max_users, 10);
+        assert!(config.admin_email.is_empty());
+        let mut with_email = valid_config();
+        with_email.auth.admin_email = "operator@example.example".into();
+        with_email.validate().unwrap();
+        for bad in ["not-an-email", "a b@example.example", &"a@".repeat(200)] {
+            with_email.auth.admin_email = bad.into();
+            assert!(with_email.validate().is_err(), "{bad}");
+        }
         assert_eq!(UsersConfig::default().tasks_per_user_per_day, 500);
         valid_config().validate().unwrap();
     }
