@@ -4,117 +4,77 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
-<title>SeraBot</title>
+<meta name="description" content="SeraBot is a small, invitation-only AI agent workspace: your own bots, memory and documents, with approvals before anything destructive.">
+<title>SeraBot — your own agents, privately hosted</title>
+<link rel="icon" type="image/png" href="/favicon.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>
-  :root {
-    color-scheme: dark light;
-    --bg: #101418;
-    --panel: #171d23;
-    --border: #2b343d;
-    --text: #e6edf3;
-    --muted: #9aa7b4;
-    --accent: #4d9fff;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    min-height: 100vh;
-    background: var(--bg);
-    color: var(--text);
-    font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    display: flex;
-    justify-content: center;
-    padding: 40px 20px;
-  }
-  main {
-    width: 100%;
-    max-width: 640px;
-  }
-  .eyebrow {
-    margin: 0 0 8px;
-    color: var(--muted);
-    font-size: 13px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-  }
-  h1 {
-    margin: 0 0 12px;
-    font-size: 40px;
-    line-height: 1.1;
-    letter-spacing: -0.02em;
-  }
-  h2 {
-    margin: 0 0 10px;
-    font-size: 17px;
-    line-height: 1.3;
-  }
-  p { margin: 0 0 12px; }
-  .lede { color: var(--muted); }
-  section {
-    margin-top: 20px;
-    padding: 20px;
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-  }
-  .downloads p { margin: 0; }
-  .links {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-    margin-bottom: 12px;
-  }
-  a.button {
-    display: inline-block;
-    padding: 10px 14px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: #1f2831;
-    color: var(--text);
-    font-weight: 600;
-    text-decoration: none;
-    transition: border-color 140ms ease, background-color 140ms ease, transform 100ms ease-out;
-  }
-  a.button:hover, a.button:focus-visible { border-color: var(--accent); }
-  a.button:active { transform: scale(0.97); }
-  .meta { color: var(--muted); font-size: 14px; }
-  .meta a { color: var(--accent); }
-  code {
-    padding: 1px 5px;
-    border: 1px solid var(--border);
-    border-radius: 5px;
-    background: #0d1116;
-    font-size: 13px;
-  }
-  footer {
-    margin-top: 20px;
-    color: var(--muted);
-    font-size: 13px;
-  }
+{{CSS}}
 </style>
 </head>
 <body>
-<main>
-  <header>
-    <p class="eyebrow">Private single-operator deployment</p>
-    <h1>SeraBot</h1>
-    <p class="lede">A self-hosted agent pipeline. This page distributes the owner clients; it is not an admin console and it holds no data.</p>
+<div class="wrap">
+  <nav class="top" aria-label="Main">
+    <a class="brand" href="/"><img src="/brand/serabot.webp" alt="" width="34" height="34">SeraBot</a>
+    <div class="links">
+      <a href="#features">Features</a>
+      <a href="#downloads">Downloads</a>
+      <a href="/privacy">Privacy</a>
+      <a href="/terms">Terms</a>
+      <a href="/login">Sign in</a>
+    </div>
+  </nav>
+
+  <header class="hero">
+    <div>
+      <p class="eyebrow">Invitation-only · privately hosted</p>
+      <h1>Your own agents, kept private.</h1>
+      <p class="lede">SeraBot is a small, invitation-only agent workspace. Every member gets their own bots, memory, documents and connected accounts, isolated from everyone else, with approvals before anything destructive happens.</p>
+      <div class="cta">
+        <a class="button primary" href="/login">Sign in</a>
+        <a class="button" href="#downloads">Get the apps</a>
+      </div>
+    </div>
+    <img class="mascot" src="/brand/serabot.webp" alt="The SeraBot mascot: a hooded robot with glowing eyes, resting its chin on one hand" width="380" height="380">
   </header>
-  <section class="downloads">
+
+  <section class="block" id="features">
+    <p class="eyebrow">What it does</p>
+    <h2>A small circle, a capable assistant</h2>
+    <div class="grid">
+      <div class="card"><h3>Bots that are yours</h3><p>Create bots with their own role, picture and model, and group them into teams that work together on a task.</p></div>
+      <div class="card"><h3>Memory and documents</h3><p>Bots remember what you tell them and answer from your own documents with citations. Nothing is shared between members.</p></div>
+      <div class="card"><h3>Your accounts, your connection</h3><p>Connect OneDrive, Outlook, Calendar, Notion or Google yourself. Each credential is encrypted per member and never visible to the operator.</p></div>
+      <div class="card"><h3>Approval where it matters</h3><p>Deleting memory, sending email or uploading files always asks you first. Everything is recorded in an audit trail.</p></div>
+      <div class="card"><h3>Wherever you are</h3><p>Use the Windows desktop console, the Android app, or chat with your bots on Telegram.</p></div>
+      <div class="card"><h3>Untrusted by default</h3><p>Web pages, files and model output are treated as data, never as instructions, and outgoing actions pass through one policy gateway.</p></div>
+    </div>
+  </section>
+
+  <section class="block downloads" id="downloads">
+    <p class="eyebrow">Clients</p>
     <h2>Downloads</h2>
+    <div class="panel">
     {{DOWNLOADS}}
+    <p class="meta" style="margin-top:12px">Published assets are listed in <code>SHA256SUMS</code>; compare the hash of the downloaded file before installing. Android: allow installation from unknown sources and sideload the APK. Windows: run the executable.</p>
+    </div>
   </section>
-  <section class="access">
-    <h2>Access</h2>
-    <p>This is a private single-operator deployment. The API and both clients require an access token issued by the operator. Downloading a client does not grant access, and no token is embedded in any build.</p>
+
+  <section class="block" id="access">
+    <p class="eyebrow">Access</p>
+    <h2>By invitation</h2>
+    <div class="panel">
+      <p>SeraBot has no public sign-up. You need an invitation from the operator, then you sign in with your Microsoft account. Downloading a client does not grant access, and no credential is embedded in any build.</p>
+      <p class="meta" style="margin:0">Questions about access or your data: <a href="mailto:founder@seradyx.tech">founder@seradyx.tech</a></p>
+    </div>
   </section>
-  <section class="verify">
-    <h2>Verify a build</h2>
-    <p>Published assets are listed in <code>SHA256SUMS</code>. Compare the hash of the downloaded file before installing.</p>
-  </section>
-  <footer>
-    <p>Android: allow installation from unknown sources and sideload the APK. Windows: unzip or run the executable.</p>
+
+  <footer class="site">
+    <div class="row">
+      <span>© SeraBot by <a href="https://seradyx.tech">Seradyx</a></span>
+      <span><a href="/privacy">Privacy</a> · <a href="/terms">Terms</a> · <a href="/healthz">Status</a></span>
+    </div>
   </footer>
-</main>
+</div>
 </body>
 </html>

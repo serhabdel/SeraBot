@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta name="description" content="How SeraBot handles member data: what is stored, who can see it, and which services it passes through.">
+<title>Privacy policy — SeraBot</title>
+<link rel="icon" type="image/png" href="/favicon.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<style>
+{{CSS}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top" aria-label="Main">
+    <a class="brand" href="/"><img src="/brand/serabot.webp" alt="" width="34" height="34">SeraBot</a>
+    <div class="links">
+      <a href="/">Home</a>
+      <a href="/privacy" aria-current="page">Privacy</a>
+      <a href="/terms">Terms</a>
+      <a href="/login">Sign in</a>
+    </div>
+  </nav>
+
+  <article class="doc">
+    <p class="eyebrow">Legal</p>
+    <h1>Privacy policy</h1>
+    <p class="meta">Last updated: November 6, 2026</p>
+
+    <p>SeraBot is a small, invitation-only service run by Seradyx (the “operator”) on a server the operator controls. This page explains, in plain words, what the service stores about its members, who can see it, and which other services it passes through. If anything here is unclear, write to <a href="mailto:founder@seradyx.tech">founder@seradyx.tech</a>.</p>
+
+    <h2>1. What we store</h2>
+    <ul>
+      <li><strong>Identity.</strong> When you sign in with Microsoft we receive a stable account identifier and your email address. SeraBot never sees your Microsoft password.</li>
+      <li><strong>Your content.</strong> Conversations, the bots and groups you create, memories, tasks, schedules, and any documents you upload, together with the text extracted from them so bots can search and cite them.</li>
+      <li><strong>Connector credentials.</strong> Tokens or keys for accounts you connect (for example OneDrive, Outlook, Notion, Google). They are encrypted per member before they are written to disk. The operator can see that a connector exists, but cannot read your credentials.</li>
+      <li><strong>Telegram link.</strong> If you link Telegram, we keep the Telegram chat identifier needed to talk to you there.</li>
+      <li><strong>Audit and usage records.</strong> Which tools ran, approvals you granted or declined, model usage counts and quota. The operator can read these audit records to keep the service safe.</li>
+      <li><strong>Technical logs.</strong> Standard server logs (request time, path, status, network address) used for security and debugging.</li>
+    </ul>
+
+    <h2>2. Who can see it</h2>
+    <p>Everything you create is scoped to your account; other members cannot read, search or use your data, bots or connectors. The operator administers the service and the server, and can see account and audit records, but credentials you store are encrypted so that the operator cannot read them. We do not sell data, show advertising, or use your content to train models.</p>
+
+    <h2>3. Services your data may pass through</h2>
+    <p>SeraBot is an agent, so doing a task can involve other providers. Only what is needed for the task is sent:</p>
+    <ul>
+      <li><strong>Language-model providers</strong> configured by the operator receive your messages and the memory or document excerpts needed to answer them.</li>
+      <li><strong>Microsoft and other accounts you connect</strong> (Outlook, OneDrive, Google, Notion) receive the requests your bots make on your behalf, within the permissions you granted.</li>
+      <li><strong>Web search and page-fetch providers</strong> receive queries and URLs when a bot browses the web for you.</li>
+      <li><strong>Telegram</strong>, if you use it, carries your messages under Telegram’s own terms.</li>
+      <li><strong>Voice providers</strong>, if audio features are enabled, receive the audio or text you choose to transcribe or speak.</li>
+      <li><strong>Cloudflare</strong> relays traffic to the server, and <strong>GitHub</strong> hosts the client downloads.</li>
+    </ul>
+    <p>Each of these providers handles data under its own terms. You can disconnect any connector at any time.</p>
+
+    <h2>4. Cookies and tracking</h2>
+    <p>This site sets no cookies and runs no analytics or advertising trackers. The apps keep a session token on your device so you stay signed in; it can be revoked by signing out or by the operator.</p>
+
+    <h2>5. Security</h2>
+    <p>Data lives in a single database on the operator’s server. Connector credentials are envelope-encrypted per member, server secrets are kept in an encrypted store, actions with outside effects go through an approval and policy gateway, and web or file content is treated as data, never as instructions. No system is perfectly secure; if we learn of a breach that affects you, we will tell you.</p>
+
+    <h2>6. Retention and deletion</h2>
+    <p>We keep your data while your account is active. You can delete individual memories, conversations and documents yourself. To disable your account or have your data removed, email us and we will act on it promptly; backup copies made before deletion disappear as backups are rotated out.</p>
+
+    <h2>7. Your rights</h2>
+    <p>You can ask what we hold about you, ask for a copy, ask for corrections, or ask for deletion. Write to <a href="mailto:founder@seradyx.tech">founder@seradyx.tech</a>; for security issues use the address on <a href="https://seradyx.tech/privacy">seradyx.tech/privacy</a>.</p>
+
+    <h2>8. Changes</h2>
+    <p>If this policy changes in a way that matters, we will update the date above and tell members through the service.</p>
+  </article>
+
+  <footer class="site">
+    <div class="row">
+      <span>© SeraBot by <a href="https://seradyx.tech">Seradyx</a></span>
+      <span><a href="/">Home</a> · <a href="/privacy">Privacy</a> · <a href="/terms">Terms</a></span>
+    </div>
+  </footer>
+</div>
+</body>
+</html>

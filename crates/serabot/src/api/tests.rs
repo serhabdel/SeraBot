@@ -507,7 +507,7 @@ async fn serves_public_landing_page_without_authentication() {
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(!body.contains("<script"));
         assert!(body.contains("SeraBot"));
-        assert!(body.contains("private single-operator deployment"));
+        assert!(body.contains("Invitation-only"));
     }
 }
 
