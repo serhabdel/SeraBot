@@ -61,6 +61,14 @@ pub enum OperationKind {
     Usage,
 }
 
+impl OperationKind {
+    /// Repeating background reads. A 429 on these backs off quietly instead
+    /// of raising the error banner.
+    pub fn is_background_poll(self) -> bool {
+        matches!(self, Self::History | Self::Task | Self::Approvals)
+    }
+}
+
 pub enum Operation {
     Health,
     /// `GET /v1/me`: who the session token belongs to.

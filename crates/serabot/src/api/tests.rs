@@ -111,6 +111,8 @@ fn app_with_stack(
     config.api.token_hash = sha256_hex("test-token-that-is-long-enough-123");
     if let Some(limit) = rate_limit {
         config.server.rate_limit_per_minute = limit;
+        config.server.user_rate_limit_per_minute = limit;
+        config.server.poll_rate_limit_per_minute = limit;
     }
     config.llm.data_egress_approved = egress_approved;
     config.llm.model = "test".into();
@@ -388,13 +390,13 @@ async fn rate_limit_is_per_user_not_global() {
 
     let first = app
         .clone()
-        .oneshot(request_with_token("GET", "/v1/health", &admin_token, None))
+        .oneshot(request_with_token("GET", "/v1/status", &admin_token, None))
         .await
         .unwrap();
     assert_eq!(first.status(), StatusCode::OK);
     let second = app
         .clone()
-        .oneshot(request_with_token("GET", "/v1/health", &admin_token, None))
+        .oneshot(request_with_token("GET", "/v1/status", &admin_token, None))
         .await
         .unwrap();
     assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -405,7 +407,7 @@ async fn rate_limit_is_per_user_not_global() {
         .clone()
         .oneshot(request_with_token(
             "GET",
-            "/v1/health",
+            "/v1/status",
             &second_admin_session,
             None,
         ))
@@ -416,10 +418,52 @@ async fn rate_limit_is_per_user_not_global() {
     // The member's budget is independent of the admin's.
     let member_response = app
         .clone()
-        .oneshot(request_with_token("GET", "/v1/health", &member_token, None))
+        .oneshot(request_with_token("GET", "/v1/status", &member_token, None))
         .await
         .unwrap();
     assert_eq!(member_response.status(), StatusCode::OK);
+}
+
+/// Polling reads have their own bucket: exhausting it never blocks real
+/// actions, and a flood of actions never blocks polling.
+#[tokio::test]
+async fn polling_reads_use_a_separate_bucket() {
+    let (app, _, store) = app_with_rate_limit(2);
+    let admin_id = admin(&store);
+    let token = mint_for(&store, &admin_id, "poll-session");
+    for _ in 0..2 {
+        let r = app
+            .clone()
+            .oneshot(request_with_token("GET", "/v1/health", &token, None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+    let limited = app
+        .clone()
+        .oneshot(request_with_token("GET", "/v1/health", &token, None))
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(limited.headers().contains_key("retry-after"));
+    let action = app
+        .clone()
+        .oneshot(request_with_token("GET", "/v1/status", &token, None))
+        .await
+        .unwrap();
+    assert_eq!(action.status(), StatusCode::OK);
+}
+
+#[test]
+fn poll_route_classification() {
+    use axum::http::Method;
+    assert!(is_poll_request(&Method::GET, "/v1/browser/screenshot"));
+    assert!(is_poll_request(
+        &Method::GET,
+        "/v1/conversations/c1/messages"
+    ));
+    assert!(!is_poll_request(&Method::POST, "/v1/messages"));
+    assert!(!is_poll_request(&Method::GET, "/v1/memories"));
 }
 
 #[tokio::test]

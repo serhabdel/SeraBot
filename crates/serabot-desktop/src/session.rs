@@ -523,6 +523,8 @@ pub struct Session {
     poll_history: bool,
     poll_paused: bool,
     poll_approvals: bool,
+    /// Consecutive 429s on background polls; resets on any success.
+    rate_attempts: u32,
 }
 
 impl Default for Session {
@@ -621,6 +623,7 @@ impl Session {
             poll_history: false,
             poll_paused: false,
             poll_approvals: false,
+            rate_attempts: 0,
             panel: PanelState::new(),
             panel_worker: None,
         }
@@ -1871,10 +1874,12 @@ impl Session {
         {
             return;
         }
+        // Unfocused window: poll about eight times less often.
+        let slow: u32 = if self.panel.focused { 1 } else { 8 };
         if let Some(task) = &self.state.task {
             if !task.status.terminal() {
                 if self.events_active {
-                    self.schedule(Operation::Task(task.id.clone()), POLL_SAFETY);
+                    self.schedule(Operation::Task(task.id.clone()), POLL_SAFETY * slow);
                 } else {
                     let operation =
                         if self.poll_approvals && task.status == TaskStatus::AwaitingApproval {
@@ -1892,11 +1897,11 @@ impl Session {
                     } else {
                         self.poll_history = !self.poll_history;
                     }
-                    self.schedule(operation, POLL_GAP);
+                    self.schedule(operation, POLL_GAP * slow);
                 }
             }
         } else if self.section == Section::Approvals {
-            self.schedule(Operation::Approvals, POLL_GAP * 2);
+            self.schedule(Operation::Approvals, POLL_GAP * 2 * slow);
         } else {
             self.ensure_section_data();
         }
@@ -2062,6 +2067,19 @@ impl Session {
                     self.oauth_signing_in = None;
                     self.scheduled = None;
                 }
+                Err(ApiError::Http(429)) if completion.kind.is_background_poll() => {
+                    // A rate-limited background poll backs off quietly (no
+                    // banner) and the poll loop carries on afterwards.
+                    self.rate_attempts = self.rate_attempts.saturating_add(1);
+                    self.refreshing = false;
+                    self.scheduled = None;
+                    self.next_request = Instant::now()
+                        + crate::api::poll_backoff(
+                            crate::api::last_retry_after_secs(),
+                            self.rate_attempts,
+                            crate::api::jitter_seed(),
+                        );
+                }
                 Err(error) => {
                     let message = error.to_string();
                     let rate_limited = error == ApiError::Http(429);
@@ -2122,10 +2140,12 @@ impl Session {
                         self.restarting = false;
                     }
                     if rate_limited {
-                        self.next_request = Instant::now() + Duration::from_secs(60);
+                        self.next_request = Instant::now()
+                            + Duration::from_secs(crate::api::last_retry_after_secs());
                     }
                 }
                 Ok(reply) => {
+                    self.rate_attempts = 0;
                     if let Reply::Artifact {
                         filename, bytes, ..
                     } = reply

@@ -388,12 +388,7 @@ impl Runtime {
                 context.allowed_tools.contains(&spec.name)
             })
             .collect::<Vec<_>>();
-        let tool_names = tool_specs
-            .iter()
-            .map(|spec| spec.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        upsert_tool_notice(&mut state.messages, &tool_names);
+        upsert_tool_notice(&mut state.messages, &tool_specs);
         let temperature = bot.config.temperature;
         self.checked_route(&user, &state.route)?;
 

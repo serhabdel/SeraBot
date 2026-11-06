@@ -66,6 +66,9 @@ pub struct Config {
     pub skills: SkillsConfig,
     #[serde(default)]
     pub browser: BrowserConfig,
+    /// Tool approval policy (see docs/approvals.md).
+    #[serde(default)]
+    pub approvals: ApprovalsConfig,
     #[serde(default)]
     pub connectors: ConnectorsConfig,
     /// Fleet file locations. Relative to `base_dir`; the owner API never accepts paths.
@@ -107,6 +110,7 @@ impl Default for Config {
             ocr: OcrConfig::default(),
             skills: SkillsConfig::default(),
             browser: BrowserConfig::default(),
+            approvals: ApprovalsConfig::default(),
             connectors: ConnectorsConfig::default(),
             fleet: FleetConfig::default(),
             base_dir: PathBuf::from("."),
@@ -404,6 +408,16 @@ impl Config {
     }
 }
 
+/// Tool approval policy. Only destructive tools need approval by default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ApprovalsConfig {
+    /// When true, a bot's stored `require_approval` list can add approval
+    /// for non-destructive tools. When false (default) those lists are
+    /// ignored for non-destructive tools.
+    #[serde(default)]
+    pub respect_bot_lists: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_bind")]
@@ -417,6 +431,13 @@ pub struct ServerConfig {
     /// same user share the user's budget rather than multiplying it.
     #[serde(default = "default_rate_limit")]
     pub rate_limit_per_minute: u32,
+    /// Per-minute budget for each authenticated user's actions (default 1200).
+    #[serde(default = "default_user_rate_limit")]
+    pub user_rate_limit_per_minute: u32,
+    /// Separate per-minute budget for each user's cheap idempotent polling
+    /// reads (default 600), so polling never starves real actions.
+    #[serde(default = "default_poll_rate_limit")]
+    pub poll_rate_limit_per_minute: u32,
     #[serde(default = "default_event_retention_days")]
     pub event_retention_days: i64,
     #[serde(default)]
@@ -430,6 +451,8 @@ impl Default for ServerConfig {
             body_limit_bytes: default_body_limit(),
             request_timeout_secs: default_request_timeout(),
             rate_limit_per_minute: default_rate_limit(),
+            user_rate_limit_per_minute: default_user_rate_limit(),
+            poll_rate_limit_per_minute: default_poll_rate_limit(),
             event_retention_days: default_event_retention_days(),
             allow_non_loopback: false,
         }
@@ -1638,38 +1661,6 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
 
 const DEFAULT_SPECIALIST_TOOLS: &[&str] = &["skill_list", "skill_search", "skill_load"];
 
-/// Tools with an external effect. A scaffold lists these in `require_approval`.
-const EXTERNAL_EFFECT_TOOLS: &[&str] = &[
-    "audio_transcribe",
-    "audio_understand",
-    "firecrawl_scrape",
-    "firecrawl_map",
-    "firecrawl_search",
-    "firecrawl_crawl",
-    "firecrawl_extract",
-    "tavily_search",
-    "elevenlabs_text_to_speech",
-    "elevenlabs_sound_effect",
-    "elevenlabs_transcribe",
-    "elevenlabs_generate_image",
-    "elevenlabs_generate_video",
-    "telegram_send_document",
-    "onedrive_upload",
-    "browser_navigate",
-    "browser_click",
-    "browser_type",
-    "browser_press",
-    "google_drive_list",
-    "google_sheets_read",
-    "google_calendar_list_events",
-    "gmail_list_messages",
-    "outlook_list_messages",
-    "outlook_calendar_list_events",
-    "notion_query_database",
-    "agentmail_inboxes_list",
-    "agentmail_send",
-];
-
 const MAX_BOT_DESCRIPTION_CHARS: usize = 2000;
 const MAX_SCAFFOLD_TOOLS: usize = 32;
 const MAX_SCAFFOLD_SKILLS: usize = 16;
@@ -1725,7 +1716,7 @@ pub fn build_specialist_bot(
     }
     let require_approval: Vec<String> = tools
         .iter()
-        .filter(|tool| EXTERNAL_EFFECT_TOOLS.contains(&tool.as_str()))
+        .filter(|tool| crate::gateway::is_destructive_tool(tool))
         .cloned()
         .collect();
     let config = BotConfig {
@@ -1897,6 +1888,14 @@ fn default_body_limit() -> usize {
 fn default_request_timeout() -> u64 {
     30
 }
+fn default_user_rate_limit() -> u32 {
+    1200
+}
+
+fn default_poll_rate_limit() -> u32 {
+    600
+}
+
 fn default_rate_limit() -> u32 {
     60
 }
@@ -2362,7 +2361,7 @@ enabled = false
             vec!["rag_search", "firecrawl_search"]
         );
         assert_eq!(scaffolded.config.skills, vec!["ask"]);
-        assert_eq!(scaffolded.config.require_approval, vec!["firecrawl_search"]);
+        assert!(scaffolded.config.require_approval.is_empty());
         assert!(
             !scaffolded
                 .config

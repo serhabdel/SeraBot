@@ -928,6 +928,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.api.approval_expiry_hours,
         config.runtime.owner_standing_consent,
     )
+    .with_respect_bot_lists(config.approvals.respect_bot_lists)
     .with_vault(users.clone());
 
     let runtime = Runtime::with_fleet(

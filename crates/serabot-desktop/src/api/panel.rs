@@ -343,6 +343,7 @@ impl ApiClient {
             request = request.json(body);
         }
         let response = request.send().map_err(|_| ApiError::Transport)?;
+        note_rate_limit(&response);
         let status = response.status();
         let mut bytes = Zeroizing::new(Vec::new());
         response
@@ -451,6 +452,7 @@ impl ApiClient {
             .bearer_auth(self.token.expose_secret())
             .send()
             .map_err(|_| ApiError::Transport)?;
+        note_rate_limit(&response);
         let status = response.status();
         if !status.is_success() {
             return Err(ApiError::Http(status.as_u16()));
