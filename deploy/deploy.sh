@@ -6,7 +6,7 @@
 #
 # Exact manifest (nothing else is touched):
 #   NEW   /var/lib/serabot/releases/serabot-<tag>-<sha>     (staged binary)
-#   NEW   /var/lib/serabot/releases/serabot-pre-<tag>       (backup of old binary)
+#   REPL  /opt/serabot/serabot.prev                         (single rollback copy; serabot.bak-* removed)
 #   NEW   /var/lib/serabot/backups/serabot-db-pre-<tag>.db (SQLite online backup)
 #   REPL  /opt/serabot/serabot                              (after SHA-256 + glibc check)
 #   RUN   systemctl restart serabot                         (only this service)
@@ -20,7 +20,7 @@ SHA=$(cat "$DEPLOY_DIR/pending-sha")
 REPO=serhabdel/SeraBot
 SHORT=${SHA:0:7}
 STAGED=/var/lib/serabot/releases/serabot-${TAG}-${SHORT}
-BACKUP=/var/lib/serabot/releases/serabot-pre-${TAG}
+PREV=/opt/serabot/serabot.prev
 DBBACKUP=/var/lib/serabot/backups/serabot-db-pre-${TAG}.db
 ASSET_URL="https://github.com/${REPO}/releases/download/${TAG}"
 
@@ -29,7 +29,7 @@ echo "deploy: tag=${TAG} sha=${SHA}"
 echo "== preflight =="
 systemctl is-active serabot
 df -h /
-ldd --version | head -1
+ldd --version | sed -n 1p  # not head -1: SIGPIPE + pipefail gives exit 141
 
 echo "== download release binary + checksum asset and verify =="
 TMP=$(mktemp -d)
@@ -50,7 +50,10 @@ install -m 0755 "$TMP/serabot-linux-x64" "$STAGED"
 [ "$(sha256sum "$STAGED" | cut -d' ' -f1)" = "$EXPECTED" ] || { echo "staged SHA mismatch"; exit 1; }
 
 echo "== backups =="
-cp -a /opt/serabot/serabot "$BACKUP"
+# Exactly one rollback copy: replace serabot.prev atomically, drop legacy backups.
+cp -a /opt/serabot/serabot "$PREV.new"
+mv -f "$PREV.new" "$PREV"
+rm -f /opt/serabot/serabot.bak-*
 # Use Python's sqlite3 module rather than the sqlite3 CLI: the CLI is not
 # installed on the VPS, and the online backup API is identical.
 python3 -c 'import sqlite3, sys
@@ -87,7 +90,7 @@ if verify; then
 fi
 
 echo "== VERIFY FAILED: rolling back =="
-install -m 0755 "$BACKUP" /opt/serabot/serabot
+install -m 0755 "$PREV" /opt/serabot/serabot
 systemctl restart serabot
 sleep 4
 systemctl is-active serabot
