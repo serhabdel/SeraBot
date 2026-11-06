@@ -214,21 +214,21 @@ fn require_named_secret(
     }
 }
 
-fn plausible_secret(value: &str) -> bool {
+pub(crate) fn plausible_secret(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 16 * 1024
         && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OAuthProvider {
+pub enum OAuthProvider {
     Google,
     Microsoft,
     Notion,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConnectorKind {
+pub enum ConnectorKind {
     GoogleDrive,
     GoogleSheets,
     GoogleCalendar,
@@ -239,7 +239,23 @@ enum ConnectorKind {
 }
 
 impl ConnectorKind {
-    fn section(self) -> &'static str {
+    /// Every OAuth-style connector product, in console order.
+    pub const ALL: [Self; 7] = [
+        Self::OutlookMail,
+        Self::OutlookCalendar,
+        Self::GoogleDrive,
+        Self::GoogleSheets,
+        Self::GoogleCalendar,
+        Self::Gmail,
+        Self::Notion,
+    ];
+
+    /// The connector for a console id (`outlook`, `gmail`, ...).
+    pub fn from_section(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.section() == id)
+    }
+
+    pub fn section(self) -> &'static str {
         match self {
             Self::GoogleDrive => "google_drive",
             Self::GoogleSheets => "google_sheets",
@@ -251,7 +267,7 @@ impl ConnectorKind {
         }
     }
 
-    fn tool_name(self) -> &'static str {
+    pub fn tool_name(self) -> &'static str {
         match self {
             Self::GoogleDrive => "google_drive_list",
             Self::GoogleSheets => "google_sheets_read",
@@ -263,7 +279,7 @@ impl ConnectorKind {
         }
     }
 
-    fn summary(self) -> &'static str {
+    pub fn summary(self) -> &'static str {
         match self {
             Self::GoogleDrive => "List Google Drive files",
             Self::GoogleSheets => "Read a Google Sheets range",
@@ -275,7 +291,7 @@ impl ConnectorKind {
         }
     }
 
-    fn description(self) -> &'static str {
+    pub fn description(self) -> &'static str {
         match self {
             Self::GoogleDrive => {
                 "List Google Drive file ids and names (read-only, untrusted metadata)."
@@ -289,7 +305,7 @@ impl ConnectorKind {
         }
     }
 
-    fn provider(self) -> OAuthProvider {
+    pub fn provider(self) -> OAuthProvider {
         match self {
             Self::GoogleDrive | Self::GoogleSheets | Self::GoogleCalendar | Self::Gmail => {
                 OAuthProvider::Google
@@ -315,7 +331,7 @@ impl ConnectorKind {
         }
     }
 
-    fn api_base(self) -> &'static str {
+    pub fn api_base(self) -> &'static str {
         match self {
             Self::GoogleDrive | Self::GoogleCalendar => "https://www.googleapis.com",
             Self::GoogleSheets => "https://sheets.googleapis.com",
@@ -325,7 +341,7 @@ impl ConnectorKind {
         }
     }
 
-    fn scope(self) -> &'static str {
+    pub fn scope(self) -> &'static str {
         match self {
             Self::GoogleDrive => "https://www.googleapis.com/auth/drive.readonly",
             Self::GoogleSheets => "https://www.googleapis.com/auth/spreadsheets.readonly",
@@ -337,7 +353,7 @@ impl ConnectorKind {
         }
     }
 
-    fn parameters(self) -> Value {
+    pub fn parameters(self) -> Value {
         match self {
             Self::GoogleSheets => json!({
                 "type": "object",
@@ -1008,7 +1024,7 @@ fn error_code(bytes: &[u8], secrets: &[String]) -> String {
     "request_failed".into()
 }
 
-fn sanitize_code(value: &str, secrets: &[String]) -> String {
+pub(crate) fn sanitize_code(value: &str, secrets: &[String]) -> String {
     let cleaned: String = value
         .chars()
         .filter(|character| character.is_ascii_graphic())
@@ -1025,7 +1041,7 @@ fn sanitize_code(value: &str, secrets: &[String]) -> String {
     }
 }
 
-fn redact(message: &str, secrets: &[String]) -> String {
+pub(crate) fn redact(message: &str, secrets: &[String]) -> String {
     let mut message = message.to_owned();
     for secret in secrets {
         if secret.len() >= 8 {
@@ -1035,7 +1051,7 @@ fn redact(message: &str, secrets: &[String]) -> String {
     message
 }
 
-fn redact_json(value: &mut Value, secrets: &[String]) {
+pub(crate) fn redact_json(value: &mut Value, secrets: &[String]) {
     match value {
         Value::String(text) => *text = redact(text, secrets),
         Value::Array(items) => {
@@ -1090,7 +1106,7 @@ fn oauth_token_ok(value: &str, min: usize, max: usize) -> bool {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn pkce_s256() -> (String, String) {
+pub(crate) fn pkce_s256() -> (String, String) {
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
@@ -1099,14 +1115,14 @@ fn pkce_s256() -> (String, String) {
     (verifier, challenge)
 }
 
-fn page_size(args: &Value) -> u32 {
+pub(crate) fn page_size(args: &Value) -> u32 {
     let value = args.get("page_size").and_then(Value::as_u64).unwrap_or(10);
     u32::try_from(value)
         .unwrap_or(MAX_PAGE_SIZE)
         .clamp(1, MAX_PAGE_SIZE)
 }
 
-fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
+pub(crate) fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
         .map(str::trim)
@@ -1114,14 +1130,14 @@ fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
         .ok_or_else(|| SeraError::Validation(format!("{key} is required")))
 }
 
-fn segment_ok(value: &str, min: usize, max: usize) -> bool {
+pub(crate) fn segment_ok(value: &str, min: usize, max: usize) -> bool {
     (min..=max).contains(&value.len())
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
-fn sheet_range_ok(value: &str) -> bool {
+pub(crate) fn sheet_range_ok(value: &str) -> bool {
     !value.is_empty()
         && value.chars().count() <= 128
         && !value.chars().any(|character| {
@@ -1129,7 +1145,7 @@ fn sheet_range_ok(value: &str) -> bool {
         })
 }
 
-fn notion_id_ok(value: &str) -> bool {
+pub(crate) fn notion_id_ok(value: &str) -> bool {
     let hex = |character: char| character.is_ascii_hexdigit();
     (value.len() == 32 && value.chars().all(hex))
         || (value.len() == 36
@@ -1138,7 +1154,7 @@ fn notion_id_ok(value: &str) -> bool {
                 .all(|character| hex(character) || character == '-'))
 }
 
-fn encode_component(value: &str) -> String {
+pub(crate) fn encode_component(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {
         match byte {
@@ -1282,7 +1298,7 @@ fn probe_status_message(code: u16) -> String {
     }
 }
 
-fn map_transport(context: &str, error: reqwest::Error) -> SeraError {
+pub(crate) fn map_transport(context: &str, error: reqwest::Error) -> SeraError {
     let detail = if error.is_timeout() {
         "timed out"
     } else if error.is_connect() {

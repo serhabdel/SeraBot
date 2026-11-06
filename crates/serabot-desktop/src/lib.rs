@@ -4,6 +4,7 @@ mod api;
 #[cfg(any(windows, feature = "ui-check"))]
 pub mod audio_capture;
 pub mod branding;
+pub mod connector_card;
 pub mod creds;
 pub mod events;
 pub mod oauth;
