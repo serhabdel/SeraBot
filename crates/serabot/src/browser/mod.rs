@@ -68,16 +68,8 @@ impl SecretResolver for VaultResolver {
         field: &str,
         host: &str,
     ) -> Result<Zeroizing<String>> {
-        match field {
-            // `vault::resolve_for_browser` has a fixed signature without a
-            // field selector: it returns the entry's secret value.
-            "password" | "value" => {
-                crate::vault::resolve_for_browser(&self.users, user_id, name, host)
-            }
-            _ => Err(SeraError::Validation(
-                "the vault only resolves the secret value (field password or value) for now".into(),
-            )),
-        }
+        let field = crate::vault::VaultField::parse(field)?;
+        crate::vault::resolve_field_for_browser(&self.users, user_id, name, host, field)
     }
 }
 
