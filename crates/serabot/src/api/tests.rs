@@ -8,6 +8,8 @@ use axum::body::Body;
 use axum::http::Request;
 use tower::ServiceExt;
 
+mod vault_http;
+
 /// The bootstrap admin's id â€” the acting user behind the config token
 /// the tests use.
 fn admin(store: &Store) -> String {

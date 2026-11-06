@@ -58,6 +58,7 @@ const MIGRATION_11: &str = include_str!("../migrations/0011_user_secrets.sql");
 const MIGRATION_12: &str = include_str!("../migrations/0012_user_telegram.sql");
 const MIGRATION_13: &str = include_str!("../migrations/0013_conversation_artifacts.sql");
 const MIGRATION_14: &str = include_str!("../migrations/0014_auth_handoffs.sql");
+const MIGRATION_15: &str = include_str!("../migrations/0015_vault.sql");
 
 /// Fixed admin id written by migration 0008 and mirrored in
 /// `kv['admin_user_id']`. Code resolves the admin through the kv entry (the
@@ -502,6 +503,11 @@ impl Store {
         if version < 14 {
             connection.execute_batch(MIGRATION_14)?;
             connection.pragma_update(None, "user_version", 14)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 15 {
+            connection.execute_batch(MIGRATION_15)?;
+            connection.pragma_update(None, "user_version", 15)?;
         }
         let stored_dimension: Option<String> = connection
             .query_row(
@@ -4447,7 +4453,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -4512,7 +4518,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -4581,7 +4587,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -4712,7 +4718,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -4867,7 +4873,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.

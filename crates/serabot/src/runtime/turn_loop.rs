@@ -411,9 +411,11 @@ impl Runtime {
             self.scan_model_messages(&user, &state.messages)?;
             self.gateway
                 .scan_egress(&user, &serde_json::to_string(&tool_specs)?)?;
+            // Vault values never reach a model: redact a copy of the request.
+            let outgoing = self.gateway.redact_messages(&user, &state.messages)?;
             let response = self
                 .router
-                .complete(&user, route, &state.messages, &tool_specs, temperature)
+                .complete(&user, route, &outgoing, &tool_specs, temperature)
                 .await?;
             self.store.record_audit(
                 &user,

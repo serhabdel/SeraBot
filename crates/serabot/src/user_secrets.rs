@@ -119,6 +119,38 @@ impl UserSecrets {
     pub fn set(&self, user_id: &str, provider: &str, value: &str) -> Result<()> {
         validate_provider(provider)?;
         validate_value(value)?;
+        self.seal_and_store(user_id, provider, value)
+    }
+
+    /// The store behind this credential vault, for the vault's metadata rows.
+    pub(crate) fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// Seal a vault value under provider id `vault:<name>`. Vault values may
+    /// hold tabs and newlines (free-text notes), so they use the vault's own
+    /// value rules instead of [`validate_value`]; the provider-id check is
+    /// the vault's too, which keeps `vault:` ids out of the public API's
+    /// provider namespace.
+    pub(crate) fn set_vault(&self, user_id: &str, name: &str, value: &str) -> Result<()> {
+        let provider = vault_provider_id(name)?;
+        crate::vault::validate_value(value)?;
+        self.seal_and_store(user_id, &provider, value)
+    }
+
+    /// The acting user's vault value for `name`, if any.
+    pub(crate) fn get_vault(&self, user_id: &str, name: &str) -> Result<Option<SecretString>> {
+        let provider = vault_provider_id(name)?;
+        self.get_unchecked(user_id, &provider)
+    }
+
+    /// Delete the acting user's vault value for `name`.
+    pub(crate) fn delete_vault(&self, user_id: &str, name: &str) -> Result<bool> {
+        let provider = vault_provider_id(name)?;
+        self.store.delete_user_credential(user_id, &provider)
+    }
+
+    fn seal_and_store(&self, user_id: &str, provider: &str, value: &str) -> Result<()> {
         if self.store.get_user(user_id)?.is_none() {
             return Err(SeraError::NotFound(format!("user {user_id}")));
         }
@@ -132,6 +164,10 @@ impl UserSecrets {
     /// a grant: use [`Self::resolve`] for the routing path.
     pub fn get(&self, user_id: &str, provider: &str) -> Result<Option<SecretString>> {
         validate_provider(provider)?;
+        self.get_unchecked(user_id, provider)
+    }
+
+    fn get_unchecked(&self, user_id: &str, provider: &str) -> Result<Option<SecretString>> {
         let Some(row) = self.store.user_credential(user_id, provider)? else {
             return Ok(None);
         };
@@ -218,6 +254,8 @@ impl UserSecrets {
     /// admin grants. Names only — never a value.
     pub fn providers_for(&self, user_id: &str) -> Result<Vec<String>> {
         let mut names = self.store.list_user_credential_providers(user_id)?;
+        // Vault entries are not AI providers; they are listed by the vault.
+        names.retain(|name| !name.starts_with(VAULT_PROVIDER_PREFIX));
         for grant in self.store.list_active_grants_for(user_id)? {
             names.push(grant.provider);
         }
@@ -433,6 +471,15 @@ impl CredentialWriter for UserCredentialWriter {
             }
         }
     }
+}
+
+/// Provider-id prefix under which vault values are sealed.
+pub(crate) const VAULT_PROVIDER_PREFIX: &str = "vault:";
+
+/// The sealed-credential provider id for vault entry `name`.
+pub(crate) fn vault_provider_id(name: &str) -> Result<String> {
+    crate::vault::validate_name(name)?;
+    Ok(format!("{VAULT_PROVIDER_PREFIX}{name}"))
 }
 
 /// Provider ids are config keys: letters, digits, `-`, `_`, and `.`.
