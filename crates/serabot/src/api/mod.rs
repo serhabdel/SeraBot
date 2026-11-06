@@ -1,0 +1,600 @@
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::convert::Infallible;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use axum::body::Body;
+use axum::extract::{Extension, Path, Query, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, patch, post, put};
+use axum::{Json, Router};
+use chrono::{DateTime, SecondsFormat, Utc};
+use futures::StreamExt;
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use tokio::sync::Mutex;
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::trace::TraceLayer;
+use tracing::warn;
+
+use crate::admin::{
+    AdminStore, BotConfigOverlay, BotProfile, ProviderSecrets, connector_secret_roles,
+};
+use crate::auth::{self, AuthService};
+use crate::config::{
+    BotConfig, Config, OAuthConnectorSettings, ProviderConfig, build_specialist_bot,
+};
+use crate::connectors::{ApiKeyProbe, probe_api_key};
+use crate::domain::Task;
+use crate::error::{Result, SeraError};
+use crate::gateway::Decision;
+use crate::maker::ArtifactStore;
+use crate::memory;
+use crate::model_router::ModelSelection;
+use crate::onedrive::{
+    CONSENT_CALLBACK_PATH, ONEDRIVE_PROVIDER, OneDriveConsent, OneDriveRegistry,
+};
+use crate::orchestration::{
+    BotRole, ConversationKind, safe_bot_label, scoped_conversation_id, validate_conversation_id,
+};
+use crate::runtime::{ApprovalNotice, Notifier, Runtime};
+use crate::secrets::SharedSecrets;
+use crate::skills::create_user_skill;
+use crate::store::{Store, StoredConversation, User, UserRole, UserStatus};
+use crate::user_secrets::{ProviderCredential, UserSecrets, validate_provider};
+use crate::util::{constant_time_eq, sha256_hex, truncate_chars};
+
+mod accounts;
+mod admin;
+mod approvals;
+mod bots;
+mod connectors;
+mod conversations;
+mod memories;
+mod messages;
+mod skills;
+mod status;
+#[cfg(test)]
+mod tests;
+
+use accounts::*;
+use admin::*;
+use approvals::*;
+use bots::*;
+use connectors::*;
+use conversations::*;
+use memories::*;
+use messages::*;
+use skills::*;
+use status::*;
+
+#[derive(Clone)]
+pub struct ApiNotifier {
+    store: Store,
+}
+
+impl ApiNotifier {
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait::async_trait]
+impl Notifier for ApiNotifier {
+    async fn send_text(&self, user_id: &str, conversation_id: &str, text: &str) -> Result<()> {
+        self.store.append_event(
+            user_id,
+            "message",
+            &json!({"conversation_id": conversation_id, "text": text}),
+        )?;
+        Ok(())
+    }
+
+    async fn approval_requested(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        notice: &ApprovalNotice,
+    ) -> Result<()> {
+        self.store.append_event(
+            user_id,
+            "approval",
+            &json!({
+                "conversation_id": conversation_id,
+                "approval_id": notice.approval.id,
+                "action_id": notice.action.id,
+                "tool": notice.approval.tool,
+                "summary": notice.approval.summary,
+                "destination": notice.action.destination,
+                "expires_at": notice.approval.expires_at,
+            }),
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct ApiState {
+    runtime: Runtime,
+    store: Store,
+    config: Arc<Config>,
+    artifacts: Arc<ArtifactStore>,
+    secrets: SharedSecrets,
+    /// Per-user envelope-encrypted credential store (phase 4).
+    users: Arc<UserSecrets>,
+    /// Per-user OneDrive client registry; `None` while `[onedrive]` is off.
+    onedrive: Option<Arc<OneDriveRegistry>>,
+    /// OneDrive consent (auth code + PKCE); `None` while `[onedrive]` is off.
+    onedrive_consent: Option<Arc<OneDriveConsent>>,
+    token_hash: String,
+    /// Per-user request buckets for the per-minute limit. Keyed by the
+    /// acting user id (never a token); public sign-in routes without an
+    /// authenticated user share one `anonymous` bucket.
+    rate: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
+    rate_limit: usize,
+    admin: Option<AdminStore>,
+    /// The OIDC sign-in service; `None` while `[auth] enabled = false`, so
+    /// every sign-in endpoint fails closed.
+    auth: Option<Arc<AuthService>>,
+    /// Providers with a device sign-in still running in the background.
+    oauth_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl ApiState {
+    /// Fails fast when sign-in is enabled but misconfigured: a missing auth
+    /// client id, a bad redirect, or an unusable provider must stop startup
+    /// rather than surface at sign-in time.
+    pub fn new(
+        runtime: Runtime,
+        store: Store,
+        config: Arc<Config>,
+        artifacts: Arc<ArtifactStore>,
+        secrets: SharedSecrets,
+        users: Arc<UserSecrets>,
+        onedrive: Option<Arc<OneDriveRegistry>>,
+    ) -> Result<Self> {
+        let auth = if config.auth.enabled {
+            let fleet = runtime.fleet();
+            Some(Arc::new(
+                AuthService::new(&config, store.clone(), &secrets)?.with_fleet(fleet),
+            ))
+        } else {
+            None
+        };
+        let onedrive_consent =
+            OneDriveConsent::new(&config, &secrets, users.clone())?.map(Arc::new);
+        Ok(Self {
+            runtime,
+            store,
+            artifacts,
+            secrets,
+            users,
+            onedrive,
+            onedrive_consent,
+            token_hash: config.api.token_hash.to_ascii_lowercase(),
+            rate: Arc::new(Mutex::new(HashMap::new())),
+            rate_limit: config.server.rate_limit_per_minute.max(1) as usize,
+            admin: AdminStore::open(&config).ok(),
+            auth,
+            oauth_inflight: Arc::default(),
+            config,
+        })
+    }
+}
+
+pub fn router(state: ApiState) -> Router {
+    let shared = Arc::new(state);
+    let protected = Router::new()
+        .route("/v1/health", get(health))
+        .route("/v1/status", get(status))
+        .route("/v1/usage", get(usage))
+        .route("/v1/messages", post(send_message))
+        .route("/v1/bots", get(list_bots).post(create_bot))
+        .route(
+            "/v1/bots/{id}",
+            get(bot_detail).put(update_bot).delete(delete_bot),
+        )
+        .route("/v1/skills", get(list_skills).post(create_skill_pack))
+        .route(
+            "/v1/conversations",
+            get(list_conversations).post(create_conversation),
+        )
+        .route(
+            "/v1/conversations/{id}",
+            patch(rename_conversation).delete(archive_conversation),
+        )
+        .route(
+            "/v1/conversations/{id}/unarchive",
+            post(unarchive_conversation),
+        )
+        .route("/v1/memories", get(list_memories).post(add_memory))
+        .route("/v1/memories/{id}", delete(delete_memory))
+        .route("/v1/providers", get(list_providers))
+        .route("/v1/providers/{id}/key", put(set_provider_key))
+        .route("/v1/providers/{id}", delete(delete_provider_credential))
+        .route("/v1/admin/grants", get(list_grants).post(grant_provider))
+        .route(
+            "/v1/admin/grants/{grantee}/{provider}",
+            delete(revoke_grant_endpoint),
+        )
+        .route("/v1/connectors/onedrive", delete(disconnect_onedrive))
+        .route(
+            "/v1/connectors/onedrive/start",
+            post(start_onedrive_consent),
+        )
+        .route("/v1/telegram", get(telegram_status))
+        .route(
+            "/v1/telegram/link",
+            post(start_telegram_link).delete(unlink_telegram),
+        )
+        .route("/v1/admin/providers", post(admin_add_provider))
+        .route("/v1/admin/providers/{id}", delete(admin_remove_provider))
+        .route(
+            "/v1/admin/providers/{id}/oauth/start",
+            post(admin_provider_oauth_start),
+        )
+        .route(
+            "/v1/admin/providers/{id}/oauth/complete",
+            post(admin_provider_oauth_complete),
+        )
+        .route("/v1/admin/connectors/{id}", put(admin_set_connector))
+        .route("/v1/admin/connectors/{id}/test", post(admin_test_connector))
+        .route(
+            "/v1/admin/connectors/{id}/oauth/start",
+            post(admin_connector_oauth_start),
+        )
+        .route(
+            "/v1/admin/connectors/{id}/oauth/complete",
+            post(admin_connector_oauth_complete),
+        )
+        .route("/v1/admin/audio", put(admin_set_audio))
+        .route(
+            "/v1/settings/voice",
+            get(voice_settings).put(admin_set_voice),
+        )
+        .route(
+            "/v1/conversations/{id}/reply-mode",
+            get(get_reply_mode).put(set_reply_mode),
+        )
+        .route("/v1/admin/bots/{id}", put(admin_set_bot_profile))
+        .route("/v1/admin/bots/{id}/config", put(admin_update_bot_config))
+        .route("/v1/admin/restart", post(admin_restart))
+        .route("/v1/connectors", get(list_connectors))
+        .route("/v1/models", get(models))
+        .route("/v1/conversations/{id}/model", put(select_model))
+        .route(
+            "/v1/conversations/{id}/messages",
+            get(conversation_messages),
+        )
+        .route(
+            "/v1/conversations/{id}/team",
+            get(conversation_team).put(set_conversation_team),
+        )
+        .route("/v1/conversations/{id}/library", get(conversation_library))
+        .route("/v1/tasks/{id}", get(task))
+        .route("/v1/approvals", get(list_approvals))
+        .route("/v1/approvals/{id}/decide", post(decide_approval))
+        .route("/v1/events", get(events))
+        .route("/v1/audit", get(audit))
+        .route("/v1/artifacts/{hash}", get(artifact))
+        .route("/v1/artifacts/{hash}/approve", post(approve_artifact))
+        .route("/v1/me", get(auth_me))
+        .route("/v1/auth/logout", post(auth_logout))
+        .route("/v1/auth/invites", post(auth_invites))
+        .route("/v1/users", get(list_users))
+        .route("/v1/users/{id}/disable", post(disable_user))
+        .route("/v1/users/{id}/enable", post(enable_user))
+        .layer(RequestBodyLimitLayer::new(
+            shared.config.server.body_limit_bytes,
+        ));
+    // Voice capture posts raw bytes up to the Telegram voice ceiling; the JSON
+    // endpoints keep the smaller server body limit.
+    //
+    // The route layer alone is not enough: axum's own `DefaultBodyLimit`
+    // (2 MiB) is what a `Bytes` extraction actually enforces, so the audio
+    // route raises that limit too and the handler reads the body through
+    // `to_bytes` with an explicit ceiling of its own.
+    let audio = Router::new()
+        .route("/v1/audio/transcribe", post(transcribe_audio))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            crate::audio::DEFAULT_TELEGRAM_AUDIO_MAX_BYTES as usize,
+        ));
+    // Sign-in entry points are public: the caller by definition has no
+    // session token yet. They share the JSON body limit and the per-minute
+    // rate limit, but not the bearer-token middleware.
+    let public_auth = Router::new()
+        .route("/v1/auth/providers", get(auth_providers))
+        .route("/v1/auth/login/start", post(auth_login_start))
+        .route("/v1/auth/callback", get(auth_callback))
+        .route("/v1/auth/handoff", post(auth_handoff))
+        .route("/login/microsoft", get(auth_login_microsoft))
+        // The OneDrive consent redirect is a browser round trip from
+        // Microsoft: no session exists, and the `state` value binds it to the
+        // user exactly like the sign-in callback.
+        .route(CONSENT_CALLBACK_PATH, get(onedrive_callback))
+        .layer(RequestBodyLimitLayer::new(
+            shared.config.server.body_limit_bytes,
+        ))
+        .layer(middleware::from_fn_with_state(shared.clone(), rate_limit));
+    // `authorize` runs first so the rate limiter can key on the authenticated
+    // user; an unknown token is rejected before it can create a bucket.
+    let protected = protected
+        .merge(audio)
+        .layer(middleware::from_fn_with_state(shared.clone(), rate_limit))
+        .layer(middleware::from_fn_with_state(shared.clone(), authorize));
+    crate::web::router()
+        .merge(public_auth)
+        .merge(protected)
+        .layer(TraceLayer::new_for_http())
+        .with_state(shared)
+}
+
+async fn health(State(state): State<Arc<ApiState>>) -> Response {
+    match state.store.health() {
+        Ok(()) => Json(json!({
+            "ok": true,
+            "version": env!("CARGO_PKG_VERSION"),
+            "build": crate::web::build_sha(),
+            "audio_enabled": state.config.audio.enabled,
+            "audio_transcription_model": state.config.audio.transcription_model,
+            "audio_understanding_model": state.config.audio.understanding_model,
+            "firecrawl_enabled": state.config.firecrawl.enabled,
+            "tavily_enabled": state.config.tavily.enabled,
+            "telegram_enabled": state.config.telegram.enabled,
+            "catalog_fetch": state.config.llm.catalog_fetch,
+            "bot_chat_binding": true,
+            "bot_profiles": true,
+            "conversation_titles": true,
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"ok": false, "error": "database unavailable"})),
+        )
+            .into_response()
+            .tap(|_| warn!(%error, "health check failed")),
+    }
+}
+
+trait Tap: Sized {
+    fn tap(self, f: impl FnOnce(&Self)) -> Self {
+        f(&self);
+        self
+    }
+}
+impl<T> Tap for T {}
+
+/// Names only. Secret values never leave the age store.
+fn secret_status(secrets: &SharedSecrets, name: Option<&str>) -> Value {
+    match name.filter(|name| !name.is_empty()) {
+        Some(name) => json!({"name": name, "configured": secrets.has(name)}),
+        None => json!({"name": Value::Null, "configured": false}),
+    }
+}
+
+/// The acting user's credential status for one provider: own row, active
+/// admin grant, or neither. Presence only — never a value.
+fn credential_view(state: &ApiState, user_id: &str, provider: &str) -> Result<Value> {
+    let status = state.users.credential_status(user_id, provider)?;
+    Ok(json!({
+        "configured": status.usable(),
+        "own": status.own,
+        "granted": status.granted,
+    }))
+}
+
+/// The identity behind an authenticated request, threaded into handlers
+/// through request extensions. Carries only ids and the role — never a raw
+/// token (the `token_hash` field is the sha256 the server stores).
+#[derive(Clone, Debug)]
+pub struct ActingUser {
+    pub id: String,
+    pub role: UserRole,
+    /// The device-token row id when the bearer token is a session; `None`
+    /// for the static config token, which has no revocable session row.
+    pub session_id: Option<String>,
+    pub token_hash: String,
+}
+
+impl ActingUser {
+    pub fn is_admin(&self) -> bool {
+        self.role == UserRole::Admin
+    }
+}
+
+/// Gate a handler on the admin role. Members receive an explicit 403.
+fn require_admin(user: &ActingUser) -> Result<()> {
+    if user.role != UserRole::Admin {
+        return Err(SeraError::Forbidden(
+            "this endpoint requires the admin role".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the user behind a bearer token, or fail closed.
+///
+/// The static config token is the operator's own credential and maps to the
+/// bootstrap admin. Device tokens map to the owning user recorded on the
+/// row (existing operator tokens were backfilled to the admin by migration
+/// 0008). Unknown owners, disabled accounts, and revoked or expired tokens
+/// all reject identically, so a rejected caller learns nothing about which
+/// check failed.
+async fn authorize(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    if !state.config.api.enabled {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "api disabled"})),
+        )
+            .into_response();
+    }
+    let Some(header) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return unauthorized();
+    };
+    let Some(token) = header.strip_prefix("Bearer ") else {
+        return unauthorized();
+    };
+    if token.len() < 32 || token.len() > 512 {
+        return unauthorized();
+    }
+    let candidate = sha256_hex(token);
+    if constant_time_eq(&candidate, &state.token_hash) {
+        let Some(admin) = active_user(&state, None) else {
+            return unauthorized();
+        };
+        request.extensions_mut().insert(ActingUser {
+            id: admin.id,
+            role: admin.role,
+            session_id: None,
+            token_hash: candidate,
+        });
+        return next.run(request).await;
+    }
+    let now = chrono::Utc::now();
+    match state.store.device_token_by_hash(&candidate) {
+        Ok(Some(record)) if record.active_at(now) => {
+            let Some(user) = active_user(&state, record.user_id.as_deref()) else {
+                return unauthorized();
+            };
+            if let Err(error) = state.store.touch_device_token(&record.id, now) {
+                warn!(%error, "device token last-used update failed");
+            }
+            request.extensions_mut().insert(ActingUser {
+                id: user.id,
+                role: user.role,
+                session_id: Some(record.id),
+                token_hash: candidate,
+            });
+            next.run(request).await
+        }
+        Ok(_) => unauthorized(),
+        Err(error) => {
+            warn!(%error, "device token lookup failed");
+            unauthorized()
+        }
+    }
+}
+
+/// The active user behind a token, or `None` when the owner is missing or
+/// disabled. A `None` owner id maps to the bootstrap admin (pre-migration
+/// rows were backfilled, but the lookup stays explicit either way).
+fn active_user(state: &ApiState, user_id: Option<&str>) -> Option<User> {
+    let user = match user_id {
+        Some(id) => state.store.get_user(id).ok()??,
+        None => state.store.admin_user().ok()??,
+    };
+    (user.status == UserStatus::Active).then_some(user)
+}
+
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "unauthorized"})),
+    )
+        .into_response()
+}
+
+// ---- Auth endpoints (public entry, protected sessions) ----
+
+/// Per-minute request limit, one bucket per acting user.
+///
+/// The bucket key is the authenticated user id, so one user cannot exhaust
+/// another's budget and multiple sessions of the same user share the
+/// configured limit instead of multiplying it. Requests that reach this
+/// middleware without an `ActingUser` — the public sign-in routes — share one
+/// anonymous bucket. Buckets are pruned on every request, so idle sessions do
+/// not accumulate.
+async fn rate_limit(State(state): State<Arc<ApiState>>, request: Request, next: Next) -> Response {
+    let key = request
+        .extensions()
+        .get::<ActingUser>()
+        .map(|user| user.id.clone())
+        .unwrap_or_else(|| "anonymous".to_owned());
+    {
+        let mut buckets = state.rate.lock().await;
+        let now = Instant::now();
+        let window = Duration::from_secs(60);
+        buckets.retain(|_, entries| {
+            while entries
+                .front()
+                .is_some_and(|entry| now.duration_since(*entry) > window)
+            {
+                entries.pop_front();
+            }
+            !entries.is_empty()
+        });
+        let entries = buckets.entry(key).or_default();
+        if entries.len() >= state.rate_limit {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", "60")],
+                Json(json!({"error": "rate limit exceeded"})),
+            )
+                .into_response();
+        }
+        entries.push_back(now);
+    }
+    next.run(request).await
+}
+
+#[derive(Debug, Serialize)]
+struct ApiErrorBody {
+    error: String,
+    code: &'static str,
+}
+
+impl IntoResponse for SeraError {
+    fn into_response(self) -> Response {
+        let (status, code, message) = match &self {
+            SeraError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found", "not found"),
+            SeraError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden", "forbidden"),
+            SeraError::PolicyViolation => (
+                StatusCode::FORBIDDEN,
+                "policy_violation",
+                "blocked by content policy",
+            ),
+            SeraError::Validation(_) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation",
+                "invalid request",
+            ),
+            SeraError::InvalidState(_) => (
+                StatusCode::CONFLICT,
+                "invalid_state",
+                "the requested operation is not valid in the current state",
+            ),
+            _ => {
+                warn!(%self, "api request failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    "internal server error",
+                )
+            }
+        };
+        (
+            status,
+            Json(ApiErrorBody {
+                error: message.to_string(),
+                code,
+            }),
+        )
+            .into_response()
+    }
+}
+
+pub fn sanitize_for_event(value: &str) -> String {
+    truncate_chars(value, 2000)
+}
