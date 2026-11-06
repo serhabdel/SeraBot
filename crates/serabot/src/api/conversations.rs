@@ -400,10 +400,14 @@ pub(super) async fn list_conversations(
         .map(|record| record.id.as_str())
         .collect::<Vec<_>>();
     let previews = state.store.last_message_previews(&user.id, &ids)?;
+    let avatar_versions = state.store.conversation_avatar_versions(&user.id)?;
     let conversations = records
         .iter()
         .map(|record| {
             let mut view = conversation_view(record)?;
+            if let Some(version) = avatar_versions.get(&record.id) {
+                view["avatar_version"] = json!(version);
+            }
             if let Some((role, content)) = previews.get(&record.id) {
                 // Same policy scan as the transcript: a blocked message never
                 // leaks through the list.

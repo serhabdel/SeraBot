@@ -135,6 +135,23 @@ struct OneDriveStartAck {
     url: String,
 }
 
+/// Reply of `PUT /v1/connectors/{id}/token` and `DELETE /v1/connectors/{id}`.
+#[derive(Deserialize)]
+struct ConnectorAck {
+    #[serde(default)]
+    connected: bool,
+}
+
+#[derive(Serialize)]
+struct ConnectorTokenBody<'a> {
+    token: &'a str,
+}
+
+/// Console ids of the per-user products (`outlook`, `google_drive`, ...).
+fn valid_personal_id(id: &str) -> bool {
+    (1..=32).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+}
+
 #[derive(Deserialize)]
 struct OneDriveDisconnectAck {
     #[serde(default)]
@@ -324,7 +341,7 @@ impl ApiClient {
     /// One request with a bounded body. `400`/`409`/`422`/`404` keep the
     /// server's short message when it is safe to show; anything else stays a
     /// bare status so the session's token and back-off paths still work.
-    fn panel_exchange<B: Serialize + ?Sized>(
+    pub(super) fn panel_exchange<B: Serialize + ?Sized>(
         &self,
         method: Method,
         route: &[&str],
@@ -343,6 +360,7 @@ impl ApiClient {
             request = request.json(body);
         }
         let response = request.send().map_err(|_| ApiError::Transport)?;
+        note_rate_limit(&response);
         let status = response.status();
         let mut bytes = Zeroizing::new(Vec::new());
         response
@@ -367,7 +385,7 @@ impl ApiClient {
         Ok(bytes)
     }
 
-    fn panel_json<T: DeserializeOwned, B: Serialize + ?Sized>(
+    pub(super) fn panel_json<T: DeserializeOwned, B: Serialize + ?Sized>(
         &self,
         method: Method,
         route: &[&str],
@@ -451,6 +469,7 @@ impl ApiClient {
             .bearer_auth(self.token.expose_secret())
             .send()
             .map_err(|_| ApiError::Transport)?;
+        note_rate_limit(&response);
         let status = response.status();
         if !status.is_success() {
             return Err(ApiError::Http(status.as_u16()));
@@ -527,6 +546,54 @@ impl ApiClient {
         )?;
         check_consent_url(&ack.url)?;
         Ok(ack.url)
+    }
+
+    /// `POST /v1/connectors/{id}/start`: the provider's consent page for the
+    /// acting user (Outlook, Google, Notion sign-in). Only an `https` address
+    /// is accepted back. A conflict means the provider is not set up yet.
+    pub fn connector_consent_start(&self, id: &str) -> Result<String, ApiError> {
+        if !valid_personal_id(id) {
+            return Err(ApiError::Validation("Connector id is not valid."));
+        }
+        let ack: OneDriveStartAck =
+            self.panel_json::<_, ()>(Method::POST, &["v1", "connectors", id, "start"], None)?;
+        check_consent_url(&ack.url)?;
+        Ok(ack.url)
+    }
+
+    /// `PUT /v1/connectors/{id}/token`: connect with a pasted token (Notion).
+    /// The token is sent once, sealed on the server, and never read back.
+    pub fn connector_set_token(&self, id: &str, token: &str) -> Result<(), ApiError> {
+        if !valid_personal_id(id) {
+            return Err(ApiError::Validation("Connector id is not valid."));
+        }
+        if token.is_empty() || token.len() > 512 || !token.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(ApiError::Validation("That does not look like a token."));
+        }
+        let ack: ConnectorAck = self.panel_json(
+            Method::PUT,
+            &["v1", "connectors", id, "token"],
+            Some(&ConnectorTokenBody { token }),
+        )?;
+        if ack.connected {
+            Ok(())
+        } else {
+            Err(ApiError::InvalidResponse)
+        }
+    }
+
+    /// `DELETE /v1/connectors/{id}`: forget the acting user's connection.
+    pub fn connector_disconnect(&self, id: &str) -> Result<(), ApiError> {
+        if !valid_personal_id(id) {
+            return Err(ApiError::Validation("Connector id is not valid."));
+        }
+        let ack: ConnectorAck =
+            self.panel_json::<_, ()>(Method::DELETE, &["v1", "connectors", id], None)?;
+        if ack.connected {
+            Err(ApiError::InvalidResponse)
+        } else {
+            Ok(())
+        }
     }
 
     /// `DELETE /v1/connectors/onedrive`: forget the acting user's OneDrive.

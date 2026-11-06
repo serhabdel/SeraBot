@@ -59,6 +59,8 @@ const MIGRATION_12: &str = include_str!("../migrations/0012_user_telegram.sql");
 const MIGRATION_13: &str = include_str!("../migrations/0013_conversation_artifacts.sql");
 const MIGRATION_14: &str = include_str!("../migrations/0014_auth_handoffs.sql");
 const MIGRATION_15: &str = include_str!("../migrations/0015_vault.sql");
+const MIGRATION_17: &str = include_str!("../migrations/0017_bot_profiles_onboarding.sql");
+const MIGRATION_18: &str = include_str!("../migrations/0018_conversation_origin.sql");
 
 /// Fixed admin id written by migration 0008 and mirrored in
 /// `kv['admin_user_id']`. Code resolves the admin through the kv entry (the
@@ -508,6 +510,17 @@ impl Store {
         if version < 15 {
             connection.execute_batch(MIGRATION_15)?;
             connection.pragma_update(None, "user_version", 15)?;
+        }
+        // 0016 belongs to a parallel branch; the numbers only need to rise.
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 17 {
+            connection.execute_batch(MIGRATION_17)?;
+            connection.pragma_update(None, "user_version", 17)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 18 {
+            connection.execute_batch(MIGRATION_18)?;
+            connection.pragma_update(None, "user_version", 18)?;
         }
         let stored_dimension: Option<String> = connection
             .query_row(
@@ -2073,6 +2086,36 @@ impl Store {
              VALUES (?1, ?2, NULL, ?3, ?4, ?4)
              ON CONFLICT(id) DO NOTHING",
             params![id, conversation_kind_str(scope.kind), user_id, now_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Origin channel (`app` or `telegram`) of the acting user's conversation,
+    /// `None` when the user has no such conversation (system and scheduled
+    /// ids such as `owner` or `system` are not conversation rows).
+    pub fn conversation_origin(&self, user_id: &str, id: &str) -> Result<Option<String>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT origin_channel FROM conversations WHERE id = ?1 AND user_id = ?2",
+                params![id, user_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Record the channel a conversation was started from. Creates the
+    /// conversation lazily (same rules as turns) and only ever changes the
+    /// acting user's own row.
+    pub fn set_conversation_origin(&self, user_id: &str, id: &str, origin: &str) -> Result<()> {
+        if !matches!(origin, "app" | "telegram") {
+            return Err(SeraError::Validation("unknown conversation origin".into()));
+        }
+        self.ensure_conversation_accepts_turns(user_id, id)?;
+        let connection = self.connection()?;
+        connection.execute(
+            "UPDATE conversations SET origin_channel = ?3 WHERE id = ?1 AND user_id = ?2",
+            params![id, user_id, origin],
         )?;
         Ok(())
     }
@@ -4485,7 +4528,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 18);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -4550,7 +4593,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 18);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -4619,7 +4662,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 18);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -4750,7 +4793,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 18);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -4905,7 +4948,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 18);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.
@@ -6392,5 +6435,44 @@ mod tests {
         assert_eq!(store.pending_task_count(&admin_id).unwrap(), 1);
         assert_eq!(store.pending_task_count(&member.id).unwrap(), 2);
         assert_eq!(store.pending_task_count_all().unwrap(), 3);
+    }
+
+    #[test]
+    fn conversation_origin_defaults_to_app_and_migration_backfills_telegram_chats() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        store.link_telegram(&admin, 10, 20).unwrap();
+        store
+            .ensure_conversation_accepts_turns(&admin, "20")
+            .unwrap();
+        store
+            .ensure_conversation_accepts_turns(&admin, "other")
+            .unwrap();
+        assert_eq!(
+            store.conversation_origin(&admin, "20").unwrap().as_deref(),
+            Some("app")
+        );
+        // Re-run the migration's backfill statement against pre-existing rows.
+        let backfill = MIGRATION_18
+            .split_once("UPDATE conversations")
+            .map(|(_, rest)| format!("UPDATE conversations{rest}"))
+            .unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute_batch(&backfill)
+            .unwrap();
+        assert_eq!(
+            store.conversation_origin(&admin, "20").unwrap().as_deref(),
+            Some("telegram")
+        );
+        assert_eq!(
+            store
+                .conversation_origin(&admin, "other")
+                .unwrap()
+                .as_deref(),
+            Some("app")
+        );
+        assert!(store.set_conversation_origin(&admin, "other", "x").is_err());
     }
 }

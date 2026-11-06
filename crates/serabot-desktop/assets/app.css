@@ -4320,3 +4320,221 @@ html[data-reduce-transparency="true"] .chat-header {
   white-space: nowrap;
 }
 
+
+/* ------------------------------------------------- bots and groups (0.15) -- */
+
+/* A tile whose bot or group has a picture: the image replaces the letter. The
+   picture itself is a custom property defined once in a single stylesheet. */
+.avatar[style*="--avatar-img"] {
+  background-image: var(--avatar-img);
+  background-size: cover;
+  background-position: center;
+  color: transparent;
+  font-size: 0;
+}
+
+.avatar.xl {
+  width: 64px;
+  height: 64px;
+  font-size: var(--fs-display);
+  border-radius: var(--r-md);
+  overflow: hidden;
+}
+
+.avatar-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.avatar-pick {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.avatar-pick-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.file-btn {
+  position: relative;
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.file-input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+  width: 100%;
+}
+
+.sheet.wide {
+  width: min(560px, calc(100vw - 48px));
+  max-height: min(84vh, 760px);
+}
+
+.check-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 200px;
+  overflow-y: auto;
+  padding: 3px;
+  margin: -3px;
+}
+
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  cursor: pointer;
+  transition: background var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease),
+    transform var(--dur-press) var(--ease);
+}
+
+.check-row:hover {
+  background: var(--surface-2);
+}
+
+.check-row:active {
+  transform: scale(var(--press-scale));
+}
+
+.check-row.on {
+  border-color: var(--accent);
+  box-shadow: var(--ring);
+}
+
+.check-row input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 16px;
+  height: 16px;
+  flex: none;
+}
+
+.check-row .thread-title {
+  flex: 1;
+  min-width: 0;
+}
+
+.cap-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.cap-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--hairline);
+  cursor: pointer;
+}
+
+.cap-row:last-child {
+  border-bottom: 0;
+}
+
+.cap-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.cap-label {
+  font-size: var(--fs-body);
+  color: var(--label-1);
+}
+
+.cap-hint {
+  font-size: var(--fs-caption);
+  color: var(--label-3);
+}
+
+/* A switch is a checkbox drawn as a pill. */
+.switch {
+  appearance: none;
+  -webkit-appearance: none;
+  position: relative;
+  flex: none;
+  width: 38px;
+  height: 22px;
+  margin: 0;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--hairline-strong);
+  background: var(--surface-2);
+  cursor: pointer;
+  transition: background var(--dur-2) var(--ease), border-color var(--dur-2) var(--ease);
+}
+
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: var(--r-pill);
+  background: var(--label-2);
+  transition: transform var(--dur-2) var(--spring), background var(--dur-2) var(--ease);
+}
+
+.switch:checked {
+  background: var(--accent);
+  border-color: transparent;
+}
+
+.switch:checked::after {
+  background: var(--on-accent);
+  transform: translateX(16px);
+}
+
+.switch:active::after {
+  width: 20px;
+}
+
+.switch:checked:active::after {
+  transform: translateX(12px);
+}
+
+.switch:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+}
+
+.approval-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 10px 0 4px;
+  font-size: var(--fs-caption);
+  color: var(--label-3);
+}
+
+.onboard-confirm {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 0 4px 40px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .switch,
+  .switch::after,
+  .check-row {
+    transition: none;
+  }
+}

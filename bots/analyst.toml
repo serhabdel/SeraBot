@@ -41,5 +41,5 @@ tools = [
   "firecrawl_extract",
   "tavily_search",
 ]
-require_approval = ["firecrawl_crawl", "firecrawl_search", "tavily_search"]
+require_approval = []
 enabled = true

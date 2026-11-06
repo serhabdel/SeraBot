@@ -12,9 +12,53 @@ use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
 mod panel;
+mod profiles;
 pub use panel::*;
+pub use profiles::*;
 
 const MAX_RESPONSE: u64 = 2 * 1024 * 1024;
+
+/// Seconds from the most recent `Retry-After` header on a 429 (0 = none seen).
+static LAST_RETRY_AFTER_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Remember the server's `Retry-After` when `response` is a 429.
+pub(crate) fn note_rate_limit(response: &reqwest::blocking::Response) {
+    if response.status().as_u16() != 429 {
+        return;
+    }
+    let secs = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    LAST_RETRY_AFTER_SECS.store(secs.min(300), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The `Retry-After` seconds from the latest 429, at least 1.
+pub fn last_retry_after_secs() -> u64 {
+    LAST_RETRY_AFTER_SECS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1)
+}
+
+/// Exponential backoff for background polls after a 429: the larger of the
+/// server's `Retry-After` and `2^attempt` seconds (cap 120 s), plus up to 25%
+/// jitter from `jitter_seed`.
+pub fn poll_backoff(retry_after_secs: u64, attempt: u32, jitter_seed: u64) -> Duration {
+    let exponential = 1u64 << attempt.clamp(1, 7);
+    let base = retry_after_secs.max(exponential).min(120);
+    let jitter_ms = (jitter_seed % 1000) * base * 250 / 1000;
+    Duration::from_millis(base * 1000 + jitter_ms)
+}
+
+/// A cheap jitter seed (sub-second clock noise); not security relevant.
+pub fn jitter_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApiError {
@@ -52,9 +96,11 @@ impl fmt::Display for ApiError {
             Self::Http(422) => {
                 f.write_str("Rejected (422). The server did not accept the request.")
             }
-            Self::Http(429) => {
-                f.write_str("Rate limited (429). Wait at least one minute, then retry the read.")
-            }
+            Self::Http(429) => write!(
+                f,
+                "Too many requests right now. Trying again in {} seconds.",
+                last_retry_after_secs()
+            ),
             Self::Http(300..=399) => f.write_str(
                 "Server redirected the request. Redirects are disabled; check the server URL.",
             ),
@@ -679,6 +725,9 @@ pub struct BotSummary {
     pub description: Option<String>,
     #[serde(default)]
     pub avatar: Option<String>,
+    /// Version stamp of the uploaded image, when the bot has one.
+    #[serde(default)]
+    pub avatar_version: Option<String>,
     pub tools: Vec<String>,
     pub skills: Vec<String>,
     #[serde(default)]
@@ -796,6 +845,9 @@ pub struct ConversationSummary {
     /// Newest user or assistant message, as a plain-text preview.
     #[serde(default)]
     pub last_message: Option<LastMessage>,
+    /// Version stamp of the group image, when it has one.
+    #[serde(default)]
+    pub avatar_version: Option<String>,
 }
 
 /// List preview of the newest message (`role`: user or assistant, `text`:
@@ -874,7 +926,7 @@ pub struct ProviderStatus {
 }
 
 /// Read-only connector view from `GET /v1/connectors`.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct ConnectorStatus {
     pub id: String,
     pub kind: String,
@@ -900,6 +952,33 @@ pub struct ConnectorStatus {
     /// their own account. `None` for server-wide connectors.
     #[serde(default)]
     pub connected: Option<bool>,
+    /// Per-user products (Outlook, Google, Notion): this account's own state.
+    #[serde(default)]
+    pub personal: Option<PersonalStatus>,
+}
+
+/// One account's state for a per-user connector (`personal` in the list).
+///
+/// `state` is `not_set_up` (an admin has to configure the provider),
+/// `ready` (this account can connect) or `connected`. Links and help text
+/// are fixed in the console, never taken from the server.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct PersonalStatus {
+    pub state: String,
+    #[serde(default)]
+    pub account: Option<String>,
+    /// Short admin-facing note, shown when `state` is `not_set_up`.
+    #[serde(default)]
+    pub hint: Option<String>,
+    /// How this account can connect: `oauth` and/or `token`.
+    #[serde(default)]
+    pub methods: Vec<String>,
+    /// The redirect address an admin registers with the provider.
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
+    /// `google` when an admin can set the provider up from the console.
+    #[serde(default)]
+    pub admin_setup: Option<String>,
 }
 
 /// OAuth sign-in metadata for a connector (ElevenLabs CIMD flow).
@@ -1602,6 +1681,7 @@ impl ApiClient {
             request = request.json(body);
         }
         let response = request.send().map_err(|_| ApiError::Transport)?;
+        note_rate_limit(&response);
         let status = response.status();
         if !status.is_success() {
             return Err(ApiError::Http(status.as_u16()));
@@ -2354,6 +2434,28 @@ impl ApiClient {
                     .as_deref()
                     .is_some_and(|inbox| !bounded_text(inbox, 256))
                 || !valid_secret_map(&connector.secrets)
+                || connector.personal.as_ref().is_some_and(|personal| {
+                    !matches!(
+                        personal.state.as_str(),
+                        "not_set_up" | "ready" | "connected"
+                    ) || personal
+                        .account
+                        .as_deref()
+                        .is_some_and(|account| !bounded_text(account, 256))
+                        || personal
+                            .hint
+                            .as_deref()
+                            .is_some_and(|hint| !bounded_text(hint, 512))
+                        || personal
+                            .redirect_uri
+                            .as_deref()
+                            .is_some_and(|uri| !bounded_text(uri, 2_048))
+                        || personal.methods.len() > 4
+                        || personal
+                            .methods
+                            .iter()
+                            .any(|method| !matches!(method.as_str(), "oauth" | "token"))
+                })
             {
                 return Err(ApiError::InvalidResponse);
             }
@@ -2883,6 +2985,7 @@ impl PublicApiClient {
             request = request.json(body);
         }
         let response = request.send().map_err(|_| ApiError::Transport)?;
+        note_rate_limit(&response);
         let status = response.status();
         if !status.is_success() {
             return Err(ApiError::Http(status.as_u16()));
@@ -3435,6 +3538,7 @@ mod tests {
             unread_count: 0,
             accepts_turns,
             last_message: None,
+            avatar_version: None,
         }
     }
 

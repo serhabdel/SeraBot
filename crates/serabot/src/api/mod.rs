@@ -41,6 +41,7 @@ use crate::onedrive::{
 use crate::orchestration::{
     BotRole, ConversationKind, safe_bot_label, scoped_conversation_id, validate_conversation_id,
 };
+use crate::personal::PersonalConnectors;
 use crate::runtime::{ApprovalNotice, Notifier, Runtime};
 use crate::secrets::SharedSecrets;
 use crate::skills::create_user_skill;
@@ -57,6 +58,7 @@ mod connectors;
 mod conversations;
 mod memories;
 mod messages;
+mod profiles;
 mod skills;
 mod status;
 #[cfg(test)]
@@ -134,12 +136,16 @@ pub struct ApiState {
     onedrive: Option<Arc<OneDriveRegistry>>,
     /// OneDrive consent (auth code + PKCE); `None` while `[onedrive]` is off.
     onedrive_consent: Option<Arc<OneDriveConsent>>,
+    /// Per-user Outlook, Google, and Notion connections.
+    personal: Arc<PersonalConnectors>,
     token_hash: String,
     /// Per-user request buckets for the per-minute limit. Keyed by the
     /// acting user id (never a token); public sign-in routes without an
     /// authenticated user share one `anonymous` bucket.
     rate: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
     rate_limit: usize,
+    user_rate_limit: usize,
+    poll_rate_limit: usize,
     admin: Option<AdminStore>,
     /// The OIDC sign-in service; `None` while `[auth] enabled = false`, so
     /// every sign-in endpoint fails closed.
@@ -148,6 +154,9 @@ pub struct ApiState {
     oauth_inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Per-user server browser; None while [browser] is off.
     browser: Option<Arc<crate::browser::BrowserManager>>,
+    /// Model call behind the onboarding interview; None uses the runtime.
+    /// Tests script it so no request leaves the process.
+    onboarding_drafter: Option<Arc<dyn crate::onboarding::Drafter>>,
 }
 
 impl ApiState {
@@ -173,6 +182,7 @@ impl ApiState {
         };
         let onedrive_consent =
             OneDriveConsent::new(&config, &secrets, users.clone())?.map(Arc::new);
+        let personal = Arc::new(PersonalConnectors::new(&config, &secrets, users.clone())?);
         Ok(Self {
             runtime,
             store,
@@ -181,15 +191,35 @@ impl ApiState {
             users,
             onedrive,
             onedrive_consent,
+            personal,
             token_hash: config.api.token_hash.to_ascii_lowercase(),
             rate: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: config.server.rate_limit_per_minute.max(1) as usize,
+            user_rate_limit: config.server.user_rate_limit_per_minute.max(1) as usize,
+            poll_rate_limit: config.server.poll_rate_limit_per_minute.max(1) as usize,
             admin: AdminStore::open(&config).ok(),
             auth,
             oauth_inflight: Arc::default(),
             browser: None,
+            onboarding_drafter: None,
             config,
         })
+    }
+
+    /// Share the per-user connector service the tools already use, so a
+    /// disconnect also drops the tools' cached access tokens.
+    pub fn with_personal(mut self, personal: Arc<PersonalConnectors>) -> Self {
+        self.personal = personal;
+        self
+    }
+
+    /// Replace the model call used by the onboarding interview.
+    pub fn with_onboarding_drafter(
+        mut self,
+        drafter: Option<Arc<dyn crate::onboarding::Drafter>>,
+    ) -> Self {
+        self.onboarding_drafter = drafter;
+        self
     }
 
     /// Attach the per-user browser manager (owner live-view routes).
@@ -243,6 +273,9 @@ pub fn router(state: ApiState) -> Router {
             delete(revoke_grant_endpoint),
         )
         .route("/v1/connectors/onedrive", delete(disconnect_onedrive))
+        .route("/v1/connectors/{id}", delete(disconnect_personal))
+        .route("/v1/connectors/{id}/start", post(start_personal_consent))
+        .route("/v1/connectors/{id}/token", put(set_personal_token))
         .route(
             "/v1/connectors/onedrive/start",
             post(start_onedrive_consent),
@@ -337,6 +370,14 @@ pub fn router(state: ApiState) -> Router {
         // Microsoft: no session exists, and the `state` value binds it to the
         // user exactly like the sign-in callback.
         .route(CONSENT_CALLBACK_PATH, get(onedrive_callback))
+        .route(
+            crate::personal::GOOGLE_CALLBACK_PATH,
+            get(personal_callback),
+        )
+        .route(
+            crate::personal::NOTION_CALLBACK_PATH,
+            get(personal_callback),
+        )
         .layer(RequestBodyLimitLayer::new(
             shared.config.server.body_limit_bytes,
         ))
@@ -345,6 +386,7 @@ pub fn router(state: ApiState) -> Router {
     // user; an unknown token is rejected before it can create a bucket.
     let protected = protected
         .merge(audio)
+        .merge(profiles::routes())
         .layer(middleware::from_fn_with_state(shared.clone(), rate_limit))
         .layer(middleware::from_fn_with_state(shared.clone(), authorize));
     crate::web::router()
@@ -538,11 +580,17 @@ fn unauthorized() -> Response {
 /// anonymous bucket. Buckets are pruned on every request, so idle sessions do
 /// not accumulate.
 async fn rate_limit(State(state): State<Arc<ApiState>>, request: Request, next: Next) -> Response {
-    let key = request
+    let user = request
         .extensions()
         .get::<ActingUser>()
-        .map(|user| user.id.clone())
-        .unwrap_or_else(|| "anonymous".to_owned());
+        .map(|u| u.id.clone());
+    let (key, limit) = match user {
+        Some(id) if is_poll_request(request.method(), request.uri().path()) => {
+            (format!("poll:{id}"), state.poll_rate_limit)
+        }
+        Some(id) => (id, state.user_rate_limit),
+        None => ("anonymous".to_owned(), state.rate_limit),
+    };
     {
         let mut buckets = state.rate.lock().await;
         let now = Instant::now();
@@ -557,10 +605,19 @@ async fn rate_limit(State(state): State<Arc<ApiState>>, request: Request, next: 
             !entries.is_empty()
         });
         let entries = buckets.entry(key).or_default();
-        if entries.len() >= state.rate_limit {
+        if entries.len() >= limit {
+            let retry = entries
+                .front()
+                .map(|oldest| {
+                    window
+                        .saturating_sub(now.duration_since(*oldest))
+                        .as_secs()
+                        .clamp(1, 60)
+                })
+                .unwrap_or(60);
             return (
                 StatusCode::TOO_MANY_REQUESTS,
-                [("retry-after", "60")],
+                [("retry-after", retry.to_string())],
                 Json(json!({"error": "rate limit exceeded"})),
             )
                 .into_response();
@@ -568,6 +625,21 @@ async fn rate_limit(State(state): State<Arc<ApiState>>, request: Request, next: 
         entries.push_back(now);
     }
     next.run(request).await
+}
+
+/// Cheap idempotent polling reads the desktop repeats every few seconds.
+/// They get their own bucket so polling can never starve real actions.
+fn is_poll_request(method: &axum::http::Method, path: &str) -> bool {
+    if method != axum::http::Method::GET {
+        return false;
+    }
+    matches!(
+        path,
+        "/v1/health" | "/v1/browser" | "/v1/browser/screenshot" | "/v1/events" | "/v1/approvals"
+    ) || path
+        .strip_prefix("/v1/conversations/")
+        .is_some_and(|rest| rest.ends_with("/messages") && rest.matches('/').count() == 1)
+        || path.starts_with("/v1/tasks/")
 }
 
 #[derive(Debug, Serialize)]

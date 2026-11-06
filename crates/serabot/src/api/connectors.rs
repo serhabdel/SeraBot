@@ -1,4 +1,5 @@
 use super::*;
+use crate::connectors::ConnectorKind;
 
 pub(super) async fn list_providers(
     State(state): State<Arc<ApiState>>,
@@ -145,6 +146,17 @@ pub(super) async fn list_connectors(
         .into_iter()
         .map(|(id, connector)| oauth_connector_view(&state, id, connector))
         .collect::<Vec<_>>();
+    // Per-user products report this account's own state; "not set up" carries
+    // an admin hint instead of a sign-in action.
+    for view in &mut views {
+        let Some(kind) = view["id"].as_str().and_then(ConnectorKind::from_section) else {
+            continue;
+        };
+        if let Some(personal) = state.personal.view(&user.id, kind)? {
+            view["connected"] = json!(personal.state == "connected");
+            view["personal"] = personal.to_json();
+        }
+    }
     let agentmail = &connectors.agentmail;
     let api_base = agentmail.api_base.trim();
     let inbox_id = agentmail.default_inbox_id.trim();
@@ -451,6 +463,11 @@ pub(super) async fn onedrive_callback(
     State(state): State<Arc<ApiState>>,
     Query(params): Query<ConsentCallbackParams>,
 ) -> Response {
+    // Outlook consents share OneDrive's registered redirect; the state value
+    // says which flow started the round trip.
+    if state.personal.owns_state(&params.state).await {
+        return personal_callback_inner(&state, params).await;
+    }
     let Some(consent) = state.onedrive_consent.as_ref() else {
         return auth_error_page(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -518,6 +535,141 @@ pub(super) async fn disconnect_onedrive(
         "connected": false,
         "was_connected": deleted,
     })))
+}
+
+/// The per-user connectors a console id can name.
+fn personal_kind(id: &str) -> Result<ConnectorKind> {
+    ConnectorKind::from_section(id).ok_or_else(|| SeraError::NotFound(format!("connector {id}")))
+}
+
+/// Start a per-user consent (Outlook, Google, Notion OAuth). While the
+/// provider is not set up the answer is a typed `not_set_up` conflict that
+/// carries the admin hint; no provider page is ever opened for it.
+pub(super) async fn start_personal_consent(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Response> {
+    let kind = personal_kind(&id)?;
+    if let Err(hint) = state.personal.consent_ready(kind) {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({"error": "not set up yet", "code": "not_set_up", "hint": hint})),
+        )
+            .into_response());
+    }
+    let url = state.personal.start(&user.id, kind).await?;
+    audit_auth(
+        &state,
+        &user.id,
+        "connector.consent_started",
+        json!({"connector": id}),
+    )?;
+    Ok(Json(json!({"url": url})).into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PersonalTokenRequest {
+    token: String,
+}
+
+/// Connect Notion with a pasted internal integration token (write-only: the
+/// token is verified, sealed for this user, and never returned).
+pub(super) async fn set_personal_token(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+    Json(request): Json<PersonalTokenRequest>,
+) -> Result<Json<Value>> {
+    if personal_kind(&id)? != ConnectorKind::Notion {
+        return Err(SeraError::NotFound(format!("connector {id}")));
+    }
+    let account = state
+        .personal
+        .connect_notion_token(&user.id, &request.token)
+        .await?;
+    audit_auth(
+        &state,
+        &user.id,
+        "connector.token_connected",
+        json!({"connector": id}),
+    )?;
+    Ok(Json(
+        json!({"id": id, "connected": true, "account": account}),
+    ))
+}
+
+/// Disconnect the acting user's own connection to one product.
+pub(super) async fn disconnect_personal(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    let kind = personal_kind(&id)?;
+    let was_connected = state.personal.disconnect(&user.id, kind).await?;
+    audit_auth(
+        &state,
+        &user.id,
+        "connector.disconnected",
+        json!({"connector": id, "was_connected": was_connected}),
+    )?;
+    Ok(Json(json!({
+        "id": id,
+        "connected": false,
+        "was_connected": was_connected,
+    })))
+}
+
+/// Google and Notion consent redirect (Outlook shares OneDrive's route).
+pub(super) async fn personal_callback(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<ConsentCallbackParams>,
+) -> Response {
+    personal_callback_inner(&state, params).await
+}
+
+async fn personal_callback_inner(state: &ApiState, params: ConsentCallbackParams) -> Response {
+    if params.error.is_some() {
+        // Drop the pending state so a declined consent cannot be replayed.
+        let _ = state.personal.take_state(&params.state).await;
+        return auth_error_page(
+            StatusCode::BAD_REQUEST,
+            "The connection was not approved. Nothing was connected.",
+        );
+    }
+    let Some(code) = params.code.as_deref() else {
+        return auth_error_page(
+            StatusCode::BAD_REQUEST,
+            "The response was incomplete. Start again from the console.",
+        );
+    };
+    match state.personal.complete(&params.state, code).await {
+        Ok((user_id, kind)) => {
+            if let Err(error) = audit_auth(
+                state,
+                &user_id,
+                "connector.connected",
+                json!({"connector": kind.section()}),
+            ) {
+                warn!(%error, "connector connect audit write failed");
+            }
+            html_response(
+                StatusCode::OK,
+                auth_page(
+                    "Connected",
+                    "<p class=\"lede\">Your account is connected. Your bots can use it after you approve each use.</p>\n<p class=\"meta\">You can close this page and return to the client.</p>",
+                ),
+            )
+        }
+        Err(error) => {
+            warn!(%error, "connector consent callback failed");
+            auth_error_page(
+                StatusCode::BAD_REQUEST,
+                "The account could not be connected. The link may have expired or been used; start again from the console.",
+            )
+        }
+    }
 }
 
 /// Telegram linking lifetime: long enough to switch apps, short enough that a

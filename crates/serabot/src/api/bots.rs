@@ -3,9 +3,20 @@ use super::*;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct CreateBotRequest {
-    id: String,
+    /// Explicit slug (older clients). New clients send `name` and the server
+    /// derives the id.
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     description: String,
+    /// Model id from the catalog; the provider follows from it.
+    #[serde(default)]
+    model: Option<String>,
+    /// Room the bot joins once the owner confirms its onboarding.
+    #[serde(default)]
+    group: Option<String>,
     #[serde(default)]
     tools: Option<Vec<String>>,
     #[serde(default)]
@@ -38,14 +49,42 @@ pub(super) async fn create_bot(
         .catalog()
         .effective(&state.store, &user.id)?
         .skill_ids();
-    let scaffolded = build_specialist_bot(
-        &request.id,
+    let bot_id = match (request.id.as_deref(), request.name.as_deref()) {
+        (Some(id), _) => id.to_owned(),
+        (None, Some(name)) => {
+            let name = name.trim();
+            if name.is_empty() || name.chars().count() > 60 {
+                return Err(SeraError::Validation(
+                    "the name must be 1 to 60 characters".into(),
+                ));
+            }
+            state.runtime.scan_owner_output(&user.id, name)?;
+            let base = super::profiles::slugify(name, 32, "bot");
+            super::profiles::unique_slug(&base, 32, |candidate| {
+                Ok(candidate == crate::orchestration::ORCHESTRATOR_BOT
+                    || fleet.row(&user.id, candidate)?.is_some())
+            })?
+        }
+        (None, None) => return Err(SeraError::Validation("a name is required".into())),
+    };
+    let mut scaffolded = build_specialist_bot(
+        &bot_id,
         &request.description,
         request.tools.as_deref(),
         request.skills.as_deref(),
         &known,
         state.runtime.policy(),
     )?;
+    if let Some(model) = request.model.as_deref().filter(|m| !m.is_empty()) {
+        state.runtime.scan_owner_output(&user.id, model)?;
+        if state.runtime.router().provider_for_model(model).is_none() {
+            return Err(SeraError::Validation("unknown model".into()));
+        }
+        scaffolded.config.model = Some(model.to_owned());
+    }
+    if let Some(group) = request.group.as_deref() {
+        team_conversation(&state, &user, group)?;
+    }
     if state
         .runtime
         .fleet()
@@ -62,6 +101,15 @@ pub(super) async fn create_bot(
         return Err(SeraError::InvalidState("bot already exists".into()));
     }
     state.runtime.fleet().invalidate(&user.id);
+    if let Err(error) = state.store.put_onboarding(
+        &user.id,
+        &scaffolded.id,
+        &super::profiles::new_interview_row(&scaffolded.id, request.group.clone())?,
+    ) {
+        let _ = state.store.delete_bot(&user.id, &scaffolded.id);
+        state.runtime.fleet().invalidate(&user.id);
+        return Err(error);
+    }
     if let Err(error) = state.store.record_audit(
         &user.id,
         "bot.scaffolded",
@@ -80,6 +128,9 @@ pub(super) async fn create_bot(
         })),
     ) {
         let _ = state.store.delete_bot(&user.id, &scaffolded.id);
+        let _ = state
+            .store
+            .delete_bot_profile_rows(&user.id, &scaffolded.id);
         state.runtime.fleet().invalidate(&user.id);
         return Err(error);
     }
@@ -103,6 +154,7 @@ pub(super) async fn list_bots(
     Extension(user): Extension<ActingUser>,
 ) -> Result<Json<Value>> {
     let configured = state.runtime.fleet().configured(&user.id)?;
+    let avatar_versions = state.store.bot_avatar_versions(&user.id)?;
     let bots = configured
         .into_iter()
         .map(|bot| {
@@ -133,6 +185,7 @@ pub(super) async fn list_bots(
                 "display_name": profile.as_ref().map(|p| p.display_name.clone()).filter(|name| !name.is_empty()),
                 "description": profile.as_ref().map(|p| p.description.clone()).filter(|text| !text.is_empty()),
                 "avatar": profile.as_ref().map(|p| p.avatar.clone()).filter(|avatar| !avatar.is_empty()),
+                "avatar_version": avatar_versions.get(&id),
                 "tools": tools,
                 "skills": skills,
                 "require_approval": require_approval,
@@ -292,15 +345,15 @@ pub(super) async fn bot_detail(
 #[serde(deny_unknown_fields)]
 pub(super) struct UpdateBotRequest {
     #[serde(default)]
-    enabled: Option<bool>,
+    pub(super) enabled: Option<bool>,
     #[serde(default)]
-    prompt: Option<String>,
+    pub(super) prompt: Option<String>,
     #[serde(default)]
-    tools: Option<Vec<String>>,
+    pub(super) tools: Option<Vec<String>>,
     #[serde(default)]
-    skills: Option<Vec<String>>,
+    pub(super) skills: Option<Vec<String>>,
     #[serde(default)]
-    require_approval: Option<Vec<String>>,
+    pub(super) require_approval: Option<Vec<String>>,
 }
 
 /// `PUT /v1/bots/{id}` — update the session user's bot row. Enable/disable and
@@ -466,6 +519,7 @@ pub(super) async fn delete_bot(
     if !state.store.delete_bot(&user.id, &id)? {
         return Err(SeraError::NotFound(format!("bot {id}")));
     }
+    state.store.delete_bot_profile_rows(&user.id, &id)?;
     state.runtime.fleet().invalidate(&user.id);
     state.store.record_audit(
         &user.id,

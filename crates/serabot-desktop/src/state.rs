@@ -1,8 +1,9 @@
 use crate::{
     ApiError, Approval, AuthUser, BotDetail, BotSummary, Catalog, ConnectorStatus,
-    ConnectorTestResult, ConversationSummary, CreatedBot, CreatedConversation, CreatedSkill,
-    LibraryEntry, MemoryEntry, Message, ProviderStatus, Scope, Selection, SkillSummary, Task, Team,
-    UsageReport,
+    ConnectorTestResult, ConversationSummary, CreatedBot, CreatedConversation, CreatedGroup,
+    CreatedSkill, LibraryEntry, MemoryEntry, Message, Onboarding, ProviderStatus, Scope, Selection,
+    SkillSummary, Task, Team, UsageReport,
+    avatars::AvatarImage,
     worker::{OperationKind, Reply},
 };
 use std::collections::BTreeMap;
@@ -67,6 +68,11 @@ pub struct State {
     pub created_bot: Option<CreatedBot>,
     pub created_conversation: Option<CreatedConversation>,
     pub created_skill: Option<CreatedSkill>,
+    pub created_group: Option<CreatedGroup>,
+    /// The bot onboarding interview, owner-scoped like the bot list.
+    pub onboarding: Option<Onboarding>,
+    /// Fetched avatars by `AvatarTarget::key`. Owner-scoped.
+    pub avatars: BTreeMap<String, AvatarImage>,
     pub listed_skills: Vec<SkillSummary>,
     pub skills_loaded: bool,
     pub listed_bots: Vec<BotSummary>,
@@ -133,6 +139,9 @@ impl Default for State {
             created_bot: None,
             created_conversation: None,
             created_skill: None,
+            created_group: None,
+            onboarding: None,
+            avatars: BTreeMap::new(),
             listed_skills: Vec::new(),
             skills_loaded: false,
             listed_bots: Vec::new(),
@@ -162,6 +171,9 @@ impl State {
         let created_bot = self.created_bot.clone();
         let created_conversation = self.created_conversation.clone();
         let created_skill = self.created_skill.clone();
+        let created_group = self.created_group.clone();
+        let onboarding = self.onboarding.clone();
+        let avatars = self.avatars.clone();
         let listed_skills = self.listed_skills.clone();
         let skills_loaded = self.skills_loaded;
         let listed_bots = self.listed_bots.clone();
@@ -198,6 +210,9 @@ impl State {
             created_bot,
             created_conversation,
             created_skill,
+            created_group,
+            onboarding,
+            avatars,
             listed_skills,
             skills_loaded,
             listed_bots,
@@ -223,6 +238,9 @@ impl State {
         self.created_bot = None;
         self.created_conversation = None;
         self.created_skill = None;
+        self.created_group = None;
+        self.onboarding = None;
+        self.avatars.clear();
         self.listed_skills.clear();
         self.skills_loaded = false;
         self.listed_bots.clear();
@@ -409,6 +427,18 @@ impl State {
                 self.voice = Some(settings);
             }
             Reply::AdminSaved | Reply::BotProfileSaved | Reply::AdminRestarted => {}
+            Reply::AvatarImage {
+                target,
+                version,
+                data_url,
+            } => {
+                self.avatars
+                    .insert(target.key(), AvatarImage { version, data_url });
+            }
+            // The session reacts to these (it owns the drafts they came from).
+            Reply::AvatarSaved(_) | Reply::ToolsSaved => {}
+            Reply::CreatedGroup(group) => self.created_group = Some(group),
+            Reply::Onboarding(onboarding) => self.onboarding = Some(onboarding),
         }
         true
     }
@@ -431,6 +461,9 @@ impl State {
                 | OperationKind::AddMemory
                 | OperationKind::TeamWrite
                 | OperationKind::BotConfigWrite
+                | OperationKind::CreateGroup
+                | OperationKind::OnboardingWrite
+                | OperationKind::ToolsWrite
         );
         if mutation && error.unknown_outcome() {
             self.unknown_outcome = true;
@@ -446,6 +479,9 @@ impl State {
                 OperationKind::AddMemory => "memory write",
                 OperationKind::TeamWrite => "team update",
                 OperationKind::BotConfigWrite => "bot config update",
+                OperationKind::CreateGroup => "group create",
+                OperationKind::OnboardingWrite => "interview step",
+                OperationKind::ToolsWrite => "capability change",
                 _ => "model change",
             };
             self.error = Some(format!(
@@ -662,6 +698,7 @@ mod tests {
             display_name: Some("Analyst".into()),
             description: None,
             avatar: Some("A".into()),
+            avatar_version: None,
             tools: vec!["skill_list".into()],
             skills: vec!["ask".into()],
             require_approval: Vec::new(),
@@ -696,6 +733,7 @@ mod tests {
             unread_count: 0,
             accepts_turns: matches!(kind, "direct" | "room"),
             last_message: None,
+            avatar_version: None,
         }
     }
 
@@ -843,6 +881,7 @@ mod tests {
                 auth_modes: Vec::new(),
                 oauth: None,
                 connected: None,
+                personal: None,
             }]),
         );
         assert!(state.providers_loaded);

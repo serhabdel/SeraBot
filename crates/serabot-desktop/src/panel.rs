@@ -12,9 +12,9 @@
 
 use crate::worker::Credentials;
 use crate::{
-    ApiClient, ApiError, BrowserController, BrowserInfo, BrowserInput, MAX_VAULT_DOMAINS,
-    MAX_VAULT_NOTE_CHARS, MAX_VAULT_USERNAME_CHARS, VaultEntry, VaultKind, VaultPut,
-    normalize_vault_domain, valid_vault_name, validate_vault_put,
+    ApiClient, ApiError, BrowserController, BrowserInfo, BrowserInput, ConnectorUpdate,
+    MAX_VAULT_DOMAINS, MAX_VAULT_NOTE_CHARS, MAX_VAULT_USERNAME_CHARS, VaultEntry, VaultKind,
+    VaultPut, normalize_vault_domain, valid_vault_name, validate_vault_put,
 };
 use std::{
     collections::VecDeque,
@@ -30,14 +30,21 @@ use zeroize::{Zeroize, Zeroizing};
 /// `GET /v1/browser` while the app has focus.
 pub const STATUS_EVERY: Duration = Duration::from_secs(2);
 /// Screenshots are polled at most twice a second, and only while visible.
+/// Status poll interval while the window is unfocused (screenshots stop).
+pub const UNFOCUSED_STATUS_EVERY: Duration = Duration::from_secs(30);
 pub const SHOT_EVERY: Duration = Duration::from_millis(500);
 const MAX_QUEUED_INPUTS: usize = 64;
 const MAX_INPUTS_IN_FLIGHT: usize = 4;
 
 pub enum PanelOp {
     VaultList,
-    VaultPut { name: String, input: VaultPut },
-    VaultDelete { name: String },
+    VaultPut {
+        name: String,
+        input: VaultPut,
+    },
+    VaultDelete {
+        name: String,
+    },
     Status,
     Shot,
     Takeover,
@@ -46,6 +53,19 @@ pub enum PanelOp {
     Input(BrowserInput),
     OneDriveStart,
     OneDriveDisconnect,
+    /// Open the consent page of a per-user connector.
+    ConnectorStart(String),
+    /// Connect with a pasted token (write-only).
+    ConnectorToken {
+        id: String,
+        token: Zeroizing<String>,
+    },
+    ConnectorDisconnect(String),
+    /// Admin: save the Google OAuth client (write-only).
+    GoogleSetup {
+        client_id: Zeroizing<String>,
+        client_secret: Zeroizing<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +81,10 @@ pub enum PanelKind {
     Input,
     OneDriveStart,
     OneDriveDisconnect,
+    ConnectorStart,
+    ConnectorToken,
+    ConnectorDisconnect,
+    GoogleSetup,
 }
 
 impl PanelOp {
@@ -77,6 +101,10 @@ impl PanelOp {
             Self::Input(_) => PanelKind::Input,
             Self::OneDriveStart => PanelKind::OneDriveStart,
             Self::OneDriveDisconnect => PanelKind::OneDriveDisconnect,
+            Self::ConnectorStart(_) => PanelKind::ConnectorStart,
+            Self::ConnectorToken { .. } => PanelKind::ConnectorToken,
+            Self::ConnectorDisconnect(_) => PanelKind::ConnectorDisconnect,
+            Self::GoogleSetup { .. } => PanelKind::GoogleSetup,
         }
     }
 }
@@ -92,6 +120,9 @@ pub enum PanelReply {
     Input(BrowserInfo),
     OneDriveUrl(String),
     OneDriveDisconnected,
+    ConnectorUrl(String),
+    ConnectorChanged,
+    GoogleSaved,
 }
 
 pub struct PanelDone {
@@ -208,6 +239,31 @@ fn execute(job: &PanelJob, cache: &mut Option<ApiClient>) -> Result<PanelReply, 
         PanelOp::OneDriveDisconnect => client
             .onedrive_disconnect()
             .map(|()| PanelReply::OneDriveDisconnected),
+        PanelOp::ConnectorStart(id) => client
+            .connector_consent_start(id)
+            .map(PanelReply::ConnectorUrl),
+        PanelOp::ConnectorToken { id, token } => client
+            .connector_set_token(id, token)
+            .map(|()| PanelReply::ConnectorChanged),
+        PanelOp::ConnectorDisconnect(id) => client
+            .connector_disconnect(id)
+            .map(|()| PanelReply::ConnectorChanged),
+        PanelOp::GoogleSetup {
+            client_id,
+            client_secret,
+        } => client
+            .admin_set_connector(
+                GOOGLE_SETUP_CONNECTOR,
+                &ConnectorUpdate {
+                    enabled: false,
+                    values: std::collections::BTreeMap::from([
+                        ("client_id".to_owned(), client_id.to_string()),
+                        ("client_secret".to_owned(), client_secret.to_string()),
+                    ]),
+                    auth: None,
+                },
+            )
+            .map(|_| PanelReply::GoogleSaved),
     }
 }
 
@@ -385,6 +441,56 @@ impl OneDriveFlow {
     }
 }
 
+/// The Google credentials are stored under the shared Google client secrets;
+/// any Google connector id addresses them.
+const GOOGLE_SETUP_CONNECTOR: &str = "google_drive";
+
+/// The per-user connector flows (Outlook, Google, Notion) and the admin
+/// Google setup behind the Connectors page. One request runs at a time.
+#[derive(Default)]
+pub struct ConnectorFlow {
+    /// The connector whose request is on its way.
+    pub busy: Option<String>,
+    /// The connector whose consent page was opened and is awaiting the user.
+    pub waiting: Option<String>,
+    /// Plain-words error per connector id.
+    pub errors: std::collections::BTreeMap<String, String>,
+    pub google_busy: bool,
+    pub google_error: Option<String>,
+    /// The Google credentials were saved.
+    pub google_saved: bool,
+    pending_url: Option<String>,
+    refresh_due: bool,
+}
+
+impl ConnectorFlow {
+    /// The consent address to open in the system browser, once.
+    pub fn take_url(&mut self) -> Option<String> {
+        self.pending_url.take()
+    }
+
+    /// True once after a change the connector list should be re-read for.
+    pub fn take_refresh(&mut self) -> bool {
+        std::mem::take(&mut self.refresh_due)
+    }
+
+    pub fn busy_with(&self, id: &str) -> bool {
+        self.busy.as_deref() == Some(id)
+    }
+}
+
+/// What went wrong, in everyday words.
+fn connector_error_text(error: &ApiError) -> String {
+    match error {
+        ApiError::Http(409) => {
+            "Not set up yet. Ask your admin to finish the setup, then try again.".into()
+        }
+        ApiError::Http(422) => "That was not accepted. Check it and try again.".into(),
+        ApiError::Http(403) => "You are not allowed to do that.".into(),
+        other => other.to_string(),
+    }
+}
+
 // --------------------------------------------------------------- browser --
 
 pub struct PanelState {
@@ -403,6 +509,10 @@ pub struct PanelState {
     hidden: bool,
     status_inflight: bool,
     shot_inflight: bool,
+    /// Consecutive 429s on background polls; resets on any success.
+    rate_attempts: u32,
+    /// No background poll is sent before this instant (429 backoff).
+    poll_hold_until: Instant,
     next_status: Instant,
     next_shot: Instant,
     queue: VecDeque<PanelOp>,
@@ -410,6 +520,7 @@ pub struct PanelState {
     pub control_busy: bool,
     pub vault: VaultView,
     pub onedrive: OneDriveFlow,
+    pub connectors: ConnectorFlow,
 }
 
 impl PanelState {
@@ -425,6 +536,8 @@ impl PanelState {
             hidden: false,
             status_inflight: false,
             shot_inflight: false,
+            rate_attempts: 0,
+            poll_hold_until: now,
             next_status: now,
             next_shot: now,
             queue: VecDeque::new(),
@@ -432,6 +545,7 @@ impl PanelState {
             control_busy: false,
             vault: VaultView::default(),
             onedrive: OneDriveFlow::default(),
+            connectors: ConnectorFlow::default(),
         }
     }
 
@@ -543,6 +657,71 @@ impl PanelState {
         self.queue.push_back(PanelOp::OneDriveDisconnect);
     }
 
+    /// Open the consent page of a per-user connector (Outlook, Google, Notion).
+    pub fn connect_connector(&mut self, id: &str) {
+        if self.connectors.busy.is_some() {
+            return;
+        }
+        self.connectors.busy = Some(id.to_owned());
+        self.connectors.errors.remove(id);
+        self.queue.push_back(PanelOp::ConnectorStart(id.to_owned()));
+    }
+
+    /// Connect with a pasted token (Notion). The value is wiped after sending.
+    pub fn connect_connector_token(&mut self, id: &str, token: &str) {
+        let token = token.trim();
+        if self.connectors.busy.is_some() {
+            return;
+        }
+        if token.is_empty() {
+            self.connectors
+                .errors
+                .insert(id.to_owned(), "Paste the token first.".into());
+            return;
+        }
+        self.connectors.busy = Some(id.to_owned());
+        self.connectors.errors.remove(id);
+        self.queue.push_back(PanelOp::ConnectorToken {
+            id: id.to_owned(),
+            token: Zeroizing::new(token.to_owned()),
+        });
+    }
+
+    /// Forget the acting user's connection to one product.
+    pub fn disconnect_connector(&mut self, id: &str) {
+        if self.connectors.busy.is_some() {
+            return;
+        }
+        self.connectors.busy = Some(id.to_owned());
+        self.connectors.errors.remove(id);
+        self.queue
+            .push_back(PanelOp::ConnectorDisconnect(id.to_owned()));
+    }
+
+    pub fn clear_connector_error(&mut self, id: &str) {
+        self.connectors.errors.remove(id);
+    }
+
+    /// Admin: save the Google OAuth client id and secret.
+    pub fn save_google_setup(&mut self, client_id: &str, client_secret: &str) {
+        let (client_id, client_secret) = (client_id.trim(), client_secret.trim());
+        if self.connectors.google_busy {
+            return;
+        }
+        self.connectors.google_saved = false;
+        if !crate::valid_credential(client_id) || !crate::valid_credential(client_secret) {
+            self.connectors.google_error =
+                Some("Paste both the client ID and the client secret.".into());
+            return;
+        }
+        self.connectors.google_error = None;
+        self.connectors.google_busy = true;
+        self.queue.push_back(PanelOp::GoogleSetup {
+            client_id: Zeroizing::new(client_id.to_owned()),
+            client_secret: Zeroizing::new(client_secret.to_owned()),
+        });
+    }
+
     pub fn ask_vault_list(&mut self) {
         self.vault.want_list = true;
         self.vault.loading = true;
@@ -617,15 +796,20 @@ impl PanelState {
                 return Some(op);
             }
         }
-        if !self.focused {
+        if now < self.poll_hold_until {
             return None;
         }
         if !self.status_inflight && now >= self.next_status {
             self.status_inflight = true;
-            self.next_status = now + STATUS_EVERY;
+            self.next_status = now
+                + if self.focused {
+                    STATUS_EVERY
+                } else {
+                    UNFOCUSED_STATUS_EVERY
+                };
             return Some(PanelOp::Status);
         }
-        if self.open() && !self.shot_inflight && now >= self.next_shot {
+        if self.focused && self.open() && !self.shot_inflight && now >= self.next_shot {
             self.shot_inflight = true;
             self.next_shot = now + SHOT_EVERY;
             return Some(PanelOp::Shot);
@@ -648,10 +832,16 @@ impl PanelState {
             }
             PanelKind::Takeover | PanelKind::Handback => self.control_busy = false,
             PanelKind::OneDriveStart | PanelKind::OneDriveDisconnect => self.onedrive.busy = false,
+            PanelKind::GoogleSetup => self.connectors.google_busy = false,
             _ => {}
         }
         match done.result {
-            Ok(reply) => self.apply_reply(reply, now),
+            Ok(reply) => {
+                if matches!(done.kind, PanelKind::Status | PanelKind::Shot) {
+                    self.rate_attempts = 0;
+                }
+                self.apply_reply(reply, now)
+            }
             Err(error) => self.apply_error(done.kind, error, now),
         }
         unauthorized
@@ -696,6 +886,20 @@ impl PanelState {
                 self.onedrive.waiting = false;
                 self.onedrive.refresh_due = true;
             }
+            PanelReply::ConnectorUrl(url) => {
+                self.connectors.pending_url = Some(url);
+                self.connectors.waiting = self.connectors.busy.take();
+            }
+            PanelReply::ConnectorChanged => {
+                self.connectors.busy = None;
+                self.connectors.waiting = None;
+                self.connectors.refresh_due = true;
+            }
+            PanelReply::GoogleSaved => {
+                self.connectors.google_saved = true;
+                self.connectors.google_error = None;
+                self.connectors.refresh_due = true;
+            }
             PanelReply::VaultList(entries) => {
                 self.vault.entries = entries;
                 self.vault.loaded = true;
@@ -724,6 +928,17 @@ impl PanelState {
     }
 
     fn apply_error(&mut self, kind: PanelKind, error: ApiError, now: Instant) {
+        if error == ApiError::Http(429) && matches!(kind, PanelKind::Status | PanelKind::Shot) {
+            // A rate-limited background poll backs off quietly: no banner.
+            self.rate_attempts = self.rate_attempts.saturating_add(1);
+            self.poll_hold_until = now
+                + crate::api::poll_backoff(
+                    crate::api::last_retry_after_secs(),
+                    self.rate_attempts,
+                    crate::api::jitter_seed(),
+                );
+            return;
+        }
         let message = error.to_string();
         match kind {
             PanelKind::Status => {
@@ -748,6 +963,18 @@ impl PanelState {
             }
             PanelKind::OneDriveStart | PanelKind::OneDriveDisconnect => {
                 self.onedrive.error = Some(message);
+            }
+            PanelKind::ConnectorStart
+            | PanelKind::ConnectorToken
+            | PanelKind::ConnectorDisconnect => {
+                if let Some(id) = self.connectors.busy.take() {
+                    self.connectors
+                        .errors
+                        .insert(id, connector_error_text(&error));
+                }
+            }
+            PanelKind::GoogleSetup => {
+                self.connectors.google_error = Some(connector_error_text(&error));
             }
             PanelKind::VaultList => {
                 self.vault.loading = false;
@@ -913,8 +1140,33 @@ mod tests {
             ),
             t0,
         );
+        // Blurred: the status poll slows to the unfocused interval.
         state.set_focused(false);
-        assert!(state.next_op(t0 + Duration::from_secs(60)).is_none());
+        assert!(matches!(
+            state.next_op(t0 + Duration::from_secs(60)),
+            Some(PanelOp::Status)
+        ));
+        state.apply(
+            done(
+                &state,
+                PanelKind::Status,
+                Ok(PanelReply::Status(info(false, BrowserController::Bot))),
+            ),
+            t0,
+        );
+        assert!(state.next_op(t0 + Duration::from_secs(70)).is_none());
+        assert!(matches!(
+            state.next_op(t0 + Duration::from_secs(91)),
+            Some(PanelOp::Status)
+        ));
+        state.apply(
+            done(
+                &state,
+                PanelKind::Status,
+                Ok(PanelReply::Status(info(false, BrowserController::Bot))),
+            ),
+            t0,
+        );
         state.set_focused(true);
         assert!(matches!(
             state.next_op(Instant::now() + Duration::from_millis(1)),
@@ -963,7 +1215,7 @@ mod tests {
             state.next_op(t1 + Duration::from_millis(501)),
             Some(PanelOp::Shot)
         ));
-        // Blurred: nothing is polled.
+        // Blurred: no screenshots.
         state.apply(
             done(
                 &state,
@@ -973,7 +1225,38 @@ mod tests {
             t1,
         );
         state.set_focused(false);
-        assert!(state.next_op(t1 + Duration::from_secs(30)).is_none());
+        assert!(!matches!(
+            state.next_op(t1 + Duration::from_secs(30)),
+            Some(PanelOp::Shot)
+        ));
+    }
+
+    #[test]
+    fn a_429_on_a_background_poll_backs_off_without_a_banner() {
+        let mut state = PanelState::new();
+        let t0 = Instant::now();
+        assert!(matches!(state.next_op(t0), Some(PanelOp::Status)));
+        state.apply(
+            done(&state, PanelKind::Status, Err(ApiError::Http(429))),
+            t0,
+        );
+        assert!(state.browser_error.is_none());
+        // Held for the 2 s backoff floor. The jitter adds 0-25 % on top, so
+        // only a time below the floor is deterministic (2.1 s was flaky).
+        assert!(state.next_op(t0 + Duration::from_millis(1900)).is_none());
+        assert!(matches!(
+            state.next_op(t0 + Duration::from_secs(130)),
+            Some(PanelOp::Status)
+        ));
+    }
+
+    #[test]
+    fn poll_backoff_grows_honours_retry_after_and_is_capped() {
+        use crate::api::poll_backoff;
+        assert!(poll_backoff(1, 1, 0) >= Duration::from_secs(2));
+        assert!(poll_backoff(1, 3, 0) >= Duration::from_secs(8));
+        assert!(poll_backoff(30, 1, 0) >= Duration::from_secs(30));
+        assert!(poll_backoff(500, 9, 999) <= Duration::from_millis(150_000));
     }
 
     #[test]

@@ -861,6 +861,9 @@ impl TelegramClient {
         artifacts: Option<&ArtifactStore>,
         message: TelegramMessage,
     ) -> Result<()> {
+        // The chat is its own conversation. Record its origin so replies and
+        // approval prompts for it (and only it) are delivered back here.
+        store.set_conversation_origin(user_id, &chat_id.to_string(), ORIGIN_TELEGRAM)?;
         match self
             .handle_owner_document(runtime, store, user_id, &message)
             .await?
@@ -1130,13 +1133,43 @@ fn start_code(text: Option<&str>) -> Option<&str> {
     Some(code)
 }
 
+/// Conversation origin recorded for chats that started in Telegram.
+pub const ORIGIN_TELEGRAM: &str = "telegram";
+
+impl TelegramClient {
+    /// The chat to deliver a message for `conversation_id` to, or `None` when
+    /// it must not go to Telegram.
+    ///
+    /// A conversation row is delivered only when it originated in Telegram:
+    /// conversations started in the app never reach Telegram. An id with no
+    /// conversation row belongs to an explicit system notification (the
+    /// startup alert, scheduled briefs and watches) and is delivered to the
+    /// user's own linked chat.
+    fn delivery_chat(&self, user_id: &str, conversation_id: &str) -> Result<Option<i64>> {
+        let Some(chat_id) = self.notification_chat(user_id)? else {
+            return Ok(None);
+        };
+        let store = self.store.as_ref().ok_or_else(|| {
+            SeraError::InvalidState(
+                "Telegram per-user routing is not configured on this client".into(),
+            )
+        })?;
+        match store.conversation_origin(user_id, conversation_id)? {
+            Some(origin) => Ok((origin == ORIGIN_TELEGRAM).then_some(chat_id)),
+            // An id owned by another user is not a system notification.
+            None if store.conversation_exists(conversation_id)? => Ok(None),
+            None => Ok(Some(chat_id)),
+        }
+    }
+}
 #[async_trait]
 impl Notifier for TelegramClient {
-    async fn send_text(&self, user_id: &str, _conversation_id: &str, text: &str) -> Result<()> {
-        match self.notification_chat(user_id)? {
+    async fn send_text(&self, user_id: &str, conversation_id: &str, text: &str) -> Result<()> {
+        match self.delivery_chat(user_id, conversation_id)? {
             Some(chat_id) => self.send_message(chat_id, text).await,
-            // The account has no linked chat: other notifiers carry the
-            // message, and nothing is ever sent to another user's chat.
+            // Not a Telegram conversation or no linked chat: other notifiers
+            // carry the message, and nothing is ever sent to another user's
+            // chat.
             None => Ok(()),
         }
     }
@@ -1144,16 +1177,16 @@ impl Notifier for TelegramClient {
     /// Send the reply as a Telegram voice note.
     ///
     /// The caption carries the text so the content is searchable and readable
-    /// without playing the audio. An account with no linked chat is a no-op,
-    /// exactly like `send_text`.
+    /// without playing the audio. A conversation that is not Telegram's, or an
+    /// account with no linked chat, is a no-op exactly like `send_text`.
     async fn send_voice(
         &self,
         user_id: &str,
-        _conversation_id: &str,
+        conversation_id: &str,
         text: &str,
         audio: &[u8],
     ) -> Result<()> {
-        match self.notification_chat(user_id)? {
+        match self.delivery_chat(user_id, conversation_id)? {
             Some(chat_id) => self.send_voice_note(chat_id, audio, text).await,
             None => Ok(()),
         }
@@ -1162,16 +1195,15 @@ impl Notifier for TelegramClient {
     async fn approval_requested(
         &self,
         user_id: &str,
-        _conversation_id: &str,
+        conversation_id: &str,
         notice: &ApprovalNotice,
     ) -> Result<()> {
-        match self.notification_chat(user_id)? {
+        match self.delivery_chat(user_id, conversation_id)? {
             Some(chat_id) => self.send_approval(chat_id, notice).await,
             None => Ok(()),
         }
     }
 }
-
 #[derive(Debug, Deserialize)]
 struct TelegramResponse<T> {
     ok: bool,
@@ -2017,6 +2049,7 @@ fn is_bot_secret_char(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{Action, Approval};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2770,5 +2803,188 @@ mod tests {
             "<pre>{\"a\": 1}</pre>"
         );
         assert_eq!(markdown_to_telegram_html("*Nota*"), "<i>Nota</i>");
+    }
+
+    // ---- conversation origin isolation -------------------------------
+
+    fn notice() -> ApprovalNotice {
+        let now = chrono::Utc::now();
+        ApprovalNotice {
+            approval: Approval {
+                id: "ap-1".into(),
+                action_id: "ac-1".into(),
+                tool: "send_email".into(),
+                summary: "Send a synthetic email".into(),
+                state: "pending".into(),
+                scope: None,
+                expires_at: now + chrono::Duration::hours(1),
+                created_at: now,
+                decided_at: None,
+                note: None,
+            },
+            action: Action {
+                id: "ac-1".into(),
+                tool: "send_email".into(),
+                task_id: None,
+                turn_id: None,
+                canonical_args: "{}".into(),
+                canonical_hash: "h".into(),
+                destination: None,
+                artifact_hash: None,
+                policy_version: "p".into(),
+                status: "pending".into(),
+                outcome: None,
+                created_at: now,
+                updated_at: now,
+            },
+        }
+    }
+
+    async fn telegram_fixture() -> (MockServer, TelegramClient, Store, String) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": {}})),
+            )
+            .mount(&server)
+            .await;
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let client = TelegramClient::new("123:abc", 10, 20)
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_store(store.clone());
+        client.bootstrap_admin_binding(&store).unwrap();
+        (server, client, store, admin)
+    }
+
+    #[tokio::test]
+    async fn app_conversations_produce_zero_telegram_sends() {
+        let (server, client, store, admin) = telegram_fixture().await;
+        store
+            .set_conversation_origin(&admin, "dir:research", "app")
+            .unwrap();
+        // A conversation created lazily by the app defaults to the app origin.
+        store
+            .ensure_conversation_accepts_turns(&admin, "app-chat-1")
+            .unwrap();
+        for id in ["dir:research", "app-chat-1"] {
+            client.send_text(&admin, id, "reply").await.unwrap();
+            client
+                .send_voice(&admin, id, "reply", b"audio")
+                .await
+                .unwrap();
+            client
+                .approval_requested(&admin, id, &notice())
+                .await
+                .unwrap();
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn telegram_conversations_deliver_text_and_approvals_to_telegram() {
+        let (server, client, store, admin) = telegram_fixture().await;
+        store
+            .set_conversation_origin(&admin, "20", ORIGIN_TELEGRAM)
+            .unwrap();
+        client.send_text(&admin, "20", "reply").await.unwrap();
+        client
+            .approval_requested(&admin, "20", &notice())
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| String::from_utf8_lossy(&request.body).contains("\"chat_id\":20"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delegated_handoff_reports_back_to_telegram_only() {
+        // A handoff keeps the originating conversation id, so the specialist's
+        // reply is routed by that conversation's origin alone.
+        let (server, client, store, admin) = telegram_fixture().await;
+        store
+            .set_conversation_origin(&admin, "20", ORIGIN_TELEGRAM)
+            .unwrap();
+        store
+            .set_conversation_origin(&admin, "dir:analyst", "app")
+            .unwrap();
+        client
+            .send_text(&admin, "20", "Queued handoff to analyst.")
+            .await
+            .unwrap();
+        client
+            .send_text(&admin, "20", "analyst: the figures are ready")
+            .await
+            .unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        client
+            .send_text(&admin, "dir:analyst", "analyst: the figures are ready")
+            .await
+            .unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn explicit_system_notifications_still_reach_the_linked_chat() {
+        let (server, client, _store, admin) = telegram_fixture().await;
+        // Startup alert and scheduled routines use ids with no conversation row.
+        client
+            .send_text(&admin, "system", "SeraBot 0.0.0 started")
+            .await
+            .unwrap();
+        client
+            .send_text(&admin, "owner", "Morning brief")
+            .await
+            .unwrap();
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn origin_routing_never_crosses_users() {
+        let (server, client, store, admin) = telegram_fixture().await;
+        let member = store
+            .create_user("microsoft:origin-member", "o@example.example", "Member")
+            .unwrap()
+            .id;
+        // The member has no linked chat: nothing is sent even for their own
+        // Telegram-origin conversation.
+        store
+            .set_conversation_origin(&member, "77", ORIGIN_TELEGRAM)
+            .unwrap();
+        client.send_text(&member, "77", "hi").await.unwrap();
+        // The admin cannot reach the member's conversation id either.
+        client.send_text(&admin, "77", "hi").await.unwrap();
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(store.conversation_origin(&admin, "77").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn inbound_telegram_messages_mark_the_chat_conversation() {
+        let (server, client, store, admin) = telegram_fixture().await;
+        let (runtime, _) = model_runtime();
+        let _ = &server;
+        let update: Update = serde_json::from_value(json!({
+            "update_id": 5001,
+            "message": {
+                "message_id": 1,
+                "chat": {"id": 20, "type": "private"},
+                "from": {"id": 10},
+                "text": "/status"
+            }
+        }))
+        .unwrap();
+        client
+            .handle_update(&runtime, &store, None, update)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.conversation_origin(&admin, "20").unwrap().as_deref(),
+            Some("telegram")
+        );
     }
 }

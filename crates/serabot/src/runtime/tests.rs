@@ -3,6 +3,35 @@
 use super::*;
 use crate::config::BotConfig;
 
+fn spec(name: &str, description: &str) -> crate::gateway::ToolSpec {
+    crate::gateway::ToolSpec {
+        name: name.into(),
+        description: description.into(),
+        parameters: serde_json::json!({"type": "object"}),
+        external_effect: false,
+    }
+}
+
+#[test]
+fn tool_notice_describes_tools_and_groups_browser() {
+    let mut messages = vec![LlmMessage::system("rules"), LlmMessage::user("hi")];
+    upsert_tool_notice(
+        &mut messages,
+        &[
+            spec("rag_search", "Search private documents. More text."),
+            spec("browser_navigate", "Open a URL."),
+            spec("browser_click", "Click."),
+            spec("vault_list", "List vault names."),
+            spec("memory_delete", "Delete a memory."),
+        ],
+    );
+    let text = messages[1].content.as_deref().unwrap();
+    assert!(text.contains("- rag_search: Search private documents\n"));
+    assert!(text.contains("You can control a real web browser on the server: browser_navigate, browser_click, vault_list"));
+    assert!(!text.contains("- browser_navigate:"));
+    assert!(text.contains("- memory_delete: Delete a memory [needs owner approval]"));
+}
+
 #[test]
 fn tool_notice_is_refreshed_not_duplicated() {
     let mut messages = vec![
@@ -10,7 +39,10 @@ fn tool_notice_is_refreshed_not_duplicated() {
         LlmMessage::system(format!("{TOOL_NOTICE_PREFIX} old_tool.")),
         LlmMessage::user("hi"),
     ];
-    upsert_tool_notice(&mut messages, "rag_search");
+    upsert_tool_notice(
+        &mut messages,
+        &[spec("rag_search", "Search private documents. More text.")],
+    );
     let notices = messages
         .iter()
         .filter(|m| {
@@ -29,7 +61,10 @@ fn tool_notice_is_refreshed_not_duplicated() {
 #[test]
 fn tool_notice_inserted_after_first_system_message_when_absent() {
     let mut messages = vec![LlmMessage::system("rules"), LlmMessage::user("hi")];
-    upsert_tool_notice(&mut messages, "rag_search");
+    upsert_tool_notice(
+        &mut messages,
+        &[spec("rag_search", "Search private documents. More text.")],
+    );
     assert_eq!(messages.len(), 3);
     assert_eq!(messages[1].role, Role::System);
     assert!(
@@ -114,7 +149,7 @@ struct FakeUpload {
 impl Tool for FakeUpload {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "upload".into(),
+            name: "onedrive_upload".into(),
             description: "fake upload".into(),
             parameters: serde_json::json!({"type": "object"}),
             external_effect: true,
@@ -146,7 +181,7 @@ fn bot() -> LoadedBot {
             model: None,
             system_prompt: "prompts/main.txt".into(),
             skills: vec![],
-            tools: vec!["upload".into()],
+            tools: vec!["onedrive_upload".into()],
             require_approval: vec![],
             enabled: true,
             temperature: None,
@@ -333,7 +368,7 @@ async fn endpoint_changes_reject_queued_and_resumed_routes_before_effects() {
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(
             json!({"choices":[{"message":{"tool_calls":[{
-                "id":"call_1", "function":{"name":"upload", "arguments":"{\"dest\":\"folder\"}"}
+                "id":"call_1", "function":{"name":"onedrive_upload", "arguments":"{\"dest\":\"folder\"}"}
             }]}}]}),
         ))
         .expect(1)
@@ -630,7 +665,7 @@ async fn approval_suspends_then_resumes_once() {
                         "tool_calls": [{
                             "id": "call_1",
                             "type": "function",
-                            "function": {"name": "upload", "arguments": "{\"dest\":\"folder\"}"}
+                            "function": {"name": "onedrive_upload", "arguments": "{\"dest\":\"folder\"}"}
                         }]
                     },
                     "finish_reason": "tool_calls"

@@ -153,6 +153,7 @@ mod tests {
             display_name: Some(id.into()),
             description: None,
             avatar: None,
+            avatar_version: None,
             model: None,
             tools: Vec::new(),
             skills: Vec::new(),

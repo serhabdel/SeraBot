@@ -8,15 +8,19 @@
 
 use dioxus::prelude::*;
 use serabot_desktop::{
-    ApprovalDecision, BotConfigUpdate, ConnectorStatus, ConversationKind, MAX_TEAM_MEMBERS, Role,
-    SPECIALIST_TOOLS, Selection, TaskStatus, Team, TeamMember, TeamMode,
+    ApprovalDecision, BotConfigUpdate, ConversationKind, MAX_TEAM_MEMBERS, Role, SPECIALIST_TOOLS,
+    Selection, TaskStatus, Team, TeamMember, TeamMode,
     audio_capture::MicRecorder,
-    branding, parse_skill_list, provider_presets,
-    session::{Section, Session, SignInPhase, Theme, humanize_label},
+    branding, provider_presets,
+    session::{ImageSlot, Section, Session, SignInPhase, Theme, humanize_label},
     teams, valid_skill_id,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use crate::ui_bots::{
+    AvatarPicker, CapabilityToggles, NewBotSheet, NewGroupSheet, OnboardingView, capability_chips,
+};
+use crate::ui_connectors::ConnectorsView;
 use crate::ui_dock::BrowserDock;
 use crate::ui_vault::VaultSheet;
 
@@ -89,71 +93,6 @@ const PROVIDER_KINDS: [&str; 15] = [
     "moonshot",
     "muse-code",
 ];
-
-/// The provider authorization pages the console can open.
-///
-/// These are the same fixed endpoints the server uses
-/// (`crates/serabot/src/connectors.rs`). The console never builds a URL from
-/// unvalidated server data: the endpoint comes from this table and only a
-/// checked redirect URI is appended.
-const CONNECTOR_AUTH_URLS: [(&str, &str); 8] = [
-    (
-        "google_drive",
-        "https://accounts.google.com/o/oauth2/v2/auth",
-    ),
-    (
-        "google_sheets",
-        "https://accounts.google.com/o/oauth2/v2/auth",
-    ),
-    (
-        "google_calendar",
-        "https://accounts.google.com/o/oauth2/v2/auth",
-    ),
-    ("gmail", "https://accounts.google.com/o/oauth2/v2/auth"),
-    (
-        "outlook",
-        "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
-    ),
-    (
-        "outlook_calendar",
-        "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
-    ),
-    ("notion", "https://api.notion.com/v1/oauth/authorize"),
-    ("agentmail", "https://app.agentmail.to/"),
-];
-
-/// The authorization page of a connector, with its redirect URI appended.
-///
-/// `None` when the connector has no known authorization page or when the
-/// redirect URI is not a plain HTTP(S) address. The result is always an
-/// HTTPS URL built from the fixed table above.
-fn connector_auth_url(connector_id: &str, redirect_uri: Option<&str>) -> Option<String> {
-    let (_, endpoint) = CONNECTOR_AUTH_URLS
-        .iter()
-        .find(|(id, _)| *id == connector_id)?;
-    let mut url = url::Url::parse(endpoint).ok()?;
-    if url.scheme() != "https" {
-        return None;
-    }
-    if let Some(redirect) = redirect_uri
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if !redirect.starts_with("https://") && !redirect.starts_with("http://") {
-            return None;
-        }
-        // Only a plain address is accepted: no shell metacharacters and no
-        // query string, so the opened URL can carry nothing but the address.
-        if !redirect
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "-._~:/?@#%".contains(character))
-        {
-            return None;
-        }
-        url.query_pairs_mut().append_pair("redirect_uri", redirect);
-    }
-    Some(url.to_string())
-}
 
 /// Global key bindings, installed once in the WebView.
 /// Cmd/Ctrl+K focuses the sidebar search; Esc closes the topmost sheet, menu
@@ -265,8 +204,12 @@ fn civil_from_days(days: i64) -> String {
 
 /// Overlay surfaces that sit above the shell.
 #[derive(Clone, Copy, PartialEq)]
-enum Overlay {
+pub(crate) enum Overlay {
     None,
+    /// The create-bot sheet: name, picture, model, group.
+    NewBot,
+    /// The create-group sheet: name, picture, members, rules, model.
+    NewGroup,
     /// The new-conversation sheet. The kind lives in the session draft, so
     /// the menu, the sheet and the Threads form always agree.
     NewConversation,
@@ -295,7 +238,6 @@ struct BotCard {
     model: Option<String>,
     tools: Vec<String>,
     skills: Vec<String>,
-    require_approval: Vec<String>,
 }
 
 fn avatar_hue(id: &str) -> u16 {
@@ -307,11 +249,32 @@ fn avatar_hue(id: &str) -> u16 {
 }
 
 /// Only the hue travels to the DOM; the colors themselves are CSS tokens.
-fn avatar_style(id: &str) -> String {
-    format!("--avatar-hue: {};", avatar_hue(id))
+pub(crate) fn avatar_style(id: &str) -> String {
+    serabot_desktop::avatars::tile_style(
+        &serabot_desktop::avatars::css_key("bot", id),
+        avatar_hue(id),
+    )
 }
 
-fn human_model(model: &str) -> String {
+/// Tile style for a conversation row: a direct chat wears its bot's picture,
+/// a group its own, anything else the hue only.
+fn conversation_avatar_style(id: &str) -> String {
+    if id.starts_with("room:") {
+        group_avatar_style(id)
+    } else {
+        avatar_style(id.strip_prefix("dir:").unwrap_or(id))
+    }
+}
+
+/// Same for a group (room) tile; `id` is the room conversation id.
+pub(crate) fn group_avatar_style(id: &str) -> String {
+    serabot_desktop::avatars::tile_style(
+        &serabot_desktop::avatars::css_key("grp", id),
+        avatar_hue(id),
+    )
+}
+
+pub(crate) fn human_model(model: &str) -> String {
     let base = model.strip_suffix("-latest").unwrap_or(model);
     base.split(['-', '_'])
         .filter(|word| !word.is_empty())
@@ -326,7 +289,7 @@ fn human_model(model: &str) -> String {
         .join(" ")
 }
 
-fn human_provider(provider: &str) -> String {
+pub(crate) fn human_provider(provider: &str) -> String {
     if provider == "default" {
         "Default provider".into()
     } else {
@@ -1325,8 +1288,12 @@ fn Shell(session: Signal<Session>) -> Element {
     let mut drawer_open = use_signal(|| false);
     let vault_open = use_signal(|| false);
     let mut toast = use_signal(|| Option::<(String, bool)>::None);
+    let onboarding_open = chat && session.read().onboarding_ui.open;
+    // One stylesheet defines every avatar image; tiles only reference it.
+    let avatar_css = serabot_desktop::avatars::stylesheet(&session.read().state.avatars);
 
     rsx! {
+        style { "{avatar_css}" }
         div { class: "app-shell",
             IconRail { session, toast }
             if chat {
@@ -1337,11 +1304,14 @@ fn Shell(session: Signal<Session>) -> Element {
                 }
             }
             main { class: "main",
-                if chat {
+                if chat && !onboarding_open {
                     Topbar { session, overlay, inspector_open, drawer_open, vault_open }
                 }
                 StatusBanner { session }
                 UpdateBanner { session }
+                if onboarding_open {
+                    OnboardingView { session }
+                } else {
                 div { class: "pane",
                     {match section {
                         Section::Chat => rsx! { ChatView { session, overlay } },
@@ -1354,11 +1324,12 @@ fn Shell(session: Signal<Session>) -> Element {
                             if session.read().selected_bot.is_some() {
                                 rsx! { BotProfileView { session } }
                             } else {
-                                rsx! { FleetView { session } }
+                                rsx! { FleetView { session, overlay } }
                             }
                         }
                         Section::Settings => rsx! { SettingsView { session } },
                     }}
+                }
                 }
             }
             if chat {
@@ -1372,6 +1343,12 @@ fn Shell(session: Signal<Session>) -> Element {
             {match overlay() {
                 Overlay::NewConversation => rsx! {
                     NewConversationSheet { session, overlay }
+                },
+                Overlay::NewBot => rsx! {
+                    NewBotSheet { session, overlay }
+                },
+                Overlay::NewGroup => rsx! {
+                    NewGroupSheet { session, overlay }
                 },
                 Overlay::AddProvider => rsx! {
                     AddProviderSheet { session, overlay }
@@ -1536,8 +1513,7 @@ fn NewMenu(
                     class: "menu-item",
                     onclick: move |_| {
                         open.set(false);
-                        session.write().fleet.conv_kind = ConversationKind::Room;
-                        overlay.set(Overlay::NewConversation);
+                        overlay.set(Overlay::NewGroup);
                     },
                     Icon { name: "shield", size: 16 }
                     "New group chat"
@@ -1566,7 +1542,7 @@ fn NewMenu(
                     class: "menu-item",
                     onclick: move |_| {
                         open.set(false);
-                        session.write().open_section(Section::Fleet);
+                        overlay.set(Overlay::NewBot);
                     },
                     Icon { name: "robot", size: 16 }
                     "New bot"
@@ -1913,7 +1889,7 @@ fn Sidebar(
                                                 session.write().open_bot_chat(bot);
                                             }
                                         },
-                                        span { class: "avatar bot", style: avatar_style(&id), "{avatar}" }
+                                        span { class: "avatar bot", style: conversation_avatar_style(&id), "{avatar}" }
                                         div { class: "thread-copy",
                                             span { class: "thread-title", "{label}" }
                                             span { class: "thread-meta", if enabled { "{role}" } else { "{role} · disabled" } }
@@ -1999,7 +1975,7 @@ fn Sidebar(
                                                 let id = id.clone();
                                                 move |_| session.write().open_conversation(id.clone())
                                             },
-                                            span { class: "avatar bot", style: avatar_style(&id), "{initial_of(&label)}" }
+                                            span { class: "avatar bot", style: conversation_avatar_style(&id), "{initial_of(&label)}" }
                                             div { class: "thread-copy",
                                                 span { class: "thread-title", "{label}" }
                                                 span { class: "thread-meta", "{subtitle}" }
@@ -3605,17 +3581,7 @@ fn Inspector(session: Signal<Session>, overlay: Signal<Overlay>, open: Signal<bo
                 })
                 .collect();
             let skills_full = attached_skills.len() >= MAX_BOT_SKILLS;
-            let tool_rows: Vec<(String, bool, Option<&'static str>)> = detail
-                .tools
-                .iter()
-                .map(|tool| {
-                    (
-                        tool.clone(),
-                        detail.require_approval.iter().any(|item| item == tool),
-                        capability_label(tool),
-                    )
-                })
-                .collect();
+            let tool_rows: Vec<String> = detail.tools.clone();
             let instructions = detail.instructions.clone();
             let instruction_preview = instructions.as_ref().map(|text| {
                 let truncated: String = text.chars().take(8000).collect();
@@ -3808,25 +3774,27 @@ fn Inspector(session: Signal<Session>, overlay: Signal<Overlay>, open: Signal<bo
                 }
                 div { class: "card",
                     div { class: "card-head",
-                        h3 { class: "card-title", "Tools" }
-                        span { class: "chip muted", "{detail.tools.len()}" }
+                        h3 { class: "card-title", "What it can do" }
                     }
                     if tool_rows.is_empty() {
-                        p { class: "hint", "No tools enabled." }
+                        p { class: "hint", "Nothing switched on." }
                     } else {
                         div { class: "chips",
-                            for (tool, needs_approval, _cap) in tool_rows.clone() {
-                                span {
-                                    class: if needs_approval { "chip warn" } else { "chip" },
-                                    title: if needs_approval { "Requires approval" } else { "Enabled tool" },
-                                    "{tool}"
-                                }
+                            for label in capability_chips(&detail.tools) {
+                                span { class: "chip", "{label}" }
                             }
                         }
-                        div { class: "row",
-                            for (tool, _needs_approval, cap) in tool_rows {
-                                if let Some(label) = cap {
-                                    span { class: "tiny", "{tool}: {label}" }
+                    }
+                    p { class: "approval-note",
+                        Icon { name: "shield", size: 14 }
+                        "Asks before deleting or sending anything"
+                    }
+                    details { class: "advanced",
+                        summary { "Advanced" }
+                        div { class: "advanced-body",
+                            div { class: "chips",
+                                for tool in tool_rows {
+                                    span { class: "chip mono", "{tool}" }
                                 }
                             }
                         }
@@ -4304,7 +4272,7 @@ fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
                             session.write().fleet.conv_kind = next;
                             session.write().fleet.conv_parent.clear();
                         },
-                        for candidate in ConversationKind::ALL {
+                        for candidate in ConversationKind::ALL.into_iter().filter(|kind| *kind != ConversationKind::Room) {
                             option { value: "{candidate.as_str()}", "{candidate.label()}" }
                         }
                     }
@@ -4319,15 +4287,20 @@ fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
                         oninput: move |event| session.write().fleet.conv_title = event.value(),
                     }
                 }
-                div { class: "field",
-                    label { class: "field-label", "Id" }
-                    input {
-                        class: "input",
-                        value: "{slug}",
-                        placeholder: "id (lowercase slug)",
-                        oninput: move |event| session.write().fleet.conv_slug = event.value(),
+                details { class: "advanced",
+                    summary { "Advanced" }
+                    div { class: "advanced-body",
+                        div { class: "field",
+                            label { class: "field-label", "Id" }
+                            input {
+                                class: "input",
+                                value: "{slug}",
+                                placeholder: "made from the name",
+                                oninput: move |event| session.write().fleet.conv_slug = event.value(),
+                            }
+                            span { class: "hint", "Leave empty to make it from the name." }
+                        }
                     }
-                    span { class: "hint", "The server assigns the id prefix (sec:, grp:, dir:, room:)." }
                 }
                 if kind != ConversationKind::Section {
                     div { class: "field",
@@ -4441,8 +4414,13 @@ fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
                     class: "btn primary",
                     onclick: move |_| {
                         let kind = session.read().fleet.conv_kind;
-                        let slug = session.read().fleet.conv_slug.clone();
                         let title = session.read().fleet.conv_title.clone();
+                        let slug = session.read().fleet.conv_slug.clone();
+                        let slug = if slug.trim().is_empty() {
+                            serabot_desktop::preview_id(&title, "item")
+                        } else {
+                            slug
+                        };
                         let parent = session.read().fleet.conv_parent.trim().to_owned();
                         let parent = (!parent.is_empty()).then_some(parent);
                         let members = picked();
@@ -4715,7 +4693,8 @@ fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
 }
 
 #[component]
-fn FleetView(session: Signal<Session>) -> Element {
+fn FleetView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
+    let mut overlay = overlay;
     let bots: Vec<BotCard> = {
         let state = session.read();
         state
@@ -4733,16 +4712,12 @@ fn FleetView(session: Signal<Session>) -> Element {
                 model: bot.model.clone(),
                 tools: bot.tools.clone(),
                 skills: bot.skills.clone(),
-                require_approval: bot.require_approval.clone(),
             })
             .collect()
     };
     let bots_empty = bots.is_empty();
     let bots_loaded = session.read().state.bots_loaded;
     let bot_binding = session.read().state.bot_chat_binding == Some(true);
-    let mut bot_id = use_signal(String::new);
-    let mut bot_desc = use_signal(String::new);
-    let mut bot_skills = use_signal(String::new);
     let mut skill_id = use_signal(String::new);
     let mut skill_desc = use_signal(String::new);
     let mut skill_body = use_signal(String::new);
@@ -4751,13 +4726,21 @@ fn FleetView(session: Signal<Session>) -> Element {
             div { class: "pane-head",
                 div {
                     h1 { class: "pane-title", "Fleet" }
-                    p { class: "muted", "Specialists, tools, and approval rules." }
+                    p { class: "muted", "Your bots and what they can do." }
                 }
-                button {
-                    class: "btn ghost",
-                    onclick: move |_| session.write().refresh_bots(),
-                    Icon { name: "refresh", size: 16 }
-                    "Refresh"
+                div { class: "row",
+                    button {
+                        class: "btn ghost",
+                        onclick: move |_| session.write().refresh_bots(),
+                        Icon { name: "refresh", size: 16 }
+                        "Refresh"
+                    }
+                    button {
+                        class: "btn primary",
+                        onclick: move |_| overlay.set(Overlay::NewBot),
+                        Icon { name: "plus", size: 16 }
+                        "New bot"
+                    }
                 }
             }
             div { class: "pane-body",
@@ -4767,74 +4750,6 @@ fn FleetView(session: Signal<Session>) -> Element {
                     }
                 }
                 div { class: "pane-section",
-                details { class: "card",
-                    summary { "New specialist" }
-                    div { class: "form-grid",
-                        div { class: "field",
-                            label { class: "field-label", "Bot id" }
-                            input {
-                                class: "input",
-                                value: "{bot_id}",
-                                placeholder: "bot id (lowercase slug)",
-                                oninput: move |event| bot_id.set(event.value()),
-                            }
-                        }
-                        div { class: "field",
-                            label { class: "field-label", "Skills" }
-                            input {
-                                class: "input",
-                                value: "{bot_skills}",
-                                placeholder: "skills: ask, notes",
-                                oninput: move |event| bot_skills.set(event.value()),
-                            }
-                        }
-                    }
-                    div { class: "field",
-                        label { class: "field-label", "Description" }
-                        textarea {
-                            class: "textarea",
-                            value: "{bot_desc}",
-                            placeholder: "What this specialist is for",
-                            oninput: move |event| bot_desc.set(event.value()),
-                        }
-                    }
-                    details {
-                        summary { class: "tiny", "Tools" }
-                        div { class: "form-grid",
-                            for (index, name) in SPECIALIST_TOOLS.iter().enumerate() {
-                                label { key: "{index}", class: "check",
-                                    input {
-                                        "type": "checkbox",
-                                        checked: session.read().fleet.bot_tools.get(index).copied().unwrap_or(false),
-                                        onchange: move |event| {
-                                            if let Some(flag) = session.write().fleet.bot_tools.get_mut(index) {
-                                                *flag = event.checked();
-                                            }
-                                        },
-                                    }
-                                    "{name}"
-                                }
-                            }
-                        }
-                    }
-                    button {
-                        class: "btn primary",
-                        onclick: move |_| {
-                            match parse_skill_list(&bot_skills()) {
-                                Ok(skills) => {
-                                    let tools = session.read().selected_tools();
-                                    session.write().create_bot(bot_id(), bot_desc(), tools, skills);
-                                    bot_id.set(String::new());
-                                    bot_desc.set(String::new());
-                                    bot_skills.set(String::new());
-                                }
-                                Err(error) => session.write().state.error = Some(error.to_string()),
-                            }
-                        },
-                        "Create disabled bot"
-                    }
-                    p { class: "tiny", "The bot stays disabled until serabot.service restarts." }
-                }
                 details { class: "card",
                     summary { "New skill pack" }
                     div { class: "form-grid",
@@ -4898,7 +4813,7 @@ fn FleetView(session: Signal<Session>) -> Element {
                                 }
                                 div { class: "chips",
                                     span { class: if bot.enabled { "chip ok" } else { "chip muted" }, if bot.enabled { "enabled" } else { "disabled" } }
-                                    if !bot.live {
+                                    if bot.enabled && !bot.live {
                                         span { class: "chip warn", "restart required" }
                                     }
                                 }
@@ -4910,14 +4825,18 @@ fn FleetView(session: Signal<Session>) -> Element {
                                 span { class: "chip", if let Some(model) = bot.model.clone() { "Model: {human_model(&model)}" } else { "Model: conversation route" } }
                             }
                             div { class: "chips",
-                                for tool in bot.tools {
-                                    span { class: if bot.require_approval.contains(&tool) { "chip warn" } else { "chip" }, "{tool}" }
+                                for label in capability_chips(&bot.tools) {
+                                    span { class: "chip", "{label}" }
                                 }
                             }
                             div { class: "chips",
                                 for skill in bot.skills {
                                     span { class: "chip accent", "{skill}" }
                                 }
+                            }
+                            p { class: "approval-note",
+                                Icon { name: "shield", size: 14 }
+                                "Asks before deleting or sending anything"
                             }
                             div { class: "card-actions",
                                 button {
@@ -4936,6 +4855,16 @@ fn FleetView(session: Signal<Session>) -> Element {
                                         move |_| session.write().open_bot(id.clone())
                                     },
                                     "Open profile"
+                                }
+                                if !bot.enabled && bot.role != "orchestrator" {
+                                    button {
+                                        class: "btn ghost sm",
+                                        onclick: {
+                                            let id = bot.id.clone();
+                                            move |_| session.write().open_onboarding(id.clone())
+                                        },
+                                        "Finish setup"
+                                    }
                                 }
                             }
                         }
@@ -5089,7 +5018,23 @@ fn BotProfileView(session: Signal<Session>) -> Element {
                             h3 { class: "card-title", "Profile" }
                         }
                         p { class: "tiny", "Display name, avatar and description belong to the console. Behavior, tools and model stay in the bot file." }
-                        p { class: "tiny", "Use an emoji or initials for the avatar. Image uploads are not supported yet." }
+                        div { class: "field",
+                            label { class: "field-label", "Picture" }
+                            AvatarPicker {
+                                preview: None,
+                                letter: avatar.clone(),
+                                style: avatar_style(&bot.id),
+                                has_image: bot.avatar_version.is_some(),
+                                on_pick: {
+                                    let id = bot.id.clone();
+                                    move |bytes: Vec<u8>| session.write().pick_image(ImageSlot::Bot(id.clone()), bytes)
+                                },
+                                on_clear: {
+                                    let id = bot.id.clone();
+                                    move |_| session.write().clear_image(ImageSlot::Bot(id.clone()))
+                                },
+                            }
+                        }
                         div { class: "form-grid",
                             div { class: "field",
                                 label { class: "field-label", "Display name" }
@@ -5144,6 +5089,12 @@ fn BotProfileView(session: Signal<Session>) -> Element {
                                 }
                             }
                         }
+                    }
+                    div { class: "card",
+                        div { class: "card-head",
+                            h3 { class: "card-title", "What it can do" }
+                        }
+                        CapabilityToggles { session, bot: bot.id.clone() }
                     }
                     div { class: "card",
                         div { class: "card-head",
@@ -5908,446 +5859,6 @@ fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element 
     }
 }
 
-/// What a connector card offers as its one main action.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ConnectorAction {
-    ConnectOneDrive,
-    DisconnectOneDrive,
-    SignIn,
-    Authorize(String),
-    AddKey,
-    ReplaceKey,
-}
-
-/// The single primary action for a connector in its current state, or `None`
-/// when there is nothing the owner can do from the card.
-fn connector_action(
-    connector: &ConnectorStatus,
-    connected: bool,
-    auth_mode: &str,
-) -> Option<ConnectorAction> {
-    if connector.id == "onedrive" {
-        return Some(if connected {
-            ConnectorAction::DisconnectOneDrive
-        } else {
-            ConnectorAction::ConnectOneDrive
-        });
-    }
-    if connector.oauth.is_some()
-        && auth_mode == "oauth"
-        && connector.auth_modes.iter().any(|mode| mode == "oauth")
-    {
-        return Some(ConnectorAction::SignIn);
-    }
-    // A pasted API key beats a sign-in page: those pages only help you find one.
-    let takes_key = connector.secrets.keys().any(|role| role == "api_key");
-    if !takes_key
-        && let Some(url) = connector_auth_url(&connector.id, connector.redirect_uri.as_deref())
-    {
-        return Some(ConnectorAction::Authorize(url));
-    }
-    if !connector.secrets.is_empty() {
-        return Some(if connected {
-            ConnectorAction::ReplaceKey
-        } else {
-            ConnectorAction::AddKey
-        });
-    }
-    None
-}
-
-fn connector_title(id: &str) -> String {
-    match id {
-        "onedrive" => "OneDrive",
-        "google_drive" => "Google Drive",
-        "google_sheets" => "Google Sheets",
-        "google_calendar" => "Google Calendar",
-        "gmail" => "Gmail",
-        "outlook" => "Outlook",
-        "outlook_calendar" => "Outlook Calendar",
-        "notion" => "Notion",
-        "agentmail" => "AgentMail",
-        "tavily" => "Tavily Search",
-        "firecrawl" => "Firecrawl",
-        "elevenlabs" => "ElevenLabs",
-        other => return humanize_label(other),
-    }
-    .to_owned()
-}
-
-fn connector_blurb(id: &str) -> &'static str {
-    match id {
-        "onedrive" => "Save and read files in your OneDrive.",
-        "google_drive" => "Files in your Google Drive.",
-        "google_sheets" => "Your Google spreadsheets.",
-        "google_calendar" => "Your Google calendar.",
-        "gmail" => "Read and send email.",
-        "outlook" => "Read and send email.",
-        "outlook_calendar" => "Your Outlook calendar.",
-        "notion" => "Your notes and pages.",
-        "agentmail" => "A mailbox for your bots.",
-        "tavily" | "firecrawl" => "Let bots search and read the web.",
-        "elevenlabs" => "Voices and sound.",
-        _ => "",
-    }
-}
-
-/// A key field name in everyday words ("api_key" becomes "API key").
-fn secret_label(role: &str) -> String {
-    let words = role.replace(['_', '-'], " ");
-    let mut text = words.trim().to_lowercase();
-    if let Some(rest) = text.strip_prefix("api ") {
-        text = format!("API {rest}");
-    }
-    let mut chars = text.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-        None => "Key".to_owned(),
-    }
-}
-
-#[component]
-fn ConnectorsView(session: Signal<Session>) -> Element {
-    let connectors = session.read().state.connectors.clone();
-    let loaded = session.read().state.connectors_loaded;
-    rsx! {
-        div { class: "pane",
-            div { class: "pane-head",
-                div {
-                    h1 { class: "pane-title", "Connectors" }
-                    p { class: "muted", "Let your bots use your accounts and tools." }
-                }
-                button {
-                    class: "btn ghost",
-                    title: "Check for changes",
-                    onclick: move |_| session.write().refresh_connectors(),
-                    Icon { name: "refresh", size: 15 }
-                    "Refresh"
-                }
-            }
-            div { class: "pane-body",
-                if !loaded {
-                    div { class: "card",
-                        div { class: "skeleton title" }
-                        div { class: "skeleton block" }
-                    }
-                }
-                if loaded && connectors.is_empty() {
-                    div { class: "empty",
-                        div { class: "empty-icon", Icon { name: "connectors", size: 20 } }
-                        h2 { class: "empty-title", "No connectors available" }
-                        p { class: "empty-text", "The server did not list any connectors. Check the connection and try again." }
-                        button {
-                            class: "btn primary",
-                            onclick: move |_| session.write().refresh_connectors(),
-                            "Refresh"
-                        }
-                    }
-                }
-                for (suite_title, suite_ids) in [
-                    ("Microsoft", &["onedrive", "outlook", "outlook_calendar"][..]),
-                    ("Google", &["google_drive", "google_sheets", "google_calendar", "gmail"][..]),
-                    ("Notes and email", &["notion", "agentmail"][..]),
-                    ("Web search", &["tavily", "firecrawl"][..]),
-                    ("Voice", &["elevenlabs"][..]),
-                ] {
-                    {
-                        let suite_connectors: Vec<_> = suite_ids
-                            .iter()
-                            .filter_map(|id| connectors.iter().find(|c| c.id == *id))
-                            .cloned()
-                            .collect();
-                        if !suite_connectors.is_empty() {
-                            rsx! {
-                                h2 { class: "connector-suite-title", "{suite_title}" }
-                                div { class: "card-grid",
-                                    for connector in suite_connectors {
-                                        ConnectorCard { key: "{connector.id}", session, connector }
-                                    }
-                                }
-                            }
-                        } else {
-                            rsx! {}
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// One connector: its state, one main action that fits that state, and the
-/// developer fields behind "Advanced" for administrators.
-#[component]
-fn ConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> Element {
-    let mut session = session;
-    let can_save = session.read().can_admin();
-    let is_admin = session.read().is_admin();
-    let id = connector.id.clone();
-    let connected = connector
-        .connected
-        .unwrap_or_else(|| connector.secrets.values().any(|s| s.configured));
-    let title = connector_title(&id);
-    let blurb = connector_blurb(&id);
-    let enabled = session
-        .read()
-        .connector_drafts
-        .get(&id)
-        .map(|draft| draft.enabled)
-        .unwrap_or(connector.enabled);
-    let testing = session.read().connector_testing.as_deref() == Some(id.as_str());
-    let signing_in = session.read().oauth_signing_in.as_deref() == Some(id.as_str());
-    let auth_mode = session
-        .read()
-        .connector_drafts
-        .get(&id)
-        .and_then(|draft| draft.auth.clone())
-        .or_else(|| connector.auth.clone())
-        .unwrap_or_default();
-    let test_result = session.read().state.connector_tests.get(&id).cloned();
-    let values = session
-        .read()
-        .connector_drafts
-        .get(&id)
-        .map(|draft| draft.values.clone())
-        .unwrap_or_default();
-    let (od_busy, od_waiting, od_error) = {
-        let state = session.read();
-        let flow = &state.panel.onedrive;
-        (flow.busy, flow.waiting, flow.error.clone())
-    };
-    let action = connector_action(&connector, connected, &auth_mode);
-    let key_inputs = matches!(
-        action,
-        Some(ConnectorAction::AddKey | ConnectorAction::ReplaceKey)
-    ) && is_admin;
-    let needs_admin = !is_admin
-        && matches!(
-            action,
-            Some(
-                ConnectorAction::SignIn
-                    | ConnectorAction::Authorize(_)
-                    | ConnectorAction::AddKey
-                    | ConnectorAction::ReplaceKey
-            )
-        );
-    let has_values = values.values().any(|value| !value.trim().is_empty());
-    rsx! {
-        div { class: "card connector-card",
-            div { class: "card-head",
-                div { class: "connector-id",
-                    BrandLogo { brand: id.clone(), size: 28 }
-                    div {
-                        h3 { class: "card-title", "{title}" }
-                        if !blurb.is_empty() {
-                            span { class: "card-sub", "{blurb}" }
-                        }
-                    }
-                }
-                span {
-                    class: if connected { "status-pill connected" } else { "status-pill disconnected" },
-                    if connected { "Connected" } else { "Not connected" }
-                }
-            }
-            if key_inputs {
-                div { class: "form-grid",
-                    for (role, secret) in &connector.secrets {
-                        {
-                            let role = role.clone();
-                            let label = secret_label(&role);
-                            let value = values.get(&role).cloned().unwrap_or_default();
-                            rsx! {
-                                div { class: "field", key: "{role}",
-                                    label { class: "field-label", "{label}" }
-                                    input {
-                                        class: "input",
-                                        "type": "password",
-                                        value: "{value}",
-                                        autocomplete: "off",
-                                        placeholder: if secret.configured { "Paste a new one to replace it" } else { "Paste it here" },
-                                        oninput: {
-                                            let id = id.clone();
-                                            let role = role.clone();
-                                            move |event| session.write().set_connector_value(&id, &role, event.value())
-                                        },
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if od_waiting && id == "onedrive" && !connected {
-                p { class: "tiny", role: "status",
-                    "Finish signing in with Microsoft in your browser, then press Refresh."
-                }
-            }
-            if id == "onedrive" {
-                if let Some(message) = od_error {
-                    p { class: "banner err", role: "alert", "{message}" }
-                }
-            }
-            if needs_admin && !connected {
-                p { class: "tiny", "Your admin sets this one up." }
-            }
-            if let Some(result) = test_result {
-                p { class: if result.ok { "banner ok" } else { "banner err" }, "{result.message}" }
-            }
-            div { class: "card-actions",
-                {match action.clone() {
-                    Some(ConnectorAction::ConnectOneDrive) => rsx! {
-                        button {
-                            class: "btn primary",
-                            disabled: od_busy,
-                            onclick: move |_| session.write().panel.connect_onedrive(),
-                            if od_busy { "Opening…" } else { "Connect OneDrive" }
-                        }
-                    },
-                    Some(ConnectorAction::DisconnectOneDrive) => rsx! {
-                        button {
-                            class: "btn ghost",
-                            disabled: od_busy,
-                            onclick: move |_| session.write().panel.disconnect_onedrive(),
-                            "Disconnect"
-                        }
-                    },
-                    Some(ConnectorAction::SignIn) if is_admin => {
-                        let callback_uri = connector
-                            .oauth
-                            .as_ref()
-                            .and_then(|o| o.callback_uri.clone())
-                            .unwrap_or_default();
-                        let id = id.clone();
-                        rsx! {
-                            button {
-                                class: if connected { "btn ghost" } else { "btn primary" },
-                                title: "Sign in with your account in your browser",
-                                disabled: signing_in || !can_save,
-                                onclick: move |_| session.write().sign_in_connector(id.clone(), callback_uri.clone()),
-                                if signing_in { "Signing in…" } else if connected { "Sign in again" } else { "Sign in" }
-                            }
-                        }
-                    },
-                    Some(ConnectorAction::Authorize(url)) if is_admin => rsx! {
-                        button {
-                            class: if connected { "btn ghost" } else { "btn primary" },
-                            title: "Open the sign-in page in your browser",
-                            onclick: move |_| session.write().open_in_browser(url.clone()),
-                            Icon { name: "external", size: 14 }
-                            if connected { "Reconnect" } else { "Connect" }
-                        }
-                    },
-                    Some(ConnectorAction::AddKey | ConnectorAction::ReplaceKey) if is_admin => {
-                        let id = id.clone();
-                        let key_page = connector_auth_url(&id, connector.redirect_uri.as_deref());
-                        rsx! {
-                            button {
-                                class: if connected { "btn ghost" } else { "btn primary" },
-                                disabled: !can_save || !has_values,
-                                title: if has_values { "Save the key" } else { "Paste the key first" },
-                                onclick: move |_| session.write().add_connector_key(id.clone()),
-                                if connected { "Replace key" } else { "Add key" }
-                            }
-                            if let Some(url) = key_page {
-                                button {
-                                    class: "btn ghost",
-                                    title: "Open the provider's site to get a key",
-                                    onclick: move |_| session.write().open_in_browser(url.clone()),
-                                    Icon { name: "external", size: 14 }
-                                    "Get a key"
-                                }
-                            }
-                        }
-                    },
-                    _ => rsx! {},
-                }}
-            }
-            if is_admin {
-                details { class: "advanced",
-                    summary { "Advanced" }
-                    div { class: "advanced-body",
-                        div { class: "chips",
-                            span { class: "chip mono", "{connector.kind}" }
-                            span { class: if enabled { "chip ok" } else { "chip muted" },
-                                if enabled { "enabled" } else { "disabled" }
-                            }
-                            if let Some(oauth) = connector.oauth.as_ref() {
-                                span { class: "chip mono accent", "client_id: {oauth.client_id}" }
-                            }
-                            for (role, secret) in &connector.secrets {
-                                if secret.configured || secret.name.as_deref().is_some_and(|n| !n.is_empty()) {
-                                    span {
-                                        key: "{role}",
-                                        class: if secret.configured { "chip mono accent" } else { "chip mono warn" },
-                                        "{role}: {secret.name.clone().unwrap_or_default()}"
-                                    }
-                                }
-                            }
-                        }
-                        if let Some(uri) = connector.redirect_uri.clone() {
-                            code { class: "tiny", "{uri}" }
-                        }
-                        if connector.auth_modes.len() > 1 {
-                            div { class: "field",
-                                label { class: "field-label", "How it signs in" }
-                                select {
-                                    class: "input",
-                                    value: "{auth_mode}",
-                                    onchange: {
-                                        let id = id.clone();
-                                        move |event| session.write().set_connector_auth(&id, event.value())
-                                    },
-                                    for mode in &connector.auth_modes {
-                                        option { value: "{mode}", "{mode}" }
-                                    }
-                                }
-                            }
-                        }
-                        if id != "onedrive" {
-                            p { class: "tiny",
-                                "Turning a connector on makes it available. Give its tools to a bot in Bots. Reading and sending still ask you first."
-                            }
-                            if connector_auth_url(&id, connector.redirect_uri.as_deref()).is_some() {
-                                p { class: "tiny",
-                                    "Connect opens the provider's sign-in page. Register the address above with the client id the server stores, then paste the refresh token."
-                                }
-                            }
-                            div { class: "card-actions",
-                                button {
-                                    class: if enabled { "btn ghost sm" } else { "btn primary sm" },
-                                    onclick: {
-                                        let id = id.clone();
-                                        move |_| session.write().toggle_connector(&id)
-                                    },
-                                    if enabled { "Turn off" } else { "Turn on" }
-                                }
-                                button {
-                                    class: "btn ghost sm",
-                                    disabled: !can_save,
-                                    onclick: {
-                                        let id = id.clone();
-                                        move |_| session.write().save_connector(id.clone())
-                                    },
-                                    "Save settings"
-                                }
-                                button {
-                                    class: "btn ghost sm",
-                                    title: "Run a read-only check of the saved credentials",
-                                    disabled: !can_save || testing,
-                                    onclick: {
-                                        let id = id.clone();
-                                        move |_| session.write().test_connector(id.clone())
-                                    },
-                                    if testing { "Testing…" } else { "Test" }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
 #[component]
 fn MemoryView(session: Signal<Session>) -> Element {
     let memories = session.read().state.memories.clone();
@@ -7470,37 +6981,6 @@ mod tests {
     }
 
     #[test]
-    fn authorization_urls_are_fixed_https_endpoints() {
-        let url = connector_auth_url("gmail", None).expect("gmail has an authorization page");
-        assert!(url.starts_with("https://accounts.google.com/"), "{url}");
-        assert!(
-            connector_auth_url("notion", None)
-                .expect("notion has an authorization page")
-                .starts_with("https://api.notion.com/"),
-        );
-        assert!(
-            connector_auth_url("outlook", None)
-                .expect("outlook has an authorization page")
-                .starts_with("https://login.microsoftonline.com/"),
-        );
-        assert!(connector_auth_url("unknown", None).is_none());
-    }
-
-    #[test]
-    fn a_redirect_uri_is_appended_only_when_it_is_a_plain_address() {
-        let url = connector_auth_url("gmail", Some("http://127.0.0.1:8765/callback"))
-            .expect("gmail has an authorization page");
-        assert!(url.contains("redirect_uri="), "{url}");
-        assert!(url.starts_with("https://"), "{url}");
-        // Not an address, or carrying shell metacharacters: rejected.
-        assert!(connector_auth_url("gmail", Some("javascript:alert(1)")).is_none());
-        assert!(connector_auth_url("gmail", Some("https://ok.example/cb&calc")).is_none());
-        assert!(connector_auth_url("gmail", Some("https://ok.example/cb?state=1")).is_none());
-        assert!(connector_auth_url("gmail", Some("https://ok.example/\"")).is_none());
-        assert!(connector_auth_url("gmail", Some("   ")).is_some());
-    }
-
-    #[test]
     fn markdown_parser_handles_screenshot_patterns() {
         let text = r#"### **3. Cosa NON ho in questa sessione**
 - **`firecrawl_search`** o **`firecrawl_scrape`**: non sono attivi
@@ -7611,59 +7091,5 @@ mod tests {
             Some("Clicked on the page")
         );
         assert_eq!(tool_sentence("deck_build", "x", false), None);
-    }
-
-    fn connector(id: &str) -> ConnectorStatus {
-        ConnectorStatus {
-            id: id.into(),
-            kind: "api_key".into(),
-            enabled: false,
-            redirect_uri: None,
-            api_base: None,
-            default_inbox_id: None,
-            secrets: BTreeMap::new(),
-            auth: None,
-            auth_modes: Vec::new(),
-            oauth: None,
-            connected: None,
-        }
-    }
-
-    #[test]
-    fn each_connector_shows_one_action_that_fits_its_state() {
-        let onedrive = connector("onedrive");
-        assert_eq!(
-            connector_action(&onedrive, false, ""),
-            Some(ConnectorAction::ConnectOneDrive)
-        );
-        assert_eq!(
-            connector_action(&onedrive, true, ""),
-            Some(ConnectorAction::DisconnectOneDrive)
-        );
-        let mut notion = connector("notion");
-        notion.secrets.insert(
-            "api_key".into(),
-            serabot_desktop::SecretStatus {
-                name: Some("notion_key".into()),
-                configured: false,
-            },
-        );
-        assert_eq!(
-            connector_action(&notion, false, ""),
-            Some(ConnectorAction::AddKey)
-        );
-        assert_eq!(
-            connector_action(&notion, true, ""),
-            Some(ConnectorAction::ReplaceKey)
-        );
-        let gmail = connector("gmail");
-        assert!(matches!(
-            connector_action(&gmail, false, ""),
-            Some(ConnectorAction::Authorize(_))
-        ));
-        assert_eq!(connector_action(&connector("unknown"), false, ""), None);
-        assert_eq!(secret_label("api_key"), "API key");
-        assert_eq!(secret_label("refresh_token"), "Refresh token");
-        assert_eq!(connector_title("onedrive"), "OneDrive");
     }
 }
