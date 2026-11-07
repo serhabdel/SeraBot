@@ -159,6 +159,50 @@ impl Section {
     }
 }
 
+/// The sections of the Settings page, in list order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsSection {
+    Account,
+    Appearance,
+    Notifications,
+    Chat,
+    Telegram,
+    Voice,
+    Admin,
+    About,
+}
+
+impl SettingsSection {
+    pub const ALL: [Self; 8] = [
+        Self::Account,
+        Self::Appearance,
+        Self::Notifications,
+        Self::Chat,
+        Self::Telegram,
+        Self::Voice,
+        Self::Admin,
+        Self::About,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Account => "Account",
+            Self::Appearance => "Appearance",
+            Self::Notifications => "Notifications",
+            Self::Chat => "Chat",
+            Self::Telegram => "Telegram",
+            Self::Voice => "Voice",
+            Self::Admin => "Admin",
+            Self::About => "About",
+        }
+    }
+
+    /// Only admins see the Admin section.
+    pub fn visible(self, is_admin: bool) -> bool {
+        self != Self::Admin || is_admin
+    }
+}
+
 pub struct FleetDraft {
     pub bot_id: String,
     pub bot_description: String,
@@ -471,6 +515,7 @@ pub struct Session {
     pub theme: Theme,
     /// Device-local look and chat preferences (Settings page).
     pub prefs: creds::UiPrefs,
+    pub settings_section: SettingsSection,
     seen_approvals: Option<usize>,
     /// Usage page range in days (7, 30 or 90) and whether a load is running.
     pub usage_days: u32,
@@ -609,6 +654,7 @@ impl Session {
             connecting: false,
             theme,
             prefs: creds::UiPrefs::default(),
+            settings_section: SettingsSection::Account,
             seen_approvals: None,
             pins,
             usage_days: 30,
@@ -3778,8 +3824,29 @@ mod tests {
         AtomicBool, Duration, EventRefresh, Instant, Ordering, Session, SignInPhase, SignInUi,
         Theme, event_refresh, telegram_error,
     };
+    use super::SettingsSection;
     use crate::ApiError;
     use std::sync::Arc;
+
+    #[test]
+    fn admin_settings_section_is_hidden_from_members() {
+        let count = |admin| {
+            SettingsSection::ALL
+                .iter()
+                .filter(|section| section.visible(admin))
+                .count()
+        };
+        assert_eq!(count(true), 8);
+        assert_eq!(count(false), 7);
+        assert!(!SettingsSection::Admin.visible(false));
+    }
+
+    #[test]
+    fn system_theme_round_trips_and_toggles_to_dark() {
+        assert_eq!(Theme::from_stored(Some("system")), Theme::System);
+        assert_eq!(Theme::System.as_str(), "system");
+        assert_eq!(Theme::System.toggled(), Theme::Dark);
+    }
 
     #[test]
     fn a_team_event_refreshes_the_team_only_in_a_room() {

@@ -12,7 +12,7 @@ use serabot_desktop::{
     TaskStatus, Team, TeamMember, TeamMode,
     audio_capture::MicRecorder,
     branding, provider_presets,
-    session::{Section, Session, SignInPhase, Theme, humanize_label},
+    session::{Section, Session, SettingsSection, SignInPhase, Theme, humanize_label},
     teams,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -22,6 +22,9 @@ use crate::ui_browser::BrowserView;
 use crate::ui_connectors::ConnectorsView;
 use crate::ui_dock::BrowserDock;
 use crate::ui_settings::SettingsPanel;
+use crate::ui_settings_page::{
+    AboutCard, AppearanceCard, ChatPrefsCard, NotificationsCard, SettingsNav,
+};
 use crate::ui_usage::UsagePage;
 use crate::ui_vault::VaultPage;
 
@@ -5136,7 +5139,6 @@ fn ConversationsView(session: Signal<Session>) -> Element {
 
 #[component]
 fn SettingsView(session: Signal<Session>) -> Element {
-    let theme = session.read().theme;
     let signed_in_user = session.read().state.user.clone();
     let signing_out = session.read().sign_out.in_flight;
     let server = session.read().server.clone();
@@ -5261,476 +5263,495 @@ fn SettingsView(session: Signal<Session>) -> Element {
     };
     let gated_empty = gated_tools.is_empty();
     let egress_empty = egress.is_empty();
+    let sel = session.read().settings_section;
+    let settings_new_cards = rsx! {
+        if sel == SettingsSection::Appearance {
+            AppearanceCard { session }
+        }
+        if sel == SettingsSection::Notifications {
+            NotificationsCard { session }
+        }
+        if sel == SettingsSection::Chat {
+            ChatPrefsCard { session }
+        }
+        if sel == SettingsSection::About {
+            AboutCard { session }
+        }
+    };
     rsx! {
         div { class: "pane",
             div { class: "pane-head",
                 div {
                     h1 { class: "pane-title", "Settings" }
-                    p { class: "muted", "Your account, Telegram, safety checks, voice, appearance and updates." }
+                    p { class: "muted", "Your account, how SeraBot looks and behaves, and what is connected." }
                 }
             }
-            div { class: "pane-body",
-                div { class: "card",
-                    div { class: "card-head",
-                        h3 { class: "card-title", "Your account" }
-                    }
-                    p { class: "card-sub", "{server}" }
-                    if !version.is_empty() {
-                        p { class: "tiny", "Server {version}" }
-                    }
-                    if let Some(user) = &signed_in_user {
-                        div { class: "kv-row",
-                            span { class: "kv-key", "Signed in as" }
-                            span { class: "kv-val", "{user.label()}" }
+            div { class: "pane-body settings-layout",
+                SettingsNav { session }
+                div { class: "settings-content",
+                    {settings_new_cards}
+                    if sel == SettingsSection::Account {
+                    div { class: "card",
+                        div { class: "card-head",
+                            h3 { class: "card-title", "Your account" }
                         }
-                        if !user.email.is_empty() && user.email != user.label() {
+                        p { class: "card-sub", "{server}" }
+                        if !version.is_empty() {
+                            p { class: "tiny", "Server {version}" }
+                        }
+                        if let Some(user) = &signed_in_user {
                             div { class: "kv-row",
-                                span { class: "kv-key", "Email" }
-                                span { class: "kv-val", "{user.email}" }
+                                span { class: "kv-key", "Signed in as" }
+                                span { class: "kv-val", "{user.label()}" }
                             }
-                        }
-                        if !user.role.is_empty() {
-                            div { class: "kv-row",
-                                span { class: "kv-key", "Role" }
-                                span { class: "kv-val", "{user.role}" }
+                            if !user.email.is_empty() && user.email != user.label() {
+                                div { class: "kv-row",
+                                    span { class: "kv-key", "Email" }
+                                    span { class: "kv-val", "{user.email}" }
+                                }
                             }
-                        }
-                    } else {
-                        p { class: "tiny", "Signed in with a saved session." }
-                    }
-                    div { class: "card-actions",
-                        button {
-                            class: "btn danger",
-                            disabled: signing_out,
-                            title: "End this session on the server and remove it from this device",
-                            onclick: move |_| session.write().sign_out(),
-                            if signing_out { "Signing out…" } else { "Sign out" }
-                        }
-                        if signing_out {
-                            span { class: "spinner", title: "Signing out" }
-                        }
-                    }
-                }
-                div { class: "card",
-                    div { class: "card-head",
-                        h3 { class: "card-title", "Telegram" }
-                        div { class: "row",
-                            if telegram_loading {
-                                span { class: "spinner", title: "Reading Telegram status" }
+                            if !user.role.is_empty() {
+                                div { class: "kv-row",
+                                    span { class: "kv-key", "Role" }
+                                    span { class: "kv-val", "{user.role}" }
+                                }
                             }
+                        } else {
+                            p { class: "tiny", "Signed in with a saved session." }
+                        }
+                        div { class: "card-actions",
                             button {
-                                class: "btn ghost sm",
-                                disabled: telegram_loading || telegram_linking || telegram_unlinking,
-                                onclick: move |_| session.write().refresh_telegram(),
-                                Icon { name: "refresh", size: 14 }
-                                "Refresh status"
+                                class: "btn danger",
+                                disabled: signing_out,
+                                title: "End this session on the server and remove it from this device",
+                                onclick: move |_| session.write().sign_out(),
+                                if signing_out { "Signing out…" } else { "Sign out" }
+                            }
+                            if signing_out {
+                                span { class: "spinner", title: "Signing out" }
                             }
                         }
                     }
-                    p { class: "card-sub",
-                        "Link Telegram to chat with your bots from your phone. They use the same memory and ask you first, just like here."
                     }
-                    if let Some(status) = telegram_status {
-                        div { class: "chips",
-                            span {
-                                class: if status.enabled { "chip ok" } else { "chip muted" },
-                                if status.enabled { "Telegram on" } else { "Telegram off" }
-                            }
-                            span {
-                                class: if status.linked { "chip ok" } else { "chip muted" },
-                                if status.linked { "linked" } else { "not linked" }
-                            }
-                            if let Some(chat) = status.chat_label() {
-                                span { class: "chip mono", "{chat}" }
-                            }
-                            if let Some(since) = status.linked_at.as_deref() {
-                                span { class: "chip", "since {stamp(since)}" }
+                    if sel == SettingsSection::Telegram {
+                    div { class: "card",
+                        div { class: "card-head",
+                            h3 { class: "card-title", "Telegram" }
+                            div { class: "row",
+                                if telegram_loading {
+                                    span { class: "spinner", title: "Reading Telegram status" }
+                                }
+                                button {
+                                    class: "btn ghost sm",
+                                    disabled: telegram_loading || telegram_linking || telegram_unlinking,
+                                    onclick: move |_| session.write().refresh_telegram(),
+                                    Icon { name: "refresh", size: 14 }
+                                    "Refresh status"
+                                }
                             }
                         }
-                        if !status.enabled {
+                        p { class: "card-sub",
+                            "Link Telegram to chat with your bots from your phone. They use the same memory and ask you first, just like here."
+                        }
+                        if let Some(status) = telegram_status {
+                            div { class: "chips",
+                                span {
+                                    class: if status.enabled { "chip ok" } else { "chip muted" },
+                                    if status.enabled { "Telegram on" } else { "Telegram off" }
+                                }
+                                span {
+                                    class: if status.linked { "chip ok" } else { "chip muted" },
+                                    if status.linked { "linked" } else { "not linked" }
+                                }
+                                if let Some(chat) = status.chat_label() {
+                                    span { class: "chip mono", "{chat}" }
+                                }
+                                if let Some(since) = status.linked_at.as_deref() {
+                                    span { class: "chip", "since {stamp(since)}" }
+                                }
+                            }
+                            if !status.enabled {
+                                p { class: "tiny",
+                                    "Telegram is turned off on the server. Ask your admin to turn it on."
+                                }
+                            }
+                            if status.linked {
+                                if telegram_confirm {
+                                    div { class: "row",
+                                        span { class: "tiny",
+                                            "Unlink this chat? Messages from it will be ignored until you link again."
+                                        }
+                                        button {
+                                            class: "btn danger sm",
+                                            disabled: telegram_unlinking || telegram_loading,
+                                            onclick: move |_| session.write().confirm_unlink_telegram(),
+                                            if telegram_unlinking { "Unlinking…" } else { "Unlink" }
+                                        }
+                                        button {
+                                            class: "btn ghost sm",
+                                            disabled: telegram_unlinking,
+                                            onclick: move |_| session.write().cancel_unlink_telegram(),
+                                            "Cancel"
+                                        }
+                                    }
+                                } else {
+                                    div { class: "card-actions",
+                                        button {
+                                            class: "btn danger sm",
+                                            onclick: move |_| session.write().request_unlink_telegram(),
+                                            "Unlink Telegram"
+                                        }
+                                    }
+                                }
+                            } else if status.enabled {
+                                div { class: "card-actions",
+                                    button {
+                                        class: "btn primary",
+                                        disabled: telegram_linking || telegram_loading,
+                                        onclick: move |_| session.write().link_telegram(),
+                                        if telegram_linking { "Requesting code…" } else { "Link Telegram" }
+                                    }
+                                }
+                            }
+                        } else if telegram_loading {
+                            div { class: "skeleton block" }
+                        } else if telegram_loaded && telegram_error.is_none() {
                             p { class: "tiny",
-                                "Telegram is turned off on the server. Ask your admin to turn it on."
+                                "Telegram status is unavailable. Press Refresh status to retry."
+                            }
+                        } else if !telegram_loaded && telegram_error.is_none() {
+                            p { class: "tiny", "Reading Telegram status…" }
+                        }
+                        if let Some(link) = telegram_link {
+                            div { class: "field",
+                                label { class: "field-label", "Send this command to the SeraBot bot" }
+                                code { class: "link-code", "{link.command()}" }
+                                p { class: "tiny",
+                                    "The code works once and expires 10 minutes after it was requested. After sending it, press Refresh status."
+                                }
+                                if let Some(expires) = link.expires_at.as_deref() {
+                                    p { class: "tiny", "Expires {expires}." }
+                                }
                             }
                         }
-                        if status.linked {
-                            if telegram_confirm {
-                                div { class: "row",
-                                    span { class: "tiny",
-                                        "Unlink this chat? Messages from it will be ignored until you link again."
+                        if let Some(message) = telegram_error {
+                            div { class: "banner err", span { "{message}" } }
+                        }
+                    }
+                    }
+                    if sel == SettingsSection::Admin && can_admin {
+                    div { class: "card",
+                        div { class: "card-head",
+                            h3 { class: "card-title", "Safety checks" }
+                            div { class: "row",
+                                if status_loading {
+                                    span { class: "spinner", title: "Reading the server posture" }
+                                }
+                                button {
+                                    class: "btn ghost sm",
+                                    onclick: move |_| session.write().refresh_status(),
+                                    Icon { name: "refresh", size: 14 }
+                                    "Refresh"
+                                }
+                            }
+                        }
+                        p { class: "card-sub", "What the server checks before your bots act." }
+                        div { class: "chips",
+                            span { class: "chip", "Safety rules: {policy_version}" }
+                            span { class: "chip", "Tasks waiting: {pending_tasks}" }
+                            span { class: "chip", "Waiting for your OK: {pending_approvals}" }
+                            span {
+                                class: if restart_pending { "chip warn" } else { "chip ok" },
+                                if restart_pending { "Restart needed" } else { "Up to date" }
+                            }
+                        }
+                        if let Some(error) = status_error {
+                            div { class: "banner err", span { "{error}" } }
+                        }
+                        div { class: "field",
+                            label { class: "field-label", "Bots ask you first before using" }
+                            if bots_loaded {
+                                div { class: "chips",
+                                    for (_tool, label) in gated_tools {
+                                        span { class: "chip warn", "{label}" }
                                     }
-                                    button {
-                                        class: "btn danger sm",
-                                        disabled: telegram_unlinking || telegram_loading,
-                                        onclick: move |_| session.write().confirm_unlink_telegram(),
-                                        if telegram_unlinking { "Unlinking…" } else { "Unlink" }
-                                    }
-                                    button {
-                                        class: "btn ghost sm",
-                                        disabled: telegram_unlinking,
-                                        onclick: move |_| session.write().cancel_unlink_telegram(),
-                                        "Cancel"
+                                    if gated_empty {
+                                        span { class: "chip muted", "Nothing needs your OK" }
                                     }
                                 }
                             } else {
-                                div { class: "card-actions",
-                                    button {
-                                        class: "btn danger sm",
-                                        onclick: move |_| session.write().request_unlink_telegram(),
-                                        "Unlink Telegram"
+                                span { class: "hint", "unknown" }
+                            }
+                        }
+                        if !pending_tools_empty {
+                            div { class: "field",
+                                label { class: "field-label", "Waiting for your decision" }
+                                div { class: "chips",
+                                    for tool in pending_tools {
+                                        span { class: "chip accent", "{tool}" }
                                     }
                                 }
                             }
-                        } else if status.enabled {
-                            div { class: "card-actions",
-                                button {
-                                    class: "btn primary",
-                                    disabled: telegram_linking || telegram_loading,
-                                    onclick: move |_| session.write().link_telegram(),
-                                    if telegram_linking { "Requesting code…" } else { "Link Telegram" }
+                        }
+                        div { class: "field",
+                            label { class: "field-label", "Sending data to AI providers" }
+                            if providers_loaded {
+                                div { class: "chips",
+                                    for (provider_id, egress_state, approved) in egress {
+                                        span { class: if approved { "chip ok" } else { "chip warn" },
+                                            "{provider_id}: {egress_state}"
+                                        }
+                                    }
+                                    if egress_empty {
+                                        span { class: "chip muted", "No AI provider yet" }
+                                    }
                                 }
+                            } else {
+                                span { class: "hint", "unknown" }
                             }
                         }
-                    } else if telegram_loading {
-                        div { class: "skeleton block" }
-                    } else if telegram_loaded && telegram_error.is_none() {
-                        p { class: "tiny",
-                            "Telegram status is unavailable. Press Refresh status to retry."
-                        }
-                    } else if !telegram_loaded && telegram_error.is_none() {
-                        p { class: "tiny", "Reading Telegram status…" }
                     }
-                    if let Some(link) = telegram_link {
-                        div { class: "field",
-                            label { class: "field-label", "Send this command to the SeraBot bot" }
-                            code { class: "link-code", "{link.command()}" }
+                    }
+                    if sel == SettingsSection::Admin && can_admin {
+                    div { class: "card",
+                        div { class: "card-head",
+                            h3 { class: "card-title", "What's turned on" }
+                        }
+                        div { class: "chips",
+                            span {
+                                class: match audio_enabled { Some(true) => "chip ok", Some(false) => "chip warn", None => "chip muted" },
+                                match audio_enabled { Some(true) => "Audio on", Some(false) => "Audio off", None => "Audio unknown" }
+                            }
+                            span {
+                                class: match firecrawl_enabled { Some(true) => "chip ok", Some(false) => "chip muted", None => "chip muted" },
+                                match firecrawl_enabled { Some(true) => "Firecrawl on", Some(false) => "Firecrawl off", None => "Firecrawl unknown" }
+                            }
+                            span {
+                                class: match telegram_enabled { Some(true) => "chip ok", Some(false) => "chip muted", None => "chip muted" },
+                                match telegram_enabled { Some(true) => "Telegram on", Some(false) => "Telegram off", None => "Telegram unknown" }
+                            }
+                            span {
+                                class: match catalog_fetch { Some(true) => "chip ok", Some(false) => "chip warn", None => "chip muted" },
+                                match catalog_fetch { Some(true) => "Model lists update themselves", Some(false) => "Model lists are fixed", None => "Model lists unknown" }
+                            }
+                        }
+                        if audio_enabled == Some(true) {
                             p { class: "tiny",
-                                "The code works once and expires 10 minutes after it was requested. After sending it, press Refresh status."
+                                "Speech-to-text: {transcription}. Audio understanding: {understanding}."
                             }
-                            if let Some(expires) = link.expires_at.as_deref() {
-                                p { class: "tiny", "Expires {expires}." }
+                            p { class: "tiny",
+                                "Voice notes you send on Telegram are turned into text before the bot answers."
                             }
-                        }
-                    }
-                    if let Some(message) = telegram_error {
-                        div { class: "banner err", span { "{message}" } }
-                    }
-                }
-                div { class: "card",
-                    div { class: "card-head",
-                        h3 { class: "card-title", "Safety checks" }
-                        div { class: "row",
-                            if status_loading {
-                                span { class: "spinner", title: "Reading the server posture" }
-                            }
-                            button {
-                                class: "btn ghost sm",
-                                onclick: move |_| session.write().refresh_status(),
-                                Icon { name: "refresh", size: 14 }
-                                "Refresh"
-                            }
-                        }
-                    }
-                    p { class: "card-sub", "What the server checks before your bots act." }
-                    div { class: "chips",
-                        span { class: "chip", "Safety rules: {policy_version}" }
-                        span { class: "chip", "Tasks waiting: {pending_tasks}" }
-                        span { class: "chip", "Waiting for your OK: {pending_approvals}" }
-                        span {
-                            class: if restart_pending { "chip warn" } else { "chip ok" },
-                            if restart_pending { "Restart needed" } else { "Up to date" }
-                        }
-                    }
-                    if let Some(error) = status_error {
-                        div { class: "banner err", span { "{error}" } }
-                    }
-                    div { class: "field",
-                        label { class: "field-label", "Bots ask you first before using" }
-                        if bots_loaded {
-                            div { class: "chips",
-                                for (_tool, label) in gated_tools {
-                                    span { class: "chip warn", "{label}" }
-                                }
-                                if gated_empty {
-                                    span { class: "chip muted", "Nothing needs your OK" }
-                                }
-                            }
+                        } else if audio_enabled == Some(false) {
+                            p { class: "tiny", "Audio is turned off on the server." }
                         } else {
-                            span { class: "hint", "unknown" }
-                        }
-                    }
-                    if !pending_tools_empty {
-                        div { class: "field",
-                            label { class: "field-label", "Waiting for your decision" }
-                            div { class: "chips",
-                                for tool in pending_tools {
-                                    span { class: "chip accent", "{tool}" }
-                                }
+                            p { class: "tiny",
+                                "This server is too old to report what is turned on. Update it to see live status."
                             }
                         }
-                    }
-                    div { class: "field",
-                        label { class: "field-label", "Sending data to AI providers" }
-                        if providers_loaded {
-                            div { class: "chips",
-                                for (provider_id, egress_state, approved) in egress {
-                                    span { class: if approved { "chip ok" } else { "chip warn" },
-                                        "{provider_id}: {egress_state}"
-                                    }
-                                }
-                                if egress_empty {
-                                    span { class: "chip muted", "No AI provider yet" }
-                                }
+                        if catalog_fetch == Some(false) {
+                            p { class: "tiny",
+                                "Ask your admin to turn on live model lists, then use Fetch models on the AI keys page."
                             }
-                        } else {
-                            span { class: "hint", "unknown" }
-                        }
-                    }
-                }
-                div { class: "card",
-                    div { class: "card-head",
-                        h3 { class: "card-title", "What's turned on" }
-                    }
-                    div { class: "chips",
-                        span {
-                            class: match audio_enabled { Some(true) => "chip ok", Some(false) => "chip warn", None => "chip muted" },
-                            match audio_enabled { Some(true) => "Audio on", Some(false) => "Audio off", None => "Audio unknown" }
-                        }
-                        span {
-                            class: match firecrawl_enabled { Some(true) => "chip ok", Some(false) => "chip muted", None => "chip muted" },
-                            match firecrawl_enabled { Some(true) => "Firecrawl on", Some(false) => "Firecrawl off", None => "Firecrawl unknown" }
-                        }
-                        span {
-                            class: match telegram_enabled { Some(true) => "chip ok", Some(false) => "chip muted", None => "chip muted" },
-                            match telegram_enabled { Some(true) => "Telegram on", Some(false) => "Telegram off", None => "Telegram unknown" }
-                        }
-                        span {
-                            class: match catalog_fetch { Some(true) => "chip ok", Some(false) => "chip warn", None => "chip muted" },
-                            match catalog_fetch { Some(true) => "Model lists update themselves", Some(false) => "Model lists are fixed", None => "Model lists unknown" }
-                        }
-                    }
-                    if audio_enabled == Some(true) {
-                        p { class: "tiny",
-                            "Speech-to-text: {transcription}. Audio understanding: {understanding}."
-                        }
-                        p { class: "tiny",
-                            "Voice notes you send on Telegram are turned into text before the bot answers."
-                        }
-                    } else if audio_enabled == Some(false) {
-                        p { class: "tiny", "Audio is turned off on the server." }
-                    } else {
-                        p { class: "tiny",
-                            "This server is too old to report what is turned on. Update it to see live status."
-                        }
-                    }
-                    if catalog_fetch == Some(false) {
-                        p { class: "tiny",
-                            "Ask your admin to turn on live model lists, then use Fetch models on the AI keys page."
-                        }
-                    }
-                    div { class: "form-grid",
-                        div { class: "field",
-                            label { class: "field-label", "Speech-to-text model" }
-                            input {
-                                class: "input",
-                                value: "{audio_transcription}",
-                                placeholder: "speech-to-text model",
-                                oninput: move |event| session.write().audio.transcription_model = event.value(),
-                            }
-                        }
-                        div { class: "field",
-                            label { class: "field-label", "Audio understanding model" }
-                            input {
-                                class: "input",
-                                value: "{audio_understanding}",
-                                placeholder: "audio understanding model",
-                                oninput: move |event| session.write().audio.understanding_model = event.value(),
-                            }
-                        }
-                    }
-                    p { class: "tiny",
-                        "Audio uses the Mistral key you already saved under AI keys."
-                    }
-                    label { class: "check",
-                        input {
-                            "type": "checkbox",
-                            checked: audio_on,
-                            onchange: move |event| session.write().audio.enabled = event.checked(),
-                        }
-                        span { "Turn on audio transcription and understanding" }
-                    }
-                    button {
-                        class: "btn primary",
-                        disabled: !can_admin,
-                        onclick: move |_| session.write().save_audio(),
-                        "Save audio settings"
-                    }
-                }
-                div { class: "card",
-                    div { class: "card-head",
-                        h3 { class: "card-title", "Voice and scanned pages" }
-                        if voice_loading {
-                            span { class: "chip muted", "Loading" }
-                        }
-                    }
-                    div { class: "card-actions",
-                        span {
-                            class: if voice_stt_ready { "chip ok" } else { "chip warn" },
-                            if voice_stt_ready { "Speech-to-text ready" } else { "Speech-to-text off" }
-                        }
-                        span {
-                            class: if voice_tts_ready { "chip ok" } else { "chip warn" },
-                            if voice_tts_ready { "Voice replies ready" } else { "Voice replies off" }
-                        }
-                        span {
-                            class: if voice_ocr_ready { "chip ok" } else { "chip warn" },
-                            if voice_ocr_ready { "Scanned pages ready" } else { "Scanned pages off" }
-                        }
-                    }
-                    if !voice_loaded {
-                        p { class: "tiny",
-                            "Load the settings to see whether speech-to-text, voice replies and scanned-page reading can run on this server."
-                        }
-                        button {
-                            class: "btn ghost",
-                            disabled: voice_loading,
-                            onclick: move |_| session.write().load_voice(),
-                            "Load voice settings"
-                        }
-                    } else {
-                        p { class: "tiny",
-                            "Scanned PDFs and images are read with OCR when they have no text. Voice replies send a Telegram voice note instead of text."
-                        }
-                        if let Some(detail) = voice_stt_detail.clone() {
-                            p { class: "tiny", "Speech to text: {detail}" }
-                        }
-                        if let Some(detail) = voice_tts_detail.clone() {
-                            p { class: "tiny", "Voice replies: {detail}" }
-                        }
-                        if let Some(detail) = voice_ocr_detail.clone() {
-                            p { class: "tiny", "Scanned pages: {detail}" }
                         }
                         div { class: "form-grid",
                             div { class: "field",
                                 label { class: "field-label", "Speech-to-text model" }
                                 input {
                                     class: "input",
-                                    value: "{voice_stt}",
-                                    disabled: true,
+                                    value: "{audio_transcription}",
                                     placeholder: "speech-to-text model",
+                                    oninput: move |event| session.write().audio.transcription_model = event.value(),
                                 }
                             }
                             div { class: "field",
-                                label { class: "field-label", "Voice reply model" }
+                                label { class: "field-label", "Audio understanding model" }
                                 input {
                                     class: "input",
-                                    value: "{voice_tts}",
-                                    placeholder: "voxtral-mini-tts-2603",
-                                    oninput: move |event| session.write().voice.tts_model = event.value(),
-                                }
-                            }
-                            div { class: "field",
-                                label { class: "field-label", "Voice" }
-                                input {
-                                    class: "input",
-                                    value: "{voice_id}",
-                                    placeholder: "voice name from your provider",
-                                    oninput: move |event| session.write().voice.voice_id = event.value(),
-                                }
-                            }
-                            div { class: "field",
-                                label { class: "field-label", "Scanned-page model" }
-                                input {
-                                    class: "input",
-                                    value: "{voice_ocr}",
-                                    placeholder: "mistral-ocr-latest",
-                                    oninput: move |event| session.write().voice.ocr_model = event.value(),
-                                }
-                            }
-                        }
-                        label { class: "check",
-                            input {
-                                "type": "checkbox",
-                                checked: voice_ocr_enabled,
-                                onchange: move |event| session.write().voice.ocr_enabled = event.checked(),
-                            }
-                            span { "Read scanned PDFs and images when they have no text" }
-                        }
-                        div { class: "card-actions",
-                            for mode in ["text", "voice"] {
-                                button {
-                                    class: if voice_reply_mode == mode { "btn primary" } else { "btn ghost" },
-                                    onclick: {
-                                        let mode = mode.to_string();
-                                        move |_| session.write().voice.reply_mode = mode.clone()
-                                    },
-                                    if mode == "voice" { "Reply with voice" } else { "Reply with text" }
+                                    value: "{audio_understanding}",
+                                    placeholder: "audio understanding model",
+                                    oninput: move |event| session.write().audio.understanding_model = event.value(),
                                 }
                             }
                         }
                         p { class: "tiny",
-                            "Voice replies stop at {voice_max_chars} characters. In Telegram, /voice and /text switch the style for that chat."
+                            "Audio uses the Mistral key you already saved under AI keys."
+                        }
+                        label { class: "check",
+                            input {
+                                "type": "checkbox",
+                                checked: audio_on,
+                                onchange: move |event| session.write().audio.enabled = event.checked(),
+                            }
+                            span { "Turn on audio transcription and understanding" }
                         }
                         button {
                             class: "btn primary",
                             disabled: !can_admin,
-                            onclick: move |_| session.write().save_voice(),
-                            "Save voice settings"
+                            onclick: move |_| session.write().save_audio(),
+                            "Save audio settings"
                         }
                     }
-                }
-                div { class: "card",
-                    div { class: "card-head",
-                        h3 { class: "card-title", "Appearance" }
                     }
-                    div { class: "card-actions",
-                        for mode in [Theme::Dark, Theme::Light] {
+                    if sel == SettingsSection::Voice {
+                    div { class: "card",
+                        div { class: "card-head",
+                            h3 { class: "card-title", "Voice and scanned pages" }
+                            if voice_loading {
+                                span { class: "chip muted", "Loading" }
+                            }
+                        }
+                        div { class: "card-actions",
+                            span {
+                                class: if voice_stt_ready { "chip ok" } else { "chip warn" },
+                                if voice_stt_ready { "Speech-to-text ready" } else { "Speech-to-text off" }
+                            }
+                            span {
+                                class: if voice_tts_ready { "chip ok" } else { "chip warn" },
+                                if voice_tts_ready { "Voice replies ready" } else { "Voice replies off" }
+                            }
+                            span {
+                                class: if voice_ocr_ready { "chip ok" } else { "chip warn" },
+                                if voice_ocr_ready { "Scanned pages ready" } else { "Scanned pages off" }
+                            }
+                        }
+                        if !voice_loaded {
+                            p { class: "tiny",
+                                "Load the settings to see whether speech-to-text, voice replies and scanned-page reading can run on this server."
+                            }
                             button {
-                                class: if theme == mode { "btn primary" } else { "btn ghost" },
-                                onclick: move |_| session.write().set_theme(mode),
-                                "{mode:?}"
+                                class: "btn ghost",
+                                disabled: voice_loading,
+                                onclick: move |_| session.write().load_voice(),
+                                "Load voice settings"
+                            }
+                        } else {
+                            p { class: "tiny",
+                                "Scanned PDFs and images are read with OCR when they have no text. Voice replies send a Telegram voice note instead of text."
+                            }
+                            if let Some(detail) = voice_stt_detail.clone() {
+                                p { class: "tiny", "Speech to text: {detail}" }
+                            }
+                            if let Some(detail) = voice_tts_detail.clone() {
+                                p { class: "tiny", "Voice replies: {detail}" }
+                            }
+                            if let Some(detail) = voice_ocr_detail.clone() {
+                                p { class: "tiny", "Scanned pages: {detail}" }
+                            }
+                            div { class: "form-grid",
+                                div { class: "field",
+                                    label { class: "field-label", "Speech-to-text model" }
+                                    input {
+                                        class: "input",
+                                        value: "{voice_stt}",
+                                        disabled: true,
+                                        placeholder: "speech-to-text model",
+                                    }
+                                }
+                                div { class: "field",
+                                    label { class: "field-label", "Voice reply model" }
+                                    input {
+                                        class: "input",
+                                        value: "{voice_tts}",
+                                        placeholder: "voxtral-mini-tts-2603",
+                                        oninput: move |event| session.write().voice.tts_model = event.value(),
+                                    }
+                                }
+                                div { class: "field",
+                                    label { class: "field-label", "Voice" }
+                                    input {
+                                        class: "input",
+                                        value: "{voice_id}",
+                                        placeholder: "voice name from your provider",
+                                        oninput: move |event| session.write().voice.voice_id = event.value(),
+                                    }
+                                }
+                                div { class: "field",
+                                    label { class: "field-label", "Scanned-page model" }
+                                    input {
+                                        class: "input",
+                                        value: "{voice_ocr}",
+                                        placeholder: "mistral-ocr-latest",
+                                        oninput: move |event| session.write().voice.ocr_model = event.value(),
+                                    }
+                                }
+                            }
+                            label { class: "check",
+                                input {
+                                    "type": "checkbox",
+                                    checked: voice_ocr_enabled,
+                                    onchange: move |event| session.write().voice.ocr_enabled = event.checked(),
+                                }
+                                span { "Read scanned PDFs and images when they have no text" }
+                            }
+                            div { class: "card-actions",
+                                for mode in ["text", "voice"] {
+                                    button {
+                                        class: if voice_reply_mode == mode { "btn primary" } else { "btn ghost" },
+                                        onclick: {
+                                            let mode = mode.to_string();
+                                            move |_| session.write().voice.reply_mode = mode.clone()
+                                        },
+                                        if mode == "voice" { "Reply with voice" } else { "Reply with text" }
+                                    }
+                                }
+                            }
+                            p { class: "tiny",
+                                "Voice replies stop at {voice_max_chars} characters. In Telegram, /voice and /text switch the style for that chat."
+                            }
+                            button {
+                                class: "btn primary",
+                                disabled: !can_admin,
+                                onclick: move |_| session.write().save_voice(),
+                                "Save voice settings"
                             }
                         }
                     }
-                }
-                div { class: "card",
-                    div { class: "card-head",
-                        h3 { class: "card-title", "Updates" }
                     }
-                    button {
-                        class: "btn ghost",
-                        disabled: checking,
-                        onclick: move |_| session.write().check_updates_manual(),
-                        if checking { "Checking…" } else { "Check for updates" }
-                    }
-                    if let Some(message) = update_notice {
-                        p { class: "tiny", "{message}" }
-                    }
-                    if let Some(info) = update {
-                        p { class: "accent", "v{info.version} available" }
+                    if sel == SettingsSection::About {
+                    div { class: "card",
+                        div { class: "card-head",
+                            h3 { class: "card-title", "Updates" }
+                        }
                         button {
-                            class: "btn primary",
-                            onclick: {
-                                let info = info.clone();
-                                move |_| {
-                                    let result = session.write().apply_update(&info);
-                                    match result {
-                                        Ok(()) => std::process::exit(0),
-                                        Err(error) => session.write().update.error = Some(error),
+                            class: "btn ghost",
+                            disabled: checking,
+                            onclick: move |_| session.write().check_updates_manual(),
+                            if checking { "Checking…" } else { "Check for updates" }
+                        }
+                        if let Some(message) = update_notice {
+                            p { class: "tiny", "{message}" }
+                        }
+                        if let Some(info) = update {
+                            p { class: "accent", "v{info.version} available" }
+                            button {
+                                class: "btn primary",
+                                onclick: {
+                                    let info = info.clone();
+                                    move |_| {
+                                        let result = session.write().apply_update(&info);
+                                        match result {
+                                            Ok(()) => std::process::exit(0),
+                                            Err(error) => session.write().update.error = Some(error),
+                                        }
                                     }
-                                }
-                            },
-                            "Install and restart"
+                                },
+                                "Install and restart"
+                            }
+                        }
+                        if let Some(error) = update_error {
+                            p { class: "error-text", "{error}" }
                         }
                     }
-                    if let Some(error) = update_error {
-                        p { class: "error-text", "{error}" }
                     }
-                }
-                div { class: "card",
-                    div { class: "card-head",
-                        h3 { class: "card-title", "Keyboard" }
+                    if sel == SettingsSection::Chat {
+                    div { class: "card",
+                        div { class: "card-head",
+                            h3 { class: "card-title", "Keyboard" }
+                        }
+                        p { class: "tiny", "Enter sends, Shift+Enter adds a line, Ctrl/Cmd+K focuses search, Esc closes the topmost sheet or menu." }
                     }
-                    p { class: "tiny", "Enter sends, Shift+Enter adds a line, Ctrl/Cmd+K focuses search, Esc closes the topmost sheet or menu." }
+                    }
                 }
             }
         }
