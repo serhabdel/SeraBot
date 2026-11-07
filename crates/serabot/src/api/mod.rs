@@ -308,7 +308,11 @@ pub fn router(state: ApiState) -> Router {
             post(unarchive_conversation),
         )
         .route("/v1/memories", get(list_memories).post(add_memory))
-        .route("/v1/memories/{id}", delete(delete_memory))
+        .route("/v1/memories/stats", get(memory_stats))
+        .route(
+            "/v1/memories/{id}",
+            patch(patch_memory).delete(delete_memory),
+        )
         .route("/v1/vault", get(list_vault))
         .route("/v1/vault/{name}", put(put_vault).delete(delete_vault))
         .route("/v1/providers", get(list_providers))
@@ -386,6 +390,7 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/conversations/{id}/library", get(conversation_library))
         .route("/v1/conversations/{id}/plan", get(get_conversation_plan))
+        .route("/v1/conversations/{id}/cancel", post(cancel_conversation))
         .route(
             "/v1/conversations/{id}/auto-approve",
             get(get_auto_approve).put(set_auto_approve),
@@ -720,6 +725,26 @@ struct ApiErrorBody {
 
 impl IntoResponse for SeraError {
     fn into_response(self) -> Response {
+        if let SeraError::Upstream { code, message, .. } = &self {
+            // A bad key, plan, or request is the caller's to fix (422). An
+            // outage is a gateway failure (502). A rate limit is a 503 and
+            // not 502: the call was never run, so clients must not treat it
+            // as an unknown outcome. Never 401: the desktop treats that as an
+            // expired session.
+            let status = match *code {
+                "composio_unavailable" => StatusCode::BAD_GATEWAY,
+                "composio_rate_limited" => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::UNPROCESSABLE_ENTITY,
+            };
+            return (
+                status,
+                Json(ApiErrorBody {
+                    error: message.clone(),
+                    code,
+                }),
+            )
+                .into_response();
+        }
         let (status, code, message) = match &self {
             SeraError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found", "not found"),
             SeraError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden", "forbidden"),

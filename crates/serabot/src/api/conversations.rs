@@ -645,6 +645,20 @@ pub(super) async fn get_conversation_plan(
     Ok(Json(json!({"plan": body})))
 }
 
+/// Stop the caller's running turns in this conversation. The turns end at
+/// their next checkpoint with a "Stopped." reply. `stopping` counts the
+/// turns that were marked; 0 means nothing was running. Another user's
+/// conversation reads as unknown.
+pub(super) async fn cancel_conversation(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    require_own_or_new_conversation(&state, &user.id, &id)?;
+    let stopping = state.runtime.request_stop(&user.id, &id)?;
+    Ok(Json(json!({"conversation_id": id, "stopping": stopping})))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AutoApproveRequest {

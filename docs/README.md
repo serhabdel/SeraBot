@@ -22,7 +22,34 @@ artifacts.
 | [Crafting Apps adoption](craft-adoption.md) | Storytold craft repos: take `deckcraft-pptx` for text-only generated decks and bounded import/edit of owner decks; skip the editors, MCP servers, and egui shells. |
 | [ElevenLabs](elevenlabs.md) | Speech, STT, sound effects, and image/video flow tools. |
 | [Owner wake checklist](owner-wake.md) | Morning status: `main` tip, OVH binary for `27b1018`, configure-later, smoke commands. |
+| [Knowledge packs](knowledge-packs.md) | Import the owner's own accounting guides into the comptable bot's document inbox. |
 | [Multi-user spec](specs/multi-user-reconstruction.md) | Owner-approved and implemented: small-circle multi-user — OIDC sign-in, UID-scoped data, per-user bots, credentials, and connectors. |
+
+## Bot roster
+
+The default fleet seeds twelve bots per user from `bots/*.toml` and
+`prompts/*.txt`. `main` is the only orchestrator and delegates to the others.
+Each bot has a default picture (`main` uses the brand icon) that an upload
+overrides.
+
+| Bot | Role | Focus | Key tools |
+| --- | --- | --- | --- |
+| main | orchestrator | Front door; routes requests and delegates | delegate, rag_search, deck and office tools |
+| analyst | specialist | Documents, transcripts, spreadsheets | xlsx and docx tools, document_index |
+| maker | specialist | Decks, Word and Excel deliverables | deck_build, docx_build, onedrive (approval) |
+| watcher | specialist | Monitored sources, deadlines, briefs | watch_now, fetch_url |
+| legal | specialist | Curated legal corpus (disabled until curated) | rag_search |
+| comptable | specialist | Moroccan accounting, tax, payroll | rag_search, xlsx tools, ma-tax-2026, pcm-cgnc |
+| auditor | specialist | Checklists, controls, reconciliations | rag_search, xlsx tools |
+| marketer | specialist | Campaigns, copy, social posts, SEO briefs | deck_build, docx_build, web search |
+| markets | specialist | Market and stock research, read-only | web search, xlsx tools |
+| courier | specialist | Telegram drafts; sends files only with approval | telegram_send_document (approval), composio (approval) |
+| whatsapp | specialist | WhatsApp drafts and approved sends | composio tools (every execute needs approval) |
+| inbox | specialist | Email triage and drafts; never sends | gmail and outlook list tools, composio (approval) |
+
+Bots that send or delete anything through an external account keep approval
+on: `telegram_send_document`, `composio_execute` (for the messaging bots), and
+`onedrive_upload`. Only `main` has the `delegate` tool.
 
 Related sources of truth:
 

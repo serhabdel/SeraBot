@@ -1,8 +1,8 @@
 use crate::{
     ApiError, Approval, AuthUser, BotDetail, BotSummary, Catalog, ConnectorStatus,
     ConnectorTestResult, ConversationSummary, CreatedBot, CreatedConversation, CreatedGroup,
-    CreatedSkill, LibraryEntry, MemoryEntry, Message, Onboarding, ProviderStatus, Scope, Selection,
-    SkillSummary, Task, Team, UsageReport,
+    CreatedSkill, LibraryEntry, MemoryEntry, MemoryStatsView, Message, Onboarding, ProviderStatus,
+    Scope, Selection, SkillSummary, Task, Team, UsageReport,
     avatars::AvatarImage,
     worker::{OperationKind, Reply},
 };
@@ -43,6 +43,8 @@ pub struct State {
     pub archived_loaded: bool,
     pub memories: Vec<MemoryEntry>,
     pub memories_loaded: bool,
+    /// Header counts for the Memory page; `None` until fetched or after a change.
+    pub memory_stats: Option<MemoryStatsView>,
     pub providers: Vec<ProviderStatus>,
     pub providers_loaded: bool,
     pub connectors: Vec<ConnectorStatus>,
@@ -127,6 +129,7 @@ impl Default for State {
             archived_loaded: false,
             memories: Vec::new(),
             memories_loaded: false,
+            memory_stats: None,
             providers: Vec::new(),
             providers_loaded: false,
             connectors: Vec::new(),
@@ -393,6 +396,18 @@ impl State {
                 }
                 self.memories_loaded = true;
             }
+            Reply::UpdatedMemory(memory) => {
+                if let Some(existing) = self
+                    .memories
+                    .iter_mut()
+                    .find(|existing| existing.id == memory.id)
+                {
+                    *existing = memory;
+                }
+            }
+            Reply::MemoryStats(stats) => {
+                self.memory_stats = Some(stats);
+            }
             Reply::DeletedMemory(id) => {
                 self.memories.retain(|memory| memory.id != id);
             }
@@ -430,6 +445,8 @@ impl State {
             Reply::Artifact { .. } => {}
             // The session keeps uploaded attachments on the composer draft.
             Reply::Attached(_) => {}
+            // The stop result is shown as a toast by the session.
+            Reply::Stopping(_) => {}
             Reply::OAuthSignedIn { id, device_code } => {
                 self.oauth_result = Some((id, device_code));
             }
@@ -856,6 +873,12 @@ mod tests {
             source: "operator:desktop".into(),
             created_at: "2026-10-29T10:00:00.000Z".into(),
             updated_at: "2026-10-29T10:00:00.000Z".into(),
+            origin: "explicit".into(),
+            status: "active".into(),
+            bot: None,
+            importance: 0.5,
+            last_recalled_at: None,
+            recall_count: 0,
         };
         state.receive(&scope, Reply::AddedMemory(memory.clone()));
         state.receive(&scope, Reply::AddedMemory(memory.clone()));

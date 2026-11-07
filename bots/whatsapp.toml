@@ -1,0 +1,17 @@
+name = "whatsapp"
+trigger = "command"
+system_prompt = "prompts/whatsapp.txt"
+skills = ["messaging-etiquette"]
+tools = [
+  "skill_list",
+  "skill_search",
+  "skill_load",
+  "memory_save",
+  "memory_list",
+  "memory_delete",
+  "composio_search_tools",
+  "composio_connect",
+  "composio_execute",
+]
+require_approval = ["composio_execute"]
+enabled = true

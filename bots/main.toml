@@ -1,6 +1,17 @@
 name = "main"
 role = "orchestrator"
-delegates = ["analyst", "maker", "watcher"]
+delegates = [
+  "analyst",
+  "maker",
+  "watcher",
+  "comptable",
+  "auditor",
+  "marketer",
+  "markets",
+  "courier",
+  "whatsapp",
+  "inbox",
+]
 trigger = "command"
 system_prompt = "prompts/main.txt"
 skills = ["triage", "ask", "firecrawl", "audio", "elevenlabs", "scheduler", "skill-creator"]
@@ -11,6 +22,8 @@ tools = [
   "skill_load",
   "memory_save",
   "memory_list",
+  "memory_search",
+  "memory_update",
   "memory_delete",
   "rag_search",
   "deck_build",
@@ -62,6 +75,7 @@ tools = [
   "browser_close",
   "browser_tabs",
   "browser_new_tab",
+  "telegram_send_document",
   "local_list",
   "local_read",
   "local_write",

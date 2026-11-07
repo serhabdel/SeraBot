@@ -16,6 +16,7 @@ pub mod connectors;
 pub mod deck;
 #[cfg(feature = "pptx")]
 pub mod deck_pptx;
+pub mod default_avatars;
 pub mod delegate;
 pub mod documents;
 #[cfg(feature = "docx")]
@@ -31,6 +32,7 @@ pub mod gateway;
 pub mod llm;
 pub mod local_relay;
 pub mod maker;
+pub mod mem0;
 pub mod memory;
 pub mod model_router;
 pub mod ocr;

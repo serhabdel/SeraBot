@@ -1,0 +1,25 @@
+name = "comptable"
+trigger = "file"
+system_prompt = "prompts/comptable.txt"
+skills = ["ma-tax-2026", "pcm-cgnc", "ma-payroll", "financial-analysis", "xlsx"]
+tools = [
+  "skill_list",
+  "skill_search",
+  "skill_load",
+  "memory_save",
+  "memory_list",
+  "memory_delete",
+  "rag_search",
+  "document_index",
+  "pdf_inspect",
+  "docx_inspect",
+  "docx_read",
+  "xlsx_inspect",
+  "xlsx_read",
+  "xlsx_analyze",
+  "xlsx_build",
+  "fetch_url",
+  "tavily_search",
+]
+require_approval = []
+enabled = true

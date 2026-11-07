@@ -85,3 +85,33 @@ not `packs/` entries.
 Built-in integration skills (`firecrawl`, `onedrive`, `audio`, `elevenlabs`,
 `scheduler`, `skill-creator`) document optional subsystems configured in
 `serabot.toml`.
+
+## Built-in bot skills (0.19)
+
+Each shipped bot allowlists the skill ids below in `bots/*.toml`. Bodies live in
+`skills/<id>/SKILL.md` and are loaded on demand with `skill_load`.
+
+| Skill id | Bot or bots | What it covers |
+| --- | --- | --- |
+| `ma-tax-2026` | comptable, auditor | Moroccan IS, IR, TVA, withholding, minimum tax, CSS, calendar. Marked "a verifier" where unconfirmed. |
+| `pcm-cgnc` | comptable, auditor | PCM classes 1 to 8, key accounts, standard entries, closing, liasse tables. |
+| `ma-payroll` | comptable | Gross to net: CNSS, AMO, professional deduction, IR barème, family deductions, worked example. |
+| `financial-analysis` | comptable, markets, analyst | FR, BFR, TN, ratios, SIG, CAF, break-even. |
+| `audit-checklist` | auditor | Control areas, evidence requests, finding template. Advisory only. |
+| `bank-reconciliation` | auditor | Matching rules, timing items, reconciliation formula, exception list. |
+| `campaign-plan` | marketer | SMART objective, segments, budget formulas, KPIs, approvals. |
+| `social-posts` | marketer | Platform lengths, batch variants, claims check, approval draft. |
+| `equity-research` | markets | Fundamentals, multiples, DCF sketch, risks, source log. Information only. |
+| `email-triage` | inbox | Priority rules, scoring, reply templates, phishing check. Drafts only. |
+| `messaging-etiquette` | courier, whatsapp, inbox | Approval flow, tone, timing, privacy for outbound messages. |
+| `contract-review` | legal | Clause review procedure and red flags. Not legal advice. |
+| `monitoring-playbook` | watcher | Source registry, change classes, failure handling, brief order. |
+| `design-brief` | maker | Design brief, colour and type roles, contrast checks, hand-off. |
+| `xlsx`, `copy`, `write`, `onepager`, `design`, `docx`, `pptx` | analyst, maker, marketer, comptable | Existing office and writing packs, reused. |
+
+The accounting skills end with the line "Sources: Loi de Finances 2026 (BO),
+CGI, CGNC — verify rates against the current BO." Rates they mark "a verifier"
+are not confirmed; check them before a filing or a payment.
+
+To add the owner's own reference guides for the comptable bot, see
+[knowledge packs](knowledge-packs.md).

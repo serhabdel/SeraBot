@@ -1,13 +1,15 @@
 name = "analyst"
 trigger = "file"
 system_prompt = "prompts/analyst.txt"
-skills = ["synthesis", "transcript", "xlsx", "timesheets", "ask"]
+skills = ["synthesis", "transcript", "xlsx", "docx", "pptx", "timesheets", "ask", "financial-analysis"]
 tools = [
   "skill_list",
   "skill_search",
   "skill_load",
   "memory_save",
   "memory_list",
+  "memory_search",
+  "memory_update",
   "memory_delete",
   "rag_search",
   "deck_build",
@@ -40,6 +42,8 @@ tools = [
   "firecrawl_crawl",
   "firecrawl_extract",
   "tavily_search",
+  "local_list",
+  "local_read",
 ]
 require_approval = []
 enabled = true

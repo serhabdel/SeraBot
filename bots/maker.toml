@@ -1,13 +1,15 @@
 name = "maker"
 trigger = "command"
 system_prompt = "prompts/maker.txt"
-skills = ["deck", "copy", "write", "design", "onepager", "translate-it-fr", "docx", "pptx", "onedrive", "elevenlabs"]
+skills = ["deck", "copy", "write", "design", "onepager", "translate-it-fr", "docx", "pptx", "xlsx", "onedrive", "elevenlabs", "design-brief"]
 tools = [
   "skill_list",
   "skill_search",
   "skill_load",
   "memory_save",
   "memory_list",
+  "memory_search",
+  "memory_update",
   "memory_delete",
   "rag_search",
   "deck_build",
@@ -40,6 +42,8 @@ tools = [
   "elevenlabs_transcribe",
   "elevenlabs_generate_image",
   "elevenlabs_generate_video",
+  "local_list",
+  "local_read",
 ]
 require_approval = ["onedrive_upload"]
 enabled = true

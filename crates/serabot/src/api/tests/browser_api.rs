@@ -37,6 +37,7 @@ fn rig(with_browser: bool) -> Rig {
         None,
         None,
         with_browser.then(|| manager.clone()),
+        None,
     );
     let (member, member_token) = member_with_session(&store);
     Rig {

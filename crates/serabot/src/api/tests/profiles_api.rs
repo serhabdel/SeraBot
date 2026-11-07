@@ -106,6 +106,68 @@ async fn bot_avatar_round_trip_reencodes_and_lists_a_version() {
     assert_eq!(gone.status(), StatusCode::NOT_FOUND);
 }
 
+/// A shipped bot without an upload serves its bundled picture; an upload
+/// overrides it; deleting the upload restores it. A bot with no default and
+/// no upload keeps answering 404.
+#[tokio::test]
+async fn bundled_default_avatar_falls_back_and_yields_to_an_upload() {
+    let (app, _, store) = app();
+    let token = member(&store, "avatar-defaults");
+    make_bot(&app, &token, "Analyst").await;
+
+    let default = call(&app, &token, "GET", "/v1/bots/analyst/avatar", None).await;
+    assert_eq!(default.status(), StatusCode::OK);
+    assert_eq!(default.headers()["content-type"], "image/png");
+    let bundled = body_bytes(default).await;
+    assert_eq!(
+        bundled,
+        crate::default_avatars::default_avatar("analyst")
+            .unwrap()
+            .to_vec()
+    );
+
+    let listed = read_json(call(&app, &token, "GET", "/v1/bots", None).await).await;
+    let bot = listed["bots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|bot| bot["id"] == "analyst")
+        .unwrap();
+    assert!(
+        bot["avatar_version"]
+            .as_str()
+            .unwrap()
+            .starts_with(crate::default_avatars::DEFAULT_AVATAR_VERSION_PREFIX)
+    );
+
+    let upload = synthetic(ImageFormat::Png, 64, 48);
+    let put = put_bytes(&app, &token, "/v1/bots/analyst/avatar", upload).await;
+    assert_eq!(put.status(), StatusCode::OK);
+    let overridden =
+        body_bytes(call(&app, &token, "GET", "/v1/bots/analyst/avatar", None).await).await;
+    assert_ne!(overridden, bundled);
+    assert_eq!(
+        image::load_from_memory(&overridden).unwrap().width(),
+        crate::avatar::AVATAR_EDGE
+    );
+
+    let removed =
+        read_json(call(&app, &token, "DELETE", "/v1/bots/analyst/avatar", None).await).await;
+    assert_eq!(removed["deleted"], true);
+    let restored = call(&app, &token, "GET", "/v1/bots/analyst/avatar", None).await;
+    assert_eq!(restored.status(), StatusCode::OK);
+    assert_eq!(body_bytes(restored).await, bundled);
+
+    // The owner's own fleet has main with the brand icon, and a bot the
+    // templates do not know still has no picture.
+    let main = call(&app, &token, "GET", "/v1/bots/main/avatar", None).await;
+    assert_eq!(main.status(), StatusCode::OK);
+    assert_eq!(main.headers()["content-type"], "image/png");
+    make_bot(&app, &token, "Scribe").await;
+    let none = call(&app, &token, "GET", "/v1/bots/scribe/avatar", None).await;
+    assert_eq!(none.status(), StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn avatar_upload_rejects_bad_input() {
     let (app, _, store) = app();

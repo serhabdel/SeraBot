@@ -80,6 +80,9 @@ pub(crate) fn ComposioCard(session: Signal<Session>, connector: ConnectorStatus)
                         placeholder: "Paste it here",
                         oninput: move |event| key.set(event.value()),
                     }
+                    p { class: "tiny",
+                        "Paste the project API key from platform.composio.dev → Settings → API keys."
+                    }
                 }
                 p { class: "tiny",
                     "The key stays on the server and is never shown again. It lets your bots use only the apps you link here."

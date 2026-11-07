@@ -34,7 +34,7 @@ use crate::fleet::FleetRegistry;
 use crate::gateway::{
     Decision, DecisionResult, Gateway, Tool, ToolContext, ToolOutcome, ToolOutput, ToolSpec,
 };
-use crate::memory;
+use crate::memory::{self, MemoryHub};
 use crate::model_router::{ModelRouter, ModelSelection, PinnedRoute, ProviderView};
 use crate::orchestration::{
     BotRole, ConversationKind, HandoffContext, ORCHESTRATOR_BOT, assistant_speaker,
@@ -51,10 +51,12 @@ use crate::util::truncate_chars;
 
 mod activity;
 use activity::StepPhase;
+mod extract;
 mod models;
 mod notifier;
 mod prompts;
 mod rag_tool;
+mod recall;
 mod routing;
 mod schedules;
 #[cfg(test)]
@@ -162,6 +164,11 @@ pub struct Runtime {
     semaphore: Arc<Semaphore>,
     worker_id: String,
     shutdown: CancellationToken,
+    memory: MemoryHub,
+    extract_gate: Arc<extract::ExtractGate>,
+    /// Turn ids the owner asked to stop. The turn loop checks this between
+    /// model and tool steps; a marked turn never starts another step.
+    stop_requests: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,6 +222,14 @@ impl Runtime {
             }
         }
         let semaphore = Arc::new(Semaphore::new(config.runtime.max_concurrent_turns));
+        let memory = MemoryHub::new(&config.memory, gateway.clone())?;
+        if let Some(model) = &config.memory.extract_model
+            && router.provider_for_model(model).is_none()
+        {
+            return Err(SeraError::Config(format!(
+                "memory.extract_model {model} is not served by any configured provider"
+            )));
+        }
         Ok(Self {
             config,
             store,
@@ -225,7 +240,45 @@ impl Runtime {
             semaphore,
             worker_id: format!("worker-{}", &uuid::Uuid::new_v4().to_string()[..8]),
             shutdown,
+            memory,
+            extract_gate: Arc::new(extract::ExtractGate::default()),
+            stop_requests: Arc::new(std::sync::Mutex::new(HashSet::new())),
         })
+    }
+
+    /// The agent memory provider: local SQLite, plus the optional third-party
+    /// recall source when `[memory] provider = "mem0"`.
+    pub fn memory(&self) -> &MemoryHub {
+        &self.memory
+    }
+
+    /// Ask the acting user's running turns in one conversation to stop.
+    /// Each running turn is marked; its loop ends at the next checkpoint with
+    /// a "Stopped." reply and never starts another model or tool step. Only
+    /// the caller's own turns are marked. Returns how many were marked.
+    pub fn request_stop(&self, user_id: &str, conversation_id: &str) -> Result<usize> {
+        validate_conversation_id(conversation_id)?;
+        let turn_ids = self.store.running_turn_ids(user_id, conversation_id)?;
+        let mut marks = self
+            .stop_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        marks.extend(turn_ids.iter().cloned());
+        Ok(turn_ids.len())
+    }
+
+    fn stop_requested(&self, turn_id: &str) -> bool {
+        self.stop_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(turn_id)
+    }
+
+    fn clear_stop(&self, turn_id: &str) {
+        self.stop_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(turn_id);
     }
 
     pub fn store(&self) -> &Store {

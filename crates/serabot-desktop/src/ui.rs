@@ -8,13 +8,13 @@
 
 use dioxus::prelude::*;
 use serabot_desktop::{
-    ApprovalDecision, ConversationKind, MAX_TEAM_MEMBERS, Role, SPECIALIST_TOOLS, Selection,
-    TaskStatus, Team, TeamMember, TeamMode,
+    ApprovalDecision, ConversationKind, MAX_TEAM_MEMBERS, MemoryEntry, MemoryStatsView, Role,
+    SPECIALIST_TOOLS, Selection, TaskStatus, Team, TeamMember, TeamMode,
     activity::{Step, StepPhase},
     audio_capture::MicRecorder,
-    branding, provider_presets,
+    branding, chat_compose, chat_feed, provider_presets,
     session::{Section, Session, SettingsSection, SignInPhase, Theme, humanize_label},
-    teams,
+    teams, ui_highlight,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -22,7 +22,10 @@ use crate::ui_bots::{NewBotSheet, NewGroupSheet, OnboardingView};
 use crate::ui_browser::BrowserView;
 use crate::ui_connectors::ConnectorsView;
 use crate::ui_dock::BrowserDock;
-use crate::ui_files::{ComposerFiles, MediaCards, MessageFiles};
+use crate::ui_files::{
+    CONFIRM_RESET_JS, ComposerFiles, MediaCards, MessageFiles, PASTE_BRIDGE_JS, PastedFile,
+    copy_script, decode_pasted,
+};
 use crate::ui_settings::SettingsPanel;
 use crate::ui_settings_page::{
     AboutCard, AppearanceCard, ChatPrefsCard, LocalFoldersCard, NotificationsCard, SettingsNav,
@@ -41,16 +44,25 @@ const CSS_PAGES: &str = concat!(
 );
 
 /// A chat row: id, owner flag, speaker, avatar, bot, time, body, peer flag.
-type ChatRow = (
-    String,
-    bool,
-    String,
-    String,
-    Option<String>,
-    String,
-    String,
-    bool,
-);
+/// One prepared transcript row: what the message draws, the day heading
+/// where a new day starts, and the actions it offers.
+#[derive(Clone, PartialEq)]
+struct MsgView {
+    id: String,
+    user: bool,
+    speaker: String,
+    avatar: String,
+    bot: Option<String>,
+    stamp: String,
+    content: String,
+    peer: bool,
+    class: String,
+    day: Option<String>,
+    /// The last user message while idle: offers Edit.
+    edit: bool,
+    /// The last bot reply while idle: Regenerate sends this text again.
+    regen: Option<String>,
+}
 
 /// A roster row: bot id, display name, avatar, enabled, live, role.
 type RosterRow = (String, String, String, bool, bool, String);
@@ -639,6 +651,9 @@ pub(crate) fn Icon(name: String, #[props(default = 20)] size: u32) -> Element {
         "search" => "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM20 20l-4-4",
         "plus" => "M12 5v14M5 12h14",
         "send" => "M4 12l16-8-6 16-2-6-8-2z",
+        "copy" => "M9 9h10v10H9zM5 15V5h10",
+        "arrow-down" => "M12 5v14M6 13l6 6 6-6",
+        "stop" => "M7 7h10v10H7z",
         "mic" => "M12 3a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3zM5 11a7 7 0 0 0 14 0M12 18v3",
         "paperclip" => {
             "M20 11l-8.5 8.5a5 5 0 0 1-7-7L13 4a3.5 3.5 0 0 1 5 5l-8.5 8.5a2 2 0 0 1-3-3L15 6"
@@ -1103,6 +1118,49 @@ pub fn parse_inline(text: &str) -> Vec<InlineSpan> {
     spans
 }
 
+/// A fenced code block: the language label, a Copy button that confirms on
+/// the button itself, and token colours from `ui_highlight`.
+#[component]
+fn CodeBlock(lang: String, code: String) -> Element {
+    let mut copied = use_signal(|| false);
+    let label = match lang.trim() {
+        "" => "text".to_owned(),
+        name => name.to_owned(),
+    };
+    let tokens = ui_highlight::tokenize(&lang, &code);
+    rsx! {
+        div { class: "md-code-block",
+            div { class: "md-code-head",
+                span { class: "md-code-lang", "{label}" }
+                button {
+                    class: "md-code-copy",
+                    "aria-label": "Copy code",
+                    onclick: {
+                        let code = code.clone();
+                        move |_| {
+                            let _ = dioxus::document::eval(&copy_script(&code));
+                            copied.set(true);
+                            spawn(async move {
+                                let mut done = dioxus::document::eval(CONFIRM_RESET_JS);
+                                let _ = done.recv::<bool>().await;
+                                copied.set(false);
+                            });
+                        }
+                    },
+                    if copied() { "Copied" } else { "Copy" }
+                }
+            }
+            pre {
+                code {
+                    for (index, token) in tokens.into_iter().enumerate() {
+                        span { key: "{index}", class: ui_highlight::css_class(token.kind), "{token.text}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 pub fn MarkdownBody(content: String) -> Element {
     let blocks = parse_markdown_blocks(&content);
@@ -1117,12 +1175,7 @@ pub fn MarkdownBody(content: String) -> Element {
                         _ => rsx! { h4 { key: "{idx}", class: "md-h4", InlineMarkdown { text } } },
                     },
                     MdBlock::CodeBlock { lang, code } => rsx! {
-                        div { key: "{idx}", class: "md-code-block",
-                            if !lang.is_empty() {
-                                div { class: "md-code-head", span { "{lang}" } }
-                            }
-                            pre { code { "{code}" } }
-                        }
+                        CodeBlock { key: "{idx}", lang, code }
                     },
                     MdBlock::Rule => rsx! {
                         hr { key: "{idx}", class: "md-hr" }
@@ -1373,7 +1426,11 @@ fn Shell(session: Signal<Session>) -> Element {
                 } else {
                 div { class: "pane",
                     {match section {
-                        Section::Chat => rsx! { ChatView { session, overlay } },
+                        // Keyed by conversation: switching chats remounts the
+                        // view, so scroll position and unseen counts start fresh.
+                        Section::Chat => rsx! {
+                            ChatView { key: "{session.read().conversation}", session, overlay }
+                        },
                         Section::Conversations => rsx! { ConversationsView { session } },
                         Section::Memory => rsx! { MemoryView { session } },
                         Section::Providers => rsx! { ProvidersView { session, overlay } },
@@ -2699,6 +2756,11 @@ fn UpdateBanner(session: Signal<Session>) -> Element {
     }
 }
 
+/// Moves the caret to the composer (after a suggestion fills it).
+fn focus_composer() {
+    let _ = dioxus::document::eval("document.getElementById('composer-input')?.focus();");
+}
+
 #[component]
 pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
     let conversation_kind = session.read().conversation_kind().map(str::to_owned);
@@ -2710,57 +2772,87 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         .iter()
         .find(|bot| bot.role == "orchestrator")
         .map(|bot| bot.id.clone());
-    let messages: Vec<ChatRow> = {
+    let today = today_utc_date();
+    let idle = session
+        .read()
+        .state
+        .task
+        .as_ref()
+        .is_none_or(|task| task.status.terminal());
+    let awaiting_approval = session
+        .read()
+        .state
+        .task
+        .as_ref()
+        .is_some_and(|task| task.status == TaskStatus::AwaitingApproval);
+    // One prepared row per message: what the transcript draws, the day
+    // heading where a new day starts, and which actions it offers.
+    let messages: Vec<MsgView> = {
         let state = session.read();
-        state
+        let last_user = state
             .state
             .messages
             .iter()
-            .map(|message| {
-                let user = message.role == Role::User;
-                let (speaker, avatar, bot) = state.message_speaker(message);
-                let peer = !user
-                    && group_like
-                    && bot.as_deref().is_some()
-                    && bot.as_deref() != orchestrator.as_deref();
-                (
-                    message.id.clone(),
-                    user,
-                    speaker,
-                    avatar,
-                    bot,
-                    msg_stamp(&message.created_at),
-                    message.content.clone(),
-                    peer,
-                )
-            })
-            .collect()
-    };
-    // Group by speaker: a change of speaker opens a new visual block;
-    // consecutive messages from one speaker stay glued together. The class
-    // string is precomputed here because `let` bindings are not allowed
-    // inside the rsx! body.
-    let mut msg_classes: Vec<String> = Vec::with_capacity(messages.len());
-    let mut prev_user: Option<bool> = None;
-    for row in &messages {
-        let (user, peer) = (row.1, row.7);
-        let speaker_change = match prev_user {
-            None => true,
-            Some(previous) => previous != user,
-        };
-        prev_user = Some(user);
-        let mut class = String::from(if user {
-            "msg user"
-        } else if peer {
-            "msg bot peer"
-        } else {
-            "msg bot"
-        });
-        if speaker_change {
-            class.push_str(" speaker-change");
+            .rposition(|m| m.role == Role::User);
+        let last_bot = state
+            .state
+            .messages
+            .iter()
+            .rposition(|m| m.role != Role::User);
+        let regen_text = last_user.map(|index| state.state.messages[index].content.clone());
+        let mut rows: Vec<MsgView> = Vec::with_capacity(state.state.messages.len());
+        let mut prev_user: Option<bool> = None;
+        let mut prev_day: Option<String> = None;
+        for (index, message) in state.state.messages.iter().enumerate() {
+            let user = message.role == Role::User;
+            let (speaker, avatar, bot) = state.message_speaker(message);
+            let peer = !user
+                && group_like
+                && bot.as_deref().is_some()
+                && bot.as_deref() != orchestrator.as_deref();
+            let day_now = chat_feed::day_key(&message.created_at, &today);
+            let day = match &day_now {
+                Some(now) if prev_day.as_deref() != Some(now.as_str()) => {
+                    Some(chat_feed::day_heading(now, &today))
+                }
+                _ => None,
+            };
+            if day_now.is_some() {
+                prev_day = day_now;
+            }
+            let speaker_change = prev_user != Some(user);
+            prev_user = Some(user);
+            let mut class = String::from(if user {
+                "msg user"
+            } else if peer {
+                "msg bot peer"
+            } else {
+                "msg bot"
+            });
+            if speaker_change {
+                class.push_str(" speaker-change");
+            }
+            rows.push(MsgView {
+                id: message.id.clone(),
+                user,
+                speaker,
+                avatar,
+                bot,
+                stamp: msg_stamp(&message.created_at),
+                content: message.content.clone(),
+                peer,
+                class,
+                day,
+                edit: idle && Some(index) == last_user,
+                regen: if idle && Some(index) == last_bot && !user {
+                    regen_text.clone()
+                } else {
+                    None
+                },
+            });
         }
-        msg_classes.push(class);
-    }
+        rows
+    };
     let task = session
         .read()
         .state
@@ -2787,7 +2879,6 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     };
     let chat_plan = session.read().state.plan.clone();
     let composer = session.read().composer.clone();
-    let has_files = !session.read().composer_files.is_empty();
     let can_send = session.read().state.can_send();
     let accepts = session.read().conversation_accepts_turns();
     let (active_bot, active_name, active_avatar, roster) = {
@@ -2829,6 +2920,12 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             .collect::<Vec<RosterRow>>();
         (active, name, avatar, roster)
     };
+    // "Main is working", plus the step that is running right now.
+    let running_step = steps
+        .iter()
+        .find(|step| step.phase == StepPhase::Running)
+        .map(|step| step.label.clone());
+    let working = chat_feed::working_line(&active_name, running_step.as_deref());
     let bot_meta: HashMap<String, (String, bool)> = roster
         .iter()
         .map(|(id, _, _, _, live, role)| (id.clone(), (role.clone(), *live)))
@@ -2874,6 +2971,20 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let mut mention_idx = use_signal(|| 0usize);
     let mut slash = use_signal(|| Option::<String>::None);
     let mut slash_idx = use_signal(|| 0usize);
+    // Message list and composer state (0.19).
+    let mut at_bottom = use_signal(|| true);
+    let mut unseen = use_signal(|| 0usize);
+    let mut last_count = use_signal(|| 0usize);
+    let mut dragging = use_signal(|| false);
+    let mut composer_focused = use_signal(|| false);
+    let mut copied = use_signal(|| Option::<String>::None);
+    // Files pasted into the composer arrive through the JS bridge.
+    use_future(move || async move {
+        let mut bridge = dioxus::document::eval(PASTE_BRIDGE_JS);
+        while let Ok(pasted) = bridge.recv::<PastedFile>().await {
+            session.write().queue_files(vec![decode_pasted(pasted)]);
+        }
+    });
     let transcript_error = session.read().state.transcript_error.clone();
     use_effect(move || {
         let transcript = session.read().state.transcript.clone();
@@ -2890,10 +3001,30 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         }
     });
     use_effect(move || {
-        let _ = session.read().state.messages.len();
-        let _ = dioxus::document::eval(
-            "const el=document.getElementById('messages'); if(el && el.scrollHeight - el.scrollTop - el.clientHeight < 80){el.scrollTop=el.scrollHeight;}",
-        );
+        let count = session.read().state.messages.len();
+        let own_send =
+            session.read().state.messages.last().is_some_and(|message| {
+                message.role == Role::User && message.id.starts_with("opt-")
+            });
+        let previous = *last_count.peek();
+        // A fresh mount (first render or a switch) starts at the newest line.
+        let jump = own_send || previous == 0;
+        if count != previous {
+            if count > previous && !*at_bottom.peek() && !own_send {
+                let added = *unseen.peek() + (count - previous);
+                unseen.set(added);
+            }
+            last_count.set(count);
+        }
+        // Your own message always brings you to the newest line; a reply
+        // only follows when you were already near the bottom.
+        if own_send {
+            at_bottom.set(true);
+            unseen.set(0);
+        }
+        let _ = dioxus::document::eval(&format!(
+            "const el=document.getElementById('messages'); if(el && ({jump} || el.scrollHeight - el.scrollTop - el.clientHeight < 80)){{el.scrollTop=el.scrollHeight;}}"
+        ));
     });
     let empty = messages.is_empty();
     let is_one_to_one = session.read().conversation.starts_with("dir:");
@@ -2940,8 +3071,46 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let key_mention_conns = mention_conns.clone();
     let key_slash_skills = slash_skills.clone();
     let key_slash_tools = slash_tool_matches(&slash_q);
+    let composer_chars = composer.chars().count();
+    let length_note = chat_compose::length_message(composer_chars);
+    let over_limit = composer_chars > chat_compose::MAX_TEXT_CHARS;
+    let composer_file_count = session.read().composer_files.len();
+    let busy = session.read().uploading || session.read().upload_pending() > 0;
+    let send_ready = chat_compose::can_submit(&composer, composer_file_count, busy);
     rsx! {
         div { class: "pane-body chat-body",
+            ondragover: move |event: DragEvent| {
+                event.prevent_default();
+                dragging.set(true);
+            },
+            ondragleave: move |_| dragging.set(false),
+            ondrop: move |event: DragEvent| async move {
+                event.prevent_default();
+                dragging.set(false);
+                // Admit by name and size first: a refused file is never read.
+                let dropped = event.data_transfer().files();
+                let meta: Vec<(String, u64)> = dropped.iter().map(|file| (file.name(), file.size())).collect();
+                let sizes: Vec<(&str, u64)> = meta.iter().map(|(name, size)| (name.as_str(), *size)).collect();
+                let held = session.read().attachments_held();
+                let admission = chat_compose::admit_files(held, &sizes);
+                let mut picked = Vec::new();
+                for (index, file) in dropped.iter().enumerate() {
+                    if admission.accepted.contains(&index) {
+                        let bytes = file.read_bytes().await.map(|data| data.to_vec()).unwrap_or_default();
+                        picked.push((file.name(), bytes));
+                    }
+                }
+                session.write().queue_files(picked);
+                session.write().refuse_files(admission.refused);
+            },
+            if dragging() {
+                div { class: "drop-zone", "aria-hidden": "true",
+                    div { class: "drop-zone-card",
+                        span { class: "drop-zone-title", "Drop files to attach them" }
+                        span { class: "drop-zone-meta", "Up to 6 files, 25 MB in total" }
+                    }
+                }
+            }
             div { class: "chat-column",
                 if let Some((status, label)) = task {
                     if status == TaskStatus::AwaitingApproval {
@@ -2958,7 +3127,19 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                 if let Some(plan) = chat_plan.clone() {
                     PlanPanel { plan }
                 }
-                div { class: if group_like { "messages group" } else { "messages" }, id: "messages",
+                div {
+                    class: if group_like { "messages group" } else { "messages" },
+                    id: "messages",
+                    onscroll: move |event: ScrollEvent| {
+                        let distance = event.scroll_height() as f64
+                            - event.scroll_top()
+                            - event.client_height() as f64;
+                        let bottom = distance < 80.0;
+                        at_bottom.set(bottom);
+                        if bottom {
+                            unseen.set(0);
+                        }
+                    },
                     if empty {
                         div { class: "empty",
                             div {
@@ -2982,6 +3163,20 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     "A one-to-one conversation. Replies come from {active_name}, not the orchestrator."
                                 } else {
                                     "Ask the orchestrator, or open a group with your specialists."
+                                }
+                            }
+                            if accepts {
+                                div { class: "suggestions", role: "group", "aria-label": "Starter prompts",
+                                    for text in chat_feed::suggestions(active_bot.as_deref()).iter().copied() {
+                                        button {
+                                            class: "suggestion",
+                                            onclick: move |_| {
+                                                session.write().composer = text.to_owned();
+                                                focus_composer();
+                                            },
+                                            "{text}"
+                                        }
+                                    }
                                 }
                             }
                             div { class: "roster",
@@ -3022,42 +3217,95 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             }
                         }
                     }
-                    for ((id, user, speaker, avatar, bot, stamp, content, peer), class) in
-                        messages.into_iter().zip(msg_classes.iter())
-                    {
-                        div {
-                            key: "{id}",
-                            class: "{class}",
-                            span {
-                                class: if user { "msg-avatar avatar user" } else { "msg-avatar avatar bot" },
-                                style: bot.as_deref().map(avatar_style).unwrap_or_default(),
-                                "{avatar}"
+                    for row in messages.into_iter() {
+                        Fragment { key: "{row.id}",
+                            if let Some(heading) = row.day.clone() {
+                                div { class: "day-sep", role: "separator",
+                                    span { "{heading}" }
+                                }
                             }
-                            div { class: "msg-main",
-                                div { class: "msg-head",
-                                    // The own-message label restates what the
-                                    // right-aligned bubble already says.
-                                    if !user {
-                                        span { class: "msg-name", "{speaker}" }
-                                    }
-                                    span { class: "msg-time", "{stamp}" }
-                                    if let Some(id) = bot.as_ref() {
-                                        if let Some((role, live)) = bot_meta.get(id) {
-                                            span { class: "team-chip", "{role}" }
-                                            span {
-                                                class: if *live { "chip ok" } else { "chip warn" },
-                                                if *live { "live" } else { "not live" }
+                            div { class: "{row.class}",
+                                span {
+                                    class: if row.user { "msg-avatar avatar user" } else { "msg-avatar avatar bot" },
+                                    style: row.bot.as_deref().map(avatar_style).unwrap_or_default(),
+                                    "{row.avatar}"
+                                }
+                                div { class: "msg-main",
+                                    div { class: "msg-head",
+                                        // The own-message label restates what the
+                                        // right-aligned bubble already says.
+                                        if !row.user {
+                                            span { class: "msg-name", "{row.speaker}" }
+                                        }
+                                        span { class: "msg-time", "{row.stamp}" }
+                                        if let Some(id) = row.bot.as_ref() {
+                                            if let Some((role, live)) = bot_meta.get(id) {
+                                                span { class: "team-chip", "{role}" }
+                                                span {
+                                                    class: if *live { "chip ok" } else { "chip warn" },
+                                                    if *live { "live" } else { "not live" }
+                                                }
                                             }
                                         }
+                                        if row.peer {
+                                            span { class: "team-chip", "peer bot" }
+                                        }
                                     }
-                                    if peer {
-                                        span { class: "team-chip", "peer bot" }
+                                    div { class: "msg-body", title: "{row.stamp}",
+                                        MarkdownBody { content: row.content.clone() }
+                                        if row.user {
+                                            MessageFiles { session, id: row.id.clone() }
+                                        }
                                     }
-                                }
-                                div { class: "msg-body", title: "{stamp}",
-                                    MarkdownBody { content: content.clone() }
-                                    if user {
-                                        MessageFiles { session, id: id.clone() }
+                                    div { class: "msg-actions", role: "toolbar", "aria-label": "Message actions",
+                                        button {
+                                            class: "msg-action",
+                                            "aria-label": "Copy message",
+                                            title: "Copy",
+                                            onclick: {
+                                                let text = row.content.clone();
+                                                let id = row.id.clone();
+                                                move |_| {
+                                                    let _ = dioxus::document::eval(&copy_script(&text));
+                                                    copied.set(Some(id.clone()));
+                                                    let id = id.clone();
+                                                    spawn(async move {
+                                                        let mut done = dioxus::document::eval(CONFIRM_RESET_JS);
+                                                        let _ = done.recv::<bool>().await;
+                                                        if copied.peek().as_deref() == Some(id.as_str()) {
+                                                            copied.set(None);
+                                                        }
+                                                    });
+                                                }
+                                            },
+                                            Icon { name: "copy", size: 13 }
+                                            span { class: "msg-action-label",
+                                                if copied().as_deref() == Some(row.id.as_str()) { "Copied" } else { "Copy" }
+                                            }
+                                        }
+                                        if row.edit {
+                                            button {
+                                                class: "msg-action",
+                                                "aria-label": "Edit message",
+                                                title: "Put this message back in the composer",
+                                                onclick: {
+                                                    let text = row.content.clone();
+                                                    move |_| session.write().edit_text(text.clone())
+                                                },
+                                                Icon { name: "edit", size: 13 }
+                                                span { class: "msg-action-label", "Edit" }
+                                            }
+                                        }
+                                        if let Some(text) = row.regen.clone() {
+                                            button {
+                                                class: "msg-action",
+                                                "aria-label": "Regenerate reply",
+                                                title: "Send your last message again",
+                                                onclick: move |_| session.write().regenerate(text.clone()),
+                                                Icon { name: "refresh", size: 13 }
+                                                span { class: "msg-action-label", "Regenerate" }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -3075,8 +3323,13 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     }
                     if live_task.is_some() {
                         div { class: "activity", role: "status", "aria-live": "polite",
-                            if steps.iter().all(|step| step.phase != StepPhase::Running) {
-                                span { class: "shimmer", "Thinking…" }
+                            span { class: "working",
+                                span { class: "working-text", "{working}" }
+                                span { class: "working-dots", "aria-hidden": "true",
+                                    span {}
+                                    span {}
+                                    span {}
+                                }
                             }
                             for step in steps.iter().cloned() {
                                 ActivityRow { session, step, key: "{step.call_id}" }
@@ -3094,6 +3347,21 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                         }
                     }
                 }
+                if !at_bottom() {
+                    button {
+                        class: "scroll-bottom",
+                        "aria-label": "Scroll to the newest message",
+                        title: "Newest messages",
+                        onclick: move |_| {
+                            let _ = dioxus::document::eval("const el=document.getElementById('messages'); if(el){el.scrollTo({top: el.scrollHeight, behavior: 'smooth'});}");
+                            unseen.set(0);
+                        },
+                        Icon { name: "arrow-down", size: 16 }
+                        if let Some(badge) = chat_feed::unseen_badge(unseen()) {
+                            span { class: "scroll-badge", "aria-label": "{badge} unseen messages", "{badge}" }
+                        }
+                    }
+                }
                 div { class: "composer-wrap",
                     if let Some(message) = transcript_error {
                         div { class: "banner err", span { "{message}" } }
@@ -3108,6 +3376,8 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             value: "{composer}",
                             placeholder: if accepts { format!("Message {active_name}…") } else { "This node does not accept turns".into() },
                             disabled: !accepts,
+                            onfocus: move |_| composer_focused.set(true),
+                            onblur: move |_| composer_focused.set(false),
                             oninput: move |event| {
                                 let value = event.value();
                                 session.write().composer = value.clone();
@@ -3185,19 +3455,47 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     }
                                     return;
                                 }
+                                // Up in an empty composer recalls the last message.
+                                if event.key() == Key::ArrowUp && session.read().composer.is_empty() {
+                                    let texts: Vec<String> = session
+                                        .read()
+                                        .state
+                                        .messages
+                                        .iter()
+                                        .filter(|message| message.role == Role::User)
+                                        .map(|message| message.content.clone())
+                                        .collect();
+                                    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+                                    if let Some(text) = chat_compose::recall_text(&refs) {
+                                        event.prevent_default();
+                                        session.write().composer = text;
+                                    }
+                                }
                                 if event.key() == Key::Enter {
+                                    let modifiers = event.modifiers();
+                                    let command = modifiers.contains(Modifiers::CONTROL)
+                                        || modifiers.contains(Modifiers::META);
                                     let enter_sends = session.read().prefs.enter_sends;
-                                    let send = if enter_sends {
-                                        !event.modifiers().contains(Modifiers::SHIFT)
-                                    } else {
-                                        event.modifiers().contains(Modifiers::CONTROL)
-                                    };
-                                    if send {
+                                    if chat_compose::enter_sends(
+                                        enter_sends,
+                                        modifiers.contains(Modifiers::SHIFT),
+                                        command,
+                                    ) {
                                         event.prevent_default();
                                         session.write().submit();
                                     }
                                 }
                             },
+                        }
+                        if composer_focused() && composer.is_empty() {
+                            div { class: "composer-hint", "{chat_compose::COMPOSER_HINT}" }
+                        }
+                        if let Some(note) = length_note.clone() {
+                            div {
+                                class: if over_limit { "composer-count over" } else { "composer-count" },
+                                role: "status",
+                                "{note}"
+                            }
                         }
                         div { class: "composer-row",
                             NewMenu { session, overlay }
@@ -3279,13 +3577,27 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     onclick: move |_| session.write().pick_attachments(),
                                     Icon { name: "paperclip", size: 16 }
                                 }
-                                button {
-                                    class: "btn primary send-btn",
-                                    title: "Send",
-                                    "aria-label": "Send message",
-                                    disabled: !can_send || (composer.trim().is_empty() && !has_files),
-                                    onclick: move |_| session.write().submit(),
-                                    Icon { name: "send", size: 16 }
+                                if awaiting_approval {
+                                    span { class: "composer-waiting", role: "status",
+                                        "Waiting for your approval. Decline it to stop."
+                                    }
+                                } else if live_task.is_some() {
+                                    button {
+                                        class: "btn stop-btn",
+                                        title: "Stop the reply",
+                                        "aria-label": "Stop the reply",
+                                        onclick: move |_| session.write().stop_turn(),
+                                        Icon { name: "stop", size: 14 }
+                                    }
+                                } else {
+                                    button {
+                                        class: "btn primary send-btn",
+                                        title: "Send",
+                                        "aria-label": "Send message",
+                                        disabled: !can_send || !send_ready,
+                                        onclick: move |_| session.write().submit(),
+                                        Icon { name: "send", size: 16 }
+                                    }
                                 }
                             }
                         }
@@ -4942,22 +5254,107 @@ fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element 
     }
 }
 
+/// Filter chips on the Memory page: `(filter key, label)`.
+const MEMORY_FILTERS: &[(&str, &str)] = &[
+    ("all", "All"),
+    ("saved", "Saved"),
+    ("learned", "Learned"),
+    ("superseded", "Superseded"),
+    ("review", "To review"),
+];
+
+/// One memory card, prepared before rendering so the markup stays plain.
+#[derive(Clone, PartialEq)]
+struct MemoryRow {
+    id: String,
+    content: String,
+    kind: String,
+    origin: &'static str,
+    superseded: bool,
+    pending: bool,
+    delete_label: &'static str,
+    bot: Option<String>,
+    importance: String,
+    created: String,
+    recalled: String,
+}
+
+fn memory_rows(memories: &[MemoryEntry]) -> Vec<MemoryRow> {
+    memories
+        .iter()
+        .map(|memory| MemoryRow {
+            id: memory.id.clone(),
+            content: memory.content.clone(),
+            kind: memory.kind.clone(),
+            origin: if memory.origin == "extracted" {
+                "Learned"
+            } else {
+                "Saved"
+            },
+            superseded: memory.status == "superseded",
+            pending: memory.status == "pending",
+            delete_label: if memory.status == "pending" {
+                "Discard"
+            } else {
+                "Delete"
+            },
+            bot: memory.bot.clone(),
+            importance: format!(
+                "{:.0}% important",
+                memory.importance.clamp(0.0, 1.0) * 100.0
+            ),
+            created: memory.created_at.clone(),
+            recalled: match &memory.last_recalled_at {
+                Some(at) => format!("last recalled {at} ({}×)", memory.recall_count),
+                None => "not recalled yet".into(),
+            },
+        })
+        .collect()
+}
+
+/// The header line: counts by origin and status, and the last extraction.
+fn memory_header(stats: Option<&MemoryStatsView>) -> String {
+    match stats {
+        None => "Owner-scoped memory. Loading counts…".into(),
+        Some(stats) => {
+            let count = |map: &std::collections::BTreeMap<String, i64>, key: &str| {
+                map.get(key).copied().unwrap_or(0)
+            };
+            let last = stats
+                .last_extraction_at
+                .as_deref()
+                .map_or("never".to_owned(), |at| at.to_owned());
+            format!(
+                "{} active · {} saved · {} learned · {} superseded · last learned: {last}",
+                stats.active,
+                count(&stats.by_origin, "explicit"),
+                count(&stats.by_origin, "extracted"),
+                count(&stats.by_status, "superseded"),
+            )
+        }
+    }
+}
+
 #[component]
 fn MemoryView(session: Signal<Session>) -> Element {
-    let memories = session.read().state.memories.clone();
+    let memories = memory_rows(&session.read().state.memories);
     let memories_loaded = session.read().state.memories_loaded;
+    let header = memory_header(session.read().state.memory_stats.as_ref());
     let kind = session.read().memory.kind.clone();
     let content = session.read().memory.content.clone();
     let source = session.read().memory.source.clone();
     let query = session.read().memory.query.clone();
+    let filter = session.read().memory.filter.clone();
     let confirm = session.read().memory.delete_confirm.clone();
+    let editing = session.read().memory.editing.clone();
+    let edit_content = session.read().memory.edit_content.clone();
     let memories_empty = memories.is_empty();
     rsx! {
         div { class: "pane",
             div { class: "pane-head",
                 div {
                     h1 { class: "pane-title", "Memory" }
-                    p { class: "muted", "Owner-scoped facts. The orchestrator reads the 20 most recent." }
+                    p { class: "muted", "{header}" }
                 }
                 button {
                     class: "btn ghost",
@@ -5008,13 +5405,23 @@ fn MemoryView(session: Signal<Session>) -> Element {
                     input {
                         class: "input",
                         value: "{query}",
-                        placeholder: "Filter content, kind or source",
+                        placeholder: "Search all of your memory, including old facts",
                         oninput: move |event| session.write().memory.query = event.value(),
                     }
                     button {
                         class: "btn ghost",
                         onclick: move |_| session.write().load_memories(),
                         "Search"
+                    }
+                }
+                div { class: "field-row",
+                    for (key, label) in MEMORY_FILTERS.iter().copied() {
+                        button {
+                            key: "{key}",
+                            class: if filter == key { "chip accent" } else { "chip" },
+                            onclick: move |_| session.write().set_memory_filter(key),
+                            "{label}"
+                        }
                     }
                 }
                 div { class: "card-grid",
@@ -5027,10 +5434,60 @@ fn MemoryView(session: Signal<Session>) -> Element {
                     for memory in memories {
                         div { class: "card", key: "{memory.id}",
                             div { class: "card-head",
-                                span { class: "chip accent", "{memory.kind}" }
-                                span { class: "tiny", "{memory.created_at} · {memory.source}" }
+                                span { class: if memory.origin == "Learned" { "chip" } else { "chip accent" }, "{memory.origin}" }
+                                if let Some(bot) = memory.bot.clone() {
+                                    span { class: "chip", "{bot}" }
+                                }
+                                span { class: "chip", "{memory.kind}" }
+                                if memory.superseded {
+                                    span { class: "chip", "Superseded" }
+                                }
+                                if memory.pending {
+                                    span { class: "chip accent", "To review" }
+                                }
+                                span { class: "tiny", "{memory.importance}" }
                             }
-                            p { "{memory.content}" }
+                            if editing.as_deref() == Some(memory.id.as_str()) {
+                                textarea {
+                                    class: "textarea",
+                                    value: "{edit_content}",
+                                    oninput: move |event| session.write().memory.edit_content = event.value(),
+                                }
+                                div { class: "field-row",
+                                    button {
+                                        class: "btn primary sm",
+                                        onclick: move |_| session.write().save_memory_edit(),
+                                        "Save"
+                                    }
+                                    button {
+                                        class: "btn ghost sm",
+                                        onclick: move |_| session.write().cancel_memory_edit(),
+                                        "Cancel"
+                                    }
+                                }
+                            } else {
+                                p { "{memory.content}" }
+                                p { class: "tiny", "{memory.created} · {memory.recalled}" }
+                                if memory.pending {
+                                    button {
+                                        class: "btn primary sm",
+                                        onclick: {
+                                            let id = memory.id.clone();
+                                            move |_| session.write().approve_memory(id.clone())
+                                        },
+                                        "Approve"
+                                    }
+                                }
+                                button {
+                                    class: "btn ghost sm",
+                                    onclick: {
+                                        let id = memory.id.clone();
+                                        let text = memory.content.clone();
+                                        move |_| session.write().begin_memory_edit(id.clone(), &text)
+                                    },
+                                    "Edit"
+                                }
+                            }
                             if confirm.as_deref() == Some(memory.id.as_str()) {
                                 button {
                                     class: "btn danger sm",
@@ -5047,7 +5504,7 @@ fn MemoryView(session: Signal<Session>) -> Element {
                                         let id = memory.id.clone();
                                         move |_| session.write().memory.delete_confirm = Some(id.clone())
                                     },
-                                    "Delete"
+                                    "{memory.delete_label}"
                                 }
                             }
                         }

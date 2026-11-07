@@ -1,5 +1,6 @@
 use super::*;
 use crate::browser_profiles::{MAX_BOT_DESCRIPTION_CHARS, MAX_BOT_DISPLAY_NAME_CHARS};
+use crate::default_avatars::default_avatar_version;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -197,7 +198,10 @@ pub(super) async fn list_bots(
                 "description": settings.description.clone().or_else(|| profile.as_ref().map(|p| p.description.clone()).filter(|text| !text.is_empty())),
                 "browser_profile": profile_by_bot.get(&id).cloned().unwrap_or_else(|| "default".into()),
                 "avatar": profile.as_ref().map(|p| p.avatar.clone()).filter(|avatar| !avatar.is_empty()),
-                "avatar_version": avatar_versions.get(&id),
+                // A bundled default counts as a picture, so the console fetches it.
+                "avatar_version": avatar_versions.get(&id).cloned().or_else(|| {
+                    default_avatar_version(&id)
+                }),
                 "tools": tools,
                 "skills": skills,
                 "require_approval": require_approval,

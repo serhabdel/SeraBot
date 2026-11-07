@@ -77,6 +77,10 @@ pub struct Config {
     /// Fleet file locations. Relative to `base_dir`; the owner API never accepts paths.
     #[serde(default)]
     pub fleet: FleetConfig,
+    /// Agent memory: recall provider, automatic extraction and summaries
+    /// (see docs/memory.md).
+    #[serde(default)]
+    pub memory: MemoryConfig,
     #[serde(skip)]
     pub base_dir: PathBuf,
     /// Admin-console bot config overrides (tools/skills/require_approval),
@@ -117,6 +121,7 @@ impl Default for Config {
             approvals: ApprovalsConfig::default(),
             connectors: ConnectorsConfig::default(),
             fleet: FleetConfig::default(),
+            memory: MemoryConfig::default(),
             base_dir: PathBuf::from("."),
             bot_config_overrides: BTreeMap::new(),
         }
@@ -183,6 +188,7 @@ impl Config {
         }
         self.auth.validate()?;
         self.users.validate()?;
+        self.memory.validate()?;
         if !self.server.bind.starts_with("127.")
             && !self.server.bind.starts_with("localhost")
             && !self.server.bind.starts_with("[::1]")
@@ -1082,6 +1088,11 @@ pub struct ComposioConfig {
     /// Largest Composio response body read, in bytes.
     #[serde(default = "default_composio_max_bytes")]
     pub max_response_bytes: usize,
+    /// Toolkit version sent with every tool execution. Unset means `latest`.
+    /// Set it to pin a specific Composio toolkit version (for example
+    /// `00000000_00`, the version Composio uses when none is sent).
+    #[serde(default)]
+    pub tool_version: Option<String>,
 }
 
 impl Default for ComposioConfig {
@@ -1090,6 +1101,7 @@ impl Default for ComposioConfig {
             api_base: default_composio_api_base(),
             timeout_secs: default_composio_timeout(),
             max_response_bytes: default_composio_max_bytes(),
+            tool_version: None,
         }
     }
 }
@@ -1308,6 +1320,136 @@ impl Default for RuntimeConfig {
             owner_standing_consent: false,
         }
     }
+}
+
+/// `[memory]`: recall provider and the post-turn background work. Built-in
+/// SQLite memory is always on; `provider = "mem0"` adds the Mem0 Platform as
+/// an extra recall source for users who saved a Mem0 key (`conn.mem0`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    /// `builtin` (local only, the default) or `mem0`.
+    #[serde(default = "default_memory_provider")]
+    pub provider: String,
+    /// Extract durable facts from owner turns after the reply is stored.
+    #[serde(default = "default_true")]
+    pub auto_extract: bool,
+    /// Facts injected per turn (1..=20).
+    #[serde(default = "default_recall_k")]
+    pub recall_k: usize,
+    /// Summarize a conversation after this many new messages; `0` turns
+    /// summaries off, otherwise 10..=500.
+    #[serde(default = "default_summary_every")]
+    pub summary_every: usize,
+    /// Mem0 Platform base URL. Must be https, or http on loopback (tests).
+    #[serde(default = "default_mem0_base")]
+    pub mem0_api_base: String,
+    #[serde(default = "default_mem0_timeout")]
+    pub mem0_timeout_secs: u64,
+    /// Upper bound for the background extraction and summary call.
+    #[serde(default = "default_extract_timeout")]
+    pub extract_timeout_secs: u64,
+    /// Model for extraction and summaries. Unset: the bot's own model.
+    #[serde(default)]
+    pub extract_model: Option<String>,
+    /// Minimum seconds between two extraction runs for one user (0..=3600).
+    #[serde(default = "default_extract_min_interval")]
+    pub extract_min_interval_secs: u64,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_memory_provider(),
+            auto_extract: true,
+            recall_k: default_recall_k(),
+            summary_every: default_summary_every(),
+            mem0_api_base: default_mem0_base(),
+            mem0_timeout_secs: default_mem0_timeout(),
+            extract_timeout_secs: default_extract_timeout(),
+            extract_model: None,
+            extract_min_interval_secs: default_extract_min_interval(),
+        }
+    }
+}
+
+impl MemoryConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.provider != "builtin" && self.provider != "mem0" {
+            return Err(SeraError::Config(
+                "memory.provider must be \"builtin\" or \"mem0\"".into(),
+            ));
+        }
+        if !(1..=20).contains(&self.recall_k) {
+            return Err(SeraError::Config("memory.recall_k must be 1..=20".into()));
+        }
+        if self.summary_every != 0 && !(10..=500).contains(&self.summary_every) {
+            return Err(SeraError::Config(
+                "memory.summary_every must be 0 (off) or 10..=500".into(),
+            ));
+        }
+        let base = self.mem0_api_base.trim();
+        let loopback = base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
+        if !(base.starts_with("https://") || loopback) || base.contains('@') {
+            return Err(SeraError::Config(
+                "memory.mem0_api_base must be an https URL without credentials".into(),
+            ));
+        }
+        if !(2..=30).contains(&self.mem0_timeout_secs) {
+            return Err(SeraError::Config(
+                "memory.mem0_timeout_secs must be 2..=30".into(),
+            ));
+        }
+        if !(5..=120).contains(&self.extract_timeout_secs) {
+            return Err(SeraError::Config(
+                "memory.extract_timeout_secs must be 5..=120".into(),
+            ));
+        }
+        if !(0..=3600).contains(&self.extract_min_interval_secs) {
+            return Err(SeraError::Config(
+                "memory.extract_min_interval_secs must be 0..=3600".into(),
+            ));
+        }
+        if let Some(model) = &self.extract_model
+            && (model.is_empty() || model.len() > 128 || model.chars().any(char::is_whitespace))
+        {
+            return Err(SeraError::Config(
+                "memory.extract_model must be a model id without spaces".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_memory_provider() -> String {
+    "builtin".into()
+}
+
+fn default_recall_k() -> usize {
+    8
+}
+
+fn default_summary_every() -> usize {
+    30
+}
+
+fn default_mem0_base() -> String {
+    "https://api.mem0.ai".into()
+}
+
+fn default_mem0_timeout() -> u64 {
+    8
+}
+
+fn default_extract_timeout() -> u64 {
+    45
+}
+
+fn default_extract_min_interval() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1638,6 +1780,8 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "skill_load",
     "memory_save",
     "memory_list",
+    "memory_search",
+    "memory_update",
     "memory_delete",
     "rag_search",
     "xlsx_analyze",
@@ -2320,6 +2464,86 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 5, "expected the shipped bot files");
+    }
+
+    fn shipped_bot(name: &str) -> BotConfig {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bots");
+        let raw = std::fs::read_to_string(root.join(format!("{name}.toml"))).expect("bot file");
+        toml::from_str(&raw).unwrap_or_else(|error| panic!("{name}: {error}"))
+    }
+
+    /// A prompt may name a tool only when its bot is granted it, or when the
+    /// runtime grants it on every turn (memory, plan, skill, and team tools).
+    #[test]
+    fn shipped_prompts_only_name_tools_their_bot_has() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let known = crate::tools::known_tool_names();
+        let always = [
+            "memory_save",
+            "memory_list",
+            "memory_delete",
+            crate::plans::PLAN_TOOL,
+            "skill_list",
+            "skill_search",
+            "skill_load",
+            crate::teams::TEAM_ASK_TOOL,
+            crate::teams::TEAM_REPLY_TOOL,
+        ];
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(repo.join("bots")).expect("bots directory") {
+            let path = entry.expect("bots entry").path();
+            if path.extension().and_then(|value| value.to_str()) != Some("toml") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path).expect("bot file");
+            let bot: BotConfig =
+                toml::from_str(&raw).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            let prompt_path = repo.join(&bot.system_prompt);
+            let prompt = std::fs::read_to_string(&prompt_path).expect("prompt file");
+            for word in
+                prompt.split(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+            {
+                let is_tool = known.contains(&word);
+                let always_granted = always.contains(&word);
+                let granted = bot.tools.iter().any(|tool| tool == word);
+                assert!(
+                    !is_tool || always_granted || granted,
+                    "{} names tool '{word}' but bot '{}' is not granted it",
+                    prompt_path.display(),
+                    bot.name
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 5, "expected the shipped bot files");
+    }
+
+    /// The owner's main bot can reach the PC folders and the approval-gated
+    /// document send. The specialists may read PC folders, never write them.
+    #[test]
+    fn local_folder_tools_are_granted_to_main_and_read_only_to_specialists() {
+        let main = shipped_bot("main");
+        for tool in [
+            "local_list",
+            "local_read",
+            "local_write",
+            "telegram_send_document",
+        ] {
+            assert!(main.tools.iter().any(|name| name == tool), "main: {tool}");
+        }
+        for name in ["analyst", "maker"] {
+            let bot = shipped_bot(name);
+            for tool in ["local_list", "local_read"] {
+                assert!(
+                    bot.tools.iter().any(|granted| granted == tool),
+                    "{name}: {tool}"
+                );
+            }
+            assert!(
+                !bot.tools.iter().any(|granted| granted == "local_write"),
+                "{name} must not write to the PC"
+            );
+        }
     }
 
     #[test]

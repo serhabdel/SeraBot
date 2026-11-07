@@ -1,0 +1,22 @@
+name = "markets"
+trigger = "command"
+system_prompt = "prompts/markets.txt"
+skills = ["equity-research", "financial-analysis"]
+tools = [
+  "skill_list",
+  "skill_search",
+  "skill_load",
+  "memory_save",
+  "memory_list",
+  "memory_delete",
+  "rag_search",
+  "tavily_search",
+  "firecrawl_search",
+  "firecrawl_scrape",
+  "fetch_url",
+  "xlsx_analyze",
+  "xlsx_read",
+  "xlsx_build",
+]
+require_approval = []
+enabled = true
