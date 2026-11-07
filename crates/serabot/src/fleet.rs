@@ -20,10 +20,11 @@
 //! seed templates, so members never inherit the admin's tool or skill
 //! overrides.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, RwLock};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::config::{BotConfig, Config, ConfiguredBot, LoadedBot, apply_bot_config_override};
 use crate::error::{Result, SeraError};
@@ -35,10 +36,16 @@ use crate::util::sha256_hex;
 /// A user's loaded fleet, keyed by bot id.
 pub type Fleet = HashMap<String, LoadedBot>;
 
-/// SHA-256 of prompt texts shipped before offering records existed (the
-/// 0.18 templates), by bot. A row without a record whose prompt is one of
-/// these is an unedited shipped prompt and may be upgraded; any other text
-/// is the owner's and is kept.
+/// Digest of a prompt text. CRLF is stripped first, so a Windows checkout
+/// hashes the same as the committed LF file.
+fn prompt_digest(text: &str) -> String {
+    sha256_hex(text.replace('\r', ""))
+}
+
+/// Prompt digests shipped before offering records existed (the 0.18
+/// templates), by bot. A row without a record whose prompt is one of these is
+/// an unedited shipped prompt and may be upgraded; any other text is the
+/// owner's and is kept.
 const SHIPPED_BEFORE_OFFERINGS: &[(&str, &str)] = &[
     (
         "main",
@@ -52,6 +59,14 @@ const SHIPPED_BEFORE_OFFERINGS: &[(&str, &str)] = &[
         "maker",
         "4380e832859c3b0c2c450128034c0fb5fd7ab68730a5d5e205e1164f5b6062a9",
     ),
+    (
+        "legal",
+        "48cabdfe757d189aacfc5372f9f538b667157054591d7182c6c57921811505d4",
+    ),
+    (
+        "watcher",
+        "bf942e84859332c591d6dd26514f596e2cf31830580a4f4cb2b41b8f1bbe5506",
+    ),
 ];
 
 /// What the shipped template for one bot offered the last time it was seeded
@@ -63,7 +78,9 @@ struct BotOffering {
     tools: BTreeSet<String>,
     #[serde(default)]
     skills: BTreeSet<String>,
-    /// SHA-256 of the prompt text last offered.
+    #[serde(default)]
+    delegates: BTreeSet<String>,
+    /// Prompt digest (see `prompt_digest`) of the text last offered.
     #[serde(default)]
     prompt_sha256: String,
 }
@@ -73,7 +90,8 @@ impl BotOffering {
         Self {
             tools: template.config.tools.iter().cloned().collect(),
             skills: template.config.skills.iter().cloned().collect(),
-            prompt_sha256: sha256_hex(&template.prompt),
+            delegates: template.config.delegates.iter().cloned().collect(),
+            prompt_sha256: prompt_digest(&template.prompt),
         }
     }
 }
@@ -135,6 +153,10 @@ pub struct FleetRegistry {
     templates: Arc<Vec<LoadedBot>>,
     admin_user_id: String,
     cache: Arc<RwLock<HashMap<String, Arc<Fleet>>>>,
+    /// One lock per user, so concurrent seeds for one user run in turn.
+    user_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Users whose upgrade already ran in this process.
+    upgraded: Arc<Mutex<HashSet<String>>>,
 }
 
 impl FleetRegistry {
@@ -158,6 +180,8 @@ impl FleetRegistry {
             templates: Arc::new(templates),
             admin_user_id,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            user_locks: Arc::new(Mutex::new(HashMap::new())),
+            upgraded: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -190,21 +214,58 @@ impl FleetRegistry {
     /// Bring the user's fleet up to the shipped templates. Idempotent; returns
     /// the number of bot rows inserted.
     ///
-    /// For each template, against the user's offering record (the baseline):
+    /// The work runs once per user per process: the first call holds that
+    /// user's lock and upgrades, and later calls return at once until
+    /// [`Self::invalidate`] clears the mark. Per template, against the user's
+    /// offering record:
     /// - no row and no record: insert it, so a new default bot reaches an
     ///   existing user. A row the owner deleted after an offering stays gone.
-    /// - a row: add the tools and skills the template gained since the
-    ///   baseline, never re-adding one the owner removed. Replace the prompt
-    ///   only while the row still holds a shipped text (the recorded hash, or
-    ///   an empty prompt, or a pre-record 0.18 text); an owner's edit is kept.
+    /// - a row: add the tools, skills, and delegates the template gained since
+    ///   the baseline, never re-adding one the owner removed. Replace the
+    ///   prompt only while the row still holds a shipped text (the recorded
+    ///   digest, an empty prompt, or a pre-record 0.18 text); an owner's edit
+    ///   is kept.
     ///
     /// Nothing is ever deleted, and the record is written only when it
     /// changes. Empty prompts left by migration 0010 are repaired here too,
-    /// since SQL cannot read the prompt files.
+    /// since SQL cannot read the prompt files. An unreadable record is logged
+    /// and replaced by defaults; a row whose config cannot be parsed is logged
+    /// and skipped. Neither fails the fleet.
     pub fn seed(&self, user_id: &str) -> Result<usize> {
+        let user_lock = self.user_lock(user_id);
+        let _guard = user_lock.lock().unwrap_or_else(|error| error.into_inner());
+        let done = self
+            .upgraded
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(user_id);
+        if done {
+            return Ok(0);
+        }
+        let inserted = self.upgrade(user_id)?;
+        self.upgraded
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(user_id.to_owned());
+        Ok(inserted)
+    }
+
+    fn user_lock(&self, user_id: &str) -> Arc<Mutex<()>> {
+        self.user_locks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(user_id.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    fn upgrade(&self, user_id: &str) -> Result<usize> {
         let rows = self.store.list_bots(user_id)?;
         let mut offerings: Offerings = match self.store.fleet_offerings(user_id)? {
-            Some(raw) => serde_json::from_str(&raw)?,
+            Some(raw) => serde_json::from_str(&raw).unwrap_or_else(|error| {
+                warn!(%error, "fleet offering record is unreadable; using defaults");
+                Offerings::default()
+            }),
             None => Offerings::default(),
         };
         let original = offerings.clone();
@@ -229,34 +290,49 @@ impl FleetRegistry {
                 }
                 continue;
             };
-            let mut config: BotConfig =
-                serde_json::from_value(row.config.clone()).map_err(|_| {
-                    SeraError::Config(format!("bot '{name}' has an invalid stored config"))
-                })?;
+            let mut config: BotConfig = match serde_json::from_value(row.config.clone()) {
+                Ok(config) => config,
+                Err(error) => {
+                    warn!(bot = name, %error, "bot has an invalid stored config; not upgrading it");
+                    continue;
+                }
+            };
             // Without a record the row itself is the baseline, so nothing it
-            // already holds is treated as new.
+            // already holds is treated as new. The cost: a tool, skill, or
+            // delegate the owner removed before the first upgrade may be added
+            // back once; after this run the record keeps it removed.
             let baseline = record.unwrap_or_else(|| BotOffering {
                 tools: config.tools.iter().cloned().collect(),
                 skills: config.skills.iter().cloned().collect(),
+                delegates: config.delegates.iter().cloned().collect(),
                 prompt_sha256: String::new(),
             });
-            let row_sha = sha256_hex(&row.prompt);
+            let row_digest = prompt_digest(&row.prompt);
             let prompt_is_shipped = row.prompt.is_empty()
-                || baseline.prompt_sha256 == row_sha
-                || SHIPPED_BEFORE_OFFERINGS.contains(&(name, row_sha.as_str()));
-            let prompt_changed = prompt_is_shipped && row.prompt != template.prompt;
-            let tools_before = config.tools.len();
-            let skills_before = config.skills.len();
+                || baseline.prompt_sha256 == row_digest
+                || SHIPPED_BEFORE_OFFERINGS.contains(&(name, row_digest.as_str()));
+            let prompt_changed =
+                prompt_is_shipped && prompt_digest(&row.prompt) != prompt_digest(&template.prompt);
+            let counts = |config: &BotConfig| {
+                (
+                    config.tools.len(),
+                    config.skills.len(),
+                    config.delegates.len(),
+                )
+            };
+            let before = counts(&config);
             add_gained(&mut config.tools, &template.config.tools, &baseline.tools);
             add_gained(
                 &mut config.skills,
                 &template.config.skills,
                 &baseline.skills,
             );
-            if config.tools.len() != tools_before
-                || config.skills.len() != skills_before
-                || prompt_changed
-            {
+            add_gained(
+                &mut config.delegates,
+                &template.config.delegates,
+                &baseline.delegates,
+            );
+            if counts(&config) != before || prompt_changed {
                 let prompt = if prompt_changed {
                     template.prompt.as_str()
                 } else {
@@ -275,6 +351,7 @@ impl FleetRegistry {
             let mut next = BotOffering::of(template);
             next.tools.extend(baseline.tools);
             next.skills.extend(baseline.skills);
+            next.delegates.extend(baseline.delegates);
             offerings.bots.insert(name.to_owned(), next);
         }
         if offerings != original {
@@ -282,7 +359,7 @@ impl FleetRegistry {
                 .set_fleet_offerings(user_id, &serde_json::to_string(&offerings)?)?;
         }
         if inserted > 0 || rows_changed {
-            self.invalidate(user_id);
+            self.evict(user_id);
         }
         Ok(inserted)
     }
@@ -365,6 +442,15 @@ impl FleetRegistry {
     /// Drop the cached fleet after a bot write so the next read sees the new
     /// rows.
     pub fn invalidate(&self, user_id: &str) {
+        self.evict(user_id);
+        self.upgraded
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(user_id);
+    }
+
+    /// Drop the cached fleet only; the upgrade mark stays set.
+    fn evict(&self, user_id: &str) {
         self.cache
             .write()
             .unwrap_or_else(|error| error.into_inner())
@@ -911,5 +997,140 @@ mod tests {
             store.get_bot(&admin, "main").unwrap().unwrap().prompt,
             "a pre-0.19 prompt"
         );
+    }
+
+    /// A template bot added to `main.delegates` reaches an existing user: the
+    /// bot row is inserted and `main` gains the delegate.
+    #[test]
+    fn a_new_template_bot_joins_an_existing_users_main_delegates() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        registry_with(&store, versioned(&[], "v1"))
+            .seed(&admin)
+            .unwrap();
+        assert_eq!(config_of(&store, &admin, "main").delegates, vec!["analyst"]);
+
+        let mut templates = versioned(&[], "v1");
+        templates[0].config.delegates.push("watcher".into());
+        templates.push(bot("watcher", BotRole::Specialist, vec![], true));
+        assert_eq!(registry_with(&store, templates).seed(&admin).unwrap(), 1);
+        assert!(store.get_bot(&admin, "watcher").unwrap().is_some());
+        assert_eq!(
+            config_of(&store, &admin, "main").delegates,
+            vec!["analyst", "watcher"]
+        );
+    }
+
+    /// The 0.18 main prompt, copied byte for byte from `release/0.19.0`, is
+    /// recognised as shipped with or without CRLF line endings and is replaced.
+    #[test]
+    fn the_shipped_0_18_main_prompt_is_replaced_with_or_without_crlf() {
+        const MAIN_0_18: &str = include_str!("fixtures/main_0_18_prompt.txt");
+        for prompt in [MAIN_0_18.to_owned(), MAIN_0_18.replace('\n', "\r\n")] {
+            let store = Store::open_in_memory(384).unwrap();
+            let admin = store.admin_user_id().unwrap();
+            let old = versioned(&["delegate"], "x");
+            store
+                .upsert_bot(
+                    &admin,
+                    "main",
+                    &serde_json::to_value(&old[0].config).unwrap(),
+                    &prompt,
+                    true,
+                )
+                .unwrap();
+            registry_with(&store, versioned(&["delegate"], "v2 prompt"))
+                .seed(&admin)
+                .unwrap();
+            assert_eq!(
+                store.get_bot(&admin, "main").unwrap().unwrap().prompt,
+                "v2 prompt"
+            );
+        }
+    }
+
+    /// An unreadable offering record is logged and replaced by defaults; the
+    /// fleet still upgrades and the record is valid JSON afterwards.
+    #[test]
+    fn an_unreadable_offering_record_does_not_fail_the_fleet() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        registry_with(&store, versioned(&["delegate"], "v1"))
+            .seed(&admin)
+            .unwrap();
+        store.set_fleet_offerings(&admin, "not json {").unwrap();
+
+        let next = registry_with(&store, versioned(&["delegate", "local_list"], "v1"));
+        assert_eq!(next.seed(&admin).unwrap(), 0);
+        assert_eq!(
+            config_of(&store, &admin, "main").tools,
+            vec!["delegate", "local_list"]
+        );
+        let record = store.fleet_offerings(&admin).unwrap().unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&record).is_ok());
+    }
+
+    /// A row whose stored config cannot be parsed is skipped with a warning:
+    /// its text is left alone, other bots still upgrade, and seed succeeds.
+    #[test]
+    fn an_unparseable_row_is_skipped_and_the_rest_upgrade() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        store
+            .upsert_bot(
+                &admin,
+                "main",
+                &serde_json::json!({"not": "a bot config"}),
+                "owner text",
+                true,
+            )
+            .unwrap();
+        let registry = registry_with(&store, versioned(&["delegate"], "v2"));
+        assert_eq!(registry.seed(&admin).unwrap(), 1);
+        let main = store.get_bot(&admin, "main").unwrap().unwrap();
+        assert_eq!(main.config, serde_json::json!({"not": "a bot config"}));
+        assert_eq!(main.prompt, "owner text");
+        assert!(store.get_bot(&admin, "analyst").unwrap().is_some());
+    }
+
+    /// Concurrent seeds for one user serialize: exactly one of them inserts
+    /// the missing template bot.
+    #[test]
+    fn concurrent_seeds_for_one_user_insert_each_bot_once() {
+        let path =
+            std::env::temp_dir().join(format!("serabot-fleet-race-{}.db", uuid::Uuid::new_v4()));
+        let store = Store::open(&path, 384, 5000).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let registry = registry_with(&store, versioned(&[], "v1"));
+        let total: usize = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let registry = registry.clone();
+                    let admin = admin.clone();
+                    scope.spawn(move || registry.seed(&admin).unwrap())
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .sum()
+        });
+        assert_eq!(total, 2);
+        assert_eq!(store.count_bots(&admin).unwrap(), 2);
+    }
+
+    /// The upgrade runs once per user per process: the mark is set after the
+    /// first seed and cleared by `invalidate`.
+    #[test]
+    fn the_upgrade_runs_once_until_invalidated() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let registry = registry_with(&store, versioned(&[], "v1"));
+        registry.seed(&admin).unwrap();
+        assert!(registry.upgraded.lock().unwrap().contains(&admin));
+        registry.invalidate(&admin);
+        assert!(!registry.upgraded.lock().unwrap().contains(&admin));
+        assert_eq!(registry.seed(&admin).unwrap(), 0);
+        assert!(registry.upgraded.lock().unwrap().contains(&admin));
     }
 }
