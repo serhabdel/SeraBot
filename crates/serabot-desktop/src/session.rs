@@ -122,11 +122,12 @@ pub enum Section {
     Approvals,
     Browser,
     Vault,
+    Usage,
     Settings,
 }
 
 impl Section {
-    pub const NAV: [Self; 8] = [
+    pub const NAV: [Self; 9] = [
         Self::Chat,
         Self::Conversations,
         Self::Browser,
@@ -135,6 +136,7 @@ impl Section {
         Self::Connectors,
         Self::Approvals,
         Self::Vault,
+        Self::Usage,
     ];
 
     pub fn label(self) -> &'static str {
@@ -147,6 +149,7 @@ impl Section {
             Self::Approvals => "Approvals",
             Self::Browser => "Browser",
             Self::Vault => "Vault",
+            Self::Usage => "Usage",
             Self::Settings => "Settings",
         }
     }
@@ -462,6 +465,9 @@ pub struct Session {
     pub connect_error: Option<String>,
     pub connecting: bool,
     pub theme: Theme,
+    /// Usage page range in days (7, 30 or 90) and whether a load is running.
+    pub usage_days: u32,
+    pub usage_loading: bool,
     /// Pinned bots/conversations shown in the inspector strip. Persisted in
     /// settings.json through [`creds::Settings::pins`].
     pub pins: Vec<String>,
@@ -595,6 +601,8 @@ impl Session {
             connecting: false,
             theme,
             pins,
+            usage_days: 30,
+            usage_loading: false,
             section: Section::Chat,
             conversation: "windows-owner".into(),
             composer: String::new(),
@@ -947,6 +955,9 @@ impl Session {
         self.panel.set_page_open(section == Section::Browser);
         if section == Section::Vault {
             self.panel.ask_vault_list();
+        }
+        if section == Section::Usage {
+            self.load_usage_days(self.usage_days);
         }
         if section == Section::Settings {
             self.refresh_status();
@@ -1558,6 +1569,14 @@ impl Session {
         self.start_request(Operation::UpdateBotConfig { id, update });
     }
 
+    /// Usage page: pick a range (7, 30 or 90 days) and load it.
+    pub fn load_usage_days(&mut self, days: u32) {
+        let days = if matches!(days, 7 | 30 | 90) { days } else { 30 };
+        self.usage_days = days;
+        self.usage_loading = true;
+        self.load_usage(days);
+    }
+
     /// Load the token usage report for the last `days` days (1–365).
     pub fn load_usage(&mut self, days: u32) {
         self.load_usage_scoped(days, None, None);
@@ -2141,6 +2160,7 @@ impl Session {
                         );
                 }
                 Err(error) => {
+                    self.usage_loading = false;
                     let message = error.to_string();
                     let rate_limited = error == ApiError::Http(429);
                     self.state.fail(&completion.scope, completion.kind, error);
@@ -2534,7 +2554,7 @@ impl Session {
                         // The detail is cached in the state; nothing else to do.
                         OperationKind::BotDetail => {}
                         // The usage report is cached in the state.
-                        OperationKind::Usage => {}
+                        OperationKind::Usage => self.usage_loading = false,
                         OperationKind::BotConfigWrite => {
                             if let Some((id, update)) = bot_config {
                                 // Optimistic update of the cached detail; the
@@ -2613,7 +2633,7 @@ impl Session {
             Section::Providers => (!self.state.providers_loaded).then_some(Operation::Providers),
             Section::Connectors => (!self.state.connectors_loaded).then_some(Operation::Connectors),
             Section::Approvals => (!self.state.approvals_loaded).then_some(Operation::Approvals),
-            Section::Browser | Section::Vault | Section::Settings => None,
+            Section::Browser | Section::Vault | Section::Usage | Section::Settings => None,
         }
     }
 

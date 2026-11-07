@@ -22,9 +22,15 @@ use crate::ui_browser::BrowserView;
 use crate::ui_connectors::ConnectorsView;
 use crate::ui_dock::BrowserDock;
 use crate::ui_settings::SettingsPanel;
+use crate::ui_usage::UsagePage;
 use crate::ui_vault::VaultPage;
 
 const CSS: &str = include_str!("../assets/app.css");
+/// Styles of the 0.17 usage and settings pages, kept apart from app.css.
+const CSS_PAGES: &str = concat!(
+    include_str!("../assets/usage.css"),
+    include_str!("../assets/settings.css")
+);
 
 /// A chat row: id, owner flag, speaker, avatar, bot, time, body, peer flag.
 type ChatRow = (
@@ -574,6 +580,7 @@ fn App() -> Element {
     let _revision = revision();
     rsx! {
         style { {CSS} }
+        style { {CSS_PAGES} }
         div { class: "root", "data-theme": theme,
             if connected || restarting {
                 Shell { session }
@@ -643,6 +650,7 @@ pub(crate) fn Icon(name: String, #[props(default = 20)] size: u32) -> Element {
         "approvals" => "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM8 12l3 3 5-6",
         "fleet" => "M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z",
         "lock" => "M6 11h12v9H6zM8 11V8a4 4 0 0 1 8 0v3",
+        "usage" => "M5 20V10M12 20V4M19 20v-7",
         "globe" => {
             "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"
         }
@@ -1306,6 +1314,7 @@ fn Shell(session: Signal<Session>) -> Element {
                         Section::Approvals => rsx! { ApprovalsView { session } },
                         Section::Browser => rsx! { BrowserView { session, overlay } },
                         Section::Vault => rsx! { VaultPage { session } },
+                        Section::Usage => rsx! { UsagePage { session } },
                         Section::Settings => rsx! { SettingsView { session } },
                     }}
                 }
@@ -1361,13 +1370,14 @@ fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> 
     let mut session = session;
     let section = session.read().section;
     let pending = session.read().state.approvals.len();
-    let destinations: [(Section, &str, &str); 7] = [
+    let destinations: [(Section, &str, &str); 8] = [
         (Section::Chat, "chat", "Chats"),
         (Section::Browser, "globe", "Browser"),
         (Section::Approvals, "approvals", "Approvals"),
         (Section::Memory, "memory", "Memory"),
         (Section::Connectors, "connectors", "Connectors"),
         (Section::Vault, "lock", "Vault"),
+        (Section::Usage, "usage", "Usage"),
         (Section::Providers, "providers", "AI keys"),
     ];
     rsx! {
