@@ -10,6 +10,21 @@ pub const POLL_EVERY: Duration = Duration::from_secs(4);
 /// The sign-in wait ends after this long without the app showing up.
 pub const WAIT_LIMIT: Duration = Duration::from_secs(300);
 
+/// A short note under the key box for what has been typed so far. It reads
+/// only the public prefix, so nothing secret is kept or shown.
+pub fn key_hint(key: &str) -> &'static str {
+    let key = key.trim();
+    if key.starts_with("uak_") {
+        "This looks like a user key (uak_)."
+    } else if key.starts_with("ak_") {
+        "This looks like a project key (ak_)."
+    } else if key.starts_with("ck_") {
+        "This looks like a Composio Connect key (ck_). Your apps are managed in Composio Connect."
+    } else {
+        "SeraBot accepts project keys (ak_), user keys (uak_) and Connect keys (ck_)."
+    }
+}
+
 pub struct ComposioFlow {
     /// A change (key, connect, disconnect) is on its way.
     pub busy: bool,
@@ -146,6 +161,14 @@ mod tests {
             toolkit: toolkit.into(),
             status: status.into(),
         }
+    }
+
+    #[test]
+    fn the_key_hint_names_the_kind_from_the_prefix() {
+        assert!(key_hint("ck_abc").contains("Connect"));
+        assert!(key_hint(" ak_abc").contains("project"));
+        assert!(key_hint("uak_abc").contains("user key"));
+        assert!(key_hint("zzz").contains("ck_"));
     }
 
     #[test]
