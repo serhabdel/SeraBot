@@ -205,7 +205,9 @@ fn normalize(key: &str) -> String {
 
 fn find(key: &str) -> Option<&'static Brand> {
     let key = normalize(key);
-    BRANDS.iter().find(|brand| brand.keys.contains(&key.as_str()))
+    BRANDS
+        .iter()
+        .find(|brand| brand.keys.contains(&key.as_str()))
 }
 
 /// A `data:` URI for the brand's image, if we have one. Unknown keys return
@@ -287,7 +289,11 @@ mod tests {
         let mut total = 0;
         for brand in BRANDS {
             if let Mark::Png(bytes) = brand.mark {
-                assert!(bytes.starts_with(&PNG_MAGIC), "{} is not a PNG", brand.label);
+                assert!(
+                    bytes.starts_with(&PNG_MAGIC),
+                    "{} is not a PNG",
+                    brand.label
+                );
                 // IHDR width and height are big-endian u32 at bytes 16..24.
                 let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
                 let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
@@ -316,8 +322,14 @@ mod tests {
                 assert!(seen.insert(*key), "duplicate brand key {key}");
             }
         }
-        assert_eq!(brand_image_src("Google_Drive"), brand_image_src("google-drive"));
-        assert_eq!(brand_image_src("GOOGLE-DRIVE"), brand_image_src("google-drive"));
+        assert_eq!(
+            brand_image_src("Google_Drive"),
+            brand_image_src("google-drive")
+        );
+        assert_eq!(
+            brand_image_src("GOOGLE-DRIVE"),
+            brand_image_src("google-drive")
+        );
         assert_eq!(brand_image_src("MiniMax_CN"), brand_image_src("minimax-cn"));
         assert_eq!(
             brand_image_src("Google_Antigravity"),

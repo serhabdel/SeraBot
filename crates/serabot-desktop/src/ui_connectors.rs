@@ -14,9 +14,8 @@ use dioxus::prelude::*;
 use serabot_desktop::ConnectorStatus;
 use serabot_desktop::connector_card::{
     CardState, DEFAULT_ADMIN_HINT, GOOGLE_CONSOLE_URL, GOOGLE_SETUP_STEPS, NOTION_HELP_URL,
-    NOTION_SHARE_HINT, connector_card_state, editable_roles, google_is_set_up,
-    google_redirect_uri, google_setup_offered, is_internal_role, legacy_connected,
-    supports_sign_in, uses_api_key,
+    NOTION_SHARE_HINT, connector_card_state, editable_roles, google_is_set_up, google_redirect_uri,
+    google_setup_offered, is_internal_role, legacy_connected, supports_sign_in, uses_api_key,
 };
 use serabot_desktop::session::{Session, humanize_label};
 
@@ -98,10 +97,7 @@ enum ConnectorAction {
 
 /// The single primary action for a connector in its current state, or `None`
 /// when there is nothing the owner can do from the card.
-fn connector_action(
-    connector: &ConnectorStatus,
-    connected: bool,
-) -> Option<ConnectorAction> {
+fn connector_action(connector: &ConnectorStatus, connected: bool) -> Option<ConnectorAction> {
     if connector.id == "onedrive" {
         return Some(if connected {
             ConnectorAction::DisconnectOneDrive
@@ -958,8 +954,14 @@ mod tests {
             );
         }
         // Whatever mode the server reports, signing in leads and no key sits beside it.
-        assert_eq!(connector_action(&voice, false), Some(ConnectorAction::SignIn));
-        assert_eq!(connector_action(&voice, true), Some(ConnectorAction::SignIn));
+        assert_eq!(
+            connector_action(&voice, false),
+            Some(ConnectorAction::SignIn)
+        );
+        assert_eq!(
+            connector_action(&voice, true),
+            Some(ConnectorAction::SignIn)
+        );
         assert_eq!(editable_roles(&voice), vec!["api_key".to_owned()]);
     }
 
