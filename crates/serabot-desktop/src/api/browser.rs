@@ -59,9 +59,39 @@ struct ProfileList {
     profiles: Vec<BrowserProfile>,
 }
 
+/// One tab of a browser (`t1`, `t2`, ...).
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct BrowserTab {
+    pub id: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub active: bool,
+}
+
+/// The last pointer action of whoever drives the page, in viewport pixels
+/// (`vw` x `vh`). `seq` grows with every action.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct BrowserPointer {
+    pub x: f64,
+    pub y: f64,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub vw: u32,
+    #[serde(default)]
+    pub vh: u32,
+}
+
+pub const MAX_BROWSER_TABS: usize = 8;
+
 /// One live (or idle) browser: `GET /v1/browser/sessions`. The session id is
 /// the profile id.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct BrowserSessionInfo {
     pub id: String,
     pub profile_name: String,
@@ -71,6 +101,10 @@ pub struct BrowserSessionInfo {
     #[serde(default)]
     pub title: Option<String>,
     pub controller: BrowserController,
+    #[serde(default)]
+    pub tabs: Vec<BrowserTab>,
+    #[serde(default)]
+    pub pointer: Option<BrowserPointer>,
     /// The bot that last drove this browser.
     #[serde(default)]
     pub bot: Option<String>,
@@ -217,6 +251,17 @@ fn check_session(session: &BrowserSessionInfo) -> Result<(), ApiError> {
             .title
             .as_deref()
             .is_none_or(|v| plain(v, 512, false))
+        && session.tabs.len() <= MAX_BROWSER_TABS
+        && session.tabs.iter().all(|tab| {
+            valid_tab_id(&tab.id) && plain(&tab.url, 2048, false) && plain(&tab.title, 512, false)
+        })
+        && session.pointer.as_ref().is_none_or(|p| {
+            p.x.is_finite()
+                && p.y.is_finite()
+                && p.vw <= 8192
+                && p.vh <= 8192
+                && p.action.len() <= 16
+        })
         && session.bot.as_deref().is_none_or(valid_speaker)
         && session.conversation_id.as_deref().is_none_or(valid_id)
         && plain(&session.updated_at, 64, false);
@@ -225,6 +270,12 @@ fn check_session(session: &BrowserSessionInfo) -> Result<(), ApiError> {
     } else {
         Err(ApiError::InvalidResponse)
     }
+}
+
+/// `t` and 1-6 digits, like the server.
+pub fn valid_tab_id(id: &str) -> bool {
+    id.strip_prefix('t')
+        .is_some_and(|n| !n.is_empty() && n.len() <= 6 && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn session_id(id: &str) -> Result<(), ApiError> {
@@ -340,6 +391,35 @@ impl ApiClient {
     /// `POST /v1/browser/sessions/{id}/handback`.
     pub fn browser_session_handback(&self, id: &str) -> Result<BrowserSessionInfo, ApiError> {
         self.session_control(id, "handback")
+    }
+
+    /// `POST /v1/browser/sessions/{id}/tabs/{tab}/switch` (user in control).
+    pub fn browser_tab_switch(&self, id: &str, tab: &str) -> Result<BrowserSessionInfo, ApiError> {
+        self.tab_control(id, tab, "switch")
+    }
+
+    /// `POST /v1/browser/sessions/{id}/tabs/{tab}/close` (user in control).
+    pub fn browser_tab_close(&self, id: &str, tab: &str) -> Result<BrowserSessionInfo, ApiError> {
+        self.tab_control(id, tab, "close")
+    }
+
+    fn tab_control(
+        &self,
+        id: &str,
+        tab: &str,
+        action: &str,
+    ) -> Result<BrowserSessionInfo, ApiError> {
+        session_id(id)?;
+        if !valid_tab_id(tab) {
+            return Err(ApiError::Validation("That tab is not valid."));
+        }
+        let info: BrowserSessionInfo = self.panel_json::<_, ()>(
+            Method::POST,
+            &["v1", "browser", "sessions", id, "tabs", tab, action],
+            None,
+        )?;
+        check_session(&info)?;
+        Ok(info)
     }
 
     /// `POST /v1/browser/sessions/{id}/input`, valid only while the user
@@ -536,6 +616,42 @@ mod tests {
         let mut bad = list.sessions[0].clone();
         bad.title = Some("a\nb".into());
         assert!(check_session(&bad).is_err());
+    }
+
+    /// The takeover/handback/input reply is parsed as a session: it must carry
+    /// `id` and `profile_name` (the server once left them out, so "Take
+    /// control" failed with an API error although the switch had happened).
+    #[test]
+    fn control_replies_parse_as_sessions_and_carry_tabs_and_pointer() {
+        let reply = r#"{"active":true,"url":"https://example.com/","title":"Example",
+            "controller":"user","updated_at":"2026-11-07T10:00:00Z","id":"default",
+            "profile_name":"Default","tabs":[{"id":"t1","url":"https://example.com/",
+            "title":"Example","active":true},{"id":"t2","url":"https://example.org/",
+            "title":"Other","active":false}],
+            "pointer":{"x":10.5,"y":20.0,"action":"click","seq":3,"vw":1280,"vh":800}}"#;
+        let info: BrowserSessionInfo = serde_json::from_str(reply).unwrap();
+        assert!(check_session(&info).is_ok());
+        assert_eq!(info.controller, BrowserController::User);
+        assert_eq!(info.tabs.len(), 2);
+        assert!(info.tabs[0].active && !info.tabs[1].active);
+        assert_eq!(info.pointer.as_ref().map(|p| p.seq), Some(3));
+        // Older servers send neither tabs nor pointer.
+        let old: BrowserSessionInfo = serde_json::from_str(
+            r#"{"active":true,"controller":"bot","updated_at":"x","id":"default","profile_name":"Default"}"#,
+        )
+        .unwrap();
+        assert!(old.tabs.is_empty() && old.pointer.is_none());
+        // A reply without the session identity is exactly what broke Take control.
+        assert!(
+            serde_json::from_str::<BrowserSessionInfo>(
+                r#"{"active":true,"controller":"user","updated_at":"x"}"#
+            )
+            .is_err()
+        );
+        let mut bad = info.clone();
+        bad.tabs[0].id = "../x".into();
+        assert!(check_session(&bad).is_err());
+        assert!(valid_tab_id("t12") && !valid_tab_id("t") && !valid_tab_id("x1"));
     }
 
     #[test]

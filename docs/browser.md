@@ -46,6 +46,8 @@ when you must run as root.
 | `browser_press{key}` | yes | Enter, Tab, Escape, arrows, a single letter or digit, ... |
 | `browser_screenshot{}` | no | JPEG stored as an artifact; not returned to the model. |
 | `browser_close{}` | no | Close the session. |
+| `browser_tabs{action?, tab?}` | no | List tabs (`t1`, `t2`, ...) or `switch`/`close` one by id. The active tab is the one the other tools act on; switching clears the refs. |
+| `browser_new_tab{url}` | yes | Open a public http(s) URL in a new active tab (at most 8 tabs; same URL policy as `browser_navigate`). |
 
 While the owner has taken over (`controller = user`) every bot tool, including
 `browser_close`, fails with "the user is in control of the browser".
@@ -105,3 +107,7 @@ the service user to private ranges at the host firewall as defence in depth.
 
 Firecrawl for plain extraction (see `docs/firecrawl.md`); BrowserOS neo on the owner PC
 for logged-in flows is out of scope for this server browser.
+
+## Tabs and pointer (0.18)
+
+`GET /v1/browser/sessions` entries (and the takeover, handback, input and tab replies, which also carry `id` and `profile_name`) include `tabs` (`[{id: "t1", url, title, active}]`, at most 8) and `pointer` (`{x, y, action: "click"|"scroll", seq, vw, vh}`, viewport pixels, `seq` grows per action). While the user holds control: `POST /v1/browser/sessions/{id}/tabs {"url"}` opens a tab (public http(s) only), `POST .../tabs/{tab}/switch` and `.../tabs/{tab}/close` switch or close one; the last tab cannot be closed. The desktop Browser page draws a tab strip above the live view and a cursor with a click ripple (static under reduced motion) while the bot drives.

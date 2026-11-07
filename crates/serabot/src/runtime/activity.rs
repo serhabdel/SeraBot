@@ -68,6 +68,14 @@ pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -
         "browser_press" => ("pointer", "Pressing a key".into()),
         "browser_screenshot" => ("image", "Taking a screenshot".into()),
         "browser_close" => ("globe", "Closing the browser".into()),
+        "browser_tabs" => ("globe", "Checking the browser tabs".into()),
+        "browser_new_tab" => (
+            "globe",
+            host_of(args).map_or_else(
+                || "Opening a new tab".into(),
+                |h| format!("Opening {h} in a new tab"),
+            ),
+        ),
         "fetch_url" | "firecrawl_scrape" | "firecrawl_extract" => (
             "globe",
             host_of(args).map_or_else(|| "Reading a web page".into(), |h| format!("Reading {h}")),

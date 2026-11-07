@@ -259,6 +259,15 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/browser/sessions/{id}/handback", post(session_handback))
         .route("/v1/browser/sessions/{id}/input", post(session_input))
         .route("/v1/browser/sessions/{id}/close", post(session_close))
+        .route("/v1/browser/sessions/{id}/tabs", post(session_tab_open))
+        .route(
+            "/v1/browser/sessions/{id}/tabs/{tab}/switch",
+            post(session_tab_switch),
+        )
+        .route(
+            "/v1/browser/sessions/{id}/tabs/{tab}/close",
+            post(session_tab_close),
+        )
         .route(
             "/v1/browser/profiles",
             get(profiles_list).post(profile_create),

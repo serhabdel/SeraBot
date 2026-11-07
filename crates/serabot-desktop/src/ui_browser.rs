@@ -15,7 +15,9 @@ use crate::ui::{ChatView, Icon, Overlay, avatar_style};
 use dioxus::prelude::*;
 use serabot_desktop::panel::{address_to_url, host_label, profile_users};
 use serabot_desktop::session::Session;
-use serabot_desktop::{BrowserController, BrowserInput, BrowserSessionInfo};
+use serabot_desktop::{
+    BrowserController, BrowserInput, BrowserPointer, BrowserSessionInfo, BrowserTab,
+};
 
 /// A grid card: the session, its latest picture, and the bot driving it.
 type Card = (BrowserSessionInfo, Option<String>, Option<(String, String)>);
@@ -26,6 +28,84 @@ pub fn BrowserView(session: Signal<Session>, overlay: Signal<Overlay>) -> Elemen
     match focus {
         Some(id) => rsx! { FocusView { session, overlay, id } },
         None => rsx! { BrowserGrid { session } },
+    }
+}
+
+/// Where the bot last moved or clicked, drawn over the live picture by the
+/// script in `ui_dock.rs` (which maps viewport pixels onto the image). Hidden
+/// from assistive tech; only rendered while the bot drives.
+#[component]
+pub fn PointerOverlay(pointer: Option<BrowserPointer>) -> Element {
+    let Some(p) = pointer else {
+        return rsx! {};
+    };
+    rsx! {
+        div {
+            id: "dock-pointer",
+            class: "dock-pointer",
+            "aria-hidden": "true",
+            "data-x": "{p.x}",
+            "data-y": "{p.y}",
+            "data-vw": "{p.vw}",
+            "data-vh": "{p.vh}",
+            "data-seq": "{p.seq}",
+            "data-action": "{p.action}",
+            span { class: "dock-pointer-ripple" }
+            span { class: "dock-pointer-dot" }
+        }
+    }
+}
+
+/// A short label for a tab: its title, else its host, else "New tab".
+fn tab_label(tab: &BrowserTab) -> String {
+    let title = tab.title.trim();
+    if !title.is_empty() {
+        return title.chars().take(28).collect();
+    }
+    match host_label(Some(tab.url.as_str())) {
+        host if !host.is_empty() => host.chars().take(28).collect(),
+        _ => "New tab".to_owned(),
+    }
+}
+
+/// The tab strip above the page. Switching and closing need control, like
+/// typing into the page does.
+#[component]
+fn TabStrip(session: Signal<Session>, tabs: Vec<BrowserTab>, in_control: bool) -> Element {
+    let mut session = session;
+    let only = tabs.len() <= 1;
+    rsx! {
+        div { class: "tab-strip", role: "tablist", "aria-label": "Browser tabs",
+            for tab in tabs {
+                {
+                    let label = tab_label(&tab);
+                    let switch_id = tab.id.clone();
+                    let close_id = tab.id.clone();
+                    rsx! {
+                        div { key: "{tab.id}", class: if tab.active { "tab active" } else { "tab" },
+                            button {
+                                class: "tab-main",
+                                role: "tab",
+                                "aria-selected": if tab.active { "true" } else { "false" },
+                                title: if in_control { "{tab.url}" } else { "Take control to switch tabs" },
+                                disabled: !in_control && !tab.active,
+                                onclick: move |_| session.write().panel.switch_tab(&switch_id),
+                                "{label}"
+                            }
+                            if in_control && !only {
+                                button {
+                                    class: "tab-close",
+                                    "aria-label": "Close tab {label}",
+                                    title: "Close tab",
+                                    onclick: move |_| session.write().panel.close_tab(&close_id),
+                                    "\u{d7}"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -349,6 +429,8 @@ fn FocusView(session: Signal<Session>, overlay: Signal<Overlay>, id: String) -> 
         .as_ref()
         .map(|i| i.profile_name.clone())
         .unwrap_or_else(|| id.clone());
+    let tabs = info.as_ref().map(|i| i.tabs.clone()).unwrap_or_default();
+    let pointer = info.as_ref().and_then(|i| i.pointer.clone());
     let url = info
         .as_ref()
         .and_then(|i| i.url.clone())
@@ -433,6 +515,9 @@ fn FocusView(session: Signal<Session>, overlay: Signal<Overlay>, id: String) -> 
                         span { class: "dock-url-text", "{url_text}" }
                     }
                 }
+                if active && !tabs.is_empty() {
+                    TabStrip { session, tabs: tabs.clone(), in_control }
+                }
                 div { class: if active && shot.is_some() { "focus-view has-shot" } else { "focus-view" },
                     if active && shot.is_some() {
                         div {
@@ -447,6 +532,9 @@ fn FocusView(session: Signal<Session>, overlay: Signal<Overlay>, id: String) -> 
                                 alt: "Live view of the page",
                                 draggable: false,
                                 src: shot.clone().unwrap_or_default(),
+                            }
+                            if !in_control {
+                                PointerOverlay { pointer }
                             }
                         }
                     } else if active {

@@ -69,7 +69,30 @@ async fn controller_for(
     browser
         .set_controller(&user.id, profile, controller)
         .await?;
-    Ok(Json(browser.info(&user.id, profile).await.to_json()))
+    session_reply(
+        state,
+        user,
+        profile,
+        browser.info(&user.id, profile).await.to_json(),
+    )
+}
+
+/// The shape the desktop expects for a session: the live info plus the
+/// profile `id` and `profile_name` (the list route adds the same two).
+fn session_reply(
+    state: &ApiState,
+    user: &ActingUser,
+    profile: &str,
+    mut info: Value,
+) -> Result<Json<Value>> {
+    let name = state
+        .store
+        .get_browser_profile(&user.id, profile)?
+        .map(|p| p.name)
+        .unwrap_or_else(|| profile.to_owned());
+    info["id"] = json!(profile);
+    info["profile_name"] = json!(name);
+    Ok(Json(info))
 }
 
 async fn close_for(state: &ApiState, user: &ActingUser, profile: &str) -> Result<Json<Value>> {
@@ -205,6 +228,81 @@ pub(super) async fn session_input(
     input_for(&state, &user, &id, input).await
 }
 
+// ---- tabs (user, while holding control) ----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TabOpen {
+    url: String,
+}
+
+fn valid_tab_id(id: &str) -> bool {
+    id.strip_prefix('t')
+        .is_some_and(|n| !n.is_empty() && n.len() <= 6 && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// `POST /v1/browser/sessions/{id}/tabs` `{"url"}` - a new active tab. Like
+/// `input`, only while the user holds control, and public URLs only.
+pub(super) async fn session_tab_open(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+    Json(body): Json<TabOpen>,
+) -> Result<Json<Value>> {
+    existing_profile(&state, &user, &id)?;
+    let browser = manager(&state)?;
+    let url = validate_resolved(&body.url).await?;
+    let lease = browser.user_lease(&user.id, &id).await?;
+    lease.backend().open_tab(url.as_str()).await?;
+    drop(lease);
+    session_reply(
+        &state,
+        &user,
+        &id,
+        browser.info(&user.id, &id).await.to_json(),
+    )
+}
+
+async fn tab_op(
+    state: &ApiState,
+    user: &ActingUser,
+    id: &str,
+    tab: &str,
+    close: bool,
+) -> Result<Json<Value>> {
+    existing_profile(state, user, id)?;
+    if !valid_tab_id(tab) {
+        return Err(SeraError::NotFound(format!("browser tab {tab}")));
+    }
+    let browser = manager(state)?;
+    let lease = browser.user_lease(&user.id, id).await?;
+    if close {
+        lease.backend().close_tab(tab).await?;
+    } else {
+        lease.backend().switch_tab(tab).await?;
+    }
+    drop(lease);
+    session_reply(state, user, id, browser.info(&user.id, id).await.to_json())
+}
+
+/// `POST /v1/browser/sessions/{id}/tabs/{tab}/switch`
+pub(super) async fn session_tab_switch(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path((id, tab)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    tab_op(&state, &user, &id, &tab, false).await
+}
+
+/// `POST /v1/browser/sessions/{id}/tabs/{tab}/close`
+pub(super) async fn session_tab_close(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path((id, tab)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    tab_op(&state, &user, &id, &tab, true).await
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub(super) enum BrowserInput {
@@ -272,7 +370,12 @@ async fn input_for(
         _ => {}
     }
     drop(lease);
-    Ok(Json(browser.info(&user.id, profile).await.to_json()))
+    session_reply(
+        state,
+        user,
+        profile,
+        browser.info(&user.id, profile).await.to_json(),
+    )
 }
 
 // ---- profiles ----

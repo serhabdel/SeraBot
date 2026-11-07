@@ -27,6 +27,8 @@ pub const CAPABILITIES: &[Capability] = &[
             "browser_press",
             "browser_screenshot",
             "browser_close",
+            "browser_tabs",
+            "browser_new_tab",
         ],
     },
     Capability {

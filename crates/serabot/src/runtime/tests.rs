@@ -28,6 +28,7 @@ fn tool_notice_describes_tools_and_groups_browser() {
     let text = messages[1].content.as_deref().unwrap();
     assert!(text.contains("- rag_search: Search private documents\n"));
     assert!(text.contains("You can control a real web browser on the server: browser_navigate, browser_click, vault_list"));
+    assert!(text.contains("never write them in a reply to the user"));
     assert!(!text.contains("- browser_navigate:"));
     assert!(text.contains("- memory_delete: Delete a memory [needs owner approval]"));
 }

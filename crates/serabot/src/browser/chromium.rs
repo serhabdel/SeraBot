@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -21,7 +22,7 @@ use tokio::task::JoinHandle;
 
 use super::cdp::{CdpConnection, CdpEvent};
 use super::guard::allow_subrequest;
-use super::manager::{BrowserBackend, BrowserLauncher, PageInfo};
+use super::manager::{BrowserBackend, BrowserLauncher, PageInfo, Pointer, TabInfo};
 use super::outline::{Outline, build_outline, key_def};
 use crate::config::BrowserConfig;
 use crate::error::{Result, SeraError};
@@ -32,6 +33,71 @@ pub const MAX_SCREENSHOT_BYTES: usize = 512 * 1024;
 const SNAPSHOT_CHARS: usize = 12_000;
 const SNAPSHOT_REFS: usize = 200;
 const VERDICT_TTL: Duration = Duration::from_secs(30);
+/// Most tabs one session may hold.
+pub const MAX_TABS: usize = 8;
+
+/// One attached page.
+#[derive(Debug, Clone)]
+struct Tab {
+    label: String,
+    target_id: String,
+    session_id: String,
+}
+
+/// The tabs of one browser and which one the tools act on.
+#[derive(Debug, Default)]
+struct TabSet {
+    tabs: Vec<Tab>,
+    active: String,
+    next: u32,
+}
+
+impl TabSet {
+    fn add(&mut self, target_id: String, session_id: String) -> String {
+        self.next += 1;
+        let label = format!("t{}", self.next);
+        self.tabs.push(Tab {
+            label: label.clone(),
+            target_id,
+            session_id,
+        });
+        self.active = label.clone();
+        label
+    }
+
+    fn active_tab(&self) -> Option<&Tab> {
+        self.tabs.iter().find(|tab| tab.label == self.active)
+    }
+
+    fn find(&self, label: &str) -> Option<&Tab> {
+        self.tabs.iter().find(|tab| tab.label == label)
+    }
+
+    fn owns_session(&self, session_id: &str) -> bool {
+        self.tabs.iter().any(|tab| tab.session_id == session_id)
+    }
+
+    fn owns_target(&self, target_id: &str) -> bool {
+        self.tabs.iter().any(|tab| tab.target_id == target_id)
+    }
+
+    fn remove(&mut self, label: &str) {
+        self.tabs.retain(|tab| tab.label != label);
+        if self.active == label {
+            self.active = self
+                .tabs
+                .first()
+                .map(|tab| tab.label.clone())
+                .unwrap_or_default();
+        }
+    }
+}
+
+type SharedTabs = Arc<std::sync::Mutex<TabSet>>;
+
+fn lock_tabs(tabs: &SharedTabs) -> std::sync::MutexGuard<'_, TabSet> {
+    tabs.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Chromium binaries to try, in order, when none is configured.
 pub const CHROMIUM_CANDIDATES: &[&str] = &[
@@ -184,13 +250,14 @@ impl BrowserLauncher for ChromiumLauncher {
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
         match ChromiumBackend::setup(port, &path, self.timeout).await {
-            Ok((cdp, session_id, target_id, tasks)) => Ok(Arc::new(ChromiumBackend {
+            Ok((cdp, tabs, tasks)) => Ok(Arc::new(ChromiumBackend {
                 cdp,
-                session_id,
-                target_id,
+                tabs,
                 child: Mutex::new(Some(child)),
                 outline: std::sync::Mutex::new(Outline::default()),
                 tasks: std::sync::Mutex::new(tasks),
+                pointer: std::sync::Mutex::new(None),
+                pointer_seq: AtomicU64::new(0),
             })),
             Err(error) => {
                 let _ = child.kill().await;
@@ -202,11 +269,12 @@ impl BrowserLauncher for ChromiumLauncher {
 
 pub struct ChromiumBackend {
     cdp: Arc<CdpConnection>,
-    session_id: String,
-    target_id: String,
+    tabs: SharedTabs,
     child: Mutex<Option<Child>>,
     outline: std::sync::Mutex<Outline>,
     tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    pointer: std::sync::Mutex<Option<Pointer>>,
+    pointer_seq: AtomicU64,
 }
 
 impl ChromiumBackend {
@@ -214,7 +282,7 @@ impl ChromiumBackend {
         port: u16,
         path: &str,
         timeout: Duration,
-    ) -> Result<(Arc<CdpConnection>, String, String, Vec<JoinHandle<()>>)> {
+    ) -> Result<(Arc<CdpConnection>, SharedTabs, Vec<JoinHandle<()>>)> {
         let cdp = Arc::new(CdpConnection::connect(port, path, timeout).await?);
         let targets = cdp.call(None, "Target.getTargets", json!({})).await?;
         let existing = targets["targetInfos"]
@@ -231,6 +299,23 @@ impl ChromiumBackend {
                 .ok_or_else(|| browser_error("no page target"))?
                 .to_owned(),
         };
+        let tabs: SharedTabs = Arc::default();
+        // Subscribe before enabling Fetch so no paused request is missed.
+        let events = spawn_event_loop(cdp.clone(), tabs.clone());
+        if let Err(error) = Self::attach_tab(&cdp, &tabs, &target_id).await {
+            events.abort();
+            return Err(error);
+        }
+        Ok((cdp, tabs, vec![events]))
+    }
+
+    /// Attach to a page, register it (so its requests are guarded from the
+    /// first one) and configure it. Returns the tab label.
+    async fn attach_tab(
+        cdp: &Arc<CdpConnection>,
+        tabs: &SharedTabs,
+        target_id: &str,
+    ) -> Result<String> {
         let attached = cdp
             .call(
                 None,
@@ -242,14 +327,17 @@ impl ChromiumBackend {
             .as_str()
             .ok_or_else(|| browser_error("attach returned no session"))?
             .to_owned();
-
-        // Subscribe before enabling Fetch so no paused request is missed.
-        let events = spawn_event_loop(cdp.clone(), session_id.clone(), target_id.clone());
-        if let Err(error) = Self::configure(&cdp, &session_id).await {
-            events.abort();
+        let previous = lock_tabs(tabs).active.clone();
+        let label = lock_tabs(tabs).add(target_id.to_owned(), session_id.clone());
+        if let Err(error) = Self::configure(cdp, &session_id).await {
+            let mut set = lock_tabs(tabs);
+            set.remove(&label);
+            if set.tabs.iter().any(|tab| tab.label == previous) {
+                set.active = previous;
+            }
             return Err(error);
         }
-        Ok((cdp, session_id, target_id, vec![events]))
+        Ok(label)
     }
 
     async fn configure(cdp: &Arc<CdpConnection>, session_id: &str) -> Result<()> {
@@ -280,12 +368,36 @@ impl ChromiumBackend {
         Ok(())
     }
 
-    fn sid(&self) -> Option<&str> {
-        Some(self.session_id.as_str())
+    fn active(&self) -> Result<Tab> {
+        lock_tabs(&self.tabs)
+            .active_tab()
+            .cloned()
+            .ok_or_else(|| browser_error("the browser has no open tab"))
+    }
+
+    fn sid(&self) -> String {
+        self.active().map(|tab| tab.session_id).unwrap_or_default()
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
-        self.cdp.call(self.sid(), method, params).await
+        let tab = self.active()?;
+        self.cdp
+            .call(Some(tab.session_id.as_str()), method, params)
+            .await
+    }
+
+    fn set_pointer(&self, x: f64, y: f64, action: &'static str) {
+        let seq = self.pointer_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Ok(mut slot) = self.pointer.lock() {
+            *slot = Some(Pointer {
+                x,
+                y,
+                action,
+                seq,
+                vw: VIEWPORT_WIDTH,
+                vh: VIEWPORT_HEIGHT,
+            });
+        }
     }
 
     async fn click_node(&self, backend_node_id: i64) -> Result<()> {
@@ -312,6 +424,15 @@ impl ChromiumBackend {
         self.click_at(x, y).await
     }
 
+    /// Refs belong to the page they were taken on.
+    fn reset_outline(&self) -> Result<()> {
+        *self
+            .outline
+            .lock()
+            .map_err(|_| browser_error("outline lock poisoned"))? = Outline::default();
+        Ok(())
+    }
+
     async fn settle(&self) {
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
@@ -326,11 +447,7 @@ impl ChromiumBackend {
 }
 
 /// Handles Fetch pauses (guard), popups and JS dialogs for one page session.
-fn spawn_event_loop(
-    cdp: Arc<CdpConnection>,
-    session_id: String,
-    target_id: String,
-) -> JoinHandle<()> {
+fn spawn_event_loop(cdp: Arc<CdpConnection>, tabs: SharedTabs) -> JoinHandle<()> {
     let mut events = cdp.subscribe();
     let verdicts: Arc<std::sync::Mutex<HashMap<String, (Instant, bool)>>> = Arc::default();
     tokio::spawn(async move {
@@ -340,22 +457,26 @@ fn spawn_event_loop(
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
             };
-            handle_event(&cdp, &session_id, &target_id, &verdicts, event);
+            handle_event(&cdp, &tabs, &verdicts, event);
         }
     })
 }
 
 fn handle_event(
     cdp: &Arc<CdpConnection>,
-    session_id: &str,
-    target_id: &str,
+    tabs: &SharedTabs,
     verdicts: &Arc<std::sync::Mutex<HashMap<String, (Instant, bool)>>>,
     event: CdpEvent,
 ) {
+    let known_session = event
+        .session_id
+        .as_deref()
+        .filter(|sid| lock_tabs(tabs).owns_session(sid))
+        .map(str::to_owned);
     match event.method.as_str() {
-        "Fetch.requestPaused" if event.session_id.as_deref() == Some(session_id) => {
+        "Fetch.requestPaused" if known_session.is_some() => {
             let cdp = cdp.clone();
-            let session_id = session_id.to_owned();
+            let session_id = known_session.unwrap_or_default();
             let verdicts = verdicts.clone();
             tokio::spawn(async move {
                 let request_id = event.params["requestId"]
@@ -379,21 +500,25 @@ fn handle_event(
             let info = &event.params["targetInfo"];
             if info["type"] == "page"
                 && let Some(id) = info["targetId"].as_str()
-                && id != target_id
             {
-                // Popups and window.open are not guarded by our Fetch session: close them.
+                // Popups and window.open are not guarded by our Fetch session:
+                // close them unless a tab we opened registers the target first.
                 let cdp = cdp.clone();
+                let tabs = tabs.clone();
                 let id = id.to_owned();
                 tokio::spawn(async move {
-                    let _ = cdp
-                        .call(None, "Target.closeTarget", json!({"targetId": id}))
-                        .await;
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    if !lock_tabs(&tabs).owns_target(&id) {
+                        let _ = cdp
+                            .call(None, "Target.closeTarget", json!({"targetId": id}))
+                            .await;
+                    }
                 });
             }
         }
-        "Page.javascriptDialogOpening" if event.session_id.as_deref() == Some(session_id) => {
+        "Page.javascriptDialogOpening" if known_session.is_some() => {
             let cdp = cdp.clone();
-            let session_id = session_id.to_owned();
+            let session_id = known_session.unwrap_or_default();
             tokio::spawn(async move {
                 let _ = cdp
                     .call(
@@ -447,6 +572,7 @@ async fn cached_verdict(
 impl BrowserBackend for ChromiumBackend {
     async fn navigate(&self, url: &str) -> Result<PageInfo> {
         let mut events = self.cdp.subscribe();
+        let wanted = self.sid();
         let result = self.call("Page.navigate", json!({"url": url})).await?;
         if let Some(error) = result["errorText"].as_str() {
             return Err(browser_error(format!("navigation failed: {error}")));
@@ -454,7 +580,7 @@ impl BrowserBackend for ChromiumBackend {
         let wait = async {
             while let Ok(event) = events.recv().await {
                 if event.method == "Page.loadEventFired"
-                    && event.session_id.as_deref() == self.sid()
+                    && event.session_id.as_deref() == Some(wanted.as_str())
                 {
                     break;
                 }
@@ -530,6 +656,7 @@ impl BrowserBackend for ChromiumBackend {
     }
 
     async fn click_at(&self, x: f64, y: f64) -> Result<()> {
+        self.set_pointer(x, y, "click");
         for (kind, extra) in [("mouseMoved", 0), ("mousePressed", 1), ("mouseReleased", 1)] {
             self.call(
                 "Input.dispatchMouseEvent",
@@ -546,6 +673,11 @@ impl BrowserBackend for ChromiumBackend {
     }
 
     async fn scroll(&self, dy: f64) -> Result<()> {
+        self.set_pointer(
+            f64::from(VIEWPORT_WIDTH / 2),
+            f64::from(VIEWPORT_HEIGHT / 2),
+            "scroll",
+        );
         self.call(
             "Input.dispatchMouseEvent",
             json!({"type": "mouseWheel", "x": VIEWPORT_WIDTH / 2, "y": VIEWPORT_HEIGHT / 2, "deltaX": 0, "deltaY": dy}),
@@ -581,7 +713,7 @@ impl BrowserBackend for ChromiumBackend {
             .call(
                 None,
                 "Target.getTargetInfo",
-                json!({"targetId": self.target_id}),
+                json!({"targetId": self.active()?.target_id}),
             )
             .await?;
         Ok(PageInfo {
@@ -594,6 +726,138 @@ impl BrowserBackend for ChromiumBackend {
                 .unwrap_or_default()
                 .to_owned(),
         })
+    }
+
+    fn pointer(&self) -> Option<Pointer> {
+        self.pointer.lock().ok().and_then(|slot| *slot)
+    }
+
+    async fn tabs(&self) -> Result<Vec<TabInfo>> {
+        let targets = self.cdp.call(None, "Target.getTargets", json!({})).await?;
+        let infos = targets["targetInfos"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let mut set = lock_tabs(&self.tabs);
+        // Forget tabs the page closed itself.
+        let gone: Vec<String> = set
+            .tabs
+            .iter()
+            .filter(|tab| {
+                !infos
+                    .iter()
+                    .any(|info| info["targetId"].as_str() == Some(tab.target_id.as_str()))
+            })
+            .map(|tab| tab.label.clone())
+            .collect();
+        for label in gone {
+            set.remove(&label);
+        }
+        Ok(set
+            .tabs
+            .iter()
+            .map(|tab| {
+                let info = infos
+                    .iter()
+                    .find(|info| info["targetId"].as_str() == Some(tab.target_id.as_str()));
+                TabInfo {
+                    id: tab.label.clone(),
+                    url: info
+                        .and_then(|i| i["url"].as_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    title: info
+                        .and_then(|i| i["title"].as_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    active: tab.label == set.active,
+                }
+            })
+            .collect())
+    }
+
+    async fn open_tab(&self, url: &str) -> Result<Vec<TabInfo>> {
+        if lock_tabs(&self.tabs).tabs.len() >= MAX_TABS {
+            return Err(SeraError::Validation(format!(
+                "at most {MAX_TABS} tabs; close one first"
+            )));
+        }
+        let created = self
+            .cdp
+            .call(None, "Target.createTarget", json!({"url": "about:blank"}))
+            .await?;
+        let target_id = created["targetId"]
+            .as_str()
+            .ok_or_else(|| browser_error("no page target"))?
+            .to_owned();
+        if let Err(error) = Self::attach_tab(&self.cdp, &self.tabs, &target_id).await {
+            let _ = self
+                .cdp
+                .call(None, "Target.closeTarget", json!({"targetId": target_id}))
+                .await;
+            return Err(error);
+        }
+        self.reset_outline()?;
+        let _ = self
+            .cdp
+            .call(
+                None,
+                "Target.activateTarget",
+                json!({"targetId": target_id}),
+            )
+            .await;
+        self.navigate(url).await?;
+        self.tabs().await
+    }
+
+    async fn switch_tab(&self, tab: &str) -> Result<()> {
+        let target = {
+            let mut set = lock_tabs(&self.tabs);
+            let found = set
+                .find(tab)
+                .cloned()
+                .ok_or_else(|| SeraError::Validation(format!("no tab {tab}")))?;
+            set.active = found.label.clone();
+            found.target_id
+        };
+        self.reset_outline()?;
+        let _ = self
+            .cdp
+            .call(None, "Target.activateTarget", json!({"targetId": target}))
+            .await;
+        Ok(())
+    }
+
+    async fn close_tab(&self, tab: &str) -> Result<()> {
+        let (target, next) = {
+            let mut set = lock_tabs(&self.tabs);
+            let found = set
+                .find(tab)
+                .cloned()
+                .ok_or_else(|| SeraError::Validation(format!("no tab {tab}")))?;
+            if set.tabs.len() <= 1 {
+                return Err(SeraError::Validation(
+                    "that is the last tab; close the browser instead".into(),
+                ));
+            }
+            set.remove(tab);
+            (
+                found.target_id,
+                set.active_tab().map(|next| next.target_id.clone()),
+            )
+        };
+        self.reset_outline()?;
+        let _ = self
+            .cdp
+            .call(None, "Target.closeTarget", json!({"targetId": target}))
+            .await;
+        if let Some(next) = next {
+            let _ = self
+                .cdp
+                .call(None, "Target.activateTarget", json!({"targetId": next}))
+                .await;
+        }
+        Ok(())
     }
 
     async fn is_alive(&self) -> bool {
