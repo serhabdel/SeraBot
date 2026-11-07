@@ -443,7 +443,6 @@ impl ModelRouter {
                     verified: true,
                     // The report counts what is now offered (live catalog
                     // intersected with the allowlist).
-
                     model_count: provider.advertised().len(),
                 })
             }
@@ -1952,6 +1951,119 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    /// Regression: the picker listed Mistral's full live catalog while the
+    /// save check enforces the admin allowlist, so most picks were rejected.
+    /// Every listed entry must now pass the full save check, for every
+    /// provider the acting user can route to; a user with no credential
+    /// sees nothing and can save nothing.
+    #[tokio::test]
+    async fn every_listed_model_passes_the_save_check() {
+        let live = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [
+                    {"id": "mistral-large-latest"}, {"id": "mistral-medium-latest"},
+                    {"id": "mistral-small-latest"}, {"id": "codestral-latest"},
+                    {"id": "pixtral-large-latest"}, {"id": "mistral-embed"},
+                    {"id": "voxtral-mini-latest"}
+                ]
+            })))
+            .mount(&live)
+            .await;
+        let other = MockServer::start().await;
+        let config = LlmConfig {
+            base_url: live.uri(),
+            model: "mistral-large-latest".into(),
+            data_egress_approved: true,
+            kind: "openai-compatible".into(),
+            catalog_fetch: true,
+            catalog_ttl_secs: 60,
+            models: vec![
+                "mistral-medium-latest".into(),
+                "mistral-small-latest".into(),
+                "codestral-latest".into(),
+                "ministral-8b-latest".into(),
+            ],
+            providers: BTreeMap::from([(
+                "own".into(),
+                ProviderConfig {
+                    base_url: other.uri(),
+                    api_key_secret: "own_key".into(),
+                    models: vec!["own-a".into(), "own-b".into()],
+                    data_egress_approved: true,
+                    ..ProviderConfig::default()
+                },
+            )]),
+            ..LlmConfig::default()
+        };
+        let credentials = Arc::new(FakeCredentials::new(&[("alice", "alice-key")]));
+        let router = ModelRouter::with_credentials(&config, credentials).unwrap();
+        router.refresh_catalogs("alice").await.unwrap();
+
+        let entries = router.catalog_entries("alice");
+        let listed: BTreeSet<(String, String)> = entries
+            .iter()
+            .map(|entry| (entry.provider.clone(), entry.model.clone()))
+            .collect();
+        // Live ∩ allowlist on the default provider; the full list for the
+        // user's own provider (no catalog fetch).
+        let expected: BTreeSet<(String, String)> = [
+            ("default", "codestral-latest"),
+            ("default", "mistral-large-latest"),
+            ("default", "mistral-medium-latest"),
+            ("default", "mistral-small-latest"),
+            ("own", "own-a"),
+            ("own", "own-b"),
+        ]
+        .into_iter()
+        .map(|(provider, model)| (provider.to_owned(), model.to_owned()))
+        .collect();
+        assert_eq!(listed, expected);
+        // The list and `catalog()` agree.
+        for view in router.catalog("alice") {
+            for model in &view.models {
+                assert!(listed.contains(&(view.id.clone(), model.clone())));
+            }
+        }
+        for entry in &entries {
+            let selection = ModelSelection {
+                provider: entry.provider.clone(),
+                model: entry.model.clone(),
+            };
+            router.pin(&selection).unwrap();
+            router.catalog_gate("alice", &selection).unwrap();
+            router.validate_selection("alice", &selection).unwrap();
+        }
+        // Live-only and allowlisted-but-not-live models are neither listed
+        // nor savable.
+        for model in ["pixtral-large-latest", "ministral-8b-latest"] {
+            assert!(!listed.contains(&("default".to_owned(), model.to_owned())));
+            let selection = ModelSelection {
+                provider: "default".into(),
+                model: model.into(),
+            };
+            assert!(
+                router.pin(&selection).is_err()
+                    || router.catalog_gate("alice", &selection).is_err()
+            );
+        }
+        // Switching providers: both the default and the user's own provider
+        // are listed and savable for alice.
+        assert!(listed.iter().any(|(provider, _)| provider == "default"));
+        assert!(listed.iter().any(|(provider, _)| provider == "own"));
+        // Bob holds no credential: nothing is listed and nothing is savable.
+        assert!(router.catalog_entries("bob").is_empty());
+        assert!(router.catalog("bob").is_empty());
+        for (provider, model) in &expected {
+            let selection = ModelSelection {
+                provider: provider.clone(),
+                model: model.clone(),
+            };
+            assert!(router.catalog_gate("bob", &selection).is_err());
+        }
     }
 
     #[tokio::test]

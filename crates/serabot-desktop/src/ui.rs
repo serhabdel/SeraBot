@@ -3347,6 +3347,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     }
 }
 
+/// Shown under the picker when the server lists no concrete model.
+const NO_MODELS_HINT: &str = "Ask the admin to allow more models.";
+
 #[component]
 fn ModelBar(session: Signal<Session>, #[props(default = false)] compact: bool) -> Element {
     // Picker items: (value, label). "auto" first, then the catalog entries
@@ -3405,6 +3408,8 @@ fn ModelBar(session: Signal<Session>, #[props(default = false)] compact: bool) -
         }
     };
     let changed = value != current;
+    // Only "auto" is left: the server offered no concrete model.
+    let no_models = session.read().state.catalog.is_some() && items.len() <= 1;
     let current_label = items
         .iter()
         .find(|(item_value, _)| *item_value == value)
@@ -3506,7 +3511,12 @@ fn ModelBar(session: Signal<Session>, #[props(default = false)] compact: bool) -
                         }
                     }
                     div { class: "pop-list",
-                        if filtered.is_empty() {
+                        if no_models {
+                            div { class: "pop-empty",
+                                "No models are available for your providers."
+                            }
+                            div { class: "pop-empty tiny", "{NO_MODELS_HINT}" }
+                        } else if filtered.is_empty() {
                             div { class: "pop-empty", "No models match." }
                         }
                         for (index, item_value, label) in filtered.clone() {

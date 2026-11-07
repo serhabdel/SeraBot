@@ -492,7 +492,7 @@ impl State {
             ));
         } else if kind == OperationKind::Apply && error == ApiError::Http(422) {
             self.error = Some(
-                "The server rejected that model selection. Refresh, reopen Model routing, and pick a listed provider and model."
+                "The server rejected that model selection. Refresh, reopen Model routing, and pick a listed provider and model. If the list is empty, ask the admin to allow more models."
                     .into(),
             );
         } else {
