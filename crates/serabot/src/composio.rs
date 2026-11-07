@@ -484,7 +484,8 @@ impl ComposioService {
             "POST",
             &format!("/api/v3/tools/execute/{slug}"),
             &[],
-            Some(&json!({"user_id": user_id, "arguments": arguments})),
+            // REST v3 requires an explicit toolkit version for execution.
+            Some(&json!({"user_id": user_id, "version": "latest", "arguments": arguments})),
         )
         .await
     }
@@ -765,7 +766,7 @@ mod tests {
             .and(path("/api/v3/tools/execute/GMAIL_FETCH_EMAILS"))
             .and(header("x-api-key", KEY_A))
             .and(wiremock::matchers::body_json(
-                json!({"user_id": a, "arguments": {"max": 1}}),
+                json!({"user_id": a, "version": "latest", "arguments": {"max": 1}}),
             ))
             .respond_with(
                 ResponseTemplate::new(200)
