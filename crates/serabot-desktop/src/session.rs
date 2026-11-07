@@ -713,7 +713,13 @@ impl Session {
         if let Some(url) = self.panel.connectors.take_url() {
             self.open_in_browser(url);
         }
-        if self.panel.onedrive.take_refresh() | self.panel.connectors.take_refresh() {
+        if let Some(url) = self.panel.composio.take_url() {
+            self.open_in_browser(url);
+        }
+        if self.panel.onedrive.take_refresh()
+            | self.panel.connectors.take_refresh()
+            | self.panel.composio.take_refresh()
+        {
             self.refresh_connectors();
         }
         if unauthorized {
