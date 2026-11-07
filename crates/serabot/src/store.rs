@@ -62,6 +62,7 @@ const MIGRATION_15: &str = include_str!("../migrations/0015_vault.sql");
 const MIGRATION_17: &str = include_str!("../migrations/0017_bot_profiles_onboarding.sql");
 const MIGRATION_18: &str = include_str!("../migrations/0018_conversation_origin.sql");
 const MIGRATION_19: &str = include_str!("../migrations/0019_browser_profiles.sql");
+const MIGRATION_25: &str = include_str!("../migrations/0025_chat_attachments.sql");
 
 /// Fixed admin id written by migration 0008 and mirrored in
 /// `kv['admin_user_id']`. Code resolves the admin through the kv entry (the
@@ -548,6 +549,12 @@ impl Store {
         if version < 19 {
             connection.execute_batch(MIGRATION_19)?;
             connection.pragma_update(None, "user_version", 19)?;
+        }
+        // 0020-0024 belong to parallel branches; the numbers only need to rise.
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 25 {
+            connection.execute_batch(MIGRATION_25)?;
+            connection.pragma_update(None, "user_version", 25)?;
         }
         let stored_dimension: Option<String> = connection
             .query_row(

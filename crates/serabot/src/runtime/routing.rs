@@ -12,10 +12,38 @@ impl Runtime {
         text: &str,
         bot_override: Option<&str>,
     ) -> Result<Task> {
+        self.submit_text_attached(user_id, conversation_id, text, bot_override, &[])
+    }
+
+    /// Like `submit_text`, with uploaded chat attachments. Each id must be an
+    /// unattached upload of the acting user in this conversation; a message
+    /// may carry attachments with no text.
+    pub fn submit_text_attached(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        text: &str,
+        bot_override: Option<&str>,
+        attachment_ids: &[String],
+    ) -> Result<Task> {
         validate_conversation_id(conversation_id)?;
         self.store
             .ensure_conversation_accepts_turns(user_id, conversation_id)?;
+        if attachment_ids.len() > crate::attachments::MAX_ATTACHMENTS_PER_MESSAGE {
+            return Err(SeraError::Validation("too many attachments".into()));
+        }
+        let unique: HashSet<&String> = attachment_ids.iter().collect();
+        if unique.len() != attachment_ids.len() {
+            return Err(SeraError::Validation("duplicate attachment".into()));
+        }
+        self.store
+            .pending_chat_attachments(user_id, conversation_id, attachment_ids)?;
         let text = text.trim();
+        let text = if text.is_empty() && !attachment_ids.is_empty() {
+            "Please review the attached file(s)."
+        } else {
+            text
+        };
         if text.is_empty() {
             return Err(SeraError::Validation("message is empty".into()));
         }
@@ -166,6 +194,7 @@ impl Runtime {
             handoff: None,
             team: None,
             mentions: mentions.clone(),
+            attachments: attachment_ids.to_vec(),
         };
         // User-initiated work: the daily quota is checked atomically with the
         // insert, so a user at the cap gets an explicit validation error.
@@ -271,6 +300,7 @@ impl Runtime {
                     handoff: None,
                     team: Some(frame.clone()),
                     mentions: Vec::new(),
+                    attachments: Vec::new(),
                 })?)
             })();
             let payload = match payload {

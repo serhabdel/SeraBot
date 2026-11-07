@@ -57,6 +57,7 @@ mod browser;
 mod composio;
 mod connectors;
 mod conversations;
+mod files;
 mod memories;
 mod messages;
 mod profiles;
@@ -422,6 +423,7 @@ pub fn router(state: ApiState) -> Router {
     let protected = protected
         .merge(audio)
         .merge(profiles::routes())
+        .merge(files::routes())
         .layer(middleware::from_fn_with_state(shared.clone(), rate_limit))
         .layer(middleware::from_fn_with_state(shared.clone(), authorize));
     crate::web::router()

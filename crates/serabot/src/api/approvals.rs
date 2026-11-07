@@ -173,8 +173,13 @@ pub(super) async fn audit(
 
 pub(super) async fn artifact(
     State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
     Path(hash): Path<String>,
 ) -> Result<Response> {
+    // Only artifacts produced in the acting user's own conversations.
+    if !state.store.user_owns_artifact(&user.id, &hash)? {
+        return Err(SeraError::NotFound("artifact".into()));
+    }
     let artifact = state.artifacts.load(&hash)?;
     let filename = artifact.filename.replace(['"', '\\', '\r', '\n'], "-");
     let mime = crate::util::mime_for_filename(&artifact.filename);

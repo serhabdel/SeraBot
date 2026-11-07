@@ -2,6 +2,7 @@ pub mod admin;
 pub mod analyst;
 pub mod api;
 pub mod ask;
+pub mod attachments;
 pub mod audio;
 pub mod auth;
 pub mod avatar;

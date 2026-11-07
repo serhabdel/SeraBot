@@ -13,9 +13,20 @@ pub(super) async fn conversation_messages(
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
-    let messages = state
+    let visible =
+        state
+            .store
+            .list_visible_messages(&user.id, &id, query.limit.unwrap_or(100).clamp(1, 200))?;
+    // Attachment chips for the user messages of these turns (own rows only).
+    let turn_ids = visible
+        .iter()
+        .filter(|message| message.role == crate::domain::Role::User)
+        .filter_map(|message| message.turn_id.clone())
+        .collect::<Vec<_>>();
+    let attachments = state
         .store
-        .list_visible_messages(&user.id, &id, query.limit.unwrap_or(100).clamp(1, 200))?
+        .chat_attachments_for_turns(&user.id, &turn_ids)?;
+    let messages = visible
         .into_iter()
         .map(|message| {
             let content = if state
@@ -39,6 +50,16 @@ pub(super) async fn conversation_messages(
                 id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
             }) {
                 body["turn_id"] = json!(turn_id);
+                if message.role == crate::domain::Role::User {
+                    let chips = attachments
+                        .iter()
+                        .filter(|attachment| attachment.turn_id.as_deref() == Some(turn_id))
+                        .map(|attachment| attachment.view())
+                        .collect::<Vec<_>>();
+                    if !chips.is_empty() {
+                        body["attachments"] = json!(chips);
+                    }
+                }
             }
             if let Some(name) = message
                 .name
@@ -287,6 +308,9 @@ pub(super) async fn conversation_library(
                 "tool": entry.tool,
                 "hash": entry.hash,
                 "filename": meta.as_ref().map(|meta| meta.filename.clone()),
+                "mime": meta
+                    .as_ref()
+                    .map(|meta| crate::util::mime_for_filename(&meta.filename)),
                 "title": meta.as_ref().map(|meta| meta.title.clone()),
                 "created_at": entry.created_at,
             })

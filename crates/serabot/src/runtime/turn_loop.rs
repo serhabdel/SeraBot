@@ -107,7 +107,22 @@ impl Runtime {
         };
         state.messages.push(LlmMessage::system(system));
         state.messages.extend(history);
-        state.messages.push(LlmMessage::user(payload.text.clone()));
+        let mut model_text = payload.text.clone();
+        if !payload.attachments.is_empty() {
+            let attachments = self.store.pending_chat_attachments(
+                &user,
+                &payload.conversation_id,
+                &payload.attachments,
+            )?;
+            self.store
+                .attach_chat_attachments_to_turn(&user, &turn.id, &payload.attachments)?;
+            let block = crate::attachments::render_for_model(&self.config, &user, &attachments);
+            // The block carries file content: the same blocklist as every model request.
+            if !block.is_empty() && self.scan_owner_output(&user, &block).is_ok() {
+                model_text.push_str(&block);
+            }
+        }
+        state.messages.push(LlmMessage::user(model_text));
         self.store
             .update_turn(&user, &turn.id, "active", &serde_json::to_value(&state)?)?;
         self.advance(task, &turn, state, &payload.conversation_id)
