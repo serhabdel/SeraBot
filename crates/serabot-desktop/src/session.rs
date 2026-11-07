@@ -1764,6 +1764,7 @@ impl Session {
             return;
         }
         self.state.error = None;
+        self.state.activity.clear();
         let text = std::mem::take(&mut self.composer);
         self.state.messages.push(Message {
             id: format!("opt-{}", Instant::now().elapsed().as_nanos()),
@@ -1950,8 +1951,13 @@ impl Session {
                     EventUpdate::Connected => self.events_active = true,
                     EventUpdate::Disconnected => self.events_active = false,
                     EventUpdate::Unauthorized => unauthorized = true,
-                    EventUpdate::Event { id, kind, .. } => {
+                    EventUpdate::Event { id, kind, payload } => {
                         self.last_event_id = self.last_event_id.max(id);
+                        // Step events only feed the live view; the transcript
+                        // is not re-read for each one.
+                        if self.state.activity.apply(&kind, &payload) {
+                            continue;
+                        }
                         self.last_event_kind = kind;
                         self.events_dirty = true;
                     }

@@ -2,6 +2,7 @@ mod api;
 /// Microphone capture through the webview. Needs Dioxus, so it is only built
 /// where the console runs (Windows) or where the UI is type-checked.
 #[cfg(any(windows, feature = "ui-check"))]
+pub mod activity;
 pub mod audio_capture;
 pub mod avatars;
 pub mod branding;

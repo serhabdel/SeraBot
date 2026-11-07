@@ -10,6 +10,7 @@ use dioxus::prelude::*;
 use serabot_desktop::{
     ApprovalDecision, ConversationKind, MAX_TEAM_MEMBERS, Role, SPECIALIST_TOOLS, Selection,
     TaskStatus, Team, TeamMember, TeamMode,
+    activity::{Step, StepPhase},
     audio_capture::MicRecorder,
     branding, provider_presets,
     session::{Section, Session, SignInPhase, Theme, humanize_label},
@@ -300,6 +301,7 @@ fn capability_label(tool: &str) -> Option<&'static str> {
 }
 
 /// The host part of the first `http(s)` URL in `text`, if any.
+#[allow(dead_code)]
 fn host_in(text: &str) -> Option<String> {
     let start = text.find("://")? + 3;
     let rest = &text[start..];
@@ -311,6 +313,7 @@ fn host_in(text: &str) -> Option<String> {
 }
 
 /// The vault entry name quoted as `secret 'name'` in a tool summary.
+#[allow(dead_code)]
 fn secret_in(text: &str) -> Option<String> {
     let start = text.find("secret '")? + "secret '".len();
     let end = text[start..].find('\'')?;
@@ -322,6 +325,7 @@ fn secret_in(text: &str) -> Option<String> {
 /// tool without one (the caller falls back to the tool's own label).
 /// `done` picks the past tense for finished work and the "wants to" form for a
 /// request that waits on the owner.
+#[allow(dead_code)]
 fn tool_sentence(tool: &str, summary: &str, done: bool) -> Option<String> {
     let sentence = match tool {
         "browser_type" if secret_in(summary).is_some() => {
@@ -2072,13 +2076,70 @@ fn Sidebar(
     }
 }
 
-/// Pill tone for a task row.
-fn tool_pill_class(status: TaskStatus) -> &'static str {
-    match status {
-        TaskStatus::Running => "pill ok",
-        TaskStatus::AwaitingApproval => "pill warn",
-        TaskStatus::Failed => "pill danger",
-        _ => "pill",
+/// Server step icon names to the console's icon set.
+fn step_icon(name: &str) -> &'static str {
+    match name {
+        "globe" => "globe",
+        "search" | "eye" => "search",
+        "image" => "image",
+        "file" => "folder",
+        "brain" => "memory",
+        "mail" => "send",
+        "lock" => "lock",
+        "chart" => "grid",
+        "bot" => "robot",
+        "mic" => "mic",
+        _ => "bolt",
+    }
+}
+
+/// One live step: status icon, plain-language label, and inline Approve and
+/// Deny when it waits on the owner. Decisions use the approvals API, so the
+/// gateway still binds and audits them.
+#[component]
+fn ActivityRow(mut session: Signal<Session>, step: Step) -> Element {
+    let state_class = match step.phase {
+        StepPhase::Running => "step running",
+        StepPhase::Done => "step done",
+        StepPhase::Failed => "step failed",
+        StepPhase::WaitingApproval => "step waiting",
+    };
+    let status_icon = match step.phase {
+        StepPhase::Done => "check",
+        StepPhase::Failed => "x",
+        StepPhase::Running => "",
+        StepPhase::WaitingApproval => "lock",
+    };
+    let approval = step.approval_id.clone();
+    rsx! {
+        div { class: "{state_class}",
+            span { class: "step-status",
+                if status_icon.is_empty() {
+                    span { class: "pill-dot live" }
+                } else {
+                    Icon { name: status_icon, size: 13 }
+                }
+            }
+            span { class: "step-icon", Icon { name: step_icon(&step.icon), size: 14 } }
+            span { class: "step-label", "{step.label}" }
+            if let Some(id) = approval {
+                span { class: "step-actions",
+                    button {
+                        class: "btn primary sm",
+                        onclick: {
+                            let id = id.clone();
+                            move |_| session.write().decide(id.clone(), ApprovalDecision::Once)
+                        },
+                        "Approve"
+                    }
+                    button {
+                        class: "btn danger sm",
+                        onclick: move |_| session.write().decide(id.clone(), ApprovalDecision::Deny),
+                        "Deny"
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2576,38 +2637,24 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         .task
         .as_ref()
         .map(|task| (task.status, task.status.label().to_owned()));
-    let live_task: Option<(TaskStatus, String, String)> = {
+    let live_task: Option<TaskStatus> = session
+        .read()
+        .state
+        .task
+        .as_ref()
+        .and_then(|task| (!task.status.terminal()).then_some(task.status));
+    let (steps, steps_summary, sending) = {
         let state = session.read();
-        state.state.task.as_ref().and_then(|task| {
-            (!task.status.terminal()).then(|| {
-                (
-                    task.status,
-                    task.kind.clone(),
-                    state.bot_display_name(&task.bot),
-                )
-            })
-        })
-    };
-    let waiting: Vec<(String, String, String)> = if matches!(
-        live_task.as_ref().map(|task| task.0),
-        Some(TaskStatus::AwaitingApproval)
-    ) {
-        session
-            .read()
+        let sending = state
             .state
-            .approvals
-            .iter()
-            .take(3)
-            .map(|approval| {
-                (
-                    approval.id.clone(),
-                    approval.tool.clone(),
-                    approval.summary.clone(),
-                )
-            })
-            .collect()
-    } else {
-        Vec::new()
+            .messages
+            .last()
+            .is_some_and(|message| message.role == Role::User && message.id.starts_with("opt-"));
+        (
+            state.state.activity.steps.clone(),
+            state.state.activity.summary(),
+            sending,
+        )
     };
     let composer = session.read().composer.clone();
     let can_send = session.read().state.can_send();
@@ -2887,35 +2934,31 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             }
                         }
                     }
-                    // Work in flight shows as compact tool rows, not as chat
-                    // bubbles: what is running, and what waits on the owner.
-                    if let Some((status, kind, bot)) = live_task {
-                        div { class: "tool-row", role: "status",
-                            Icon { name: "bolt", size: 14 }
-                            span { class: "tool-name", "{kind}" }
-                            span { class: "tool-detail", "{bot}" }
-                            span { class: tool_pill_class(status),
-                                if status == TaskStatus::Running {
-                                    span { class: "pill-dot live" }
-                                }
-                                "{status.label()}"
-                            }
+                    // What the bot is doing right now, in plain words: a
+                    // shimmer while it thinks, one row per step, and a small
+                    // "N steps" summary once the reply has landed.
+                    if sending && live_task.is_none() {
+                        div { class: "activity", role: "status",
+                            span { class: "shimmer", "Sending…" }
                         }
                     }
-                    for (approval_id, tool, summary) in waiting {
-                        div { class: "tool-row", key: "{approval_id}",
-                            Icon { name: "lock", size: 14 }
-                            if let Some(sentence) = tool_sentence(&tool, &summary, false) {
-                                span { class: "tool-name", "{sentence}" }
-                            } else {
-                                span { class: "tool-name", "{humanize_label(&tool)}" }
-                                span { class: "tool-detail", "{summary}" }
+                    if live_task.is_some() {
+                        div { class: "activity", role: "status", "aria-live": "polite",
+                            if steps.iter().all(|step| step.phase != StepPhase::Running) {
+                                span { class: "shimmer", "Thinking…" }
                             }
-                            span { class: "pill warn", "awaiting approval" }
-                            button {
-                                class: "btn ghost sm",
-                                onclick: move |_| session.write().open_section(Section::Approvals),
-                                "Review"
+                            for step in steps.iter().cloned() {
+                                ActivityRow { session, step, key: "{step.call_id}" }
+                            }
+                        }
+                    } else if !steps.is_empty() {
+                        details { class: "activity done",
+                            summary { class: "activity-summary",
+                                Icon { name: "chevron-right", size: 12 }
+                                "{steps_summary}"
+                            }
+                            for step in steps.iter().cloned() {
+                                ActivityRow { session, step, key: "{step.call_id}" }
                             }
                         }
                     }
