@@ -311,7 +311,7 @@ fn capability_label(tool: &str) -> Option<&'static str> {
         "xlsx_analyze" | "timesheet_analyze" => Some("Spreadsheet analysis"),
         "rag_search" | "document_index" => Some("Document search"),
         "fetch_url" | "watch_now" | "firecrawl_scrape" | "firecrawl_map" | "firecrawl_search"
-        | "firecrawl_crawl" => Some("Web research"),
+        | "firecrawl_crawl" | "exa_search" | "exa_get_contents" => Some("Web research"),
         "audio_transcribe" | "audio_understand" => Some("Audio notes"),
         "elevenlabs_text_to_speech"
         | "elevenlabs_sound_effect"
@@ -319,6 +319,16 @@ fn capability_label(tool: &str) -> Option<&'static str> {
         | "elevenlabs_generate_image"
         | "elevenlabs_generate_video" => Some("Voice and media"),
         "onedrive_upload" | "onedrive_list" => Some("OneDrive files"),
+        "github_search_repos"
+        | "github_list_issues"
+        | "github_get_issue"
+        | "github_create_issue"
+        | "github_comment_issue"
+        | "github_get_file" => Some("GitHub"),
+        "todoist_list_tasks" | "todoist_add_task" | "todoist_complete_task" => {
+            Some("Todoist tasks")
+        }
+        "slack_list_channels" | "slack_read_channel" | "slack_post_message" => Some("Slack"),
         "skill_list" | "skill_search" | "skill_load" => Some("Skills"),
         "delegate" => Some("Team handoffs"),
         _ => None,
@@ -731,13 +741,13 @@ pub(crate) fn Icon(name: String, #[props(default = 20)] size: u32) -> Element {
     }
 }
 
-/// Inline brand SVG logos for all supported connectors and providers.
-/// The SVG markup itself lives in [`branding`]; a brand without a known
-/// mark falls back to an initial-letter avatar.
+/// Brand logos for all supported connectors and providers. The embedded
+/// images live in [`branding`]; a brand without a known mark falls back to
+/// an initial-letter avatar.
 #[component]
 pub fn BrandLogo(brand: String, #[props(default = 24)] size: u32) -> Element {
     let title = branding::brand_label(&brand).map(str::to_owned);
-    let svg = branding::brand_svg(&brand).map(str::to_owned);
+    let image = branding::brand_image_src(&brand);
     let initial: String = brand
         .chars()
         .next()
@@ -748,10 +758,12 @@ pub fn BrandLogo(brand: String, #[props(default = 24)] size: u32) -> Element {
             class: "brand-logo",
             style: "width: {size}px; height: {size}px;",
             title: title.as_deref().unwrap_or(""),
-            if let Some(svg) = svg {
-                div {
-                    style: "width: 100%; height: 100%; display: flex;",
-                    dangerous_inner_html: "{svg}",
+            if let Some(src) = image {
+                img {
+                    src: "{src}",
+                    alt: "",
+                    draggable: "false",
+                    style: "width: 100%; height: 100%; object-fit: contain; border-radius: inherit;",
                 }
             } else {
                 span { style: "font-size: {size * 3 / 5}px; font-weight: 600;", "{initial}" }
@@ -2682,6 +2694,19 @@ fn StatusBanner(session: Signal<Session>) -> Element {
             }
         }
     });
+    let link_down = session.read().link_down && !restarting;
+    let link_view = link_down.then(|| {
+        rsx! {
+            div { class: "banner warn", role: "status",
+                span { "Can't reach SeraBot right now. Retrying…" }
+                button {
+                    class: "btn ghost sm",
+                    onclick: move |_| session.write().retry_link(),
+                    "Try again"
+                }
+            }
+        }
+    });
     let restarting_view = restarting.then(|| {
         rsx! {
             div { class: "banner warn",
@@ -2698,6 +2723,7 @@ fn StatusBanner(session: Signal<Session>) -> Element {
         {admin_error_view}
         {admin_notice_view}
         {restarting_view}
+        {link_view}
         {error_view}
         {unknown_view}
         {task_view}

@@ -144,6 +144,8 @@ pub struct ApiState {
     personal: Arc<PersonalConnectors>,
     /// Per-user Composio key and linked apps.
     composio: Arc<crate::composio::ComposioService>,
+    /// Per-user GitHub, Todoist, Slack and Exa tokens.
+    token_connectors: Arc<crate::token_connectors::TokenConnectors>,
     token_hash: String,
     /// Per-user request buckets for the per-minute limit. Keyed by the
     /// acting user id (never a token); public sign-in routes without an
@@ -195,6 +197,10 @@ impl ApiState {
             &config,
             users.clone(),
         )?);
+        let token_connectors = Arc::new(crate::token_connectors::TokenConnectors::new(
+            &config,
+            users.clone(),
+        )?);
         Ok(Self {
             runtime,
             store,
@@ -205,6 +211,7 @@ impl ApiState {
             onedrive_consent,
             personal,
             composio,
+            token_connectors,
             token_hash: config.api.token_hash.to_ascii_lowercase(),
             rate: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: config.server.rate_limit_per_minute.max(1) as usize,
@@ -732,8 +739,10 @@ impl IntoResponse for SeraError {
             // as an unknown outcome. Never 401: the desktop treats that as an
             // expired session.
             let status = match *code {
-                "composio_unavailable" => StatusCode::BAD_GATEWAY,
-                "composio_rate_limited" => StatusCode::SERVICE_UNAVAILABLE,
+                "composio_unavailable" | "connector_unavailable" => StatusCode::BAD_GATEWAY,
+                "composio_rate_limited" | "connector_rate_limited" => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
                 _ => StatusCode::UNPROCESSABLE_ENTITY,
             };
             return (

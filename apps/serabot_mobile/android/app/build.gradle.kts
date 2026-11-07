@@ -8,6 +8,17 @@ plugins {
 // variable at it. Source builds without the variable keep the debug fallback.
 val keystorePath = System.getenv("ANDROID_KEYSTORE_PATH")
 
+// Release CI sets this so a missing key fails the build instead of silently
+// producing a debug-signed APK that could never update an installed app.
+if (System.getenv("SERABOT_REQUIRE_RELEASE_SIGNING") == "1") {
+    check(!keystorePath.isNullOrBlank() && file(keystorePath).isFile) {
+        "SERABOT_REQUIRE_RELEASE_SIGNING=1 but ANDROID_KEYSTORE_PATH is unset or not a file"
+    }
+    check(listOf("ANDROID_KEYSTORE_PASSWORD", "ANDROID_KEY_ALIAS", "ANDROID_KEY_PASSWORD").all { !System.getenv(it).isNullOrBlank() }) {
+        "SERABOT_REQUIRE_RELEASE_SIGNING=1 but a keystore password or alias is unset"
+    }
+}
+
 android {
     namespace = "com.serabot.serabot_mobile"
     compileSdk = flutter.compileSdkVersion

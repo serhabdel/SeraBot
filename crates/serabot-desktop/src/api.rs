@@ -83,6 +83,24 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// The longer text for the sign-in and server screens, where the owner
+    /// can actually fix the address, certificate or tunnel. Everywhere else a
+    /// dropped connection is shown calmly by the reconnect banner.
+    pub fn sign_in_text(&self) -> String {
+        match self {
+            Self::Transport => {
+                "Can't reach the server. Check the server URL, TLS certificate and tunnel."
+                    .to_owned()
+            }
+            other => other.to_string(),
+        }
+    }
+
+    /// Whether this is a dropped or timed-out connection.
+    pub fn is_transport(&self) -> bool {
+        matches!(self, Self::Transport)
+    }
+
     pub fn unknown_outcome(&self) -> bool {
         // In particular, a gateway/request timeout does not prove rejection.
         match self {
@@ -126,9 +144,7 @@ impl fmt::Display for ApiError {
                 f,
                 "Server returned HTTP {code}. Check server availability or API compatibility."
             ),
-            Self::Transport => f.write_str(
-                "Connection failed or timed out. Check the server URL, TLS certificate and tunnel.",
-            ),
+            Self::Transport => f.write_str("Can't reach SeraBot right now. Retrying…"),
             Self::InvalidResponse => {
                 f.write_str("Unexpected API response. Check server version and compatibility.")
             }
@@ -325,6 +341,20 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
     "notion_query_database",
     "agentmail_inboxes_list",
     "agentmail_send",
+    "github_search_repos",
+    "github_list_issues",
+    "github_get_issue",
+    "github_create_issue",
+    "github_comment_issue",
+    "github_get_file",
+    "todoist_list_tasks",
+    "todoist_add_task",
+    "todoist_complete_task",
+    "slack_list_channels",
+    "slack_read_channel",
+    "slack_post_message",
+    "exa_search",
+    "exa_get_contents",
     "memory_save",
     "memory_list",
     "memory_search",
@@ -1042,6 +1072,9 @@ pub struct ConnectorStatus {
     /// Per-user products (Outlook, Google, Notion): this account's own state.
     #[serde(default)]
     pub personal: Option<PersonalStatus>,
+    /// Composio: the kind of key saved (`project`, `user` or `consumer`).
+    #[serde(default)]
+    pub key_kind: Option<String>,
 }
 
 /// One account's state for a per-user connector (`personal` in the list).
@@ -1742,6 +1775,33 @@ pub(crate) struct ConnectorsEnvelope {
     pub(crate) connectors: Vec<ConnectorStatus>,
 }
 
+/// Send one request with the timeout its route deserves. Reads are tried up
+/// to three times with short pauses when the connection fails or times out;
+/// writes are sent once.
+pub(crate) fn send_with_policy(
+    method: &Method,
+    route: &[&str],
+    build: impl Fn() -> reqwest::blocking::RequestBuilder,
+) -> Result<reqwest::blocking::Response, ApiError> {
+    let timeout = crate::net_policy::request_timeout(method, route);
+    let delays: &[Duration] = if crate::net_policy::retries_allowed(method) {
+        &crate::net_policy::GET_RETRY_DELAYS
+    } else {
+        &[]
+    };
+    crate::net_policy::with_retries(
+        delays,
+        || {
+            build()
+                .timeout(timeout)
+                .send()
+                .map_err(|_| ApiError::Transport)
+        },
+        ApiError::is_transport,
+        std::thread::sleep,
+    )
+}
+
 /// Build the one HTTP client shape both the authenticated and the public
 /// clients use: no retries, cookies, redirects, environment proxies or
 /// persistent storage.
@@ -1750,8 +1810,8 @@ fn build_http_client(endpoint: &Url) -> Result<Client, ApiError> {
         .redirect(Policy::none())
         .no_proxy()
         .retry(reqwest::retry::never())
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(20));
+        .connect_timeout(crate::net_policy::CONNECT_TIMEOUT)
+        .timeout(crate::net_policy::READ_TIMEOUT);
     if endpoint.host_str() == Some("localhost") {
         // Never send a plaintext token to a DNS-resolved non-loopback address.
         builder = builder.resolve("localhost", SocketAddr::from(([127, 0, 0, 1], 0)));
@@ -1804,14 +1864,16 @@ impl ApiClient {
         if !query.is_empty() {
             url.query_pairs_mut().extend_pairs(query.iter().copied());
         }
-        let mut request = self
-            .client
-            .request(method, url)
-            .bearer_auth(self.token.expose_secret());
-        if let Some(body) = body {
-            request = request.json(body);
-        }
-        let response = request.send().map_err(|_| ApiError::Transport)?;
+        let response = send_with_policy(&method, route, || {
+            let mut request = self
+                .client
+                .request(method.clone(), url.clone())
+                .bearer_auth(self.token.expose_secret());
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+            request
+        })?;
         note_rate_limit(&response);
         let status = response.status();
         if !status.is_success() {
@@ -2015,6 +2077,7 @@ impl ApiClient {
             .client
             .post(url)
             .bearer_auth(self.token.expose_secret())
+            .timeout(crate::net_policy::SLOW_TIMEOUT)
             .header("X-Filename", filename)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(bytes.to_vec())
@@ -3007,6 +3070,7 @@ impl ApiClient {
             .client
             .post(url)
             .bearer_auth(self.token.expose_secret())
+            .timeout(crate::net_policy::SLOW_TIMEOUT)
             .header("X-Audio-Filename", filename)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(bytes.to_vec())

@@ -46,6 +46,11 @@ pub const DESTRUCTIVE_TOOLS: &[&str] = &[
     "telegram_send_document",
     "onedrive_upload",
     "local_write",
+    "github_create_issue",
+    "github_comment_issue",
+    "todoist_add_task",
+    "todoist_complete_task",
+    "slack_post_message",
 ];
 
 /// Audit reason recorded when the owner's YOLO setting approved a call.
@@ -1775,6 +1780,11 @@ mod tests {
             "telegram_send_document",
             "onedrive_upload",
             "local_write",
+            "github_create_issue",
+            "github_comment_issue",
+            "todoist_add_task",
+            "todoist_complete_task",
+            "slack_post_message",
         ] {
             assert!(is_destructive_tool(name), "{name}");
         }
@@ -1784,6 +1794,13 @@ mod tests {
             "browser_type",
             "browser_press",
             "firecrawl_search",
+            "github_search_repos",
+            "github_get_file",
+            "todoist_list_tasks",
+            "slack_list_channels",
+            "slack_read_channel",
+            "exa_search",
+            "exa_get_contents",
             "memory_save",
             "pdf_edit",
         ] {

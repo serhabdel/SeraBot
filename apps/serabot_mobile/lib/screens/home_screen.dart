@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../session.dart';
+import '../update_flow.dart';
 import '../validation.dart';
 import 'approvals_tab.dart';
 import 'chat_tab.dart';
@@ -47,6 +48,11 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: Text('v$version', style: Theme.of(context).textTheme.bodySmall),
               ),
             ),
+          IconButton(
+            tooltip: 'Check for updates',
+            icon: const Icon(Icons.system_update),
+            onPressed: () => checkForUpdates(context),
+          ),
           TextButton(onPressed: _signOut, child: const Text('Sign out')),
         ],
       ),

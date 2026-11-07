@@ -366,14 +366,16 @@ impl ApiClient {
         if !query.is_empty() {
             url.query_pairs_mut().extend_pairs(query);
         }
-        let mut request = self
-            .client
-            .request(method, url)
-            .bearer_auth(self.token.expose_secret());
-        if let Some(body) = body {
-            request = request.json(body);
-        }
-        let response = request.send().map_err(|_| ApiError::Transport)?;
+        let response = send_with_policy(&method, route, || {
+            let mut request = self
+                .client
+                .request(method.clone(), url.clone())
+                .bearer_auth(self.token.expose_secret());
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+            request
+        })?;
         note_rate_limit(&response);
         let status = response.status();
         let mut bytes = Zeroizing::new(Vec::new());

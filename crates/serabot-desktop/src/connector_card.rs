@@ -15,6 +15,56 @@ use crate::{ConnectorStatus, PersonalStatus};
 pub const NOTION_HELP_URL: &str = "https://www.notion.so/profile/integrations";
 /// One line telling a Notion user what to do after connecting.
 pub const NOTION_SHARE_HINT: &str = "Then share each page you want your bots to use with the integration (open the page, choose the \u{2026} menu, then Connections).";
+/// What a pasted-token card says: the field name, where the user creates the
+/// token, and one line on what to do. Fixed in the console; the server never
+/// supplies a link the console opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenHelp {
+    pub label: &'static str,
+    pub url: &'static str,
+    pub hint: &'static str,
+}
+
+/// Help for the connectors that connect with a pasted token.
+pub fn token_help(id: &str) -> Option<TokenHelp> {
+    Some(match id {
+        "notion" => TokenHelp {
+            label: "Integration token",
+            url: NOTION_HELP_URL,
+            hint: NOTION_SHARE_HINT,
+        },
+        "github" => TokenHelp {
+            label: "Fine-grained token",
+            url: GITHUB_HELP_URL,
+            hint: "Limit it to the repositories you want. Give it Issues (read and write) and Contents (read).",
+        },
+        "todoist" => TokenHelp {
+            label: "API token",
+            url: TODOIST_HELP_URL,
+            hint: "Open Settings, Integrations, Developer and copy your API token.",
+        },
+        "slack" => TokenHelp {
+            label: "Bot token",
+            url: SLACK_HELP_URL,
+            hint: "Add the bot scopes channels:read, groups:read, channels:history, groups:history and chat:write, install the app, then invite the bot to each channel.",
+        },
+        "exa" => TokenHelp {
+            label: "API key",
+            url: EXA_HELP_URL,
+            hint: "Create a key in the Exa dashboard. Connecting runs one small search to check it.",
+        },
+        _ => return None,
+    })
+}
+
+/// Where an Exa user creates an API key.
+pub const EXA_HELP_URL: &str = "https://dashboard.exa.ai/api-keys";
+/// Where a Slack user creates an app and copies its bot token.
+pub const SLACK_HELP_URL: &str = "https://api.slack.com/apps";
+/// Where a Todoist user finds their API token.
+pub const TODOIST_HELP_URL: &str = "https://app.todoist.com/app/settings/integrations/developer";
+/// Where a GitHub user creates a fine-grained personal access token.
+pub const GITHUB_HELP_URL: &str = "https://github.com/settings/personal-access-tokens/new";
 /// Shown when the server gave no admin hint.
 pub const DEFAULT_ADMIN_HINT: &str = "Ask your admin to set this up.";
 
@@ -108,6 +158,64 @@ pub fn connector_card_state(connector: &ConnectorStatus, error: Option<&str>) ->
         .map(|personal| personal_card_state(personal, error))
 }
 
+/// Secret roles that are OAuth outputs. The server may store them, but a
+/// person never types or sees them, so no card draws a field for them.
+pub const INTERNAL_SECRET_ROLES: [&str; 2] = ["access_token", "refresh_token"];
+
+/// True for a role the console must never show as an editable field.
+pub fn is_internal_role(role: &str) -> bool {
+    INTERNAL_SECRET_ROLES.contains(&role)
+}
+
+/// Roles a person may type into, in catalog order (internal ones removed).
+pub fn editable_roles(connector: &ConnectorStatus) -> Vec<String> {
+    connector
+        .secrets
+        .keys()
+        .filter(|role| !is_internal_role(role))
+        .cloned()
+        .collect()
+}
+
+/// A connector the person signs in to (ElevenLabs): the server lists an OAuth
+/// sign-in for it and offers `oauth` as one of its auth modes.
+pub fn supports_sign_in(connector: &ConnectorStatus) -> bool {
+    connector.oauth.is_some() && connector.auth_modes.iter().any(|mode| mode == "oauth")
+}
+
+fn secret_configured(connector: &ConnectorStatus, role: &str) -> bool {
+    connector
+        .secrets
+        .get(role)
+        .is_some_and(|secret| secret.configured)
+}
+
+/// Whether a server-wide card counts as connected. A sign-in connector is
+/// connected through whichever mode is active: stored sign-in tokens in
+/// `oauth` mode, the API key otherwise. Others keep the server's own answer.
+pub fn legacy_connected(connector: &ConnectorStatus, auth_mode: &str) -> bool {
+    if supports_sign_in(connector) {
+        return if auth_mode == "oauth" {
+            INTERNAL_SECRET_ROLES
+                .iter()
+                .any(|role| secret_configured(connector, role))
+        } else {
+            secret_configured(connector, "api_key")
+        };
+    }
+    connector.connected.unwrap_or_else(|| {
+        connector
+            .secrets
+            .iter()
+            .any(|(role, secret)| !is_internal_role(role) && secret.configured)
+    })
+}
+
+/// Whether a sign-in connector currently runs on a pasted API key.
+pub fn uses_api_key(connector: &ConnectorStatus, auth_mode: &str) -> bool {
+    supports_sign_in(connector) && auth_mode != "oauth" && secret_configured(connector, "api_key")
+}
+
 const GOOGLE_IDS: [&str; 4] = ["google_drive", "google_sheets", "google_calendar", "gmail"];
 
 fn google_connectors(connectors: &[ConnectorStatus]) -> impl Iterator<Item = &PersonalStatus> {
@@ -155,6 +263,25 @@ mod tests {
             personal,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn token_connectors_have_fixed_https_help_links() {
+        for id in ["notion", "github", "todoist", "slack", "exa"] {
+            let help = token_help(id).expect(id);
+            assert!(help.url.starts_with("https://"), "{id}");
+            assert!(!help.label.is_empty() && !help.hint.is_empty(), "{id}");
+        }
+        assert!(token_help("gmail").is_none());
+        let mut github = personal("ready");
+        github.methods = vec!["token".into()];
+        assert_eq!(
+            personal_card_state(&github, None),
+            CardState::Connect {
+                oauth: false,
+                token: true
+            }
+        );
     }
 
     #[test]
@@ -252,6 +379,78 @@ mod tests {
             personal_card_state(&personal("ready"), Some("  ")),
             CardState::Connect { .. }
         ));
+    }
+
+    fn elevenlabs(auth: &str, configured: &[&str]) -> ConnectorStatus {
+        let secrets = ["api_key", "access_token", "refresh_token"]
+            .into_iter()
+            .map(|role| {
+                (
+                    role.to_owned(),
+                    crate::SecretStatus {
+                        name: Some(format!("elevenlabs_{role}")),
+                        configured: configured.contains(&role),
+                    },
+                )
+            })
+            .collect();
+        ConnectorStatus {
+            id: "elevenlabs".into(),
+            kind: "api_key".into(),
+            auth: Some(auth.into()),
+            auth_modes: vec!["api_key".into(), "oauth".into()],
+            oauth: Some(crate::ConnectorOauth {
+                client_id: "https://example.example/client.json".into(),
+                authorize_url: None,
+                cimd_path: None,
+                callback_uri: Some("http://127.0.0.1:1/cb".into()),
+                scope: None,
+            }),
+            secrets,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn oauth_outputs_are_never_editable_fields() {
+        let card = elevenlabs("oauth", &["access_token", "refresh_token"]);
+        assert_eq!(editable_roles(&card), vec!["api_key".to_owned()]);
+        assert!(is_internal_role("access_token"));
+        assert!(is_internal_role("refresh_token"));
+        assert!(!is_internal_role("api_key"));
+        assert!(!is_internal_role("client_secret"));
+    }
+
+    #[test]
+    fn a_sign_in_connector_is_connected_through_its_active_mode() {
+        let signed_in = elevenlabs("oauth", &["access_token", "refresh_token"]);
+        assert!(supports_sign_in(&signed_in));
+        assert!(legacy_connected(&signed_in, "oauth"));
+        // Tokens left over from an earlier sign-in do not count once the key
+        // mode is active.
+        assert!(!legacy_connected(&signed_in, "api_key"));
+        let keyed = elevenlabs("api_key", &["api_key"]);
+        assert!(legacy_connected(&keyed, "api_key"));
+        assert!(uses_api_key(&keyed, "api_key"));
+        assert!(!legacy_connected(&keyed, "oauth"));
+        assert!(!legacy_connected(&elevenlabs("oauth", &[]), "oauth"));
+    }
+
+    #[test]
+    fn plain_key_connectors_ignore_internal_roles_when_counting() {
+        let mut tavily = status("tavily", None);
+        assert!(!supports_sign_in(&tavily));
+        assert!(!legacy_connected(&tavily, ""));
+        tavily.secrets.insert(
+            "api_key".into(),
+            crate::SecretStatus {
+                name: None,
+                configured: true,
+            },
+        );
+        assert!(legacy_connected(&tavily, ""));
+        tavily.connected = Some(false);
+        assert!(!legacy_connected(&tavily, ""));
     }
 
     #[test]

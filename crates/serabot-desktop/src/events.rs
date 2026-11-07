@@ -22,7 +22,7 @@ use url::Url;
 const LIMIT: &str = "100";
 const READ_CHUNK: usize = 8 * 1024;
 const MAX_SSE_BUFFER: usize = 256 * 1024;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT: Duration = crate::net_policy::CONNECT_TIMEOUT;
 const STOP_POLL: Duration = Duration::from_millis(200);
 const BACKOFF: [Duration; 5] = [
     Duration::from_secs(1),

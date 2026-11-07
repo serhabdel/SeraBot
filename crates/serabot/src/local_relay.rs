@@ -269,7 +269,7 @@ impl LocalRelay {
                     slot.queue.retain(|request| request.id != id);
                 });
                 Err(SeraError::External(
-                    "PC folder relay did not answer in time: the SeraBot desktop app may be closed or busy. Ask the owner to check the desktop app.".into(),
+                    "Your PC app didn't answer in time, so I can't reach your folders. The SeraBot desktop app may be closed or busy. Ask the owner to check it, then try again.".into(),
                 ))
             }
         }
@@ -277,7 +277,7 @@ impl LocalRelay {
 }
 
 /// Shown to the model and the owner when the desktop is not connected.
-const OFFLINE_MESSAGE: &str = "PC folder relay offline: the SeraBot desktop app is not connected. Ask the owner to open the desktop app.";
+const OFFLINE_MESSAGE: &str = "Your PC app is closed, so I can't reach your folders. Folders on the PC only work while the SeraBot desktop app is open there. Ask the owner to open the desktop app, then try again.";
 
 /// The allowed folder ids and labels only, never a path.
 fn allowed_folders(roots: &[LocalRoot]) -> String {
@@ -373,7 +373,7 @@ impl Tool for LocalListTool {
             let roots = self.relay.roots(&context.user_id);
             if roots.is_empty() {
                 return Err(SeraError::External(
-                    "No PC folders are available: either the SeraBot desktop app is not connected, or the owner has not allowlisted a folder. Ask the owner to open the desktop app and allow a folder under Settings → Local folders.".into(),
+                    "Your PC app is closed, so I can't reach your folders (or no folder is allowed yet): either the SeraBot desktop app is not connected, or the owner has not allowlisted a folder. Ask the owner to open the desktop app and allow a folder under Settings → Local folders.".into(),
                 ));
             }
             let lines = roots
@@ -538,7 +538,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains("PC folder relay offline")
+            error.to_string().contains("Your PC app is closed")
                 && error.to_string().contains("open the desktop app"),
             "{error}"
         );

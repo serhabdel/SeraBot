@@ -13,9 +13,10 @@ use crate::ui::{BrandLogo, Icon};
 use dioxus::prelude::*;
 use serabot_desktop::ConnectorStatus;
 use serabot_desktop::connector_card::{
-    CardState, DEFAULT_ADMIN_HINT, GOOGLE_CONSOLE_URL, GOOGLE_SETUP_STEPS, NOTION_HELP_URL,
-    NOTION_SHARE_HINT, connector_card_state, google_is_set_up, google_redirect_uri,
-    google_setup_offered,
+    CardState, DEFAULT_ADMIN_HINT, GOOGLE_CONSOLE_URL, GOOGLE_SETUP_STEPS, NOTION_SHARE_HINT,
+    connector_card_state, editable_roles, google_is_set_up, google_redirect_uri,
+    google_setup_offered, is_internal_role, legacy_connected, supports_sign_in, token_help,
+    uses_api_key,
 };
 use serabot_desktop::session::{Session, humanize_label};
 
@@ -97,11 +98,7 @@ enum ConnectorAction {
 
 /// The single primary action for a connector in its current state, or `None`
 /// when there is nothing the owner can do from the card.
-fn connector_action(
-    connector: &ConnectorStatus,
-    connected: bool,
-    auth_mode: &str,
-) -> Option<ConnectorAction> {
+fn connector_action(connector: &ConnectorStatus, connected: bool) -> Option<ConnectorAction> {
     if connector.id == "onedrive" {
         return Some(if connected {
             ConnectorAction::DisconnectOneDrive
@@ -109,10 +106,9 @@ fn connector_action(
             ConnectorAction::ConnectOneDrive
         });
     }
-    if connector.oauth.is_some()
-        && auth_mode == "oauth"
-        && connector.auth_modes.iter().any(|mode| mode == "oauth")
-    {
+    // Signing in with the account is the one main action. A pasted key lives
+    // under Advanced, never next to the button.
+    if supports_sign_in(connector) {
         return Some(ConnectorAction::SignIn);
     }
     // A pasted API key beats a sign-in page: those pages only help you find one.
@@ -122,7 +118,7 @@ fn connector_action(
     {
         return Some(ConnectorAction::Authorize(url));
     }
-    if !connector.secrets.is_empty() {
+    if !editable_roles(connector).is_empty() {
         return Some(if connected {
             ConnectorAction::ReplaceKey
         } else {
@@ -142,6 +138,10 @@ fn connector_title(id: &str) -> String {
         "outlook" => "Outlook",
         "outlook_calendar" => "Outlook Calendar",
         "notion" => "Notion",
+        "github" => "GitHub",
+        "todoist" => "Todoist",
+        "slack" => "Slack",
+        "exa" => "Exa Search",
         "agentmail" => "AgentMail",
         "tavily" => "Tavily Search",
         "firecrawl" => "Firecrawl",
@@ -161,8 +161,13 @@ fn connector_blurb(id: &str) -> &'static str {
         "outlook" => "Read and send email.",
         "outlook_calendar" => "Your Outlook calendar.",
         "notion" => "Your notes and pages.",
+        "github" => {
+            "Search repositories, read issues and files, and file issues with your approval."
+        }
+        "todoist" => "Your to-do list.",
+        "slack" => "Read channels and post with your approval.",
         "agentmail" => "A mailbox for your bots.",
-        "tavily" | "firecrawl" => "Let bots search and read the web.",
+        "tavily" | "firecrawl" | "exa" => "Let bots search and read the web.",
         "elevenlabs" => "Voices and sound.",
         _ => "",
     }
@@ -228,7 +233,9 @@ pub(crate) fn ConnectorsView(session: Signal<Session>) -> Element {
                     ("Microsoft", &["onedrive", "outlook", "outlook_calendar"][..]),
                     ("Google", &["google_drive", "google_sheets", "google_calendar", "gmail"][..]),
                     ("Notes and email", &["notion", "agentmail"][..]),
-                    ("Web search", &["tavily", "firecrawl"][..]),
+                    ("Code and tasks", &["github", "todoist"][..]),
+                    ("Messages", &["slack"][..]),
+                    ("Web search", &["tavily", "firecrawl", "exa"][..]),
                     ("Voice", &["elevenlabs"][..]),
                     ("Apps and tools", &["composio"][..]),
                 ] {
@@ -306,6 +313,9 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
         .as_ref()
         .and_then(|personal| personal.redirect_uri.clone());
     let is_notion = id == "notion";
+    let help = token_help(&id);
+    let token_label = help.map_or("Token", |help| help.label);
+    let token_hint = help.map_or("", |help| help.hint);
     rsx! {
         div { class: "card connector-card",
             div { class: "card-head",
@@ -327,7 +337,7 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
                 CardState::Connect { oauth, token: takes_token } => rsx! {
                     if takes_token {
                         div { class: "field",
-                            label { class: "field-label", "Integration token" }
+                            label { class: "field-label", "{token_label}" }
                             input {
                                 class: "input",
                                 "type": "password",
@@ -337,7 +347,9 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
                                 oninput: move |event| token.set(event.value()),
                             }
                         }
-                        p { class: "tiny", "{NOTION_SHARE_HINT}" }
+                        if !token_hint.is_empty() {
+                            p { class: "tiny", "{token_hint}" }
+                        }
                     }
                     if waiting {
                         p { class: "tiny", role: "status",
@@ -358,11 +370,11 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
                                 },
                                 if busy { "Connecting…" } else { "Connect" }
                             }
-                            if is_notion {
+                            if let Some(help) = help {
                                 button {
                                     class: "btn ghost",
-                                    title: "Open Notion to create an integration and copy its token",
-                                    onclick: move |_| session.write().open_in_browser(NOTION_HELP_URL.to_owned()),
+                                    title: "Open the page where you create this token",
+                                    onclick: move |_| session.write().open_in_browser(help.url.to_owned()),
                                     Icon { name: "external", size: 14 }
                                     "How to get one"
                                 }
@@ -552,9 +564,6 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
     let can_save = session.read().can_admin();
     let is_admin = session.read().is_admin();
     let id = connector.id.clone();
-    let connected = connector
-        .connected
-        .unwrap_or_else(|| connector.secrets.values().any(|s| s.configured));
     let title = connector_title(&id);
     let blurb = connector_blurb(&id);
     let enabled = session
@@ -572,7 +581,11 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
         .and_then(|draft| draft.auth.clone())
         .or_else(|| connector.auth.clone())
         .unwrap_or_default();
+    let connected = legacy_connected(&connector, &auth_mode);
+    let signed_in_with_account = supports_sign_in(&connector) && connected && auth_mode == "oauth";
+    let on_api_key = uses_api_key(&connector, &auth_mode);
     let test_result = session.read().state.connector_tests.get(&id).cloned();
+    let needs_attention = test_result.as_ref().is_some_and(|result| !result.ok);
     let values = session
         .read()
         .connector_drafts
@@ -584,7 +597,7 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
         let flow = &state.panel.onedrive;
         (flow.busy, flow.waiting, flow.error.clone())
     };
-    let action = connector_action(&connector, connected, &auth_mode);
+    let action = connector_action(&connector, connected);
     let key_inputs = matches!(
         action,
         Some(ConnectorAction::AddKey | ConnectorAction::ReplaceKey)
@@ -600,6 +613,7 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
             )
         );
     let has_values = values.values().any(|value| !value.trim().is_empty());
+    let api_key_value = values.get("api_key").cloned().unwrap_or_default();
     rsx! {
         div { class: "card connector-card",
             div { class: "card-head",
@@ -613,13 +627,25 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                     }
                 }
                 span {
-                    class: if connected { "status-pill connected" } else { "status-pill disconnected" },
-                    if connected { "Connected" } else { "Not connected" }
+                    class: if connected && !needs_attention { "status-pill connected" } else { "status-pill disconnected" },
+                    if needs_attention {
+                        "Needs attention"
+                    } else if connected {
+                        "Connected"
+                    } else {
+                        "Not connected"
+                    }
                 }
+            }
+            if signed_in_with_account {
+                p { class: "tiny", role: "status", "Signed in with your {title} account." }
+            }
+            if on_api_key {
+                p { class: "tiny", role: "status", "Connected with an API key." }
             }
             if key_inputs {
                 div { class: "form-grid",
-                    for (role, secret) in &connector.secrets {
+                    for (role, secret) in connector.secrets.iter().filter(|(role, _)| !is_internal_role(role)) {
                         {
                             let role = role.clone();
                             let label = secret_label(&role);
@@ -691,8 +717,23 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                                 class: if connected { "btn ghost" } else { "btn primary" },
                                 title: "Sign in with your account in your browser",
                                 disabled: signing_in || !can_save,
-                                onclick: move |_| session.write().sign_in_connector(id.clone(), callback_uri.clone()),
-                                if signing_in { "Signing inÔÇª" } else if connected { "Sign in again" } else { "Sign in" }
+                                onclick: {
+                                    let id = id.clone();
+                                    move |_| session.write().sign_in_connector(id.clone(), callback_uri.clone())
+                                },
+                                if signing_in { "Signing inÔÇª" } else if signed_in_with_account { "Reconnect" } else { "Sign in with {title}" }
+                            }
+                            if signed_in_with_account {
+                                button {
+                                    class: "btn ghost",
+                                    title: "Stop using this account sign-in",
+                                    disabled: !can_save,
+                                    onclick: {
+                                        let id = id.clone();
+                                        move |_| session.write().sign_out_connector(id.clone())
+                                    },
+                                    "Sign out"
+                                }
                             }
                         }
                     },
@@ -742,7 +783,7 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                             if let Some(oauth) = connector.oauth.as_ref() {
                                 span { class: "chip mono accent", "client_id: {oauth.client_id}" }
                             }
-                            for (role, secret) in &connector.secrets {
+                            for (role, secret) in connector.secrets.iter().filter(|(role, _)| !is_internal_role(role)) {
                                 if secret.configured || secret.name.as_deref().is_some_and(|n| !n.is_empty()) {
                                     span {
                                         key: "{role}",
@@ -755,19 +796,30 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                         if let Some(uri) = connector.redirect_uri.clone() {
                             code { class: "tiny", "{uri}" }
                         }
-                        if connector.auth_modes.len() > 1 {
+                        if supports_sign_in(&connector) && connector.secrets.contains_key("api_key") {
                             div { class: "field",
-                                label { class: "field-label", "How it signs in" }
-                                select {
+                                label { class: "field-label", "Use an API key instead" }
+                                input {
                                     class: "input",
-                                    value: "{auth_mode}",
-                                    onchange: {
+                                    "type": "password",
+                                    autocomplete: "off",
+                                    value: "{api_key_value}",
+                                    placeholder: if on_api_key { "Paste a new key to replace it" } else { "Paste your API key" },
+                                    oninput: {
                                         let id = id.clone();
-                                        move |event| session.write().set_connector_auth(&id, event.value())
+                                        move |event| session.write().set_connector_value(&id, "api_key", event.value())
                                     },
-                                    for mode in &connector.auth_modes {
-                                        option { value: "{mode}", "{mode}" }
-                                    }
+                                }
+                            }
+                            div { class: "card-actions",
+                                button {
+                                    class: "btn ghost sm",
+                                    disabled: !can_save || api_key_value.trim().is_empty(),
+                                    onclick: {
+                                        let id = id.clone();
+                                        move |_| session.write().use_api_key_instead(id.clone())
+                                    },
+                                    "Save key"
                                 }
                             }
                         }
@@ -864,11 +916,11 @@ mod tests {
     fn each_connector_shows_one_action_that_fits_its_state() {
         let onedrive = connector("onedrive");
         assert_eq!(
-            connector_action(&onedrive, false, ""),
+            connector_action(&onedrive, false),
             Some(ConnectorAction::ConnectOneDrive)
         );
         assert_eq!(
-            connector_action(&onedrive, true, ""),
+            connector_action(&onedrive, true),
             Some(ConnectorAction::DisconnectOneDrive)
         );
         let mut notion = connector("notion");
@@ -880,22 +932,54 @@ mod tests {
             },
         )]);
         assert_eq!(
-            connector_action(&notion, false, ""),
+            connector_action(&notion, false),
             Some(ConnectorAction::AddKey)
         );
         assert_eq!(
-            connector_action(&notion, true, ""),
+            connector_action(&notion, true),
             Some(ConnectorAction::ReplaceKey)
         );
         let gmail = connector("gmail");
         assert!(matches!(
-            connector_action(&gmail, false, ""),
+            connector_action(&gmail, false),
             Some(ConnectorAction::Authorize(_))
         ));
-        assert_eq!(connector_action(&connector("unknown"), false, ""), None);
+        assert_eq!(connector_action(&connector("unknown"), false), None);
         assert_eq!(secret_label("api_key"), "API key");
         assert_eq!(secret_label("refresh_token"), "Refresh token");
         assert_eq!(connector_title("onedrive"), "OneDrive");
+    }
+
+    #[test]
+    fn a_sign_in_connector_always_leads_with_sign_in_and_hides_tokens() {
+        let mut voice = connector("elevenlabs");
+        voice.auth_modes = vec!["api_key".into(), "oauth".into()];
+        voice.oauth = Some(serabot_desktop::ConnectorOauth {
+            client_id: "https://example.example/client.json".into(),
+            authorize_url: None,
+            cimd_path: None,
+            callback_uri: Some("http://127.0.0.1:1/cb".into()),
+            scope: None,
+        });
+        for role in ["api_key", "access_token", "refresh_token"] {
+            voice.secrets.insert(
+                role.to_owned(),
+                serabot_desktop::SecretStatus {
+                    name: Some(format!("secret_{role}")),
+                    configured: false,
+                },
+            );
+        }
+        // Whatever mode the server reports, signing in leads and no key sits beside it.
+        assert_eq!(
+            connector_action(&voice, false),
+            Some(ConnectorAction::SignIn)
+        );
+        assert_eq!(
+            connector_action(&voice, true),
+            Some(ConnectorAction::SignIn)
+        );
+        assert_eq!(editable_roles(&voice), vec!["api_key".to_owned()]);
     }
 
     #[test]

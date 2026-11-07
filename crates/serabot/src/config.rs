@@ -53,6 +53,9 @@ pub struct Config {
     /// Composio apps (per-user key; see docs/composio.md).
     #[serde(default)]
     pub composio: ComposioConfig,
+    /// Per-user token connectors: GitHub, Todoist, Slack, Exa.
+    #[serde(default)]
+    pub token_connectors: TokenConnectorsConfig,
     #[serde(default)]
     pub render: RenderConfig,
     #[serde(default)]
@@ -110,6 +113,7 @@ impl Default for Config {
             tavily: TavilyConfig::default(),
             elevenlabs: ElevenLabsConfig::default(),
             composio: ComposioConfig::default(),
+            token_connectors: TokenConnectorsConfig::default(),
             render: RenderConfig::default(),
             runtime: RuntimeConfig::default(),
             schedule: ScheduleConfig::default(),
@@ -387,6 +391,7 @@ impl Config {
         }
         self.browser.validate()?;
         self.connectors.validate()?;
+        self.token_connectors.validate()?;
         validate_relative_dir("fleet.bots_dir", &self.fleet.bots_dir)?;
         validate_relative_dir("fleet.prompts_dir", &self.fleet.prompts_dir)?;
         Ok(())
@@ -1083,6 +1088,9 @@ impl OneDriveConfig {
 pub struct ComposioConfig {
     #[serde(default = "default_composio_api_base")]
     pub api_base: String,
+    /// The Composio Connect MCP endpoint, used for Connect (`ck_`) keys.
+    #[serde(default = "default_composio_mcp_base")]
+    pub mcp_base: String,
     #[serde(default = "default_composio_timeout")]
     pub timeout_secs: u64,
     /// Largest Composio response body read, in bytes.
@@ -1099,6 +1107,7 @@ impl Default for ComposioConfig {
     fn default() -> Self {
         Self {
             api_base: default_composio_api_base(),
+            mcp_base: default_composio_mcp_base(),
             timeout_secs: default_composio_timeout(),
             max_response_bytes: default_composio_max_bytes(),
             tool_version: None,
@@ -1110,6 +1119,10 @@ fn default_composio_api_base() -> String {
     "https://backend.composio.dev".into()
 }
 
+fn default_composio_mcp_base() -> String {
+    "https://connect.composio.dev/mcp".into()
+}
+
 fn default_composio_timeout() -> u64 {
     30
 }
@@ -1118,6 +1131,89 @@ fn default_composio_max_bytes() -> usize {
     256 * 1024
 }
 
+/// API bases for the per-user token connectors (GitHub, Todoist, Slack, Exa).
+/// Tokens are pasted by each user and sealed per user; only the bases, the
+/// timeout and the response cap live here. Bases must be HTTPS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenConnectorsConfig {
+    #[serde(default = "default_github_api_base")]
+    pub github_api_base: String,
+    #[serde(default = "default_todoist_api_base")]
+    pub todoist_api_base: String,
+    #[serde(default = "default_slack_api_base")]
+    pub slack_api_base: String,
+    #[serde(default = "default_exa_api_base")]
+    pub exa_api_base: String,
+    #[serde(default = "default_token_connectors_timeout")]
+    pub timeout_secs: u64,
+    /// Largest provider response body read, in bytes.
+    #[serde(default = "default_token_connectors_max_bytes")]
+    pub max_response_bytes: usize,
+}
+
+impl Default for TokenConnectorsConfig {
+    fn default() -> Self {
+        Self {
+            github_api_base: default_github_api_base(),
+            todoist_api_base: default_todoist_api_base(),
+            slack_api_base: default_slack_api_base(),
+            exa_api_base: default_exa_api_base(),
+            timeout_secs: default_token_connectors_timeout(),
+            max_response_bytes: default_token_connectors_max_bytes(),
+        }
+    }
+}
+
+impl TokenConnectorsConfig {
+    fn validate(&self) -> Result<()> {
+        for (name, base) in [
+            ("github_api_base", &self.github_api_base),
+            ("todoist_api_base", &self.todoist_api_base),
+            ("slack_api_base", &self.slack_api_base),
+            ("exa_api_base", &self.exa_api_base),
+        ] {
+            let url = url::Url::parse(base.trim()).map_err(|_| {
+                SeraError::Config(format!("token_connectors.{name} must be an https URL"))
+            })?;
+            if url.scheme() != "https"
+                || url.host_str().is_none_or(str::is_empty)
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(SeraError::Config(format!(
+                    "token_connectors.{name} must be https without credentials, a query, or a fragment"
+                )));
+            }
+        }
+        if !(4 * 1024..=4 * 1024 * 1024).contains(&self.max_response_bytes) {
+            return Err(SeraError::Config(
+                "token_connectors.max_response_bytes must be between 4096 and 4194304".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_github_api_base() -> String {
+    "https://api.github.com".into()
+}
+fn default_todoist_api_base() -> String {
+    "https://api.todoist.com".into()
+}
+fn default_slack_api_base() -> String {
+    "https://slack.com/api".into()
+}
+fn default_exa_api_base() -> String {
+    "https://api.exa.ai".into()
+}
+fn default_token_connectors_timeout() -> u64 {
+    30
+}
+fn default_token_connectors_max_bytes() -> usize {
+    1024 * 1024
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FirecrawlConfig {
     #[serde(default)]
@@ -1842,6 +1938,20 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "notion_query_database",
     "agentmail_inboxes_list",
     "agentmail_send",
+    "github_search_repos",
+    "github_list_issues",
+    "github_get_issue",
+    "github_create_issue",
+    "github_comment_issue",
+    "github_get_file",
+    "todoist_list_tasks",
+    "todoist_add_task",
+    "todoist_complete_task",
+    "slack_list_channels",
+    "slack_read_channel",
+    "slack_post_message",
+    "exa_search",
+    "exa_get_contents",
     "local_list",
     "local_read",
     "local_write",

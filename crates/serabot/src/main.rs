@@ -882,6 +882,11 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         users.clone(),
     )?);
     serabot::composio::register_composio_tools(&mut registry, &composio)?;
+    let token_connectors = Arc::new(serabot::token_connectors::TokenConnectors::new(
+        &config,
+        users.clone(),
+    )?);
+    serabot::token_connectors::register_token_tools(&mut registry, &token_connectors)?;
     let mut onedrive_registry: Option<Arc<serabot::onedrive::OneDriveRegistry>> = None;
     if config.onedrive.enabled {
         if serabot::onedrive::import_global_refresh_token(

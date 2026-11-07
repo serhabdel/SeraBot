@@ -74,3 +74,89 @@ Docs: [agentmail.to/docs](https://www.agentmail.to/docs/api-reference). Send nee
 
 Specialist scaffolds may list these tools. OAuth reads and both AgentMail tools
 are in the external-effect list, so a scaffold puts them in `require_approval`.
+
+## Personal token connectors (GitHub, Todoist, Slack, Exa)
+
+These connect with a token each user pastes in the console, like Notion. The
+server verifies it with one cheap read, seals it in the per-user credential
+store, and never shows it again. Tools always run as the acting user with that
+user's own token; a user who has not connected gets a "connect it first" answer
+and never anyone else's access. The API bases live under `[token_connectors]`
+(`github_api_base`, `todoist_api_base`, `slack_api_base`, `exa_api_base`,
+`timeout_secs`, `max_response_bytes`). Bases must be HTTPS. Every tool goes
+through the gateway, results are untrusted data, responses are size capped, and
+the token is redacted from all output. A `401` shows "<name> rejected your
+token" without echoing it. Writes ask for approval and the approval is bound
+to where the effect lands (the repository, the channel, the task).
+
+### GitHub
+
+Tools: `github_search_repos`, `github_list_issues`, `github_get_issue`,
+`github_get_file` (read) and `github_create_issue`, `github_comment_issue`
+(write, approval).
+
+1. Open <https://github.com/settings/personal-access-tokens/new> and create a
+   **fine-grained personal access token**.
+2. Under **Repository access**, choose only the repositories your bots need.
+3. Under **Repository permissions**, set **Issues: Read and write** and
+   **Contents: Read-only** (Metadata read is added automatically). Leave the
+   rest at No access. Drop Issues to read-only if bots should never write.
+4. Generate it, copy it, and paste it into the GitHub card in Connectors.
+
+Search results are paged (30 per page at most, 10 pages), files over 200 KB are
+refused, and file text is cut at 20,000 characters. The REST API version header
+is pinned to `2022-11-28`.
+### Todoist
+
+Tools: `todoist_list_tasks` (read), `todoist_add_task` and
+`todoist_complete_task` (write, approval).
+
+1. In Todoist open **Settings, Integrations, Developer** (direct link:
+   <https://app.todoist.com/app/settings/integrations/developer>).
+2. Copy the **API token** and paste it into the Todoist card in Connectors.
+
+The connector uses the current unified REST API (`/api/v1`, cursor paging),
+not the deprecated v2 endpoints. Todoist API tokens are full account access and
+have no scopes, so keep the write tools behind approval. Task ids are
+validated before any request, listings are capped at 50 per page, and a `403`
+from Todoist is treated as a rejected token (that is how Todoist reports one).
+### Slack
+
+Tools: `slack_list_channels`, `slack_read_channel` (read) and
+`slack_post_message` (write, approval; the approval names the channel and
+thread).
+
+1. Go to <https://api.slack.com/apps> and choose **Create New App**, from
+   scratch, in your workspace.
+2. Under **OAuth & Permissions**, add these **Bot Token Scopes**:
+   `channels:read`, `groups:read`, `channels:history`, `groups:history`,
+   `chat:write`. (Add `chat:write.public` only if the bot should post in
+   channels it has not joined.)
+3. **Install to Workspace**, then copy the **Bot User OAuth Token** (it starts
+   with `xoxb-`) into the Slack card in Connectors. Other token types are
+   refused.
+4. In Slack, invite the bot to each channel it should read or post in
+   (`/invite @your-app`).
+
+Slack reports most errors inside an HTTP 200; the connector maps them to plain
+messages (revoked token, bot not in the channel, missing scope with the scope
+name). Channel ids (`C…` or `G…`) are validated before any request, history is
+capped at 50 messages per call, and posting refuses `@channel`, `@here` and
+`@everyone` mentions and turns link previews off.
+### Exa (web search)
+
+Tools: `exa_search`, `exa_get_contents` (both read). Exa sits with Tavily and
+Firecrawl under Web search; unlike those server-wide connectors, each user
+brings their own Exa key, so usage and billing stay with the user.
+
+1. Sign in at <https://dashboard.exa.ai/api-keys> and create an **API key**.
+2. Paste it into the Exa card in Connectors. Connecting runs one
+   single-result search to prove the key works (Exa has no free "who am I"
+   call), which uses a tiny amount of the user's credit.
+
+`exa_search` returns up to 10 results with relevant passages (highlights) and
+supports an optional list of domains to restrict to. `exa_get_contents` reads
+up to 5 pages (http or https, no embedded credentials) and keeps at most
+20,000 characters per page. A `401` shows "Exa rejected your API key"; running
+out of credits or a plan limit is reported in Exa's own words with the key
+removed.

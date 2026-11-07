@@ -8,9 +8,12 @@
 use crate::ui::{BrandLogo, Icon};
 use dioxus::prelude::*;
 use serabot_desktop::ConnectorStatus;
+use serabot_desktop::composio_flow::key_hint;
 use serabot_desktop::session::Session;
 
 const COMPOSIO_HELP_URL: &str = "https://platform.composio.dev/";
+/// Where a Connect key's apps are managed. Fixed here, never taken from the server.
+const COMPOSIO_CONNECT_URL: &str = "https://dashboard.composio.dev/";
 
 #[component]
 pub(crate) fn ComposioCard(session: Signal<Session>, connector: ConnectorStatus) -> Element {
@@ -18,6 +21,8 @@ pub(crate) fn ComposioCard(session: Signal<Session>, connector: ConnectorStatus)
     let mut key = use_signal(String::new);
     let mut search = use_signal(String::new);
     let connected = connector.connected.unwrap_or(false);
+    // A Connect (ck_) key: its apps are linked on Composio's side.
+    let managed = connected && connector.key_kind.as_deref() == Some("consumer");
     let (busy, loading, loaded, error, waiting, apps, accounts) = {
         let state = session.read();
         let flow = &state.panel.composio;
@@ -81,7 +86,10 @@ pub(crate) fn ComposioCard(session: Signal<Session>, connector: ConnectorStatus)
                         oninput: move |event| key.set(event.value()),
                     }
                     p { class: "tiny",
-                        "Paste the project API key from platform.composio.dev → Settings → API keys."
+                        "Paste a project key (ak_) from platform.composio.dev, a user key (uak_), or a Connect key (ck_) from Composio Connect."
+                    }
+                    if !key().trim().is_empty() {
+                        p { class: "tiny", role: "status", "{key_hint(&key())}" }
                     }
                 }
                 p { class: "tiny",
@@ -119,6 +127,20 @@ pub(crate) fn ComposioCard(session: Signal<Session>, connector: ConnectorStatus)
                         },
                     }
                 }
+                if managed {
+                    p { class: "tiny", role: "status",
+                        "Your apps are managed in Composio Connect. Link or remove them there; the tools below are what this key offers."
+                    }
+                    div { class: "card-actions",
+                        button {
+                            class: "btn ghost",
+                            title: "Open Composio Connect to manage your apps",
+                            onclick: move |_| session.write().open_in_browser(COMPOSIO_CONNECT_URL.to_owned()),
+                            Icon { name: "external", size: 14 }
+                            "Open Composio Connect"
+                        }
+                    }
+                }
                 if let Some(slug) = waiting.clone() {
                     p { class: "tiny", role: "status",
                         "Finish signing in to {slug} in your browser. This card updates by itself."
@@ -149,7 +171,9 @@ pub(crate) fn ComposioCard(session: Signal<Session>, connector: ConnectorStatus)
                                         }
                                     }
                                     div { class: "vault-actions",
-                                        if linked {
+                                        if managed {
+                                            span { class: "vault-meta", "Available" }
+                                        } else if linked {
                                             span { class: "status-pill connected", "Connected" }
                                             button {
                                                 class: "btn ghost",

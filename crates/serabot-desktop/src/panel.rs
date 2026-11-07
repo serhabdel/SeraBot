@@ -617,6 +617,9 @@ fn profile_error_text(error: &ApiError) -> String {
 /// What went wrong, in everyday words.
 fn connector_error_text(error: &ApiError) -> String {
     match error {
+        // Written for the user by the server (for example GitHub rejected the
+        // token), so shown as is.
+        ApiError::Coded { code, message, .. } if code.starts_with("connector_") => message.clone(),
         ApiError::Http(409) => {
             "Not set up yet. Ask your admin to finish the setup, then try again.".into()
         }
@@ -647,7 +650,7 @@ fn composio_error_text(error: &ApiError) -> String {
         ApiError::Http(409) => "Add your Composio key first.".into(),
         // The server answers 403 when no key is saved. It is not a policy block.
         ApiError::Http(403) => "Composio is not connected yet. Add your key first.".into(),
-        ApiError::Http(422) => "Composio did not accept that key. Check it and try again.".into(),
+        ApiError::Http(422) => "Composio did not accept that key. SeraBot takes project keys (ak_), user keys (uak_) and Connect keys (ck_). Check it and try again.".into(),
         ApiError::Http(502..=504) => "Composio could not be reached. Try again in a moment.".into(),
         other => other.to_string(),
     }
@@ -2725,7 +2728,7 @@ mod tests {
         );
         assert_eq!(
             composio_error_text(&ApiError::Http(422)),
-            "Composio did not accept that key. Check it and try again."
+            "Composio did not accept that key. SeraBot takes project keys (ak_), user keys (uak_) and Connect keys (ck_). Check it and try again."
         );
         for status in [502, 503, 504] {
             assert_eq!(

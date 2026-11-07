@@ -575,6 +575,16 @@ fn connector_oauth_sign_in(
             .map_err(|error| ApiError::Rejected(error.to_string()))?;
     drop(listener);
     client.admin_connector_oauth_complete(id, &code, &pkce.verifier, &redirect)?;
+    // The server stores the tokens but keeps its old mode: switch to the
+    // sign-in so the card shows Connected without a second click.
+    client.admin_set_connector(
+        id,
+        &crate::ConnectorUpdate {
+            enabled: true,
+            values: Default::default(),
+            auth: Some("oauth".to_owned()),
+        },
+    )?;
     Ok(Reply::OAuthSignedIn {
         id: id.to_owned(),
         device_code: None,
