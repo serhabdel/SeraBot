@@ -32,6 +32,8 @@ pub struct State {
     pub messages: Vec<Message>,
     pub history_loaded: bool,
     pub task: Option<Task>,
+    /// Live steps of the latest turn, from the event stream.
+    pub activity: crate::activity::Activity,
     pub approvals: Vec<Approval>,
     pub approvals_loaded: bool,
     pub conversations: Vec<ConversationSummary>,
@@ -111,6 +113,7 @@ impl Default for State {
             messages: Vec::new(),
             history_loaded: false,
             task: None,
+            activity: Default::default(),
             approvals: Vec::new(),
             approvals_loaded: false,
             conversations: Vec::new(),

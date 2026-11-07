@@ -1,3 +1,4 @@
+pub mod activity;
 mod api;
 /// Microphone capture through the webview. Needs Dioxus, so it is only built
 /// where the console runs (Windows) or where the UI is type-checked.
@@ -6,6 +7,7 @@ pub mod audio_capture;
 pub mod avatars;
 pub mod branding;
 pub mod capabilities;
+pub mod composio_flow;
 pub mod connector_card;
 pub mod creds;
 pub mod events;

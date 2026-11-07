@@ -33,6 +33,13 @@ pub(super) async fn conversation_messages(
                 "content": content,
                 "created_at": message.created_at,
             });
+            // Opaque turn id: lets the desktop fold a finished turn's live
+            // steps into the reply that turn produced.
+            if let Some(turn_id) = message.turn_id.as_deref().filter(|id| {
+                id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            }) {
+                body["turn_id"] = json!(turn_id);
+            }
             if let Some(name) = message
                 .name
                 .as_deref()

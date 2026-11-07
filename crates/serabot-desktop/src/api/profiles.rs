@@ -10,6 +10,13 @@ use super::*;
 
 /// The server accepts at most 1 MiB per upload.
 pub const MAX_AVATAR_UPLOAD_BYTES: usize = 1024 * 1024;
+/// The `accept` value of the avatar file input.
+///
+/// Extensions, not MIME types: dioxus-desktop opens the native dialog itself
+/// and only maps `.ext` and `image/*` to dialog filters. A MIME list such as
+/// `image/png,image/jpeg` becomes a filter with no extensions, the dialog
+/// offers nothing to pick, no file reaches the page and no upload is sent.
+pub const AVATAR_FILE_ACCEPT: &str = ".png,.jpg,.jpeg,.webp";
 /// A stored avatar is a 256x256 PNG; anything past this is not one.
 pub const MAX_AVATAR_DOWNLOAD_BYTES: usize = 512 * 1024;
 const MAX_ONBOARDING_LINES: usize = 40;
@@ -422,6 +429,24 @@ fn valid_conversation_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn avatar_picker_filter_is_extensions_the_native_dialog_understands() {
+        // dioxus-desktop turns only `.ext` and `image/*` into dialog filters;
+        // any other token (a MIME type) yields an empty filter and an empty
+        // dialog, so the upload never starts.
+        for token in AVATAR_FILE_ACCEPT.split(',') {
+            let ext = token.strip_prefix('.').expect("extension token");
+            assert!(!ext.is_empty() && ext.chars().all(|c| c.is_ascii_lowercase()));
+        }
+        for needed in ["png", "jpg", "jpeg", "webp"] {
+            assert!(
+                AVATAR_FILE_ACCEPT
+                    .split(',')
+                    .any(|t| t == format!(".{needed}"))
+            );
+        }
+    }
 
     #[test]
     fn images_are_sniffed_by_magic_bytes_and_capped() {

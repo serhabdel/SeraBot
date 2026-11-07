@@ -37,6 +37,43 @@ pub struct Settings {
     pub theme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pins: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefs: Option<UiPrefs>,
+}
+
+/// Look-and-feel and chat preferences of this device (0.17). Local only:
+/// nothing here is sent to the server.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct UiPrefs {
+    /// `small`, `normal` or `large`.
+    pub text_size: String,
+    pub reduce_motion: bool,
+    /// Show a message when a bot is waiting for the user's OK.
+    pub notify_approvals: bool,
+    /// Enter sends the message (Shift+Enter adds a line); off means Ctrl+Enter sends.
+    pub enter_sends: bool,
+}
+
+impl Default for UiPrefs {
+    fn default() -> Self {
+        Self {
+            text_size: "normal".into(),
+            reduce_motion: false,
+            notify_approvals: true,
+            enter_sends: true,
+        }
+    }
+}
+
+impl UiPrefs {
+    /// Fold an unknown stored text size back to the default.
+    pub fn sanitized(mut self) -> Self {
+        if !matches!(self.text_size.as_str(), "small" | "normal" | "large") {
+            self.text_size = "normal".into();
+        }
+        self
+    }
 }
 
 /// A pin is either a bot id slug (`analyst`) or a full conversation id
@@ -129,23 +166,26 @@ pub fn load_settings_from(dir: &Path) -> Settings {
         return Settings::default();
     };
     let theme = settings.theme.and_then(|theme| match theme.as_str() {
-        "dark" | "light" => Some(theme),
+        "dark" | "light" | "system" => Some(theme),
         _ => None,
     });
     let pins = settings
         .pins
         .map(sanitize_pins)
         .filter(|pins| !pins.is_empty());
+    let prefs = settings.prefs.map(UiPrefs::sanitized);
     match validate_endpoint(settings.server.trim()) {
         Ok(url) => Settings {
             server: url.origin().ascii_serialization(),
             theme,
             pins,
+            prefs,
         },
         Err(_) => Settings {
             server: String::new(),
             theme,
             pins,
+            prefs,
         },
     }
 }
@@ -169,6 +209,7 @@ pub fn save_settings_to(dir: &Path, settings: &Settings) -> Result<(), String> {
             .as_ref()
             .map(|pins| sanitize_pins(pins.clone()))
             .filter(|pins| !pins.is_empty()),
+        prefs: settings.prefs.clone().map(UiPrefs::sanitized),
     })
     .map_err(|_| "Could not encode settings.".to_owned())?;
     fs::create_dir_all(dir).map_err(|_| "Could not create the settings directory.".to_owned())?;
@@ -325,6 +366,7 @@ mod tests {
                 server: "https://bot.example/".into(),
                 theme: Some("light".into()),
                 pins: Some(vec!["dir:analyst".into(), "room:review".into()]),
+                prefs: None,
             },
         )
         .unwrap();
@@ -333,7 +375,8 @@ mod tests {
             Settings {
                 server: "https://bot.example".into(),
                 theme: Some("light".into()),
-                pins: Some(vec!["dir:analyst".into(), "room:review".into()])
+                pins: Some(vec!["dir:analyst".into(), "room:review".into()]),
+                prefs: None,
             }
         );
         let text = fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
@@ -347,11 +390,43 @@ mod tests {
                 server: "http://127.0.0.1:8787".into(),
                 theme: None,
                 pins: None,
+                prefs: None,
             },
         )
         .unwrap();
         assert_eq!(load_settings_from(&dir).server, "http://127.0.0.1:8787");
         assert_eq!(load_settings_from(&dir).pins, None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn prefs_round_trip_and_unknown_values_fall_back() {
+        let dir = temp_dir("settings-prefs");
+        let prefs = UiPrefs {
+            text_size: "large".into(),
+            reduce_motion: true,
+            notify_approvals: false,
+            enter_sends: false,
+        };
+        save_settings_to(
+            &dir,
+            &Settings {
+                server: String::new(),
+                theme: Some("system".into()),
+                pins: None,
+                prefs: Some(prefs.clone()),
+            },
+        )
+        .unwrap();
+        let loaded = load_settings_from(&dir);
+        assert_eq!(loaded.theme.as_deref(), Some("system"));
+        assert_eq!(loaded.prefs, Some(prefs));
+        fs::write(
+            dir.join(SETTINGS_FILE),
+            r#"{"server":"","prefs":{"text_size":"huge"}}"#,
+        )
+        .unwrap();
+        assert_eq!(load_settings_from(&dir).prefs, Some(UiPrefs::default()));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -373,6 +448,7 @@ mod tests {
                     "room:review".into(),
                     "12345".into(),
                 ]),
+                prefs: None,
             },
         )
         .unwrap();
@@ -494,6 +570,7 @@ mod tests {
             server: "http://owner.example".into(),
             theme: None,
             pins: None,
+            prefs: None,
         };
         // Invalid saved origins fall back to the optional compiled hint.
         assert_eq!(prefill_server(&settings), default_server_url());

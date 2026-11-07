@@ -54,6 +54,7 @@ mod admin;
 mod approvals;
 mod bots;
 mod browser;
+mod composio;
 mod connectors;
 mod conversations;
 mod memories;
@@ -70,6 +71,7 @@ use admin::*;
 use approvals::*;
 use bots::*;
 use browser::*;
+use composio::*;
 use connectors::*;
 use conversations::*;
 use memories::*;
@@ -138,6 +140,8 @@ pub struct ApiState {
     onedrive_consent: Option<Arc<OneDriveConsent>>,
     /// Per-user Outlook, Google, and Notion connections.
     personal: Arc<PersonalConnectors>,
+    /// Per-user Composio key and linked apps.
+    composio: Arc<crate::composio::ComposioService>,
     token_hash: String,
     /// Per-user request buckets for the per-minute limit. Keyed by the
     /// acting user id (never a token); public sign-in routes without an
@@ -183,6 +187,10 @@ impl ApiState {
         let onedrive_consent =
             OneDriveConsent::new(&config, &secrets, users.clone())?.map(Arc::new);
         let personal = Arc::new(PersonalConnectors::new(&config, &secrets, users.clone())?);
+        let composio = Arc::new(crate::composio::ComposioService::new(
+            &config,
+            users.clone(),
+        )?);
         Ok(Self {
             runtime,
             store,
@@ -192,6 +200,7 @@ impl ApiState {
             onedrive,
             onedrive_consent,
             personal,
+            composio,
             token_hash: config.api.token_hash.to_ascii_lowercase(),
             rate: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: config.server.rate_limit_per_minute.max(1) as usize,
@@ -290,6 +299,15 @@ pub fn router(state: ApiState) -> Router {
             delete(revoke_grant_endpoint),
         )
         .route("/v1/connectors/onedrive", delete(disconnect_onedrive))
+        .route("/v1/connectors/composio", delete(disconnect_composio))
+        .route("/v1/connectors/composio/key", put(set_composio_key))
+        .route("/v1/connectors/composio/accounts", get(composio_accounts))
+        .route(
+            "/v1/connectors/composio/accounts/{account}",
+            delete(composio_disconnect_account),
+        )
+        .route("/v1/connectors/composio/toolkits", get(composio_toolkits))
+        .route("/v1/connectors/composio/connect", post(composio_connect))
         .route("/v1/connectors/{id}", delete(disconnect_personal))
         .route("/v1/connectors/{id}/start", post(start_personal_consent))
         .route("/v1/connectors/{id}/token", put(set_personal_token))

@@ -12,9 +12,11 @@ use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
 mod browser;
+mod composio;
 mod panel;
 mod profiles;
 pub use browser::*;
+pub use composio::*;
 pub use panel::*;
 pub use profiles::*;
 
@@ -818,6 +820,34 @@ pub struct UsageBucket {
     pub total_tokens: i64,
 }
 
+/// One `per_model` row of the usage report.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct UsageModel {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub calls: i64,
+    #[serde(default)]
+    pub prompt_tokens: i64,
+    #[serde(default)]
+    pub completion_tokens: i64,
+    #[serde(default)]
+    pub total_tokens: i64,
+}
+
+/// One `tools` row of the usage report: runs of one tool.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct UsageTool {
+    #[serde(default)]
+    pub tool: String,
+    #[serde(default)]
+    pub completed: i64,
+    #[serde(default)]
+    pub failed: i64,
+}
+
 /// Report of `GET /v1/usage?days=&bot=&conversation_id=`.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct UsageReport {
@@ -827,6 +857,10 @@ pub struct UsageReport {
     pub per_day: Vec<UsageBucket>,
     #[serde(default)]
     pub per_bot: Vec<UsageBucket>,
+    #[serde(default)]
+    pub per_model: Vec<UsageModel>,
+    #[serde(default)]
+    pub tools: Vec<UsageTool>,
 }
 
 /// One conversation row from `GET /v1/conversations`.
@@ -3448,6 +3482,21 @@ fn check_usage_report(report: UsageReport) -> Result<UsageReport, ApiError> {
     let bad = !totals_ok
         || report.per_day.len() > MAX_USAGE_DAYS as usize + 1
         || report.per_bot.len() > MAX_BOT_CONFIG_ITEMS
+        || report.per_model.len() > 100
+        || report.tools.len() > 100
+        || report.per_model.iter().any(|row| {
+            !usage_counts_ok(
+                row.calls,
+                row.prompt_tokens,
+                row.completion_tokens,
+                row.total_tokens,
+            ) || !bounded_text(&row.model, 200)
+                || !bounded_text(&row.provider, 200)
+        })
+        || report
+            .tools
+            .iter()
+            .any(|row| row.completed < 0 || row.failed < 0 || !bounded_text(&row.tool, 200))
         || report.per_day.iter().any(|bucket| {
             !usage_counts_ok(
                 bucket.calls,

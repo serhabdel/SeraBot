@@ -7,11 +7,17 @@ mod ui_bots;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_browser;
 #[cfg(any(windows, feature = "ui-check"))]
+mod ui_composio;
+#[cfg(any(windows, feature = "ui-check"))]
 mod ui_connectors;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_dock;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_settings;
+#[cfg(any(windows, feature = "ui-check"))]
+mod ui_settings_page;
+#[cfg(any(windows, feature = "ui-check"))]
+mod ui_usage;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_vault;
 

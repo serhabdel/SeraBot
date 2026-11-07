@@ -2628,7 +2628,7 @@ async fn providers_and_connectors_report_status_without_secret_values() {
     )
     .await;
     let list = connectors["connectors"].as_array().unwrap();
-    assert_eq!(list.len(), 11);
+    assert_eq!(list.len(), 12);
     let gmail = list
         .iter()
         .find(|connector| connector["id"] == "gmail")
@@ -4596,4 +4596,101 @@ async fn conversation_list_carries_a_plain_last_message_preview_for_the_acting_u
     .await;
     assert!(theirs.to_string().contains("member secret chatter"));
     assert!(!theirs.to_string().contains("Bold code"));
+}
+
+#[tokio::test]
+async fn usage_scope_all_is_admin_only_and_members_only_see_their_own_rows() {
+    let (app, _, store) = app();
+    let admin_id = store.admin_user_id().unwrap();
+    let (member, member_token) = member_with_session(&store);
+    let record = |actor: &str, task_id: Option<&str>, tokens: i64, model: &str| {
+        store
+            .record_audit(
+                actor,
+                "model.used",
+                None,
+                task_id,
+                None,
+                None,
+                Some("policy-synthetic"),
+                Some(&json!({
+                    "provider": "default",
+                    "model": model,
+                    "usage": {"prompt_tokens": tokens, "completion_tokens": 1, "total_tokens": tokens + 1},
+                })),
+            )
+            .unwrap();
+    };
+    record(&admin_id, None, 10, "admin-model");
+    record(&member.id, None, 100, "member-model");
+    for (actor, tool, event) in [
+        (&admin_id, "web_search", "tool.completed"),
+        (&member.id, "read_file", "tool.completed"),
+        (&member.id, "read_file", "tool.failed"),
+    ] {
+        store
+            .record_audit(actor, event, Some(tool), None, None, None, None, None)
+            .unwrap();
+    }
+
+    // The member sees only their own model and tool rows.
+    let own = read_json(
+        app.clone()
+            .oneshot(request_with_token("GET", "/v1/usage", &member_token, None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(own["scope"], "me");
+    assert_eq!(own["totals"]["calls"], 1);
+    assert_eq!(own["per_model"].as_array().unwrap().len(), 1);
+    assert_eq!(own["per_model"][0]["model"], "member-model");
+    assert_eq!(own["per_model"][0]["total_tokens"], 101);
+    assert_eq!(own["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(own["tools"][0]["tool"], "read_file");
+    assert_eq!(own["tools"][0]["completed"], 1);
+    assert_eq!(own["tools"][0]["failed"], 1);
+
+    // A member cannot widen the scope; nothing leaks in the error.
+    let denied = app
+        .clone()
+        .oneshot(request_with_token(
+            "GET",
+            "/v1/usage?scope=all",
+            &member_token,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    // An unknown scope is rejected.
+    let bad = app
+        .clone()
+        .oneshot(request(&app, "GET", "/v1/usage?scope=everyone", true, None))
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // The admin sees only their own rows by default and everyone's on request.
+    let admin_own = read_json(
+        app.clone()
+            .oneshot(request(&app, "GET", "/v1/usage", true, None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(admin_own["totals"]["calls"], 1);
+    assert_eq!(admin_own["per_model"][0]["model"], "admin-model");
+    let all = read_json(
+        app.clone()
+            .oneshot(request(&app, "GET", "/v1/usage?scope=all", true, None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(all["scope"], "all");
+    assert_eq!(all["totals"]["calls"], 2);
+    assert_eq!(all["per_model"].as_array().unwrap().len(), 2);
+    assert_eq!(all["tools"].as_array().unwrap().len(), 2);
 }

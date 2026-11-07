@@ -347,11 +347,25 @@ impl ApiClient {
         route: &[&str],
         body: Option<&B>,
     ) -> Result<Zeroizing<Vec<u8>>, ApiError> {
+        self.panel_exchange_query(method, route, &[], body)
+    }
+
+    /// Like [`Self::panel_exchange`], with query parameters (encoded here).
+    pub(super) fn panel_exchange_query<B: Serialize + ?Sized>(
+        &self,
+        method: Method,
+        route: &[&str],
+        query: &[(&str, &str)],
+        body: Option<&B>,
+    ) -> Result<Zeroizing<Vec<u8>>, ApiError> {
         let mut url = self.endpoint.clone();
         url.path_segments_mut()
             .map_err(|_| ApiError::InvalidResponse)?
             .clear()
             .extend(route);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
         let mut request = self
             .client
             .request(method, url)

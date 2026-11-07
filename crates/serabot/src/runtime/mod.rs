@@ -49,6 +49,8 @@ use crate::teams::{
 };
 use crate::util::truncate_chars;
 
+mod activity;
+use activity::StepPhase;
 mod models;
 mod notifier;
 mod prompts;

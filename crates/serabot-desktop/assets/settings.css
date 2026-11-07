@@ -1,0 +1,86 @@
+
+/* Settings page (0.17). Tokens only; nothing here hard-codes a colour. */
+.settings-layout {
+  display: flex;
+  align-items: flex-start;
+  gap: 24px;
+}
+
+.settings-nav {
+  flex: 0 0 180px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  position: sticky;
+  top: 0;
+}
+
+.settings-nav-item {
+  padding: 8px 12px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--label-2);
+  font: inherit;
+  font-size: var(--fs-body-2);
+  text-align: left;
+  cursor: pointer;
+}
+
+.settings-nav-item:hover {
+  background: var(--surface-2);
+  color: var(--label-1);
+}
+
+.settings-nav-item.on {
+  background: var(--active);
+  color: var(--label-1);
+  font-weight: 600;
+}
+
+.settings-content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Text size preference: the root carries data-text. */
+.root[data-text="small"] {
+  --fs-micro: 10px;
+  --fs-caption: 11px;
+  --fs-body-2: 12px;
+  --fs-body: 13px;
+  --fs-msg: 14px;
+}
+
+.root[data-text="large"] {
+  --fs-micro: 12px;
+  --fs-caption: 13px;
+  --fs-body-2: 15px;
+  --fs-body: 16px;
+  --fs-msg: 17px;
+}
+
+/* Reduce motion preference. */
+.root[data-motion="reduce"] *,
+.root[data-motion="reduce"] *::before,
+.root[data-motion="reduce"] *::after {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+}
+
+@media (max-width: 720px) {
+  .settings-layout {
+    flex-direction: column;
+  }
+
+  .settings-nav {
+    flex-direction: row;
+    flex-wrap: wrap;
+    flex-basis: auto;
+    position: static;
+  }
+}
