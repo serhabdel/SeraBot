@@ -43,10 +43,17 @@ pub fn token_help(id: &str) -> Option<TokenHelp> {
             url: TODOIST_HELP_URL,
             hint: "Open Settings, Integrations, Developer and copy your API token.",
         },
+        "slack" => TokenHelp {
+            label: "Bot token",
+            url: SLACK_HELP_URL,
+            hint: "Add the bot scopes channels:read, groups:read, channels:history, groups:history and chat:write, install the app, then invite the bot to each channel.",
+        },
         _ => return None,
     })
 }
 
+/// Where a Slack user creates an app and copies its bot token.
+pub const SLACK_HELP_URL: &str = "https://api.slack.com/apps";
 /// Where a Todoist user finds their API token.
 pub const TODOIST_HELP_URL: &str = "https://app.todoist.com/app/settings/integrations/developer";
 /// Where a GitHub user creates a fine-grained personal access token.
@@ -195,7 +202,7 @@ mod tests {
 
     #[test]
     fn token_connectors_have_fixed_https_help_links() {
-        for id in ["notion", "github", "todoist"] {
+        for id in ["notion", "github", "todoist", "slack"] {
             let help = token_help(id).expect(id);
             assert!(help.url.starts_with("https://"), "{id}");
             assert!(!help.label.is_empty() && !help.hint.is_empty(), "{id}");

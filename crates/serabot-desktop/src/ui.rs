@@ -328,6 +328,7 @@ fn capability_label(tool: &str) -> Option<&'static str> {
         "todoist_list_tasks" | "todoist_add_task" | "todoist_complete_task" => {
             Some("Todoist tasks")
         }
+        "slack_list_channels" | "slack_read_channel" | "slack_post_message" => Some("Slack"),
         "skill_list" | "skill_search" | "skill_load" => Some("Skills"),
         "delegate" => Some("Team handoffs"),
         _ => None,

@@ -120,3 +120,26 @@ not the deprecated v2 endpoints. Todoist API tokens are full account access and
 have no scopes, so keep the write tools behind approval. Task ids are
 validated before any request, listings are capped at 50 per page, and a `403`
 from Todoist is treated as a rejected token (that is how Todoist reports one).
+### Slack
+
+Tools: `slack_list_channels`, `slack_read_channel` (read) and
+`slack_post_message` (write, approval; the approval names the channel and
+thread).
+
+1. Go to <https://api.slack.com/apps> and choose **Create New App**, from
+   scratch, in your workspace.
+2. Under **OAuth & Permissions**, add these **Bot Token Scopes**:
+   `channels:read`, `groups:read`, `channels:history`, `groups:history`,
+   `chat:write`. (Add `chat:write.public` only if the bot should post in
+   channels it has not joined.)
+3. **Install to Workspace**, then copy the **Bot User OAuth Token** (it starts
+   with `xoxb-`) into the Slack card in Connectors. Other token types are
+   refused.
+4. In Slack, invite the bot to each channel it should read or post in
+   (`/invite @your-app`).
+
+Slack reports most errors inside an HTTP 200; the connector maps them to plain
+messages (revoked token, bot not in the channel, missing scope with the scope
+name). Channel ids (`C…` or `G…`) are validated before any request, history is
+capped at 50 messages per call, and posting refuses `@channel`, `@here` and
+`@everyone` mentions and turns link previews off.

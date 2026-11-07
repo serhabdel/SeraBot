@@ -151,6 +151,15 @@ pub const CAPABILITIES: &[Capability] = &[
         ],
     },
     Capability {
+        label: "Read and post in Slack",
+        hint: "Read channels the bot is in. Posting a message asks you first.",
+        tools: &[
+            "slack_list_channels",
+            "slack_read_channel",
+            "slack_post_message",
+        ],
+    },
+    Capability {
         label: "Work with folders on this PC",
         hint: "Read, and with your approval write, folders you allow in Settings.",
         tools: &["local_list", "local_read", "local_write"],
