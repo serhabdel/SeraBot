@@ -2682,6 +2682,19 @@ fn StatusBanner(session: Signal<Session>) -> Element {
             }
         }
     });
+    let link_down = session.read().link_down && !restarting;
+    let link_view = link_down.then(|| {
+        rsx! {
+            div { class: "banner warn", role: "status",
+                span { "Can't reach SeraBot right now. Retrying…" }
+                button {
+                    class: "btn ghost sm",
+                    onclick: move |_| session.write().retry_link(),
+                    "Try again"
+                }
+            }
+        }
+    });
     let restarting_view = restarting.then(|| {
         rsx! {
             div { class: "banner warn",
@@ -2698,6 +2711,7 @@ fn StatusBanner(session: Signal<Session>) -> Element {
         {admin_error_view}
         {admin_notice_view}
         {restarting_view}
+        {link_view}
         {error_view}
         {unknown_view}
         {task_view}

@@ -572,6 +572,11 @@ pub struct Session {
     pub admin_error: Option<String>,
     pub restart_pending: bool,
     pub restarting: bool,
+    /// The connection dropped while signed in: the reconnect banner shows
+    /// and the console retries on its own.
+    pub link_down: bool,
+    link_attempts: u32,
+    link_retry_at: Option<Instant>,
     pub rename: Option<RenameDraft>,
     pub archive_confirm: Option<String>,
     /// Editable copy of the open room's group instructions; synced from the
@@ -773,6 +778,9 @@ impl Session {
             pending_team: None,
             pending_room_refresh: false,
             reconnect_at: None,
+            link_down: false,
+            link_attempts: 0,
+            link_retry_at: None,
             scheduled: None,
             next_request: Instant::now(),
             refreshing: false,
@@ -868,6 +876,47 @@ impl Session {
             && Instant::now() >= self.next_request
     }
 
+    /// The connection dropped or timed out while signed in: show the calm
+    /// banner and plan the next automatic try.
+    pub(crate) fn note_link_down(&mut self) {
+        if self.link_down {
+            self.link_attempts = self.link_attempts.saturating_add(1);
+        } else {
+            self.link_down = true;
+            self.link_attempts = 0;
+        }
+        self.link_retry_at =
+            Some(Instant::now() + crate::net_policy::reconnect_delay(self.link_attempts));
+    }
+
+    /// Any good answer from the server ends the banner.
+    pub(crate) fn link_recovered(&mut self) {
+        if self.link_down {
+            self.link_down = false;
+            self.link_attempts = 0;
+            self.link_retry_at = None;
+            self.state.error = None;
+        }
+    }
+
+    /// Try the server again now ("Try again", or the automatic timer): the
+    /// polling that the failure paused resumes and a cheap read probes it.
+    /// The banner stays up until something answers.
+    pub fn retry_link(&mut self) {
+        if !self.state.connected || self.pending.is_some() {
+            return;
+        }
+        self.link_retry_at =
+            Some(Instant::now() + crate::net_policy::reconnect_delay(self.link_attempts));
+        self.poll_paused = false;
+        self.refreshing = false;
+        self.next_request = Instant::now();
+        if !self.state.unknown_outcome {
+            self.state.error = None;
+        }
+        self.schedule(Operation::History, Duration::ZERO);
+    }
+
     pub fn connect_now(&mut self) {
         let endpoint = match crate::validate_endpoint(self.server.trim()) {
             Ok(endpoint) => endpoint,
@@ -930,6 +979,9 @@ impl Session {
         self.pending = None;
         self.bot_detail_pending = None;
         self.bot_config_pending = None;
+        self.link_down = false;
+        self.link_attempts = 0;
+        self.link_retry_at = None;
         self.scheduled = None;
         self.refreshing = false;
         self.poll_history = false;
@@ -2354,6 +2406,12 @@ impl Session {
         self.poll_launches();
         self.hydrate_bot_settings();
         self.pump_panel();
+        if self.link_down
+            && self.pending.is_none()
+            && self.link_retry_at.is_some_and(|at| Instant::now() >= at)
+        {
+            self.retry_link();
+        }
         if let Some(at) = self.reconnect_at {
             if Instant::now() >= at {
                 self.reconnect_at = None;
@@ -2653,8 +2711,19 @@ impl Session {
                 Err(error) => {
                     self.usage_loading = false;
                     let message = error.to_string();
+                    let sign_in_message = error.sign_in_text();
                     let rate_limited = error == ApiError::Http(429);
+                    let dropped = error.is_transport();
                     self.state.fail(&completion.scope, completion.kind, error);
+                    if dropped && self.state.connected {
+                        // A dropped connection is one calm banner with a
+                        // retry button, not an error in every panel. An
+                        // unknown write outcome keeps its own warning.
+                        self.note_link_down();
+                        if !self.state.unknown_outcome {
+                            self.state.error = None;
+                        }
+                    }
                     self.refreshing = false;
                     self.scheduled = None;
                     self.poll_paused = true;
@@ -2732,7 +2801,9 @@ impl Session {
                         _ => {}
                     }
                     if !self.state.connected {
-                        self.connect_error = Some(message);
+                        // The sign-in and server screen is where the address,
+                        // certificate and tunnel hint helps.
+                        self.connect_error = Some(sign_in_message);
                         self.restarting = false;
                     }
                     if rate_limited {
@@ -2742,6 +2813,7 @@ impl Session {
                 }
                 Ok(reply) => {
                     self.rate_attempts = 0;
+                    self.link_recovered();
                     if let Reply::Artifact {
                         filename, bytes, ..
                     } = reply
@@ -4674,5 +4746,64 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(session.toast.as_deref(), Some("launched"));
+    }
+
+    fn plain_session() -> Session {
+        Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None)
+    }
+
+    #[test]
+    fn a_dropped_connection_shows_one_banner_and_recovers() {
+        let mut session = plain_session();
+        assert!(!session.link_down);
+        session.note_link_down();
+        assert!(session.link_down);
+        let first = session.link_retry_at.unwrap();
+        session.note_link_down();
+        assert_eq!(session.link_attempts, 1);
+        assert!(session.link_retry_at.unwrap() > first);
+        session.state.error = Some("old".into());
+        session.link_recovered();
+        assert!(!session.link_down && session.link_retry_at.is_none());
+        assert!(session.state.error.is_none());
+        // The calm text is for panels; the long hint is for sign-in only.
+        assert!(ApiError::Transport.to_string().contains("Retrying"));
+        assert!(!ApiError::Transport.to_string().contains("TLS"));
+        assert!(ApiError::Transport.sign_in_text().contains("TLS"));
+    }
+
+    #[test]
+    fn ability_switches_are_part_of_the_draft_and_closing_asks() {
+        let mut session = plain_session();
+        session.bot_settings.open = true;
+        session.bot_settings.hydrated = true;
+        session.bot_settings.bot = Some("analyst".into());
+        // Nothing edited: closing is immediate.
+        session.request_close_bot_settings();
+        assert!(!session.bot_settings.open);
+
+        session.bot_settings.open = true;
+        let index = crate::capabilities::CAPABILITIES
+            .iter()
+            .position(|c| c.label == "Remember things for you")
+            .unwrap();
+        session.toggle_draft_capability(index, true);
+        assert!(session.bot_settings.dirty());
+        assert!(
+            session
+                .bot_settings
+                .draft
+                .tools
+                .contains(&"memory_save".to_owned())
+        );
+        // Closing with edits asks instead of closing.
+        session.request_close_bot_settings();
+        assert!(session.bot_settings.open && session.bot_settings.confirm_close);
+        session.keep_editing_bot_settings();
+        assert!(!session.bot_settings.confirm_close && session.bot_settings.dirty());
+        // Cancel / Discard reverts the abilities too and closes.
+        session.cancel_bot_settings();
+        assert!(session.bot_settings.draft.tools.is_empty());
+        assert!(!session.bot_settings.dirty() && !session.bot_settings.open);
     }
 }

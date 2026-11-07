@@ -678,6 +678,44 @@ mod tests {
         assert!(registry.load(&admin).is_ok());
     }
 
+    /// A tool change written to a bot is what the very next turn loads: the
+    /// turn loop reads the fleet on every step, so once the API invalidates
+    /// after a write nothing stale can stay cached per conversation.
+    #[test]
+    fn a_tool_change_is_seen_by_the_next_load_after_invalidate() {
+        let store = Store::open_in_memory(384).unwrap();
+        let member = member(&store);
+        let registry = registry(&store, config());
+        let before = registry.load(&member).unwrap();
+        assert!(before.get("analyst").unwrap().config.tools.is_empty());
+
+        let row = store.get_bot(&member, "analyst").unwrap().unwrap();
+        let mut config = row.config.clone();
+        config["tools"] = serde_json::json!(["memory_save", "local_list"]);
+        assert!(
+            store
+                .update_bot(&member, "analyst", &config, &row.prompt, true)
+                .unwrap()
+        );
+        // Without invalidate the cache still answers; the API always calls it.
+        assert!(
+            registry
+                .load(&member)
+                .unwrap()
+                .get("analyst")
+                .unwrap()
+                .config
+                .tools
+                .is_empty()
+        );
+        registry.invalidate(&member);
+        let after = registry.load(&member).unwrap();
+        assert_eq!(
+            after.get("analyst").unwrap().config.tools,
+            vec!["memory_save".to_owned(), "local_list".to_owned()]
+        );
+    }
+
     #[test]
     fn admin_overlay_applies_only_to_the_admin() {
         let store = Store::open_in_memory(384).unwrap();

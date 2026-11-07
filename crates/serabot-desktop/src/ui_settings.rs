@@ -87,8 +87,34 @@ pub fn SettingsPanel(session: Signal<Session>, overlay: Signal<Overlay>) -> Elem
                     class: "icon-btn",
                     title: "Close",
                     "aria-label": "Close settings",
-                    onclick: move |_| session.write().close_bot_settings(),
+                    onclick: move |_| session.write().request_close_bot_settings(),
                     Icon { name: "x", size: 16 }
+                }
+            }
+            if open && session.read().bot_settings.confirm_close {
+                div { class: "settings-confirm", role: "alertdialog", "aria-label": "Save changes?",
+                    span { class: "settings-confirm-title", "Save changes?" }
+                    span { class: "caption", "You changed this bot. Save before closing?" }
+                    div { class: "row",
+                        button {
+                            class: "btn primary sm",
+                            r#type: "button",
+                            onclick: move |_| session.write().save_and_close_bot_settings(),
+                            "Save"
+                        }
+                        button {
+                            class: "btn sm",
+                            r#type: "button",
+                            onclick: move |_| session.write().cancel_bot_settings(),
+                            "Discard"
+                        }
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            onclick: move |_| session.write().keep_editing_bot_settings(),
+                            "Keep editing"
+                        }
+                    }
                 }
             }
             if bot_id.is_some() || is_room {
@@ -116,8 +142,8 @@ pub fn SettingsPanel(session: Signal<Session>, overlay: Signal<Overlay>) -> Elem
     }
 }
 
-/// The bot's form. Picture and abilities save the moment they change; the
-/// rest waits for Save.
+/// The bot's form. The picture saves the moment it changes; everything else,
+/// the abilities included, waits for Save.
 #[component]
 fn BotForm(session: Signal<Session>, id: String) -> Element {
     let mut session = session;
@@ -321,7 +347,7 @@ fn BotForm(session: Signal<Session>, id: String) -> Element {
                 div { class: "field",
                     span { class: "field-label", "What it can do" }
                     CapabilityToggles { session, bot: id.clone() }
-                    span { class: "hint", "Changes here are saved right away." }
+                    span { class: "hint", "Press Save to apply. The bot uses the new abilities from its next message." }
                 }
                 SkillsSection { session, id: id.clone() }
                 AdvancedSection { session, id: id.clone() }

@@ -167,6 +167,9 @@ pub struct BotSettingsUpdate {
     pub model: Option<Option<ModelPick>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browser_profile: Option<Option<String>>,
+    /// The bot's tool ids (the capability switches).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
 }
 
 impl BotSettingsUpdate {
@@ -218,6 +221,9 @@ pub fn validate_bot_settings(update: &BotSettingsUpdate) -> Result<(), ApiError>
         return Err(ApiError::Validation(
             "Pick a browser profile from the list.",
         ));
+    }
+    if let Some(tools) = &update.tools {
+        validate_tool_list(tools)?;
     }
     Ok(())
 }
@@ -523,8 +529,14 @@ mod tests {
             })),
             browser_profile: Some(Some("work".into())),
             enabled: None,
+            tools: Some(vec!["vault_list".into()]),
         };
         assert!(validate_bot_settings(&ok).is_ok());
+        let bad_tools = BotSettingsUpdate {
+            tools: Some(vec!["delegate".into()]),
+            ..BotSettingsUpdate::default()
+        };
+        assert!(validate_bot_settings(&bad_tools).is_err());
         let bad_name = BotSettingsUpdate {
             display_name: Some("  ".into()),
             ..Default::default()

@@ -249,6 +249,7 @@ impl ApiClient {
         let response = self
             .client
             .put(url)
+            .timeout(crate::net_policy::WRITE_TIMEOUT)
             .bearer_auth(self.token.expose_secret())
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(bytes.to_vec())
