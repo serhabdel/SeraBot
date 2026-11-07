@@ -6,6 +6,9 @@ pub(super) struct MessageRequest {
     text: String,
     #[serde(default)]
     bot: Option<String>,
+    /// Ids returned by `POST /v1/conversations/{id}/attachments`.
+    #[serde(default)]
+    attachments: Vec<String>,
 }
 
 pub(super) async fn send_message(
@@ -14,11 +17,12 @@ pub(super) async fn send_message(
     Json(request): Json<MessageRequest>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&request.conversation_id)?;
-    let task = state.runtime.submit_text(
+    let task = state.runtime.submit_text_attached(
         &user.id,
         &request.conversation_id,
         &request.text,
         request.bot.as_deref(),
+        &request.attachments,
     )?;
     Ok(Json(json!({"task": task_view(&task)})))
 }

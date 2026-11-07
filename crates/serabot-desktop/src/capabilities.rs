@@ -130,6 +130,11 @@ pub const CAPABILITIES: &[Capability] = &[
         ],
     },
     Capability {
+        label: "Work with folders on this PC",
+        hint: "Read, and with your approval write, folders you allow in Settings.",
+        tools: &["local_list", "local_read", "local_write"],
+    },
+    Capability {
         label: "Send files to Telegram",
         hint: "Share finished files in your Telegram chat.",
         tools: &["telegram_send_document"],

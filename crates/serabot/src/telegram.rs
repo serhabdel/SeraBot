@@ -1492,7 +1492,7 @@ fn user_scope_segment(user_id: &str) -> Result<String> {
 
 /// A filename that is safe to join under the inbox: ASCII letters, digits,
 /// dot, dash, and underscore only, at most 120 characters.
-fn safe_upload_name(name: &str) -> String {
+pub(crate) fn safe_upload_name(name: &str) -> String {
     let base = std::path::Path::new(name)
         .file_name()
         .and_then(|value| value.to_str())

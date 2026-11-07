@@ -12,6 +12,7 @@ pub mod composio_flow;
 pub mod connector_card;
 pub mod creds;
 pub mod events;
+pub mod local_folders;
 pub mod oauth;
 pub mod panel;
 pub mod provider_presets;

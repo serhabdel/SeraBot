@@ -57,6 +57,8 @@ mod browser;
 mod composio;
 mod connectors;
 mod conversations;
+mod files;
+mod local;
 mod memories;
 mod messages;
 mod profiles;
@@ -161,6 +163,8 @@ pub struct ApiState {
     /// Model call behind the onboarding interview; None uses the runtime.
     /// Tests script it so no request leaves the process.
     onboarding_drafter: Option<Arc<dyn crate::onboarding::Drafter>>,
+    /// Desktop relay for the local folder tools (0.18).
+    local: Arc<crate::local_relay::LocalRelay>,
 }
 
 impl ApiState {
@@ -211,8 +215,16 @@ impl ApiState {
             oauth_inflight: Arc::default(),
             browser: None,
             onboarding_drafter: None,
+            local: crate::local_relay::LocalRelay::new(),
             config,
         })
+    }
+
+    /// Share the relay the local folder tools use, so the desktop's polls
+    /// reach the same queue as the tools' calls.
+    pub fn with_local_relay(mut self, local: Arc<crate::local_relay::LocalRelay>) -> Self {
+        self.local = local;
+        self
     }
 
     /// Share the per-user connector service the tools already use, so a
@@ -436,6 +448,8 @@ pub fn router(state: ApiState) -> Router {
     let protected = protected
         .merge(audio)
         .merge(profiles::routes())
+        .merge(files::routes())
+        .merge(local::routes())
         .layer(middleware::from_fn_with_state(shared.clone(), rate_limit))
         .layer(middleware::from_fn_with_state(shared.clone(), authorize));
     crate::web::router()

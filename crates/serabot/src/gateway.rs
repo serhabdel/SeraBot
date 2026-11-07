@@ -45,6 +45,7 @@ pub const DESTRUCTIVE_TOOLS: &[&str] = &[
     "agentmail_send",
     "telegram_send_document",
     "onedrive_upload",
+    "local_write",
 ];
 
 /// Audit reason recorded when the owner's YOLO setting approved a call.
@@ -1766,6 +1767,7 @@ mod tests {
             "agentmail_send",
             "telegram_send_document",
             "onedrive_upload",
+            "local_write",
         ] {
             assert!(is_destructive_tool(name), "{name}");
         }

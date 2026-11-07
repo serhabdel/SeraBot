@@ -87,6 +87,9 @@ pub struct TurnPayload {
     /// and never routed to bots that are not room team members.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mentions: Vec<String>,
+    /// Chat attachment ids (already validated as the owner's) for this turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

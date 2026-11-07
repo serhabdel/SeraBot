@@ -10,6 +10,7 @@ use tower::ServiceExt;
 
 mod browser_api;
 mod chat_api;
+mod files_api;
 mod personal_api;
 mod profiles_api;
 mod vault_http;

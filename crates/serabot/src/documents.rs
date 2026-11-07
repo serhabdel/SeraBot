@@ -449,6 +449,15 @@ async fn extract_pages(kind: DocumentKind, bytes: Vec<u8>) -> Result<Vec<PageTex
     }
 }
 
+/// Plain text of a digital PDF (all pages joined), for chat attachments.
+pub fn extract_pdf_text(bytes: Vec<u8>) -> Result<String> {
+    Ok(extract_pdf_pages(bytes)?
+        .into_iter()
+        .map(|page| page.text)
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 fn extract_pdf_pages(bytes: Vec<u8>) -> Result<Vec<PageText>> {
     let document = catch_unwind(AssertUnwindSafe(|| lopdf::Document::load_mem(&bytes)))
         .map_err(|_| {

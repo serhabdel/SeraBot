@@ -1,0 +1,84 @@
+/* Chat files (0.18): attachment chips and media cards. Tokens only. */
+.file-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.file-chips.composer-files {
+  margin: 0 0 6px;
+  padding: 0 4px;
+}
+
+.file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 260px;
+  padding: 3px 8px;
+  border-radius: var(--r-md);
+  background: var(--card-bg);
+  border: 1px solid var(--glass-edge);
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+}
+
+.file-chip.pending {
+  font-style: italic;
+}
+
+.file-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-chip-size {
+  opacity: 0.7;
+}
+
+.file-chip-x {
+  display: inline-flex;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+}
+
+.media-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0;
+}
+
+.media-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  background: var(--card-bg);
+  border: 1px solid var(--glass-edge);
+}
+
+.media-card-copy {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.media-card-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--label);
+}
+
+.media-card-meta {
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+}

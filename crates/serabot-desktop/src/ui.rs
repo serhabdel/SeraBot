@@ -22,9 +22,10 @@ use crate::ui_bots::{NewBotSheet, NewGroupSheet, OnboardingView};
 use crate::ui_browser::BrowserView;
 use crate::ui_connectors::ConnectorsView;
 use crate::ui_dock::BrowserDock;
+use crate::ui_files::{ComposerFiles, MediaCards, MessageFiles};
 use crate::ui_settings::SettingsPanel;
 use crate::ui_settings_page::{
-    AboutCard, AppearanceCard, ChatPrefsCard, NotificationsCard, SettingsNav,
+    AboutCard, AppearanceCard, ChatPrefsCard, LocalFoldersCard, NotificationsCard, SettingsNav,
 };
 use crate::ui_usage::UsagePage;
 use crate::ui_vault::VaultPage;
@@ -35,7 +36,8 @@ const SYSTEM_THEME_JS: &str = "const m = window.matchMedia('(prefers-color-schem
 /// Styles of the 0.17 usage and settings pages, kept apart from app.css.
 const CSS_PAGES: &str = concat!(
     include_str!("../assets/usage.css"),
-    include_str!("../assets/settings.css")
+    include_str!("../assets/settings.css"),
+    include_str!("../assets/files.css")
 );
 
 /// A chat row: id, owner flag, speaker, avatar, bot, time, body, peer flag.
@@ -2785,6 +2787,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     };
     let chat_plan = session.read().state.plan.clone();
     let composer = session.read().composer.clone();
+    let has_files = !session.read().composer_files.is_empty();
     let can_send = session.read().state.can_send();
     let accepts = session.read().conversation_accepts_turns();
     let (active_bot, active_name, active_avatar, roster) = {
@@ -3053,10 +3056,15 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 }
                                 div { class: "msg-body", title: "{stamp}",
                                     MarkdownBody { content: content.clone() }
+                                    if user {
+                                        MessageFiles { session, id: id.clone() }
+                                    }
                                 }
                             }
                         }
                     }
+                    // Files the bots produced in this chat (Open / Save as).
+                    MediaCards { session }
                     // What the bot is doing right now, in plain words: a
                     // shimmer while it thinks, one row per step, and a small
                     // "N steps" summary once the reply has landed.
@@ -3091,6 +3099,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                         div { class: "banner err", span { "{message}" } }
                     }
                     div { class: "composer",
+                        ComposerFiles { session }
                         textarea {
                             class: "composer-input",
                             id: "composer-input",
@@ -3262,19 +3271,19 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     },
                                     Icon { name: if recording() { "check" } else { "mic" }, size: 16 }
                                 }
-                                // TODO(desktop-features): attachments need `session::Session::attach_file(&mut self, path: String) -> Option<String>` — the client has no inbox upload path yet, so the button stays disabled.
                                 button {
                                     class: "composer-mic",
-                                    title: "Attachments are not available yet",
-                                    "aria-label": "Attachments are not available yet",
-                                    disabled: true,
+                                    title: "Attach files (images, PDF, Office, text; up to 25 MB)",
+                                    "aria-label": "Attach files",
+                                    disabled: !accepts,
+                                    onclick: move |_| session.write().pick_attachments(),
                                     Icon { name: "paperclip", size: 16 }
                                 }
                                 button {
                                     class: "btn primary send-btn",
                                     title: "Send",
                                     "aria-label": "Send message",
-                                    disabled: !can_send || composer.trim().is_empty(),
+                                    disabled: !can_send || (composer.trim().is_empty() && !has_files),
                                     onclick: move |_| session.write().submit(),
                                     Icon { name: "send", size: 16 }
                                 }
@@ -5435,6 +5444,9 @@ fn SettingsView(session: Signal<Session>) -> Element {
         }
         if sel == SettingsSection::Chat {
             ChatPrefsCard { session }
+        }
+        if sel == SettingsSection::LocalFolders {
+            LocalFoldersCard { session }
         }
         if sel == SettingsSection::About {
             AboutCard { session }

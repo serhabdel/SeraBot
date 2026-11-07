@@ -720,6 +720,9 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "agentmail_send",
         "onedrive_upload",
         "onedrive_list",
+        "local_list",
+        "local_read",
+        "local_write",
     ];
     #[cfg(feature = "docx")]
     names.extend([
