@@ -47,26 +47,39 @@ const OFFICIAL_CATALOGS: &[OfficialCatalog] = &[
         kind: "mistral",
         host: "api.mistral.ai",
         path: "/v1/models",
+        strict: true,
     },
     OfficialCatalog {
         kind: "deepseek",
         host: "api.deepseek.com",
         path: "/models",
+        strict: true,
     },
     OfficialCatalog {
         kind: "minimax",
         host: "api.minimax.io",
         path: "/v1/models",
+        strict: true,
     },
     OfficialCatalog {
         kind: "minimax-cn",
         host: "api.minimaxi.com",
         path: "/v1/models",
+        strict: true,
     },
     OfficialCatalog {
         kind: "muse-code",
         host: "api.meta.ai",
         path: "/v1/models",
+        strict: true,
+    },
+    // Perplexity chats on the host root but lists models under /v1; its list
+    // shape is not pinned, so the looser parser applies.
+    OfficialCatalog {
+        kind: "perplexity",
+        host: "api.perplexity.ai",
+        path: "/v1/models",
+        strict: false,
     },
 ];
 
@@ -74,6 +87,8 @@ struct OfficialCatalog {
     kind: &'static str,
     host: &'static str,
     path: &'static str,
+    /// Whether the list shape is pinned (`{object:"list", data:[...]}`).
+    strict: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +177,36 @@ const BUILTINS: &[BuiltinProvider] = &[
         base_url: Some("https://api.moonshot.ai/v1"),
         auth: "api_key",
         summary: "Moonshot OpenAI-compatible chat",
+    },
+    BuiltinProvider {
+        kind: "gemini",
+        base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai"),
+        auth: "api_key",
+        summary: "Google Gemini API, OpenAI-compatible endpoint; catalog GET {base}/models",
+    },
+    BuiltinProvider {
+        kind: "perplexity",
+        base_url: Some("https://api.perplexity.ai"),
+        auth: "api_key",
+        summary: "Perplexity Sonar chat; catalog GET https://api.perplexity.ai/v1/models",
+    },
+    BuiltinProvider {
+        kind: "huggingface",
+        base_url: Some("https://router.huggingface.co/v1"),
+        auth: "api_key",
+        summary: "Hugging Face Inference Providers router; catalog GET {base}/models",
+    },
+    BuiltinProvider {
+        kind: "nebius",
+        base_url: Some("https://api.tokenfactory.nebius.com/v1"),
+        auth: "api_key",
+        summary: "Nebius Token Factory; catalog GET {base}/models",
+    },
+    BuiltinProvider {
+        kind: "sambanova",
+        base_url: Some("https://api.sambanova.ai/v1"),
+        auth: "api_key",
+        summary: "SambaNova Cloud; catalog GET {base}/models",
     },
     BuiltinProvider {
         kind: "muse-code",
@@ -355,7 +400,7 @@ pub fn resolve_catalog(kind: &str, base_url: &str) -> Result<ResolvedCatalog> {
         if is_exact_loopback(&parsed) {
             return Ok(ResolvedCatalog {
                 url: validate_base_url(&format!("{base}/models"))?,
-                strict: true,
+                strict: spec.strict,
             });
         }
         let host = parsed.host_str().unwrap_or("");
@@ -366,7 +411,7 @@ pub fn resolve_catalog(kind: &str, base_url: &str) -> Result<ResolvedCatalog> {
         }
         return Ok(ResolvedCatalog {
             url: validate_base_url(&format!("https://{}{}", spec.host, spec.path))?,
-            strict: true,
+            strict: spec.strict,
         });
     }
     Ok(ResolvedCatalog {
@@ -1169,6 +1214,11 @@ mod tests {
             "groq",
             "openrouter",
             "google-antigravity",
+            "gemini",
+            "perplexity",
+            "huggingface",
+            "nebius",
+            "sambanova",
         ] {
             assert!(kinds.contains(&kind), "{kind}");
         }
@@ -1200,6 +1250,54 @@ mod tests {
             enforce_oauth_target(OAuthStyle::MuseMint, "https://evil.example/muse-code/key")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn new_provider_kinds_resolve_documented_bases_and_catalog_urls() {
+        for (kind, base, catalog, strict) in [
+            (
+                "gemini",
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+                "https://generativelanguage.googleapis.com/v1beta/openai/models",
+                false,
+            ),
+            (
+                "huggingface",
+                "https://router.huggingface.co/v1",
+                "https://router.huggingface.co/v1/models",
+                false,
+            ),
+            (
+                "nebius",
+                "https://api.tokenfactory.nebius.com/v1",
+                "https://api.tokenfactory.nebius.com/v1/models",
+                false,
+            ),
+            (
+                "sambanova",
+                "https://api.sambanova.ai/v1",
+                "https://api.sambanova.ai/v1/models",
+                false,
+            ),
+            (
+                "perplexity",
+                "https://api.perplexity.ai",
+                "https://api.perplexity.ai/v1/models",
+                false,
+            ),
+        ] {
+            assert_eq!(resolve_base_url(kind, "").unwrap(), base, "{kind}");
+            let resolved = resolve_catalog(kind, base).unwrap();
+            assert_eq!(resolved.url, catalog, "{kind}");
+            assert_eq!(resolved.strict, strict, "{kind}");
+            assert!(matches!(auth_plan(kind, "").unwrap(), AuthPlan::ApiKey));
+        }
+        // Perplexity only contacts its own host for the list.
+        assert!(resolve_catalog("perplexity", "https://evil.example").is_err());
+        // An Ollama-style server is a custom OpenAI-compatible endpoint on
+        // exact loopback; any other plain-http host is refused.
+        assert!(resolve_base_url("openai-compatible", "http://127.0.0.1:11434/v1").is_ok());
+        assert!(resolve_base_url("openai-compatible", "http://192.168.1.5:11434/v1").is_err());
     }
 
     #[test]
