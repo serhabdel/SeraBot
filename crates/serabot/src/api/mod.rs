@@ -167,6 +167,8 @@ pub struct ApiState {
     onboarding_drafter: Option<Arc<dyn crate::onboarding::Drafter>>,
     /// Desktop relay for the local folder tools (0.18).
     local: Arc<crate::local_relay::LocalRelay>,
+    /// Host sampler and cached storage scan behind GET /v1/admin/status.
+    sys_status: Arc<crate::sysstatus::StatusMonitor>,
 }
 
 impl ApiState {
@@ -223,6 +225,7 @@ impl ApiState {
             browser: None,
             onboarding_drafter: None,
             local: crate::local_relay::LocalRelay::new(),
+            sys_status: Arc::new(crate::sysstatus::StatusMonitor::new()),
             config,
         })
     }
@@ -263,6 +266,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
         .route("/v1/usage", get(usage))
+        .route("/v1/admin/status", get(admin_status))
         .route("/v1/browser", get(browser_status))
         .route("/v1/browser/screenshot", get(browser_screenshot))
         .route("/v1/browser/takeover", post(browser_takeover))

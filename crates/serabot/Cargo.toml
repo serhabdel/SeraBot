@@ -72,6 +72,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sqlite-vec = "0.1.9"
+# Server health for the owner's Usage tab: process/host memory, CPU and disk.
+# Only the system and disk readers; no network, component or user lists.
+sysinfo = { version = "0.37", default-features = false, features = ["system", "disk"] }
 subtle = "2"
 text-splitter = "0.16"
 thiserror = "2"
