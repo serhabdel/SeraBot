@@ -1578,3 +1578,55 @@ fn bot_settings_save_sends_only_what_changed_and_null_for_defaults() {
         serde_json::json!({"model":null,"browser_profile":null})
     );
 }
+
+/// Reads one request and keeps the body as raw bytes (the shared helper
+/// decodes text only).
+fn raw_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut bytes = Vec::new();
+    let mut buf = [0; 4096];
+    loop {
+        let n = stream.read(&mut buf).unwrap();
+        assert!(n > 0);
+        bytes.extend_from_slice(&buf[..n]);
+        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&bytes[..end]).to_string();
+            let length = head
+                .to_lowercase()
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: ").map(str::to_owned))
+                .map(|s| s.parse::<usize>().unwrap())
+                .unwrap_or(0);
+            if bytes.len() >= end + 4 + length {
+                return (head, bytes[end + 4..end + 4 + length].to_vec());
+            }
+        }
+    }
+}
+
+#[test]
+fn bot_avatar_upload_sends_the_raw_image_bytes_to_the_avatar_route() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let captured = raw_request(&mut stream);
+        let body = r#"{"avatar":{"bot":"recruiter","version":"v1"}}"#;
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        captured
+    });
+    let client = ApiClient::new(
+        validate_endpoint(&url).unwrap(),
+        SecretString::new(TOKEN.into()),
+    )
+    .unwrap();
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    png.extend((0..5000u32).map(|i| (i % 251) as u8));
+    client.set_bot_avatar("recruiter", &png).unwrap();
+    let (head, body) = handle.join().unwrap();
+    assert!(head.starts_with("PUT /v1/bots/recruiter/avatar "), "{head}");
+    assert!(head.to_lowercase().contains("authorization: bearer "));
+    assert_eq!(body, png);
+}

@@ -8,7 +8,7 @@ use crate::ui::{Icon, Overlay, avatar_style, group_avatar_style, human_model, hu
 use dioxus::prelude::*;
 use serabot_desktop::capabilities;
 use serabot_desktop::session::{ImageSlot, Session};
-use serabot_desktop::{MAX_AVATAR_UPLOAD_BYTES, MAX_TEAM_MEMBERS, preview_id};
+use serabot_desktop::{AVATAR_FILE_ACCEPT, MAX_AVATAR_UPLOAD_BYTES, MAX_TEAM_MEMBERS, preview_id};
 
 /// Choose an image from disk. The bytes are read off the UI event and handed
 /// to `on_pick`; the session checks the type and size.
@@ -37,7 +37,7 @@ pub fn AvatarPicker(
                         input {
                             class: "file-input",
                             "type": "file",
-                            accept: "image/png,image/jpeg,image/webp",
+                            accept: AVATAR_FILE_ACCEPT,
                             "aria-label": "{label}",
                             onchange: move |event| {
                                 let files = event.files();
