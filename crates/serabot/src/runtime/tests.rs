@@ -119,12 +119,27 @@ impl Respond for Sequence {
 struct Capture {
     texts: Mutex<Vec<String>>,
     approvals: Mutex<Vec<String>>,
+    late: Mutex<Option<LateMark>>,
+}
+
+impl Capture {
+    /// Fire the late stop mark at the matching notifier event.
+    fn fire_late_mark(&self, at_approval: bool) {
+        let guard = self.late.lock().unwrap();
+        if let Some(late) = guard.as_ref()
+            && late.at_approval == at_approval
+            && let Some(turn) = late.turn.lock().unwrap().clone()
+        {
+            late.runtime.stop_requests.lock().unwrap().insert(turn);
+        }
+    }
 }
 
 #[async_trait]
 impl Notifier for Capture {
     async fn send_text(&self, _user_id: &str, _conversation_id: &str, text: &str) -> Result<()> {
         self.texts.lock().unwrap().push(text.to_owned());
+        self.fire_late_mark(false);
         Ok(())
     }
 
@@ -138,6 +153,7 @@ impl Notifier for Capture {
             .lock()
             .unwrap()
             .push(notice.approval.id.clone());
+        self.fire_late_mark(true);
         Ok(())
     }
 }
@@ -1922,4 +1938,135 @@ async fn stop_from_another_user_does_not_touch_the_turn() {
     );
     let turn = store.get_turn_by_task(&owner, &task.id).unwrap().unwrap();
     assert_eq!(turn.status, "completed");
+}
+
+/// Responds like `reply`, and records which turn was active for the call so
+/// a test can name that turn to a late stop.
+struct CaptureTurn {
+    runtime: Runtime,
+    user: String,
+    conversation: String,
+    turn: Arc<Mutex<Option<String>>>,
+    reply: Value,
+}
+
+impl Respond for CaptureTurn {
+    fn respond(&self, _request: &MockRequest) -> ResponseTemplate {
+        let active = self
+            .runtime
+            .store()
+            .running_turn_ids(&self.user, &self.conversation)
+            .unwrap();
+        *self.turn.lock().unwrap() = active.into_iter().next();
+        ResponseTemplate::new(200).set_body_json(self.reply.clone())
+    }
+}
+
+/// Marks the captured turn stopped at a chosen notifier event, which is the
+/// window after the turn's last stop checkpoint.
+struct LateMark {
+    runtime: Runtime,
+    turn: Arc<Mutex<Option<String>>>,
+    at_approval: bool,
+}
+
+#[tokio::test]
+async fn late_stop_after_the_last_checkpoint_leaves_no_mark() {
+    let server = MockServer::start().await;
+    let notifier = Arc::new(Capture::default());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (runtime, store) = setup(&server.uri(), notifier.clone(), calls);
+    let owner = admin(&store);
+    let turn = Arc::new(Mutex::new(None));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(CaptureTurn {
+            runtime: runtime.clone(),
+            user: owner.clone(),
+            conversation: "owner".into(),
+            turn: turn.clone(),
+            reply: bonjour_reply(),
+        })
+        .mount(&server)
+        .await;
+    // The stop lands while the reply is being delivered, after the checkpoint.
+    *notifier.late.lock().unwrap() = Some(LateMark {
+        runtime: runtime.clone(),
+        turn: turn.clone(),
+        at_approval: false,
+    });
+    runtime.submit_text(&owner, "owner", "salut", None).unwrap();
+    let task = store.claim_task("test", 30).unwrap().unwrap();
+    runtime.process_task(task.clone()).await.unwrap();
+
+    assert_eq!(
+        notifier.texts.lock().unwrap().as_slice(),
+        ["bonjour".to_string()]
+    );
+    let turn_row = store.get_turn_by_task(&owner, &task.id).unwrap().unwrap();
+    assert_eq!(turn_row.status, "completed");
+    assert!(runtime.stop_requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn stop_mark_before_an_approval_pause_does_not_end_the_resumed_turn() {
+    let server = MockServer::start().await;
+    let notifier = Arc::new(Capture::default());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (runtime, store) = setup(&server.uri(), notifier.clone(), calls.clone());
+    let owner = admin(&store);
+    let turn = Arc::new(Mutex::new(None));
+    let tool_call = upload_then_reply_server_responses().remove(0);
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(CaptureTurn {
+            runtime: runtime.clone(),
+            user: owner.clone(),
+            conversation: "owner".into(),
+            turn: turn.clone(),
+            reply: tool_call,
+        })
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(Sequence::new(vec![serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "delivered"}, "finish_reason": "stop"}]
+        })]))
+        .mount(&server)
+        .await;
+    // A stop mark lands as the approval is requested, just before the pause.
+    *notifier.late.lock().unwrap() = Some(LateMark {
+        runtime: runtime.clone(),
+        turn: turn.clone(),
+        at_approval: true,
+    });
+    runtime
+        .submit_text(&owner, "owner", "deliver it", None)
+        .unwrap();
+    let task = store.claim_task("test", 30).unwrap().unwrap();
+    runtime.process_task(task).await.unwrap();
+
+    // The pause clears the mark, so the turn is not stopped when it resumes.
+    assert!(runtime.stop_requests.lock().unwrap().is_empty());
+    let approvals = store.list_pending_approvals(&owner, 10).unwrap();
+    assert_eq!(approvals.len(), 1);
+    runtime
+        .handle_approval(&owner, &approvals[0].id, Decision::Once)
+        .await
+        .unwrap();
+    let resume = store.claim_task("test", 30).unwrap().unwrap();
+    runtime.process_task(resume).await.unwrap();
+
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        notifier
+            .texts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|text| text == "delivered")
+    );
+    assert!(runtime.stop_requests.lock().unwrap().is_empty());
 }

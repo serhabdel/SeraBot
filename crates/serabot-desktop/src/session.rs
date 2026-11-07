@@ -904,6 +904,7 @@ impl Session {
         // Attachments belong to the conversation they were uploaded to.
         self.composer_files.clear();
         self.attach_notice = None;
+        self.stop_queued = false;
         self.upload_queue.clear();
         self.uploading = false;
         self.pending = None;
@@ -2127,6 +2128,29 @@ impl Session {
         }
     }
 
+    /// Files and bytes the draft already holds, uploaded or queued. Used to
+    /// admit a drop before any of its bytes are read.
+    pub fn attachments_held(&self) -> crate::chat_compose::Held {
+        crate::chat_compose::Held {
+            count: self.composer_files.len() + self.upload_queue.len(),
+            bytes: self
+                .composer_files
+                .iter()
+                .map(|file| file.size_bytes)
+                .sum::<u64>()
+                + self
+                    .upload_queue
+                    .iter()
+                    .map(|(_, bytes)| bytes.len() as u64)
+                    .sum::<u64>(),
+        }
+    }
+
+    /// Show why files were refused before they were read.
+    pub fn refuse_files(&mut self, refused: Vec<String>) {
+        self.attach_notice = (!refused.is_empty()).then(|| refused.join(" "));
+    }
+
     /// Keep a picture preview for an uploaded file. Only the most recent few
     /// are kept, so a long session cannot grow the previews without bound.
     fn remember_thumb(&mut self, id: String, url: String) {
@@ -2733,6 +2757,10 @@ impl Session {
                             self.composer_files.push(file);
                         }
                         continue;
+                    }
+                    // Nothing marked means no turn was running when Stop was pressed.
+                    if matches!(reply, Reply::Stopping(0)) {
+                        self.toast = Some("Nothing is running to stop.".into());
                     }
                     let bot_config_saved = match &reply {
                         Reply::BotConfigSaved { restart_required } => Some(*restart_required),

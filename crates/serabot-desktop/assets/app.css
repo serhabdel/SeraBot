@@ -5809,3 +5809,11 @@ html[data-reduce-transparency="true"] .chat-header {
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
 }
+
+/* Shown in place of Stop while a tool waits for the owner's approval. */
+.composer-waiting {
+  padding: 0 8px;
+  font-size: 12.5px;
+  color: var(--label-3);
+  white-space: nowrap;
+}

@@ -1426,7 +1426,11 @@ fn Shell(session: Signal<Session>) -> Element {
                 } else {
                 div { class: "pane",
                     {match section {
-                        Section::Chat => rsx! { ChatView { session, overlay } },
+                        // Keyed by conversation: switching chats remounts the
+                        // view, so scroll position and unseen counts start fresh.
+                        Section::Chat => rsx! {
+                            ChatView { key: "{session.read().conversation}", session, overlay }
+                        },
                         Section::Conversations => rsx! { ConversationsView { session } },
                         Section::Memory => rsx! { MemoryView { session } },
                         Section::Providers => rsx! { ProvidersView { session, overlay } },
@@ -2775,6 +2779,12 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         .task
         .as_ref()
         .is_none_or(|task| task.status.terminal());
+    let awaiting_approval = session
+        .read()
+        .state
+        .task
+        .as_ref()
+        .is_some_and(|task| task.status == TaskStatus::AwaitingApproval);
     // One prepared row per message: what the transcript draws, the day
     // heading where a new day starts, and which actions it offers.
     let messages: Vec<MsgView> = {
@@ -2997,6 +3007,8 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                 message.role == Role::User && message.id.starts_with("opt-")
             });
         let previous = *last_count.peek();
+        // A fresh mount (first render or a switch) starts at the newest line.
+        let jump = own_send || previous == 0;
         if count != previous {
             if count > previous && !*at_bottom.peek() && !own_send {
                 let added = *unseen.peek() + (count - previous);
@@ -3011,7 +3023,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             unseen.set(0);
         }
         let _ = dioxus::document::eval(&format!(
-            "const el=document.getElementById('messages'); if(el && ({own_send} || el.scrollHeight - el.scrollTop - el.clientHeight < 80)){{el.scrollTop=el.scrollHeight;}}"
+            "const el=document.getElementById('messages'); if(el && ({jump} || el.scrollHeight - el.scrollTop - el.clientHeight < 80)){{el.scrollTop=el.scrollHeight;}}"
         ));
     });
     let empty = messages.is_empty();
@@ -3075,13 +3087,21 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             ondrop: move |event: DragEvent| async move {
                 event.prevent_default();
                 dragging.set(false);
+                // Admit by name and size first: a refused file is never read.
+                let dropped = event.data_transfer().files();
+                let meta: Vec<(String, u64)> = dropped.iter().map(|file| (file.name(), file.size())).collect();
+                let sizes: Vec<(&str, u64)> = meta.iter().map(|(name, size)| (name.as_str(), *size)).collect();
+                let held = session.read().attachments_held();
+                let admission = chat_compose::admit_files(held, &sizes);
                 let mut picked = Vec::new();
-                for file in event.data_transfer().files() {
-                    let name = file.name();
-                    let bytes = file.read_bytes().await.map(|data| data.to_vec()).unwrap_or_default();
-                    picked.push((name, bytes));
+                for (index, file) in dropped.iter().enumerate() {
+                    if admission.accepted.contains(&index) {
+                        let bytes = file.read_bytes().await.map(|data| data.to_vec()).unwrap_or_default();
+                        picked.push((file.name(), bytes));
+                    }
                 }
                 session.write().queue_files(picked);
+                session.write().refuse_files(admission.refused);
             },
             if dragging() {
                 div { class: "drop-zone", "aria-hidden": "true",
@@ -3557,7 +3577,11 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     onclick: move |_| session.write().pick_attachments(),
                                     Icon { name: "paperclip", size: 16 }
                                 }
-                                if live_task.is_some() {
+                                if awaiting_approval {
+                                    span { class: "composer-waiting", role: "status",
+                                        "Waiting for your approval. Decline it to stop."
+                                    }
+                                } else if live_task.is_some() {
                                     button {
                                         class: "btn stop-btn",
                                         title: "Stop the reply",

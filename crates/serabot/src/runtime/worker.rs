@@ -3,6 +3,23 @@
 use super::*;
 
 impl Runtime {
+    /// The turn a task drives, when it has one: a turn task's own turn, or
+    /// the turn a resume task continues.
+    fn task_turn_id(&self, task: &Task) -> Option<String> {
+        match task.kind.as_str() {
+            "turn" => self
+                .store
+                .get_turn_by_task(&task.user_id, &task.id)
+                .ok()
+                .flatten()
+                .map(|turn| turn.id),
+            "resume" => serde_json::from_value::<ResumePayload>(task.payload.clone())
+                .ok()
+                .map(|payload| payload.turn_id),
+            _ => None,
+        }
+    }
+
     pub async fn run_worker(self) {
         if let Err(error) = self.store.reconcile_dispatching_actions() {
             error!(%error, "failed to reconcile dispatching actions");
@@ -87,6 +104,13 @@ impl Runtime {
                 "unsupported task kind in this build: {other}"
             ))),
         };
+        // Every exit of the task (completed, parked for approval, failed or
+        // superseded) drops the turn's stop mark, so a stop that arrived late
+        // cannot linger, and a mark set before an approval pause cannot end
+        // the turn after it resumes.
+        if let Some(turn_id) = self.task_turn_id(&task) {
+            self.clear_stop(&turn_id);
+        }
         match outcome {
             Ok(TurnOutcome::Completed) => {
                 if !self

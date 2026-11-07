@@ -2828,8 +2828,6 @@ impl ApiClient {
         Ok(response.enabled)
     }
 
-    /// `PUT /v1/conversations/{id}/auto-approve`: the owner's per-conversation
-    /// switch. Returns the value the server stored.
     /// Stop the owner's running turns in a conversation. The reply counts the
     /// turns that were marked; 0 means nothing was running.
     pub fn stop_conversation(&self, conversation: &str) -> Result<usize, ApiError> {
@@ -2847,6 +2845,8 @@ impl ApiClient {
         Ok(response.stopping)
     }
 
+    /// `PUT /v1/conversations/{id}/auto-approve`: the owner's per-conversation
+    /// switch. Returns the value the server stored.
     pub fn set_auto_approve(&self, conversation: &str, enabled: bool) -> Result<bool, ApiError> {
         check_id(conversation)?;
         #[derive(Serialize)]
