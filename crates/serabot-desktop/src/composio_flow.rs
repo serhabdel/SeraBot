@@ -69,7 +69,9 @@ impl ComposioFlow {
 
     /// The linked account for one app, if any.
     pub fn account_for(&self, toolkit: &str) -> Option<&ComposioAccount> {
-        self.accounts.iter().find(|a| a.toolkit.eq_ignore_ascii_case(toolkit))
+        self.accounts
+            .iter()
+            .find(|a| a.toolkit.eq_ignore_ascii_case(toolkit))
     }
 
     pub(crate) fn begin_wait(&mut self, toolkit: &str, now: Instant) {

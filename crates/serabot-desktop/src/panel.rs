@@ -12,13 +12,13 @@
 
 use crate::composio_flow::ComposioFlow;
 use crate::worker::Credentials;
-use crate::{ComposioAccount, ComposioApp};
 use crate::{
     ApiClient, ApiError, BrowserController, BrowserInfo, BrowserInput, BrowserProfile,
     BrowserSessionInfo, ConnectorUpdate, DEFAULT_PROFILE, MAX_VAULT_DOMAINS, MAX_VAULT_NOTE_CHARS,
     MAX_VAULT_USERNAME_CHARS, VaultEntry, VaultKind, VaultPut, normalize_vault_domain,
     valid_vault_name, validate_vault_put,
 };
+use crate::{ComposioAccount, ComposioApp};
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
@@ -609,9 +609,7 @@ fn composio_error_text(error: &ApiError) -> String {
     match error {
         ApiError::Http(409) => "Add your Composio key first.".into(),
         ApiError::Http(422) => "Composio did not accept that key. Check it and try again.".into(),
-        ApiError::Http(502..=504) => {
-            "Composio could not be reached. Try again in a moment.".into()
-        }
+        ApiError::Http(502..=504) => "Composio could not be reached. Try again in a moment.".into(),
         other => other.to_string(),
     }
 }

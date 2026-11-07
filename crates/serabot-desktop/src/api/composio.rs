@@ -72,7 +72,9 @@ fn plain_id(value: &str, max: usize) -> bool {
 }
 
 fn check_app(app: &ComposioApp) -> bool {
-    plain_id(&app.slug, 64) && bounded_text(&app.name, 120) && app.description.chars().count() <= 400
+    plain_id(&app.slug, 64)
+        && bounded_text(&app.name, 120)
+        && app.description.chars().count() <= 400
 }
 
 impl ApiClient {
@@ -129,9 +131,10 @@ impl ApiClient {
             None,
         )?;
         if list.accounts.len() > MAX_ACCOUNTS
-            || !list.accounts.iter().all(|a| {
-                plain_id(&a.id, 128) && plain_id(&a.toolkit, 64) && a.status.len() <= 32
-            })
+            || !list
+                .accounts
+                .iter()
+                .all(|a| plain_id(&a.id, 128) && plain_id(&a.toolkit, 64) && a.status.len() <= 32)
         {
             return Err(ApiError::InvalidResponse);
         }

@@ -359,7 +359,8 @@ impl Gateway {
         let canonical = canonical_json(&args)?;
         let hash = canonical_hash(&args)?;
 
-        if tool.requires_approval(&args) || (self.respect_bot_lists && context.require_approval.contains(name))
+        if tool.requires_approval(&args)
+            || (self.respect_bot_lists && context.require_approval.contains(name))
         {
             if let Some(output) = self.check_standing_grant(&spec, &args, &hash, context)? {
                 return self.dispatch(tool.as_ref(), args, context, output).await;
