@@ -15,6 +15,7 @@ or sends something to a third party that cannot be recalled. The list lives in
 | `agentmail_send` | Sends email to a third party. |
 | `telegram_send_document` | Sends a file into a chat. |
 | `onedrive_upload` | Writes (and may overwrite) a file in the owner's OneDrive. |
+| `local_write` | Creates or overwrites a text file in a read-write local folder on the owner's PC (through the desktop). |
 
 ## Not destructive (no approval)
 
@@ -23,6 +24,7 @@ or sends something to a third party that cannot be recalled. The list lives in
 - Memory: `memory_save`, `memory_list`.
 - Research and media: `firecrawl_scrape`, `firecrawl_map`, `firecrawl_search`, `firecrawl_crawl`, `firecrawl_extract`, `tavily_search`, `fetch_url`, `watch_now`, `audio_transcribe`, `audio_understand`, `elevenlabs_list_voices`, `elevenlabs_text_to_speech`, `elevenlabs_sound_effect`, `elevenlabs_transcribe`, `elevenlabs_generate_image`, `elevenlabs_generate_video`.
 - Documents (produce new artifacts): `docx_build`, `docx_import`, `docx_inspect`, `docx_read`, `docx_edit`, `docx_pdf`, `xlsx_build`, `xlsx_import`, `xlsx_inspect`, `xlsx_read`, `xlsx_edit`, `xlsx_analyze`, `timesheet_analyze`, `pptx_import`, `pptx_inspect`, `pptx_edit`, `pptx_pdf`, `pdf_inspect`, `pdf_edit`, `pdf_merge`, `deck_build`, `document_index`, `rag_search`.
+- Local folders (read only): `local_list`, `local_read`. They only work while the desktop is online and only inside folders the user allowed.
 - Read-only connectors: `google_drive_list`, `google_sheets_read`, `google_calendar_list_events`, `gmail_list_messages`, `outlook_list_messages`, `outlook_calendar_list_events`, `notion_query_database`, `agentmail_inboxes_list`, `onedrive_list`.
 - Orchestration: `delegate`, `team_ask`, `team_reply`, `skill_list`, `skill_search`, `skill_load`.
 

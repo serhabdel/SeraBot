@@ -60,6 +60,9 @@ tools = [
   "browser_press",
   "browser_screenshot",
   "browser_close",
+  "local_list",
+  "local_read",
+  "local_write",
 ]
 require_approval = []
 enabled = true

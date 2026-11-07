@@ -312,6 +312,9 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
     "memory_save",
     "memory_list",
     "memory_delete",
+    "local_list",
+    "local_read",
+    "local_write",
 ];
 
 pub const DEFAULT_SPECIALIST_TOOLS: &[&str] = &["skill_list", "skill_search", "skill_load"];

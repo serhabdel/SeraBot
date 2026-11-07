@@ -1696,6 +1696,9 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "notion_query_database",
     "agentmail_inboxes_list",
     "agentmail_send",
+    "local_list",
+    "local_read",
+    "local_write",
 ];
 
 const DEFAULT_SPECIALIST_TOOLS: &[&str] = &["skill_list", "skill_search", "skill_load"];

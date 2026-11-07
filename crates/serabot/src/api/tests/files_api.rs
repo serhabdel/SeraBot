@@ -163,3 +163,70 @@ fn artifact_ownership_is_per_user() {
     assert!(!store.user_owns_artifact(&bob.id, "hash-one").unwrap());
     assert!(!store.user_owns_artifact(&alice.id, "other").unwrap());
 }
+
+#[tokio::test]
+async fn local_relay_routes_are_per_user() {
+    let root = temp_base();
+    let (app, _, store) = app_with_root(true, Policy::empty(), root);
+    let alice = store
+        .create_user("subject-la", "la@example.example", "Synthetic A")
+        .unwrap();
+    let bob = store
+        .create_user("subject-lb", "lb@example.example", "Synthetic B")
+        .unwrap();
+    let alice_token = mint_for(&store, &alice.id, "local-a");
+    let bob_token = mint_for(&store, &bob.id, "local-b");
+
+    let status = read_json(get(&app, &alice_token, "/v1/local/status").await).await;
+    assert_eq!(status["online"], false);
+
+    let poll = app
+        .clone()
+        .oneshot(request_with_token(
+            "POST",
+            "/v1/local/poll",
+            &alice_token,
+            Some(json!({"roots": [{"id": "docs", "label": "Docs", "mode": "read"}], "wait_secs": 0})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(poll.status(), StatusCode::OK);
+    assert!(read_json(poll).await["request"].is_null());
+
+    let status = read_json(get(&app, &alice_token, "/v1/local/status").await).await;
+    assert_eq!(status["online"], true);
+    assert_eq!(status["roots"][0]["id"], "docs");
+    // Bob sees nothing of Alice's desktop.
+    let status = read_json(get(&app, &bob_token, "/v1/local/status").await).await;
+    assert_eq!(status["online"], false);
+    assert_eq!(status["roots"], json!([]));
+
+    // Hostile root ids and modes are refused; unknown results are 404.
+    for roots in [
+        json!([{"id": "../x", "label": "x", "mode": "read"}]),
+        json!([{"id": "docs", "label": "x", "mode": "admin"}]),
+    ] {
+        let bad = app
+            .clone()
+            .oneshot(request_with_token(
+                "POST",
+                "/v1/local/poll",
+                &alice_token,
+                Some(json!({"roots": roots, "wait_secs": 0})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let unknown = app
+        .clone()
+        .oneshot(request_with_token(
+            "POST",
+            "/v1/local/result/nope",
+            &bob_token,
+            Some(json!({"ok": true, "text": "x"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+}

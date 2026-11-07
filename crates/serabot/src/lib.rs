@@ -29,6 +29,7 @@ pub mod firecrawl;
 pub mod fleet;
 pub mod gateway;
 pub mod llm;
+pub mod local_relay;
 pub mod maker;
 pub mod memory;
 pub mod model_router;

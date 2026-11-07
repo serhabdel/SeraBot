@@ -84,6 +84,9 @@ pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -
         "agentmail_inboxes_list" => ("mail", "Checking the inbox".into()),
         "telegram_send_document" | "onedrive_upload" => ("file", "Sending a file".into()),
         "onedrive_list" => ("file", "Listing files".into()),
+        "local_list" => ("file", "Looking at a folder on your PC".into()),
+        "local_read" => ("file", "Reading a file on your PC".into()),
+        "local_write" => ("file", "Writing a file on your PC".into()),
         "vault_list" => ("lock", "Checking the vault".into()),
         "analyst" => ("chart", "Analyzing data".into()),
         "delegate" => (

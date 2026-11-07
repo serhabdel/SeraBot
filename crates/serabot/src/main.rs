@@ -842,6 +842,10 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             TavilyLimits::from_config(&config.tavily),
         ))?;
     }
+    // Local folder tools relay to the user's desktop; they are inert until a
+    // desktop registers an allowlisted folder.
+    let local_relay = serabot::local_relay::LocalRelay::new();
+    serabot::local_relay::register_local_tools(&mut registry, local_relay.clone(), policy.clone())?;
     let mut browser_manager = None;
     if config.browser.enabled {
         let manager = serabot::browser::build_manager(&config)?;
@@ -967,6 +971,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
             onedrive_registry.clone(),
         )?
         .with_personal(personal_connectors.clone())
+        .with_local_relay(local_relay.clone())
         .with_browser(browser_manager.clone());
         if let Some(manager) = &browser_manager {
             // Closes idle sessions, and every session on shutdown.

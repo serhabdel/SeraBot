@@ -45,6 +45,7 @@ pub const DESTRUCTIVE_TOOLS: &[&str] = &[
     "agentmail_send",
     "telegram_send_document",
     "onedrive_upload",
+    "local_write",
 ];
 
 /// Risk class of a tool by name: true when it needs approval.
@@ -1574,6 +1575,7 @@ mod tests {
             "agentmail_send",
             "telegram_send_document",
             "onedrive_upload",
+            "local_write",
         ] {
             assert!(is_destructive_tool(name), "{name}");
         }
