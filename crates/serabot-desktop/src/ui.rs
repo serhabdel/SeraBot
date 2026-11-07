@@ -311,7 +311,7 @@ fn capability_label(tool: &str) -> Option<&'static str> {
         "xlsx_analyze" | "timesheet_analyze" => Some("Spreadsheet analysis"),
         "rag_search" | "document_index" => Some("Document search"),
         "fetch_url" | "watch_now" | "firecrawl_scrape" | "firecrawl_map" | "firecrawl_search"
-        | "firecrawl_crawl" => Some("Web research"),
+        | "firecrawl_crawl" | "exa_search" | "exa_get_contents" => Some("Web research"),
         "audio_transcribe" | "audio_understand" => Some("Audio notes"),
         "elevenlabs_text_to_speech"
         | "elevenlabs_sound_effect"

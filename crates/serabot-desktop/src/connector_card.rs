@@ -48,10 +48,17 @@ pub fn token_help(id: &str) -> Option<TokenHelp> {
             url: SLACK_HELP_URL,
             hint: "Add the bot scopes channels:read, groups:read, channels:history, groups:history and chat:write, install the app, then invite the bot to each channel.",
         },
+        "exa" => TokenHelp {
+            label: "API key",
+            url: EXA_HELP_URL,
+            hint: "Create a key in the Exa dashboard. Connecting runs one small search to check it.",
+        },
         _ => return None,
     })
 }
 
+/// Where an Exa user creates an API key.
+pub const EXA_HELP_URL: &str = "https://dashboard.exa.ai/api-keys";
 /// Where a Slack user creates an app and copies its bot token.
 pub const SLACK_HELP_URL: &str = "https://api.slack.com/apps";
 /// Where a Todoist user finds their API token.
@@ -202,7 +209,7 @@ mod tests {
 
     #[test]
     fn token_connectors_have_fixed_https_help_links() {
-        for id in ["notion", "github", "todoist", "slack"] {
+        for id in ["notion", "github", "todoist", "slack", "exa"] {
             let help = token_help(id).expect(id);
             assert!(help.url.starts_with("https://"), "{id}");
             assert!(!help.label.is_empty() && !help.hint.is_empty(), "{id}");

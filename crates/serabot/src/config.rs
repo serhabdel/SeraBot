@@ -1942,6 +1942,8 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "slack_list_channels",
     "slack_read_channel",
     "slack_post_message",
+    "exa_search",
+    "exa_get_contents",
     "local_list",
     "local_read",
     "local_write",

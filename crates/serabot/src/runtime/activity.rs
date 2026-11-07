@@ -81,7 +81,10 @@ pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -
             host_of(args).map_or_else(|| "Reading a web page".into(), |h| format!("Reading {h}")),
         ),
         "firecrawl_crawl" | "firecrawl_map" => ("globe", "Exploring a website".into()),
-        "tavily_search" | "firecrawl_search" => ("search", "Searching the web".into()),
+        "exa_get_contents" => ("globe", "Reading web pages".into()),
+        "tavily_search" | "firecrawl_search" | "exa_search" => {
+            ("search", "Searching the web".into())
+        }
         "rag_search" => ("search", "Searching your documents".into()),
         "document_index" => ("file", "Reading a document".into()),
         "memory_save" | "memory_update" => ("brain", "Saving to memory".into()),

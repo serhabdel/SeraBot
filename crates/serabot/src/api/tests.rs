@@ -2842,7 +2842,7 @@ async fn providers_and_connectors_report_status_without_secret_values() {
     )
     .await;
     let list = connectors["connectors"].as_array().unwrap();
-    assert_eq!(list.len(), 15);
+    assert_eq!(list.len(), 16);
     let gmail = list
         .iter()
         .find(|connector| connector["id"] == "gmail")

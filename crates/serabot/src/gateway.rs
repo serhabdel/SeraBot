@@ -1799,6 +1799,8 @@ mod tests {
             "todoist_list_tasks",
             "slack_list_channels",
             "slack_read_channel",
+            "exa_search",
+            "exa_get_contents",
             "memory_save",
             "pdf_edit",
         ] {

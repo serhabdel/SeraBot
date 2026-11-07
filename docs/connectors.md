@@ -143,3 +143,20 @@ messages (revoked token, bot not in the channel, missing scope with the scope
 name). Channel ids (`C…` or `G…`) are validated before any request, history is
 capped at 50 messages per call, and posting refuses `@channel`, `@here` and
 `@everyone` mentions and turns link previews off.
+### Exa (web search)
+
+Tools: `exa_search`, `exa_get_contents` (both read). Exa sits with Tavily and
+Firecrawl under Web search; unlike those server-wide connectors, each user
+brings their own Exa key, so usage and billing stay with the user.
+
+1. Sign in at <https://dashboard.exa.ai/api-keys> and create an **API key**.
+2. Paste it into the Exa card in Connectors. Connecting runs one
+   single-result search to prove the key works (Exa has no free "who am I"
+   call), which uses a tiny amount of the user's credit.
+
+`exa_search` returns up to 10 results with relevant passages (highlights) and
+supports an optional list of domains to restrict to. `exa_get_contents` reads
+up to 5 pages (http or https, no embedded credentials) and keeps at most
+20,000 characters per page. A `401` shows "Exa rejected your API key"; running
+out of credits or a plan limit is reported in Exa's own words with the key
+removed.

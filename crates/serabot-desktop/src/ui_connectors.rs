@@ -144,6 +144,7 @@ fn connector_title(id: &str) -> String {
         "github" => "GitHub",
         "todoist" => "Todoist",
         "slack" => "Slack",
+        "exa" => "Exa Search",
         "agentmail" => "AgentMail",
         "tavily" => "Tavily Search",
         "firecrawl" => "Firecrawl",
@@ -169,7 +170,7 @@ fn connector_blurb(id: &str) -> &'static str {
         "todoist" => "Your to-do list.",
         "slack" => "Read channels and post with your approval.",
         "agentmail" => "A mailbox for your bots.",
-        "tavily" | "firecrawl" => "Let bots search and read the web.",
+        "tavily" | "firecrawl" | "exa" => "Let bots search and read the web.",
         "elevenlabs" => "Voices and sound.",
         _ => "",
     }
@@ -237,7 +238,7 @@ pub(crate) fn ConnectorsView(session: Signal<Session>) -> Element {
                     ("Notes and email", &["notion", "agentmail"][..]),
                     ("Code and tasks", &["github", "todoist"][..]),
                     ("Messages", &["slack"][..]),
-                    ("Web search", &["tavily", "firecrawl"][..]),
+                    ("Web search", &["tavily", "firecrawl", "exa"][..]),
                     ("Voice", &["elevenlabs"][..]),
                     ("Apps and tools", &["composio"][..]),
                 ] {

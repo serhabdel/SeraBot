@@ -337,6 +337,8 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
     "slack_list_channels",
     "slack_read_channel",
     "slack_post_message",
+    "exa_search",
+    "exa_get_contents",
     "memory_save",
     "memory_list",
     "memory_search",

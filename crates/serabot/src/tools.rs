@@ -928,6 +928,8 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "slack_list_channels",
         "slack_read_channel",
         "slack_post_message",
+        "exa_search",
+        "exa_get_contents",
         "onedrive_upload",
         "onedrive_list",
         "local_list",

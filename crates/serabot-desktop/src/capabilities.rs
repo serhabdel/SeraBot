@@ -79,6 +79,8 @@ pub const CAPABILITIES: &[Capability] = &[
             "firecrawl_search",
             "firecrawl_crawl",
             "firecrawl_extract",
+            "exa_search",
+            "exa_get_contents",
         ],
     },
     Capability {
