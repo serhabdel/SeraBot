@@ -923,6 +923,7 @@ mod tests {
                 oauth: None,
                 connected: None,
                 personal: None,
+                key_kind: None,
             }]),
         );
         assert!(state.providers_loaded);

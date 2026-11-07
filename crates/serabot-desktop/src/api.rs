@@ -1058,6 +1058,9 @@ pub struct ConnectorStatus {
     /// Per-user products (Outlook, Google, Notion): this account's own state.
     #[serde(default)]
     pub personal: Option<PersonalStatus>,
+    /// Composio: the kind of key saved (`project`, `user` or `consumer`).
+    #[serde(default)]
+    pub key_kind: Option<String>,
 }
 
 /// One account's state for a per-user connector (`personal` in the list).

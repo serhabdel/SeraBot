@@ -1083,6 +1083,9 @@ impl OneDriveConfig {
 pub struct ComposioConfig {
     #[serde(default = "default_composio_api_base")]
     pub api_base: String,
+    /// The Composio Connect MCP endpoint, used for Connect (`ck_`) keys.
+    #[serde(default = "default_composio_mcp_base")]
+    pub mcp_base: String,
     #[serde(default = "default_composio_timeout")]
     pub timeout_secs: u64,
     /// Largest Composio response body read, in bytes.
@@ -1099,6 +1102,7 @@ impl Default for ComposioConfig {
     fn default() -> Self {
         Self {
             api_base: default_composio_api_base(),
+            mcp_base: default_composio_mcp_base(),
             timeout_secs: default_composio_timeout(),
             max_response_bytes: default_composio_max_bytes(),
             tool_version: None,
@@ -1108,6 +1112,10 @@ impl Default for ComposioConfig {
 
 fn default_composio_api_base() -> String {
     "https://backend.composio.dev".into()
+}
+
+fn default_composio_mcp_base() -> String {
+    "https://connect.composio.dev/mcp".into()
 }
 
 fn default_composio_timeout() -> u64 {

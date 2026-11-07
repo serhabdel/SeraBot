@@ -11,6 +11,7 @@ pub mod browser;
 pub mod browser_profiles;
 pub mod cloud_code;
 pub mod composio;
+pub mod composio_mcp;
 pub mod config;
 pub mod connectors;
 pub mod deck;
