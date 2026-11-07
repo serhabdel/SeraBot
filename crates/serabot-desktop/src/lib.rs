@@ -15,6 +15,7 @@ pub mod connector_card;
 pub mod creds;
 pub mod events;
 pub mod local_folders;
+pub mod local_fs;
 pub mod net_policy;
 pub mod oauth;
 pub mod panel;
