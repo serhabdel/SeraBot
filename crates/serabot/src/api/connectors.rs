@@ -232,6 +232,8 @@ pub(super) async fn list_connectors(
         "enabled": true,
         "redirect_uri": Value::Null,
         "connected": state.composio.connected(&user.id)?,
+        "key_kind": state.composio.key_kind(&user.id)?.map(crate::composio::KeyKind::as_str),
+        "manage_url": crate::composio::CONNECT_URL,
         "help_url": crate::composio::HELP_URL,
     }));
     for view in &mut views {

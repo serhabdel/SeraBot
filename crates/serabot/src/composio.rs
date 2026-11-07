@@ -24,6 +24,7 @@ use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::composio_mcp::McpClient;
 use crate::config::{ComposioConfig, Config};
 use crate::connectors::plausible_secret;
 use crate::error::{Result, SeraError};
@@ -34,6 +35,8 @@ use crate::util::truncate_chars;
 /// The per-user credential row name.
 pub const CREDENTIAL_ID: &str = "conn.composio";
 pub const HELP_URL: &str = "https://platform.composio.dev";
+/// Where a Connect (`ck_`) key is created and its apps are managed.
+pub const CONNECT_URL: &str = "https://dashboard.composio.dev";
 const MAX_KEY_BYTES: usize = 512;
 const MAX_ARGS_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_CHARS: usize = 24_000;
@@ -120,7 +123,7 @@ fn valid_account_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-fn clean(value: &str, max: usize) -> String {
+pub(crate) fn clean(value: &str, max: usize) -> String {
     truncate_chars(
         &value
             .chars()
@@ -138,20 +141,49 @@ fn text(value: &Value, key: &str, max: usize) -> String {
         .unwrap_or_default()
 }
 
-/// Which header carries a key. Project keys use `x-api-key`; user-level keys
-/// (from Composio's user settings) use `x-user-api-key`.
+/// Which kind of key this is, and so where it is sent. Project keys (`ak_`)
+/// use `x-api-key` on the REST API; user-level keys (`uak_`) use
+/// `x-user-api-key`; Composio Connect consumer keys (`ck_`) use
+/// `x-consumer-api-key` on the Connect MCP endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum KeyHeader {
+pub enum KeyKind {
     Project,
     User,
+    Consumer,
 }
 
-impl KeyHeader {
+impl KeyKind {
+    /// The kind a key's prefix announces, or `None` for an unknown prefix.
+    /// `uak_` is checked before `ak_` only for clarity; they never overlap.
+    pub fn detect(key: &str) -> Option<Self> {
+        if key.starts_with("uak_") {
+            Some(Self::User)
+        } else if key.starts_with("ak_") {
+            Some(Self::Project)
+        } else if key.starts_with("ck_") {
+            Some(Self::Consumer)
+        } else {
+            None
+        }
+    }
+
+    /// The REST header for this kind. A consumer key has none: it is never
+    /// sent to the REST API.
     fn name(self) -> &'static str {
         match self {
             Self::Project => "x-api-key",
             Self::User => "x-user-api-key",
+            Self::Consumer => "x-consumer-api-key",
+        }
+    }
+
+    /// The word used in the connector list and the console.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::User => "user",
+            Self::Consumer => "consumer",
         }
     }
 }
@@ -161,14 +193,14 @@ impl KeyHeader {
 #[derive(Serialize, Deserialize)]
 struct SealedKey {
     key: String,
-    header: KeyHeader,
+    header: KeyKind,
 }
 
 impl SealedKey {
     fn parse(raw: &str) -> Self {
         serde_json::from_str(raw).unwrap_or_else(|_| Self {
             key: raw.to_owned(),
-            header: KeyHeader::Project,
+            header: KeyKind::Project,
         })
     }
 }
@@ -210,7 +242,7 @@ fn replace_ascii_ci(text: &str, needle: &str, with: &str) -> String {
 
 /// Remove the key from text in every form it can take: as sent, percent
 /// encoded (as in a URL), and in any letter case.
-fn scrub_key(text: &str, key: &str) -> String {
+pub(crate) fn scrub_key(text: &str, key: &str) -> String {
     let mut out = text.to_owned();
     for form in [key.to_owned(), percent_encoded(key)] {
         out = replace_ascii_ci(&out, &form, "[redacted]");
@@ -221,7 +253,7 @@ fn scrub_key(text: &str, key: &str) -> String {
 /// A failed Composio response, reduced to what is safe to show. The key is
 /// removed from every text first; control characters are dropped and each
 /// text is capped. `status` is 0 when no response arrived.
-fn upstream_error(status: u16, body: &Value, key: &str) -> SeraError {
+pub(crate) fn upstream_error(status: u16, body: &Value, key: &str) -> SeraError {
     let text = |pointer: &str, max: usize| {
         let raw = body
             .pointer(pointer)
@@ -237,8 +269,9 @@ fn upstream_error(status: u16, body: &Value, key: &str) -> SeraError {
         401 | 403 => (
             "composio_rejected",
             format!(
-                "Composio rejected this API key{}. Use the project API key from platform.composio.dev → Settings → API keys.",
-                parenthesized(&detail)
+                "Composio rejected this API key{}. {}",
+                parenthesized(&detail),
+                rejection_hint(key)
             ),
         ),
         402 => (
@@ -280,6 +313,25 @@ fn upstream_error(status: u16, body: &Value, key: &str) -> SeraError {
     }
 }
 
+/// What to do about a rejected key, by the kind its prefix announces. Never
+/// includes the key itself, only its (public) prefix.
+fn rejection_hint(key: &str) -> &'static str {
+    match KeyKind::detect(key) {
+        Some(KeyKind::Consumer) => {
+            "This looks like a Composio Connect key (ck_). Copy it again from Composio Connect → Settings → Sessions & API Key; regenerating it there invalidates the old one."
+        }
+        Some(KeyKind::Project) => {
+            "This looks like a project API key (ak_). Copy a current one from platform.composio.dev → Settings → API keys. A Connect key starts with ck_."
+        }
+        Some(KeyKind::User) => {
+            "This looks like a user API key (uak_). Use a current one, or the project API key (ak_) from platform.composio.dev → Settings → API keys."
+        }
+        None => {
+            "Use the project API key from platform.composio.dev → Settings → API keys. SeraBot accepts project keys (ak_), user keys (uak_) and Connect keys (ck_)."
+        }
+    }
+}
+
 fn parenthesized(detail: &str) -> String {
     if detail.is_empty() {
         String::new()
@@ -289,7 +341,7 @@ fn parenthesized(detail: &str) -> String {
 }
 
 /// A request that never got a response (timeout, refused connection, reset).
-fn transport_failure(error: reqwest::Error) -> SeraError {
+pub(crate) fn transport_failure(error: reqwest::Error) -> SeraError {
     let detail = if error.is_timeout() {
         "timed out"
     } else if error.is_connect() {
@@ -308,6 +360,7 @@ pub struct ComposioService {
     users: Arc<UserSecrets>,
     http: reqwest::Client,
     base: String,
+    mcp: McpClient,
     max_bytes: usize,
     tool_version: String,
 }
@@ -316,6 +369,7 @@ impl std::fmt::Debug for ComposioService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ComposioService")
             .field("base", &self.base)
+            .field("mcp_base", &self.mcp.url())
             .finish_non_exhaustive()
     }
 }
@@ -342,17 +396,45 @@ impl ComposioService {
                 "composio tool_version must be 1-32 letters, digits, '.', '-', or '_'".into(),
             ));
         }
+        let max_bytes = settings.max_response_bytes.clamp(4 * 1024, 4 * 1024 * 1024);
+        let mcp = McpClient::new(
+            &settings.mcp_base,
+            Duration::from_secs(settings.timeout_secs.clamp(5, 120)),
+            max_bytes,
+        )?;
         Ok(Self {
             users,
             http,
             base: settings.api_base.trim().trim_end_matches('/').to_owned(),
-            max_bytes: settings.max_response_bytes.clamp(4 * 1024, 4 * 1024 * 1024),
+            mcp,
+            max_bytes,
             tool_version: tool_version.to_owned(),
         })
     }
 
     pub fn api_base(&self) -> &str {
         &self.base
+    }
+
+    pub fn mcp_base(&self) -> &str {
+        self.mcp.url()
+    }
+
+    /// The outbound destination for this user's Composio calls: the Connect
+    /// MCP endpoint for a Connect key, the REST API otherwise.
+    fn destination(&self, user_id: &str) -> &str {
+        match self.key_kind(user_id) {
+            Ok(Some(KeyKind::Consumer)) => self.mcp.url(),
+            _ => &self.base,
+        }
+    }
+
+    /// Which kind of key this user saved, if any.
+    pub fn key_kind(&self, user_id: &str) -> Result<Option<KeyKind>> {
+        Ok(self
+            .users
+            .get(user_id, CREDENTIAL_ID)?
+            .map(|secret| SealedKey::parse(secret.expose_secret()).header))
     }
 
     /// Whether this user has saved a Composio key.
@@ -381,18 +463,32 @@ impl ComposioService {
                 "that does not look like a Composio API key".into(),
             ));
         }
-        let header = match self.check(key, KeyHeader::Project).await {
-            Ok(()) => KeyHeader::Project,
-            // Composio refuses some user-level keys sent as x-api-key. Only a
-            // 401 earns the second try; a key that fails both is still refused.
-            Err(error @ SeraError::Upstream { status: 401, .. }) => {
-                if self.check(key, KeyHeader::User).await.is_ok() {
-                    KeyHeader::User
-                } else {
-                    return Err(error);
-                }
+        let header = match KeyKind::detect(key) {
+            // A Connect key is checked against the MCP endpoint, never REST.
+            Some(KeyKind::Consumer) => {
+                self.mcp.list_tools(key).await?;
+                KeyKind::Consumer
             }
-            Err(error) => return Err(error),
+            // The prefix names the header: send it there and nowhere else.
+            Some(kind) => {
+                self.check(key, kind).await?;
+                kind
+            }
+            // No known prefix: try the project header, then once the user one.
+            None => match self.check(key, KeyKind::Project).await {
+                Ok(()) => KeyKind::Project,
+                // Composio refuses some user-level keys sent as x-api-key.
+                // Only a 401 earns the second try; a key that fails both is
+                // still refused.
+                Err(error @ SeraError::Upstream { status: 401, .. }) => {
+                    if self.check(key, KeyKind::User).await.is_ok() {
+                        KeyKind::User
+                    } else {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            },
         };
         let sealed = serde_json::to_string(&SealedKey {
             key: key.to_owned(),
@@ -403,7 +499,7 @@ impl ComposioService {
 
     /// One cheap authenticated read, to see whether Composio takes the key
     /// under `header`.
-    async fn check(&self, key: &str, header: KeyHeader) -> Result<()> {
+    async fn check(&self, key: &str, header: KeyKind) -> Result<()> {
         let candidate = SealedKey {
             key: key.to_owned(),
             header,
@@ -432,6 +528,13 @@ impl ComposioService {
         query: &[(&str, &str)],
         body: Option<&Value>,
     ) -> Result<Value> {
+        if key.header == KeyKind::Consumer {
+            // A Connect key is for the MCP endpoint only; sending it to the
+            // REST API would just leak it to the wrong place.
+            return Err(SeraError::Internal(
+                "a Connect key cannot call the REST API".into(),
+            ));
+        }
         let url = format!("{}{path}", self.base);
         let mut request = match method {
             "GET" => self.http.get(&url),
@@ -473,6 +576,9 @@ impl ComposioService {
         if query.trim().is_empty() {
             return Err(SeraError::Validation("query is required".into()));
         }
+        if key.header == KeyKind::Consumer {
+            return self.consumer_search_tools(&key, &query, limit).await;
+        }
         let limit = limit.clamp(1, 20).to_string();
         let reply = self
             .call(
@@ -498,7 +604,7 @@ impl ComposioService {
                             "description": text(item, "description", 240),
                             "toolkit": item.pointer("/toolkit/slug").and_then(Value::as_str)
                                 .map(|s| clean(s, 64)).unwrap_or_default(),
-                            "needs_approval": slug_is_destructive(&slug),
+                            "needs_approval": slug_needs_approval(&slug),
                         })
                     })
                     .collect()
@@ -511,6 +617,9 @@ impl ComposioService {
     pub async fn search_toolkits(&self, user_id: &str, query: &str) -> Result<Value> {
         let key = self.key(user_id)?;
         let query = clean(query, 80);
+        if key.header == KeyKind::Consumer {
+            return self.consumer_apps(&key, &query).await;
+        }
         let mut params = vec![("limit", "24"), ("sort_by", "usage")];
         if !query.trim().is_empty() {
             params.push(("search", query.as_str()));
@@ -543,6 +652,14 @@ impl ComposioService {
     /// This user's linked apps (Composio connected accounts).
     pub async fn accounts(&self, user_id: &str) -> Result<Value> {
         let key = self.key(user_id)?;
+        if key.header == KeyKind::Consumer {
+            // Connect keeps linked apps on Composio's side.
+            return Ok(json!({
+                "accounts": [],
+                "managed_externally": true,
+                "manage_url": CONNECT_URL,
+            }));
+        }
         let reply = self
             .call(
                 &key,
@@ -581,6 +698,11 @@ impl ComposioService {
             return Err(SeraError::Validation("invalid account id".into()));
         }
         let key = self.key(user_id)?;
+        if key.header == KeyKind::Consumer {
+            return Err(SeraError::Validation(
+                "your apps are managed in Composio Connect".into(),
+            ));
+        }
         let own = self.accounts(user_id).await?;
         let owned = own["accounts"]
             .as_array()
@@ -606,6 +728,10 @@ impl ComposioService {
             return Err(SeraError::Validation("invalid app name".into()));
         }
         let key = self.key(user_id)?;
+        if key.header == KeyKind::Consumer {
+            // Apps for a Connect key are linked on Composio's own site.
+            return Ok(json!({"url": CONNECT_URL, "toolkit": toolkit, "managed_externally": true}));
+        }
         let configs = self
             .call(
                 &key,
@@ -684,6 +810,9 @@ impl ComposioService {
             return Err(SeraError::Validation("arguments are too large".into()));
         }
         let key = self.key(user_id)?;
+        if key.header == KeyKind::Consumer {
+            return self.consumer_execute(&key, slug, arguments).await;
+        }
         self.call(
             &key,
             "POST",
@@ -696,6 +825,153 @@ impl ComposioService {
             })),
         )
         .await
+    }
+}
+
+/// Tool names that wrap other tools (run many, run code or shell). The slug
+/// does not say what the inner call does, so these always need approval.
+fn is_wrapper_tool(slug: &str) -> bool {
+    let upper = slug.to_ascii_uppercase();
+    upper.starts_with("COMPOSIO_")
+        && !upper.starts_with("COMPOSIO_SEARCH")
+        && !upper.starts_with("COMPOSIO_GET_")
+        && !upper.starts_with("COMPOSIO_MANAGE_CONNECTIONS")
+}
+
+/// True when running this tool needs approval: a destructive verb in the
+/// slug, or a Connect meta tool that can run anything.
+pub fn slug_needs_approval(slug: &str) -> bool {
+    slug_is_destructive(slug) || is_wrapper_tool(slug)
+}
+
+/// The app a Connect tool belongs to: the slug text before its first `_`.
+fn tool_app(slug: &str) -> String {
+    slug.split('_')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+impl ComposioService {
+    /// Tools of a Connect key matching a query. The Connect server may list
+    /// only a few meta tools, so when nothing matches the whole (bounded)
+    /// list is returned with a note on how to discover app actions.
+    async fn consumer_search_tools(
+        &self,
+        key: &SealedKey,
+        query: &str,
+        limit: usize,
+    ) -> Result<Value> {
+        let tools = self.mcp.list_tools(&key.key).await?;
+        let words: Vec<String> = query
+            .split_whitespace()
+            .map(str::to_ascii_lowercase)
+            .collect();
+        let describe = |item: &Value| {
+            let slug = text(item, "name", 128);
+            json!({
+                "slug": slug,
+                "name": text(item, "title", 120),
+                "description": text(item, "description", 240),
+                "toolkit": tool_app(&slug),
+                "needs_approval": slug_needs_approval(&slug),
+            })
+        };
+        let mut scored: Vec<(usize, Value)> = tools
+            .iter()
+            .filter(|item| valid_slug(&text(item, "name", 129)))
+            .map(|item| {
+                let haystack = format!(
+                    "{} {} {}",
+                    text(item, "name", 128),
+                    text(item, "title", 120),
+                    text(item, "description", 600)
+                )
+                .to_ascii_lowercase()
+                .replace('_', " ");
+                let score = words
+                    .iter()
+                    .filter(|w| haystack.contains(w.as_str()))
+                    .count();
+                (score, describe(item))
+            })
+            .collect();
+        let matched = scored.iter().any(|(score, _)| *score > 0);
+        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        let picked: Vec<Value> = scored
+            .into_iter()
+            .filter(|(score, _)| !matched || *score > 0)
+            .take(limit.clamp(1, 20))
+            .map(|(_, tool)| tool)
+            .collect();
+        let mut reply = json!({"tools": picked});
+        if !matched {
+            reply["note"] = json!(
+                "No tool matched. These are the tools this Composio Connect key offers; use COMPOSIO_SEARCH_TOOLS through composio_execute to find app actions."
+            );
+        }
+        Ok(reply)
+    }
+
+    /// The apps behind a Connect key's tools, grouped by slug prefix.
+    async fn consumer_apps(&self, key: &SealedKey, query: &str) -> Result<Value> {
+        let tools = self.mcp.list_tools(&key.key).await?;
+        let needle = query.trim().to_ascii_lowercase();
+        let mut toolkits: Vec<Value> = Vec::new();
+        for item in &tools {
+            let app = tool_app(&text(item, "name", 128));
+            if !valid_toolkit(&app)
+                || toolkits.iter().any(|t| t["slug"] == app.as_str())
+                || (!needle.is_empty() && !app.contains(&needle))
+            {
+                continue;
+            }
+            toolkits.push(json!({
+                "slug": app,
+                "name": app,
+                "description": text(item, "description", 160),
+            }));
+            if toolkits.len() >= MAX_LIST {
+                break;
+            }
+        }
+        Ok(json!({
+            "toolkits": toolkits,
+            "managed_externally": true,
+            "manage_url": CONNECT_URL,
+        }))
+    }
+
+    /// Run one tool on the Connect endpoint. The reply has the same shape as
+    /// a REST execution (`successful`, `error`, `data`).
+    async fn consumer_execute(
+        &self,
+        key: &SealedKey,
+        slug: &str,
+        arguments: &Value,
+    ) -> Result<Value> {
+        let result = self.mcp.call_tool(&key.key, slug, arguments).await?;
+        let failed = result.get("isError").and_then(Value::as_bool) == Some(true);
+        let texts: Vec<&str> = result
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let joined = scrub_key(&texts.join("\n"), &key.key);
+        let data = match result.get("structuredContent") {
+            Some(value) if !value.is_null() => value.clone(),
+            _ => serde_json::from_str::<Value>(&joined).unwrap_or(Value::String(joined.clone())),
+        };
+        Ok(json!({
+            "successful": !failed,
+            "error": if failed { Value::String(clean(&joined, 500)) } else { Value::Null },
+            "data": if failed { Value::Null } else { data },
+        }))
     }
 }
 
@@ -762,7 +1038,7 @@ impl Tool for SearchTool {
             .ok_or_else(|| SeraError::Validation("query is required".into()))?;
         let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
         let value = self.0.search_tools(&context.user_id, query, limit).await?;
-        Ok(output(value, self.0.api_base()))
+        Ok(output(value, self.0.destination(&context.user_id)))
     }
 }
 
@@ -795,7 +1071,7 @@ impl Tool for ConnectTool {
             "toolkit": link["toolkit"],
             "note": "Ask the user to open this link and approve access.",
         });
-        Ok(output(value, self.0.api_base()))
+        Ok(output(value, self.0.destination(&context.user_id)))
     }
 }
 
@@ -823,7 +1099,7 @@ impl Tool for ExecuteTool {
 
     fn requires_approval(&self, args: &Value) -> bool {
         match args.get("tool_slug").and_then(Value::as_str) {
-            Some(slug) => slug_is_destructive(slug),
+            Some(slug) => slug_needs_approval(slug),
             // No readable slug: the call fails validation, but never skip approval.
             None => true,
         }
@@ -853,7 +1129,7 @@ impl Tool for ExecuteTool {
             "error": reply.get("error").and_then(Value::as_str).map(|e| clean(e, 500)),
             "data": reply.get("data").cloned().unwrap_or(Value::Null),
         });
-        Ok(output(value, self.0.api_base()))
+        Ok(output(value, self.0.destination(&context.user_id)))
     }
 }
 
@@ -880,6 +1156,7 @@ mod tests {
             .id;
         let settings = ComposioConfig {
             api_base: server.uri(),
+            mcp_base: format!("{}/mcp", server.uri()),
             timeout_secs: 5,
             max_response_bytes: 8 * 1024,
             tool_version: None,
@@ -1157,10 +1434,7 @@ mod tests {
         let (svc, a, _b) = service(&server);
         svc.connect_key(&a, KEY_A).await.unwrap();
         let raw = svc.users.get(&a, CREDENTIAL_ID).unwrap().unwrap();
-        assert_eq!(
-            SealedKey::parse(raw.expose_secret()).header,
-            KeyHeader::User
-        );
+        assert_eq!(SealedKey::parse(raw.expose_secret()).header, KeyKind::User);
         // Later calls use the stored header, not x-api-key.
         Mock::given(method("POST"))
             .and(path("/api/v3/tools/execute/GMAIL_FETCH_EMAILS"))
@@ -1192,7 +1466,7 @@ mod tests {
         let raw = svc.users.get(&a, CREDENTIAL_ID).unwrap().unwrap();
         assert_eq!(
             SealedKey::parse(raw.expose_secret()).header,
-            KeyHeader::Project
+            KeyKind::Project
         );
     }
 
@@ -1220,7 +1494,7 @@ mod tests {
         let text = assert_upstream(&error, 401, "composio_rejected");
         assert_eq!(
             text,
-            "Composio rejected this API key (Invalid API key). Use the project API key from platform.composio.dev → Settings → API keys. Composio suggests: Check the key"
+            "Composio rejected this API key (Invalid API key). Use the project API key from platform.composio.dev → Settings → API keys. SeraBot accepts project keys (ak_), user keys (uak_) and Connect keys (ck_). Composio suggests: Check the key"
         );
         assert_no_key(&error, KEY_A);
         assert!(!svc.connected(&a).unwrap());
@@ -1338,6 +1612,7 @@ mod tests {
             .port();
         let settings = ComposioConfig {
             api_base: format!("http://127.0.0.1:{port}"),
+            mcp_base: format!("http://127.0.0.1:{port}/mcp"),
             timeout_secs: 5,
             max_response_bytes: 8 * 1024,
             tool_version: None,
@@ -1388,13 +1663,13 @@ mod tests {
         let sealed = SealedKey::parse(r#"{"key":"cmp_x","header":"user"}"#);
         assert_eq!(
             (sealed.key.as_str(), sealed.header),
-            ("cmp_x", KeyHeader::User)
+            ("cmp_x", KeyKind::User)
         );
         // A row from before the header was recorded is a bare project key.
         let legacy = SealedKey::parse(KEY_A);
         assert_eq!(
             (legacy.key.as_str(), legacy.header),
-            (KEY_A, KeyHeader::Project)
+            (KEY_A, KeyKind::Project)
         );
     }
 
@@ -1412,6 +1687,7 @@ mod tests {
             .id;
         let settings = ComposioConfig {
             api_base: server.uri(),
+            mcp_base: format!("{}/mcp", server.uri()),
             timeout_secs: 5,
             max_response_bytes: 8 * 1024,
             tool_version: tool_version.map(str::to_owned),
@@ -1499,5 +1775,428 @@ mod tests {
         assert!(!text.to_ascii_lowercase().contains("synthetic"), "{text}");
         assert!(text.contains("[redacted]"), "{text}");
         assert_no_key(&error, PLUS_KEY);
+    }
+}
+
+#[cfg(test)]
+mod consumer_tests {
+    use super::*;
+    use crate::store::Store;
+    use wiremock::matchers::{body_partial_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const CK: &str = "ck_synthetic_key_carol_0003";
+    const AK: &str = "ak_synthetic_key_dave_00004";
+    const UAK: &str = "uak_synthetic_key_erin_00005";
+
+    fn service(server: &MockServer) -> (Arc<ComposioService>, String) {
+        let store = Store::open_in_memory(384).unwrap();
+        let users = Arc::new(UserSecrets::with_master_key(store.clone(), [7u8; 32]).unwrap());
+        let user = store
+            .create_user("microsoft:c", "c@example.example", "C")
+            .unwrap()
+            .id;
+        let settings = ComposioConfig {
+            api_base: server.uri(),
+            mcp_base: format!("{}/mcp", server.uri()),
+            timeout_secs: 5,
+            max_response_bytes: 8 * 1024,
+            tool_version: None,
+        };
+        (
+            Arc::new(ComposioService::with_settings(&settings, users).unwrap()),
+            user,
+        )
+    }
+
+    fn sse(message: Value) -> ResponseTemplate {
+        // A progress event first, so the answer is not the first event.
+        let body = format!(
+            "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{{}}}}\n\nevent: message\ndata: {message}\n\n"
+        );
+        ResponseTemplate::new(200).set_body_raw(body.into_bytes(), "text/event-stream")
+    }
+
+    fn rpc(id: u64, result: Value) -> Value {
+        json!({"jsonrpc": "2.0", "id": id, "result": result})
+    }
+
+    /// A Connect server: initialize (plain JSON, with a session id), the
+    /// initialized notification, a `tools/list` that answers as an event
+    /// stream, and the session close. Every request must carry the key, and
+    /// every request after initialize the session id.
+    async fn mount_connect(server: &MockServer, key: &'static str) {
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(header("x-consumer-api-key", key))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("mcp-session-id", "sess-1")
+                    .set_body_json(rpc(
+                        1,
+                        json!({"protocolVersion": "2025-03-26", "capabilities": {},
+                               "serverInfo": {"name": "synthetic", "version": "0"}}),
+                    )),
+            )
+            .expect(1..)
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(header("x-consumer-api-key", key))
+            .and(header("mcp-session-id", "sess-1"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .expect(1..)
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(header("x-consumer-api-key", key))
+            .and(header("mcp-session-id", "sess-1"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(sse(rpc(
+                2,
+                json!({"tools": [
+                    {"name": "COMPOSIO_SEARCH_TOOLS", "description": "Find app actions"},
+                    {"name": "COMPOSIO_MULTI_EXECUTE_TOOL", "description": "Run tools"},
+                    {"name": "GMAIL_FETCH_EMAILS", "description": "Fetch mail from gmail"},
+                    {"name": "GMAIL_SEND_EMAIL", "description": "Send mail from gmail"},
+                    {"name": "bad name!", "description": "ignored"}
+                ]}),
+            )))
+            .expect(1..)
+            .mount(server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/mcp"))
+            .and(header("mcp-session-id", "sess-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+    }
+
+    async fn rest_untouched(server: &MockServer) {
+        Mock::given(wiremock::matchers::path_regex("^/api/"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(server)
+            .await;
+    }
+
+    #[test]
+    fn prefixes_pick_the_kind() {
+        assert_eq!(KeyKind::detect("ak_abc"), Some(KeyKind::Project));
+        assert_eq!(KeyKind::detect("uak_abc"), Some(KeyKind::User));
+        assert_eq!(KeyKind::detect("ck_abc"), Some(KeyKind::Consumer));
+        assert_eq!(KeyKind::detect("cmp_abc"), None);
+        let sealed = SealedKey::parse(r#"{"key":"ck_x","header":"consumer"}"#);
+        assert_eq!(sealed.header, KeyKind::Consumer);
+    }
+
+    #[tokio::test]
+    async fn connect_key_is_checked_over_mcp_and_sealed_as_consumer() {
+        let server = MockServer::start().await;
+        mount_connect(&server, CK).await;
+        rest_untouched(&server).await;
+        let (svc, user) = service(&server);
+        svc.connect_key(&user, CK).await.unwrap();
+        assert_eq!(svc.key_kind(&user).unwrap(), Some(KeyKind::Consumer));
+        assert!(svc.connected(&user).unwrap());
+        assert!(!format!("{svc:?}").contains(CK));
+    }
+
+    #[tokio::test]
+    async fn tools_are_searched_and_listed_from_tools_list() {
+        let server = MockServer::start().await;
+        mount_connect(&server, CK).await;
+        rest_untouched(&server).await;
+        let (svc, user) = service(&server);
+        svc.connect_key(&user, CK).await.unwrap();
+
+        let found = svc.search_tools(&user, "send gmail", 5).await.unwrap();
+        let tools = found["tools"].as_array().unwrap();
+        assert!(tools.iter().all(|t| t["slug"] != "bad name!"));
+        assert_eq!(tools[0]["slug"], "GMAIL_SEND_EMAIL");
+        assert_eq!(tools[0]["needs_approval"], true);
+        assert!(found.get("note").is_none());
+
+        // Nothing matches: the whole list comes back, with a pointer.
+        let none = svc.search_tools(&user, "zzzz", 20).await.unwrap();
+        assert_eq!(none["tools"].as_array().unwrap().len(), 4);
+        assert!(
+            none["note"]
+                .as_str()
+                .unwrap()
+                .contains("COMPOSIO_SEARCH_TOOLS")
+        );
+
+        let apps = svc.search_toolkits(&user, "").await.unwrap();
+        let slugs: Vec<&str> = apps["toolkits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["slug"].as_str())
+            .collect();
+        assert_eq!(slugs, ["composio", "gmail"]);
+        assert_eq!(apps["managed_externally"], true);
+        let gmail = svc.search_toolkits(&user, "gma").await.unwrap();
+        assert_eq!(gmail["toolkits"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn apps_are_managed_in_connect() {
+        let server = MockServer::start().await;
+        mount_connect(&server, CK).await;
+        rest_untouched(&server).await;
+        let (svc, user) = service(&server);
+        svc.connect_key(&user, CK).await.unwrap();
+        let accounts = svc.accounts(&user).await.unwrap();
+        assert_eq!(accounts["accounts"].as_array().unwrap().len(), 0);
+        assert_eq!(accounts["manage_url"], CONNECT_URL);
+        let link = svc.connect_link(&user, "gmail").await.unwrap();
+        assert_eq!(link["url"], CONNECT_URL);
+        let error = svc.disconnect_account(&user, "ca_1").await.unwrap_err();
+        assert!(matches!(error, SeraError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn execute_calls_the_tool_and_reads_an_event_stream_answer() {
+        let server = MockServer::start().await;
+        mount_connect(&server, CK).await;
+        rest_untouched(&server).await;
+        let (svc, user) = service(&server);
+        svc.connect_key(&user, CK).await.unwrap();
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(header("x-consumer-api-key", CK))
+            .and(header("mcp-session-id", "sess-1"))
+            .and(body_partial_json(json!({
+                "method": "tools/call",
+                "params": {"name": "GMAIL_FETCH_EMAILS", "arguments": {"max": 1}}
+            })))
+            .respond_with(sse(rpc(
+                2,
+                json!({"content": [{"type": "text", "text": "{\"n\":1}"}], "isError": false}),
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let reply = svc
+            .execute(&user, "GMAIL_FETCH_EMAILS", &json!({"max": 1}))
+            .await
+            .unwrap();
+        assert_eq!(reply["successful"], true);
+        assert_eq!(reply["data"]["n"], 1);
+        // Slug and arguments are still checked before anything is sent.
+        assert!(svc.execute(&user, "../x", &json!({})).await.is_err());
+        assert!(svc.execute(&user, "OK_SLUG", &json!("s")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_tool_error_is_a_failed_result_with_the_key_removed() {
+        let server = MockServer::start().await;
+        mount_connect(&server, CK).await;
+        let (svc, user) = service(&server);
+        svc.connect_key(&user, CK).await.unwrap();
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(body_partial_json(json!({"method": "tools/call"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(rpc(
+                2,
+                json!({"content": [{"type": "text", "text": format!("denied for {CK}")}],
+                       "isError": true}),
+            )))
+            .mount(&server)
+            .await;
+        let reply = svc
+            .execute(&user, "GMAIL_FETCH_EMAILS", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(reply["successful"], false);
+        let text = reply.to_string();
+        assert!(!text.contains(CK), "{text}");
+        assert!(text.contains("[redacted]"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn json_rpc_errors_never_carry_the_key() {
+        let server = MockServer::start().await;
+        mount_connect(&server, CK).await;
+        let (svc, user) = service(&server);
+        svc.connect_key(&user, CK).await.unwrap();
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .and(body_partial_json(json!({"method": "tools/call"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0", "id": 2,
+                "error": {"code": -32602, "message": format!("bad {CK}")}
+            })))
+            .mount(&server)
+            .await;
+        let error = svc
+            .execute(&user, "GMAIL_FETCH_EMAILS", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SeraError::Upstream {
+                code: "composio_bad_request",
+                ..
+            }
+        ));
+        assert!(!error.to_string().contains(CK));
+        assert!(!format!("{error:?}").contains(CK));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_connect_key_says_which_kind_it_looks_like() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_json(json!({"error": {"message": "Invalid API key: ck_**-o3k"}})),
+            )
+            .mount(&server)
+            .await;
+        rest_untouched(&server).await;
+        let (svc, user) = service(&server);
+        let error = svc.connect_key(&user, CK).await.unwrap_err();
+        let SeraError::Upstream {
+            status,
+            code,
+            message,
+        } = &error
+        else {
+            panic!("{error:?}");
+        };
+        assert_eq!((*status, *code), (401, "composio_rejected"));
+        assert!(message.contains("Composio Connect key (ck_)"), "{message}");
+        assert!(message.contains("Sessions & API Key"), "{message}");
+        assert!(!message.contains(CK));
+        assert!(!svc.connected(&user).unwrap());
+    }
+
+    #[tokio::test]
+    async fn rejected_project_and_user_keys_get_their_own_hint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/toolkits"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_json(json!({"error": {"message": "Invalid API key"}})),
+            )
+            .mount(&server)
+            .await;
+        let (svc, user) = service(&server);
+        let error = svc.connect_key(&user, AK).await.unwrap_err().to_string();
+        assert!(error.contains("project API key (ak_)"), "{error}");
+        assert!(error.contains("starts with ck_"), "{error}");
+        let error = svc.connect_key(&user, UAK).await.unwrap_err().to_string();
+        assert!(error.contains("user API key (uak_)"), "{error}");
+        assert!(!error.contains(UAK));
+    }
+
+    #[tokio::test]
+    async fn prefixed_keys_go_only_to_their_own_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/toolkits"))
+            .and(header("x-api-key", AK))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": []})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/toolkits"))
+            .and(header("x-user-api-key", UAK))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": []})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Any other header on REST, or any MCP call, would hit these.
+        Mock::given(wiremock::matchers::path("/mcp"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (svc, user) = service(&server);
+        svc.connect_key(&user, AK).await.unwrap();
+        assert_eq!(svc.key_kind(&user).unwrap(), Some(KeyKind::Project));
+        svc.connect_key(&user, UAK).await.unwrap();
+        assert_eq!(svc.key_kind(&user).unwrap(), Some(KeyKind::User));
+    }
+
+    #[tokio::test]
+    async fn mcp_responses_are_bounded() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(64 * 1024)))
+            .mount(&server)
+            .await;
+        let (svc, user) = service(&server);
+        let error = svc.connect_key(&user, CK).await.unwrap_err();
+        assert!(error.to_string().contains("size limit"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn mcp_outage_is_unavailable() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let (svc, user) = service(&server);
+        let error = svc.connect_key(&user, CK).await.unwrap_err();
+        assert!(matches!(
+            error,
+            SeraError::Upstream {
+                status: 503,
+                code: "composio_unavailable",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn wrapper_tools_always_need_approval() {
+        for slug in [
+            "COMPOSIO_MULTI_EXECUTE_TOOL",
+            "COMPOSIO_REMOTE_WORKBENCH",
+            "COMPOSIO_REMOTE_BASH_TOOL",
+            "GMAIL_SEND_EMAIL",
+        ] {
+            assert!(slug_needs_approval(slug), "{slug}");
+        }
+        for slug in [
+            "COMPOSIO_SEARCH_TOOLS",
+            "COMPOSIO_GET_TOOL_SCHEMAS",
+            "COMPOSIO_MANAGE_CONNECTIONS",
+            "GMAIL_FETCH_EMAILS",
+        ] {
+            assert!(!slug_needs_approval(slug), "{slug}");
+        }
+    }
+
+    #[test]
+    fn bad_mcp_base_is_refused_at_startup() {
+        let store = Store::open_in_memory(384).unwrap();
+        let users = Arc::new(UserSecrets::with_master_key(store, [7u8; 32]).unwrap());
+        for bad in ["", "ftp://x/mcp", "https://u:p@x/mcp"] {
+            let settings = ComposioConfig {
+                mcp_base: bad.to_owned(),
+                ..ComposioConfig::default()
+            };
+            assert!(
+                ComposioService::with_settings(&settings, users.clone()).is_err(),
+                "{bad}"
+            );
+        }
     }
 }

@@ -75,7 +75,7 @@ async fn refused_key_is_422_with_the_reason_and_never_401() {
     assert_eq!(body["code"], "composio_rejected");
     assert_eq!(
         body["error"],
-        "Composio rejected this API key (Invalid API key). Use the project API key from platform.composio.dev → Settings → API keys."
+        "Composio rejected this API key (Invalid API key). Use the project API key from platform.composio.dev → Settings → API keys. SeraBot accepts project keys (ak_), user keys (uak_) and Connect keys (ck_)."
     );
     assert!(!body.to_string().contains(KEY));
 }
