@@ -330,7 +330,11 @@ pub fn handle(folders: &[LocalFolder], request: &LocalRequest) -> Result<String,
             if folder.mode != FolderMode::ReadWrite {
                 return Err("that folder is read-only".into());
             }
-            write(root, &request.path, request.content.as_deref().unwrap_or_default())
+            write(
+                root,
+                &request.path,
+                request.content.as_deref().unwrap_or_default(),
+            )
         }
         _ => Err("unknown operation".into()),
     }
@@ -587,7 +591,11 @@ mod tests {
         );
         // Overwrite keeps no temp file around.
         handle(&folders, &request("write", "docs", "new.txt", Some("v2"))).unwrap();
-        assert!(!Path::new(&folders[0].path).join(".new.txt.serabot-tmp").exists());
+        assert!(
+            !Path::new(&folders[0].path)
+                .join(".new.txt.serabot-tmp")
+                .exists()
+        );
         std::fs::remove_dir_all(base).ok();
     }
 
@@ -631,7 +639,13 @@ mod tests {
         assert!(handle(&folders, &request("write", "docs", ".env", Some("x"))).is_err());
         assert!(handle(&folders, &request("write", "docs", "id_rsa", Some("x"))).is_err());
         assert!(handle(&folders, &request("write", "docs", "run.bat", Some("x"))).is_err());
-        assert!(handle(&folders, &request("write", "docs", "ghost/new.txt", Some("x"))).is_err());
+        assert!(
+            handle(
+                &folders,
+                &request("write", "docs", "ghost/new.txt", Some("x"))
+            )
+            .is_err()
+        );
         assert!(handle(&folders, &request("read", "docs", "bin.dat", None)).is_err());
         let big = "a".repeat(MAX_FILE_BYTES as usize + 1);
         assert!(handle(&folders, &request("write", "docs", "big.txt", Some(&big))).is_err());
@@ -660,7 +674,13 @@ mod tests {
             std::fs::remove_dir_all(base).ok();
             return;
         }
-        assert!(handle(&folders, &request("read", "docs", "escape/secret.txt", None)).is_err());
+        assert!(
+            handle(
+                &folders,
+                &request("read", "docs", "escape/secret.txt", None)
+            )
+            .is_err()
+        );
         assert!(handle(&folders, &request("list", "docs", "escape", None)).is_err());
         assert!(
             handle(

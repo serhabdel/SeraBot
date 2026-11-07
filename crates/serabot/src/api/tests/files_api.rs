@@ -186,7 +186,9 @@ async fn local_relay_routes_are_per_user() {
             "POST",
             "/v1/local/poll",
             &alice_token,
-            Some(json!({"roots": [{"id": "docs", "label": "Docs", "mode": "read"}], "wait_secs": 0})),
+            Some(
+                json!({"roots": [{"id": "docs", "label": "Docs", "mode": "read"}], "wait_secs": 0}),
+            ),
         ))
         .await
         .unwrap();

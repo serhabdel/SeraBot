@@ -194,7 +194,11 @@ pub fn save_upload(
 
 /// Prompt block describing the attachments of one message. File content is
 /// untrusted data and is labelled that way.
-pub fn render_for_model(config: &Config, user_id: &str, attachments: &[StoredAttachment]) -> String {
+pub fn render_for_model(
+    config: &Config,
+    user_id: &str,
+    attachments: &[StoredAttachment],
+) -> String {
     if attachments.is_empty() {
         return String::new();
     }
@@ -212,13 +216,13 @@ pub fn render_for_model(config: &Config, user_id: &str, attachments: &[StoredAtt
         ));
         let extension = allowed_extension(&attachment.filename).unwrap_or_default();
         if IMAGE_EXTENSIONS.contains(&extension.as_str()) {
-            out.push_str("  (image: not viewable by this model path; ask the user to describe it)\n");
+            out.push_str(
+                "  (image: not viewable by this model path; ask the user to describe it)\n",
+            );
             continue;
         }
         // Defence in depth: the stored path must stay under this user's inbox.
-        if !attachment
-            .rel_path
-            .starts_with(&format!("{user_id}/chat/"))
+        if !attachment.rel_path.starts_with(&format!("{user_id}/chat/"))
             || attachment.rel_path.contains("..")
         {
             continue;
@@ -296,11 +300,7 @@ impl Store {
         Ok(out)
     }
 
-    pub fn get_chat_attachment(
-        &self,
-        user_id: &str,
-        id: &str,
-    ) -> Result<Option<StoredAttachment>> {
+    pub fn get_chat_attachment(&self, user_id: &str, id: &str) -> Result<Option<StoredAttachment>> {
         let connection = self.connection()?;
         let record = connection
             .query_row(

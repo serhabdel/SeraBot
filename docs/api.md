@@ -316,7 +316,33 @@ conversation, newest first (at most 100). Each entry is `action_id`, `tool`,
 `hash`, `created_at`, and `filename`/`title` when the artifact sidecar has them.
 Rows come from gateway actions joined to the conversation's turns, so nothing is
 produced outside the approval path. Download the bytes through
-`GET /v1/artifacts/{hash}`.
+`GET /v1/artifacts/{hash}`, which only serves artifacts produced in the caller's
+own conversations (404 otherwise). Entries also carry `mime`.
+
+## Chat files (0.18)
+
+- `POST /v1/conversations/{id}/attachments`: raw file body with an
+  `X-Filename` header. Up to 25 MB; images (png, jpg, gif, webp), PDF, DOCX,
+  XLSX, PPTX, TXT, MD, CSV; the content must match the extension; the blocklist
+  is applied to the filename. Stored under the user's own inbox area
+  (`<watch_dir>/<user_id>/chat/<conversation>/`). Returns
+  `{"attachment": {"id", "filename", "mime", "size_bytes", "is_image"}}`.
+- `POST /v1/messages` accepts `"attachments": ["<id>", ...]` (at most 6, the
+  caller's own, unattached, uploaded to that conversation). Text may be empty
+  when attachments are present. The bot receives names, types, sizes, the inbox
+  path (for the document tools), and a bounded extracted text excerpt for TXT,
+  MD, CSV and digital PDFs. Images are stored but not passed to a model yet.
+- `GET /v1/conversations/{id}/messages` adds `attachments` to user messages.
+- `GET /v1/attachments/{id}`: download an own upload.
+
+## Local folders (0.18)
+
+Desktop relay for the `local_list`, `local_read` and `local_write` bot tools
+(`docs/specs/local-folders.md`). `POST /v1/local/poll` (body
+`{"roots": [{"id","label","mode"}], "wait_secs": 0-25}`) registers the desktop's
+allowlisted roots and long-polls for one request; `POST /v1/local/result/{id}`
+answers it; `GET /v1/local/status` reports `online` and the registered roots.
+All three act for the authenticated user only.
 
 ## Memory
 

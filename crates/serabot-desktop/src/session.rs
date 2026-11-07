@@ -493,6 +493,9 @@ impl Drop for TelegramUi {
     }
 }
 
+/// Files chosen in the attachment dialog: bytes, or why one was skipped.
+type PickedFiles = Vec<Result<(String, Vec<u8>), String>>;
+
 /// What to do with a saved artifact once the download completes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingOpen {
@@ -577,7 +580,7 @@ pub struct Session {
     upload_queue: std::collections::VecDeque<(String, Vec<u8>)>,
     /// An upload request is in flight.
     pub uploading: bool,
-    pick_rx: Option<std::sync::mpsc::Receiver<Vec<Result<(String, Vec<u8>), String>>>>,
+    pick_rx: Option<std::sync::mpsc::Receiver<PickedFiles>>,
     /// Toast text from browser/Explorer launches, which run on a helper thread.
     launch_tx: std::sync::mpsc::Sender<String>,
     launch_rx: std::sync::mpsc::Receiver<String>,
@@ -2079,13 +2082,15 @@ impl Session {
                 }
             }
         }
-        if !self.uploading && self.ready() && self.pending.is_none() {
-            if let Some((filename, bytes)) = self.upload_queue.pop_front() {
-                self.uploading = true;
-                self.start_request(Operation::UploadAttachment { filename, bytes });
-                if self.pending.is_none() {
-                    self.uploading = false;
-                }
+        if !self.uploading
+            && self.ready()
+            && self.pending.is_none()
+            && let Some((filename, bytes)) = self.upload_queue.pop_front()
+        {
+            self.uploading = true;
+            self.start_request(Operation::UploadAttachment { filename, bytes });
+            if self.pending.is_none() {
+                self.uploading = false;
             }
         }
     }
@@ -3926,7 +3931,7 @@ fn save_download(filename: &str, bytes: &[u8]) -> Result<String, String> {
 /// Windows file dialog for the paperclip. Names and sizes are checked before
 /// any bytes are read; a bad pick becomes a message, not an upload.
 #[cfg(windows)]
-fn pick_files(room: usize) -> Vec<Result<(String, Vec<u8>), String>> {
+fn pick_files(room: usize) -> PickedFiles {
     let Some(paths) = rfd::FileDialog::new()
         .set_title("Attach files")
         .add_filter("Supported files", crate::ATTACHMENT_EXTENSIONS)
@@ -3972,7 +3977,7 @@ fn pick_folder() -> Option<std::path::PathBuf> {
 }
 
 #[cfg(not(windows))]
-fn pick_files(_room: usize) -> Vec<Result<(String, Vec<u8>), String>> {
+fn pick_files(_room: usize) -> PickedFiles {
     vec![Err("Attachments need the Windows app.".into())]
 }
 

@@ -13,10 +13,11 @@ pub(super) async fn conversation_messages(
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&id)?;
-    let visible =
-        state
-            .store
-            .list_visible_messages(&user.id, &id, query.limit.unwrap_or(100).clamp(1, 200))?;
+    let visible = state.store.list_visible_messages(
+        &user.id,
+        &id,
+        query.limit.unwrap_or(100).clamp(1, 200),
+    )?;
     // Attachment chips for the user messages of these turns (own rows only).
     let turn_ids = visible
         .iter()

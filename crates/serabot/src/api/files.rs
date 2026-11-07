@@ -18,7 +18,9 @@ pub(super) fn routes() -> Router<Arc<ApiState>> {
         // Raw body, read explicitly under the attachment ceiling; the extra
         // 4 KiB lets the handler produce the readable "too large" error.
         .layer(DefaultBodyLimit::max(MAX_ATTACHMENT_BYTES as usize + 4096))
-        .layer(RequestBodyLimitLayer::new(MAX_ATTACHMENT_BYTES as usize + 4096))
+        .layer(RequestBodyLimitLayer::new(
+            MAX_ATTACHMENT_BYTES as usize + 4096,
+        ))
         .route("/v1/attachments/{id}", get(download_attachment))
 }
 
@@ -56,7 +58,11 @@ pub(super) async fn upload_attachment(
         return error.into_response();
     }
     // The blocklist applies to filenames.
-    if state.runtime.scan_owner_output(&user.id, &filename).is_err() {
+    if state
+        .runtime
+        .scan_owner_output(&user.id, &filename)
+        .is_err()
+    {
         return SeraError::PolicyViolation.into_response();
     }
     let limit = MAX_ATTACHMENT_BYTES as usize;
@@ -76,7 +82,14 @@ pub(super) async fn upload_attachment(
                 .into_response();
         }
     };
-    let result = save_upload(&state.config, &state.store, &user.id, &id, &filename, &bytes);
+    let result = save_upload(
+        &state.config,
+        &state.store,
+        &user.id,
+        &id,
+        &filename,
+        &bytes,
+    );
     match result {
         Ok(record) => {
             let _ = state.store.record_audit(
