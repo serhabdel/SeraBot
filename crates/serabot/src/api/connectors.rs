@@ -225,6 +225,15 @@ pub(super) async fn list_connectors(
             });
         }
     }
+    // Composio: a per-user key, so the card reports only this account's state.
+    views.push(json!({
+        "id": "composio",
+        "kind": "api_key_user",
+        "enabled": true,
+        "redirect_uri": Value::Null,
+        "connected": state.composio.connected(&user.id)?,
+        "help_url": crate::composio::HELP_URL,
+    }));
     for view in &mut views {
         let group = view["id"].as_str().map(connector_group).unwrap_or("Other");
         view["group"] = json!(group);
@@ -748,6 +757,7 @@ pub(super) fn connector_group(id: &str) -> &'static str {
         "elevenlabs" => "Voice & Media",
         "tavily" | "firecrawl" => "Web Research",
         "agentmail" => "Email",
+        "composio" => "Apps & tools",
         _ => "Productivity",
     }
 }

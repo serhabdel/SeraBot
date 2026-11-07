@@ -35,6 +35,7 @@ pub mod onboarding;
 pub mod onedrive;
 pub mod orchestration;
 pub mod pdf_ops;
+pub mod composio;
 pub mod personal;
 pub mod policy;
 #[cfg(feature = "pptx")]
