@@ -31,7 +31,10 @@ Step 2. Employee social contributions:
 
 Step 3. Gross taxable salary (SBI) = SBG - employee contributions.
 
-Step 4. Professional deduction (frais professionnels): 25 % of SBI, capped at 2 500 DH per month (30 000 DH per year). Formula: min(SBI x 25 %, 2 500).
+Step 4. Professional deduction (frais professionnels), two tiers, chosen by the annual gross taxable salary (SBI x 12):
+- Annual SBI up to 78 000 DH: 35 %, capped at 30 000 DH per year (2 500 DH per month).
+- Annual SBI above 78 000 DH: 25 %, capped at 35 000 DH per year (about 2 916,67 DH per month).
+The tiers and the caps are à vérifier (BO). Formula: min(SBI x rate, annual cap / 12).
 
 Step 5. Net taxable salary (SNI) = SBI - professional deduction.
 
@@ -50,7 +53,7 @@ Monthly barème (LF 2025 structure, a verifier):
 
 Apply the rate of the band that contains SNI, not a graduated sum. Check the band edges against the official table before rounding.
 
-Step 7. Family deductions = dependants x 41,67 DH per month, up to six dependants (a verifier against the current law; one owner guide still says 30 DH per month).
+Step 7. Family deductions = dependants x 41,67 DH per month, up to six dependants (a verifier against the current law; some sources give 30 DH per month).
 
 Step 8. IR net (withheld) = max(0, IR brut - family deductions).
 
@@ -74,7 +77,9 @@ Inputs: base 8 000 DH, prime de rendement 1 000 DH, 2 dependants.
 1. SBG = 8 000 + 1 000 = 9 000.
 2. CNSS = min(9 000, 6 000) x 4,48 % = 268,80. AMO = 9 000 x 2,26 % = 203,40. Total = 472,20.
 3. SBI = 9 000 - 472,20 = 8 527,80.
-4. Professional deduction = min(8 527,80 x 25 %, 2 500) = min(2 131,95, 2 500) = 2 131,95.
+4. Annual SBI = 8 527,80 x 12 = 102 333,60, above 78 000, so 25 %. Professional deduction = min(8 527,80 x 25 %, 35 000 / 12) = min(2 131,95, 2 916,67) = 2 131,95.
+
+Variant at a lower salary (synthetic): SBI 5 000 per month, annual 60 000, so 35 %. Deduction = min(5 000 x 35 %, 30 000 / 12) = min(1 750, 2 500) = 1 750.
 5. SNI = 8 527,80 - 2 131,95 = 6 395,85.
 6. Band 5 001 to 6 667 at 20 %. IR brut = 6 395,85 x 20 % - 833,33 = 1 279,17 - 833,33 = 445,84.
 7. Family deductions = 2 x 41,67 = 83,34.
@@ -89,7 +94,7 @@ Check the answer in this order: the band of SNI first, then the ceiling on the p
 
 - Using the 6 000 ceiling on the AMO. The AMO is on the whole salary; the CNSS is capped.
 - Applying 25 % to SBG instead of SBI. The professional deduction comes after the employee contributions.
-- Forgetting the 2 500 DH cap on the professional deduction for higher salaries.
+- Using one tier for every salary. The 35 % tier applies only up to an annual taxable gross of 78 000 DH. The caps (30 000 and 35 000 DH per year) are à vérifier (BO).
 - Mixing monthly and annual barèmes. Payroll uses the monthly table; the annual table is for the yearly return.
 - Treating an exempt allowance as taxable, or the reverse. Check the exemption ceilings first.
 - Negative IR. Family deductions reduce the tax but never below zero; the surplus is not refunded in the payslip.

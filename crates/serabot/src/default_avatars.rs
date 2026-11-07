@@ -11,9 +11,8 @@
 /// Content type of every bundled default.
 pub const DEFAULT_AVATAR_MIME: &str = "image/png";
 
-/// The `avatar_version` the bot list reports for a bundled default. The
-/// images only change with a release, so one fixed stamp is enough.
-pub const DEFAULT_AVATAR_VERSION: &str = "bundled";
+/// Prefix of the `avatar_version` stamp for a bundled default.
+pub const DEFAULT_AVATAR_VERSION_PREFIX: &str = "bundled-";
 
 const MAIN: &[u8] = include_bytes!("../assets/brand/apple-touch-icon-180.png");
 const ANALYST: &[u8] = include_bytes!("../assets/bots/analyst.png");
@@ -48,6 +47,15 @@ pub fn default_avatar(bot: &str) -> Option<&'static [u8]> {
     })
 }
 
+/// The `avatar_version` stamp for a bot's bundled default: the release prefix
+/// plus a short hash of the image bytes, so a changed picture revalidates
+/// caches and the console refetches it.
+pub fn default_avatar_version(bot: &str) -> Option<String> {
+    let bytes = default_avatar(bot)?;
+    let digest = crate::util::sha256_hex(bytes);
+    Some(format!("{DEFAULT_AVATAR_VERSION_PREFIX}{}", &digest[..16]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +87,15 @@ mod tests {
             let bytes = default_avatar(name).unwrap();
             assert_eq!(png_dimensions(bytes), (256, 256), "{name}");
         }
+    }
+
+    #[test]
+    fn version_stamps_are_stable_and_change_with_the_image() {
+        let analyst = default_avatar_version("analyst").unwrap();
+        assert!(analyst.starts_with(DEFAULT_AVATAR_VERSION_PREFIX));
+        assert_eq!(default_avatar_version("analyst").unwrap(), analyst);
+        assert_ne!(default_avatar_version("legal").unwrap(), analyst);
+        assert!(default_avatar_version("recruiter").is_none());
     }
 
     #[test]

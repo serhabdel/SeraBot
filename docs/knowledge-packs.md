@@ -2,7 +2,7 @@
 
 A knowledge pack is a set of owner-held reference documents that the comptable
 bot can cite. The repository ships only the synthetic skills under `skills/`.
-Your own reference guides, such as HielCompta-style notes, stay in your own
+Your own reference guides, such as your own accounting notes, stay in your own
 document store and never enter the repository.
 
 Examples below use synthetic paths and names.

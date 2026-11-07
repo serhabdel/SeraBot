@@ -130,7 +130,7 @@ fn BotForm(session: Signal<Session>, id: String) -> Element {
             s.bot_settings.hydrated,
             s.bot_settings.error.clone(),
             s.bot_settings.notice.clone(),
-            // "bundled" is the server's stamp for a shipped default picture:
+            // "bundled-" is the server's stamp for a shipped default picture:
             // there is nothing of the owner's to remove.
             s.state
                 .listed_bots
@@ -139,7 +139,7 @@ fn BotForm(session: Signal<Session>, id: String) -> Element {
                 .is_some_and(|bot| {
                     bot.avatar_version
                         .as_deref()
-                        .is_some_and(|version| version != "bundled")
+                        .is_some_and(|version| !version.starts_with("bundled-"))
                 }),
             s.bot_avatar(&id),
         )

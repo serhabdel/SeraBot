@@ -74,7 +74,7 @@ Worked example (continuing the balance sheet above; current assets 340 000, curr
 
 Worked example: turnover HT 1 000 000 (TTC 1 200 000 at 20 %); client receivables 150 000. DSO = 150 000 / 1 200 000 x 360 = 45 days. Purchases HT 600 000 (TTC 720 000); supplier payables 110 000. DPO = 110 000 / 720 000 x 360 = 55 days. A DPO longer than the DSO means suppliers finance part of the cycle.
 
-Use 360 days for these ratios, as the owner's guides do, and say so.
+Use 360 days for these ratios, as several accounting references do, and say so.
 
 ## 5. Intermediate management balances (SIG)
 

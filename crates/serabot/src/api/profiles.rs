@@ -6,7 +6,7 @@ use axum::extract::DefaultBodyLimit;
 
 use super::*;
 use crate::avatar::{self, AVATAR_MIME, MAX_UPLOAD_BYTES};
-use crate::default_avatars::{DEFAULT_AVATAR_MIME, DEFAULT_AVATAR_VERSION, default_avatar};
+use crate::default_avatars::{DEFAULT_AVATAR_MIME, default_avatar, default_avatar_version};
 use crate::onboarding::{self, Drafter, Interview, Line, Proposal, Stage};
 use crate::profiles::{OnboardingRow, StoredAvatar};
 
@@ -203,7 +203,7 @@ pub(super) async fn get_bot_avatar(
     Ok(image_response(StoredAvatar {
         mime: DEFAULT_AVATAR_MIME.to_owned(),
         data: data.to_vec(),
-        updated_at: DEFAULT_AVATAR_VERSION.to_owned(),
+        updated_at: default_avatar_version(&id).unwrap_or_default(),
     }))
 }
 

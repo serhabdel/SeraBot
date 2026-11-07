@@ -20,7 +20,7 @@ The owner's own chart of accounts may differ from this summary. When a code is m
 | 3 | Actif circulant (hors trésorerie) | Stocks (31), receivables (34), securities (35) |
 | 4 | Passif circulant (hors trésorerie) | Operating liabilities (44): suppliers, payroll, social bodies, tax, VAT |
 | 5 | Trésorerie | Bank (514), cash (516) |
-| 6 | Charges | Operating (61), financial (63), non-current (65), tax on profit (see section 6) |
+| 6 | Charges | Operating (61), financial (63), non-current (65), tax on profit (6701 Impôts sur les résultats, à vérifier) |
 | 7 | Produits | Operating (71), financial (73), non-current (75) |
 | 8 | Comptes de résultats et spéciaux | Result subtotals (81 to 88), closing accounts |
 
@@ -50,7 +50,7 @@ Rule of thumb: a debit increases an asset or a charge; a credit increases a liab
 
 ### Payroll and social bodies
 - 4432 Rémunérations dues au personnel. 4433 Dépôts du personnel. 4434 Oppositions sur salaires.
-- 4441 Caisse nationale de sécurité sociale (CNSS).
+- 4441 Sécurité sociale: CNSS, AMO and taxe de formation professionnelle, all collected through CNSS.
 - 4443 Caisses de retraite. 4445 Mutuelles.
 
 ### Tax accounts
@@ -71,7 +71,7 @@ Rule of thumb: a debit increases an asset or a charge; a credit increases a liab
 - 6191 Dotations aux amortissements des non-valeurs.
 - 6311 Intérêts des emprunts et dettes. 6331 Pertes de change.
 - Depreciation and provision charges for tangible and intangible assets, and operating provisions: codes to confirm with the owner's plan (a verifier, often in 619 and 659).
-- Income tax on profit: charge account in the owner's plan (a verifier; often under 67 or 65 in the CGNC structure).
+- Income tax on profit: 6701 Impôts sur les résultats (à vérifier).
 
 ### Income (class 7)
 - 7111 Ventes de marchandises au Maroc. 7121 Ventes de biens produits. 7124 Ventes de services produits au Maroc.
@@ -118,11 +118,9 @@ Gross salary 9 000. Employee deductions: CNSS 268,80 (4,48 % on the 6 000 ceilin
 - Debit 6171 Rémunération du personnel: 9 000.
 - Debit employer charges account (class 61 social charges, a verifier): 1 628,70.
 - Credit 4432 Rémunérations dues: 8 165,30 (cleared later by debit 4432, credit 5141 on payment).
-- Credit 4441 CNSS: 1 383,60 (employee 268,80 + employer 538,80 + allowances 576,00).
-- Credit 4445 or the AMO account in the owner's plan (a verifier): 573,30 (employee 203,40 + employer 369,90).
-- Credit 4441 or the training account (a verifier): 144,00.
+- Credit 4441 Sécurité sociale: 2 100,90 (CNSS 1 383,60 + AMO 573,30 + taxe de formation professionnelle 144,00).
 - Credit 4452 État, impôts et taxes: IR withheld 362,50.
-Check: debits 10 628,70 equal credits 8 165,30 + 1 383,60 + 573,30 + 144,00 + 362,50 = 10 628,70.
+Check: debits 10 628,70 equal credits 8 165,30 + 2 100,90 + 362,50 = 10 628,70.
 
 ### 3.7 Depreciation, straight line
 Asset 60 000 HT, 5 years, acquired at the start of the year. Rate 20 % per year.
@@ -131,7 +129,7 @@ Asset 60 000 HT, 5 years, acquired at the start of the year. Rate 20 % per year.
 
 ### 3.8 Depreciation, declining balance (degressif)
 Use only where the tax rules allow it, and track the difference with the straight line for the tax adjustment (amortissement dérogatoire, account 1351).
-- Rate = linear rate x tax coefficient. Coefficients per the owner's guide: 1,5 (3 to 4 years), 2 (5 to 6 years), and 3 for over 6 years (a verifier; some sources give 2,5).
+- Rate = linear rate x tax coefficient. Coefficients as stated in some references: 1,5 (3 to 4 years), 2 (5 to 6 years), and 3 for over 6 years (à vérifier; other sources give 2,5).
 - Annuity = net book value at the start of the year x degressive rate.
 
 ### 3.9 Provisions for risks and for depreciation
@@ -149,7 +147,7 @@ Use only where the tax rules allow it, and track the difference with the straigh
 
 ## 4. Liasse fiscale: what the tables cover
 
-The liasse for a company is made of financial statements and annex tables. The owner's guides describe about fifteen to twenty tables. Check the current model before filling any box. The bot may summarise a table from the owner's data but must not invent a box number.
+The liasse for a company is made of financial statements and annex tables. Secondary references describe about fifteen to twenty tables. Check the current model before filling any box. The bot may summarise a table from the owner's data but must not invent a box number.
 
 Financial statements (états de synthèse):
 - Bilan: actif (gross, depreciation, net), passif (equity, debts, current liabilities).
@@ -173,7 +171,7 @@ Filing: electronic only, through the DGI portal. Deadline and penalties: see the
 - Every entry balances. Post in the right fiscal year.
 - Invoice reference, supplier or customer ICE, and date are on the document. Do not post without them.
 - VAT rate matches the product. Check the rate with ma-tax-2026.
-- Payments of 10 000 DH or more are traced by bank transfer, cheque, card, or a bill of exchange, otherwise the VAT deduction is at risk (a verifier).
+- Payments above 5 000 DH par jour et par fournisseur (à vérifier) must be made by traceable means (bank transfer, cheque, card, or bill of exchange), otherwise the VAT deduction is at risk.
 - No account is created for a person without the owner's confirmation.
 - Recurring entries (rent, depreciation, provisions) are listed in a schedule and reconciled each month.
 

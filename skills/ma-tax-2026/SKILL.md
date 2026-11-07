@@ -58,7 +58,7 @@ Typical déductions (subtract):
 ### 1.3 Tax amount and the CSS surcharge
 
 - IS brut = résultat fiscal × taux applicable.
-- CSS (contribution sociale de solidarité) applies when the net profit is 1 000 000 DH or more. Bands in the owner's guides: 1,5 % (1 to 5 MDH), 2,5 % (5 to 10 MDH), 3,5 % (10 to 40 MDH), 5 % (above 40 MDH). Extension to 2028 is reported (a verifier). Confirm whether the band applies to the whole profit or by slice.
+- CSS (contribution sociale de solidarité) applies when the net profit is 1 000 000 DH or more. Bands in several secondary sources: 1,5 % (1 to 5 MDH), 2,5 % (5 to 10 MDH), 3,5 % (10 to 40 MDH), 5 % (above 40 MDH). Extension to 2028 is reported (a verifier). Confirm whether the band applies to the whole profit or by slice.
 - Total = IS brut + CSS.
 - Solde à payer = total - acomptes provisionnels versés.
 
@@ -81,11 +81,11 @@ Worked example (synthetic): turnover 8 000 000 DH, financial income 50 000 DH, l
 
 - Exercice clos au 31 décembre: the liasse fiscale is filed electronically through the DGI portal by 31 March of the following year (a verifier against the current circular).
 - Fiscal year ends that are not 31 December have a different deadline, three months after closing (a verifier).
-- Missing filing carries a minimum fine (the owner's guide says 2 000 DH, a verifier). Late filing and inaccuracies carry surcharges. Do not quote a surcharge percentage without the article.
+- Missing filing carries a minimum fine (some sources say 2 000 DH, à vérifier). Late filing and inaccuracies carry surcharges. Do not quote a surcharge percentage without the article.
 
 ## 2. Income tax (IR)
 
-### 2.1 Annual barème (LF 2025 structure, applied to 2026 by the owner's guides; a verifier)
+### 2.1 Annual barème (LF 2025 structure, applied to 2026 by some secondary sources; à vérifier)
 
 | Annual net taxable income (DH) | Rate | Somme à déduire (DH) |
 |---|---|---|
@@ -102,7 +102,7 @@ Monthly barème (used for payroll withholding): 0 to 3 333 at 0 %; 3 334 to 5 00
 
 ### 2.2 Family deductions (charges de famille)
 
-- Owner guide, 2025 law: 500 DH per year per dependant, about 41,67 DH per month, up to six dependants (a verifier). One owner guide still says 30 DH per month; flag the conflict and do not choose silently.
+- Some sources (2025 law): 500 DH per year per dependant, about 41,67 DH per month, up to six dependants (à vérifier). Other sources still give 30 DH per month; flag the conflict and do not choose silently.
 - Show the number of dependants and the result. The deduction cannot make the tax negative.
 
 ### 2.3 Professional income
@@ -122,7 +122,7 @@ Monthly barème (used for payroll withholding): 0 to 3 333 at 0 %; 3 334 to 5 00
 | 7 % | Some essential goods and services, such as certain medicines and water (a verifier). |
 | 0 % | Exports and certain goods with a zero rate, such as some basic foods (a verifier). |
 
-Owner guides describe a convergence to 10 % and 20 % by 2026. Sources disagree on individual items, for example the electricity rate. Treat the convergence as a verifier item and check each product against the CGI list before answering.
+Some secondary sources describe a convergence to 10 % and 20 % by 2026. Sources disagree on individual items, for example the electricity rate. Treat the convergence as a verifier item and check each product against the CGI list before answering.
 
 ### 3.2 Monthly computation
 
@@ -130,7 +130,7 @@ Owner guides describe a convergence to 10 % and 20 % by 2026. Sources disagree o
 - TVA déductible = purchase VAT on invoices that qualify.
 - TVA à payer = collectée - déductible. A negative result is a credit carried forward.
 
-Deduction conditions: a regular invoice showing the supplier's ICE, goods or services used for the business, and a traceable payment for amounts at or above 10 000 DH (a verifier). Cash payments above the threshold disallow the deduction.
+Deduction conditions: a regular invoice showing the supplier's ICE, goods or services used for the business, and a traceable payment for amounts above 5 000 DH par jour et par fournisseur (à vérifier). Cash payments above the threshold disallow the deduction.
 
 ### 3.3 Prorata of deduction
 
@@ -141,13 +141,13 @@ Deduction conditions: a regular invoice showing the supplier's ICE, goods or ser
 ### 3.4 Adjustment on capital goods
 
 - Movable goods: VAT adjustment over 5 years. Formula: VAT initial x (5 - full years held) / 5.
-- Buildings: 10 years (owner guides; a verifier against the CGI).
+- Buildings: 10 years (some sources; a verifier against the CGI).
 - Only complete years count. The adjustment is declared in the return for the month of disposal.
 
 ### 3.5 Filing and payment
 
 - Monthly or quarterly return depending on the regime (a verifier).
-- The owner guide says payment by the end of the following month; confirm the exact date in the current DGI calendar before quoting it.
+- Some sources say payment by the end of the following month; confirm the exact date in the current DGI calendar before quoting it.
 
 ### 3.6 Withholding of VAT (retenue à la source TVA)
 

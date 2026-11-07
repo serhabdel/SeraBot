@@ -133,7 +133,12 @@ async fn bundled_default_avatar_falls_back_and_yields_to_an_upload() {
         .iter()
         .find(|bot| bot["id"] == "analyst")
         .unwrap();
-    assert_eq!(bot["avatar_version"], "bundled");
+    assert!(
+        bot["avatar_version"]
+            .as_str()
+            .unwrap()
+            .starts_with(crate::default_avatars::DEFAULT_AVATAR_VERSION_PREFIX)
+    );
 
     let upload = synthetic(ImageFormat::Png, 64, 48);
     let put = put_bytes(&app, &token, "/v1/bots/analyst/avatar", upload).await;
