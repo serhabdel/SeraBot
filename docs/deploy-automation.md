@@ -76,6 +76,10 @@ Setup commands:
 
 ```bash
 sudo useradd -m -s /bin/bash deploy
+# sshd refuses a locked account even when the login is certificate-only, and
+# useradd leaves the password field as "!". "*" means "no password" without
+# being locked, so password auth stays impossible while cert auth works.
+sudo usermod -p '*' deploy
 sudo useradd -r -M -s /usr/sbin/nologin deployca
 sudo install -d -m 0755 /opt/serabot-deploy
 sudo install -m 0644 deploy/deploy-ca.py deploy/deploy.sh deploy/sshd_config.deploy /opt/serabot-deploy/
