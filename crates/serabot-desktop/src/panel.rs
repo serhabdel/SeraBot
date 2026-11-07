@@ -617,6 +617,9 @@ fn profile_error_text(error: &ApiError) -> String {
 /// What went wrong, in everyday words.
 fn connector_error_text(error: &ApiError) -> String {
     match error {
+        // Written for the user by the server (for example GitHub rejected the
+        // token), so shown as is.
+        ApiError::Coded { code, message, .. } if code.starts_with("connector_") => message.clone(),
         ApiError::Http(409) => {
             "Not set up yet. Ask your admin to finish the setup, then try again.".into()
         }

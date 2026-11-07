@@ -130,6 +130,18 @@ pub const CAPABILITIES: &[Capability] = &[
         ],
     },
     Capability {
+        label: "Use GitHub",
+        hint: "Search repositories and read issues and files. Opening issues and comments ask you first.",
+        tools: &[
+            "github_search_repos",
+            "github_list_issues",
+            "github_get_issue",
+            "github_create_issue",
+            "github_comment_issue",
+            "github_get_file",
+        ],
+    },
+    Capability {
         label: "Work with folders on this PC",
         hint: "Read, and with your approval write, folders you allow in Settings.",
         tools: &["local_list", "local_read", "local_write"],

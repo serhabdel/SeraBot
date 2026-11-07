@@ -46,6 +46,8 @@ pub const DESTRUCTIVE_TOOLS: &[&str] = &[
     "telegram_send_document",
     "onedrive_upload",
     "local_write",
+    "github_create_issue",
+    "github_comment_issue",
 ];
 
 /// Audit reason recorded when the owner's YOLO setting approved a call.
@@ -1775,6 +1777,8 @@ mod tests {
             "telegram_send_document",
             "onedrive_upload",
             "local_write",
+            "github_create_issue",
+            "github_comment_issue",
         ] {
             assert!(is_destructive_tool(name), "{name}");
         }
@@ -1784,6 +1788,8 @@ mod tests {
             "browser_type",
             "browser_press",
             "firecrawl_search",
+            "github_search_repos",
+            "github_get_file",
             "memory_save",
             "pdf_edit",
         ] {

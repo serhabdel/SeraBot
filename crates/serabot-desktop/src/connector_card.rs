@@ -15,6 +15,35 @@ use crate::{ConnectorStatus, PersonalStatus};
 pub const NOTION_HELP_URL: &str = "https://www.notion.so/profile/integrations";
 /// One line telling a Notion user what to do after connecting.
 pub const NOTION_SHARE_HINT: &str = "Then share each page you want your bots to use with the integration (open the page, choose the \u{2026} menu, then Connections).";
+/// What a pasted-token card says: the field name, where the user creates the
+/// token, and one line on what to do. Fixed in the console; the server never
+/// supplies a link the console opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenHelp {
+    pub label: &'static str,
+    pub url: &'static str,
+    pub hint: &'static str,
+}
+
+/// Help for the connectors that connect with a pasted token.
+pub fn token_help(id: &str) -> Option<TokenHelp> {
+    Some(match id {
+        "notion" => TokenHelp {
+            label: "Integration token",
+            url: NOTION_HELP_URL,
+            hint: NOTION_SHARE_HINT,
+        },
+        "github" => TokenHelp {
+            label: "Fine-grained token",
+            url: GITHUB_HELP_URL,
+            hint: "Limit it to the repositories you want. Give it Issues (read and write) and Contents (read).",
+        },
+        _ => return None,
+    })
+}
+
+/// Where a GitHub user creates a fine-grained personal access token.
+pub const GITHUB_HELP_URL: &str = "https://github.com/settings/personal-access-tokens/new";
 /// Shown when the server gave no admin hint.
 pub const DEFAULT_ADMIN_HINT: &str = "Ask your admin to set this up.";
 
@@ -155,6 +184,25 @@ mod tests {
             personal,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn token_connectors_have_fixed_https_help_links() {
+        for id in ["notion", "github"] {
+            let help = token_help(id).expect(id);
+            assert!(help.url.starts_with("https://"), "{id}");
+            assert!(!help.label.is_empty() && !help.hint.is_empty(), "{id}");
+        }
+        assert!(token_help("gmail").is_none());
+        let mut github = personal("ready");
+        github.methods = vec!["token".into()];
+        assert_eq!(
+            personal_card_state(&github, None),
+            CardState::Connect {
+                oauth: false,
+                token: true
+            }
+        );
     }
 
     #[test]

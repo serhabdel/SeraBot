@@ -74,3 +74,35 @@ Docs: [agentmail.to/docs](https://www.agentmail.to/docs/api-reference). Send nee
 
 Specialist scaffolds may list these tools. OAuth reads and both AgentMail tools
 are in the external-effect list, so a scaffold puts them in `require_approval`.
+
+## Personal token connectors (GitHub, Todoist, Slack, Exa)
+
+These connect with a token each user pastes in the console, like Notion. The
+server verifies it with one cheap read, seals it in the per-user credential
+store, and never shows it again. Tools always run as the acting user with that
+user's own token; a user who has not connected gets a "connect it first" answer
+and never anyone else's access. The API bases live under `[token_connectors]`
+(`github_api_base`, `todoist_api_base`, `slack_api_base`, `exa_api_base`,
+`timeout_secs`, `max_response_bytes`). Bases must be HTTPS. Every tool goes
+through the gateway, results are untrusted data, responses are size capped, and
+the token is redacted from all output. A `401` shows "<name> rejected your
+token" without echoing it. Writes ask for approval and the approval is bound
+to where the effect lands (the repository, the channel, the task).
+
+### GitHub
+
+Tools: `github_search_repos`, `github_list_issues`, `github_get_issue`,
+`github_get_file` (read) and `github_create_issue`, `github_comment_issue`
+(write, approval).
+
+1. Open <https://github.com/settings/personal-access-tokens/new> and create a
+   **fine-grained personal access token**.
+2. Under **Repository access**, choose only the repositories your bots need.
+3. Under **Repository permissions**, set **Issues: Read and write** and
+   **Contents: Read-only** (Metadata read is added automatically). Leave the
+   rest at No access. Drop Issues to read-only if bots should never write.
+4. Generate it, copy it, and paste it into the GitHub card in Connectors.
+
+Search results are paged (30 per page at most, 10 pages), files over 200 KB are
+refused, and file text is cut at 20,000 characters. The REST API version header
+is pinned to `2022-11-28`.

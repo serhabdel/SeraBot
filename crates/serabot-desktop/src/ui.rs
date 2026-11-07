@@ -319,6 +319,12 @@ fn capability_label(tool: &str) -> Option<&'static str> {
         | "elevenlabs_generate_image"
         | "elevenlabs_generate_video" => Some("Voice and media"),
         "onedrive_upload" | "onedrive_list" => Some("OneDrive files"),
+        "github_search_repos"
+        | "github_list_issues"
+        | "github_get_issue"
+        | "github_create_issue"
+        | "github_comment_issue"
+        | "github_get_file" => Some("GitHub"),
         "skill_list" | "skill_search" | "skill_load" => Some("Skills"),
         "delegate" => Some("Team handoffs"),
         _ => None,
