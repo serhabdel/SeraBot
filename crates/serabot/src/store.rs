@@ -2619,6 +2619,20 @@ impl Store {
             .optional()?)
     }
 
+    /// Ids of the acting user's turns in this conversation that are still
+    /// running. Turns waiting on an approval or already finished are not
+    /// returned, and another user's turns never match.
+    pub fn running_turn_ids(&self, user_id: &str, conversation_id: &str) -> Result<Vec<String>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id FROM turns WHERE user_id = ?1 AND conversation_id = ?2 AND status = 'active'",
+        )?;
+        let ids = statement
+            .query_map(params![user_id, conversation_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(ids)
+    }
+
     pub fn update_turn(&self, user_id: &str, id: &str, status: &str, state: &Value) -> Result<()> {
         let connection = self.connection()?;
         connection.execute(

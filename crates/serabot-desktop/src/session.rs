@@ -576,6 +576,18 @@ pub struct Session {
     folder_pick_rx: Option<std::sync::mpsc::Receiver<Option<(std::path::PathBuf, bool)>>>,
     /// Files already uploaded and attached to the composer draft.
     pub composer_files: Vec<crate::AttachmentInfo>,
+    /// Text drafts per conversation, kept while the app runs (0.19).
+    pub drafts: crate::chat_compose::Drafts,
+    /// Why some files were refused, shown under the composer.
+    pub attach_notice: Option<String>,
+    /// Picture previews by attachment id (small images only).
+    pub attachment_thumbs: std::collections::HashMap<String, String>,
+    /// Preview of the upload in flight, kept until its reply lands.
+    upload_thumb: Option<String>,
+    /// The sent message is a regeneration of an earlier one.
+    pub regenerating: bool,
+    /// A stop was asked for while a request was in flight.
+    stop_queued: bool,
     /// Picked files waiting for upload, one request at a time.
     upload_queue: std::collections::VecDeque<(String, Vec<u8>)>,
     /// An upload request is in flight.
@@ -716,6 +728,12 @@ impl Session {
             local_notice: None,
             folder_pick_rx: None,
             composer_files: Vec::new(),
+            drafts: crate::chat_compose::Drafts::default(),
+            attach_notice: None,
+            attachment_thumbs: std::collections::HashMap::new(),
+            upload_thumb: None,
+            regenerating: false,
+            stop_queued: false,
             upload_queue: std::collections::VecDeque::new(),
             uploading: false,
             pick_rx: None,
@@ -885,6 +903,7 @@ impl Session {
         self.composer.zeroize();
         // Attachments belong to the conversation they were uploaded to.
         self.composer_files.clear();
+        self.attach_notice = None;
         self.upload_queue.clear();
         self.uploading = false;
         self.pending = None;
@@ -1596,6 +1615,8 @@ impl Session {
         if !valid_id(&id) {
             return;
         }
+        // The draft of the conversation being left waits for its return.
+        self.drafts.store(&self.conversation, &self.composer);
         self.conversation = id;
         self.section = Section::Chat;
         self.panel.set_page_open(false);
@@ -1610,6 +1631,7 @@ impl Session {
                 .as_ref()
                 .is_some_and(|c| !c.providers.is_empty());
         self.reset_scope(true);
+        self.composer = self.drafts.restore(&self.conversation);
         self.state.error = None;
         self.refreshing = true;
         self.poll_paused = false;
@@ -1911,6 +1933,9 @@ impl Session {
         self.state.error = None;
         self.state.activity.clear();
         let text = std::mem::take(&mut self.composer);
+        self.drafts.clear(&self.conversation);
+        self.attach_notice = None;
+        self.regenerating = false;
         let files = std::mem::take(&mut self.composer_files);
         self.state.messages.push(Message {
             id: format!("opt-{}", Instant::now().elapsed().as_nanos()),
@@ -2067,6 +2092,98 @@ impl Session {
     /// on the server and is never sent to the bot).
     pub fn remove_attachment(&mut self, id: &str) {
         self.composer_files.retain(|file| file.id != id);
+        self.attach_notice = None;
+    }
+
+    /// Admit files from a drop, a paste or the picker against the draft's
+    /// limits. Admitted files join the upload queue; refused ones are named
+    /// in `attach_notice` under the composer.
+    pub fn queue_files(&mut self, files: Vec<(String, Vec<u8>)>) {
+        let held = crate::chat_compose::Held {
+            count: self.composer_files.len() + self.upload_queue.len(),
+            bytes: self
+                .composer_files
+                .iter()
+                .map(|file| file.size_bytes)
+                .sum::<u64>()
+                + self
+                    .upload_queue
+                    .iter()
+                    .map(|(_, bytes)| bytes.len() as u64)
+                    .sum::<u64>(),
+        };
+        let sizes: Vec<(&str, u64)> = files
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.len() as u64))
+            .collect();
+        let admission = crate::chat_compose::admit_files(held, &sizes);
+        let accepted: std::collections::HashSet<usize> =
+            admission.accepted.iter().copied().collect();
+        self.attach_notice = (!admission.refused.is_empty()).then(|| admission.refused.join(" "));
+        for (index, file) in files.into_iter().enumerate() {
+            if accepted.contains(&index) {
+                self.upload_queue.push_back(file);
+            }
+        }
+    }
+
+    /// Keep a picture preview for an uploaded file. Only the most recent few
+    /// are kept, so a long session cannot grow the previews without bound.
+    fn remember_thumb(&mut self, id: String, url: String) {
+        if self.attachment_thumbs.len() >= 24 {
+            self.attachment_thumbs.clear();
+        }
+        self.attachment_thumbs.insert(id, url);
+    }
+
+    /// The Stop button: ask the server to end this conversation's running
+    /// reply. When another request holds the slot, the stop waits for it.
+    pub fn stop_turn(&mut self) {
+        if self
+            .state
+            .task
+            .as_ref()
+            .is_none_or(|task| task.status.terminal())
+        {
+            return;
+        }
+        self.stop_queued = true;
+        self.flush_stop();
+    }
+
+    /// Send a queued stop once the request slot is free, or drop it when the
+    /// turn has already finished.
+    fn flush_stop(&mut self) {
+        if !self.stop_queued {
+            return;
+        }
+        let running = self
+            .state
+            .task
+            .as_ref()
+            .is_some_and(|task| !task.status.terminal());
+        if !running {
+            self.stop_queued = false;
+        } else if self.ready() {
+            self.stop_queued = false;
+            self.start_request(Operation::StopTurn);
+        }
+    }
+
+    /// Put a sent message back in the composer so it can be edited and sent.
+    pub fn edit_text(&mut self, text: String) {
+        self.composer = text;
+    }
+
+    /// Send the owner's last message again to the same bot. The new message
+    /// is marked as a regeneration while it is pending.
+    pub fn regenerate(&mut self, text: String) {
+        self.composer = text;
+        self.submit();
+        self.regenerating =
+            self.state.messages.last().is_some_and(|message| {
+                message.role == Role::User && message.id.starts_with("opt-")
+            });
     }
 
     /// Drain the file picker and feed the upload queue one request at a time.
@@ -2075,12 +2192,14 @@ impl Session {
             && let Ok(picked) = receiver.try_recv()
         {
             self.pick_rx = None;
+            let mut files = Vec::new();
             for item in picked {
                 match item {
-                    Ok(file) => self.upload_queue.push_back(file),
+                    Ok(file) => files.push(file),
                     Err(message) => self.toast = Some(message),
                 }
             }
+            self.queue_files(files);
         }
         if !self.uploading
             && self.ready()
@@ -2088,9 +2207,11 @@ impl Session {
             && let Some((filename, bytes)) = self.upload_queue.pop_front()
         {
             self.uploading = true;
+            self.upload_thumb = crate::chat_compose::thumbnail_data_url(&filename, &bytes);
             self.start_request(Operation::UploadAttachment { filename, bytes });
             if self.pending.is_none() {
                 self.uploading = false;
+                self.upload_thumb = None;
             }
         }
     }
@@ -2180,6 +2301,7 @@ impl Session {
         self.poll_telegram();
         self.poll_download();
         self.poll_attachments();
+        self.flush_stop();
         self.poll_folder_pick();
         self.sync_local_agent();
         self.poll_launches();
@@ -2543,9 +2665,15 @@ impl Session {
                             self.state.error = None;
                             self.schedule(Operation::ChatPlan, Duration::ZERO);
                         }
+                        OperationKind::StopTurn => {
+                            // The reply keeps running; Stop can be pressed again.
+                            self.toast = Some(format!("Could not stop the reply: {message}"));
+                            self.state.error = None;
+                        }
                         OperationKind::Attach => {
                             // A rejected file never blocks the composer.
                             self.uploading = false;
+                            self.upload_thumb = None;
                             self.toast = Some(format!("Attachment failed: {message}"));
                             self.state.error = None;
                         }
@@ -2598,6 +2726,9 @@ impl Session {
                     // Capture the ack before the state consumes the reply.
                     if let Reply::Attached(file) = reply {
                         self.uploading = false;
+                        if let Some(url) = self.upload_thumb.take() {
+                            self.remember_thumb(file.id.clone(), url);
+                        }
                         if self.composer_files.len() < crate::MAX_ATTACHMENTS {
                             self.composer_files.push(file);
                         }
@@ -3653,6 +3784,7 @@ impl Session {
             );
             return;
         }
+        self.drafts.store(&self.conversation, &self.composer);
         self.conversation = created.id.clone();
         self.section = Section::Chat;
         self.reset_scope(true);

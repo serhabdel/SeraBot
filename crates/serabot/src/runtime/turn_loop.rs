@@ -383,6 +383,43 @@ impl Runtime {
         Ok(())
     }
 
+    /// End a turn the owner stopped. The reply is one short line; no further
+    /// model or tool step runs. Tool calls that already finished keep their
+    /// results, and nothing that had an external effect is retried.
+    async fn finish_stopped(
+        &self,
+        task: &Task,
+        turn: &Turn,
+        state: &TurnState,
+        conversation_id: &str,
+    ) -> Result<TurnOutcome> {
+        let user = task.user_id.clone();
+        self.clear_stop(&turn.id);
+        let text = "Stopped.";
+        self.notifier
+            .send_text(&user, conversation_id, text)
+            .await?;
+        self.record_assistant(&user, conversation_id, turn, text, false)?;
+        self.store
+            .update_turn(&user, &turn.id, "stopped", &serde_json::to_value(state)?)?;
+        self.store.record_audit(
+            &user,
+            "turn.stopped",
+            None,
+            Some(&task.id),
+            None,
+            None,
+            Some(self.gateway.policy().version()),
+            Some(&json!({"turn_id": turn.id})),
+        )?;
+        self.store.append_event(
+            &user,
+            "turn.completed",
+            &json!({"turn_id": turn.id, "task_id": task.id, "stopped": true}),
+        )?;
+        Ok(TurnOutcome::Completed)
+    }
+
     async fn advance(
         &self,
         task: &Task,
@@ -444,6 +481,11 @@ impl Runtime {
             if self.shutdown.is_cancelled() {
                 return Err(SeraError::Internal("shutting down".into()));
             }
+            if self.stop_requested(&turn.id) {
+                return self
+                    .finish_stopped(task, turn, &state, conversation_id)
+                    .await;
+            }
             let route = self.checked_route(&user, &state.route)?;
             self.scan_model_messages(&user, &state.messages)?;
             self.gateway
@@ -470,6 +512,12 @@ impl Runtime {
                 })),
             )?;
             let assistant = response.message;
+            // A stop that arrived during the model call discards its answer.
+            if self.stop_requested(&turn.id) {
+                return self
+                    .finish_stopped(task, turn, &state, conversation_id)
+                    .await;
+            }
             if assistant.tool_calls.is_empty() {
                 let mut text = assistant.content.unwrap_or_default();
                 if text.trim().is_empty() {
@@ -604,6 +652,10 @@ impl Runtime {
     ) -> Result<Option<PendingTool>> {
         for (index, call) in calls.iter().enumerate() {
             if state.tool_calls >= self.config.runtime.max_tool_calls_per_turn {
+                break;
+            }
+            // Calls not yet started are dropped: the owner stopped the turn.
+            if self.stop_requested(&turn.id) {
                 break;
             }
             if call.name == DELEGATE_TOOL {

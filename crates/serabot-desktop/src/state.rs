@@ -430,6 +430,8 @@ impl State {
             Reply::Artifact { .. } => {}
             // The session keeps uploaded attachments on the composer draft.
             Reply::Attached(_) => {}
+            // The stop result is shown as a toast by the session.
+            Reply::Stopping(_) => {}
             Reply::OAuthSignedIn { id, device_code } => {
                 self.oauth_result = Some((id, device_code));
             }

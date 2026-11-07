@@ -2830,6 +2830,23 @@ impl ApiClient {
 
     /// `PUT /v1/conversations/{id}/auto-approve`: the owner's per-conversation
     /// switch. Returns the value the server stored.
+    /// Stop the owner's running turns in a conversation. The reply counts the
+    /// turns that were marked; 0 means nothing was running.
+    pub fn stop_conversation(&self, conversation: &str) -> Result<usize, ApiError> {
+        check_id(conversation)?;
+        #[derive(Deserialize)]
+        struct Envelope {
+            stopping: usize,
+        }
+        let response: Envelope = self.request::<Envelope, ()>(
+            Method::POST,
+            &["v1", "conversations", conversation, "cancel"],
+            &[],
+            None,
+        )?;
+        Ok(response.stopping)
+    }
+
     pub fn set_auto_approve(&self, conversation: &str, enabled: bool) -> Result<bool, ApiError> {
         check_id(conversation)?;
         #[derive(Serialize)]

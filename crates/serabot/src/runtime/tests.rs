@@ -1822,3 +1822,104 @@ async fn prompts_inject_only_the_acting_users_memories() {
     assert!(member_handoff.contains("MEMBER-PRIVATE-FACT"));
     assert!(!member_handoff.contains("ADMIN-PRIVATE-FACT"));
 }
+
+/// Answers one model call with a fixed reply, and asks the runtime to stop
+/// `user`'s running turns in `conversation` while that call is in flight.
+struct StopDuringCall {
+    runtime: Runtime,
+    user: String,
+    conversation: String,
+    marked: Arc<std::sync::atomic::AtomicUsize>,
+    reply: Value,
+}
+
+impl Respond for StopDuringCall {
+    fn respond(&self, _request: &MockRequest) -> ResponseTemplate {
+        let marked = self
+            .runtime
+            .request_stop(&self.user, &self.conversation)
+            .unwrap();
+        self.marked
+            .store(marked, std::sync::atomic::Ordering::SeqCst);
+        ResponseTemplate::new(200).set_body_json(self.reply.clone())
+    }
+}
+
+fn bonjour_reply() -> Value {
+    serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content": "bonjour"}, "finish_reason": "stop"}]
+    })
+}
+
+/// A stop marked while the model is answering ends the turn with one
+/// "Stopped." line: the model's answer is discarded and the turn is recorded
+/// as stopped, not completed.
+#[tokio::test]
+async fn stop_during_model_call_discards_the_answer() {
+    let server = MockServer::start().await;
+    let notifier = Arc::new(Capture::default());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (runtime, store) = setup(&server.uri(), notifier.clone(), calls);
+    let owner = admin(&store);
+    let marked = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(StopDuringCall {
+            runtime: runtime.clone(),
+            user: owner.clone(),
+            conversation: "owner".into(),
+            marked: marked.clone(),
+            reply: bonjour_reply(),
+        })
+        .mount(&server)
+        .await;
+    runtime.submit_text(&owner, "owner", "salut", None).unwrap();
+    let task = store.claim_task("test", 30).unwrap().unwrap();
+    runtime.process_task(task.clone()).await.unwrap();
+
+    assert_eq!(marked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        notifier.texts.lock().unwrap().as_slice(),
+        ["Stopped.".to_string()]
+    );
+    let turn = store.get_turn_by_task(&owner, &task.id).unwrap().unwrap();
+    assert_eq!(turn.status, "stopped");
+    assert_eq!(store.pending_task_count(&owner).unwrap(), 0);
+}
+
+/// Another user's stop aimed at the same conversation id marks nothing, so
+/// the owner's turn finishes with its normal reply.
+#[tokio::test]
+async fn stop_from_another_user_does_not_touch_the_turn() {
+    let server = MockServer::start().await;
+    let notifier = Arc::new(Capture::default());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (runtime, store) = setup(&server.uri(), notifier.clone(), calls);
+    let owner = admin(&store);
+    let member = store
+        .create_user("microsoft:stop-member", "s@example.example", "S")
+        .unwrap();
+    let marked = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(StopDuringCall {
+            runtime: runtime.clone(),
+            user: member.id.clone(),
+            conversation: "owner".into(),
+            marked: marked.clone(),
+            reply: bonjour_reply(),
+        })
+        .mount(&server)
+        .await;
+    runtime.submit_text(&owner, "owner", "salut", None).unwrap();
+    let task = store.claim_task("test", 30).unwrap().unwrap();
+    runtime.process_task(task.clone()).await.unwrap();
+
+    assert_eq!(marked.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        notifier.texts.lock().unwrap().as_slice(),
+        ["bonjour".to_string()]
+    );
+    let turn = store.get_turn_by_task(&owner, &task.id).unwrap().unwrap();
+    assert_eq!(turn.status, "completed");
+}
