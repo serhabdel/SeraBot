@@ -731,13 +731,13 @@ pub(crate) fn Icon(name: String, #[props(default = 20)] size: u32) -> Element {
     }
 }
 
-/// Inline brand SVG logos for all supported connectors and providers.
-/// The SVG markup itself lives in [`branding`]; a brand without a known
-/// mark falls back to an initial-letter avatar.
+/// Brand logos for all supported connectors and providers. The embedded
+/// images live in [`branding`]; a brand without a known mark falls back to
+/// an initial-letter avatar.
 #[component]
 pub fn BrandLogo(brand: String, #[props(default = 24)] size: u32) -> Element {
     let title = branding::brand_label(&brand).map(str::to_owned);
-    let svg = branding::brand_svg(&brand).map(str::to_owned);
+    let image = branding::brand_image_src(&brand);
     let initial: String = brand
         .chars()
         .next()
@@ -748,10 +748,12 @@ pub fn BrandLogo(brand: String, #[props(default = 24)] size: u32) -> Element {
             class: "brand-logo",
             style: "width: {size}px; height: {size}px;",
             title: title.as_deref().unwrap_or(""),
-            if let Some(svg) = svg {
-                div {
-                    style: "width: 100%; height: 100%; display: flex;",
-                    dangerous_inner_html: "{svg}",
+            if let Some(src) = image {
+                img {
+                    src: "{src}",
+                    alt: "",
+                    draggable: "false",
+                    style: "width: 100%; height: 100%; object-fit: contain; border-radius: inherit;",
                 }
             } else {
                 span { style: "font-size: {size * 3 / 5}px; font-weight: 600;", "{initial}" }
