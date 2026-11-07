@@ -416,6 +416,8 @@ impl State {
             // Bytes are intercepted by the session before they reach state;
             // this arm only keeps the match exhaustive.
             Reply::Artifact { .. } => {}
+            // The session keeps uploaded attachments on the composer draft.
+            Reply::Attached(_) => {}
             Reply::OAuthSignedIn { id, device_code } => {
                 self.oauth_result = Some((id, device_code));
             }
@@ -599,6 +601,7 @@ mod tests {
             created_at: "now".into(),
             name: Some("analyst".into()),
             bot: Some("analyst".into()),
+            attachments: Vec::new(),
         });
         state.task = Some(Task {
             id: "t".into(),

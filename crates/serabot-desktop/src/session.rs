@@ -495,6 +495,8 @@ impl Drop for TelegramUi {
 enum PendingOpen {
     Open,
     Reveal,
+    /// Ask where to save with the native Save As dialog.
+    SaveAs,
 }
 
 pub struct Session {
@@ -560,6 +562,13 @@ pub struct Session {
     download_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// What to do with the saved file once the download completes.
     pending_open: Option<PendingOpen>,
+    /// Files already uploaded and attached to the composer draft.
+    pub composer_files: Vec<crate::AttachmentInfo>,
+    /// Picked files waiting for upload, one request at a time.
+    upload_queue: std::collections::VecDeque<(String, Vec<u8>)>,
+    /// An upload request is in flight.
+    pub uploading: bool,
+    pick_rx: Option<std::sync::mpsc::Receiver<Vec<Result<(String, Vec<u8>), String>>>>,
     /// Toast text from browser/Explorer launches, which run on a helper thread.
     launch_tx: std::sync::mpsc::Sender<String>,
     launch_rx: std::sync::mpsc::Receiver<String>,
@@ -688,6 +697,10 @@ impl Session {
             downloading: false,
             download_rx: None,
             pending_open: None,
+            composer_files: Vec::new(),
+            upload_queue: std::collections::VecDeque::new(),
+            uploading: false,
+            pick_rx: None,
             launch_tx,
             launch_rx,
             session_expires: None,
@@ -852,6 +865,10 @@ impl Session {
             worker.set_epoch(self.state.scope.epoch);
         }
         self.composer.zeroize();
+        // Attachments belong to the conversation they were uploaded to.
+        self.composer_files.clear();
+        self.upload_queue.clear();
+        self.uploading = false;
         self.pending = None;
         self.bot_detail_pending = None;
         self.bot_config_pending = None;
@@ -1540,6 +1557,7 @@ impl Session {
                         Err(error) => format!("Saved to {path}, but could not open it: {error}"),
                     });
                 }
+                Some(PendingOpen::SaveAs) => self.toast = Some(format!("Saved to {path}")),
                 Some(PendingOpen::Reveal) => {
                     self.toast = Some(format!("Saved to {path}"));
                     self.launch(move || match reveal_in_explorer(&path) {
@@ -1862,12 +1880,20 @@ impl Session {
     }
 
     pub fn submit(&mut self) {
-        if !self.state.can_send() || !valid_text(&self.composer) || !self.ready() {
+        let has_files = !self.composer_files.is_empty();
+        let text_ok = valid_text(&self.composer) || (has_files && self.composer.trim().is_empty());
+        if !self.state.can_send()
+            || !text_ok
+            || !self.ready()
+            || self.uploading
+            || !self.upload_queue.is_empty()
+        {
             return;
         }
         self.state.error = None;
         self.state.activity.clear();
         let text = std::mem::take(&mut self.composer);
+        let files = std::mem::take(&mut self.composer_files);
         self.state.messages.push(Message {
             id: format!("opt-{}", Instant::now().elapsed().as_nanos()),
             role: Role::User,
@@ -1875,8 +1901,82 @@ impl Session {
             created_at: "Just now".into(),
             name: None,
             bot: None,
+            attachments: files.clone(),
         });
-        self.start_request(Operation::Submit(zeroize::Zeroizing::new(text)));
+        if files.is_empty() {
+            self.start_request(Operation::Submit(zeroize::Zeroizing::new(text)));
+        } else {
+            self.start_request(Operation::SubmitWith {
+                text: zeroize::Zeroizing::new(text),
+                attachments: files.into_iter().map(|file| file.id).collect(),
+            });
+        }
+    }
+
+    /// The paperclip: pick files in a native dialog (off the UI thread),
+    /// check name and size, and queue them for upload.
+    pub fn pick_attachments(&mut self) {
+        if self.pick_rx.is_some() {
+            return;
+        }
+        let room = crate::MAX_ATTACHMENTS
+            .saturating_sub(self.composer_files.len() + self.upload_queue.len());
+        if room == 0 {
+            self.toast = Some(format!("Attach at most {} files.", crate::MAX_ATTACHMENTS));
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.pick_rx = Some(receiver);
+        if std::thread::Builder::new()
+            .name("serabot-attach".into())
+            .spawn(move || {
+                let _ = sender.send(pick_files(room));
+            })
+            .is_err()
+        {
+            self.pick_rx = None;
+            self.toast = Some("Could not open the file picker.".into());
+        }
+    }
+
+    /// Picked files still waiting to be uploaded.
+    pub fn upload_pending(&self) -> usize {
+        self.upload_queue.len()
+    }
+
+    /// Drop one attachment from the draft (the uploaded copy stays unattached
+    /// on the server and is never sent to the bot).
+    pub fn remove_attachment(&mut self, id: &str) {
+        self.composer_files.retain(|file| file.id != id);
+    }
+
+    /// Drain the file picker and feed the upload queue one request at a time.
+    fn poll_attachments(&mut self) {
+        if let Some(receiver) = &self.pick_rx
+            && let Ok(picked) = receiver.try_recv()
+        {
+            self.pick_rx = None;
+            for item in picked {
+                match item {
+                    Ok(file) => self.upload_queue.push_back(file),
+                    Err(message) => self.toast = Some(message),
+                }
+            }
+        }
+        if !self.uploading && self.ready() && self.pending.is_none() {
+            if let Some((filename, bytes)) = self.upload_queue.pop_front() {
+                self.uploading = true;
+                self.start_request(Operation::UploadAttachment { filename, bytes });
+                if self.pending.is_none() {
+                    self.uploading = false;
+                }
+            }
+        }
+    }
+
+    /// Download an artifact and ask where to save it (native Save As dialog).
+    pub fn save_artifact_as(&mut self, hash: String) {
+        self.start_download(hash, Some(PendingOpen::SaveAs));
     }
 
     pub fn apply_model(&mut self, selection: Selection) {
@@ -1958,6 +2058,7 @@ impl Session {
         self.poll_sign_in();
         self.poll_telegram();
         self.poll_download();
+        self.poll_attachments();
         self.poll_launches();
         self.hydrate_bot_settings();
         self.pump_panel();
@@ -2297,6 +2398,12 @@ impl Session {
                             self.state.library_loading = false;
                             self.state.error = None;
                         }
+                        OperationKind::Attach => {
+                            // A rejected file never blocks the composer.
+                            self.uploading = false;
+                            self.toast = Some(format!("Attachment failed: {message}"));
+                            self.state.error = None;
+                        }
                         OperationKind::FetchArtifact => {
                             self.toast = Some(format!("Download failed: {message}"));
                             self.downloading = false;
@@ -2324,10 +2431,15 @@ impl Session {
                         self.downloading = true;
                         let (sender, receiver) = std::sync::mpsc::channel();
                         self.download_rx = Some(receiver);
+                        let save_as = self.pending_open == Some(PendingOpen::SaveAs);
                         if std::thread::Builder::new()
                             .name("serabot-download".into())
                             .spawn(move || {
-                                let result = save_download(&filename, &bytes);
+                                let result = if save_as {
+                                    save_download_as(&filename, &bytes)
+                                } else {
+                                    save_download(&filename, &bytes)
+                                };
                                 let _ = sender.send(result);
                             })
                             .is_err()
@@ -2339,6 +2451,13 @@ impl Session {
                         continue;
                     }
                     // Capture the ack before the state consumes the reply.
+                    if let Reply::Attached(file) = reply {
+                        self.uploading = false;
+                        if self.composer_files.len() < crate::MAX_ATTACHMENTS {
+                            self.composer_files.push(file);
+                        }
+                        continue;
+                    }
                     let bot_config_saved = match &reply {
                         Reply::BotConfigSaved { restart_required } => Some(*restart_required),
                         _ => None,
@@ -3684,6 +3803,73 @@ fn save_download(filename: &str, bytes: &[u8]) -> Result<String, String> {
     let path = unique_download_path(&dir, &sanitized);
     std::fs::write(&path, bytes).map_err(|err| err.to_string())?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// Windows file dialog for the paperclip. Names and sizes are checked before
+/// any bytes are read; a bad pick becomes a message, not an upload.
+#[cfg(windows)]
+fn pick_files(room: usize) -> Vec<Result<(String, Vec<u8>), String>> {
+    let Some(paths) = rfd::FileDialog::new()
+        .set_title("Attach files")
+        .add_filter("Supported files", crate::ATTACHMENT_EXTENSIONS)
+        .pick_files()
+    else {
+        return Vec::new();
+    };
+    paths
+        .into_iter()
+        .take(room)
+        .map(|path| {
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            if !crate::valid_attachment_name(&name) {
+                return Err(format!("{name}: this file type cannot be attached."));
+            }
+            let size = std::fs::metadata(&path)
+                .map_err(|_| format!("{name}: could not read the file."))?
+                .len();
+            if size == 0 || size > crate::MAX_ATTACHMENT_BYTES as u64 {
+                return Err(format!("{name}: files must be between 1 byte and 25 MB."));
+            }
+            let bytes =
+                std::fs::read(&path).map_err(|_| format!("{name}: could not read the file."))?;
+            Ok((name, bytes))
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn pick_files(_room: usize) -> Vec<Result<(String, Vec<u8>), String>> {
+    vec![Err("Attachments need the Windows app.".into())]
+}
+
+/// Native Save As for a downloaded artifact. Cancelling is not an error.
+#[cfg(windows)]
+fn save_download_as(filename: &str, bytes: &[u8]) -> Result<String, String> {
+    let suggested: String = filename
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            other => other,
+        })
+        .collect();
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("Save as")
+        .set_file_name(suggested.trim())
+        .save_file()
+    else {
+        return Err("Save cancelled.".into());
+    };
+    std::fs::write(&path, bytes).map_err(|err| err.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[cfg(not(windows))]
+fn save_download_as(filename: &str, bytes: &[u8]) -> Result<String, String> {
+    save_download(filename, bytes)
 }
 
 /// Never overwrite a file the owner already has. `report.docx` becomes

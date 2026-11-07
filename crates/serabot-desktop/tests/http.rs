@@ -1630,3 +1630,43 @@ fn bot_avatar_upload_sends_the_raw_image_bytes_to_the_avatar_route() {
     assert!(head.to_lowercase().contains("authorization: bearer "));
     assert_eq!(body, png);
 }
+
+#[test]
+fn uploads_attachments_and_sends_their_ids() {
+    let task = r#"{"task":{"id":"task-1","kind":"chat","bot":"owner","status":"queued"}}"#;
+    let (client, handle) = server(vec![
+        (
+            200,
+            r#"{"attachment":{"id":"att-1","filename":"notes.md","mime":"text/plain","size_bytes":5,"is_image":false}}"#.into(),
+        ),
+        (202, task.into()),
+    ]);
+    let file = client
+        .upload_attachment("dir:main", "notes.md", b"hello")
+        .unwrap();
+    assert_eq!(file.id, "att-1");
+    client
+        .submit_with("dir:main", "", &["att-1".to_owned()])
+        .unwrap();
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("POST /v1/conversations/dir:main/attachments "));
+    assert!(requests[0].to_lowercase().contains("x-filename: notes.md"));
+    assert!(requests[1].contains(r#""attachments":["att-1"]"#));
+}
+
+#[test]
+fn attachment_checks_run_before_any_request() {
+    let (client, _handle) = server(vec![]);
+    for bad in ["run.exe", "a/b.txt", "..\\x.txt", "page.svg", ""] {
+        assert!(
+            client.upload_attachment("dir:main", bad, b"x").is_err(),
+            "{bad}"
+        );
+    }
+    assert!(client.upload_attachment("dir:main", "a.txt", b"").is_err());
+    let big = vec![0u8; serabot_desktop::MAX_ATTACHMENT_BYTES + 1];
+    assert!(client.upload_attachment("dir:main", "a.txt", &big).is_err());
+    assert!(client.submit_with("dir:main", "", &[]).is_err());
+    let seven: Vec<String> = (0..7).map(|n| format!("a{n}")).collect();
+    assert!(client.submit_with("dir:main", "hi", &seven).is_err());
+}
