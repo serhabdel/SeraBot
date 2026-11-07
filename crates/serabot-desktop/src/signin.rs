@@ -117,7 +117,7 @@ pub fn start_error(error: &ApiError) -> String {
         ApiError::Http(500..=599) => {
             "The server could not start sign-in. Try again in a moment.".into()
         }
-        other => other.to_string(),
+        other => other.sign_in_text(),
     }
 }
 
@@ -285,7 +285,7 @@ mod tests {
         assert!(start_error(&ApiError::Http(502)).contains("Try again"));
         assert_eq!(
             start_error(&ApiError::Transport),
-            ApiError::Transport.to_string()
+            ApiError::Transport.sign_in_text()
         );
         assert!(handoff_error(&ApiError::Http(400)).contains("expired"));
         assert!(handoff_error(&ApiError::Http(500)).contains("Try again"));

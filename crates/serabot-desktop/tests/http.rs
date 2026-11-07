@@ -1701,3 +1701,54 @@ fn attachment_checks_run_before_any_request() {
     let seven: Vec<String> = (0..7).map(|n| format!("a{n}")).collect();
     assert!(client.submit_with("dir:main", "hi", &seven).is_err());
 }
+
+/// A listener that drops the first `drops` connections without answering,
+/// then serves `body` once. Returns the url and how many connections it saw.
+fn flaky(drops: usize, body: &'static str) -> (String, thread::JoinHandle<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let handle = thread::spawn(move || {
+        let mut seen = 0;
+        loop {
+            let (mut stream, _) = listener.accept().unwrap();
+            seen += 1;
+            if seen <= drops {
+                drop(stream);
+                continue;
+            }
+            let _ = request(&mut stream);
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            return seen;
+        }
+    });
+    (url, handle)
+}
+
+#[test]
+fn a_dropped_read_is_retried_and_succeeds() {
+    let (url, handle) = flaky(1, r#"{"ok":true}"#);
+    let client = ApiClient::new(
+        validate_endpoint(&url).unwrap(),
+        SecretString::new(TOKEN.into()),
+    )
+    .unwrap();
+    // The typed reply may not match the body; what matters is that a second
+    // connection was made after the first was dropped.
+    let _ = client.health();
+    assert_eq!(handle.join().unwrap(), 2);
+}
+
+#[test]
+fn a_dropped_write_is_never_repeated() {
+    let (url, handle) = flaky(1, "{}");
+    let client = ApiClient::new(
+        validate_endpoint(&url).unwrap(),
+        SecretString::new(TOKEN.into()),
+    )
+    .unwrap();
+    let error = client.delete_bot("analyst").unwrap_err();
+    assert_eq!(error, ApiError::Transport);
+    // Unblock the listener thread, which waits for a second connection.
+    let _ = TcpStream::connect(url.trim_start_matches("http://"));
+    let _ = handle.join();
+}
