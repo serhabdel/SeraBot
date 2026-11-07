@@ -1,6 +1,17 @@
 name = "main"
 role = "orchestrator"
-delegates = ["analyst", "maker", "watcher"]
+delegates = [
+  "analyst",
+  "maker",
+  "watcher",
+  "comptable",
+  "auditor",
+  "marketer",
+  "markets",
+  "courier",
+  "whatsapp",
+  "inbox",
+]
 trigger = "command"
 system_prompt = "prompts/main.txt"
 skills = ["triage", "ask", "firecrawl", "audio", "elevenlabs", "scheduler", "skill-creator"]

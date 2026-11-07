@@ -6,8 +6,9 @@ use axum::extract::DefaultBodyLimit;
 
 use super::*;
 use crate::avatar::{self, AVATAR_MIME, MAX_UPLOAD_BYTES};
+use crate::default_avatars::{DEFAULT_AVATAR_MIME, default_avatar, default_avatar_version};
 use crate::onboarding::{self, Drafter, Interview, Line, Proposal, Stage};
-use crate::profiles::OnboardingRow;
+use crate::profiles::{OnboardingRow, StoredAvatar};
 
 /// The routes this module owns. They are merged into the protected router so
 /// they sit behind the same token check and per-user rate limit.
@@ -186,18 +187,24 @@ pub(super) async fn put_bot_avatar(
     Ok(Json(json!({"avatar": {"bot": id, "version": version}})))
 }
 
-/// `GET /v1/bots/{id}/avatar` - the stored 256x256 png, or 404.
+/// `GET /v1/bots/{id}/avatar` - the owner's upload (256x256 png), else the
+/// bundled default for a shipped bot, else 404.
 pub(super) async fn get_bot_avatar(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
 ) -> Result<Response> {
     owned_bot(&state, &user, &id)?;
-    let stored = state
-        .store
-        .get_bot_avatar(&user.id, &id)?
-        .ok_or_else(|| SeraError::NotFound(format!("avatar for bot {id}")))?;
-    Ok(image_response(stored))
+    if let Some(stored) = state.store.get_bot_avatar(&user.id, &id)? {
+        return Ok(image_response(stored));
+    }
+    let data =
+        default_avatar(&id).ok_or_else(|| SeraError::NotFound(format!("avatar for bot {id}")))?;
+    Ok(image_response(StoredAvatar {
+        mime: DEFAULT_AVATAR_MIME.to_owned(),
+        data: data.to_vec(),
+        updated_at: default_avatar_version(&id).unwrap_or_default(),
+    }))
 }
 
 /// `DELETE /v1/bots/{id}/avatar`

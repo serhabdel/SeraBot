@@ -1,0 +1,20 @@
+name = "marketer"
+trigger = "command"
+system_prompt = "prompts/marketer.txt"
+skills = ["campaign-plan", "social-posts", "copy", "write", "onepager"]
+tools = [
+  "skill_list",
+  "skill_search",
+  "skill_load",
+  "memory_save",
+  "memory_list",
+  "memory_delete",
+  "rag_search",
+  "deck_build",
+  "docx_build",
+  "xlsx_build",
+  "tavily_search",
+  "fetch_url",
+]
+require_approval = []
+enabled = true

@@ -16,6 +16,7 @@ pub mod connectors;
 pub mod deck;
 #[cfg(feature = "pptx")]
 pub mod deck_pptx;
+pub mod default_avatars;
 pub mod delegate;
 pub mod documents;
 #[cfg(feature = "docx")]
