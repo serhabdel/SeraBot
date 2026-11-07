@@ -141,6 +141,15 @@ impl Runtime {
             {
                 Ok(ToolOutcome::Completed(output)) => {
                     self.record_tool_result(&mut state, &pending.call, &output);
+                    self.emit_step(
+                        &user,
+                        task,
+                        &turn,
+                        &pending.call,
+                        StepPhase::Done,
+                        None,
+                        state.tool_calls,
+                    );
                 }
                 Ok(ToolOutcome::PendingApproval { .. }) => {
                     return Err(SeraError::Internal(
@@ -148,6 +157,15 @@ impl Runtime {
                     ));
                 }
                 Err(error) => {
+                    self.emit_step(
+                        &user,
+                        task,
+                        &turn,
+                        &pending.call,
+                        StepPhase::Failed,
+                        None,
+                        state.tool_calls,
+                    );
                     state.messages.push(LlmMessage {
                         role: Role::Tool,
                         content: Some(format!("The approved tool failed: {error}")),
@@ -158,6 +176,15 @@ impl Runtime {
                 }
             }
         } else {
+            self.emit_step(
+                &user,
+                task,
+                &turn,
+                &pending.call,
+                StepPhase::Failed,
+                None,
+                state.tool_calls,
+            );
             state.messages.push(LlmMessage {
                 role: Role::Tool,
                 content: Some("The owner denied this action. Do not retry it.".into()),
@@ -179,7 +206,7 @@ impl Runtime {
             }
         } else if !pending.remaining.is_empty()
             && let Some(next) = self
-                .execute_calls(task, bot, &mut state, pending.remaining, &context)
+                .execute_calls(task, &turn, bot, &mut state, pending.remaining, &context)
                 .await?
         {
             return self.suspend_for_approval(task, &turn, state, next).await;
@@ -496,7 +523,7 @@ impl Runtime {
                 .messages
                 .push(LlmMessage::assistant(assistant.content, tool_calls.clone()));
             if let Some(pending) = self
-                .execute_calls(task, &bot, &mut state, tool_calls, &context)
+                .execute_calls(task, turn, &bot, &mut state, tool_calls, &context)
                 .await?
             {
                 return self.suspend_for_approval(task, turn, state, pending).await;
@@ -554,6 +581,7 @@ impl Runtime {
     async fn execute_calls(
         &self,
         task: &Task,
+        turn: &Turn,
         bot: &LoadedBot,
         state: &mut TurnState,
         calls: Vec<ToolCall>,
@@ -593,6 +621,16 @@ impl Runtime {
                 ));
             }
             state.tool_calls += 1;
+            let ordinal = state.tool_calls;
+            self.emit_step(
+                &task.user_id,
+                task,
+                turn,
+                call,
+                StepPhase::Running,
+                None,
+                ordinal,
+            );
             match self
                 .gateway
                 .execute(&call.name, call.arguments.clone(), context)
@@ -626,12 +664,30 @@ impl Runtime {
                         state.team_asked = true;
                     }
                     self.record_tool_result(state, call, &output);
+                    self.emit_step(
+                        &task.user_id,
+                        task,
+                        turn,
+                        call,
+                        StepPhase::Done,
+                        None,
+                        ordinal,
+                    );
                 }
                 Ok(ToolOutcome::PendingApproval {
                     approval_id,
                     action_id,
                     ..
                 }) => {
+                    self.emit_step(
+                        &task.user_id,
+                        task,
+                        turn,
+                        call,
+                        StepPhase::WaitingApproval,
+                        Some(&approval_id),
+                        ordinal,
+                    );
                     return Ok(Some(PendingTool {
                         call: call.clone(),
                         remaining: calls[index + 1..].to_vec(),
@@ -640,6 +696,15 @@ impl Runtime {
                     }));
                 }
                 Err(SeraError::PolicyViolation) => {
+                    self.emit_step(
+                        &task.user_id,
+                        task,
+                        turn,
+                        call,
+                        StepPhase::Failed,
+                        None,
+                        ordinal,
+                    );
                     state.messages.push(LlmMessage {
                         role: Role::Tool,
                         content: Some(
@@ -652,6 +717,15 @@ impl Runtime {
                     });
                 }
                 Err(error) => {
+                    self.emit_step(
+                        &task.user_id,
+                        task,
+                        turn,
+                        call,
+                        StepPhase::Failed,
+                        None,
+                        ordinal,
+                    );
                     state.messages.push(LlmMessage {
                         role: Role::Tool,
                         content: Some(format!(
@@ -666,7 +740,7 @@ impl Runtime {
                 }
             }
         }
-        let _ = (task, bot);
+        let _ = bot;
         Ok(None)
     }
 
