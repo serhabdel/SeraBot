@@ -43,7 +43,14 @@ async fn auto_approve_is_owner_only_audited_and_off_by_default() {
     assert!(!store.yolo_enabled(&owner.id, "dir:owned"));
     assert!(!store.yolo_enabled(&other.id, "dir:owned"));
 
-    let on = call(&app, &owner_token, "PUT", uri, Some(json!({"enabled": true}))).await;
+    let on = call(
+        &app,
+        &owner_token,
+        "PUT",
+        uri,
+        Some(json!({"enabled": true})),
+    )
+    .await;
     assert_eq!(on.status(), StatusCode::OK);
     assert!(store.yolo_enabled(&owner.id, "dir:owned"));
     // Unknown fields are rejected.
@@ -57,7 +64,14 @@ async fn auto_approve_is_owner_only_audited_and_off_by_default() {
     .await;
     assert!(bad.status().is_client_error());
 
-    let off = call(&app, &owner_token, "PUT", uri, Some(json!({"enabled": false}))).await;
+    let off = call(
+        &app,
+        &owner_token,
+        "PUT",
+        uri,
+        Some(json!({"enabled": false})),
+    )
+    .await;
     assert_eq!(off.status(), StatusCode::OK);
     assert!(!store.yolo_enabled(&owner.id, "dir:owned"));
     let events: Vec<String> = store

@@ -4994,3 +4994,155 @@ html[data-reduce-transparency="true"] .chat-header {
     background: none;
   }
 }
+
+/* ------------------------------------------------- chat goal and todo ----- */
+/* Compact plan panel at the top of the chat; collapsed until clicked. */
+
+.plan-panel {
+  margin: 8px auto 0;
+  width: min(var(--chat-w), calc(100% - 24px));
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-1);
+  font-size: var(--fs-body-2);
+  color: var(--label-2);
+}
+
+.plan-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  cursor: pointer;
+  list-style: none;
+  border-radius: var(--r-md);
+}
+
+.plan-summary::-webkit-details-marker {
+  display: none;
+}
+
+.plan-summary:hover {
+  background: var(--hover);
+}
+
+.plan-summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.plan-chevron {
+  display: inline-flex;
+  color: var(--label-3);
+  transition: transform 0.15s ease;
+}
+
+.plan-panel[open] .plan-chevron {
+  transform: rotate(90deg);
+}
+
+.plan-goal {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--label-1);
+  font-weight: 600;
+}
+
+.plan-progress {
+  color: var(--accent-ink);
+  background: var(--accent-soft);
+  border-radius: var(--r-pill);
+  padding: 1px 9px;
+  font-size: var(--fs-body-2);
+  white-space: nowrap;
+}
+
+.plan-panel.complete .plan-progress {
+  color: var(--ok);
+  background: var(--ok-soft);
+}
+
+.plan-bar {
+  display: inline-block;
+  width: 48px;
+  height: 4px;
+  border-radius: var(--r-pill);
+  background: var(--hairline);
+  overflow: hidden;
+}
+
+.plan-bar-fill {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  border-radius: var(--r-pill);
+  transition: width 0.25s ease;
+}
+
+.plan-items {
+  list-style: none;
+  margin: 0;
+  padding: 2px 12px 10px 34px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.plan-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: var(--label-2);
+}
+
+.plan-item.doing {
+  color: var(--label-1);
+}
+
+.plan-item.done .plan-text {
+  color: var(--label-3);
+  text-decoration: line-through;
+}
+
+.plan-mark {
+  display: inline-flex;
+  width: 16px;
+  min-height: 20px;
+  align-items: center;
+  justify-content: center;
+}
+
+.plan-item.done .plan-mark {
+  color: var(--ok);
+}
+
+.plan-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  border: 1.5px solid var(--label-3);
+}
+
+.plan-text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* Per-chat auto-approve switch in the chat header. Warns when on. */
+.yolo-btn.active {
+  background: var(--warn-soft);
+  color: var(--warn);
+  border-color: var(--warn);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .plan-chevron,
+  .plan-bar-fill {
+    transition: none;
+  }
+}

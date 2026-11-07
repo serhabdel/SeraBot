@@ -49,6 +49,8 @@ pub enum OperationKind {
     Team,
     TeamWrite,
     Library,
+    ChatPlan,
+    ChatAutoApprove,
     FetchArtifact,
     Transcribe,
     AdminWrite,
@@ -142,6 +144,11 @@ pub enum Operation {
         rules: String,
     },
     Library,
+    /// Goal, todo list and auto-approve switch of the open conversation.
+    ChatPlan,
+    SetAutoApprove {
+        enabled: bool,
+    },
     FetchArtifact {
         hash: String,
     },
@@ -272,6 +279,8 @@ impl Operation {
             Self::GetTeam => OperationKind::Team,
             Self::SetTeam { .. } => OperationKind::TeamWrite,
             Self::Library => OperationKind::Library,
+            Self::ChatPlan => OperationKind::ChatPlan,
+            Self::SetAutoApprove { .. } => OperationKind::ChatAutoApprove,
             Self::FetchArtifact { .. } => OperationKind::FetchArtifact,
             Self::TranscribeAudio { .. } => OperationKind::Transcribe,
             Self::AdminSaveProvider(_)
@@ -329,6 +338,11 @@ pub enum Reply {
     Connectors(Vec<ConnectorStatus>),
     Team(Team),
     Library(Vec<LibraryEntry>),
+    ChatPlan {
+        plan: Option<crate::chat_plan::ChatPlan>,
+        auto_approve: bool,
+    },
+    AutoApprove(bool),
     Artifact {
         hash: String,
         filename: String,
@@ -635,6 +649,12 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
             .set_team(conversation, members, *mode, rules)
             .map(Reply::Team),
         Operation::Library => client.library(conversation).map(Reply::Library),
+        Operation::ChatPlan => client
+            .chat_state(conversation)
+            .map(|(plan, auto_approve)| Reply::ChatPlan { plan, auto_approve }),
+        Operation::SetAutoApprove { enabled } => client
+            .set_auto_approve(conversation, *enabled)
+            .map(Reply::AutoApprove),
         Operation::FetchArtifact { hash } => {
             client
                 .artifact(hash)

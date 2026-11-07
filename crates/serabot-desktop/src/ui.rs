@@ -2207,6 +2207,50 @@ fn ActivityRow(mut session: Signal<Session>, step: Step) -> Element {
     }
 }
 
+/// The goal and todo list of the chat. Collapsed to one line (goal and
+/// "N of M done"); a click opens the checklist. The text is model-written and
+/// rendered as plain text only.
+#[component]
+fn PlanPanel(plan: serabot_desktop::chat_plan::ChatPlan) -> Element {
+    use serabot_desktop::chat_plan::ItemStatus;
+    let progress = plan.progress();
+    let complete = plan.is_complete();
+    let total = plan.items.len().max(1);
+    let percent = plan.done() * 100 / total;
+    rsx! {
+        details { class: if complete { "plan-panel complete" } else { "plan-panel" },
+            summary { class: "plan-summary",
+                span { class: "plan-chevron", Icon { name: "chevron-right", size: 12 } }
+                span { class: "plan-goal", title: "{plan.goal}", "{plan.goal}" }
+                span { class: "plan-progress", "{progress}" }
+                span { class: "plan-bar", "aria-hidden": "true",
+                    span { class: "plan-bar-fill", style: "width: {percent}%" }
+                }
+            }
+            ul { class: "plan-items", "aria-label": "Todo list",
+                for (index, item) in plan.items.iter().enumerate() {
+                    li {
+                        key: "{index}",
+                        class: match item.status {
+                            ItemStatus::Done => "plan-item done",
+                            ItemStatus::Doing => "plan-item doing",
+                            ItemStatus::Pending => "plan-item",
+                        },
+                        span { class: "plan-mark",
+                            match item.status {
+                                ItemStatus::Done => rsx! { Icon { name: "check", size: 12 } },
+                                ItemStatus::Doing => rsx! { span { class: "pill-dot live" } },
+                                ItemStatus::Pending => rsx! { span { class: "plan-dot" } },
+                            }
+                        }
+                        span { class: "plan-text", "{item.text}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// First letter of a label, upper-cased, for avatar tiles.
 fn initial_of(label: &str) -> String {
     label
@@ -2347,6 +2391,8 @@ fn Topbar(
         (state.panel.session_active(), state.panel.open())
     };
     let task_status = session.read().state.task.as_ref().map(|task| task.status);
+    let auto_approve = session.read().state.auto_approve;
+    let accepts_turns = session.read().conversation_accepts_turns();
     let (subtitle, avatar) = {
         let state = session.read();
         let summary = state
@@ -2448,6 +2494,17 @@ fn Topbar(
                     "aria-label": "Reload",
                     onclick: move |_| session.write().refresh(),
                     Icon { name: "refresh", size: 16 }
+                }
+                if accepts_turns && connected {
+                    button {
+                        class: if auto_approve { "btn sm yolo-btn active" } else { "btn ghost sm yolo-btn" },
+                        title: "Auto-approve: when on, this chat's bots run actions that normally ask you first (sending email, uploading or deleting files) without waiting for your OK. Policy checks and the audit log still apply. Off by default; applies to this chat only.",
+                        "aria-label": "Auto-approve in this chat",
+                        "aria-pressed": if auto_approve { "true" } else { "false" },
+                        onclick: move |_| session.write().set_auto_approve(!auto_approve),
+                        Icon { name: "bolt", size: 15 }
+                        span { class: "btn-label", "Auto-approve" }
+                    }
                 }
                 if browser_active {
                     button {
@@ -2719,6 +2776,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             sending,
         )
     };
+    let chat_plan = session.read().state.plan.clone();
     let composer = session.read().composer.clone();
     let can_send = session.read().state.can_send();
     let accepts = session.read().conversation_accepts_turns();
@@ -2886,6 +2944,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             }
                         }
                     }
+                }
+                if let Some(plan) = chat_plan.clone() {
+                    PlanPanel { plan }
                 }
                 div { class: if group_like { "messages group" } else { "messages" }, id: "messages",
                     if empty {
