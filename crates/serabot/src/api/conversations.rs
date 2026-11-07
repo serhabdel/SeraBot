@@ -578,3 +578,92 @@ pub(super) async fn unarchive_conversation(
     )?;
     Ok(Json(json!({"id": id, "archived": false})))
 }
+
+/// The conversation must be this user's, or not exist yet (lazy creation).
+/// Another user's conversation id reads as unknown.
+fn require_own_or_new_conversation(state: &ApiState, user_id: &str, id: &str) -> Result<()> {
+    validate_conversation_id(id)?;
+    if state.store.get_conversation(user_id, id)?.is_none()
+        && state.store.conversation_exists(id)?
+    {
+        return Err(SeraError::NotFound(format!("conversation {id}")));
+    }
+    Ok(())
+}
+
+/// The conversation's goal and todo list, or `{"plan": null}`.
+pub(super) async fn get_conversation_plan(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    require_own_or_new_conversation(&state, &user.id, &id)?;
+    let Some(plan) = state.store.get_plan(&user.id, &id)? else {
+        return Ok(Json(json!({"plan": null})));
+    };
+    let mut body = crate::plans::plan_json(&plan);
+    let mut text = plan.goal.clone();
+    for item in &plan.items {
+        text.push('\n');
+        text.push_str(&item.text);
+    }
+    if state.runtime.scan_owner_output(&user.id, &text).is_err() {
+        body = json!({
+            "conversation_id": id,
+            "goal": "[Content withheld by policy]",
+            "items": [],
+            "done": 0,
+            "total": 0,
+            "updated_at": plan.updated_at,
+        });
+    }
+    Ok(Json(json!({"plan": body})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AutoApproveRequest {
+    enabled: bool,
+}
+
+pub(super) async fn get_auto_approve(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    require_own_or_new_conversation(&state, &user.id, &id)?;
+    Ok(Json(json!({
+        "conversation_id": id,
+        "enabled": state.store.yolo_enabled(&user.id, &id),
+    })))
+}
+
+/// Turn auto-approve on or off for the caller's own conversation. The change
+/// is audited and applies to the very next tool call.
+pub(super) async fn set_auto_approve(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+    Json(request): Json<AutoApproveRequest>,
+) -> Result<Json<Value>> {
+    require_own_or_new_conversation(&state, &user.id, &id)?;
+    state.store.set_yolo(&user.id, &id, request.enabled)?;
+    state.store.record_audit(
+        &user.id,
+        if request.enabled {
+            "yolo.enabled"
+        } else {
+            "yolo.disabled"
+        },
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(&json!({"conversation_id": id})),
+    )?;
+    Ok(Json(json!({
+        "conversation_id": id,
+        "enabled": request.enabled,
+    })))
+}
