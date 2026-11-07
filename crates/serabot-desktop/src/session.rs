@@ -3424,6 +3424,33 @@ impl Session {
         self.save_connector(id);
     }
 
+    /// Sign-in connector (ElevenLabs): use the pasted API key instead of the
+    /// account sign-in. Turns the connector on and switches the mode.
+    pub fn use_api_key_instead(&mut self, id: String) {
+        let draft = self.connector_drafts.entry(id.clone()).or_default();
+        draft.enabled = true;
+        draft.auth = Some("api_key".to_owned());
+        self.save_connector(id);
+    }
+
+    /// Sign-in connector: stop using the account sign-in. The server keeps
+    /// whatever it stored; the mode switch is what ends use of it.
+    pub fn sign_out_connector(&mut self, id: String) {
+        let enabled = self
+            .state
+            .connectors
+            .iter()
+            .find(|connector| connector.id == id)
+            .map(|connector| connector.enabled);
+        let draft = self.connector_drafts.entry(id.clone()).or_default();
+        if let Some(enabled) = enabled {
+            draft.enabled = enabled;
+        }
+        draft.auth = Some("api_key".to_owned());
+        draft.values.clear();
+        self.save_connector(id);
+    }
+
     pub fn can_admin(&self) -> bool {
         self.ready() && self.state.connected
     }
@@ -3679,9 +3706,9 @@ impl Session {
                 .entry(connector.id.clone())
                 .or_default();
             draft.enabled = connector.enabled;
-            if draft.auth.is_none() {
-                draft.auth = connector.auth.clone();
-            }
+            // The server's mode wins: sign-in and sign-out change it outside
+            // the draft, and a stale draft must not hide the real state.
+            draft.auth = connector.auth.clone();
         }
         self.connector_drafts.retain(|id, _| seen.contains(id));
     }
