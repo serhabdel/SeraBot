@@ -127,6 +127,8 @@ jobs:
             --dart-define=SERABOT_DEFAULT_SERVER_URL="${SERABOT_OWNER_API_URL}"
           cp build/app/outputs/flutter-apk/app-release.apk "serabot-mobile-${TAG}.apk"
           cp build/app/outputs/flutter-apk/app-release.apk "serabot-mobile-latest.apk"
+          # Checksum the in-app updater verifies before installing.
+          sha256sum "serabot-mobile-${TAG}.apk" > "serabot-mobile-${TAG}.apk.sha256"
       - name: Build release app bundle
         working-directory: apps/serabot_mobile
         run: |
@@ -142,6 +144,7 @@ jobs:
           name: mobile-assets
           path: |
             apps/serabot_mobile/serabot-mobile-${{ github.event.inputs.tag || github.ref_name }}.apk
+            apps/serabot_mobile/serabot-mobile-${{ github.event.inputs.tag || github.ref_name }}.apk.sha256
             apps/serabot_mobile/serabot-mobile-${{ github.event.inputs.tag || github.ref_name }}.aab
             apps/serabot_mobile/serabot-mobile-latest.apk
             apps/serabot_mobile/serabot-mobile-latest.aab
