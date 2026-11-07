@@ -4,7 +4,7 @@ use crate::{
     ConnectorUpdate, ConversationKind, ConversationPage, ConversationSummary, CreatedBot,
     CreatedConversation, CreatedGroup, CreatedSkill, Health, History, LibraryEntry, MemoryEntry,
     MemoryStatsView, NewGroup, NewProvider, Onboarding, ProviderStatus, Scope, Selection,
-    SkillSummary, Task, Team, TeamMode, Transcription, UsageReport, VoiceSettings, VoiceUpdate,
+    SkillSummary, Task, Team, TeamMode, Transcription, ServerHealth, UsageReport, VoiceSettings, VoiceUpdate,
     avatars::AvatarTarget,
 };
 use secrecy::SecretString;
@@ -68,6 +68,8 @@ pub enum OperationKind {
     BotDetail,
     BotConfigWrite,
     Usage,
+    /// Owner-only server health card (GET /v1/admin/status).
+    ServerHealth,
     Avatar,
     CreateGroup,
     OnboardingRead,
@@ -236,6 +238,8 @@ pub enum Operation {
         id: String,
         update: BotConfigUpdate,
     },
+    /// `GET /v1/admin/status` (admin only): the owner's server health card.
+    ServerHealth,
     /// `GET /v1/usage?days=&bot=&conversation_id=`.
     Usage {
         days: u32,
@@ -334,6 +338,7 @@ impl Operation {
             Self::BotDetail { .. } => OperationKind::BotDetail,
             Self::UpdateBotConfig { .. } => OperationKind::BotConfigWrite,
             Self::Usage { .. } => OperationKind::Usage,
+            Self::ServerHealth => OperationKind::ServerHealth,
             Self::CreateNamedBot { .. } => OperationKind::CreateBot,
             Self::AvatarFetch { .. } | Self::AvatarUpload { .. } | Self::AvatarRemove { .. } => {
                 OperationKind::Avatar
@@ -407,6 +412,7 @@ pub enum Reply {
         restart_required: bool,
     },
     Usage(UsageReport),
+    ServerHealth(ServerHealth),
     /// A fetched avatar as a `data:` URL; `None` when the bot has no image.
     AvatarImage {
         target: AvatarTarget,
@@ -788,6 +794,7 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
                     restart_required: ack.restart_required,
                 })
         }
+        Operation::ServerHealth => client.server_health().map(Reply::ServerHealth),
         Operation::Usage {
             days,
             bot,

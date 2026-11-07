@@ -22,6 +22,7 @@ pub mod provider_presets;
 pub mod session;
 pub mod signin;
 pub mod state;
+pub mod status_view;
 pub mod teams;
 pub mod ui_highlight;
 pub mod updater;

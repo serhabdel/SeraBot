@@ -549,6 +549,10 @@ pub struct Session {
     /// Usage page range in days (7, 30 or 90) and whether a load is running.
     pub usage_days: u32,
     pub usage_loading: bool,
+    /// Owner-only server health card: a load is running, and the calm
+    /// message to show when the last load failed (cleared on success).
+    pub server_health_loading: bool,
+    pub server_health_error: Option<String>,
     /// Pinned bots/conversations shown in the inspector strip. Persisted in
     /// settings.json through [`creds::Settings::pins`].
     pub pins: Vec<String>,
@@ -718,6 +722,8 @@ impl Session {
             pins,
             usage_days: 30,
             usage_loading: false,
+            server_health_loading: false,
+            server_health_error: None,
             section: Section::Chat,
             conversation: "windows-owner".into(),
             composer: String::new(),
@@ -1167,6 +1173,7 @@ impl Session {
         }
         if section == Section::Usage {
             self.load_usage_days(self.usage_days);
+            self.refresh_server_health();
         }
         if section == Section::Settings {
             self.refresh_status();
@@ -1792,6 +1799,20 @@ impl Session {
         self.usage_days = days;
         self.usage_loading = true;
         self.load_usage(days);
+    }
+
+    /// Owner only: load the server health card. A member never sends this
+    /// request, so the server's 403 is a backstop, not the gate.
+    pub fn refresh_server_health(&mut self) {
+        if !self.is_admin() || self.server_health_loading {
+            return;
+        }
+        self.server_health_loading = true;
+        if self.pending.is_some() || !self.ready() {
+            self.schedule(Operation::ServerHealth, Duration::ZERO);
+        } else {
+            self.start_request(Operation::ServerHealth);
+        }
     }
 
     /// Load the token usage report for the last `days` days (1–365).
@@ -2661,6 +2682,22 @@ impl Session {
                 {
                     self.onboarding_failed(completion.kind, error.to_string());
                 }
+                // The health card is optional: a failed load leaves a calm
+                // line on the card, never the global banner, and the next
+                // refresh simply tries again.
+                Err(error) if completion.kind == OperationKind::ServerHealth => {
+                    self.server_health_loading = false;
+                    self.server_health_error = Some(match &error {
+                        ApiError::Http(403) => "Only the owner can see server health.".to_owned(),
+                        ApiError::Http(404) => {
+                            "This server does not report its health yet. Update the server.".to_owned()
+                        }
+                        _ => "Server health is not available right now. Trying again soon.".to_owned(),
+                    });
+                    if error == ApiError::Http(403) {
+                        self.state.server_health = None;
+                    }
+                }
                 Err(error) if completion.kind == OperationKind::BotLifecycle => {
                     self.toast = Some(format!("Could not change that bot: {error}"));
                     self.schedule(Operation::ListBots, Duration::ZERO);
@@ -3182,6 +3219,10 @@ impl Session {
                         OperationKind::BotDetail => {}
                         // The usage report is cached in the state.
                         OperationKind::Usage => self.usage_loading = false,
+                        OperationKind::ServerHealth => {
+                            self.server_health_loading = false;
+                            self.server_health_error = None;
+                        }
                         OperationKind::BotConfigWrite => {
                             if let Some((id, update)) = bot_config {
                                 // Optimistic update of the cached detail; the
