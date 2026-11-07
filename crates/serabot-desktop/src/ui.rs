@@ -311,7 +311,7 @@ fn capability_label(tool: &str) -> Option<&'static str> {
         "xlsx_analyze" | "timesheet_analyze" => Some("Spreadsheet analysis"),
         "rag_search" | "document_index" => Some("Document search"),
         "fetch_url" | "watch_now" | "firecrawl_scrape" | "firecrawl_map" | "firecrawl_search"
-        | "firecrawl_crawl" => Some("Web research"),
+        | "firecrawl_crawl" | "exa_search" | "exa_get_contents" => Some("Web research"),
         "audio_transcribe" | "audio_understand" => Some("Audio notes"),
         "elevenlabs_text_to_speech"
         | "elevenlabs_sound_effect"
@@ -319,6 +319,16 @@ fn capability_label(tool: &str) -> Option<&'static str> {
         | "elevenlabs_generate_image"
         | "elevenlabs_generate_video" => Some("Voice and media"),
         "onedrive_upload" | "onedrive_list" => Some("OneDrive files"),
+        "github_search_repos"
+        | "github_list_issues"
+        | "github_get_issue"
+        | "github_create_issue"
+        | "github_comment_issue"
+        | "github_get_file" => Some("GitHub"),
+        "todoist_list_tasks" | "todoist_add_task" | "todoist_complete_task" => {
+            Some("Todoist tasks")
+        }
+        "slack_list_channels" | "slack_read_channel" | "slack_post_message" => Some("Slack"),
         "skill_list" | "skill_search" | "skill_load" => Some("Skills"),
         "delegate" => Some("Team handoffs"),
         _ => None,

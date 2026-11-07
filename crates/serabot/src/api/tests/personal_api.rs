@@ -136,6 +136,40 @@ async fn connections_are_per_user_and_disconnect_is_scoped() {
 }
 
 #[tokio::test]
+async fn token_connectors_list_per_user_and_refuse_malformed_tokens_offline() {
+    let (app, _, store) = app();
+    let member = store
+        .create_user("subject-tok", "t@example.example", "Synthetic T")
+        .unwrap();
+    let token = mint_for(&store, &member.id, "tok-test");
+
+    let listing = read_json(call(&app, &token, "GET", "/v1/connectors", None).await).await;
+    let github = connector(&listing, "github");
+    assert_eq!(github["kind"], "token");
+    assert_eq!(github["group"], "Code and tasks");
+    assert_eq!(github["connected"], false);
+    assert_eq!(github["personal"]["state"], "ready");
+    assert_eq!(github["personal"]["methods"], json!(["token"]));
+    assert!(github.get("secrets").is_none());
+
+    // A malformed token is refused before any request leaves the host.
+    let response = call(
+        &app,
+        &token,
+        "PUT",
+        "/v1/connectors/github/token",
+        Some(json!({"token": "short"})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // There is no sign-in flow for a token connector.
+    let response = call(&app, &token, "POST", "/v1/connectors/github/start", None).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = call(&app, &token, "DELETE", "/v1/connectors/github", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(read_json(response).await["was_connected"], false);
+}
+#[tokio::test]
 async fn the_connectors_routes_require_a_session() {
     let (app, _, _) = app();
     for (method, uri) in [

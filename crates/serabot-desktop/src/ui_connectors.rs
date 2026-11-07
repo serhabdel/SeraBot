@@ -15,7 +15,8 @@ use serabot_desktop::ConnectorStatus;
 use serabot_desktop::connector_card::{
     CardState, DEFAULT_ADMIN_HINT, GOOGLE_CONSOLE_URL, GOOGLE_SETUP_STEPS, NOTION_HELP_URL,
     NOTION_SHARE_HINT, connector_card_state, editable_roles, google_is_set_up, google_redirect_uri,
-    google_setup_offered, is_internal_role, legacy_connected, supports_sign_in, uses_api_key,
+    google_setup_offered, is_internal_role, legacy_connected, supports_sign_in, token_help,
+    uses_api_key,
 };
 use serabot_desktop::session::{Session, humanize_label};
 
@@ -137,6 +138,10 @@ fn connector_title(id: &str) -> String {
         "outlook" => "Outlook",
         "outlook_calendar" => "Outlook Calendar",
         "notion" => "Notion",
+        "github" => "GitHub",
+        "todoist" => "Todoist",
+        "slack" => "Slack",
+        "exa" => "Exa Search",
         "agentmail" => "AgentMail",
         "tavily" => "Tavily Search",
         "firecrawl" => "Firecrawl",
@@ -156,8 +161,13 @@ fn connector_blurb(id: &str) -> &'static str {
         "outlook" => "Read and send email.",
         "outlook_calendar" => "Your Outlook calendar.",
         "notion" => "Your notes and pages.",
+        "github" => {
+            "Search repositories, read issues and files, and file issues with your approval."
+        }
+        "todoist" => "Your to-do list.",
+        "slack" => "Read channels and post with your approval.",
         "agentmail" => "A mailbox for your bots.",
-        "tavily" | "firecrawl" => "Let bots search and read the web.",
+        "tavily" | "firecrawl" | "exa" => "Let bots search and read the web.",
         "elevenlabs" => "Voices and sound.",
         _ => "",
     }
@@ -223,7 +233,9 @@ pub(crate) fn ConnectorsView(session: Signal<Session>) -> Element {
                     ("Microsoft", &["onedrive", "outlook", "outlook_calendar"][..]),
                     ("Google", &["google_drive", "google_sheets", "google_calendar", "gmail"][..]),
                     ("Notes and email", &["notion", "agentmail"][..]),
-                    ("Web search", &["tavily", "firecrawl"][..]),
+                    ("Code and tasks", &["github", "todoist"][..]),
+                    ("Messages", &["slack"][..]),
+                    ("Web search", &["tavily", "firecrawl", "exa"][..]),
                     ("Voice", &["elevenlabs"][..]),
                     ("Apps and tools", &["composio"][..]),
                 ] {
@@ -301,6 +313,9 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
         .as_ref()
         .and_then(|personal| personal.redirect_uri.clone());
     let is_notion = id == "notion";
+    let help = token_help(&id);
+    let token_label = help.map_or("Token", |help| help.label);
+    let token_hint = help.map_or("", |help| help.hint);
     rsx! {
         div { class: "card connector-card",
             div { class: "card-head",
@@ -322,7 +337,7 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
                 CardState::Connect { oauth, token: takes_token } => rsx! {
                     if takes_token {
                         div { class: "field",
-                            label { class: "field-label", "Integration token" }
+                            label { class: "field-label", "{token_label}" }
                             input {
                                 class: "input",
                                 "type": "password",
@@ -332,7 +347,9 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
                                 oninput: move |event| token.set(event.value()),
                             }
                         }
-                        p { class: "tiny", "{NOTION_SHARE_HINT}" }
+                        if !token_hint.is_empty() {
+                            p { class: "tiny", "{token_hint}" }
+                        }
                     }
                     if waiting {
                         p { class: "tiny", role: "status",
@@ -353,11 +370,11 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
                                 },
                                 if busy { "Connecting…" } else { "Connect" }
                             }
-                            if is_notion {
+                            if let Some(help) = help {
                                 button {
                                     class: "btn ghost",
-                                    title: "Open Notion to create an integration and copy its token",
-                                    onclick: move |_| session.write().open_in_browser(NOTION_HELP_URL.to_owned()),
+                                    title: "Open the page where you create this token",
+                                    onclick: move |_| session.write().open_in_browser(help.url.to_owned()),
                                     Icon { name: "external", size: 14 }
                                     "How to get one"
                                 }

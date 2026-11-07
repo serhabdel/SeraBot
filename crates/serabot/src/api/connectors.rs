@@ -236,6 +236,19 @@ pub(super) async fn list_connectors(
         "manage_url": crate::composio::CONNECT_URL,
         "help_url": crate::composio::HELP_URL,
     }));
+    // Per-user token connectors (GitHub, Todoist, Slack, Exa): this account's
+    // own state only. The token itself never appears.
+    for id in crate::token_connectors::TokenConnectors::ids() {
+        let personal = state.token_connectors.view(&user.id, id)?;
+        views.push(json!({
+            "id": id,
+            "kind": "token",
+            "enabled": true,
+            "redirect_uri": Value::Null,
+            "connected": personal.state == "connected",
+            "personal": personal.to_json(),
+        }));
+    }
     for view in &mut views {
         let group = view["id"].as_str().map(connector_group).unwrap_or("Other");
         view["group"] = json!(group);
@@ -585,7 +598,7 @@ pub(super) struct PersonalTokenRequest {
     token: String,
 }
 
-/// Connect Notion with a pasted internal integration token (write-only: the
+/// Connect Notion, GitHub, Todoist, Slack or Exa with a pasted token (write-only: the
 /// token is verified, sealed for this user, and never returned).
 pub(super) async fn set_personal_token(
     State(state): State<Arc<ApiState>>,
@@ -593,6 +606,21 @@ pub(super) async fn set_personal_token(
     Path(id): Path<String>,
     Json(request): Json<PersonalTokenRequest>,
 ) -> Result<Json<Value>> {
+    if crate::token_connectors::TokenConnectors::handles(&id) {
+        let account = state
+            .token_connectors
+            .connect(&user.id, &id, &request.token)
+            .await?;
+        audit_auth(
+            &state,
+            &user.id,
+            "connector.token_connected",
+            json!({"connector": id}),
+        )?;
+        return Ok(Json(
+            json!({"id": id, "connected": true, "account": account}),
+        ));
+    }
     if personal_kind(&id)? != ConnectorKind::Notion {
         return Err(SeraError::NotFound(format!("connector {id}")));
     }
@@ -617,8 +645,12 @@ pub(super) async fn disconnect_personal(
     Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
-    let kind = personal_kind(&id)?;
-    let was_connected = state.personal.disconnect(&user.id, kind).await?;
+    let was_connected = if crate::token_connectors::TokenConnectors::handles(&id) {
+        state.token_connectors.disconnect(&user.id, &id)?
+    } else {
+        let kind = personal_kind(&id)?;
+        state.personal.disconnect(&user.id, kind).await?
+    };
     audit_auth(
         &state,
         &user.id,
@@ -760,6 +792,9 @@ pub(super) fn connector_group(id: &str) -> &'static str {
         "tavily" | "firecrawl" => "Web Research",
         "agentmail" => "Email",
         "composio" => "Apps & tools",
+        "github" | "todoist" => "Code and tasks",
+        "slack" => "Messages",
+        "exa" => "Web Research",
         _ => "Productivity",
     }
 }

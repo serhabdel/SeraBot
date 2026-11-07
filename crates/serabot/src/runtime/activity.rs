@@ -81,7 +81,10 @@ pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -
             host_of(args).map_or_else(|| "Reading a web page".into(), |h| format!("Reading {h}")),
         ),
         "firecrawl_crawl" | "firecrawl_map" => ("globe", "Exploring a website".into()),
-        "tavily_search" | "firecrawl_search" => ("search", "Searching the web".into()),
+        "exa_get_contents" => ("globe", "Reading web pages".into()),
+        "tavily_search" | "firecrawl_search" | "exa_search" => {
+            ("search", "Searching the web".into())
+        }
         "rag_search" => ("search", "Searching your documents".into()),
         "document_index" => ("file", "Reading a document".into()),
         "memory_save" | "memory_update" => ("brain", "Saving to memory".into()),
@@ -91,6 +94,15 @@ pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -
         "watch_now" => ("eye", "Checking watched pages".into()),
         "agentmail_send" | "outlook_send" => ("mail", "Sending an email".into()),
         "agentmail_inboxes_list" => ("mail", "Checking the inbox".into()),
+        "github_search_repos" => ("search", "Searching GitHub".into()),
+        "github_list_issues" | "github_get_issue" => ("bolt", "Reading a GitHub issue".into()),
+        "github_create_issue" | "github_comment_issue" => ("bolt", "Writing to GitHub".into()),
+        "slack_list_channels" => ("mail", "Checking Slack channels".into()),
+        "slack_read_channel" => ("mail", "Reading a Slack channel".into()),
+        "slack_post_message" => ("mail", "Posting to Slack".into()),
+        "todoist_list_tasks" => ("bolt", "Checking your tasks".into()),
+        "todoist_add_task" | "todoist_complete_task" => ("bolt", "Updating your tasks".into()),
+        "github_get_file" => ("file", "Reading a file on GitHub".into()),
         "telegram_send_document" | "onedrive_upload" => ("file", "Sending a file".into()),
         "onedrive_list" => ("file", "Listing files".into()),
         "local_list" => ("file", "Looking at a folder on your PC".into()),

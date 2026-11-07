@@ -71,6 +71,8 @@ pub const CAPABILITIES: &[Capability] = &[
             "firecrawl_search",
             "firecrawl_crawl",
             "firecrawl_extract",
+            "exa_search",
+            "exa_get_contents",
         ],
     },
     Capability {
@@ -176,6 +178,52 @@ pub const CAPABILITIES: &[Capability] = &[
         label: "Send files to Telegram",
         hint: "Share finished files in your Telegram chat.",
         tools: &["telegram_send_document"],
+    },
+    Capability {
+        group: "Messages",
+        needs: Needs::Connector {
+            name: "Slack",
+            ids: &["slack"],
+        },
+        label: "Read and post in Slack",
+        hint: "Read channels the bot is in. Posting a message asks you first.",
+        tools: &[
+            "slack_list_channels",
+            "slack_read_channel",
+            "slack_post_message",
+        ],
+    },
+    // ---- Code and tasks
+    Capability {
+        group: "Code and tasks",
+        needs: Needs::Connector {
+            name: "GitHub",
+            ids: &["github"],
+        },
+        label: "Use GitHub",
+        hint: "Search repositories and read issues and files. Opening issues and comments ask you first.",
+        tools: &[
+            "github_search_repos",
+            "github_list_issues",
+            "github_get_issue",
+            "github_create_issue",
+            "github_comment_issue",
+            "github_get_file",
+        ],
+    },
+    Capability {
+        group: "Code and tasks",
+        needs: Needs::Connector {
+            name: "Todoist",
+            ids: &["todoist"],
+        },
+        label: "Manage your to-do list",
+        hint: "Read your Todoist tasks. Adding and completing tasks ask you first.",
+        tools: &[
+            "todoist_list_tasks",
+            "todoist_add_task",
+            "todoist_complete_task",
+        ],
     },
     // ---- Media
     Capability {
