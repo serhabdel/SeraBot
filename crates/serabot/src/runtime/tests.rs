@@ -2125,7 +2125,7 @@ async fn team_and_handoff_prompts_carry_the_skill_clause_and_the_tool_honesty_ru
         round: 0,
     };
     let team_prompt = runtime
-        .team_system_prompt(&admin, "owner", &bot, "objective", &team)
+        .team_system_prompt(&admin, "owner", &bot, "objective", &team, "")
         .unwrap();
     assert!(team_prompt.contains(honesty), "{team_prompt}");
     assert!(team_prompt.contains(skills), "{team_prompt}");
@@ -2138,12 +2138,12 @@ async fn team_and_handoff_prompts_carry_the_skill_clause_and_the_tool_honesty_ru
         skill: None,
     };
     let handoff_prompt = runtime
-        .handoff_system_prompt(&admin, &bot, "objective", &handoff)
+        .handoff_system_prompt(&admin, &bot, "objective", &handoff, "")
         .unwrap();
     assert!(handoff_prompt.contains(honesty), "{handoff_prompt}");
     assert!(handoff_prompt.contains(skills), "{handoff_prompt}");
 
     // The direct chat prompt keeps the same rule and clause.
-    let direct = runtime.system_prompt(&admin, "owner", &bot, false, &[]);
+    let direct = runtime.system_prompt(&admin, "owner", &bot, false, &[], "");
     assert!(direct.contains(honesty) && direct.contains(skills));
 }
