@@ -166,6 +166,9 @@ pub struct Runtime {
     shutdown: CancellationToken,
     memory: MemoryHub,
     extract_gate: Arc<extract::ExtractGate>,
+    /// Turn ids the owner asked to stop. The turn loop checks this between
+    /// model and tool steps; a marked turn never starts another step.
+    stop_requests: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,6 +242,7 @@ impl Runtime {
             shutdown,
             memory,
             extract_gate: Arc::new(extract::ExtractGate::default()),
+            stop_requests: Arc::new(std::sync::Mutex::new(HashSet::new())),
         })
     }
 
@@ -246,6 +250,35 @@ impl Runtime {
     /// recall source when `[memory] provider = "mem0"`.
     pub fn memory(&self) -> &MemoryHub {
         &self.memory
+    }
+
+    /// Ask the acting user's running turns in one conversation to stop.
+    /// Each running turn is marked; its loop ends at the next checkpoint with
+    /// a "Stopped." reply and never starts another model or tool step. Only
+    /// the caller's own turns are marked. Returns how many were marked.
+    pub fn request_stop(&self, user_id: &str, conversation_id: &str) -> Result<usize> {
+        validate_conversation_id(conversation_id)?;
+        let turn_ids = self.store.running_turn_ids(user_id, conversation_id)?;
+        let mut marks = self
+            .stop_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        marks.extend(turn_ids.iter().cloned());
+        Ok(turn_ids.len())
+    }
+
+    fn stop_requested(&self, turn_id: &str) -> bool {
+        self.stop_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(turn_id)
+    }
+
+    fn clear_stop(&self, turn_id: &str) {
+        self.stop_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(turn_id);
     }
 
     pub fn store(&self) -> &Store {

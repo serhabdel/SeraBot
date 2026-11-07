@@ -319,6 +319,22 @@ produced outside the approval path. Download the bytes through
 `GET /v1/artifacts/{hash}`, which only serves artifacts produced in the caller's
 own conversations (404 otherwise). Entries also carry `mime`.
 
+## Stop a reply (0.19)
+
+- `POST /v1/conversations/{id}/cancel` asks the caller's running turns in that
+  conversation to stop. Returns `{"conversation_id", "stopping"}`, where
+  `stopping` counts the turns marked; 0 means nothing was running. Another
+  user's conversation reads as not found.
+- Stop is cooperative. The turn loop checks the mark before each model call,
+  after each model reply, and before each tool call. A tool call already in
+  flight finishes, the calls not yet started are dropped, and the turn ends
+  with a single "Stopped." reply. Nothing is replayed, and a stop never
+  retries an external effect.
+- A turn that is waiting for an approval is not marked: decline the approval
+  to end it. A turn still queued for a worker is not marked either; it runs.
+- The mark is cleared when the task exits, whether it completed, parked for an
+  approval, failed, or was superseded, so a late stop cannot end a later turn.
+
 ## Chat files (0.18)
 
 - `POST /v1/conversations/{id}/attachments`: raw file body with an

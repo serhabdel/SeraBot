@@ -125,3 +125,28 @@ async fn plan_route_returns_only_the_owners_plan() {
     let foreign = call(&app, &other_token, "GET", uri, None).await;
     assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn cancel_is_owner_scoped_and_reports_nothing_running_when_idle() {
+    let (app, _, store) = app();
+    let owner = store
+        .create_user("subject-stop-a", "sa@example.example", "Synthetic SA")
+        .unwrap();
+    let other = store
+        .create_user("subject-stop-b", "sb@example.example", "Synthetic SB")
+        .unwrap();
+    let owner_token = mint_for(&store, &owner.id, "stop-a");
+    let other_token = mint_for(&store, &other.id, "stop-b");
+    store
+        .ensure_conversation_accepts_turns(&owner.id, "dir:stoppable")
+        .unwrap();
+    let uri = "/v1/conversations/dir:stoppable/cancel";
+
+    let idle = call(&app, &owner_token, "POST", uri, None).await;
+    assert_eq!(idle.status(), StatusCode::OK);
+    assert_eq!(read_json(idle).await["stopping"], 0);
+
+    // Another account cannot stop the owner's conversation.
+    let foreign = call(&app, &other_token, "POST", uri, None).await;
+    assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+}

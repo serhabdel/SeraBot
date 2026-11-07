@@ -55,6 +55,8 @@ pub enum OperationKind {
     Library,
     ChatPlan,
     ChatAutoApprove,
+    /// Stop the running turn(s) of the open conversation.
+    StopTurn,
     FetchArtifact,
     Transcribe,
     AdminWrite,
@@ -176,6 +178,8 @@ pub enum Operation {
     SetAutoApprove {
         enabled: bool,
     },
+    /// Ask the open conversation's running turns to stop.
+    StopTurn,
     FetchArtifact {
         hash: String,
     },
@@ -312,6 +316,7 @@ impl Operation {
             Self::Library => OperationKind::Library,
             Self::ChatPlan => OperationKind::ChatPlan,
             Self::SetAutoApprove { .. } => OperationKind::ChatAutoApprove,
+            Self::StopTurn => OperationKind::StopTurn,
             Self::FetchArtifact { .. } => OperationKind::FetchArtifact,
             Self::TranscribeAudio { .. } => OperationKind::Transcribe,
             Self::AdminSaveProvider(_)
@@ -376,6 +381,8 @@ pub enum Reply {
         auto_approve: bool,
     },
     AutoApprove(bool),
+    /// Turns marked to stop (0 when nothing was running).
+    Stopping(usize),
     Artifact {
         hash: String,
         filename: String,
@@ -707,6 +714,7 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::SetAutoApprove { enabled } => client
             .set_auto_approve(conversation, *enabled)
             .map(Reply::AutoApprove),
+        Operation::StopTurn => client.stop_conversation(conversation).map(Reply::Stopping),
         Operation::FetchArtifact { hash } => {
             client
                 .artifact(hash)
