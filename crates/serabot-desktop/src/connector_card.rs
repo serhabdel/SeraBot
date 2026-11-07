@@ -38,10 +38,17 @@ pub fn token_help(id: &str) -> Option<TokenHelp> {
             url: GITHUB_HELP_URL,
             hint: "Limit it to the repositories you want. Give it Issues (read and write) and Contents (read).",
         },
+        "todoist" => TokenHelp {
+            label: "API token",
+            url: TODOIST_HELP_URL,
+            hint: "Open Settings, Integrations, Developer and copy your API token.",
+        },
         _ => return None,
     })
 }
 
+/// Where a Todoist user finds their API token.
+pub const TODOIST_HELP_URL: &str = "https://app.todoist.com/app/settings/integrations/developer";
 /// Where a GitHub user creates a fine-grained personal access token.
 pub const GITHUB_HELP_URL: &str = "https://github.com/settings/personal-access-tokens/new";
 /// Shown when the server gave no admin hint.
@@ -188,7 +195,7 @@ mod tests {
 
     #[test]
     fn token_connectors_have_fixed_https_help_links() {
-        for id in ["notion", "github"] {
+        for id in ["notion", "github", "todoist"] {
             let help = token_help(id).expect(id);
             assert!(help.url.starts_with("https://"), "{id}");
             assert!(!help.label.is_empty() && !help.hint.is_empty(), "{id}");

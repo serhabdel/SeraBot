@@ -48,6 +48,8 @@ pub const DESTRUCTIVE_TOOLS: &[&str] = &[
     "local_write",
     "github_create_issue",
     "github_comment_issue",
+    "todoist_add_task",
+    "todoist_complete_task",
 ];
 
 /// Audit reason recorded when the owner's YOLO setting approved a call.
@@ -1779,6 +1781,8 @@ mod tests {
             "local_write",
             "github_create_issue",
             "github_comment_issue",
+            "todoist_add_task",
+            "todoist_complete_task",
         ] {
             assert!(is_destructive_tool(name), "{name}");
         }
@@ -1790,6 +1794,7 @@ mod tests {
             "firecrawl_search",
             "github_search_repos",
             "github_get_file",
+            "todoist_list_tasks",
             "memory_save",
             "pdf_edit",
         ] {

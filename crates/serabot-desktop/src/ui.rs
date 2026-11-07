@@ -325,6 +325,9 @@ fn capability_label(tool: &str) -> Option<&'static str> {
         | "github_create_issue"
         | "github_comment_issue"
         | "github_get_file" => Some("GitHub"),
+        "todoist_list_tasks" | "todoist_add_task" | "todoist_complete_task" => {
+            Some("Todoist tasks")
+        }
         "skill_list" | "skill_search" | "skill_load" => Some("Skills"),
         "delegate" => Some("Team handoffs"),
         _ => None,

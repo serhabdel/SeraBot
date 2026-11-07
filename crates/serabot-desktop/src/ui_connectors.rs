@@ -142,6 +142,7 @@ fn connector_title(id: &str) -> String {
         "outlook_calendar" => "Outlook Calendar",
         "notion" => "Notion",
         "github" => "GitHub",
+        "todoist" => "Todoist",
         "agentmail" => "AgentMail",
         "tavily" => "Tavily Search",
         "firecrawl" => "Firecrawl",
@@ -164,6 +165,7 @@ fn connector_blurb(id: &str) -> &'static str {
         "github" => {
             "Search repositories, read issues and files, and file issues with your approval."
         }
+        "todoist" => "Your to-do list.",
         "agentmail" => "A mailbox for your bots.",
         "tavily" | "firecrawl" => "Let bots search and read the web.",
         "elevenlabs" => "Voices and sound.",
@@ -231,7 +233,7 @@ pub(crate) fn ConnectorsView(session: Signal<Session>) -> Element {
                     ("Microsoft", &["onedrive", "outlook", "outlook_calendar"][..]),
                     ("Google", &["google_drive", "google_sheets", "google_calendar", "gmail"][..]),
                     ("Notes and email", &["notion", "agentmail"][..]),
-                    ("Code and tasks", &["github"][..]),
+                    ("Code and tasks", &["github", "todoist"][..]),
                     ("Web search", &["tavily", "firecrawl"][..]),
                     ("Voice", &["elevenlabs"][..]),
                     ("Apps and tools", &["composio"][..]),

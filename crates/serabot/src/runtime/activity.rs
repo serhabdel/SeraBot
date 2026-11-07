@@ -94,6 +94,8 @@ pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -
         "github_search_repos" => ("search", "Searching GitHub".into()),
         "github_list_issues" | "github_get_issue" => ("bolt", "Reading a GitHub issue".into()),
         "github_create_issue" | "github_comment_issue" => ("bolt", "Writing to GitHub".into()),
+        "todoist_list_tasks" => ("bolt", "Checking your tasks".into()),
+        "todoist_add_task" | "todoist_complete_task" => ("bolt", "Updating your tasks".into()),
         "github_get_file" => ("file", "Reading a file on GitHub".into()),
         "telegram_send_document" | "onedrive_upload" => ("file", "Sending a file".into()),
         "onedrive_list" => ("file", "Listing files".into()),

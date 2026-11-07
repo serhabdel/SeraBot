@@ -64,6 +64,7 @@ const UNTRUSTED_SOURCE_PREFIXES: &[&str] = &[
     "outlook_",
     "agentmail_",
     "github_",
+    "todoist_",
     "notion_",
     "onedrive_",
     "google_",

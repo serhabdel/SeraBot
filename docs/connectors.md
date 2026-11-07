@@ -106,3 +106,17 @@ Tools: `github_search_repos`, `github_list_issues`, `github_get_issue`,
 Search results are paged (30 per page at most, 10 pages), files over 200 KB are
 refused, and file text is cut at 20,000 characters. The REST API version header
 is pinned to `2022-11-28`.
+### Todoist
+
+Tools: `todoist_list_tasks` (read), `todoist_add_task` and
+`todoist_complete_task` (write, approval).
+
+1. In Todoist open **Settings, Integrations, Developer** (direct link:
+   <https://app.todoist.com/app/settings/integrations/developer>).
+2. Copy the **API token** and paste it into the Todoist card in Connectors.
+
+The connector uses the current unified REST API (`/api/v1`, cursor paging),
+not the deprecated v2 endpoints. Todoist API tokens are full account access and
+have no scopes, so keep the write tools behind approval. Task ids are
+validated before any request, listings are capped at 50 per page, and a `403`
+from Todoist is treated as a rejected token (that is how Todoist reports one).

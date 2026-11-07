@@ -142,6 +142,15 @@ pub const CAPABILITIES: &[Capability] = &[
         ],
     },
     Capability {
+        label: "Manage your to-do list",
+        hint: "Read your Todoist tasks. Adding and completing tasks ask you first.",
+        tools: &[
+            "todoist_list_tasks",
+            "todoist_add_task",
+            "todoist_complete_task",
+        ],
+    },
+    Capability {
         label: "Work with folders on this PC",
         hint: "Read, and with your approval write, folders you allow in Settings.",
         tools: &["local_list", "local_read", "local_write"],
