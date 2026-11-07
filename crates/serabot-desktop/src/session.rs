@@ -55,6 +55,8 @@ const SIGNED_OUT_OFFLINE: &str = "You are signed out on this device. The server 
 pub enum Theme {
     Dark,
     Light,
+    /// Follow the operating system.
+    System,
 }
 
 impl Theme {
@@ -62,12 +64,14 @@ impl Theme {
         match self {
             Self::Dark => "dark",
             Self::Light => "light",
+            Self::System => "system",
         }
     }
 
     pub fn from_stored(value: Option<&str>) -> Self {
         match value {
             Some("light") => Self::Light,
+            Some("system") => Self::System,
             _ => Self::Dark,
         }
     }
@@ -75,7 +79,7 @@ impl Theme {
     pub fn toggled(self) -> Self {
         match self {
             Self::Dark => Self::Light,
-            Self::Light => Self::Dark,
+            Self::Light | Self::System => Self::Dark,
         }
     }
 }
@@ -465,6 +469,9 @@ pub struct Session {
     pub connect_error: Option<String>,
     pub connecting: bool,
     pub theme: Theme,
+    /// Device-local look and chat preferences (Settings page).
+    pub prefs: creds::UiPrefs,
+    seen_approvals: Option<usize>,
     /// Usage page range in days (7, 30 or 90) and whether a load is running.
     pub usage_days: u32,
     pub usage_loading: bool,
@@ -566,6 +573,7 @@ impl Session {
             .unwrap_or_default();
         let worker = Worker::start().ok();
         let mut session = Self::assemble(server, theme, pins, token, worker);
+        session.prefs = settings.prefs.clone().unwrap_or_default().sanitized();
         if session.worker.is_some()
             && !session.server.trim().is_empty()
             && valid_token(&session.token)
@@ -600,6 +608,8 @@ impl Session {
             connect_error: None,
             connecting: false,
             theme,
+            prefs: creds::UiPrefs::default(),
+            seen_approvals: None,
             pins,
             usage_days: 30,
             usage_loading: false,
@@ -850,6 +860,7 @@ impl Session {
             server: origin,
             theme: Some(self.theme.as_str().into()),
             pins: (!self.pins.is_empty()).then(|| self.pins.clone()),
+            prefs: Some(self.prefs.clone()),
         })
     }
 
@@ -866,6 +877,21 @@ impl Session {
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
         self.save_ui_settings();
+    }
+
+    /// Change the device preferences and persist them.
+    pub fn set_prefs(&mut self, prefs: creds::UiPrefs) {
+        self.prefs = prefs.sanitized();
+        self.save_ui_settings();
+    }
+
+    /// Toast when a new approval request appears, if the user asked for it.
+    fn note_approvals(&mut self) {
+        let count = self.state.approvals.len();
+        if self.prefs.notify_approvals && self.seen_approvals.is_some_and(|seen| count > seen) {
+            self.toast = Some("A bot is waiting for your OK.".into());
+        }
+        self.seen_approvals = Some(count);
     }
 
     /// Toggle a pinned bot id or conversation id. The id is validated
@@ -2260,6 +2286,9 @@ impl Session {
                     };
                     if !self.state.receive(&completion.scope, reply) {
                         continue;
+                    }
+                    if matches!(completion.kind, OperationKind::Approvals) {
+                        self.note_approvals();
                     }
                     match completion.kind {
                         OperationKind::Health if self.state.connected => {

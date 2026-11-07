@@ -26,6 +26,8 @@ use crate::ui_usage::UsagePage;
 use crate::ui_vault::VaultPage;
 
 const CSS: &str = include_str!("../assets/app.css");
+/// Reports whether the system prefers a dark theme, now and on every change.
+const SYSTEM_THEME_JS: &str = "const m = window.matchMedia('(prefers-color-scheme: dark)'); dioxus.send(m.matches); m.addEventListener('change', (e) => dioxus.send(e.matches));";
 /// Styles of the 0.17 usage and settings pages, kept apart from app.css.
 const CSS_PAGES: &str = concat!(
     include_str!("../assets/usage.css"),
@@ -576,12 +578,30 @@ fn App() -> Element {
     });
     let connected = session.read().state.connected;
     let restarting = session.read().restarting;
-    let theme = session.read().theme.as_str();
+    let mut system_dark = use_signal(|| true);
+    use_future(move || async move {
+        let mut feed = dioxus::document::eval(SYSTEM_THEME_JS);
+        while let Ok(dark) = feed.recv::<bool>().await {
+            system_dark.set(dark);
+        }
+    });
+    let theme = match session.read().theme {
+        Theme::System if system_dark() => "dark",
+        Theme::System => "light",
+        other => other.as_str(),
+    };
+    let (text_size, motion) = {
+        let s = session.read();
+        (
+            s.prefs.text_size.clone(),
+            if s.prefs.reduce_motion { "reduce" } else { "full" },
+        )
+    };
     let _revision = revision();
     rsx! {
         style { {CSS} }
         style { {CSS_PAGES} }
-        div { class: "root", "data-theme": theme,
+        div { class: "root", "data-theme": theme, "data-text": "{text_size}", "data-motion": motion,
             if connected || restarting {
                 Shell { session }
             } else {
@@ -3020,11 +3040,17 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     }
                                     return;
                                 }
-                                if event.key() == Key::Enter
-                                    && !event.modifiers().contains(Modifiers::SHIFT)
-                                {
-                                    event.prevent_default();
-                                    session.write().submit();
+                                if event.key() == Key::Enter {
+                                    let enter_sends = session.read().prefs.enter_sends;
+                                    let send = if enter_sends {
+                                        !event.modifiers().contains(Modifiers::SHIFT)
+                                    } else {
+                                        event.modifiers().contains(Modifiers::CONTROL)
+                                    };
+                                    if send {
+                                        event.prevent_default();
+                                        session.write().submit();
+                                    }
                                 }
                             },
                         }
