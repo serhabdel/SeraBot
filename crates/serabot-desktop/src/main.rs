@@ -16,7 +16,9 @@ mod ui_dock;
 mod ui_settings;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_settings_page;
+#[cfg(any(windows, feature = "ui-check"))]
 mod ui_usage;
+#[cfg(any(windows, feature = "ui-check"))]
 mod ui_vault;
 
 fn main() {
