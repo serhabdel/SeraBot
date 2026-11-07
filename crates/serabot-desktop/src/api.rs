@@ -361,6 +361,8 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
     "memory_update",
     "memory_delete",
     "local_list",
+    "local_search",
+    "local_stat",
     "local_read",
     "local_write",
 ];

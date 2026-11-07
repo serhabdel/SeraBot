@@ -77,6 +77,8 @@ tools = [
   "browser_new_tab",
   "telegram_send_document",
   "local_list",
+  "local_search",
+  "local_stat",
   "local_read",
   "local_write",
 ]

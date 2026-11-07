@@ -4,7 +4,7 @@
 //! authenticated user only.
 
 use super::*;
-use crate::local_relay::{LocalRoot, MAX_CONTENT_BYTES, RelayResult};
+use crate::local_relay::{LocalRoot, MAX_RESULT_BYTES, RelayResult};
 
 pub(super) fn routes() -> Router<Arc<ApiState>> {
     Router::new()
@@ -54,7 +54,7 @@ pub(super) async fn local_result(
     if id.len() > 64 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err(SeraError::Validation("invalid request id".into()));
     }
-    if request.text.as_deref().map_or(0, str::len) > MAX_CONTENT_BYTES * 2 {
+    if request.text.as_deref().map_or(0, str::len) > MAX_RESULT_BYTES {
         return Err(SeraError::Validation("local result is too large".into()));
     }
     let accepted = state.local.complete(

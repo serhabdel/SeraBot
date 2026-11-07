@@ -43,6 +43,8 @@ tools = [
   "elevenlabs_generate_image",
   "elevenlabs_generate_video",
   "local_list",
+  "local_search",
+  "local_stat",
   "local_read",
 ]
 require_approval = ["onedrive_upload"]

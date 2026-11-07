@@ -933,6 +933,8 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "onedrive_upload",
         "onedrive_list",
         "local_list",
+        "local_search",
+        "local_stat",
         "local_read",
         "local_write",
     ];

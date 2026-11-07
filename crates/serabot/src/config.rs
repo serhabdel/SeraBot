@@ -1953,6 +1953,8 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "exa_search",
     "exa_get_contents",
     "local_list",
+    "local_search",
+    "local_stat",
     "local_read",
     "local_write",
 ];

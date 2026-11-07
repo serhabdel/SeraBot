@@ -43,6 +43,8 @@ tools = [
   "firecrawl_extract",
   "tavily_search",
   "local_list",
+  "local_search",
+  "local_stat",
   "local_read",
 ]
 require_approval = []
