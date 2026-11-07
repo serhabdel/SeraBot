@@ -25,7 +25,7 @@ use crate::ui_dock::BrowserDock;
 use crate::ui_files::{ComposerFiles, MediaCards, MessageFiles};
 use crate::ui_settings::SettingsPanel;
 use crate::ui_settings_page::{
-    AboutCard, AppearanceCard, ChatPrefsCard, NotificationsCard, SettingsNav,
+    AboutCard, AppearanceCard, ChatPrefsCard, LocalFoldersCard, NotificationsCard, SettingsNav,
 };
 use crate::ui_usage::UsagePage;
 use crate::ui_vault::VaultPage;
@@ -5366,6 +5366,9 @@ fn SettingsView(session: Signal<Session>) -> Element {
         }
         if sel == SettingsSection::Chat {
             ChatPrefsCard { session }
+        }
+        if sel == SettingsSection::LocalFolders {
+            LocalFoldersCard { session }
         }
         if sel == SettingsSection::About {
             AboutCard { session }

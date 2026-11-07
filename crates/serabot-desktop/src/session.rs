@@ -169,18 +169,20 @@ pub enum SettingsSection {
     Chat,
     Telegram,
     Voice,
+    LocalFolders,
     Admin,
     About,
 }
 
 impl SettingsSection {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Account,
         Self::Appearance,
         Self::Notifications,
         Self::Chat,
         Self::Telegram,
         Self::Voice,
+        Self::LocalFolders,
         Self::Admin,
         Self::About,
     ];
@@ -193,6 +195,7 @@ impl SettingsSection {
             Self::Chat => "Chat",
             Self::Telegram => "Telegram",
             Self::Voice => "Voice",
+            Self::LocalFolders => "Local folders",
             Self::Admin => "Admin",
             Self::About => "About",
         }
@@ -562,6 +565,12 @@ pub struct Session {
     download_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// What to do with the saved file once the download completes.
     pending_open: Option<PendingOpen>,
+    /// Folders on this PC the bots may use (default empty = off). Device-local.
+    pub local_folders: Vec<crate::local_folders::LocalFolder>,
+    local_agent: Option<(crate::local_folders::LocalAgent, usize)>,
+    /// Message under the Local folders card.
+    pub local_notice: Option<String>,
+    folder_pick_rx: Option<std::sync::mpsc::Receiver<Option<(std::path::PathBuf, bool)>>>,
     /// Files already uploaded and attached to the composer draft.
     pub composer_files: Vec<crate::AttachmentInfo>,
     /// Picked files waiting for upload, one request at a time.
@@ -697,6 +706,12 @@ impl Session {
             downloading: false,
             download_rx: None,
             pending_open: None,
+            local_folders: creds::settings_dir()
+                .map(|dir| crate::local_folders::load(&dir))
+                .unwrap_or_default(),
+            local_agent: None,
+            local_notice: None,
+            folder_pick_rx: None,
             composer_files: Vec::new(),
             upload_queue: std::collections::VecDeque::new(),
             uploading: false,
@@ -1939,6 +1954,107 @@ impl Session {
         }
     }
 
+    /// Settings > Local folders > "Add folder": native folder picker off the
+    /// UI thread; the folder is added read-only (the user can widen it later).
+    pub fn pick_local_folder(&mut self) {
+        if self.folder_pick_rx.is_some() {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.folder_pick_rx = Some(receiver);
+        if std::thread::Builder::new()
+            .name("serabot-folder-pick".into())
+            .spawn(move || {
+                let _ = sender.send(pick_folder().map(|path| (path, false)));
+            })
+            .is_err()
+        {
+            self.folder_pick_rx = None;
+            self.local_notice = Some("Could not open the folder picker.".into());
+        }
+    }
+
+    fn poll_folder_pick(&mut self) {
+        let Some(receiver) = &self.folder_pick_rx else {
+            return;
+        };
+        let Ok(picked) = receiver.try_recv() else {
+            return;
+        };
+        self.folder_pick_rx = None;
+        let Some((path, _)) = picked else {
+            return;
+        };
+        let app_dir = creds::settings_dir();
+        match crate::local_folders::add_folder(
+            &mut self.local_folders,
+            &path,
+            crate::local_folders::FolderMode::Read,
+            app_dir.as_deref(),
+        ) {
+            Ok(id) => {
+                self.local_notice = Some(format!(
+                    "Added. The bot can read this folder as \"{id}\". Switch it to read and write only if you want it to save files here."
+                ));
+                self.persist_local_folders();
+            }
+            Err(message) => self.local_notice = Some(message),
+        }
+    }
+
+    pub fn remove_local_folder(&mut self, id: &str) {
+        self.local_folders.retain(|folder| folder.id != id);
+        self.persist_local_folders();
+        self.local_notice = Some("Removed. The bot can no longer see that folder.".into());
+    }
+
+    pub fn set_local_folder_mode(&mut self, id: &str, mode: crate::local_folders::FolderMode) {
+        if let Some(folder) = self.local_folders.iter_mut().find(|folder| folder.id == id) {
+            folder.mode = mode;
+        }
+        self.persist_local_folders();
+    }
+
+    fn persist_local_folders(&mut self) {
+        if let Some(dir) = creds::settings_dir()
+            && let Err(error) = crate::local_folders::save(&dir, &self.local_folders)
+        {
+            self.local_notice = Some(format!("Could not save the folder list: {error}"));
+        }
+        // Takes effect for requests already in flight too.
+        if let Some((agent, _)) = &self.local_agent {
+            agent.update(self.local_folders.clone());
+        }
+    }
+
+    /// Keep the relay agent running only while signed in with folders allowed.
+    fn sync_local_agent(&mut self) {
+        let wanted = self.state.connected && !self.local_folders.is_empty();
+        let credentials = match (&self.credentials, wanted) {
+            (Some(credentials), true) => Arc::clone(credentials),
+            _ => {
+                self.local_agent = None;
+                return;
+            }
+        };
+        let key = Arc::as_ptr(&credentials) as usize;
+        if self.local_agent.as_ref().is_some_and(|(_, k)| *k == key) {
+            return;
+        }
+        self.local_agent = None;
+        if let Ok(client) = ApiClient::new(credentials.endpoint.clone(), credentials.token.clone())
+            && let Some(agent) =
+                crate::local_folders::LocalAgent::start(client, self.local_folders.clone())
+        {
+            self.local_agent = Some((agent, key));
+        }
+    }
+
+    /// True while the relay agent is running for this session.
+    pub fn local_agent_running(&self) -> bool {
+        self.local_agent.is_some()
+    }
+
     /// Picked files still waiting to be uploaded.
     pub fn upload_pending(&self) -> usize {
         self.upload_queue.len()
@@ -2059,6 +2175,8 @@ impl Session {
         self.poll_telegram();
         self.poll_download();
         self.poll_attachments();
+        self.poll_folder_pick();
+        self.sync_local_agent();
         self.poll_launches();
         self.hydrate_bot_settings();
         self.pump_panel();
@@ -3841,6 +3959,18 @@ fn pick_files(room: usize) -> Vec<Result<(String, Vec<u8>), String>> {
         .collect()
 }
 
+#[cfg(windows)]
+fn pick_folder() -> Option<std::path::PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Choose a folder the bot may use")
+        .pick_folder()
+}
+
+#[cfg(not(windows))]
+fn pick_folder() -> Option<std::path::PathBuf> {
+    None
+}
+
 #[cfg(not(windows))]
 fn pick_files(_room: usize) -> Vec<Result<(String, Vec<u8>), String>> {
     vec![Err("Attachments need the Windows app.".into())]
@@ -4039,8 +4169,8 @@ mod tests {
                 .filter(|section| section.visible(admin))
                 .count()
         };
-        assert_eq!(count(true), 8);
-        assert_eq!(count(false), 7);
+        assert_eq!(count(true), 9);
+        assert_eq!(count(false), 8);
         assert!(!SettingsSection::Admin.visible(false));
     }
 

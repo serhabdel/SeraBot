@@ -4,6 +4,7 @@
 //!
 //! Preferences saved here live on this device only (`creds::UiPrefs`).
 
+use crate::ui::Icon;
 use dioxus::prelude::*;
 use serabot_desktop::session::{Session, SettingsSection, Theme};
 
@@ -191,6 +192,90 @@ pub fn AboutCard(session: Signal<Session>) -> Element {
                     span { class: "kv-key", "Server version" }
                     span { class: "kv-val", "{version}" }
                 }
+            }
+        }
+    }
+}
+
+/// Settings > Local folders: the allowlist of folders on this PC the bots may
+/// use. Empty by default, which means off. Device-local; the server only ever
+/// hears the folder id, a label and the mode.
+#[component]
+pub fn LocalFoldersCard(session: Signal<Session>) -> Element {
+    let mut session = session;
+    let (folders, notice, running) = {
+        let s = session.read();
+        (
+            s.local_folders.clone(),
+            s.local_notice.clone(),
+            s.local_agent_running(),
+        )
+    };
+    rsx! {
+        div { class: "card",
+            div { class: "card-head",
+                h3 { class: "card-title", "Local folders" }
+            }
+            p { class: "tiny",
+                "Let your bots read, and with your approval write, text files in folders on this PC. "
+                "It is off until you add a folder. Only this app can see the folder paths; the bots get a short name."
+            }
+            if folders.is_empty() {
+                p { class: "hint", "No folders allowed. The bots cannot see anything on this PC." }
+            }
+            div { class: "roster",
+                for folder in folders {
+                    div { key: "{folder.id}", class: "roster-row",
+                        div { class: "thread-copy",
+                            span { class: "thread-title", "{folder.id}" }
+                            span { class: "thread-meta", "{folder.path}" }
+                        }
+                        select {
+                            "aria-label": "Access for {folder.id}",
+                            value: "{folder.mode.as_str()}",
+                            onchange: {
+                                let id = folder.id.clone();
+                                move |event| {
+                                    let mode = if event.value() == "read_write" {
+                                        serabot_desktop::local_folders::FolderMode::ReadWrite
+                                    } else {
+                                        serabot_desktop::local_folders::FolderMode::Read
+                                    };
+                                    session.write().set_local_folder_mode(&id, mode);
+                                }
+                            },
+                            option { value: "read", selected: folder.mode.as_str() == "read", "Read only" }
+                            option { value: "read_write", selected: folder.mode.as_str() == "read_write", "Read and write" }
+                        }
+                        button {
+                            class: "btn icon",
+                            title: "Remove {folder.id}",
+                            "aria-label": "Remove {folder.id}",
+                            onclick: {
+                                let id = folder.id.clone();
+                                move |_| session.write().remove_local_folder(&id)
+                            },
+                            Icon { name: "trash", size: 15 }
+                        }
+                    }
+                }
+            }
+            div { class: "row",
+                button {
+                    class: "btn",
+                    onclick: move |_| session.write().pick_local_folder(),
+                    "Add folder\u{2026}"
+                }
+                if running {
+                    span { class: "chip ok", "Connected to your bots" }
+                }
+            }
+            if let Some(notice) = notice {
+                p { class: "hint", "{notice}" }
+            }
+            p { class: "tiny",
+                "Writes always ask for your approval. Links, junctions, and files like .env or private keys are never shared. "
+                "If this app is closed, the bots get a clear error instead."
             }
         }
     }

@@ -1874,6 +1874,73 @@ impl ApiClient {
         )?;
         Ok(response.selection)
     }
+    /// Local folders: register the allowed roots (id, label, mode; no paths)
+    /// and wait up to `wait_secs` for one relayed request.
+    pub fn local_poll(
+        &self,
+        roots: &serde_json::Value,
+        wait_secs: u64,
+    ) -> Result<Option<crate::local_folders::LocalRequest>, ApiError> {
+        #[derive(Serialize)]
+        struct Poll<'a> {
+            roots: &'a serde_json::Value,
+            wait_secs: u64,
+        }
+        #[derive(Deserialize)]
+        struct Reply {
+            request: Option<crate::local_folders::LocalRequest>,
+        }
+        let reply: Reply = self.request(
+            Method::POST,
+            &["v1", "local", "poll"],
+            &[],
+            Some(&Poll {
+                roots,
+                wait_secs: wait_secs.min(15),
+            }),
+        )?;
+        if let Some(request) = &reply.request
+            && (!valid_id(&request.id) || request.op.len() > 16 || request.root.len() > 64)
+        {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(reply.request)
+    }
+
+    /// Answer a relayed local folder request.
+    pub fn local_result(&self, id: &str, outcome: Result<String, String>) -> Result<(), ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::InvalidResponse);
+        }
+        #[derive(Serialize)]
+        struct Answer {
+            ok: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            text: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            error: Option<String>,
+        }
+        let answer = match outcome {
+            Ok(text) => Answer {
+                ok: true,
+                text: Some(text),
+                error: None,
+            },
+            Err(error) => Answer {
+                ok: false,
+                text: None,
+                error: Some(error),
+            },
+        };
+        let _: serde_json::Value = self.request(
+            Method::POST,
+            &["v1", "local", "result", id],
+            &[],
+            Some(&answer),
+        )?;
+        Ok(())
+    }
+
     /// Upload one chat attachment (raw body, `X-Filename`). Returns the
     /// server's record; its id goes into `submit_with`.
     pub fn upload_attachment(
