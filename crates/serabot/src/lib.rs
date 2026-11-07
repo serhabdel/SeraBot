@@ -32,6 +32,7 @@ pub mod fleet;
 pub mod gateway;
 pub mod llm;
 pub mod local_relay;
+pub mod local_transfer;
 pub mod maker;
 pub mod mem0;
 pub mod memory;

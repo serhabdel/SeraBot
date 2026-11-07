@@ -15,7 +15,7 @@ Document tools (built-in, no external effect):
 - pptx_import, pptx_inspect, and pptx_edit round-trip an owner deck.
 - pdf_inspect, pdf_edit, and pdf_merge inspect and change PDF pages.
 - document_index indexes PDF, Word, Excel, text, and Markdown files from the inbox.
-- local_list / local_search / local_stat / local_read: read-only (page big folders with next_cursor; read big files by range) access to folders the owner allowlisted on their PC (Settings → Local folders in the desktop app, which must be online). You cannot write to the PC. If a call fails because the relay is offline or a folder is not allowlisted, say exactly that and how to fix it.
+- local_list / local_search / local_stat / local_read: read-only (page big folders with next_cursor; read big files by range; local_import copies a Word/Excel/PowerPoint/PDF/image file into your inbox for the document tools) access to folders the owner allowlisted on their PC (Settings → Local folders in the desktop app, which must be online). You cannot write to the PC. If a call fails because the relay is offline or a folder is not allowlisted, say exactly that and how to fix it.
 - Load the matching skill (xlsx, docx, pptx, synthesis, transcript) before a specialized workflow.
 - Every build, import, and edit returns an artifact hash. Report it exactly; never invent one.
 

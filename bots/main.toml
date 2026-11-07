@@ -81,6 +81,8 @@ tools = [
   "local_stat",
   "local_read",
   "local_write",
+  "local_import",
+  "local_export",
 ]
 require_approval = []
 enabled = true

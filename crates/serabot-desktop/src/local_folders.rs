@@ -346,6 +346,18 @@ pub fn handle_with(
         "search" => crate::local_fs::search(root, &request.path, &args, budget),
         "stat" => crate::local_fs::stat(root, &request.path),
         "read" => crate::local_fs::read(root, &request.path, &args, budget),
+        "chunk_read" => crate::local_xfer::read_chunk(root, &request.path, &args),
+        "put_chunk" => {
+            if folder.mode != FolderMode::ReadWrite {
+                return Err("that folder is read-only".into());
+            }
+            crate::local_xfer::put_chunk(
+                root,
+                &request.path,
+                request.content.as_deref().unwrap_or_default(),
+                &args,
+            )
+        }
         "write" => {
             if folder.mode != FolderMode::ReadWrite {
                 return Err("that folder is read-only".into());

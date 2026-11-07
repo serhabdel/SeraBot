@@ -46,6 +46,7 @@ tools = [
   "local_search",
   "local_stat",
   "local_read",
+  "local_import",
 ]
 require_approval = ["onedrive_upload"]
 enabled = true

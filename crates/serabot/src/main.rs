@@ -846,6 +846,14 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     // desktop registers an allowlisted folder.
     let local_relay = serabot::local_relay::LocalRelay::new();
     serabot::local_relay::register_local_tools(&mut registry, local_relay.clone(), policy.clone())?;
+    serabot::local_transfer::register_transfer_tools(
+        &mut registry,
+        local_relay.clone(),
+        policy.clone(),
+        artifacts.clone(),
+        store.clone(),
+        config.path(&config.documents.watch_dir),
+    )?;
     let mut browser_manager = None;
     if config.browser.enabled {
         let manager = serabot::browser::build_manager(&config)?;

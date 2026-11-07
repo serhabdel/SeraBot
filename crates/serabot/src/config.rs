@@ -1957,6 +1957,8 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "local_stat",
     "local_read",
     "local_write",
+    "local_import",
+    "local_export",
 ];
 
 const DEFAULT_SPECIALIST_TOOLS: &[&str] = &["skill_list", "skill_search", "skill_load"];

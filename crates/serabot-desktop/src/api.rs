@@ -365,6 +365,8 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
     "local_stat",
     "local_read",
     "local_write",
+    "local_import",
+    "local_export",
 ];
 
 pub const DEFAULT_SPECIALIST_TOOLS: &[&str] = &["skill_list", "skill_search", "skill_load"];

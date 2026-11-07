@@ -937,6 +937,8 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "local_stat",
         "local_read",
         "local_write",
+        "local_import",
+        "local_export",
     ];
     #[cfg(feature = "docx")]
     names.extend([
