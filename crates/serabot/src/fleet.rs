@@ -20,17 +20,80 @@
 //! seed templates, so members never inherit the admin's tool or skill
 //! overrides.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
+
+use serde::{Deserialize, Serialize};
 
 use crate::config::{BotConfig, Config, ConfiguredBot, LoadedBot, apply_bot_config_override};
 use crate::error::{Result, SeraError};
 use crate::orchestration::{BotFleetMember, safe_bot_label, validate_bot_fleet};
 use crate::skills::SkillCatalog;
 use crate::store::{Store, StoredBot};
+use crate::util::sha256_hex;
 
 /// A user's loaded fleet, keyed by bot id.
 pub type Fleet = HashMap<String, LoadedBot>;
+
+/// SHA-256 of prompt texts shipped before offering records existed (the
+/// 0.18 templates), by bot. A row without a record whose prompt is one of
+/// these is an unedited shipped prompt and may be upgraded; any other text
+/// is the owner's and is kept.
+const SHIPPED_BEFORE_OFFERINGS: &[(&str, &str)] = &[
+    (
+        "main",
+        "efd3545f42d1951f1a9565f85124ce2b23830fa809babf198138ac7dd92259b3",
+    ),
+    (
+        "analyst",
+        "8c6a7ff1dfaeecc9f8bd1f68ab13f62e06e0e79bbc1a8d3cf96c3916e80f5080",
+    ),
+    (
+        "maker",
+        "4380e832859c3b0c2c450128034c0fb5fd7ab68730a5d5e205e1164f5b6062a9",
+    ),
+];
+
+/// What the shipped template for one bot offered the last time it was seeded
+/// for a user. Entries stay in the record after the owner removes them, so a
+/// later upgrade only adds what is new since this offering.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct BotOffering {
+    #[serde(default)]
+    tools: BTreeSet<String>,
+    #[serde(default)]
+    skills: BTreeSet<String>,
+    /// SHA-256 of the prompt text last offered.
+    #[serde(default)]
+    prompt_sha256: String,
+}
+
+impl BotOffering {
+    fn of(template: &LoadedBot) -> Self {
+        Self {
+            tools: template.config.tools.iter().cloned().collect(),
+            skills: template.config.skills.iter().cloned().collect(),
+            prompt_sha256: sha256_hex(&template.prompt),
+        }
+    }
+}
+
+/// One user's offering records, by bot name. Stored in `kv` under the user id.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Offerings {
+    #[serde(default)]
+    bots: BTreeMap<String, BotOffering>,
+}
+
+/// Append the entries a template gained since its last offering. An entry the
+/// baseline already covers is never added again, so a removal stays removed.
+fn add_gained(current: &mut Vec<String>, template: &[String], baseline: &BTreeSet<String>) {
+    for entry in template {
+        if !baseline.contains(entry) && !current.contains(entry) {
+            current.push(entry.clone());
+        }
+    }
+}
 
 /// Replace a user's bot rows with the shipped templates.
 ///
@@ -45,6 +108,7 @@ pub fn reseed_user(store: &Store, user_id: &str, templates: &[LoadedBot]) -> Res
     for row in store.list_bots(user_id)? {
         store.delete_bot(user_id, &row.name)?;
     }
+    let mut offerings = Offerings::default();
     for template in templates {
         store.upsert_bot(
             user_id,
@@ -53,7 +117,11 @@ pub fn reseed_user(store: &Store, user_id: &str, templates: &[LoadedBot]) -> Res
             &template.prompt,
             template.config.enabled,
         )?;
+        offerings
+            .bots
+            .insert(template.config.name.clone(), BotOffering::of(template));
     }
+    store.set_fleet_offerings(user_id, &serde_json::to_string(&offerings)?)?;
     Ok(templates.len())
 }
 
@@ -119,46 +187,104 @@ impl FleetRegistry {
         validate_bot_fleet(&members)
     }
 
-    /// Insert the default fleet for a user who has none, and repair the
-    /// empty prompts migration 0010 leaves on pre-existing rows (SQL cannot
-    /// read the prompt files). Idempotent; returns the number of rows
-    /// inserted (0 when the user already had a fleet).
+    /// Bring the user's fleet up to the shipped templates. Idempotent; returns
+    /// the number of bot rows inserted.
+    ///
+    /// For each template, against the user's offering record (the baseline):
+    /// - no row and no record: insert it, so a new default bot reaches an
+    ///   existing user. A row the owner deleted after an offering stays gone.
+    /// - a row: add the tools and skills the template gained since the
+    ///   baseline, never re-adding one the owner removed. Replace the prompt
+    ///   only while the row still holds a shipped text (the recorded hash, or
+    ///   an empty prompt, or a pre-record 0.18 text); an owner's edit is kept.
+    ///
+    /// Nothing is ever deleted, and the record is written only when it
+    /// changes. Empty prompts left by migration 0010 are repaired here too,
+    /// since SQL cannot read the prompt files.
     pub fn seed(&self, user_id: &str) -> Result<usize> {
-        let existing = self.store.list_bots(user_id)?;
-        if existing.is_empty() {
-            for template in self.templates.iter() {
-                self.store.upsert_bot(
-                    user_id,
-                    &template.config.name,
-                    &serde_json::to_value(&template.config)?,
-                    &template.prompt,
-                    template.config.enabled,
-                )?;
-            }
-            if !self.templates.is_empty() {
-                self.invalidate(user_id);
-            }
-            return Ok(self.templates.len());
-        }
-        let mut repaired = 0;
-        for row in existing {
-            if !row.prompt.is_empty() {
+        let rows = self.store.list_bots(user_id)?;
+        let mut offerings: Offerings = match self.store.fleet_offerings(user_id)? {
+            Some(raw) => serde_json::from_str(&raw)?,
+            None => Offerings::default(),
+        };
+        let original = offerings.clone();
+        let mut inserted = 0;
+        let mut rows_changed = false;
+        for template in self.templates.iter() {
+            let name = template.config.name.as_str();
+            let record = offerings.bots.get(name).cloned();
+            let Some(row) = rows.iter().find(|row| row.name == name) else {
+                if record.is_none() {
+                    self.store.upsert_bot(
+                        user_id,
+                        name,
+                        &serde_json::to_value(&template.config)?,
+                        &template.prompt,
+                        template.config.enabled,
+                    )?;
+                    offerings
+                        .bots
+                        .insert(name.to_owned(), BotOffering::of(template));
+                    inserted += 1;
+                }
                 continue;
-            }
-            if let Some(template) = self
-                .templates
-                .iter()
-                .find(|template| template.config.name == row.name)
+            };
+            let mut config: BotConfig =
+                serde_json::from_value(row.config.clone()).map_err(|_| {
+                    SeraError::Config(format!("bot '{name}' has an invalid stored config"))
+                })?;
+            // Without a record the row itself is the baseline, so nothing it
+            // already holds is treated as new.
+            let baseline = record.unwrap_or_else(|| BotOffering {
+                tools: config.tools.iter().cloned().collect(),
+                skills: config.skills.iter().cloned().collect(),
+                prompt_sha256: String::new(),
+            });
+            let row_sha = sha256_hex(&row.prompt);
+            let prompt_is_shipped = row.prompt.is_empty()
+                || baseline.prompt_sha256 == row_sha
+                || SHIPPED_BEFORE_OFFERINGS.contains(&(name, row_sha.as_str()));
+            let prompt_changed = prompt_is_shipped && row.prompt != template.prompt;
+            let tools_before = config.tools.len();
+            let skills_before = config.skills.len();
+            add_gained(&mut config.tools, &template.config.tools, &baseline.tools);
+            add_gained(
+                &mut config.skills,
+                &template.config.skills,
+                &baseline.skills,
+            );
+            if config.tools.len() != tools_before
+                || config.skills.len() != skills_before
+                || prompt_changed
             {
-                self.store
-                    .set_bot_prompt(user_id, &row.name, &template.prompt)?;
-                repaired += 1;
+                let prompt = if prompt_changed {
+                    template.prompt.as_str()
+                } else {
+                    row.prompt.as_str()
+                };
+                self.store.update_bot(
+                    user_id,
+                    name,
+                    &serde_json::to_value(&config)?,
+                    prompt,
+                    row.enabled,
+                )?;
+                rows_changed = true;
             }
+            // The record keeps everything offered before, plus this template.
+            let mut next = BotOffering::of(template);
+            next.tools.extend(baseline.tools);
+            next.skills.extend(baseline.skills);
+            offerings.bots.insert(name.to_owned(), next);
         }
-        if repaired > 0 {
+        if offerings != original {
+            self.store
+                .set_fleet_offerings(user_id, &serde_json::to_string(&offerings)?)?;
+        }
+        if inserted > 0 || rows_changed {
             self.invalidate(user_id);
         }
-        Ok(0)
+        Ok(inserted)
     }
 
     /// The acting user's rows, seeding the default fleet when the user has
@@ -407,7 +533,8 @@ mod tests {
             )
             .unwrap();
         let registry = registry(&store, config());
-        assert_eq!(registry.seed(&admin).unwrap(), 0);
+        // `analyst` is a template the row-only user never had: it is inserted.
+        assert_eq!(registry.seed(&admin).unwrap(), 1);
         assert_eq!(
             registry.row(&admin, "main").unwrap().unwrap().prompt,
             "main prompt"
@@ -531,5 +658,258 @@ mod tests {
         assert!(registry.row(&admin, "admin-only").unwrap().is_some());
         assert!(registry.row(&member, "admin-only").unwrap().is_none());
         assert!(!registry.load(&member).unwrap().contains_key("admin-only"));
+    }
+
+    /// A `main` + `analyst` fleet whose `main` offers the given tools and
+    /// prompt, for simulating successive template releases.
+    fn versioned(tools: &[&str], prompt: &str) -> Vec<LoadedBot> {
+        let mut main = bot("main", BotRole::Orchestrator, vec!["analyst".into()], true);
+        main.config.tools = tools.iter().map(|tool| (*tool).to_owned()).collect();
+        main.prompt = prompt.into();
+        vec![main, bot("analyst", BotRole::Specialist, vec![], true)]
+    }
+
+    fn registry_with(store: &Store, templates: Vec<LoadedBot>) -> FleetRegistry {
+        FleetRegistry::new(
+            Arc::new(config()),
+            store.clone(),
+            templates,
+            Arc::new(SkillCatalog::load(&Config::default()).unwrap()),
+        )
+        .unwrap()
+    }
+
+    fn config_of(store: &Store, user_id: &str, name: &str) -> BotConfig {
+        let row = store.get_bot(user_id, name).unwrap().unwrap();
+        serde_json::from_value(row.config).unwrap()
+    }
+
+    /// A pre-0.19 `main` row with no offering record gains the local folder
+    /// tools; a text the registry does not recognize is the owner's and stays.
+    #[test]
+    fn an_existing_row_without_a_record_gains_the_new_tools() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let old = versioned(&["delegate", "memory_save"], "old prompt");
+        store
+            .upsert_bot(
+                &admin,
+                "main",
+                &serde_json::to_value(&old[0].config).unwrap(),
+                "old prompt",
+                true,
+            )
+            .unwrap();
+        let registry = registry_with(
+            &store,
+            versioned(
+                &[
+                    "delegate",
+                    "memory_save",
+                    "local_list",
+                    "local_read",
+                    "local_write",
+                ],
+                "new prompt",
+            ),
+        );
+        assert_eq!(registry.seed(&admin).unwrap(), 1);
+        assert_eq!(
+            config_of(&store, &admin, "main").tools,
+            vec![
+                "delegate",
+                "memory_save",
+                "local_list",
+                "local_read",
+                "local_write"
+            ]
+        );
+        assert_eq!(
+            store.get_bot(&admin, "main").unwrap().unwrap().prompt,
+            "old prompt"
+        );
+    }
+
+    /// A tool the owner removed after an offering is not added back, while a
+    /// tool the template gains later is.
+    #[test]
+    fn a_tool_the_owner_removed_stays_removed() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        registry_with(&store, versioned(&["delegate", "memory_save"], "v1"))
+            .seed(&admin)
+            .unwrap();
+        let mut config = config_of(&store, &admin, "main");
+        config.tools.retain(|tool| tool != "memory_save");
+        let row = store.get_bot(&admin, "main").unwrap().unwrap();
+        store
+            .update_bot(
+                &admin,
+                "main",
+                &serde_json::to_value(&config).unwrap(),
+                &row.prompt,
+                true,
+            )
+            .unwrap();
+
+        let next = registry_with(
+            &store,
+            versioned(&["delegate", "memory_save", "local_list"], "v1"),
+        );
+        next.seed(&admin).unwrap();
+        assert_eq!(
+            config_of(&store, &admin, "main").tools,
+            vec!["delegate", "local_list"]
+        );
+    }
+
+    /// An unedited shipped prompt is replaced by the new one; an owner's edit
+    /// is kept, and one user's upgrade never touches another user's rows.
+    #[test]
+    fn an_unedited_prompt_upgrades_and_an_edited_one_is_kept() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let member = member(&store);
+        registry_with(&store, versioned(&["delegate"], "v1 prompt"))
+            .seed(&admin)
+            .unwrap();
+        let v1 = registry_with(&store, versioned(&["delegate"], "v1 prompt"));
+        v1.seed(&member).unwrap();
+        store
+            .set_bot_prompt(&member, "main", "the member's own wording")
+            .unwrap();
+
+        registry_with(&store, versioned(&["delegate"], "v2 prompt"))
+            .seed(&admin)
+            .unwrap();
+        assert_eq!(
+            store.get_bot(&admin, "main").unwrap().unwrap().prompt,
+            "v2 prompt"
+        );
+        assert_eq!(
+            store.get_bot(&member, "main").unwrap().unwrap().prompt,
+            "the member's own wording"
+        );
+    }
+
+    /// A template bot the user lacks is inserted, but a bot the owner deleted
+    /// after its offering is not brought back.
+    #[test]
+    fn a_new_template_bot_reaches_existing_users_and_a_deleted_one_stays_deleted() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        registry_with(&store, versioned(&[], "v1"))
+            .seed(&admin)
+            .unwrap();
+        store.delete_bot(&admin, "analyst").unwrap();
+
+        let mut templates = versioned(&[], "v1");
+        templates.push(bot("watcher", BotRole::Specialist, vec![], true));
+        let next = registry_with(&store, templates);
+        assert_eq!(next.seed(&admin).unwrap(), 1);
+        assert!(store.get_bot(&admin, "watcher").unwrap().is_some());
+        assert!(store.get_bot(&admin, "analyst").unwrap().is_none());
+    }
+
+    /// Once upgraded, a second run writes nothing: same rows, same timestamps,
+    /// same record.
+    #[test]
+    fn running_the_upgrade_twice_is_a_no_op() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let old = versioned(&["delegate"], "old prompt");
+        store
+            .upsert_bot(
+                &admin,
+                "main",
+                &serde_json::to_value(&old[0].config).unwrap(),
+                "old prompt",
+                true,
+            )
+            .unwrap();
+        let registry = registry_with(&store, versioned(&["delegate", "local_list"], "new"));
+        assert_eq!(registry.seed(&admin).unwrap(), 1);
+        let rows = store.list_bots(&admin).unwrap();
+        let record = store.fleet_offerings(&admin).unwrap();
+        assert!(record.is_some());
+
+        assert_eq!(registry.seed(&admin).unwrap(), 0);
+        let again = store.list_bots(&admin).unwrap();
+        let names = |rows: &[StoredBot]| {
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.name.clone(),
+                        row.config.to_string(),
+                        row.prompt.clone(),
+                        row.updated_at,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&rows), names(&again));
+        assert_eq!(store.fleet_offerings(&admin).unwrap(), record);
+    }
+
+    /// The shipped `main` template gains the local folder tools and the
+    /// telegram document tool; a pre-0.19 row (no record, 0.18 tools, and a
+    /// prompt the registry does not know) keeps its text.
+    #[test]
+    fn repository_templates_upgrade_a_pre_0_19_main_row() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("repository root")
+            .to_path_buf();
+        let config = Config {
+            base_dir: root.canonicalize().unwrap(),
+            ..Config::default()
+        };
+        let templates =
+            crate::config::load_bots(&config, &config.fleet.bots_dir).expect("seed templates");
+        let shipped = templates
+            .iter()
+            .find(|bot| bot.config.name == "main")
+            .unwrap()
+            .config
+            .clone();
+        let old_tools: Vec<String> = shipped
+            .tools
+            .iter()
+            .filter(|tool| !tool.starts_with("local_") && tool.as_str() != "telegram_send_document")
+            .cloned()
+            .collect();
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let old = BotConfig {
+            tools: old_tools,
+            ..shipped
+        };
+        store
+            .upsert_bot(
+                &admin,
+                "main",
+                &serde_json::to_value(&old).unwrap(),
+                "a pre-0.19 prompt",
+                true,
+            )
+            .unwrap();
+        let catalog = Arc::new(SkillCatalog::load(&config).unwrap());
+        let registry =
+            FleetRegistry::new(Arc::new(config), store.clone(), templates, catalog).unwrap();
+        registry.seed(&admin).unwrap();
+        let tools = config_of(&store, &admin, "main").tools;
+        for tool in [
+            "local_list",
+            "local_read",
+            "local_write",
+            "telegram_send_document",
+        ] {
+            assert!(tools.iter().any(|name| name == tool), "{tool}");
+        }
+        assert_eq!(
+            store.get_bot(&admin, "main").unwrap().unwrap().prompt,
+            "a pre-0.19 prompt"
+        );
     }
 }

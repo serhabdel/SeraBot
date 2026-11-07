@@ -2322,6 +2322,86 @@ mod tests {
         assert!(checked >= 5, "expected the shipped bot files");
     }
 
+    fn shipped_bot(name: &str) -> BotConfig {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bots");
+        let raw = std::fs::read_to_string(root.join(format!("{name}.toml"))).expect("bot file");
+        toml::from_str(&raw).unwrap_or_else(|error| panic!("{name}: {error}"))
+    }
+
+    /// A prompt may name a tool only when its bot is granted it, or when the
+    /// runtime grants it on every turn (memory, plan, skill, and team tools).
+    #[test]
+    fn shipped_prompts_only_name_tools_their_bot_has() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let known = crate::tools::known_tool_names();
+        let always = [
+            "memory_save",
+            "memory_list",
+            "memory_delete",
+            crate::plans::PLAN_TOOL,
+            "skill_list",
+            "skill_search",
+            "skill_load",
+            crate::teams::TEAM_ASK_TOOL,
+            crate::teams::TEAM_REPLY_TOOL,
+        ];
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(repo.join("bots")).expect("bots directory") {
+            let path = entry.expect("bots entry").path();
+            if path.extension().and_then(|value| value.to_str()) != Some("toml") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path).expect("bot file");
+            let bot: BotConfig =
+                toml::from_str(&raw).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            let prompt_path = repo.join(&bot.system_prompt);
+            let prompt = std::fs::read_to_string(&prompt_path).expect("prompt file");
+            for word in
+                prompt.split(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+            {
+                let is_tool = known.iter().any(|name| *name == word);
+                let always_granted = always.iter().any(|name| *name == word);
+                let granted = bot.tools.iter().any(|tool| tool == word);
+                assert!(
+                    !is_tool || always_granted || granted,
+                    "{} names tool '{word}' but bot '{}' is not granted it",
+                    prompt_path.display(),
+                    bot.name
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 5, "expected the shipped bot files");
+    }
+
+    /// The owner's main bot can reach the PC folders and the approval-gated
+    /// document send. The specialists may read PC folders, never write them.
+    #[test]
+    fn local_folder_tools_are_granted_to_main_and_read_only_to_specialists() {
+        let main = shipped_bot("main");
+        for tool in [
+            "local_list",
+            "local_read",
+            "local_write",
+            "telegram_send_document",
+        ] {
+            assert!(main.tools.iter().any(|name| name == tool), "main: {tool}");
+        }
+        for name in ["analyst", "maker"] {
+            let bot = shipped_bot(name);
+            for tool in ["local_list", "local_read"] {
+                assert!(
+                    bot.tools.iter().any(|granted| granted == tool),
+                    "{name}: {tool}"
+                );
+            }
+            assert!(
+                !bot.tools.iter().any(|granted| granted == "local_write"),
+                "{name} must not write to the PC"
+            );
+        }
+    }
+
     #[test]
     fn validate_bot_tools_rejects_an_unknown_name() {
         let bot = LoadedBot {

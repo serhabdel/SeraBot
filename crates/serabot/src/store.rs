@@ -812,6 +812,17 @@ impl Store {
         Ok(())
     }
 
+    /// The acting user's record of what the shipped bot templates offered
+    /// (see `fleet::FleetRegistry::seed`). The user id is part of the key, so
+    /// one user's record is never read or written for another.
+    pub fn fleet_offerings(&self, user_id: &str) -> Result<Option<String>> {
+        self.kv_get(&fleet_offerings_key(user_id))
+    }
+
+    pub fn set_fleet_offerings(&self, user_id: &str, value: &str) -> Result<()> {
+        self.kv_set(&fleet_offerings_key(user_id), value)
+    }
+
     /// The reply mode selected for one conversation: `text` or `voice`.
     ///
     /// The key carries the user id because conversation ids such as `dir:main`
@@ -3913,6 +3924,10 @@ struct TelegramLinkCode {
 
 fn telegram_link_key(code_hash: &str) -> String {
     format!("telegram_link:{code_hash}")
+}
+
+fn fleet_offerings_key(user_id: &str) -> String {
+    format!("fleet_offerings:{user_id}")
 }
 
 fn stored_bot_from_row(row: &Row<'_>) -> rusqlite::Result<StoredBot> {

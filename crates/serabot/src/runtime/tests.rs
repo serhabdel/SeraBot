@@ -1822,3 +1822,47 @@ async fn prompts_inject_only_the_acting_users_memories() {
     assert!(member_handoff.contains("MEMBER-PRIVATE-FACT"));
     assert!(!member_handoff.contains("ADMIN-PRIVATE-FACT"));
 }
+
+#[tokio::test]
+async fn team_and_handoff_prompts_carry_the_skill_clause_and_the_tool_honesty_rule() {
+    let server = MockServer::start().await;
+    let (runtime, store) = setup(
+        &server.uri(),
+        Arc::new(Capture::default()),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    let admin = admin(&store);
+    let mut bot = bot();
+    bot.config.skills = vec!["xlsx".into()];
+    let honesty = "Use only the tools provided. Never claim to have run a tool you did not run.";
+    let skills = "Allowlisted skill ids: xlsx.";
+
+    let team = TeamContext {
+        root_task_id: "root".into(),
+        root_turn_id: None,
+        from_bot: ORCHESTRATOR_BOT.into(),
+        round: 0,
+    };
+    let team_prompt = runtime
+        .team_system_prompt(&admin, "owner", &bot, "objective", &team)
+        .unwrap();
+    assert!(team_prompt.contains(honesty), "{team_prompt}");
+    assert!(team_prompt.contains(skills), "{team_prompt}");
+
+    let handoff = HandoffContext {
+        handoff_id: "handoff".into(),
+        parent_task_id: "task".into(),
+        parent_turn_id: "turn".into(),
+        memory_ids: vec![],
+        skill: None,
+    };
+    let handoff_prompt = runtime
+        .handoff_system_prompt(&admin, &bot, "objective", &handoff)
+        .unwrap();
+    assert!(handoff_prompt.contains(honesty), "{handoff_prompt}");
+    assert!(handoff_prompt.contains(skills), "{handoff_prompt}");
+
+    // The direct chat prompt keeps the same rule and clause.
+    let direct = runtime.system_prompt(&admin, "owner", &bot, false, &[]);
+    assert!(direct.contains(honesty) && direct.contains(skills));
+}

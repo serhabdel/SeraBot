@@ -62,6 +62,7 @@ tools = [
   "browser_close",
   "browser_tabs",
   "browser_new_tab",
+  "telegram_send_document",
   "local_list",
   "local_read",
   "local_write",

@@ -221,13 +221,12 @@ impl LocalRelay {
         let (sender, receiver) = oneshot::channel();
         self.with_slot(user_id, |slot| -> Result<()> {
             if !slot.last_seen.is_some_and(|t| t.elapsed() < ONLINE_WINDOW) {
-                return Err(SeraError::External(
-                    "local folders unavailable: the desktop app is offline".into(),
-                ));
+                return Err(SeraError::External(OFFLINE_MESSAGE.into()));
             }
             let Some(entry) = slot.roots.iter().find(|entry| entry.id == root) else {
                 return Err(SeraError::Validation(format!(
-                    "unknown local folder '{root}'; the user has not allowed it"
+                    "Folder '{root}' is not allowlisted. Allowed folders: {}. The owner can add folders in Settings → Local folders.",
+                    allowed_folders(&slot.roots)
                 )));
             };
             if op == "write" && !entry.writable() {
@@ -270,11 +269,32 @@ impl LocalRelay {
                     slot.queue.retain(|request| request.id != id);
                 });
                 Err(SeraError::External(
-                    "local folders unavailable: the desktop did not answer in time".into(),
+                    "PC folder relay did not answer in time: the SeraBot desktop app may be closed or busy. Ask the owner to check the desktop app.".into(),
                 ))
             }
         }
     }
+}
+
+/// Shown to the model and the owner when the desktop is not connected.
+const OFFLINE_MESSAGE: &str = "PC folder relay offline: the SeraBot desktop app is not connected. Ask the owner to open the desktop app.";
+
+/// The allowed folder ids and labels only, never a path.
+fn allowed_folders(roots: &[LocalRoot]) -> String {
+    if roots.is_empty() {
+        return "none".into();
+    }
+    roots
+        .iter()
+        .map(|root| {
+            if root.label.is_empty() {
+                root.id.clone()
+            } else {
+                format!("{} ({})", root.id, root.label)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -353,8 +373,7 @@ impl Tool for LocalListTool {
             let roots = self.relay.roots(&context.user_id);
             if roots.is_empty() {
                 return Err(SeraError::External(
-                    "local folders unavailable: the desktop app is offline or no folder is allowed"
-                        .into(),
+                    "No PC folders are available: either the SeraBot desktop app is not connected, or the owner has not allowlisted a folder. Ask the owner to open the desktop app and allow a folder under Settings → Local folders.".into(),
                 ));
             }
             let lines = roots
@@ -518,7 +537,11 @@ mod tests {
             .call("u1", "read", "docs", "a.txt", None)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("offline"), "{error}");
+        assert!(
+            error.to_string().contains("PC folder relay offline")
+                && error.to_string().contains("open the desktop app"),
+            "{error}"
+        );
 
         relay
             .poll("u1", vec![root("docs", "read")], Duration::ZERO)
@@ -528,7 +551,13 @@ mod tests {
             .call("u1", "read", "other", "a.txt", None)
             .await
             .unwrap_err();
-        assert!(unknown.to_string().contains("unknown local folder"));
+        let text = unknown.to_string();
+        assert!(
+            text.contains("Folder 'other' is not allowlisted")
+                && text.contains("Allowed folders: docs (docs)")
+                && text.contains("Settings → Local folders"),
+            "{text}"
+        );
         let denied = relay
             .call("u1", "write", "docs", "a.txt", Some("x".into()))
             .await
