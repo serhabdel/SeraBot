@@ -626,10 +626,27 @@ fn connector_error_text(error: &ApiError) -> String {
     }
 }
 
+/// The codes the server sends for a Composio failure. Their messages are
+/// already written for the user (with the fix Composio suggested), so they
+/// are shown as they are.
+const COMPOSIO_CODES: &[&str] = &[
+    "composio_rejected",
+    "composio_plan_required",
+    "composio_not_found",
+    "composio_rate_limited",
+    "composio_unavailable",
+    "composio_bad_request",
+];
+
 /// What went wrong with Composio, in everyday words.
 fn composio_error_text(error: &ApiError) -> String {
     match error {
+        ApiError::Coded { code, message, .. } if COMPOSIO_CODES.contains(&code.as_str()) => {
+            message.clone()
+        }
         ApiError::Http(409) => "Add your Composio key first.".into(),
+        // The server answers 403 when no key is saved. It is not a policy block.
+        ApiError::Http(403) => "Composio is not connected yet. Add your key first.".into(),
         ApiError::Http(422) => "Composio did not accept that key. Check it and try again.".into(),
         ApiError::Http(502..=504) => "Composio could not be reached. Try again in a moment.".into(),
         other => other.to_string(),
@@ -2664,5 +2681,81 @@ mod tests {
         );
         assert_eq!(host_label(Some("not a url")), "No page open");
         assert_eq!(host_label(None), "No page open");
+    }
+
+    fn coded(code: &str, message: &str) -> ApiError {
+        ApiError::Coded {
+            status: 422,
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn composio_codes_show_the_server_message_verbatim() {
+        for code in COMPOSIO_CODES {
+            let error = coded(code, "Composio said this, word for word.");
+            assert_eq!(
+                composio_error_text(&error),
+                "Composio said this, word for word.",
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn composio_unknown_code_falls_back_to_the_server_message() {
+        let error = coded("validation", "invalid request");
+        assert_eq!(composio_error_text(&error), "invalid request");
+    }
+
+    #[test]
+    fn composio_not_connected_is_not_blamed_on_policy() {
+        let text = composio_error_text(&ApiError::Http(403));
+        assert_eq!(text, "Composio is not connected yet. Add your key first.");
+        assert!(!text.contains("policy"));
+        assert!(!text.contains("egress"));
+    }
+
+    #[test]
+    fn composio_bare_statuses_have_everyday_text() {
+        assert_eq!(
+            composio_error_text(&ApiError::Http(409)),
+            "Add your Composio key first."
+        );
+        assert_eq!(
+            composio_error_text(&ApiError::Http(422)),
+            "Composio did not accept that key. Check it and try again."
+        );
+        for status in [502, 503, 504] {
+            assert_eq!(
+                composio_error_text(&ApiError::Http(status)),
+                "Composio could not be reached. Try again in a moment.",
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn composio_other_errors_keep_their_own_text() {
+        assert_eq!(
+            composio_error_text(&ApiError::Transport),
+            ApiError::Transport.to_string()
+        );
+        assert_eq!(
+            composio_error_text(&ApiError::Rejected("name is taken".into())),
+            "name is taken"
+        );
+    }
+
+    #[test]
+    fn coded_upstream_errors_are_not_unknown_outcomes() {
+        assert!(!coded("composio_rejected", "x").unknown_outcome());
+        let unavailable = ApiError::Coded {
+            status: 502,
+            code: "composio_unavailable".into(),
+            message: "x".into(),
+        };
+        assert!(unavailable.unknown_outcome());
     }
 }

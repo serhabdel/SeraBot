@@ -7,7 +7,8 @@
 //! one user's linked apps are never visible to or usable by another.
 //!
 //! Endpoints (REST API v3, base `https://backend.composio.dev`, header
-//! `x-api-key`): `GET /api/v3/toolkits`, `GET /api/v3/tools`,
+//! `x-api-key`, or `x-user-api-key` for a user-level key):
+//! `GET /api/v3/toolkits`, `GET /api/v3/tools`,
 //! `POST /api/v3/tools/execute/{slug}`, `GET|POST /api/v3/auth_configs`,
 //! `POST /api/v3/connected_accounts/link`, `GET /api/v3/connected_accounts`,
 //! `DELETE /api/v3/connected_accounts/{id}`. See `docs/composio.md`.
@@ -20,10 +21,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use secrecy::ExposeSecret;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::config::{ComposioConfig, Config};
-use crate::connectors::{map_transport, plausible_secret};
+use crate::connectors::{plausible_secret, redact};
 use crate::error::{Result, SeraError};
 use crate::gateway::{ApprovalDetails, Tool, ToolContext, ToolOutput, ToolRegistry, ToolSpec};
 use crate::user_secrets::UserSecrets;
@@ -121,6 +123,127 @@ fn text(value: &Value, key: &str, max: usize) -> String {
         .unwrap_or_default()
 }
 
+/// Which header carries a key. Project keys use `x-api-key`; user-level keys
+/// (from Composio's user settings) use `x-user-api-key`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum KeyHeader {
+    Project,
+    User,
+}
+
+impl KeyHeader {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Project => "x-api-key",
+            Self::User => "x-user-api-key",
+        }
+    }
+}
+
+/// The sealed per-user value: the key and the header it was accepted with.
+/// Rows saved before the header was recorded hold the bare key (a project key).
+#[derive(Serialize, Deserialize)]
+struct SealedKey {
+    key: String,
+    header: KeyHeader,
+}
+
+impl SealedKey {
+    fn parse(raw: &str) -> Self {
+        serde_json::from_str(raw).unwrap_or_else(|_| Self {
+            key: raw.to_owned(),
+            header: KeyHeader::Project,
+        })
+    }
+}
+
+/// A failed Composio response, reduced to what is safe to show. The key is
+/// removed from every text first; control characters are dropped and each
+/// text is capped. `status` is 0 when no response arrived.
+fn upstream_error(status: u16, body: &Value, key: &str) -> SeraError {
+    let text = |pointer: &str, max: usize| {
+        let raw = body
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        clean(&redact(raw, &[key.to_owned()]), max)
+    };
+    let message = text("/error/message", 240);
+    let slug = text("/error/slug", 120);
+    let fix = text("/error/suggested_fix", 240);
+    let detail = if message.is_empty() { slug } else { message };
+    let (code, base) = match status {
+        401 | 403 => (
+            "composio_rejected",
+            format!(
+                "Composio rejected this API key{}. Use the project API key from platform.composio.dev → Settings → API keys.",
+                parenthesized(&detail)
+            ),
+        ),
+        402 => (
+            "composio_plan_required",
+            format!(
+                "Composio needs a plan or credits for this request{}.",
+                parenthesized(&detail)
+            ),
+        ),
+        404 => (
+            "composio_not_found",
+            format!("Composio could not find that{}.", parenthesized(&detail)),
+        ),
+        429 => (
+            "composio_rate_limited",
+            "Composio is rate limiting requests. Try again in a minute.".to_owned(),
+        ),
+        500..=599 => (
+            "composio_unavailable",
+            format!("Composio could not be reached (HTTP {status})."),
+        ),
+        _ => (
+            "composio_bad_request",
+            format!(
+                "Composio refused the request (HTTP {status}){}.",
+                parenthesized(&detail)
+            ),
+        ),
+    };
+    let message = if fix.is_empty() {
+        base
+    } else {
+        format!("{base} Composio suggests: {fix}")
+    };
+    SeraError::Upstream {
+        status,
+        code,
+        message,
+    }
+}
+
+fn parenthesized(detail: &str) -> String {
+    if detail.is_empty() {
+        String::new()
+    } else {
+        format!(" ({detail})")
+    }
+}
+
+/// A request that never got a response (timeout, refused connection, reset).
+fn transport_failure(error: reqwest::Error) -> SeraError {
+    let detail = if error.is_timeout() {
+        "timed out"
+    } else if error.is_connect() {
+        "could not connect"
+    } else {
+        "request failed"
+    };
+    SeraError::Upstream {
+        status: 0,
+        code: "composio_unavailable",
+        message: format!("Composio could not be reached ({detail})."),
+    }
+}
+
 pub struct ComposioService {
     users: Arc<UserSecrets>,
     http: reqwest::Client,
@@ -164,10 +287,10 @@ impl ComposioService {
         Ok(self.users.get(user_id, CREDENTIAL_ID)?.is_some())
     }
 
-    fn key(&self, user_id: &str) -> Result<String> {
+    fn key(&self, user_id: &str) -> Result<SealedKey> {
         self.users
             .get(user_id, CREDENTIAL_ID)?
-            .map(|secret| secret.expose_secret().clone())
+            .map(|secret| SealedKey::parse(secret.expose_secret()))
             .ok_or_else(|| {
                 SeraError::Forbidden(
                     "Composio is not connected; add your Composio key in Connectors first".into(),
@@ -176,23 +299,51 @@ impl ComposioService {
     }
 
     /// Check the key with a cheap authenticated read, then seal it for this
-    /// user. The key is never returned.
+    /// user with the header Composio accepted. The key is never returned.
     pub async fn connect_key(&self, user_id: &str, key: &str) -> Result<()> {
         let key = key.trim();
-        if key.is_empty() || key.len() > MAX_KEY_BYTES || !plausible_secret(key) {
+        // Shorter keys could not be redacted from Composio's error text.
+        if key.len() < 8 || key.len() > MAX_KEY_BYTES || !plausible_secret(key) {
             return Err(SeraError::Validation(
                 "that does not look like a Composio API key".into(),
             ));
         }
-        self.call(key, "GET", "/api/v3/toolkits", &[("limit", "1")], None)
-            .await
-            .map_err(|error| match error {
-                SeraError::Forbidden(_) => {
-                    SeraError::Validation("Composio rejected that key".into())
+        let header = match self.check(key, KeyHeader::Project).await {
+            Ok(()) => KeyHeader::Project,
+            // Composio refuses some user-level keys sent as x-api-key. Only a
+            // 401 earns the second try; a key that fails both is still refused.
+            Err(error @ SeraError::Upstream { status: 401, .. }) => {
+                if self.check(key, KeyHeader::User).await.is_ok() {
+                    KeyHeader::User
+                } else {
+                    return Err(error);
                 }
-                other => other,
-            })?;
-        self.users.set(user_id, CREDENTIAL_ID, key)
+            }
+            Err(error) => return Err(error),
+        };
+        let sealed = serde_json::to_string(&SealedKey {
+            key: key.to_owned(),
+            header,
+        })?;
+        self.users.set(user_id, CREDENTIAL_ID, &sealed)
+    }
+
+    /// One cheap authenticated read, to see whether Composio takes the key
+    /// under `header`.
+    async fn check(&self, key: &str, header: KeyHeader) -> Result<()> {
+        let candidate = SealedKey {
+            key: key.to_owned(),
+            header,
+        };
+        self.call(
+            &candidate,
+            "GET",
+            "/api/v3/toolkits",
+            &[("limit", "1")],
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Forget this user's key. Their linked apps stay in Composio.
@@ -202,7 +353,7 @@ impl ComposioService {
 
     async fn call(
         &self,
-        key: &str,
+        key: &SealedKey,
         method: &str,
         path: &str,
         query: &[(&str, &str)],
@@ -215,7 +366,7 @@ impl ComposioService {
             "DELETE" => self.http.delete(&url),
             _ => return Err(SeraError::Internal("unsupported method".into())),
         }
-        .header("x-api-key", key)
+        .header(key.header.name(), key.key.as_str())
         .header("accept", "application/json");
         if !query.is_empty() {
             request = request.query(query);
@@ -223,17 +374,10 @@ impl ComposioService {
         if let Some(body) = body {
             request = request.json(body);
         }
-        let mut response = request
-            .send()
-            .await
-            .map_err(|error| map_transport("Composio", error))?;
+        let mut response = request.send().await.map_err(transport_failure)?;
         let status = response.status();
         let mut bytes: Vec<u8> = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|error| map_transport("Composio", error))?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(transport_failure)? {
             if bytes.len() + chunk.len() > self.max_bytes {
                 return Err(SeraError::External(
                     "Composio response exceeded the size limit".into(),
@@ -245,19 +389,7 @@ impl ComposioService {
         if status.is_success() {
             return Ok(value);
         }
-        let message = value
-            .pointer("/error/message")
-            .and_then(Value::as_str)
-            .map(|m| clean(m, 200))
-            .unwrap_or_default();
-        Err(match status.as_u16() {
-            401 | 403 => SeraError::Forbidden(
-                "Composio rejected the saved key; add it again in Connectors".into(),
-            ),
-            404 => SeraError::NotFound(format!("Composio: {message}")),
-            429 => SeraError::External("Composio is rate limiting requests; try again soon".into()),
-            code => SeraError::External(format!("Composio returned HTTP {code}: {message}")),
-        })
+        Err(upstream_error(status.as_u16(), &value, &key.key))
     }
 
     /// Find tool slugs for a task. Each result says whether running it would
@@ -484,8 +616,7 @@ impl ComposioService {
             "POST",
             &format!("/api/v3/tools/execute/{slug}"),
             &[],
-            // REST v3 requires an explicit toolkit version for execution.
-            Some(&json!({"user_id": user_id, "version": "latest", "arguments": arguments})),
+            Some(&json!({"user_id": user_id, "arguments": arguments})),
         )
         .await
     }
@@ -766,7 +897,7 @@ mod tests {
             .and(path("/api/v3/tools/execute/GMAIL_FETCH_EMAILS"))
             .and(header("x-api-key", KEY_A))
             .and(wiremock::matchers::body_json(
-                json!({"user_id": a, "version": "latest", "arguments": {"max": 1}}),
+                json!({"user_id": a, "arguments": {"max": 1}}),
             ))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -886,5 +1017,299 @@ mod tests {
         let data = out.data.unwrap();
         assert_eq!(data["tools"][0]["needs_approval"], true);
         assert_eq!(data["tools"][1]["needs_approval"], false);
+    }
+
+    /// The typed upstream error, with its status and code checked. Returns
+    /// the user-facing text.
+    fn assert_upstream(error: &SeraError, status: u16, code: &str) -> String {
+        match error {
+            SeraError::Upstream {
+                status: got_status,
+                code: got_code,
+                message,
+            } => {
+                assert_eq!(*got_status, status, "{error:?}");
+                assert_eq!(*got_code, code, "{error:?}");
+                message.clone()
+            }
+            other => panic!("expected an upstream error, got {other:?}"),
+        }
+    }
+
+    /// No error text, Display or Debug, may carry the key.
+    fn assert_no_key(error: &SeraError, key: &str) {
+        assert!(!error.to_string().contains(key), "{error}");
+        assert!(!format!("{error:?}").contains(key), "{error:?}");
+    }
+
+    /// Mount one canned reply for `GET /api/v3/toolkits` under one key header.
+    async fn toolkits_reply(
+        server: &MockServer,
+        header_name: &'static str,
+        key: &str,
+        status: u16,
+        body: Value,
+    ) {
+        Mock::given(method("GET"))
+            .and(path("/api/v3/toolkits"))
+            .and(header(header_name, key))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn user_level_key_is_retried_once_with_its_own_header_and_kept() {
+        let server = MockServer::start().await;
+        toolkits_reply(
+            &server,
+            "x-api-key",
+            KEY_A,
+            401,
+            json!({"error": {"message": "Invalid API key"}}),
+        )
+        .await;
+        toolkits_reply(&server, "x-user-api-key", KEY_A, 200, json!({"items": []})).await;
+        let (svc, a, _b) = service(&server);
+        svc.connect_key(&a, KEY_A).await.unwrap();
+        let raw = svc.users.get(&a, CREDENTIAL_ID).unwrap().unwrap();
+        assert_eq!(
+            SealedKey::parse(raw.expose_secret()).header,
+            KeyHeader::User
+        );
+        // Later calls use the stored header, not x-api-key.
+        Mock::given(method("POST"))
+            .and(path("/api/v3/tools/execute/GMAIL_FETCH_EMAILS"))
+            .and(header("x-user-api-key", KEY_A))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"successful": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let value = svc
+            .execute(&a, "GMAIL_FETCH_EMAILS", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(value["successful"], true);
+    }
+
+    #[tokio::test]
+    async fn project_key_is_never_retried_with_the_user_header() {
+        let server = MockServer::start().await;
+        mock_toolkits_ok(&server, KEY_A).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/toolkits"))
+            .and(header("x-user-api-key", KEY_A))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let (svc, a, _b) = service(&server);
+        svc.connect_key(&a, KEY_A).await.unwrap();
+        let raw = svc.users.get(&a, CREDENTIAL_ID).unwrap().unwrap();
+        assert_eq!(
+            SealedKey::parse(raw.expose_secret()).header,
+            KeyHeader::Project
+        );
+    }
+
+    #[tokio::test]
+    async fn key_refused_under_both_headers_reports_the_rejection() {
+        let server = MockServer::start().await;
+        toolkits_reply(
+            &server,
+            "x-api-key",
+            KEY_A,
+            401,
+            json!({"error": {"message": "Invalid API key", "suggested_fix": "Check the key"}}),
+        )
+        .await;
+        toolkits_reply(
+            &server,
+            "x-user-api-key",
+            KEY_A,
+            401,
+            json!({"error": {"message": "Invalid API key"}}),
+        )
+        .await;
+        let (svc, a, _b) = service(&server);
+        let error = svc.connect_key(&a, KEY_A).await.unwrap_err();
+        let text = assert_upstream(&error, 401, "composio_rejected");
+        assert_eq!(
+            text,
+            "Composio rejected this API key (Invalid API key). Use the project API key from platform.composio.dev → Settings → API keys. Composio suggests: Check the key"
+        );
+        assert_no_key(&error, KEY_A);
+        assert!(!svc.connected(&a).unwrap());
+    }
+
+    #[tokio::test]
+    async fn forbidden_is_a_rejection_and_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/toolkits"))
+            .and(header("x-api-key", KEY_A))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                "error": {"message": "Access denied", "suggested_fix": "Link the app first"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (svc, a, _b) = service(&server);
+        svc.users.set(&a, CREDENTIAL_ID, KEY_A).unwrap();
+        let error = svc.search_toolkits(&a, "mail").await.unwrap_err();
+        let text = assert_upstream(&error, 403, "composio_rejected");
+        assert!(text.starts_with("Composio rejected this API key (Access denied)."));
+        assert!(text.ends_with("Composio suggests: Link the app first"));
+        assert_no_key(&error, KEY_A);
+    }
+
+    #[tokio::test]
+    async fn payment_required_names_the_plan_or_credits() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/tools"))
+            .respond_with(
+                ResponseTemplate::new(402)
+                    .set_body_json(json!({"error": {"message": "Upgrade your plan"}})),
+            )
+            .mount(&server)
+            .await;
+        let (svc, a, _b) = service(&server);
+        svc.users.set(&a, CREDENTIAL_ID, KEY_A).unwrap();
+        let error = svc.search_tools(&a, "mail", 5).await.unwrap_err();
+        assert_eq!(
+            assert_upstream(&error, 402, "composio_plan_required"),
+            "Composio needs a plan or credits for this request (Upgrade your plan)."
+        );
+        assert_no_key(&error, KEY_A);
+    }
+
+    #[tokio::test]
+    async fn not_found_keeps_the_composio_message() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/tools/execute/NO_SUCH_TOOL"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(json!({"error": {"message": "Tool not found"}})),
+            )
+            .mount(&server)
+            .await;
+        let (svc, a, _b) = service(&server);
+        svc.users.set(&a, CREDENTIAL_ID, KEY_A).unwrap();
+        let error = svc
+            .execute(&a, "NO_SUCH_TOOL", &json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            assert_upstream(&error, 404, "composio_not_found"),
+            "Composio could not find that (Tool not found)."
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_says_to_try_again_later() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/tools/execute/BUSY_TOOL"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(json!({"error": {}})))
+            .mount(&server)
+            .await;
+        let (svc, a, _b) = service(&server);
+        svc.users.set(&a, CREDENTIAL_ID, KEY_A).unwrap();
+        let error = svc.execute(&a, "BUSY_TOOL", &json!({})).await.unwrap_err();
+        assert_eq!(
+            assert_upstream(&error, 429, "composio_rate_limited"),
+            "Composio is rate limiting requests. Try again in a minute."
+        );
+    }
+
+    #[tokio::test]
+    async fn server_error_is_unavailable_with_the_suggested_fix() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/tools/execute/DOWN_TOOL"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+                "error": {"message": "boom", "suggested_fix": "Retry later"}
+            })))
+            .mount(&server)
+            .await;
+        let (svc, a, _b) = service(&server);
+        svc.users.set(&a, CREDENTIAL_ID, KEY_A).unwrap();
+        let error = svc.execute(&a, "DOWN_TOOL", &json!({})).await.unwrap_err();
+        assert_eq!(
+            assert_upstream(&error, 500, "composio_unavailable"),
+            "Composio could not be reached (HTTP 500). Composio suggests: Retry later"
+        );
+        assert_no_key(&error, KEY_A);
+    }
+
+    #[tokio::test]
+    async fn no_response_is_unavailable_with_status_zero() {
+        // A port that was just free: nothing listens there, so the connect fails.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let settings = ComposioConfig {
+            api_base: format!("http://127.0.0.1:{port}"),
+            timeout_secs: 5,
+            max_response_bytes: 8 * 1024,
+        };
+        let store = Store::open_in_memory(384).unwrap();
+        let users = Arc::new(UserSecrets::with_master_key(store.clone(), [7u8; 32]).unwrap());
+        let a = store
+            .create_user("microsoft:a", "a@example.example", "A")
+            .unwrap()
+            .id;
+        let svc = ComposioService::with_settings(&settings, users).unwrap();
+        svc.users.set(&a, CREDENTIAL_ID, KEY_A).unwrap();
+        let error = svc.search_toolkits(&a, "mail").await.unwrap_err();
+        assert!(matches!(
+            error,
+            SeraError::Upstream {
+                status: 0,
+                code: "composio_unavailable",
+                ..
+            }
+        ));
+        assert_no_key(&error, KEY_A);
+    }
+
+    #[tokio::test]
+    async fn echoed_key_is_redacted_from_upstream_text() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/tools/execute/ECHO_TOOL"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {
+                    "message": format!("unexpected {KEY_A}"),
+                    "suggested_fix": format!("send {KEY_A} once"),
+                }
+            })))
+            .mount(&server)
+            .await;
+        let (svc, a, _b) = service(&server);
+        svc.users.set(&a, CREDENTIAL_ID, KEY_A).unwrap();
+        let error = svc.execute(&a, "ECHO_TOOL", &json!({})).await.unwrap_err();
+        let text = assert_upstream(&error, 400, "composio_bad_request");
+        assert!(text.contains("[redacted]"), "{text}");
+        assert_no_key(&error, KEY_A);
+    }
+
+    #[test]
+    fn stored_rows_read_both_formats() {
+        let sealed = SealedKey::parse(r#"{"key":"cmp_x","header":"user"}"#);
+        assert_eq!(
+            (sealed.key.as_str(), sealed.header),
+            ("cmp_x", KeyHeader::User)
+        );
+        // A row from before the header was recorded is a bare project key.
+        let legacy = SealedKey::parse(KEY_A);
+        assert_eq!(
+            (legacy.key.as_str(), legacy.header),
+            (KEY_A, KeyHeader::Project)
+        );
     }
 }

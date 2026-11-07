@@ -24,6 +24,16 @@ pub enum SeraError {
     Validation(String),
     #[error("external service error: {0}")]
     External(String),
+    /// A third-party service refused or failed a request made for the user.
+    /// `status` is the upstream HTTP status (0 when no response arrived),
+    /// `code` is a stable word clients match on, and `message` is already
+    /// safe to show: no secrets, no control characters, bounded length.
+    #[error("{message}")]
+    Upstream {
+        status: u16,
+        code: &'static str,
+        message: String,
+    },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("serialization error: {0}")]

@@ -385,14 +385,8 @@ impl ApiClient {
             return Err(ApiError::TooLarge);
         }
         if !status.is_success() {
-            if matches!(status.as_u16(), 400 | 404 | 409 | 422)
-                && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
-                && let Some(message) = value.get("error").and_then(|v| v.as_str())
-                && !message.is_empty()
-                && message.len() <= 512
-                && !message.chars().any(char::is_control)
-            {
-                return Err(ApiError::Rejected(message.to_owned()));
+            if let Some(error) = rejection(status.as_u16(), &bytes) {
+                return Err(error);
             }
             return Err(ApiError::Http(status.as_u16()));
         }
@@ -623,5 +617,88 @@ impl ApiClient {
         } else {
             Ok(())
         }
+    }
+}
+
+/// The server's own words for a refused request: `{"error": "...", "code": "..."}`.
+/// 400/404/409/422 keep the message; 422 and 502-504 keep the code too, so the
+/// panel can tell an upstream outage from a rejected key. Anything else, or any
+/// text that is not short and plain, is a bare status.
+fn rejection(status: u16, bytes: &[u8]) -> Option<ApiError> {
+    if !matches!(status, 400 | 404 | 409 | 422 | 502..=504) {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let message = value.get("error").and_then(|v| v.as_str())?;
+    if message.is_empty() || message.len() > 512 || message.chars().any(char::is_control) {
+        return None;
+    }
+    let code = value.get("code").and_then(|v| v.as_str()).filter(|code| {
+        (1..=64).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+    });
+    match (status, code) {
+        (422 | 502..=504, Some(code)) => Some(ApiError::Coded {
+            status,
+            code: code.to_owned(),
+            message: message.to_owned(),
+        }),
+        (400 | 404 | 409 | 422, _) => Some(ApiError::Rejected(message.to_owned())),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coded_rejections_keep_the_server_message_and_code() {
+        let body = br#"{"error":"Composio could not be reached (HTTP 503).","code":"composio_unavailable"}"#;
+        assert_eq!(
+            rejection(502, body),
+            Some(ApiError::Coded {
+                status: 502,
+                code: "composio_unavailable".into(),
+                message: "Composio could not be reached (HTTP 503).".into(),
+            })
+        );
+        let body = br#"{"error":"invalid request","code":"validation"}"#;
+        assert_eq!(
+            rejection(422, body),
+            Some(ApiError::Coded {
+                status: 422,
+                code: "validation".into(),
+                message: "invalid request".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn plain_rejections_keep_the_message_only() {
+        assert_eq!(
+            rejection(422, br#"{"error":"name is taken"}"#),
+            Some(ApiError::Rejected("name is taken".into()))
+        );
+        assert_eq!(
+            rejection(404, br#"{"error":"not found","code":"not_found"}"#),
+            Some(ApiError::Rejected("not found".into()))
+        );
+    }
+
+    #[test]
+    fn other_statuses_and_unsafe_text_are_bare_statuses() {
+        assert_eq!(rejection(502, b"<html>bad gateway</html>"), None);
+        assert_eq!(rejection(500, br#"{"error":"boom"}"#), None);
+        assert_eq!(rejection(401, br#"{"error":"expired"}"#), None);
+        assert_eq!(rejection(422, br#"{"error":""}"#), None);
+        assert_eq!(rejection(422, br#"{"error":"a\nb"}"#), None);
+        let long = format!(r#"{{"error":"{}"}}"#, "x".repeat(513));
+        assert_eq!(rejection(422, long.as_bytes()), None);
+        // A 502 needs a plain code to count as a server message. Without one
+        // it is a bare status, as before.
+        assert_eq!(
+            rejection(502, br#"{"error":"down","code":"Bad Code!"}"#),
+            None
+        );
     }
 }

@@ -10,6 +10,7 @@ use tower::ServiceExt;
 
 mod browser_api;
 mod chat_api;
+mod composio_api;
 mod files_api;
 mod personal_api;
 mod profiles_api;
@@ -98,9 +99,12 @@ fn app_with_auth_stack(
         auth_issuer,
         rate_limit,
         None,
+        None,
     )
 }
 
+/// `composio_base` points Composio at a mock upstream; `None` keeps the default.
+#[allow(clippy::too_many_arguments)]
 fn app_with_stack(
     egress_approved: bool,
     policy: Policy,
@@ -109,6 +113,7 @@ fn app_with_stack(
     auth_issuer: Option<&str>,
     rate_limit: Option<u32>,
     browser: Option<Arc<crate::browser::BrowserManager>>,
+    composio_base: Option<&str>,
 ) -> (Router, Arc<Config>, Store) {
     let mut config = Config::default();
     config.api.enabled = true;
@@ -179,6 +184,7 @@ fn app_with_stack(
     let users = Arc::new(
         crate::user_secrets::UserSecrets::with_master_key(store.clone(), [9u8; 32]).unwrap(),
     );
+    let composio_users = users.clone();
     let fleet = runtime.fleet();
     let auth = match auth_issuer {
         Some(issuer) => {
@@ -202,6 +208,13 @@ fn app_with_stack(
     .unwrap()
     .with_browser(browser)
     .with_onboarding_drafter(Some(Arc::new(profiles_api::ScriptedDrafter)));
+    if let Some(base) = composio_base {
+        let mut settings = config.composio.clone();
+        settings.api_base = base.to_owned();
+        state.composio = Arc::new(
+            crate::composio::ComposioService::with_settings(&settings, composio_users).unwrap(),
+        );
+    }
     if let Some(service) = auth {
         state.auth = Some(Arc::new(service));
     }
