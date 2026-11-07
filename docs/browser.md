@@ -107,3 +107,7 @@ the service user to private ranges at the host firewall as defence in depth.
 
 Firecrawl for plain extraction (see `docs/firecrawl.md`); BrowserOS neo on the owner PC
 for logged-in flows is out of scope for this server browser.
+
+## Tabs and pointer (0.18)
+
+`GET /v1/browser/sessions` entries (and the takeover, handback, input and tab replies, which also carry `id` and `profile_name`) include `tabs` (`[{id: "t1", url, title, active}]`, at most 8) and `pointer` (`{x, y, action: "click"|"scroll", seq, vw, vh}`, viewport pixels, `seq` grows per action). While the user holds control: `POST /v1/browser/sessions/{id}/tabs {"url"}` opens a tab (public http(s) only), `POST .../tabs/{tab}/switch` and `.../tabs/{tab}/close` switch or close one; the last tab cannot be closed. The desktop Browser page draws a tab strip above the live view and a cursor with a click ripple (static under reduced motion) while the bot drives.

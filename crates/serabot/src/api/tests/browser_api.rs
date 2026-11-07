@@ -1179,7 +1179,10 @@ async fn tabs_and_pointer_flow_through_the_session_api() {
         admin_req(&rig.app, "POST", &format!("{base}/tabs/t9/close"), None),
     )
     .await;
-    assert!(status.is_client_error() && status != StatusCode::NOT_FOUND, "{status}");
+    assert!(
+        status.is_client_error() && status != StatusCode::NOT_FOUND,
+        "{status}"
+    );
     let (status, info) = call(
         &rig.app,
         admin_req(&rig.app, "POST", &format!("{base}/tabs/t2/close"), None),
@@ -1193,7 +1196,10 @@ async fn tabs_and_pointer_flow_through_the_session_api() {
         admin_req(&rig.app, "POST", &format!("{base}/tabs/t1/close"), None),
     )
     .await;
-    assert!(status.is_client_error() && status != StatusCode::NOT_FOUND, "{status}");
+    assert!(
+        status.is_client_error() && status != StatusCode::NOT_FOUND,
+        "{status}"
+    );
 
     // The last click is reported for the live-view cursor, with a growing seq.
     let click = |x: u32, y: u32| {
