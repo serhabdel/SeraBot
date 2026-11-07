@@ -308,6 +308,9 @@ fn capability_label(tool: &str) -> Option<&'static str> {
         }
         "pptx_import" | "pptx_inspect" | "pptx_edit" => Some("PowerPoint decks"),
         "pdf_inspect" | "pdf_edit" | "pdf_merge" => Some("PDF pages"),
+        "image_inspect" | "image_resize" | "image_convert" => Some("Images"),
+        "local_list" | "local_search" | "local_stat" | "local_read" | "local_write"
+        | "local_import" | "local_export" => Some("Folders on this PC"),
         "xlsx_analyze" | "timesheet_analyze" => Some("Spreadsheet analysis"),
         "rag_search" | "document_index" => Some("Document search"),
         "fetch_url" | "watch_now" | "firecrawl_scrape" | "firecrawl_map" | "firecrawl_search"

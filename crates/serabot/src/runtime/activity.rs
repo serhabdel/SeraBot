@@ -124,6 +124,7 @@ pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -
         "team_ask" => ("bot", "Asking the team".into()),
         "team_reply" => ("bot", "Replying to the team".into()),
         other if other.starts_with("pdf_") => ("file", "Working on a PDF".into()),
+        other if other.starts_with("image_") => ("file", "Working on an image".into()),
         other if other.starts_with("docx_") => ("file", "Working on a Word document".into()),
         other if other.starts_with("xlsx_") || other == "timesheet_analyze" => {
             ("chart", "Working on a spreadsheet".into())

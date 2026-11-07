@@ -30,6 +30,7 @@ pub mod fetch;
 pub mod firecrawl;
 pub mod fleet;
 pub mod gateway;
+pub mod image_ops;
 pub mod llm;
 pub mod local_relay;
 pub mod local_transfer;
