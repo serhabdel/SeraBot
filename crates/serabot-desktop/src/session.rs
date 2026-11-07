@@ -67,8 +67,9 @@ impl Theme {
 
     pub fn from_stored(value: Option<&str>) -> Self {
         match value {
-            Some("light") => Self::Light,
-            _ => Self::Dark,
+            Some("dark") => Self::Dark,
+            // Light is the default until the owner picks dark.
+            _ => Self::Light,
         }
     }
 
@@ -3779,6 +3780,14 @@ mod tests {
             telegram_error(ApiError::Transport),
             ApiError::Transport.to_string()
         );
+    }
+
+    #[test]
+    fn theme_defaults_to_light_and_keeps_a_stored_dark_choice() {
+        assert_eq!(Theme::from_stored(None), Theme::Light);
+        assert_eq!(Theme::from_stored(Some("junk")), Theme::Light);
+        assert_eq!(Theme::from_stored(Some("dark")), Theme::Dark);
+        assert_eq!(Theme::from_stored(Some("light")), Theme::Light);
     }
 
     #[test]

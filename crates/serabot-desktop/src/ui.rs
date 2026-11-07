@@ -716,7 +716,10 @@ pub enum MdBlock {
     Rule,
     Quote(Vec<String>),
     UnorderedList(Vec<String>),
-    OrderedList(Vec<String>),
+    OrderedList {
+        start: usize,
+        items: Vec<String>,
+    },
     Table {
         headers: Vec<String>,
         rows: Vec<Vec<String>>,
@@ -885,10 +888,31 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
                 .chars()
                 .all(|c| c.is_ascii_digit())
         {
+            // The first number is the list's start: a list that continues
+            // after other blocks (or a blank line) must not restart at 1.
+            let start = first_word
+                .trim_end_matches('.')
+                .parse::<usize>()
+                .unwrap_or(1);
             let mut items = Vec::new();
             while i < lines.len() {
                 let l_trim = lines[i].trim();
                 let fw = l_trim.split_whitespace().next().unwrap_or("");
+                if l_trim.is_empty() && !items.is_empty() {
+                    // A blank line inside a loose list keeps it one list.
+                    let next = lines[i + 1..].iter().map(|l| l.trim()).find(|l| !l.is_empty());
+                    let continues = next.is_some_and(|l| {
+                        let w = l.split_whitespace().next().unwrap_or("");
+                        w.ends_with('.')
+                            && !w.trim_end_matches('.').is_empty()
+                            && w.trim_end_matches('.').chars().all(|c| c.is_ascii_digit())
+                    });
+                    if continues {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
                 if fw.ends_with('.') && fw.trim_end_matches('.').chars().all(|c| c.is_ascii_digit())
                 {
                     let item_text = l_trim.get(fw.len()..).unwrap_or_default().trim().to_owned();
@@ -907,7 +931,7 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
                     break;
                 }
             }
-            blocks.push(MdBlock::OrderedList(items));
+            blocks.push(MdBlock::OrderedList { start, items });
             continue;
         }
 
@@ -1070,8 +1094,8 @@ pub fn MarkdownBody(content: String) -> Element {
                             }
                         }
                     },
-                    MdBlock::OrderedList(items) => rsx! {
-                        ol { key: "{idx}", class: "md-list md-ol",
+                    MdBlock::OrderedList { start, items } => rsx! {
+                        ol { key: "{idx}", class: "md-list md-ol", start: "{start}",
                             for (i_idx, item) in items.into_iter().enumerate() {
                                 li { key: "{i_idx}", InlineMarkdown { text: item } }
                             }
@@ -2812,14 +2836,6 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     rsx! {
         div { class: "pane-body chat-body",
             div { class: "chat-column",
-                // The model selector only applies to one-to-one bot chats; rooms
-                // and the owner chat stay auto-routed (the Providers page keeps
-                // the full ModelBar).
-                if is_one_to_one {
-                    div { class: "chat-head",
-                        ModelBar { session }
-                    }
-                }
                 if let Some((status, label)) = task {
                     if status == TaskStatus::AwaitingApproval {
                         div { class: "banner warn",
@@ -3063,6 +3079,13 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                         }
                         div { class: "composer-row",
                             NewMenu { session, overlay }
+                            // The model chip only applies to one-to-one bot
+                            // chats; rooms and the owner chat stay
+                            // auto-routed (the Providers page keeps the full
+                            // ModelBar).
+                            if is_one_to_one {
+                                ModelBar { session, compact: true }
+                            }
                             div { class: "team-row",
                                 if group_like {
                                     // Collapsed: one caption chip with a count.
@@ -3280,7 +3303,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
 }
 
 #[component]
-fn ModelBar(session: Signal<Session>) -> Element {
+fn ModelBar(session: Signal<Session>, #[props(default = false)] compact: bool) -> Element {
     // Picker items: (value, label). "auto" first, then the catalog entries
     // (or the static provider model lists when the catalog is empty).
     let (items, current, allowed, saved) = {
@@ -3367,8 +3390,10 @@ fn ModelBar(session: Signal<Session>) -> Element {
     // pop-list below can still use `filtered`.
     let keyed = filtered.clone();
     rsx! {
-        div { class: "model-bar",
-            span { class: "micro", "Model" }
+        div { class: if compact { "model-bar compact" } else { "model-bar" },
+            if !compact {
+                span { class: "micro", "Model" }
+            }
             div {
                 class: "menu-wrap",
                 onkeydown: move |event: KeyboardEvent| {
@@ -3458,7 +3483,7 @@ fn ModelBar(session: Signal<Session>) -> Element {
                     }
                 }
             }
-            if changed {
+            if changed && !compact {
                 span { class: "tiny", "Egress-approved providers only" }
                 button {
                     class: "btn primary sm",
@@ -3469,7 +3494,17 @@ fn ModelBar(session: Signal<Session>) -> Element {
                     },
                     "Apply"
                 }
-            } else {
+            } else if changed {
+                button {
+                    class: "btn primary sm",
+                    disabled: !allowed,
+                    onclick: move |_| {
+                        let draft = session.read().state.draft.clone();
+                        session.write().apply_model(draft);
+                    },
+                    "Apply"
+                }
+            } else if !compact {
                 span { class: "tiny", "Saved {saved}" }
             }
         }
@@ -5894,6 +5929,39 @@ mod tests {
         assert_eq!(parsed.provider, "groq");
         assert_eq!(parsed.model, "llama-3.3-70b");
         assert!(!parsed.is_auto());
+    }
+
+    #[test]
+    fn ordered_lists_keep_their_start_number_and_loose_items() {
+        let blocks = parse_markdown_blocks("3. three
+4. four");
+        assert_eq!(
+            blocks,
+            vec![MdBlock::OrderedList {
+                start: 3,
+                items: vec!["three".into(), "four".into()],
+            }]
+        );
+        // Blank lines between items keep one list rather than N lists of "1.".
+        let loose = parse_markdown_blocks("1. a
+
+2. b
+
+3. c");
+        assert_eq!(
+            loose,
+            vec![MdBlock::OrderedList {
+                start: 1,
+                items: vec!["a".into(), "b".into(), "c".into()],
+            }]
+        );
+        // A list resumed after another block starts at its own number.
+        let resumed = parse_markdown_blocks("1. a
+
+break
+
+2. b");
+        assert!(matches!(resumed.last(), Some(MdBlock::OrderedList { start: 2, .. })));
     }
 
     #[test]

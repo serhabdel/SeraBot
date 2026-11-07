@@ -4,59 +4,6 @@
    Text tokens meet WCAG AA (>= 4.5:1) on their surfaces in both themes. */
 
 :root {
-  color-scheme: dark;
-
-  /* Surfaces */
-  --bg: #0b0b0e;
-  --surface: #15151a;
-  --surface-2: #1c1c22;
-  --glass: rgba(21, 21, 26, 0.74);
-  --card-bg: rgba(24, 24, 30, 0.9);
-  --code-bg: #101015;
-  --code-head-bg: #17171d;
-
-  /* Hairlines and edges */
-  --hairline: rgba(255, 255, 255, 0.08);
-  --hairline-strong: rgba(255, 255, 255, 0.16);
-  --glass-edge: rgba(255, 255, 255, 0.1);
-  --glass-highlight: rgba(255, 255, 255, 0.06);
-
-  /* Text: label-3 is 5.4:1 on --surface, label-2 is 9.8:1 */
-  --label-1: #f2f2f5;
-  --label-2: #b3b3bb;
-  --label-3: #8c8c95;
-
-  /* Accent: one blue. Fill colour carries white text (4.9:1); ink is for text on dark. */
-  --accent: #0a6fd6;
-  --accent-hover: #0b63bd;
-  --accent-ink: #5aa8ff;
-  --accent-2: #b07ef0;
-  --on-accent: #ffffff;
-
-  /* Semantic */
-  --danger: #ff6259;
-  --ok: #3dd17a;
-  --warn: #f5c542;
-
-  /* Translucent tints for fills and badges */
-  --scrim: rgba(0, 0, 0, 0.42);
-  --accent-soft: rgba(10, 111, 214, 0.2);
-  --accent-2-soft: rgba(176, 126, 240, 0.16);
-  --danger-soft: rgba(255, 98, 89, 0.14);
-  --ok-soft: rgba(61, 209, 122, 0.13);
-  --warn-soft: rgba(245, 197, 66, 0.13);
-  --hover: rgba(255, 255, 255, 0.05);
-  --active: rgba(255, 255, 255, 0.09);
-  --clear: rgba(255, 255, 255, 0);
-  --code-ink: #e4e4e9;
-  --code-inline-bg: rgba(255, 255, 255, 0.08);
-  --code-inline-ink: #8fc2ff;
-
-  /* Ambient field behind the glass */
-  --glow-1: rgba(10, 111, 214, 0.16);
-  --glow-2: rgba(176, 126, 240, 0.1);
-  --glow-3: rgba(61, 209, 122, 0.06);
-
   /* Avatar gradient runs from a deep stop to a light one, per-bot hue. */
   --hue-sat: 90%;
   --hue-light: 44%;
@@ -72,19 +19,6 @@
   --r-pill: 999px;
   --r-avatar: 9px;
 
-  /* Soft layered elevation */
-  --shadow-1: 0 1px 1px rgba(0, 0, 0, 0.2), 0 4px 12px rgba(0, 0, 0, 0.16);
-  --shadow-2: 0 1px 2px rgba(0, 0, 0, 0.24), 0 12px 32px rgba(0, 0, 0, 0.3);
-  --ring: 0 0 0 3px var(--accent-soft);
-
-  /* Three-pane workspace surfaces */
-  --list-bg: rgba(21, 21, 26, 0.45);
-  --dock-bg: rgba(10, 10, 13, 0.6);
-  --glass-sheet: rgba(28, 28, 34, 0.86);
-  --tool-bg: rgba(0, 0, 0, 0.25);
-  --on-accent-soft: rgba(255, 255, 255, 0.18);
-  --shadow-3: 0 24px 60px rgba(0, 0, 0, 0.6);
-
   /* Motion: ease-out and spring-like curves, short and interruptible.
      Press feedback is 100ms; panels take 320ms; fades take 160ms. */
   --ease: cubic-bezier(0.32, 0.72, 0, 1);
@@ -97,11 +31,17 @@
   --dur-3: 320ms;
   --press-scale: 0.97;
 
+  /* Shared by both themes */
+  --on-accent: #ffffff;
+  --on-accent-soft: rgba(255, 255, 255, 0.18);
+  --clear: rgba(127, 127, 127, 0);
+  --ring: 0 0 0 3px var(--accent-soft);
+
   /* Type scale */
-  --fs-micro: 11px;
-  --fs-caption: 12px;
-  --fs-body-2: 13px;
-  --fs-body: 14px;
+  --fs-micro: 12px;
+  --fs-caption: 13px;
+  --fs-body-2: 14px;
+  --fs-body: 15px;
   --fs-msg: 15px;
   --fs-title: 16px;
   --fs-display: 22px;
@@ -119,13 +59,81 @@
   --font-mono: "Cascadia Code", "Cascadia Mono", Consolas, "SFMono-Regular", ui-monospace, monospace;
 }
 
+/* Dark theme: opt-in via the Theme switch. */
+:root:has(.root[data-theme="dark"]),
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* Surfaces */
+  --bg: #0e0d14;
+  --surface: #17161f;
+  --surface-2: #1f1e29;
+  --glass: rgba(21, 21, 26, 0.74);
+  --card-bg: rgba(24, 24, 30, 0.9);
+  --code-bg: #101015;
+  --code-head-bg: #17171d;
+
+  /* Hairlines and edges */
+  --hairline: rgba(255, 255, 255, 0.08);
+  --hairline-strong: rgba(255, 255, 255, 0.16);
+  --glass-edge: rgba(255, 255, 255, 0.1);
+  --glass-highlight: rgba(255, 255, 255, 0.06);
+
+  /* Text: label-3 is 5.4:1 on --surface, label-2 is 9.8:1 */
+  --label-1: #f2f2f5;
+  --label-2: #c2c1cc;
+  --label-3: #9b9aa6;
+
+  /* Accent: one violet. Fill colour carries white text (4.9:1); ink is for text on dark. */
+  --accent: #7352e8;
+  --accent-hover: #6642d9;
+  --accent-ink: #b9a6ff;
+  --accent-2: #5aa8ff;
+
+  /* Semantic */
+  --danger: #ff6259;
+  --ok: #3dd17a;
+  --warn: #f5c542;
+
+  /* Translucent tints for fills and badges */
+  --scrim: rgba(0, 0, 0, 0.42);
+  --accent-soft: rgba(115, 82, 232, 0.24);
+  --accent-2-soft: rgba(90, 168, 255, 0.14);
+  --danger-soft: rgba(255, 98, 89, 0.14);
+  --ok-soft: rgba(61, 209, 122, 0.13);
+  --warn-soft: rgba(245, 197, 66, 0.13);
+  --hover: rgba(255, 255, 255, 0.05);
+  --active: rgba(255, 255, 255, 0.09);
+  --code-ink: #e4e4e9;
+  --code-inline-bg: rgba(255, 255, 255, 0.08);
+  --code-inline-ink: #c8b9ff;
+
+  /* Ambient field behind the glass */
+  --glow-1: rgba(115, 82, 232, 0.16);
+  --glow-2: rgba(90, 168, 255, 0.08);
+  --glow-3: rgba(61, 209, 122, 0.06);
+
+
+  /* Soft layered elevation */
+  --shadow-1: 0 1px 1px rgba(0, 0, 0, 0.2), 0 4px 12px rgba(0, 0, 0, 0.16);
+  --shadow-2: 0 1px 2px rgba(0, 0, 0, 0.24), 0 12px 32px rgba(0, 0, 0, 0.3);
+
+  /* Three-pane workspace surfaces */
+  --list-bg: rgba(21, 21, 26, 0.45);
+  --dock-bg: rgba(10, 10, 13, 0.6);
+  --glass-sheet: rgba(28, 28, 34, 0.86);
+  --tool-bg: rgba(0, 0, 0, 0.25);
+  --shadow-3: 0 24px 60px rgba(0, 0, 0, 0.6);
+}
+
+:root,
 :root:has(.root[data-theme="light"]),
 [data-theme="light"] {
   color-scheme: light;
 
-  --bg: #f4f4f6;
+  --bg: #f6f5fb;
   --surface: #ffffff;
-  --surface-2: #f2f2f5;
+  --surface-2: #efedf8;
   --glass: rgba(255, 255, 255, 0.78);
   --card-bg: rgba(255, 255, 255, 0.94);
   --code-bg: #f6f6f8;
@@ -136,22 +144,22 @@
   --glass-edge: rgba(20, 20, 30, 0.1);
   --glass-highlight: rgba(255, 255, 255, 0.7);
 
-  --label-1: #1c1c21;
-  --label-2: #4a4a52;
-  --label-3: #6b6b74;
+  --label-1: #1a1a24;
+  --label-2: #43434f;
+  --label-3: #5d5d6a;
 
-  --accent: #0a6fd6;
-  --accent-hover: #0962bb;
-  --accent-ink: #0a5fb8;
-  --accent-2: #7a3fd1;
+  --accent: #6d3fe0;
+  --accent-hover: #5c2fcf;
+  --accent-ink: #5b2fc9;
+  --accent-2: #0a6fd6;
 
   --danger: #c4001d;
   --ok: #137a2a;
   --warn: #9a4a00;
 
   --scrim: rgba(20, 20, 30, 0.26);
-  --accent-soft: rgba(10, 111, 214, 0.12);
-  --accent-2-soft: rgba(122, 63, 209, 0.1);
+  --accent-soft: rgba(109, 63, 224, 0.12);
+  --accent-2-soft: rgba(10, 111, 214, 0.1);
   --danger-soft: rgba(196, 0, 29, 0.08);
   --ok-soft: rgba(19, 122, 42, 0.09);
   --warn-soft: rgba(154, 74, 0, 0.09);
@@ -159,14 +167,14 @@
   --active: rgba(20, 20, 30, 0.08);
   --code-ink: #26262c;
   --code-inline-bg: rgba(20, 20, 30, 0.06);
-  --code-inline-ink: #0a5fb8;
+  --code-inline-ink: #5b2fc9;
 
-  --glow-1: rgba(10, 111, 214, 0.1);
-  --glow-2: rgba(122, 63, 209, 0.07);
+  --glow-1: rgba(109, 63, 224, 0.1);
+  --glow-2: rgba(10, 111, 214, 0.06);
   --glow-3: rgba(19, 122, 42, 0.05);
 
   --list-bg: rgba(255, 255, 255, 0.55);
-  --dock-bg: rgba(244, 244, 246, 0.7);
+  --dock-bg: rgba(246, 245, 251, 0.7);
   --glass-sheet: rgba(255, 255, 255, 0.88);
   --tool-bg: rgba(20, 20, 30, 0.04);
   --shadow-3: 0 24px 60px rgba(20, 20, 30, 0.18);
@@ -179,9 +187,16 @@
 }
 
 /* Light-theme chevron for .select: dark stroke on light surfaces. */
+:root .select,
 :root:has(.root[data-theme="light"]) .select,
 [data-theme="light"] .select {
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%234a4a52' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
+/* Dark chevron stays light-grey. */
+:root:has(.root[data-theme="dark"]) .select,
+[data-theme="dark"] .select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5' fill='none' stroke='%238c8c95' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 
 * {
@@ -4833,5 +4848,149 @@ html[data-reduce-transparency="true"] .chat-header {
 
   .browser-card:active {
     transform: none;
+  }
+}
+
+/* ------------------------------------------------ live chat activity ----- */
+/* What the bot is doing under the user's message. Tokens only. */
+
+.activity {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 4px 0 12px 44px;
+  padding: 10px 14px;
+  max-width: min(var(--chat-w), 100%);
+  background: var(--surface-2);
+  border-radius: var(--r-md);
+  font-size: var(--fs-body);
+  color: var(--label-2);
+}
+
+.activity.done {
+  padding: 6px 12px;
+  background: transparent;
+  gap: 4px;
+}
+
+.activity-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  list-style: none;
+  color: var(--label-2);
+  font-size: var(--fs-body-2);
+}
+
+.activity-summary::-webkit-details-marker {
+  display: none;
+}
+
+.activity[open] .activity-summary svg {
+  transform: rotate(90deg);
+}
+
+.shimmer {
+  align-self: flex-start;
+  color: transparent;
+  background: linear-gradient(
+    90deg,
+    var(--label-3) 0%,
+    var(--label-1) 45%,
+    var(--label-3) 90%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  animation: shimmer-slide 1.8s linear infinite;
+}
+
+@keyframes shimmer-slide {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+.step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 26px;
+  color: var(--label-1);
+}
+
+.step-status {
+  display: inline-flex;
+  width: 16px;
+  justify-content: center;
+  color: var(--label-3);
+}
+
+.step.done .step-status {
+  color: var(--ok);
+}
+
+.step.failed .step-status {
+  color: var(--danger);
+}
+
+.step.waiting .step-status {
+  color: var(--warn);
+}
+
+.step-icon {
+  display: inline-flex;
+  color: var(--label-2);
+}
+
+.step-label {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.step.running .step-label {
+  color: var(--label-1);
+}
+
+.step-actions {
+  display: inline-flex;
+  gap: 6px;
+}
+
+/* Model chip inside the composer. */
+.model-bar.compact {
+  flex-wrap: nowrap;
+  gap: 6px;
+}
+
+.model-bar.compact .menu-trigger {
+  border-radius: var(--r-pill);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  padding: 2px 10px;
+  max-width: 220px;
+}
+
+.model-bar.compact .menu-trigger span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-bar.compact .pop {
+  bottom: calc(100% + 6px);
+  top: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shimmer {
+    animation: none;
+    color: var(--label-2);
+    background: none;
   }
 }
