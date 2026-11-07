@@ -128,3 +128,45 @@ async fn upstream_outage_is_502_with_a_safe_message() {
     );
     assert!(!body.to_string().contains(KEY));
 }
+
+#[tokio::test]
+async fn rate_limit_is_503_not_502_so_it_is_not_an_unknown_outcome() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/toolkits"))
+        .and(header("x-api-key", KEY))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"items": []})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/connected_accounts"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({"error": {}})))
+        .mount(&server)
+        .await;
+    let (app, store) = app_against(&server);
+    let member = store
+        .create_user("subject-composio-503", "c503@example.example", "C")
+        .unwrap();
+    let token = mint_for(&store, &member.id, "composio-503");
+    let (status, _) = send(
+        &app,
+        &token,
+        "PUT",
+        "/v1/connectors/composio/key",
+        Some(json!({"key": KEY})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(
+        &app,
+        &token,
+        "GET",
+        "/v1/connectors/composio/accounts",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "composio_rate_limited");
+    assert!(!body.to_string().contains(KEY));
+}

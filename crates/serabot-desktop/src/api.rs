@@ -86,6 +86,9 @@ impl ApiError {
     pub fn unknown_outcome(&self) -> bool {
         // In particular, a gateway/request timeout does not prove rejection.
         match self {
+            // A rate limit is refused before the call runs, so it proves
+            // nothing was done. Only an outage or transport failure is unknown.
+            Self::Coded { code, .. } if code == "composio_rate_limited" => false,
             Self::Coded { status, .. } => *status >= 500,
             _ => !matches!(
                 self,

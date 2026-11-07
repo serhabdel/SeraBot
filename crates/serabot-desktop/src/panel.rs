@@ -2758,4 +2758,18 @@ mod tests {
         };
         assert!(unavailable.unknown_outcome());
     }
+
+    #[test]
+    fn a_rate_limit_is_known_not_to_have_run() {
+        let limited = ApiError::Coded {
+            status: 503,
+            code: "composio_rate_limited".into(),
+            message: "Composio is rate limiting requests. Try again in a minute.".into(),
+        };
+        assert!(!limited.unknown_outcome());
+        assert_eq!(
+            composio_error_text(&limited),
+            "Composio is rate limiting requests. Try again in a minute."
+        );
+    }
 }

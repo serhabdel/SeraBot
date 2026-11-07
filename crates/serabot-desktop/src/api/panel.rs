@@ -652,6 +652,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_503_rate_limit_keeps_its_code() {
+        let body =
+            br#"{"error":"Composio is rate limiting requests.","code":"composio_rate_limited"}"#;
+        assert_eq!(
+            rejection(503, body),
+            Some(ApiError::Coded {
+                status: 503,
+                code: "composio_rate_limited".into(),
+                message: "Composio is rate limiting requests.".into(),
+            })
+        );
+    }
+
+    #[test]
     fn coded_rejections_keep_the_server_message_and_code() {
         let body = br#"{"error":"Composio could not be reached (HTTP 503).","code":"composio_unavailable"}"#;
         assert_eq!(

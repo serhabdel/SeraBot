@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::config::{ComposioConfig, Config};
-use crate::connectors::{plausible_secret, redact};
+use crate::connectors::plausible_secret;
 use crate::error::{Result, SeraError};
 use crate::gateway::{ApprovalDetails, Tool, ToolContext, ToolOutput, ToolRegistry, ToolSpec};
 use crate::user_secrets::UserSecrets;
@@ -57,6 +57,11 @@ const DESTRUCTIVE_WORDS: &[&str] = &[
     "REVOKE",
     "CANCEL",
     "TERMINATE",
+    "REPLY",
+    "FORWARD",
+    "INVITE",
+    "SHARE",
+    "POST",
 ];
 
 /// True when running this Composio tool needs approval. Matches whole words
@@ -76,7 +81,7 @@ pub fn slug_is_destructive(slug: &str) -> bool {
     words.windows(2).any(|pair| {
         matches!(
             (pair[0].as_str(), pair[1].as_str()),
-            ("POST", "MESSAGE") | ("CREATE", "EMAIL")
+            ("POST", "MESSAGE") | ("CREATE", "EMAIL") | ("DRAFT", "SEND")
         )
     })
 }
@@ -95,6 +100,16 @@ fn valid_toolkit(toolkit: &str) -> bool {
         && toolkit
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+/// A toolkit version as Composio writes it: `latest`, or a dated id such as
+/// `00000000_00`. Bounded and plain, since it is sent in a request body.
+fn valid_tool_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 32
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn valid_account_id(id: &str) -> bool {
@@ -158,6 +173,51 @@ impl SealedKey {
     }
 }
 
+/// The key as it appears inside a URL: every byte outside the unreserved set
+/// is written as `%XX`.
+fn percent_encoded(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+/// Replace every ASCII case-insensitive occurrence of `needle` in `text`.
+/// Lowercasing ASCII keeps byte offsets, so the match positions are valid
+/// in the original text.
+fn replace_ascii_ci(text: &str, needle: &str, with: &str) -> String {
+    if needle.is_empty() {
+        return text.to_owned();
+    }
+    let lower_text = text.to_ascii_lowercase();
+    let lower_needle = needle.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (start, matched) in lower_text.match_indices(&lower_needle) {
+        out.push_str(&text[last..start]);
+        out.push_str(with);
+        last = start + matched.len();
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// Remove the key from text in every form it can take: as sent, percent
+/// encoded (as in a URL), and in any letter case.
+fn scrub_key(text: &str, key: &str) -> String {
+    let mut out = text.to_owned();
+    for form in [key.to_owned(), percent_encoded(key)] {
+        out = replace_ascii_ci(&out, &form, "[redacted]");
+    }
+    out
+}
+
 /// A failed Composio response, reduced to what is safe to show. The key is
 /// removed from every text first; control characters are dropped and each
 /// text is capped. `status` is 0 when no response arrived.
@@ -167,7 +227,7 @@ fn upstream_error(status: u16, body: &Value, key: &str) -> SeraError {
             .pointer(pointer)
             .and_then(Value::as_str)
             .unwrap_or_default();
-        clean(&redact(raw, &[key.to_owned()]), max)
+        clean(&scrub_key(raw, key), max)
     };
     let message = text("/error/message", 240);
     let slug = text("/error/slug", 120);
@@ -249,6 +309,7 @@ pub struct ComposioService {
     http: reqwest::Client,
     base: String,
     max_bytes: usize,
+    tool_version: String,
 }
 
 impl std::fmt::Debug for ComposioService {
@@ -270,11 +331,23 @@ impl ComposioService {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| SeraError::Internal(format!("Composio HTTP client: {error}")))?;
+        let tool_version = settings
+            .tool_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|version| !version.is_empty())
+            .unwrap_or("latest");
+        if !valid_tool_version(tool_version) {
+            return Err(SeraError::Config(
+                "composio tool_version must be 1-32 letters, digits, '.', '-', or '_'".into(),
+            ));
+        }
         Ok(Self {
             users,
             http,
             base: settings.api_base.trim().trim_end_matches('/').to_owned(),
             max_bytes: settings.max_response_bytes.clamp(4 * 1024, 4 * 1024 * 1024),
+            tool_version: tool_version.to_owned(),
         })
     }
 
@@ -616,7 +689,11 @@ impl ComposioService {
             "POST",
             &format!("/api/v3/tools/execute/{slug}"),
             &[],
-            Some(&json!({"user_id": user_id, "arguments": arguments})),
+            Some(&json!({
+                "user_id": user_id,
+                "version": self.tool_version,
+                "arguments": arguments,
+            })),
         )
         .await
     }
@@ -805,6 +882,7 @@ mod tests {
             api_base: server.uri(),
             timeout_secs: 5,
             max_response_bytes: 8 * 1024,
+            tool_version: None,
         };
         (
             Arc::new(ComposioService::with_settings(&settings, users).unwrap()),
@@ -848,6 +926,12 @@ mod tests {
             "DRIVE_TRASH_FILE",
             "BANK_TRANSFER_FUNDS",
             "GITHUB_REMOVE_LABEL",
+            "GMAIL_REPLY_TO_THREAD",
+            "GMAIL_FORWARD_MESSAGE",
+            "GMAIL_DRAFT_SEND",
+            "GOOGLEDRIVE_SHARE_FILE",
+            "SLACK_INVITE_USER_TO_CHANNEL",
+            "X_CREATE_POST",
         ] {
             assert!(slug_is_destructive(slug), "{slug}");
         }
@@ -897,7 +981,7 @@ mod tests {
             .and(path("/api/v3/tools/execute/GMAIL_FETCH_EMAILS"))
             .and(header("x-api-key", KEY_A))
             .and(wiremock::matchers::body_json(
-                json!({"user_id": a, "arguments": {"max": 1}}),
+                json!({"user_id": a, "version": "latest", "arguments": {"max": 1}}),
             ))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -1256,6 +1340,7 @@ mod tests {
             api_base: format!("http://127.0.0.1:{port}"),
             timeout_secs: 5,
             max_response_bytes: 8 * 1024,
+            tool_version: None,
         };
         let store = Store::open_in_memory(384).unwrap();
         let users = Arc::new(UserSecrets::with_master_key(store.clone(), [7u8; 32]).unwrap());
@@ -1311,5 +1396,108 @@ mod tests {
             (legacy.key.as_str(), legacy.header),
             (KEY_A, KeyHeader::Project)
         );
+    }
+
+    /// A service pinned by `tool_version` (None keeps the default), with KEY_A
+    /// stored for one fresh user.
+    fn pinned_service(
+        server: &MockServer,
+        tool_version: Option<&str>,
+    ) -> (ComposioService, String) {
+        let store = Store::open_in_memory(384).unwrap();
+        let users = Arc::new(UserSecrets::with_master_key(store.clone(), [7u8; 32]).unwrap());
+        let a = store
+            .create_user("microsoft:v", "v@example.example", "V")
+            .unwrap()
+            .id;
+        let settings = ComposioConfig {
+            api_base: server.uri(),
+            timeout_secs: 5,
+            max_response_bytes: 8 * 1024,
+            tool_version: tool_version.map(str::to_owned),
+        };
+        let svc = ComposioService::with_settings(&settings, users).unwrap();
+        svc.users.set(&a, CREDENTIAL_ID, KEY_A).unwrap();
+        (svc, a)
+    }
+
+    #[tokio::test]
+    async fn execute_sends_latest_by_default_and_the_configured_pin_otherwise() {
+        let server = MockServer::start().await;
+        let (default_svc, a) = pinned_service(&server, None);
+        Mock::given(method("POST"))
+            .and(path("/api/v3/tools/execute/GMAIL_FETCH_EMAILS"))
+            .and(wiremock::matchers::body_json(
+                json!({"user_id": a, "version": "latest", "arguments": {}}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"successful": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        default_svc
+            .execute(&a, "GMAIL_FETCH_EMAILS", &json!({}))
+            .await
+            .unwrap();
+
+        let (pinned_svc, p) = pinned_service(&server, Some(" 00000000_00 "));
+        Mock::given(method("POST"))
+            .and(path("/api/v3/tools/execute/GMAIL_FETCH_EMAILS"))
+            .and(wiremock::matchers::body_json(
+                json!({"user_id": p, "version": "00000000_00", "arguments": {}}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"successful": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        pinned_svc
+            .execute(&p, "GMAIL_FETCH_EMAILS", &json!({}))
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn a_malformed_tool_version_is_refused_at_startup() {
+        let store = Store::open_in_memory(384).unwrap();
+        let users = Arc::new(UserSecrets::with_master_key(store, [7u8; 32]).unwrap());
+        let long = "1".repeat(33);
+        for bad in ["bad version!", "x/../y", long.as_str()] {
+            let settings = ComposioConfig {
+                tool_version: Some(bad.to_owned()),
+                ..ComposioConfig::default()
+            };
+            assert!(
+                ComposioService::with_settings(&settings, users.clone()).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn redaction_covers_percent_encoding_and_letter_case() {
+        const PLUS_KEY: &str = "cmp+synthetic/key=0004";
+        assert_eq!(percent_encoded(PLUS_KEY), "cmp%2Bsynthetic%2Fkey%3D0004");
+        let text =
+            "a cmp+synthetic/key=0004 b cmp%2bsynthetic%2Fkey%3d0004 c CMP+SYNTHETIC/KEY=0004 d";
+        assert_eq!(
+            scrub_key(text, PLUS_KEY),
+            "a [redacted] b [redacted] c [redacted] d"
+        );
+        // Text without the key is left exactly as it was.
+        assert_eq!(scrub_key("nothing here", PLUS_KEY), "nothing here");
+    }
+
+    #[test]
+    fn upstream_text_never_carries_the_key_in_any_form() {
+        const PLUS_KEY: &str = "cmp+synthetic/key=0004";
+        let body = json!({"error": {
+            "message": "bad cmp%2Bsynthetic%2Fkey%3D0004",
+            "slug": "CMP+SYNTHETIC/KEY=0004",
+            "suggested_fix": "send cmp%2bsynthetic%2fkey%3d0004 again",
+        }});
+        let error = upstream_error(400, &body, PLUS_KEY);
+        let text = assert_upstream(&error, 400, "composio_bad_request");
+        assert!(!text.to_ascii_lowercase().contains("synthetic"), "{text}");
+        assert!(text.contains("[redacted]"), "{text}");
+        assert_no_key(&error, PLUS_KEY);
     }
 }

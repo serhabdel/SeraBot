@@ -4,7 +4,7 @@ Each member pastes their own Composio API key in Connectors. The server
 checks it with Composio (`GET /api/v3/toolkits`), seals it in the per-user
 envelope-encrypted store, and never returns it. Nothing is configured
 server-wide except the optional `[composio]` block (`api_base`,
-`timeout_secs`, `max_response_bytes`).
+`timeout_secs`, `max_response_bytes`, `tool_version`).
 
 ## Routes (all act on the signed-in user)
 
@@ -33,8 +33,11 @@ of two headers:
   uses it. The header kind is stored inside the same sealed value as the key;
   rows saved before this rule are read as project keys.
 
-Execution requests send no `version` field, so Composio applies its default
-toolkit version.
+Tool execution sends `"version": "latest"` by default. Composio uses an
+OLD pinned toolkit version (`00000000_00`) when `version` is omitted on /api/v3,
+so the field is always sent. To pin a version, set `tool_version` in the
+`[composio]` block (for example `00000000_00`). The value must be 1-32 letters,
+digits, `.`, `-`, or `_`; a malformed value stops startup.
 
 ## Errors the console shows
 
@@ -48,8 +51,12 @@ safe to show. The message keeps Composio's `message` and its
 | 422 | `composio_plan_required` | Composio needs a paid plan or credits (402). |
 | 422 | `composio_not_found` | The app or tool does not exist, or is not linked (404). |
 | 422 | `composio_bad_request` | Composio refused the request (other 4xx). |
-| 502 | `composio_rate_limited` | Composio is rate limiting requests (429). |
+| 503 | `composio_rate_limited` | Composio is rate limiting requests (429). The call was refused before it ran. |
 | 502 | `composio_unavailable` | Composio returned 5xx, or could not be reached (no response). |
+
+Only `composio_unavailable` (502) and transport failures are unknown outcomes:
+the action may or may not have run, so do not retry it blindly. A rate limit
+(503) is known not to have run.
 
 SeraBot never answers an upstream failure with 401, because the console
 treats 401 as an expired session. A `403` from SeraBot itself means no key is
@@ -93,3 +100,10 @@ Composio also offers an MCP tool router. SeraBot does not use it yet. The
 current integration calls the REST API above, one tool at a time, through
 the gateway. A tool router would need its own approval and audit design
 before it could be added.
+
+## Rolling back to 0.18
+
+Keys saved by 0.19 are sealed as a small JSON value that records the header
+kind. 0.18 reads the whole value as the key, so after rolling back, every
+member who connected Composio in 0.19 must paste the key again in Connectors.
+Keys saved by 0.18 keep working on 0.19 without any change.

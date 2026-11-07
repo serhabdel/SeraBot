@@ -1082,6 +1082,11 @@ pub struct ComposioConfig {
     /// Largest Composio response body read, in bytes.
     #[serde(default = "default_composio_max_bytes")]
     pub max_response_bytes: usize,
+    /// Toolkit version sent with every tool execution. Unset means `latest`.
+    /// Set it to pin a specific Composio toolkit version (for example
+    /// `00000000_00`, the version Composio uses when none is sent).
+    #[serde(default)]
+    pub tool_version: Option<String>,
 }
 
 impl Default for ComposioConfig {
@@ -1090,6 +1095,7 @@ impl Default for ComposioConfig {
             api_base: default_composio_api_base(),
             timeout_secs: default_composio_timeout(),
             max_response_bytes: default_composio_max_bytes(),
+            tool_version: None,
         }
     }
 }
