@@ -10,6 +10,7 @@
 //! decides what to send and when; [`PanelState::apply`] folds a result back
 //! in. Neither touches the network, so both are unit-tested.
 
+use crate::composio_flow::ComposioFlow;
 use crate::worker::Credentials;
 use crate::{
     ApiClient, ApiError, BrowserController, BrowserInfo, BrowserInput, BrowserProfile,
@@ -17,6 +18,7 @@ use crate::{
     MAX_VAULT_USERNAME_CHARS, VaultEntry, VaultKind, VaultPut, normalize_vault_domain,
     valid_vault_name, validate_vault_put,
 };
+use crate::{ComposioAccount, ComposioApp};
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
@@ -73,6 +75,13 @@ pub enum PanelOp {
         token: Zeroizing<String>,
     },
     ConnectorDisconnect(String),
+    /// Composio: save the user's own key (write-only).
+    ComposioKey(Zeroizing<String>),
+    ComposioKeyRemove,
+    /// Composio: read the app list for a search text, and the linked apps.
+    ComposioLoad(String),
+    ComposioConnect(String),
+    ComposioUnlink(String),
     /// Admin: save the Google OAuth client (write-only).
     GoogleSetup {
         client_id: Zeroizing<String>,
@@ -98,6 +107,11 @@ pub enum PanelKind {
     ConnectorStart,
     ConnectorToken,
     ConnectorDisconnect,
+    ComposioKey,
+    ComposioKeyRemove,
+    ComposioLoad,
+    ComposioConnect,
+    ComposioUnlink,
     GoogleSetup,
 }
 
@@ -122,6 +136,11 @@ impl PanelOp {
             Self::ConnectorStart(_) => PanelKind::ConnectorStart,
             Self::ConnectorToken { .. } => PanelKind::ConnectorToken,
             Self::ConnectorDisconnect(_) => PanelKind::ConnectorDisconnect,
+            Self::ComposioKey(_) => PanelKind::ComposioKey,
+            Self::ComposioKeyRemove => PanelKind::ComposioKeyRemove,
+            Self::ComposioLoad(_) => PanelKind::ComposioLoad,
+            Self::ComposioConnect(_) => PanelKind::ComposioConnect,
+            Self::ComposioUnlink(_) => PanelKind::ComposioUnlink,
             Self::GoogleSetup { .. } => PanelKind::GoogleSetup,
         }
     }
@@ -142,6 +161,18 @@ pub enum PanelReply {
     OneDriveDisconnected,
     ConnectorUrl(String),
     ConnectorChanged,
+    ComposioKeySaved,
+    ComposioKeyRemoved,
+    ComposioLoaded {
+        query: String,
+        apps: Vec<ComposioApp>,
+        accounts: Vec<ComposioAccount>,
+    },
+    ComposioUrl {
+        toolkit: String,
+        url: String,
+    },
+    ComposioUnlinked,
     GoogleSaved,
 }
 
@@ -284,6 +315,32 @@ fn execute(job: &PanelJob, cache: &mut Option<ApiClient>) -> Result<PanelReply, 
         PanelOp::ConnectorDisconnect(id) => client
             .connector_disconnect(id)
             .map(|()| PanelReply::ConnectorChanged),
+        PanelOp::ComposioKey(key) => client
+            .composio_set_key(key)
+            .map(|()| PanelReply::ComposioKeySaved),
+        PanelOp::ComposioKeyRemove => client
+            .composio_remove_key()
+            .map(|()| PanelReply::ComposioKeyRemoved),
+        PanelOp::ComposioLoad(query) => client.composio_apps(query).and_then(|apps| {
+            client
+                .composio_accounts()
+                .map(|accounts| PanelReply::ComposioLoaded {
+                    query: query.clone(),
+                    apps,
+                    accounts,
+                })
+        }),
+        PanelOp::ComposioConnect(toolkit) => {
+            client
+                .composio_connect(toolkit)
+                .map(|url| PanelReply::ComposioUrl {
+                    toolkit: toolkit.clone(),
+                    url,
+                })
+        }
+        PanelOp::ComposioUnlink(id) => client
+            .composio_remove_account(id)
+            .map(|()| PanelReply::ComposioUnlinked),
         PanelOp::GoogleSetup {
             client_id,
             client_secret,
@@ -547,6 +604,16 @@ fn connector_error_text(error: &ApiError) -> String {
     }
 }
 
+/// What went wrong with Composio, in everyday words.
+fn composio_error_text(error: &ApiError) -> String {
+    match error {
+        ApiError::Http(409) => "Add your Composio key first.".into(),
+        ApiError::Http(422) => "Composio did not accept that key. Check it and try again.".into(),
+        ApiError::Http(502..=504) => "Composio could not be reached. Try again in a moment.".into(),
+        other => other.to_string(),
+    }
+}
+
 // --------------------------------------------------------------- browser --
 
 pub struct PanelState {
@@ -596,6 +663,7 @@ pub struct PanelState {
     pub vault: VaultView,
     pub onedrive: OneDriveFlow,
     pub connectors: ConnectorFlow,
+    pub composio: ComposioFlow,
 }
 
 impl PanelState {
@@ -635,6 +703,7 @@ impl PanelState {
             vault: VaultView::default(),
             onedrive: OneDriveFlow::default(),
             connectors: ConnectorFlow::default(),
+            composio: ComposioFlow::default(),
         }
     }
 
@@ -976,6 +1045,53 @@ impl PanelState {
             .push_back(PanelOp::ConnectorDisconnect(id.to_owned()));
     }
 
+    /// Composio: save the user's own key. The value is wiped after sending.
+    pub fn composio_save_key(&mut self, key: &str) {
+        let key = key.trim();
+        if self.composio.busy {
+            return;
+        }
+        if key.is_empty() {
+            self.composio.error = Some("Paste your Composio key first.".into());
+            return;
+        }
+        self.composio.busy = true;
+        self.composio.error = None;
+        self.queue
+            .push_back(PanelOp::ComposioKey(Zeroizing::new(key.to_owned())));
+    }
+
+    pub fn composio_remove_key(&mut self) {
+        if self.composio.busy {
+            return;
+        }
+        self.composio.busy = true;
+        self.composio.error = None;
+        self.queue.push_back(PanelOp::ComposioKeyRemove);
+    }
+
+    /// Open Composio's own sign-in page for one app.
+    pub fn composio_connect(&mut self, toolkit: &str) {
+        if self.composio.busy {
+            return;
+        }
+        self.composio.busy = true;
+        self.composio.error = None;
+        self.queue
+            .push_back(PanelOp::ComposioConnect(toolkit.to_owned()));
+    }
+
+    /// Unlink one app from the user's own account.
+    pub fn composio_unlink(&mut self, account_id: &str) {
+        if self.composio.busy {
+            return;
+        }
+        self.composio.busy = true;
+        self.composio.error = None;
+        self.queue
+            .push_back(PanelOp::ComposioUnlink(account_id.to_owned()));
+    }
+
     pub fn clear_connector_error(&mut self, id: &str) {
         self.connectors.errors.remove(id);
     }
@@ -1087,6 +1203,9 @@ impl PanelState {
                 };
             return Some(PanelOp::Status);
         }
+        if let Some(query) = self.composio.next_load(now) {
+            return Some(PanelOp::ComposioLoad(query));
+        }
         if self.want_profiles && !self.profiles_busy {
             self.want_profiles = false;
             return Some(PanelOp::ProfilesList);
@@ -1125,6 +1244,11 @@ impl PanelState {
             PanelKind::ProfileChange => self.profiles_busy = false,
             PanelKind::OneDriveStart | PanelKind::OneDriveDisconnect => self.onedrive.busy = false,
             PanelKind::GoogleSetup => self.connectors.google_busy = false,
+            PanelKind::ComposioLoad => self.composio.loading = false,
+            PanelKind::ComposioKey
+            | PanelKind::ComposioKeyRemove
+            | PanelKind::ComposioConnect
+            | PanelKind::ComposioUnlink => self.composio.busy = false,
             _ => {}
         }
         match done.result {
@@ -1216,6 +1340,28 @@ impl PanelState {
                 self.connectors.waiting = None;
                 self.connectors.refresh_due = true;
             }
+            PanelReply::ComposioKeySaved => {
+                self.composio.clear();
+                self.composio.load("");
+                self.composio.refresh_due = true;
+            }
+            PanelReply::ComposioKeyRemoved => {
+                self.composio.clear();
+                self.composio.refresh_due = true;
+            }
+            PanelReply::ComposioLoaded {
+                query,
+                apps,
+                accounts,
+            } => self.composio.loaded_with(query, apps, accounts),
+            PanelReply::ComposioUrl { toolkit, url } => {
+                self.composio.pending_url = Some(url);
+                self.composio.begin_wait(&toolkit, now);
+            }
+            PanelReply::ComposioUnlinked => {
+                let query = self.composio.query.clone();
+                self.composio.load(&query);
+            }
             PanelReply::GoogleSaved => {
                 self.connectors.google_saved = true;
                 self.connectors.google_error = None;
@@ -1302,6 +1448,13 @@ impl PanelState {
                         .errors
                         .insert(id, connector_error_text(&error));
                 }
+            }
+            PanelKind::ComposioKey
+            | PanelKind::ComposioKeyRemove
+            | PanelKind::ComposioLoad
+            | PanelKind::ComposioConnect
+            | PanelKind::ComposioUnlink => {
+                self.composio.error = Some(composio_error_text(&error));
             }
             PanelKind::GoogleSetup => {
                 self.connectors.google_error = Some(connector_error_text(&error));

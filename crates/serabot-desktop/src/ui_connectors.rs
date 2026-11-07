@@ -230,6 +230,7 @@ pub(crate) fn ConnectorsView(session: Signal<Session>) -> Element {
                     ("Notes and email", &["notion", "agentmail"][..]),
                     ("Web search", &["tavily", "firecrawl"][..]),
                     ("Voice", &["elevenlabs"][..]),
+                    ("Apps and tools", &["composio"][..]),
                 ] {
                     {
                         let suite_connectors: Vec<_> = suite_ids
@@ -265,7 +266,9 @@ pub(crate) fn ConnectorsView(session: Signal<Session>) -> Element {
 /// keep the server-wide card.
 #[component]
 fn ConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> Element {
-    if connector.personal.is_some() {
+    if connector.id == "composio" {
+        rsx! { crate::ui_composio::ComposioCard { session, connector } }
+    } else if connector.personal.is_some() {
         rsx! { PersonalCard { session, connector } }
     } else {
         rsx! { LegacyConnectorCard { session, connector } }

@@ -50,6 +50,9 @@ pub struct Config {
     pub tavily: TavilyConfig,
     #[serde(default)]
     pub elevenlabs: ElevenLabsConfig,
+    /// Composio apps (per-user key; see docs/composio.md).
+    #[serde(default)]
+    pub composio: ComposioConfig,
     #[serde(default)]
     pub render: RenderConfig,
     #[serde(default)]
@@ -102,6 +105,7 @@ impl Default for Config {
             firecrawl: FirecrawlConfig::default(),
             tavily: TavilyConfig::default(),
             elevenlabs: ElevenLabsConfig::default(),
+            composio: ComposioConfig::default(),
             render: RenderConfig::default(),
             runtime: RuntimeConfig::default(),
             schedule: ScheduleConfig::default(),
@@ -1065,6 +1069,41 @@ impl OneDriveConfig {
             own
         }
     }
+}
+
+/// Composio connection settings. Keys are per user (sealed in the user
+/// store), so there is no secret name here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposioConfig {
+    #[serde(default = "default_composio_api_base")]
+    pub api_base: String,
+    #[serde(default = "default_composio_timeout")]
+    pub timeout_secs: u64,
+    /// Largest Composio response body read, in bytes.
+    #[serde(default = "default_composio_max_bytes")]
+    pub max_response_bytes: usize,
+}
+
+impl Default for ComposioConfig {
+    fn default() -> Self {
+        Self {
+            api_base: default_composio_api_base(),
+            timeout_secs: default_composio_timeout(),
+            max_response_bytes: default_composio_max_bytes(),
+        }
+    }
+}
+
+fn default_composio_api_base() -> String {
+    "https://backend.composio.dev".into()
+}
+
+fn default_composio_timeout() -> u64 {
+    30
+}
+
+fn default_composio_max_bytes() -> usize {
+    256 * 1024
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

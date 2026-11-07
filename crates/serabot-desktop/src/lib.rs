@@ -7,6 +7,7 @@ pub mod audio_capture;
 pub mod avatars;
 pub mod branding;
 pub mod capabilities;
+pub mod composio_flow;
 pub mod connector_card;
 pub mod creds;
 pub mod events;

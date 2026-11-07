@@ -12,9 +12,11 @@ use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
 mod browser;
+mod composio;
 mod panel;
 mod profiles;
 pub use browser::*;
+pub use composio::*;
 pub use panel::*;
 pub use profiles::*;
 
