@@ -154,6 +154,20 @@ dimension = 384
 cache_dir = "models"
 batch_size = 16
 
+[memory]
+# "builtin" keeps memory in the local database. "mem0" also recalls from
+# Mem0 Platform for users who saved a Mem0 key (conn.mem0). See docs/memory.md.
+provider = "builtin"
+# Extract durable facts from owner turns after the reply is stored.
+auto_extract = true
+# Facts recalled per turn (1..=20).
+recall_k = 8
+# Summarize a conversation every N new messages; 0 turns summaries off.
+summary_every = 30
+# mem0_api_base = "https://api.mem0.ai"
+# mem0_timeout_secs = 8
+# extract_timeout_secs = 45
+
 [policy]
 blocklist_file = "private/blocklist.txt"
 notify_owner_on_violation = true

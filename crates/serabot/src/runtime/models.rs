@@ -203,7 +203,36 @@ impl Runtime {
         system: &str,
         input: &str,
     ) -> Result<String> {
-        let selection = self.effective_model_selection(user_id, &format!("dir:{bot}"), bot)?;
+        self.bounded_completion_for("onboarding", user_id, bot, None, system, input)
+            .await
+    }
+
+    /// One tool-less model call under the acting user, for an auxiliary task.
+    /// The route is `model` when given (a configured provider must serve it),
+    /// otherwise the bot's default route. `purpose` is recorded on the
+    /// `model.used` audit row. Model requests pass the same blocklist and vault
+    /// redaction as turns.
+    pub async fn bounded_completion_for(
+        &self,
+        purpose: &str,
+        user_id: &str,
+        bot: &str,
+        model: Option<&str>,
+        system: &str,
+        input: &str,
+    ) -> Result<String> {
+        let selection = match model {
+            Some(model) => {
+                let provider = self.router.provider_for_model(model).ok_or_else(|| {
+                    SeraError::Config(format!("memory.extract_model {model} is not served"))
+                })?;
+                ModelSelection {
+                    provider,
+                    model: model.to_owned(),
+                }
+            }
+            None => self.effective_model_selection(user_id, &format!("dir:{bot}"), bot)?,
+        };
         let route = Some(self.router.pin(&selection)?);
         let route = self.checked_route(user_id, &route)?;
         let messages = vec![LlmMessage::system(system), LlmMessage::user(input)];
@@ -225,7 +254,7 @@ impl Runtime {
                 "provider": route.selection.provider,
                 "model": route.selection.model,
                 "usage": response.usage,
-                "purpose": "onboarding",
+                "purpose": purpose,
             })),
         )?;
         Ok(response.message.content.unwrap_or_default())

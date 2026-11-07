@@ -34,7 +34,7 @@ use crate::fleet::FleetRegistry;
 use crate::gateway::{
     Decision, DecisionResult, Gateway, Tool, ToolContext, ToolOutcome, ToolOutput, ToolSpec,
 };
-use crate::memory;
+use crate::memory::{self, MemoryHub};
 use crate::model_router::{ModelRouter, ModelSelection, PinnedRoute, ProviderView};
 use crate::orchestration::{
     BotRole, ConversationKind, HandoffContext, ORCHESTRATOR_BOT, assistant_speaker,
@@ -51,10 +51,12 @@ use crate::util::truncate_chars;
 
 mod activity;
 use activity::StepPhase;
+mod extract;
 mod models;
 mod notifier;
 mod prompts;
 mod rag_tool;
+mod recall;
 mod routing;
 mod schedules;
 #[cfg(test)]
@@ -162,6 +164,8 @@ pub struct Runtime {
     semaphore: Arc<Semaphore>,
     worker_id: String,
     shutdown: CancellationToken,
+    memory: MemoryHub,
+    extract_gate: Arc<extract::ExtractGate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,6 +219,14 @@ impl Runtime {
             }
         }
         let semaphore = Arc::new(Semaphore::new(config.runtime.max_concurrent_turns));
+        let memory = MemoryHub::new(&config.memory, gateway.clone())?;
+        if let Some(model) = &config.memory.extract_model
+            && router.provider_for_model(model).is_none()
+        {
+            return Err(SeraError::Config(format!(
+                "memory.extract_model {model} is not served by any configured provider"
+            )));
+        }
         Ok(Self {
             config,
             store,
@@ -225,7 +237,15 @@ impl Runtime {
             semaphore,
             worker_id: format!("worker-{}", &uuid::Uuid::new_v4().to_string()[..8]),
             shutdown,
+            memory,
+            extract_gate: Arc::new(extract::ExtractGate::default()),
         })
+    }
+
+    /// The agent memory provider: local SQLite, plus the optional third-party
+    /// recall source when `[memory] provider = "mem0"`.
+    pub fn memory(&self) -> &MemoryHub {
+        &self.memory
     }
 
     pub fn store(&self) -> &Store {

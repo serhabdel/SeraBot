@@ -8,8 +8,8 @@
 
 use dioxus::prelude::*;
 use serabot_desktop::{
-    ApprovalDecision, ConversationKind, MAX_TEAM_MEMBERS, Role, SPECIALIST_TOOLS, Selection,
-    TaskStatus, Team, TeamMember, TeamMode,
+    ApprovalDecision, ConversationKind, MAX_TEAM_MEMBERS, MemoryEntry, MemoryStatsView, Role,
+    SPECIALIST_TOOLS, Selection, TaskStatus, Team, TeamMember, TeamMode,
     activity::{Step, StepPhase},
     audio_capture::MicRecorder,
     branding, provider_presets,
@@ -4942,22 +4942,107 @@ fn ProvidersView(session: Signal<Session>, overlay: Signal<Overlay>) -> Element 
     }
 }
 
+/// Filter chips on the Memory page: `(filter key, label)`.
+const MEMORY_FILTERS: &[(&str, &str)] = &[
+    ("all", "All"),
+    ("saved", "Saved"),
+    ("learned", "Learned"),
+    ("superseded", "Superseded"),
+    ("review", "To review"),
+];
+
+/// One memory card, prepared before rendering so the markup stays plain.
+#[derive(Clone, PartialEq)]
+struct MemoryRow {
+    id: String,
+    content: String,
+    kind: String,
+    origin: &'static str,
+    superseded: bool,
+    pending: bool,
+    delete_label: &'static str,
+    bot: Option<String>,
+    importance: String,
+    created: String,
+    recalled: String,
+}
+
+fn memory_rows(memories: &[MemoryEntry]) -> Vec<MemoryRow> {
+    memories
+        .iter()
+        .map(|memory| MemoryRow {
+            id: memory.id.clone(),
+            content: memory.content.clone(),
+            kind: memory.kind.clone(),
+            origin: if memory.origin == "extracted" {
+                "Learned"
+            } else {
+                "Saved"
+            },
+            superseded: memory.status == "superseded",
+            pending: memory.status == "pending",
+            delete_label: if memory.status == "pending" {
+                "Discard"
+            } else {
+                "Delete"
+            },
+            bot: memory.bot.clone(),
+            importance: format!(
+                "{:.0}% important",
+                memory.importance.clamp(0.0, 1.0) * 100.0
+            ),
+            created: memory.created_at.clone(),
+            recalled: match &memory.last_recalled_at {
+                Some(at) => format!("last recalled {at} ({}×)", memory.recall_count),
+                None => "not recalled yet".into(),
+            },
+        })
+        .collect()
+}
+
+/// The header line: counts by origin and status, and the last extraction.
+fn memory_header(stats: Option<&MemoryStatsView>) -> String {
+    match stats {
+        None => "Owner-scoped memory. Loading counts…".into(),
+        Some(stats) => {
+            let count = |map: &std::collections::BTreeMap<String, i64>, key: &str| {
+                map.get(key).copied().unwrap_or(0)
+            };
+            let last = stats
+                .last_extraction_at
+                .as_deref()
+                .map_or("never".to_owned(), |at| at.to_owned());
+            format!(
+                "{} active · {} saved · {} learned · {} superseded · last learned: {last}",
+                stats.active,
+                count(&stats.by_origin, "explicit"),
+                count(&stats.by_origin, "extracted"),
+                count(&stats.by_status, "superseded"),
+            )
+        }
+    }
+}
+
 #[component]
 fn MemoryView(session: Signal<Session>) -> Element {
-    let memories = session.read().state.memories.clone();
+    let memories = memory_rows(&session.read().state.memories);
     let memories_loaded = session.read().state.memories_loaded;
+    let header = memory_header(session.read().state.memory_stats.as_ref());
     let kind = session.read().memory.kind.clone();
     let content = session.read().memory.content.clone();
     let source = session.read().memory.source.clone();
     let query = session.read().memory.query.clone();
+    let filter = session.read().memory.filter.clone();
     let confirm = session.read().memory.delete_confirm.clone();
+    let editing = session.read().memory.editing.clone();
+    let edit_content = session.read().memory.edit_content.clone();
     let memories_empty = memories.is_empty();
     rsx! {
         div { class: "pane",
             div { class: "pane-head",
                 div {
                     h1 { class: "pane-title", "Memory" }
-                    p { class: "muted", "Owner-scoped facts. The orchestrator reads the 20 most recent." }
+                    p { class: "muted", "{header}" }
                 }
                 button {
                     class: "btn ghost",
@@ -5008,13 +5093,23 @@ fn MemoryView(session: Signal<Session>) -> Element {
                     input {
                         class: "input",
                         value: "{query}",
-                        placeholder: "Filter content, kind or source",
+                        placeholder: "Search all of your memory, including old facts",
                         oninput: move |event| session.write().memory.query = event.value(),
                     }
                     button {
                         class: "btn ghost",
                         onclick: move |_| session.write().load_memories(),
                         "Search"
+                    }
+                }
+                div { class: "field-row",
+                    for (key, label) in MEMORY_FILTERS.iter().copied() {
+                        button {
+                            key: "{key}",
+                            class: if filter == key { "chip accent" } else { "chip" },
+                            onclick: move |_| session.write().set_memory_filter(key),
+                            "{label}"
+                        }
                     }
                 }
                 div { class: "card-grid",
@@ -5027,10 +5122,60 @@ fn MemoryView(session: Signal<Session>) -> Element {
                     for memory in memories {
                         div { class: "card", key: "{memory.id}",
                             div { class: "card-head",
-                                span { class: "chip accent", "{memory.kind}" }
-                                span { class: "tiny", "{memory.created_at} · {memory.source}" }
+                                span { class: if memory.origin == "Learned" { "chip" } else { "chip accent" }, "{memory.origin}" }
+                                if let Some(bot) = memory.bot.clone() {
+                                    span { class: "chip", "{bot}" }
+                                }
+                                span { class: "chip", "{memory.kind}" }
+                                if memory.superseded {
+                                    span { class: "chip", "Superseded" }
+                                }
+                                if memory.pending {
+                                    span { class: "chip accent", "To review" }
+                                }
+                                span { class: "tiny", "{memory.importance}" }
                             }
-                            p { "{memory.content}" }
+                            if editing.as_deref() == Some(memory.id.as_str()) {
+                                textarea {
+                                    class: "textarea",
+                                    value: "{edit_content}",
+                                    oninput: move |event| session.write().memory.edit_content = event.value(),
+                                }
+                                div { class: "field-row",
+                                    button {
+                                        class: "btn primary sm",
+                                        onclick: move |_| session.write().save_memory_edit(),
+                                        "Save"
+                                    }
+                                    button {
+                                        class: "btn ghost sm",
+                                        onclick: move |_| session.write().cancel_memory_edit(),
+                                        "Cancel"
+                                    }
+                                }
+                            } else {
+                                p { "{memory.content}" }
+                                p { class: "tiny", "{memory.created} · {memory.recalled}" }
+                                if memory.pending {
+                                    button {
+                                        class: "btn primary sm",
+                                        onclick: {
+                                            let id = memory.id.clone();
+                                            move |_| session.write().approve_memory(id.clone())
+                                        },
+                                        "Approve"
+                                    }
+                                }
+                                button {
+                                    class: "btn ghost sm",
+                                    onclick: {
+                                        let id = memory.id.clone();
+                                        let text = memory.content.clone();
+                                        move |_| session.write().begin_memory_edit(id.clone(), &text)
+                                    },
+                                    "Edit"
+                                }
+                            }
                             if confirm.as_deref() == Some(memory.id.as_str()) {
                                 button {
                                     class: "btn danger sm",
@@ -5047,7 +5192,7 @@ fn MemoryView(session: Signal<Session>) -> Element {
                                         let id = memory.id.clone();
                                         move |_| session.write().memory.delete_confirm = Some(id.clone())
                                     },
-                                    "Delete"
+                                    "{memory.delete_label}"
                                 }
                             }
                         }

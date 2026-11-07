@@ -92,10 +92,29 @@ impl Runtime {
             team_asked: false,
             history_messages,
         };
+        // Recalled facts answer the owner's message (or the objective of a
+        // handoff or team turn). Only owner turns also get the conversation's
+        // rolling summary.
+        let owner_turn = payload.handoff.is_none() && payload.team.is_none();
+        let memory_block = self
+            .memory_context(
+                &user,
+                owner_turn.then_some(payload.conversation_id.as_str()),
+                bot,
+                &payload.text,
+            )
+            .await;
         let system = if let Some(ref handoff) = payload.handoff {
-            self.handoff_system_prompt(&user, bot, &payload.text, handoff)?
+            self.handoff_system_prompt(&user, bot, &payload.text, handoff, &memory_block)?
         } else if let Some(team) = &payload.team {
-            self.team_system_prompt(&user, &payload.conversation_id, bot, &payload.text, team)?
+            self.team_system_prompt(
+                &user,
+                &payload.conversation_id,
+                bot,
+                &payload.text,
+                team,
+                &memory_block,
+            )?
         } else {
             self.system_prompt(
                 &user,
@@ -103,6 +122,7 @@ impl Runtime {
                 bot,
                 payload.ask_mode,
                 &payload.mentions,
+                &memory_block,
             )
         };
         state.messages.push(LlmMessage::system(system));
@@ -517,6 +537,23 @@ impl Runtime {
                     "turn.completed",
                     &json!({"turn_id": turn.id, "task_id": task.id}),
                 )?;
+                // Owner turns only: extraction and summaries run after the reply
+                // is stored, in the background, and never fail the turn.
+                if state.handoff.is_none()
+                    && state.team.is_none()
+                    && !state.ask_mode
+                    && let Some(owner) = extract::owner_text(&state.messages)
+                {
+                    let untrusted = extract::turn_used_untrusted_source(&state.messages);
+                    self.spawn_post_turn_memory(
+                        &user,
+                        &turn.bot,
+                        conversation_id,
+                        owner,
+                        &text,
+                        untrusted,
+                    );
+                }
                 return Ok(TurnOutcome::Completed);
             }
 
