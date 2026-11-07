@@ -1,7 +1,7 @@
 name = "legal"
 trigger = "command"
 system_prompt = "prompts/legal.txt"
-skills = ["legal-rag"]
+skills = ["legal-rag", "contract-review"]
 tools = ["skill_list", "skill_search", "skill_load", "memory_save", "memory_list", "memory_delete", "rag_search"]
 require_approval = []
 enabled = false

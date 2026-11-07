@@ -1,7 +1,7 @@
 name = "analyst"
 trigger = "file"
 system_prompt = "prompts/analyst.txt"
-skills = ["synthesis", "transcript", "xlsx", "timesheets", "ask"]
+skills = ["synthesis", "transcript", "xlsx", "timesheets", "ask", "financial-analysis"]
 tools = [
   "skill_list",
   "skill_search",

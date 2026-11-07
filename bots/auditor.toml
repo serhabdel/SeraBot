@@ -1,0 +1,24 @@
+name = "auditor"
+trigger = "file"
+system_prompt = "prompts/auditor.txt"
+skills = ["audit-checklist", "bank-reconciliation", "ma-tax-2026", "pcm-cgnc"]
+tools = [
+  "skill_list",
+  "skill_search",
+  "skill_load",
+  "memory_save",
+  "memory_list",
+  "memory_delete",
+  "rag_search",
+  "document_index",
+  "pdf_inspect",
+  "docx_inspect",
+  "docx_read",
+  "xlsx_inspect",
+  "xlsx_read",
+  "xlsx_analyze",
+  "xlsx_build",
+  "tavily_search",
+]
+require_approval = []
+enabled = true

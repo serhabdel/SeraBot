@@ -498,13 +498,13 @@ mod tests {
         };
         let templates =
             crate::config::load_bots(&config, &config.fleet.bots_dir).expect("seed templates");
-        assert!(templates.len() >= 5, "the shipped fleet has five bots");
+        assert!(templates.len() >= 12, "the shipped fleet has twelve bots");
         let catalog = Arc::new(SkillCatalog::load(&config).unwrap());
         let store = Store::open_in_memory(384).unwrap();
         let registry =
             FleetRegistry::new(Arc::new(config), store.clone(), templates, catalog).unwrap();
         let admin = store.admin_user_id().unwrap();
-        assert_eq!(registry.seed(&admin).unwrap(), 5);
+        assert_eq!(registry.seed(&admin).unwrap(), 12);
         let fleet = registry.load(&admin).unwrap();
         assert!(fleet["main"].config.enabled);
         assert_eq!(fleet["main"].config.role, BotRole::Orchestrator);

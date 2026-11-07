@@ -1372,6 +1372,38 @@ mod tests {
         );
     }
 
+    /// Every skill id a shipped bot names resolves in the shipped catalog, and
+    /// every shipped skill carries a name and a description the catalog shows.
+    #[test]
+    fn shipped_bot_skill_ids_resolve_in_the_catalog() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let config = test_config(&root);
+        let catalog = SkillCatalog::load(&config).unwrap();
+        let bots = crate::config::load_bots(&config, &config.fleet.bots_dir).unwrap();
+        assert!(bots.len() >= 12, "expected the twelve shipped bots");
+        catalog.validate_bot_skills(&bots).unwrap();
+        for bot in &bots {
+            for id in &bot.config.skills {
+                assert!(
+                    catalog.skill_ids().contains(id),
+                    "{} -> {id}",
+                    bot.config.name
+                );
+            }
+        }
+        for summary in catalog.summaries() {
+            assert!(!summary.name.is_empty(), "{} has no name", summary.id);
+            assert!(
+                !summary.description.is_empty(),
+                "{} has no description",
+                summary.id
+            );
+        }
+    }
+
     #[test]
     fn repository_skill_files_are_instructions_not_a_sentinel() {
         let skills = Path::new(env!("CARGO_MANIFEST_DIR"))
