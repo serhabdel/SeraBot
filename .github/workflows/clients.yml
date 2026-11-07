@@ -79,6 +79,13 @@ jobs:
         run: |
           flutter build apk --debug \
             --dart-define=SERABOT_DEFAULT_SERVER_URL="${SERABOT_OWNER_API_URL}"
+      # Release-mode compile (R8/shrinking, release manifest) so a release-only
+      # failure shows up on PRs instead of at tag time. Debug-signed; not published.
+      - name: Build release APK (compile check)
+        working-directory: apps/serabot_mobile
+        run: |
+          flutter build apk --release \
+            --dart-define=SERABOT_DEFAULT_SERVER_URL="${SERABOT_OWNER_API_URL}"
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
