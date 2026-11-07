@@ -1529,12 +1529,9 @@ mod tests {
         let router = ModelRouter::new(&config, clients).unwrap();
         let reports = router.refresh_catalogs(TEST_USER).await.unwrap();
         assert!(reports[0].fetched && !reports[0].verified);
-        // A closed snapshot falls back to the configured allowlist for
-        // display, but selection is still gated (verified_contains is false).
-        assert_eq!(
-            router.catalog(TEST_USER)[0].models,
-            vec!["kept".to_string()]
-        );
+        // A closed snapshot offers nothing: selection is gated
+        // (verified_contains is false).
+        assert!(router.catalog(TEST_USER)[0].models.is_empty());
         assert!(!router.catalog(TEST_USER)[0].catalog_verified);
         let route = router
             .pin(&ModelSelection {

@@ -324,9 +324,11 @@ async fn bot_defaults_catalog_and_unapproved_reads_are_preserved() {
             .model,
         "loaded"
     );
-    assert_eq!(
-        runtime.model_catalog(&admin(&store)).unwrap()[0].models,
-        vec!["alternative", "configured", "loaded", "test"]
+    // Without egress consent `pin` refuses every model, so none is offered.
+    assert!(
+        runtime.model_catalog(&admin(&store)).unwrap()[0]
+            .models
+            .is_empty()
     );
     assert!(
         runtime
