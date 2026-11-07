@@ -76,3 +76,103 @@
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
+
+/* Health cards (0.21): server summary for the owner, "This PC" for everyone. */
+.health-card {
+  margin-bottom: 12px;
+}
+
+.health-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
+}
+
+.health-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  border-radius: var(--r-md);
+  background: var(--card-bg);
+  border: 1px solid var(--glass-edge);
+  min-width: 0;
+}
+
+.health-value {
+  color: var(--label-1);
+  font-size: var(--fs-body-1, 1.05rem);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.health-ok {
+  color: var(--ok);
+}
+
+.health-watch {
+  color: var(--warn);
+}
+
+.meter {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--hairline);
+  overflow: hidden;
+}
+
+.meter-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.meter-fill.warn {
+  background: var(--warn);
+}
+
+.health-details {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--hairline);
+}
+
+.health-heading {
+  margin: 8px 0 0;
+  color: var(--label-1);
+  font-size: var(--fs-body-2);
+  font-weight: 600;
+}
+
+.health-split {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.cat-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cat-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 200px) 1fr 80px;
+  align-items: center;
+  gap: 12px;
+  font-size: var(--fs-body-2);
+}
+
+.cat-label {
+  color: var(--label-1);
+}
+
+.cat-size {
+  text-align: right;
+  color: var(--label-2);
+  font-variant-numeric: tabular-nums;
+}

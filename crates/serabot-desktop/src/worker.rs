@@ -4,8 +4,8 @@ use crate::{
     ConnectorUpdate, ConversationKind, ConversationPage, ConversationSummary, CreatedBot,
     CreatedConversation, CreatedGroup, CreatedSkill, Health, History, LibraryEntry, MemoryEntry,
     MemoryStatsView, NewGroup, NewProvider, Onboarding, ProviderStatus, Scope, Selection,
-    SkillSummary, Task, Team, TeamMode, Transcription, ServerHealth, UsageReport, VoiceSettings, VoiceUpdate,
-    avatars::AvatarTarget,
+    ServerHealth, SkillSummary, Task, Team, TeamMode, Transcription, UsageReport, VoiceSettings,
+    VoiceUpdate, avatars::AvatarTarget,
 };
 use secrecy::SecretString;
 use std::sync::{

@@ -109,6 +109,8 @@ struct Shared {
     folders_at: Mutex<Option<Instant>>,
     sampler: Mutex<Option<Sampler>>,
     running: AtomicBool,
+    /// A refresh was asked for while one was running: go round once more.
+    again: AtomicBool,
 }
 
 /// Handle to the background sampler. Cheap to clone.
@@ -127,9 +129,11 @@ impl PcMonitor {
         *self.shared.view.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Start a refresh on a background thread. Does nothing while one runs.
+    /// Start a refresh on a background thread. While one runs, the request
+    /// is remembered and the running one goes round once more.
     pub fn refresh(&self, dirs: PcDirs, folders: Vec<PathBuf>) {
         if self.shared.running.swap(true, Ordering::AcqRel) {
+            self.shared.again.store(true, Ordering::Release);
             return;
         }
         let shared = Arc::clone(&self.shared);
@@ -138,7 +142,12 @@ impl PcMonitor {
             .spawn({
                 let shared = Arc::clone(&shared);
                 move || {
-                    run_refresh(&shared, &dirs, &folders);
+                    loop {
+                        run_refresh(&shared, &dirs, &folders);
+                        if !shared.again.swap(false, Ordering::AcqRel) {
+                            break;
+                        }
+                    }
                     shared.running.store(false, Ordering::Release);
                 }
             });
@@ -162,7 +171,11 @@ fn run_refresh(shared: &Shared, dirs: &PcDirs, folders: &[PathBuf]) {
     shared.view.lock().unwrap_or_else(|e| e.into_inner()).quick = Some(quick);
 
     if folders.is_empty() {
-        shared.view.lock().unwrap_or_else(|e| e.into_inner()).folders = Some(FoldersSize::Done {
+        shared
+            .view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .folders = Some(FoldersSize::Done {
             count: 0,
             bytes: 0,
             truncated: false,
@@ -179,7 +192,9 @@ fn run_refresh(shared: &Shared, dirs: &PcDirs, folders: &[PathBuf]) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .folders
-        .is_some_and(|size| matches!(size, FoldersSize::Done { count, .. } if count == folders.len()));
+        .is_some_and(
+            |size| matches!(size, FoldersSize::Done { count, .. } if count == folders.len()),
+        );
     if fresh && known {
         return;
     }
@@ -190,15 +205,16 @@ fn run_refresh(shared: &Shared, dirs: &PcDirs, folders: &[PathBuf]) {
         }
     }
     let (bytes, truncated) = folders_size(folders, WALK_BUDGET, WALK_MAX_ENTRIES);
-    shared.view.lock().unwrap_or_else(|e| e.into_inner()).folders = Some(FoldersSize::Done {
+    shared
+        .view
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .folders = Some(FoldersSize::Done {
         count: folders.len(),
         bytes,
         truncated,
     });
-    *shared
-        .folders_at
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    *shared.folders_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
 }
 
 fn quick_numbers(shared: &Shared, dirs: &PcDirs) -> Quick {
@@ -227,7 +243,12 @@ fn quick_numbers(shared: &Shared, dirs: &PcDirs) -> Quick {
         sampler
             .system
             .process(pid)
-            .map(|process| (process.memory(), (process.cpu_usage() / cores).clamp(0.0, 100.0)))
+            .map(|process| {
+                (
+                    process.memory(),
+                    (process.cpu_usage() / cores).clamp(0.0, 100.0),
+                )
+            })
             .unwrap_or((0, 0.0))
     };
     let data = local_data(dirs);
@@ -263,7 +284,12 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
         .iter()
         .filter(|disk| target.starts_with(plain(disk.mount_point())))
         .max_by_key(|disk| disk.mount_point().as_os_str().len())
-        .map(|disk| (disk.total_space(), disk.available_space().min(disk.total_space())))
+        .map(|disk| {
+            (
+                disk.total_space(),
+                disk.available_space().min(disk.total_space()),
+            )
+        })
 }
 
 /// The updater's log keeps its own line in the breakdown.
@@ -273,7 +299,8 @@ const UPDATE_LOG: &str = "update.log";
 pub fn local_data(dirs: &PcDirs) -> LocalData {
     let mut data = LocalData::default();
     if let Some(dir) = &dirs.settings {
-        data.settings_bytes = walk_size(dir, Instant::now() + Duration::from_secs(2), &mut 100_000).0;
+        data.settings_bytes =
+            walk_size(dir, Instant::now() + Duration::from_secs(2), &mut 100_000).0;
     }
     if let Some(dir) = &dirs.updates {
         let total = walk_size(dir, Instant::now() + Duration::from_secs(2), &mut 100_000).0;
@@ -372,7 +399,8 @@ mod tests {
         write(&dir.join("a.txt"), 10);
         write(&dir.join("sub/b.txt"), 20);
         write(&dir.join("sub/deeper/c.txt"), 30);
-        let (bytes, truncated) = walk_size(&dir, Instant::now() + Duration::from_secs(5), &mut 1000);
+        let (bytes, truncated) =
+            walk_size(&dir, Instant::now() + Duration::from_secs(5), &mut 1000);
         assert_eq!((bytes, truncated), (60, false));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -392,7 +420,10 @@ mod tests {
     #[test]
     fn a_missing_folder_counts_as_zero() {
         let gone = std::env::temp_dir().join(format!("serabot-pc-gone-{}", uuid::Uuid::new_v4()));
-        assert_eq!(folders_size(&[gone], Duration::from_secs(1), 100), (0, false));
+        assert_eq!(
+            folders_size(&[gone], Duration::from_secs(1), 100),
+            (0, false)
+        );
     }
 
     #[cfg(unix)]
@@ -447,15 +478,24 @@ mod tests {
         let started = Instant::now();
         loop {
             let view = monitor.view();
-            if let (Some(quick), Some(FoldersSize::Done { count, bytes, truncated })) =
-                (view.quick, view.folders)
+            if let (
+                Some(quick),
+                Some(FoldersSize::Done {
+                    count,
+                    bytes,
+                    truncated,
+                }),
+            ) = (view.quick, view.folders)
             {
                 assert_eq!((count, bytes, truncated), (1, 700, false));
                 assert!(quick.app_memory_bytes > 0);
                 assert_eq!(quick.data.settings_bytes, 10);
                 break;
             }
-            assert!(started.elapsed() < Duration::from_secs(20), "refresh never finished");
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "refresh never finished"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         let _ = std::fs::remove_dir_all(&settings);
@@ -468,7 +508,10 @@ mod tests {
         monitor.refresh(PcDirs::default(), Vec::new());
         let started = Instant::now();
         loop {
-            if let Some(FoldersSize::Done { count: 0, bytes: 0, .. }) = monitor.view().folders {
+            if let Some(FoldersSize::Done {
+                count: 0, bytes: 0, ..
+            }) = monitor.view().folders
+            {
                 break;
             }
             assert!(started.elapsed() < Duration::from_secs(20));

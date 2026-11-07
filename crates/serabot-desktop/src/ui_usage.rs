@@ -7,7 +7,15 @@
 
 use dioxus::prelude::*;
 use serabot_desktop::UsageReport;
+use serabot_desktop::pc_stats::FoldersSize;
 use serabot_desktop::session::{Session, humanize_label};
+use serabot_desktop::status_view::{
+    Health, bar_percent, format_bytes, format_percent, format_uptime, health, member_label, percent,
+};
+
+/// How often the health cards refresh while the Usage page is open.
+#[cfg(windows)]
+const REFRESH_SECS: u64 = 30;
 
 /// Ranges offered by the picker, in days.
 const RANGES: [(u32, &str); 3] = [(7, "7 days"), (30, "30 days"), (90, "90 days")];
@@ -62,6 +70,19 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
     let empty = report
         .as_ref()
         .is_some_and(|report| report.totals.calls == 0);
+    let is_admin = session.read().is_admin();
+    // Refresh the health cards every 30 s, only while this page is open
+    // (the future ends when the page is left).
+    use_future(move || async move {
+        loop {
+            session.write().refresh_server_health();
+            session.read().refresh_pc();
+            #[cfg(windows)]
+            tokio::time::sleep(std::time::Duration::from_secs(REFRESH_SECS)).await;
+            #[cfg(not(windows))]
+            std::future::pending::<()>().await;
+        }
+    });
     rsx! {
         div { class: "pane usage-page",
             div { class: "pane-head",
@@ -83,6 +104,9 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                 }
             }
             div { class: "pane-body",
+                if is_admin {
+                    ServerHealthCard { session }
+                }
                 if loading && report.is_none() {
                     p { class: "caption", "Loading your usage…" }
                 } else if let Some(report) = report {
@@ -181,6 +205,350 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                     }
                 } else {
                     p { class: "caption", "Usage could not be loaded. Pick a period to try again." }
+                }
+                ThisPcCard { session }
+            }
+        }
+    }
+}
+
+/// A thin progress bar. `warn` turns it amber when something is nearly full.
+#[component]
+fn Meter(percent: u32, label: String, warn: bool) -> Element {
+    rsx! {
+        div {
+            class: "meter",
+            role: "progressbar",
+            "aria-label": "{label}",
+            "aria-valuemin": "0",
+            "aria-valuemax": "100",
+            "aria-valuenow": "{percent}",
+            div {
+                class: if warn { "meter-fill warn" } else { "meter-fill" },
+                style: "width: {percent}%;",
+            }
+        }
+    }
+}
+
+/// One small label/value block of a health card.
+#[component]
+fn HealthItem(
+    label: String,
+    value: String,
+    note: Option<String>,
+    bar: Option<(u32, bool)>,
+) -> Element {
+    rsx! {
+        div { class: "health-item",
+            span { class: "usage-tile-label", "{label}" }
+            span { class: "health-value", "{value}" }
+            if let Some((fill, warn)) = bar {
+                Meter { percent: fill, label: label.clone(), warn }
+            }
+            if let Some(note) = note {
+                span { class: "tiny", "{note}" }
+            }
+        }
+    }
+}
+
+/// Owner only: how the server is doing. A short summary that opens into the
+/// full picture. Refreshes itself every 30 seconds while the page is open.
+#[component]
+fn ServerHealthCard(session: Signal<Session>) -> Element {
+    let mut expanded = use_signal(|| false);
+    let (status, error, loading) = {
+        let s = session.read();
+        (
+            s.state.server_health.clone(),
+            s.server_health_error.clone(),
+            s.server_health_loading,
+        )
+    };
+    let Some(status) = status else {
+        return rsx! {
+            div { class: "card health-card",
+                div { class: "card-head",
+                    h3 { class: "card-title", "Your server" }
+                    if loading {
+                        span { class: "spinner", title: "Checking" }
+                    }
+                }
+                if let Some(error) = error {
+                    p { class: "caption", "{error}" }
+                } else {
+                    p { class: "caption", "Checking your server…" }
+                }
+            }
+        };
+    };
+    let (level, word) = health(&status);
+    let ram_pct = percent(
+        status.host.memory_used_bytes,
+        status.host.memory_total_bytes,
+    );
+    let (storage_used, storage_total) = match &status.disk {
+        Some(disk) => (disk.used_bytes, disk.total_bytes),
+        None => (status.storage.total_bytes, status.storage.total_bytes),
+    };
+    let storage_pct = percent(storage_used, storage_total);
+    let open = expanded();
+    let mut categories = status.storage.categories.clone();
+    categories.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    let biggest = categories.first().map(|c| c.bytes).unwrap_or(0);
+    let process_pct = percent(status.process.memory_bytes, status.host.memory_total_bytes);
+    rsx! {
+        div { class: "card health-card",
+            div { class: "card-head",
+                div {
+                    h3 { class: "card-title", "Your server" }
+                    p { class: "tiny", "Only you, the owner, see this." }
+                }
+                if loading {
+                    span { class: "spinner", title: "Refreshing" }
+                }
+                button {
+                    class: "btn ghost sm",
+                    r#type: "button",
+                    "aria-expanded": if open { "true" } else { "false" },
+                    onclick: move |_| expanded.set(!open),
+                    if open { "Hide details" } else { "Show details" }
+                }
+            }
+            div { class: "health-summary",
+                div { class: "health-item",
+                    span { class: "usage-tile-label", "Server" }
+                    span {
+                        class: if level == Health::Ok { "health-value health-ok" } else { "health-value health-watch" },
+                        "{word}"
+                    }
+                }
+                HealthItem {
+                    label: "Memory",
+                    value: format!(
+                        "{} of {}",
+                        format_bytes(status.host.memory_used_bytes),
+                        format_bytes(status.host.memory_total_bytes)
+                    ),
+                    note: None,
+                    bar: Some((ram_pct, ram_pct >= 90)),
+                }
+                HealthItem {
+                    label: "Processor",
+                    value: format_percent(status.host.cpu_percent),
+                    note: None,
+                    bar: Some((status.host.cpu_percent.clamp(0.0, 100.0) as u32, status.host.cpu_percent >= 90.0)),
+                }
+                HealthItem {
+                    label: "Storage",
+                    value: format!("{} of {}", format_bytes(storage_used), format_bytes(storage_total)),
+                    note: None,
+                    bar: Some((storage_pct, storage_pct >= 90)),
+                }
+            }
+            if let Some(error) = error {
+                p { class: "tiny", "{error}" }
+            }
+            if open {
+                div { class: "health-details",
+                    p { class: "caption",
+                        "Version {status.version} · running for {format_uptime(status.uptime_secs)} · {status.host.cpu_cores} processor cores"
+                    }
+                    h4 { class: "health-heading", "Memory and processor" }
+                    div { class: "health-split",
+                        HealthItem {
+                            label: "SeraBot itself",
+                            value: format_bytes(status.process.memory_bytes),
+                            note: Some(format!("Processor {}", format_percent(status.process.cpu_percent))),
+                            bar: Some((process_pct.max(if status.process.memory_bytes > 0 { 1 } else { 0 }), false)),
+                        }
+                        HealthItem {
+                            label: "The whole server",
+                            value: format!(
+                                "{} of {}",
+                                format_bytes(status.host.memory_used_bytes),
+                                format_bytes(status.host.memory_total_bytes)
+                            ),
+                            note: Some(format!("Processor {}", format_percent(status.host.cpu_percent))),
+                            bar: Some((ram_pct, ram_pct >= 90)),
+                        }
+                    }
+                    h4 { class: "health-heading", "What takes up space" }
+                    p { class: "tiny",
+                        if status.storage.truncated {
+                            "SeraBot data: at least {format_bytes(status.storage.total_bytes)} (counting stopped early)."
+                        } else {
+                            "SeraBot data: {format_bytes(status.storage.total_bytes)} in {status.storage.total_files} files."
+                        }
+                    }
+                    div { class: "cat-list",
+                        for category in categories {
+                            div { key: "{category.id}", class: "cat-row",
+                                span { class: "cat-label", "{category.label}" }
+                                Meter {
+                                    percent: bar_percent(category.bytes, biggest),
+                                    label: category.label.clone(),
+                                    warn: false,
+                                }
+                                span { class: "cat-size", "{format_bytes(category.bytes)}" }
+                            }
+                        }
+                    }
+                    h4 { class: "health-heading", "By person" }
+                    p { class: "tiny", "Counts and sizes only. No messages, files or logins are shown." }
+                    table { class: "usage-table",
+                        thead {
+                            tr {
+                                th { "Person" }
+                                th { class: "num", "Chats" }
+                                th { class: "num", "Messages" }
+                                th { class: "num", "Documents" }
+                                th { class: "num", "Memories" }
+                                th { class: "num", "Made files" }
+                                th { class: "num", "Space" }
+                            }
+                        }
+                        tbody {
+                            for person in status.users.clone() {
+                                tr { key: "{person.id}",
+                                    td { "{member_label(&person.display_name, &person.email)}" }
+                                    td { class: "num", "{person.conversations}" }
+                                    td { class: "num", "{person.messages}" }
+                                    td { class: "num", "{person.documents}" }
+                                    td { class: "num", "{person.memories}" }
+                                    td { class: "num", "{person.artifacts}" }
+                                    td { class: "num", "{format_bytes(person.file_bytes)}" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// For everyone: what this app uses on this computer.
+#[component]
+fn ThisPcCard(session: Signal<Session>) -> Element {
+    let mut confirming = use_signal(|| false);
+    let view = session.read().pc.view();
+    let Some(quick) = view.quick else {
+        return rsx! {
+            div { class: "card health-card",
+                div { class: "card-head",
+                    h3 { class: "card-title", "This PC" }
+                    span { class: "spinner", title: "Reading" }
+                }
+                p { class: "caption", "Reading this computer…" }
+            }
+        };
+    };
+    let folders_value = match view.folders {
+        Some(FoldersSize::Done {
+            count,
+            bytes,
+            truncated,
+        }) => {
+            let noun = if count == 1 { "folder" } else { "folders" };
+            let size = if truncated {
+                format!("at least {}", format_bytes(bytes))
+            } else {
+                format_bytes(bytes)
+            };
+            if count == 0 {
+                "None allowed".to_owned()
+            } else {
+                format!("{count} {noun}, {size}")
+            }
+        }
+        _ => "Counting…".to_owned(),
+    };
+    let disk = quick.disk.map(|(total, free)| {
+        let used = total.saturating_sub(free);
+        (total, free, percent(used, total))
+    });
+    let clearable = quick.data.clearable();
+    let open_confirm = confirming();
+    rsx! {
+        div { class: "card health-card",
+            div { class: "card-head",
+                div {
+                    h3 { class: "card-title", "This PC" }
+                    p { class: "tiny", "What SeraBot uses on this computer." }
+                }
+            }
+            div { class: "health-summary",
+                HealthItem {
+                    label: "App memory",
+                    value: format_bytes(quick.app_memory_bytes),
+                    note: None,
+                    bar: None,
+                }
+                HealthItem {
+                    label: "App processor",
+                    value: format_percent(quick.app_cpu_percent),
+                    note: None,
+                    bar: None,
+                }
+                HealthItem {
+                    label: "App files",
+                    value: format_bytes(quick.data.total()),
+                    note: Some(format!(
+                        "Settings {} · update files {} · log {}",
+                        format_bytes(quick.data.settings_bytes),
+                        format_bytes(quick.data.updates_bytes),
+                        format_bytes(quick.data.log_bytes)
+                    )),
+                    bar: None,
+                }
+                HealthItem {
+                    label: "Folders you allowed",
+                    value: folders_value,
+                    note: None,
+                    bar: None,
+                }
+                if let Some((total, free, used_pct)) = disk {
+                    HealthItem {
+                        label: "Free disk space",
+                        value: format!("{} of {}", format_bytes(free), format_bytes(total)),
+                        note: None,
+                        bar: Some((used_pct, used_pct >= 90)),
+                    }
+                }
+            }
+            if clearable > 0 {
+                if open_confirm {
+                    div { class: "vault-confirm", role: "group", "aria-label": "Confirm clear cache",
+                        span { class: "caption",
+                            "Delete downloaded update files ({format_bytes(clearable)})? They download again if needed. Your settings stay."
+                        }
+                        button {
+                            class: "btn danger sm",
+                            r#type: "button",
+                            onclick: move |_| {
+                                confirming.set(false);
+                                session.write().clear_pc_cache();
+                            },
+                            "Clear"
+                        }
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            onclick: move |_| confirming.set(false),
+                            "Keep"
+                        }
+                    }
+                } else {
+                    div { class: "card-actions",
+                        button {
+                            class: "btn sm",
+                            r#type: "button",
+                            onclick: move |_| confirming.set(true),
+                            "Clear cache ({format_bytes(clearable)})"
+                        }
+                    }
                 }
             }
         }
