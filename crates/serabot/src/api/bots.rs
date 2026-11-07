@@ -1,6 +1,6 @@
 use super::*;
 use crate::browser_profiles::{MAX_BOT_DESCRIPTION_CHARS, MAX_BOT_DISPLAY_NAME_CHARS};
-use crate::default_avatars::{default_avatar, default_avatar_version};
+use crate::default_avatars::default_avatar_version;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

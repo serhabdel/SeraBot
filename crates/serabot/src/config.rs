@@ -2503,8 +2503,8 @@ mod tests {
             for word in
                 prompt.split(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
             {
-                let is_tool = known.iter().any(|name| *name == word);
-                let always_granted = always.iter().any(|name| *name == word);
+                let is_tool = known.contains(&word);
+                let always_granted = always.contains(&word);
                 let granted = bot.tools.iter().any(|tool| tool == word);
                 assert!(
                     !is_tool || always_granted || granted,
