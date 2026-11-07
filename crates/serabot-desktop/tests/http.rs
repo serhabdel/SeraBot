@@ -628,6 +628,37 @@ fn a_library_response_with_an_unshaped_hash_is_rejected() {
     handle.join().unwrap();
 }
 
+#[test]
+fn chat_plan_and_auto_approve_use_their_routes_and_tolerate_old_servers() {
+    let (client, handle) = server(vec![
+        (
+            200,
+            r#"{"plan":{"goal":"Ship it","items":[{"text":"Build","status":"doing"}]}}"#.into(),
+        ),
+        (
+            200,
+            r#"{"conversation_id":"dir:main","enabled":true}"#.into(),
+        ),
+        (
+            200,
+            r#"{"conversation_id":"dir:main","enabled":false}"#.into(),
+        ),
+        // An older server without the routes: no plan, switch off.
+        (404, r#"{"error":"not found"}"#.into()),
+        (404, r#"{"error":"not found"}"#.into()),
+    ]);
+    let (plan, auto) = client.chat_state("dir:main").unwrap();
+    assert_eq!(plan.unwrap().goal, "Ship it");
+    assert!(auto);
+    assert!(!client.set_auto_approve("dir:main", false).unwrap());
+    let (plan, auto) = client.chat_state("dir:main").unwrap();
+    assert!(plan.is_none() && !auto);
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("GET /v1/conversations/dir:main/plan "));
+    assert!(requests[1].starts_with("GET /v1/conversations/dir:main/auto-approve "));
+    assert!(requests[2].starts_with("PUT /v1/conversations/dir:main/auto-approve "));
+}
+
 const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 const STATE: &str = "synthetic-client-state-0123456789";
 const RETURN_TO: &str = "http://127.0.0.1:51121/auth-done";
@@ -1629,4 +1660,44 @@ fn bot_avatar_upload_sends_the_raw_image_bytes_to_the_avatar_route() {
     assert!(head.starts_with("PUT /v1/bots/recruiter/avatar "), "{head}");
     assert!(head.to_lowercase().contains("authorization: bearer "));
     assert_eq!(body, png);
+}
+
+#[test]
+fn uploads_attachments_and_sends_their_ids() {
+    let task = r#"{"task":{"id":"task-1","kind":"chat","bot":"owner","status":"queued"}}"#;
+    let (client, handle) = server(vec![
+        (
+            200,
+            r#"{"attachment":{"id":"att-1","filename":"notes.md","mime":"text/plain","size_bytes":5,"is_image":false}}"#.into(),
+        ),
+        (202, task.into()),
+    ]);
+    let file = client
+        .upload_attachment("dir:main", "notes.md", b"hello")
+        .unwrap();
+    assert_eq!(file.id, "att-1");
+    client
+        .submit_with("dir:main", "", &["att-1".to_owned()])
+        .unwrap();
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("POST /v1/conversations/dir:main/attachments "));
+    assert!(requests[0].to_lowercase().contains("x-filename: notes.md"));
+    assert!(requests[1].contains(r#""attachments":["att-1"]"#));
+}
+
+#[test]
+fn attachment_checks_run_before_any_request() {
+    let (client, _handle) = server(vec![]);
+    for bad in ["run.exe", "a/b.txt", "..\\x.txt", "page.svg", ""] {
+        assert!(
+            client.upload_attachment("dir:main", bad, b"x").is_err(),
+            "{bad}"
+        );
+    }
+    assert!(client.upload_attachment("dir:main", "a.txt", b"").is_err());
+    let big = vec![0u8; serabot_desktop::MAX_ATTACHMENT_BYTES + 1];
+    assert!(client.upload_attachment("dir:main", "a.txt", &big).is_err());
+    assert!(client.submit_with("dir:main", "", &[]).is_err());
+    let seven: Vec<String> = (0..7).map(|n| format!("a{n}")).collect();
+    assert!(client.submit_with("dir:main", "hi", &seven).is_err());
 }

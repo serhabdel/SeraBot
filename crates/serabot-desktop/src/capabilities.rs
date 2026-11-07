@@ -27,6 +27,8 @@ pub const CAPABILITIES: &[Capability] = &[
             "browser_press",
             "browser_screenshot",
             "browser_close",
+            "browser_tabs",
+            "browser_new_tab",
         ],
     },
     Capability {
@@ -126,6 +128,11 @@ pub const CAPABILITIES: &[Capability] = &[
             "google_sheets_read",
             "notion_query_database",
         ],
+    },
+    Capability {
+        label: "Work with folders on this PC",
+        hint: "Read, and with your approval write, folders you allow in Settings.",
+        tools: &["local_list", "local_read", "local_write"],
     },
     Capability {
         label: "Send files to Telegram",

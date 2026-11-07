@@ -68,6 +68,14 @@ pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -
         "browser_press" => ("pointer", "Pressing a key".into()),
         "browser_screenshot" => ("image", "Taking a screenshot".into()),
         "browser_close" => ("globe", "Closing the browser".into()),
+        "browser_tabs" => ("globe", "Checking the browser tabs".into()),
+        "browser_new_tab" => (
+            "globe",
+            host_of(args).map_or_else(
+                || "Opening a new tab".into(),
+                |h| format!("Opening {h} in a new tab"),
+            ),
+        ),
         "fetch_url" | "firecrawl_scrape" | "firecrawl_extract" => (
             "globe",
             host_of(args).map_or_else(|| "Reading a web page".into(), |h| format!("Reading {h}")),
@@ -78,12 +86,16 @@ pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -
         "document_index" => ("file", "Reading a document".into()),
         "memory_save" => ("brain", "Saving to memory".into()),
         "memory_list" | "memory_delete" => ("brain", "Checking memory".into()),
+        "plan_update" => ("bolt", "Updating the plan".into()),
         "skill_list" | "skill_search" | "skill_load" => ("bolt", "Looking up a skill".into()),
         "watch_now" => ("eye", "Checking watched pages".into()),
         "agentmail_send" | "outlook_send" => ("mail", "Sending an email".into()),
         "agentmail_inboxes_list" => ("mail", "Checking the inbox".into()),
         "telegram_send_document" | "onedrive_upload" => ("file", "Sending a file".into()),
         "onedrive_list" => ("file", "Listing files".into()),
+        "local_list" => ("file", "Looking at a folder on your PC".into()),
+        "local_read" => ("file", "Reading a file on your PC".into()),
+        "local_write" => ("file", "Writing a file on your PC".into()),
         "vault_list" => ("lock", "Checking the vault".into()),
         "analyst" => ("chart", "Analyzing data".into()),
         "delegate" => (

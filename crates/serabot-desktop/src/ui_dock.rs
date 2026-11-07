@@ -43,6 +43,29 @@ const DOCK_JS: &str = r#"
     if (wheel) { out({ t: 'scroll', dy: Math.max(-5000, Math.min(5000, wheel)) }); wheel = 0; }
   };
 
+  // Draw the bot's pointer over the picture: map viewport pixels onto the
+  // image, and replay the click ripple when `data-seq` changes.
+  let lastSeq = '';
+  const placePointer = () => {
+    const p = document.getElementById('dock-pointer');
+    const img = document.getElementById('dock-shot');
+    const s = stage();
+    if (!p || !img || !s || !img.naturalWidth) return;
+    const vw = Number(p.dataset.vw) || img.naturalWidth;
+    const vh = Number(p.dataset.vh) || img.naturalHeight;
+    const x = img.offsetLeft + (Number(p.dataset.x) / vw) * img.clientWidth;
+    const y = img.offsetTop + (Number(p.dataset.y) / vh) * img.clientHeight;
+    p.style.transform = 'translate(' + x.toFixed(1) + 'px,' + y.toFixed(1) + 'px)';
+    if (p.dataset.seq !== lastSeq) {
+      lastSeq = p.dataset.seq;
+      p.classList.remove('pulse');
+      void p.offsetWidth;
+      if (p.dataset.action === 'click') p.classList.add('pulse');
+    }
+  };
+  setInterval(placePointer, 100);
+  window.addEventListener('resize', placePointer);
+
   document.addEventListener('click', (e) => {
     const s = mine();
     if (!s || !s.contains(e.target)) return;
@@ -155,7 +178,7 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
     let mut draft = use_signal(String::new);
     let mut more_open = use_signal(|| false);
 
-    let (open, in_control, busy, info, shot, error, bot_name) = {
+    let (open, in_control, busy, info, shot, error, bot_name, dock_pointer) = {
         let s = session.read();
         let driving = s
             .panel
@@ -179,6 +202,9 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
             s.panel.dock_shot(),
             s.panel.browser_error.clone(),
             bot_name,
+            s.panel
+                .session(&s.panel.dock_profile)
+                .and_then(|session| session.pointer.clone()),
         )
     };
     let active = open && info.as_ref().is_some_and(|i| i.active);
@@ -275,6 +301,9 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
                                 alt: "Live view of the page",
                                 draggable: false,
                                 src: shot.clone().unwrap_or_default(),
+                            }
+                            if !in_control {
+                                crate::ui_browser::PointerOverlay { pointer: dock_pointer }
                             }
                         }
                     } else if active {

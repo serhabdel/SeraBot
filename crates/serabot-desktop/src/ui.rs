@@ -22,9 +22,10 @@ use crate::ui_bots::{NewBotSheet, NewGroupSheet, OnboardingView};
 use crate::ui_browser::BrowserView;
 use crate::ui_connectors::ConnectorsView;
 use crate::ui_dock::BrowserDock;
+use crate::ui_files::{ComposerFiles, MediaCards, MessageFiles};
 use crate::ui_settings::SettingsPanel;
 use crate::ui_settings_page::{
-    AboutCard, AppearanceCard, ChatPrefsCard, NotificationsCard, SettingsNav,
+    AboutCard, AppearanceCard, ChatPrefsCard, LocalFoldersCard, NotificationsCard, SettingsNav,
 };
 use crate::ui_usage::UsagePage;
 use crate::ui_vault::VaultPage;
@@ -35,7 +36,8 @@ const SYSTEM_THEME_JS: &str = "const m = window.matchMedia('(prefers-color-schem
 /// Styles of the 0.17 usage and settings pages, kept apart from app.css.
 const CSS_PAGES: &str = concat!(
     include_str!("../assets/usage.css"),
-    include_str!("../assets/settings.css")
+    include_str!("../assets/settings.css"),
+    include_str!("../assets/files.css")
 );
 
 /// A chat row: id, owner flag, speaker, avatar, bot, time, body, peer flag.
@@ -374,6 +376,13 @@ fn tool_sentence(tool: &str, summary: &str, done: bool) -> Option<String> {
         }
         .to_owned(),
         "browser_snapshot" | "browser_screenshot" => "Looked at the page".to_owned(),
+        "browser_tabs" => "Checked the browser tabs".to_owned(),
+        "browser_new_tab" => if done {
+            "Opened a new tab"
+        } else {
+            "Wants to open a new tab"
+        }
+        .to_owned(),
         "browser_close" => if done {
             "Closed the browser"
         } else {
@@ -2207,6 +2216,50 @@ fn ActivityRow(mut session: Signal<Session>, step: Step) -> Element {
     }
 }
 
+/// The goal and todo list of the chat. Collapsed to one line (goal and
+/// "N of M done"); a click opens the checklist. The text is model-written and
+/// rendered as plain text only.
+#[component]
+fn PlanPanel(plan: serabot_desktop::chat_plan::ChatPlan) -> Element {
+    use serabot_desktop::chat_plan::ItemStatus;
+    let progress = plan.progress();
+    let complete = plan.is_complete();
+    let total = plan.items.len().max(1);
+    let percent = plan.done() * 100 / total;
+    rsx! {
+        details { class: if complete { "plan-panel complete" } else { "plan-panel" },
+            summary { class: "plan-summary",
+                span { class: "plan-chevron", Icon { name: "chevron-right", size: 12 } }
+                span { class: "plan-goal", title: "{plan.goal}", "{plan.goal}" }
+                span { class: "plan-progress", "{progress}" }
+                span { class: "plan-bar", "aria-hidden": "true",
+                    span { class: "plan-bar-fill", style: "width: {percent}%" }
+                }
+            }
+            ul { class: "plan-items", "aria-label": "Todo list",
+                for (index, item) in plan.items.iter().enumerate() {
+                    li {
+                        key: "{index}",
+                        class: match item.status {
+                            ItemStatus::Done => "plan-item done",
+                            ItemStatus::Doing => "plan-item doing",
+                            ItemStatus::Pending => "plan-item",
+                        },
+                        span { class: "plan-mark",
+                            match item.status {
+                                ItemStatus::Done => rsx! { Icon { name: "check", size: 12 } },
+                                ItemStatus::Doing => rsx! { span { class: "pill-dot live" } },
+                                ItemStatus::Pending => rsx! { span { class: "plan-dot" } },
+                            }
+                        }
+                        span { class: "plan-text", "{item.text}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// First letter of a label, upper-cased, for avatar tiles.
 fn initial_of(label: &str) -> String {
     label
@@ -2347,6 +2400,8 @@ fn Topbar(
         (state.panel.session_active(), state.panel.open())
     };
     let task_status = session.read().state.task.as_ref().map(|task| task.status);
+    let auto_approve = session.read().state.auto_approve;
+    let accepts_turns = session.read().conversation_accepts_turns();
     let (subtitle, avatar) = {
         let state = session.read();
         let summary = state
@@ -2448,6 +2503,17 @@ fn Topbar(
                     "aria-label": "Reload",
                     onclick: move |_| session.write().refresh(),
                     Icon { name: "refresh", size: 16 }
+                }
+                if accepts_turns && connected {
+                    button {
+                        class: if auto_approve { "btn sm yolo-btn active" } else { "btn ghost sm yolo-btn" },
+                        title: "Auto-approve: when on, this chat's bots run actions that normally ask you first (sending email, uploading or deleting files) without waiting for your OK. Policy checks and the audit log still apply. Off by default; applies to this chat only.",
+                        "aria-label": "Auto-approve in this chat",
+                        "aria-pressed": if auto_approve { "true" } else { "false" },
+                        onclick: move |_| session.write().set_auto_approve(!auto_approve),
+                        Icon { name: "bolt", size: 15 }
+                        span { class: "btn-label", "Auto-approve" }
+                    }
                 }
                 if browser_active {
                     button {
@@ -2719,7 +2785,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             sending,
         )
     };
+    let chat_plan = session.read().state.plan.clone();
     let composer = session.read().composer.clone();
+    let has_files = !session.read().composer_files.is_empty();
     let can_send = session.read().state.can_send();
     let accepts = session.read().conversation_accepts_turns();
     let (active_bot, active_name, active_avatar, roster) = {
@@ -2887,6 +2955,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                         }
                     }
                 }
+                if let Some(plan) = chat_plan.clone() {
+                    PlanPanel { plan }
+                }
                 div { class: if group_like { "messages group" } else { "messages" }, id: "messages",
                     if empty {
                         div { class: "empty",
@@ -2985,10 +3056,15 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 }
                                 div { class: "msg-body", title: "{stamp}",
                                     MarkdownBody { content: content.clone() }
+                                    if user {
+                                        MessageFiles { session, id: id.clone() }
+                                    }
                                 }
                             }
                         }
                     }
+                    // Files the bots produced in this chat (Open / Save as).
+                    MediaCards { session }
                     // What the bot is doing right now, in plain words: a
                     // shimmer while it thinks, one row per step, and a small
                     // "N steps" summary once the reply has landed.
@@ -3023,6 +3099,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                         div { class: "banner err", span { "{message}" } }
                     }
                     div { class: "composer",
+                        ComposerFiles { session }
                         textarea {
                             class: "composer-input",
                             id: "composer-input",
@@ -3194,19 +3271,19 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     },
                                     Icon { name: if recording() { "check" } else { "mic" }, size: 16 }
                                 }
-                                // TODO(desktop-features): attachments need `session::Session::attach_file(&mut self, path: String) -> Option<String>` — the client has no inbox upload path yet, so the button stays disabled.
                                 button {
                                     class: "composer-mic",
-                                    title: "Attachments are not available yet",
-                                    "aria-label": "Attachments are not available yet",
-                                    disabled: true,
+                                    title: "Attach files (images, PDF, Office, text; up to 25 MB)",
+                                    "aria-label": "Attach files",
+                                    disabled: !accepts,
+                                    onclick: move |_| session.write().pick_attachments(),
                                     Icon { name: "paperclip", size: 16 }
                                 }
                                 button {
                                     class: "btn primary send-btn",
                                     title: "Send",
                                     "aria-label": "Send message",
-                                    disabled: !can_send || composer.trim().is_empty(),
+                                    disabled: !can_send || (composer.trim().is_empty() && !has_files),
                                     onclick: move |_| session.write().submit(),
                                     Icon { name: "send", size: 16 }
                                 }
@@ -3347,6 +3424,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     }
 }
 
+/// Shown under the picker when the server lists no concrete model.
+const NO_MODELS_HINT: &str = "Ask the admin to allow more models.";
+
 #[component]
 fn ModelBar(session: Signal<Session>, #[props(default = false)] compact: bool) -> Element {
     // Picker items: (value, label). "auto" first, then the catalog entries
@@ -3405,6 +3485,8 @@ fn ModelBar(session: Signal<Session>, #[props(default = false)] compact: bool) -
         }
     };
     let changed = value != current;
+    // Only "auto" is left: the server offered no concrete model.
+    let no_models = session.read().state.catalog.is_some() && items.len() <= 1;
     let current_label = items
         .iter()
         .find(|(item_value, _)| *item_value == value)
@@ -3506,7 +3588,12 @@ fn ModelBar(session: Signal<Session>, #[props(default = false)] compact: bool) -
                         }
                     }
                     div { class: "pop-list",
-                        if filtered.is_empty() {
+                        if no_models {
+                            div { class: "pop-empty",
+                                "No models are available for your providers."
+                            }
+                            div { class: "pop-empty tiny", "{NO_MODELS_HINT}" }
+                        } else if filtered.is_empty() {
                             div { class: "pop-empty", "No models match." }
                         }
                         for (index, item_value, label) in filtered.clone() {
@@ -5357,6 +5444,9 @@ fn SettingsView(session: Signal<Session>) -> Element {
         }
         if sel == SettingsSection::Chat {
             ChatPrefsCard { session }
+        }
+        if sel == SettingsSection::LocalFolders {
+            LocalFoldersCard { session }
         }
         if sel == SettingsSection::About {
             AboutCard { session }

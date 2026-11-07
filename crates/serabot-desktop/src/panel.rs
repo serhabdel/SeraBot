@@ -41,6 +41,21 @@ pub const SHOT_EVERY: Duration = Duration::from_millis(500);
 pub const GRID_SHOT_EVERY: Duration = Duration::from_millis(1000);
 pub const GRID_SHOT_FLOOR: Duration = Duration::from_millis(330);
 const MAX_QUEUED_INPUTS: usize = 64;
+
+/// A tab operation the user asks for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TabAction {
+    Switch(String),
+    Close(String),
+}
+
+impl TabAction {
+    fn tab(&self) -> &str {
+        match self {
+            Self::Switch(tab) | Self::Close(tab) => tab,
+        }
+    }
+}
 const MAX_INPUTS_IN_FLIGHT: usize = 4;
 
 pub enum PanelOp {
@@ -58,6 +73,8 @@ pub enum PanelOp {
     Handback(String),
     Close(String),
     Input(String, BrowserInput),
+    /// Switch to or close a tab (user in control).
+    Tab(String, TabAction),
     ProfilesList,
     ProfileCreate(String),
     ProfileRename {
@@ -126,7 +143,7 @@ impl PanelOp {
             Self::Takeover(_) => PanelKind::Takeover,
             Self::Handback(_) => PanelKind::Handback,
             Self::Close(_) => PanelKind::Close,
-            Self::Input(..) => PanelKind::Input,
+            Self::Input(..) | Self::Tab(..) => PanelKind::Input,
             Self::ProfilesList => PanelKind::ProfilesList,
             Self::ProfileCreate(_) | Self::ProfileRename { .. } | Self::ProfileDelete(_) => {
                 PanelKind::ProfileChange
@@ -290,6 +307,11 @@ fn execute(job: &PanelJob, cache: &mut Option<ApiClient>) -> Result<PanelReply, 
         PanelOp::Input(id, input) => client
             .browser_session_input(id, input)
             .map(PanelReply::Input),
+        PanelOp::Tab(id, action) => match action {
+            TabAction::Switch(tab) => client.browser_tab_switch(id, tab),
+            TabAction::Close(tab) => client.browser_tab_close(id, tab),
+        }
+        .map(PanelReply::Input),
         PanelOp::ProfilesList => client.browser_profiles().map(PanelReply::Profiles),
         PanelOp::ProfileCreate(name) => client.browser_profile_create(name).map(|profile| {
             PanelReply::ProfileChanged(format!("Added \u{201c}{}\u{201d}.", profile.name))
@@ -932,6 +954,28 @@ impl PanelState {
         self.queue.push_back(PanelOp::Input(id, input));
     }
 
+    /// Switch to a tab. Ignored unless the user holds control.
+    pub fn switch_tab(&mut self, tab: &str) {
+        self.queue_tab(TabAction::Switch(tab.to_owned()));
+    }
+
+    /// Close a tab. Ignored unless the user holds control.
+    pub fn close_tab(&mut self, tab: &str) {
+        self.queue_tab(TabAction::Close(tab.to_owned()));
+    }
+
+    fn queue_tab(&mut self, action: TabAction) {
+        if !self.user_in_control() || !crate::valid_tab_id(action.tab()) {
+            return;
+        }
+        let Some(id) = self.control_target() else {
+            return;
+        };
+        if self.queue.len() < MAX_QUEUED_INPUTS {
+            self.queue.push_back(PanelOp::Tab(id, action));
+        }
+    }
+
     // ---- browser profiles ---------------------------------------------
 
     pub fn create_profile(&mut self, name: &str) {
@@ -1181,7 +1225,7 @@ impl PanelState {
             return Some(PanelOp::VaultList);
         }
         if let Some(front) = self.queue.front() {
-            let is_input = matches!(front, PanelOp::Input(..));
+            let is_input = matches!(front, PanelOp::Input(..) | PanelOp::Tab(..));
             if !is_input || self.inputs_inflight < MAX_INPUTS_IN_FLIGHT {
                 let op = self.queue.pop_front()?;
                 if is_input {
@@ -1572,6 +1616,8 @@ mod tests {
             url: active.then(|| "https://example.test/".into()),
             title: active.then(|| "Example".into()),
             controller,
+            tabs: Vec::new(),
+            pointer: None,
             bot: Some("main".into()),
             conversation_id: Some("dir:main".into()),
             updated_at: "2026-11-06T12:00:00Z".into(),
@@ -1857,6 +1903,49 @@ mod tests {
         );
         assert!(state.open());
         assert!(state.dock_shot().is_none());
+    }
+
+    #[test]
+    fn tab_operations_need_user_control_and_a_valid_tab() {
+        let mut state = PanelState::new();
+        let t0 = Instant::now();
+        state.apply(
+            done(
+                &state,
+                PanelKind::Status,
+                Ok(PanelReply::Sessions(vec![info(
+                    true,
+                    BrowserController::Bot,
+                )])),
+            ),
+            t0,
+        );
+        state.switch_tab("t2");
+        assert!(state.queue.is_empty(), "bot in control: ignored");
+        state.apply(
+            done(
+                &state,
+                PanelKind::Takeover,
+                Ok(PanelReply::Control(info(true, BrowserController::User))),
+            ),
+            t0,
+        );
+        state.switch_tab("../x");
+        state.close_tab("t");
+        assert!(state.queue.is_empty(), "invalid tab ids are never sent");
+        state.switch_tab("t2");
+        state.close_tab("t3");
+        match state.next_op(t0) {
+            Some(PanelOp::Tab(id, action)) => {
+                assert_eq!(id, "default");
+                assert_eq!(action, TabAction::Switch("t2".into()));
+            }
+            _ => panic!("expected a tab switch"),
+        }
+        assert!(matches!(
+            state.next_op(t0),
+            Some(PanelOp::Tab(_, TabAction::Close(tab))) if tab == "t3"
+        ));
     }
 
     #[test]

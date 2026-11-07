@@ -640,6 +640,7 @@ pub fn register_memory_tools(
 ) -> Result<()> {
     registry.register(MemorySaveTool::new(store.clone()))?;
     registry.register(MemoryListTool::new(store.clone()))?;
+    registry.register(crate::plans::PlanUpdateTool::new(store.clone()))?;
     registry.register(MemoryDeleteTool::new(store))?;
     Ok(())
 }
@@ -667,6 +668,7 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "memory_save",
         "memory_list",
         "memory_delete",
+        "plan_update",
         "vault_list",
         "pdf_inspect",
         "pdf_edit",
@@ -702,6 +704,8 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "browser_press",
         "browser_screenshot",
         "browser_close",
+        "browser_tabs",
+        "browser_new_tab",
         "google_drive_list",
         "google_sheets_read",
         "google_calendar_list_events",
@@ -716,6 +720,9 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "agentmail_send",
         "onedrive_upload",
         "onedrive_list",
+        "local_list",
+        "local_read",
+        "local_write",
     ];
     #[cfg(feature = "docx")]
     names.extend([

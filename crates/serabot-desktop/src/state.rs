@@ -62,6 +62,11 @@ pub struct State {
     pub library_loaded: bool,
     pub library_loading: bool,
     pub library_error: Option<String>,
+    /// Goal and todo list of the open conversation, conversation-scoped.
+    pub plan: Option<crate::chat_plan::ChatPlan>,
+    /// The owner's auto-approve switch for the open conversation. Defaults
+    /// to off and is only ever set from a server reply.
+    pub auto_approve: bool,
     /// Last transcript of a recorded note. Untrusted model output: it is a
     /// draft for the owner, never a sent message.
     pub transcript: Option<String>,
@@ -136,6 +141,8 @@ impl Default for State {
             library_loaded: false,
             library_loading: false,
             library_error: None,
+            plan: None,
+            auto_approve: false,
             transcript: None,
             transcript_error: None,
             transcript_loading: false,
@@ -409,6 +416,11 @@ impl State {
                 self.library_loading = false;
                 self.library_error = None;
             }
+            Reply::ChatPlan { plan, auto_approve } => {
+                self.plan = plan;
+                self.auto_approve = auto_approve;
+            }
+            Reply::AutoApprove(enabled) => self.auto_approve = enabled,
             Reply::Transcribed(transcription) => {
                 self.transcript = Some(transcription.text);
                 self.transcript_error = None;
@@ -416,6 +428,8 @@ impl State {
             // Bytes are intercepted by the session before they reach state;
             // this arm only keeps the match exhaustive.
             Reply::Artifact { .. } => {}
+            // The session keeps uploaded attachments on the composer draft.
+            Reply::Attached(_) => {}
             Reply::OAuthSignedIn { id, device_code } => {
                 self.oauth_result = Some((id, device_code));
             }
@@ -492,7 +506,7 @@ impl State {
             ));
         } else if kind == OperationKind::Apply && error == ApiError::Http(422) {
             self.error = Some(
-                "The server rejected that model selection. Refresh, reopen Model routing, and pick a listed provider and model."
+                "The server rejected that model selection. Refresh, reopen Model routing, and pick a listed provider and model. If the list is empty, ask the admin to allow more models."
                     .into(),
             );
         } else {
@@ -599,6 +613,7 @@ mod tests {
             created_at: "now".into(),
             name: Some("analyst".into()),
             bot: Some("analyst".into()),
+            attachments: Vec::new(),
         });
         state.task = Some(Task {
             id: "t".into(),
@@ -899,6 +914,42 @@ mod tests {
         assert!(state.providers.is_empty());
         assert!(!state.providers_loaded);
         assert!(state.connectors.is_empty());
+    }
+
+    #[test]
+    fn plan_and_auto_approve_never_cross_conversations() {
+        let mut state = State::default();
+        let scope = state.scope.clone();
+        assert!(!state.auto_approve, "auto-approve starts off");
+        let plan = crate::chat_plan::ChatPlan::from_value(&serde_json::json!({
+            "goal": "Prepare the summary",
+            "items": [{"text": "Collect figures", "status": "done"}]
+        }));
+        state.receive(
+            &scope,
+            Reply::ChatPlan {
+                plan,
+                auto_approve: true,
+            },
+        );
+        assert!(state.auto_approve);
+        assert_eq!(state.plan.as_ref().unwrap().progress(), "1 of 1 done");
+
+        // A late reply for another conversation never lands.
+        let other = Scope {
+            epoch: scope.epoch + 9,
+            conversation: "room:other".into(),
+        };
+        assert!(!state.receive(&other, Reply::AutoApprove(false)));
+        assert!(state.auto_approve);
+
+        // Switching conversation clears both: the switch is re-read from the
+        // server for the new chat and never carried over.
+        state.new_scope("room:other".into(), true);
+        assert!(state.plan.is_none());
+        assert!(!state.auto_approve);
+        state.disconnect();
+        assert!(state.plan.is_none() && !state.auto_approve);
     }
 
     #[test]

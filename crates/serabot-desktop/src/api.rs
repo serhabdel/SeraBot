@@ -299,6 +299,8 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
     "browser_press",
     "browser_screenshot",
     "browser_close",
+    "browser_tabs",
+    "browser_new_tab",
     "vault_list",
     "google_drive_list",
     "google_sheets_read",
@@ -312,6 +314,9 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
     "memory_save",
     "memory_list",
     "memory_delete",
+    "local_list",
+    "local_read",
+    "local_write",
 ];
 
 pub const DEFAULT_SPECIALIST_TOOLS: &[&str] = &["skill_list", "skill_search", "skill_load"];
@@ -1439,6 +1444,47 @@ pub struct Message {
     /// Bot that produced this assistant message, resolved by the server.
     #[serde(default)]
     pub bot: Option<String>,
+    /// Files the user attached to this (user) message.
+    #[serde(default)]
+    pub attachments: Vec<AttachmentInfo>,
+}
+
+/// One uploaded chat attachment as the server reports it. No server path.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct AttachmentInfo {
+    pub id: String,
+    pub filename: String,
+    #[serde(default)]
+    pub mime: String,
+    #[serde(default)]
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub is_image: bool,
+}
+
+/// Upload ceiling shown in the picker and enforced before the request.
+pub const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+/// Attachments per message.
+pub const MAX_ATTACHMENTS: usize = 6;
+/// Extensions the server accepts for chat attachments.
+pub const ATTACHMENT_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "pdf", "docx", "xlsx", "pptx", "txt", "md", "markdown",
+    "csv",
+];
+
+/// Client-side check mirroring the server allowlist, so a bad pick fails
+/// before any bytes are read or sent.
+pub fn valid_attachment_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 128
+        && !trimmed
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':' | '"' | '\''))
+        && std::path::Path::new(trimmed)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ATTACHMENT_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
 }
 
 impl Drop for Message {
@@ -1587,6 +1633,9 @@ pub struct LibraryEntry {
     pub filename: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
+    /// Media type derived by the server from the file name.
+    #[serde(default)]
+    pub mime: Option<String>,
     pub created_at: String,
 }
 
@@ -1827,9 +1876,166 @@ impl ApiClient {
         )?;
         Ok(response.selection)
     }
-    pub fn submit(&self, conversation: &str, text: &str) -> Result<Task, ApiError> {
+    /// Local folders: register the allowed roots (id, label, mode; no paths)
+    /// and wait up to `wait_secs` for one relayed request.
+    pub fn local_poll(
+        &self,
+        roots: &serde_json::Value,
+        wait_secs: u64,
+    ) -> Result<Option<crate::local_folders::LocalRequest>, ApiError> {
+        #[derive(Serialize)]
+        struct Poll<'a> {
+            roots: &'a serde_json::Value,
+            wait_secs: u64,
+        }
+        #[derive(Deserialize)]
+        struct Reply {
+            request: Option<crate::local_folders::LocalRequest>,
+        }
+        let reply: Reply = self.request(
+            Method::POST,
+            &["v1", "local", "poll"],
+            &[],
+            Some(&Poll {
+                roots,
+                wait_secs: wait_secs.min(15),
+            }),
+        )?;
+        if let Some(request) = &reply.request
+            && (!valid_id(&request.id) || request.op.len() > 16 || request.root.len() > 64)
+        {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(reply.request)
+    }
+
+    /// Answer a relayed local folder request.
+    pub fn local_result(&self, id: &str, outcome: Result<String, String>) -> Result<(), ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::InvalidResponse);
+        }
+        #[derive(Serialize)]
+        struct Answer {
+            ok: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            text: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            error: Option<String>,
+        }
+        let answer = match outcome {
+            Ok(text) => Answer {
+                ok: true,
+                text: Some(text),
+                error: None,
+            },
+            Err(error) => Answer {
+                ok: false,
+                text: None,
+                error: Some(error),
+            },
+        };
+        let _: serde_json::Value = self.request(
+            Method::POST,
+            &["v1", "local", "result", id],
+            &[],
+            Some(&answer),
+        )?;
+        Ok(())
+    }
+
+    /// Upload one chat attachment (raw body, `X-Filename`). Returns the
+    /// server's record; its id goes into `submit_with`.
+    pub fn upload_attachment(
+        &self,
+        conversation: &str,
+        filename: &str,
+        bytes: &[u8],
+    ) -> Result<AttachmentInfo, ApiError> {
         check_id(conversation)?;
-        if !valid_text(text) {
+        if !valid_attachment_name(filename) {
+            return Err(ApiError::Validation(
+                "Attach an image, PDF, DOCX, XLSX, PPTX, TXT, MD or CSV file.",
+            ));
+        }
+        if bytes.is_empty() {
+            return Err(ApiError::Validation("That file is empty."));
+        }
+        if bytes.len() > MAX_ATTACHMENT_BYTES {
+            return Err(ApiError::Validation("Files must be 25 MB or smaller."));
+        }
+        let mut url = self.endpoint.clone();
+        url.path_segments_mut()
+            .map_err(|_| ApiError::InvalidResponse)?
+            .clear()
+            .extend(["v1", "conversations", conversation, "attachments"]);
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(self.token.expose_secret())
+            .header("X-Filename", filename)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(bytes.to_vec())
+            .send()
+            .map_err(|_| ApiError::Transport)?;
+        let status = response.status();
+        let mut body = Zeroizing::new(Vec::new());
+        response
+            .take(MAX_RESPONSE + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| ApiError::Transport)?;
+        if body.len() as u64 > MAX_RESPONSE {
+            return Err(ApiError::TooLarge);
+        }
+        if !status.is_success() {
+            if matches!(status.as_u16(), 400 | 413 | 422)
+                && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body)
+                && let Some(message) = value.get("error").and_then(|value| value.as_str())
+                && !message.is_empty()
+                && message.len() <= 512
+                && !message.chars().any(char::is_control)
+            {
+                return Err(ApiError::Rejected(message.to_owned()));
+            }
+            return Err(ApiError::Http(status.as_u16()));
+        }
+        #[derive(Deserialize)]
+        struct Envelope {
+            attachment: AttachmentInfo,
+        }
+        let envelope: Envelope =
+            serde_json::from_slice(&body).map_err(|_| ApiError::InvalidResponse)?;
+        if !valid_id(&envelope.attachment.id) {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(envelope.attachment)
+    }
+
+    /// Download a file the user attached (own uploads only).
+    pub fn attachment_bytes(&self, id: &str) -> Result<(String, Vec<u8>), ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Invalid attachment id."));
+        }
+        self.fetch_file(&["v1", "attachments", id], id)
+    }
+
+    pub fn submit(&self, conversation: &str, text: &str) -> Result<Task, ApiError> {
+        self.submit_with(conversation, text, &[])
+    }
+
+    /// Send a message with uploaded attachments. The text may be empty when
+    /// at least one attachment is present.
+    pub fn submit_with(
+        &self,
+        conversation: &str,
+        text: &str,
+        attachments: &[String],
+    ) -> Result<Task, ApiError> {
+        check_id(conversation)?;
+        if attachments.len() > MAX_ATTACHMENTS || !attachments.iter().all(|id| valid_id(id)) {
+            return Err(ApiError::Validation("Attach at most 6 files."));
+        }
+        let text_ok = valid_text(text) || (!attachments.is_empty() && text.trim().is_empty());
+        if !text_ok {
             return Err(ApiError::Validation(
                 "Enter 1–8,000 characters of message text.",
             ));
@@ -1838,6 +2044,8 @@ impl ApiClient {
         struct Submit<'a> {
             conversation_id: &'a str,
             text: &'a str,
+            #[serde(skip_serializing_if = "<[String]>::is_empty")]
+            attachments: &'a [String],
         }
         let response: TaskEnvelope = self.request(
             Method::POST,
@@ -1846,6 +2054,7 @@ impl ApiClient {
             Some(&Submit {
                 conversation_id: conversation,
                 text,
+                attachments,
             }),
         )?;
         check_task(response.task)
@@ -2583,6 +2792,63 @@ impl ApiClient {
         Ok(response.artifacts)
     }
 
+    /// The goal and todo list of one conversation, plus its auto-approve
+    /// switch. An older server without these routes yields no plan and off.
+    pub fn chat_state(
+        &self,
+        conversation: &str,
+    ) -> Result<(Option<crate::chat_plan::ChatPlan>, bool), ApiError> {
+        check_id(conversation)?;
+        let plan: Result<serde_json::Value, ApiError> =
+            self.get(&["v1", "conversations", conversation, "plan"], &[]);
+        let plan = match plan {
+            Ok(body) => body
+                .get("plan")
+                .and_then(crate::chat_plan::ChatPlan::from_value),
+            Err(ApiError::Http(404)) => None,
+            Err(error) => return Err(error),
+        };
+        let auto = match self.auto_approve(conversation) {
+            Ok(enabled) => enabled,
+            Err(ApiError::Http(404)) => false,
+            Err(error) => return Err(error),
+        };
+        Ok((plan, auto))
+    }
+
+    /// `GET /v1/conversations/{id}/auto-approve`.
+    pub fn auto_approve(&self, conversation: &str) -> Result<bool, ApiError> {
+        check_id(conversation)?;
+        #[derive(Deserialize)]
+        struct Envelope {
+            enabled: bool,
+        }
+        let response: Envelope =
+            self.get(&["v1", "conversations", conversation, "auto-approve"], &[])?;
+        Ok(response.enabled)
+    }
+
+    /// `PUT /v1/conversations/{id}/auto-approve`: the owner's per-conversation
+    /// switch. Returns the value the server stored.
+    pub fn set_auto_approve(&self, conversation: &str, enabled: bool) -> Result<bool, ApiError> {
+        check_id(conversation)?;
+        #[derive(Serialize)]
+        struct Body {
+            enabled: bool,
+        }
+        #[derive(Deserialize)]
+        struct Envelope {
+            enabled: bool,
+        }
+        let response: Envelope = self.request(
+            Method::PUT,
+            &["v1", "conversations", conversation, "auto-approve"],
+            &[],
+            Some(&Body { enabled }),
+        )?;
+        Ok(response.enabled)
+    }
+
     /// Transcribe one recorded audio note. The body is the raw recording; the
     /// transcript is model output and stays untrusted until the owner sends it.
     pub fn transcribe_audio(
@@ -2650,11 +2916,17 @@ impl ApiClient {
         if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(ApiError::Validation("Invalid artifact hash."));
         }
+        self.fetch_file(&["v1", "artifacts", hash], hash)
+    }
+
+    /// Authenticated GET of a file route (artifact or own attachment). Server
+    /// cap 100 MiB; the filename comes from `content-disposition`.
+    fn fetch_file(&self, route: &[&str], fallback: &str) -> Result<(String, Vec<u8>), ApiError> {
         let mut url = self.endpoint.clone();
         url.path_segments_mut()
             .map_err(|_| ApiError::InvalidResponse)?
             .clear()
-            .extend(["v1", "artifacts", hash]);
+            .extend(route);
         let response = self
             .client
             .get(url)
@@ -2683,7 +2955,7 @@ impl ApiClient {
         if !status.is_success() {
             return Err(ApiError::Http(status.as_u16()));
         }
-        let filename = filename.unwrap_or_else(|| format!("{hash}.pdf"));
+        let filename = filename.unwrap_or_else(|| format!("{fallback}.pdf"));
         Ok((filename, bytes.to_vec()))
     }
 

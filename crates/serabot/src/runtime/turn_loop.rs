@@ -107,7 +107,22 @@ impl Runtime {
         };
         state.messages.push(LlmMessage::system(system));
         state.messages.extend(history);
-        state.messages.push(LlmMessage::user(payload.text.clone()));
+        let mut model_text = payload.text.clone();
+        if !payload.attachments.is_empty() {
+            let attachments = self.store.pending_chat_attachments(
+                &user,
+                &payload.conversation_id,
+                &payload.attachments,
+            )?;
+            self.store
+                .attach_chat_attachments_to_turn(&user, &turn.id, &payload.attachments)?;
+            let block = crate::attachments::render_for_model(&self.config, &user, &attachments);
+            // The block carries file content: the same blocklist as every model request.
+            if !block.is_empty() && self.scan_owner_output(&user, &block).is_ok() {
+                model_text.push_str(&block);
+            }
+        }
+        state.messages.push(LlmMessage::user(model_text));
         self.store
             .update_turn(&user, &turn.id, "active", &serde_json::to_value(&state)?)?;
         self.advance(task, &turn, state, &payload.conversation_id)
@@ -385,7 +400,7 @@ impl Runtime {
         let user = task.user_id.clone();
         let context = self.tool_context(task, turn, &bot, &state)?;
         let mut tool_names = bot.config.tools.clone();
-        for extra in [TEAM_ASK_TOOL, TEAM_REPLY_TOOL] {
+        for extra in [TEAM_ASK_TOOL, TEAM_REPLY_TOOL, crate::plans::PLAN_TOOL] {
             if context.allowed_tools.contains(extra) && !tool_names.iter().any(|name| name == extra)
             {
                 tool_names.push(extra.to_string());

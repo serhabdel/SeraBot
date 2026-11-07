@@ -49,6 +49,8 @@ pub enum OperationKind {
     Team,
     TeamWrite,
     Library,
+    ChatPlan,
+    ChatAutoApprove,
     FetchArtifact,
     Transcribe,
     AdminWrite,
@@ -65,6 +67,8 @@ pub enum OperationKind {
     OnboardingRead,
     OnboardingWrite,
     ToolsWrite,
+    /// Upload of one chat attachment from the composer.
+    Attach,
 }
 
 impl OperationKind {
@@ -83,6 +87,16 @@ pub enum Operation {
     History,
     Apply(Selection),
     Submit(Zeroizing<String>),
+    /// A message with uploaded attachment ids (text may be empty).
+    SubmitWith {
+        text: Zeroizing<String>,
+        attachments: Vec<String>,
+    },
+    /// Upload one file to the open conversation's attachment area.
+    UploadAttachment {
+        filename: String,
+        bytes: Vec<u8>,
+    },
     Task(String),
     Approvals,
     Decide {
@@ -142,6 +156,11 @@ pub enum Operation {
         rules: String,
     },
     Library,
+    /// Goal, todo list and auto-approve switch of the open conversation.
+    ChatPlan,
+    SetAutoApprove {
+        enabled: bool,
+    },
     FetchArtifact {
         hash: String,
     },
@@ -250,7 +269,8 @@ impl Operation {
             Self::Catalog => OperationKind::Catalog,
             Self::History => OperationKind::History,
             Self::Apply(_) => OperationKind::Apply,
-            Self::Submit(_) => OperationKind::Submit,
+            Self::Submit(_) | Self::SubmitWith { .. } => OperationKind::Submit,
+            Self::UploadAttachment { .. } => OperationKind::Attach,
             Self::Task(_) => OperationKind::Task,
             Self::Approvals => OperationKind::Approvals,
             Self::Decide { .. } => OperationKind::Decide,
@@ -272,6 +292,8 @@ impl Operation {
             Self::GetTeam => OperationKind::Team,
             Self::SetTeam { .. } => OperationKind::TeamWrite,
             Self::Library => OperationKind::Library,
+            Self::ChatPlan => OperationKind::ChatPlan,
+            Self::SetAutoApprove { .. } => OperationKind::ChatAutoApprove,
             Self::FetchArtifact { .. } => OperationKind::FetchArtifact,
             Self::TranscribeAudio { .. } => OperationKind::Transcribe,
             Self::AdminSaveProvider(_)
@@ -329,12 +351,19 @@ pub enum Reply {
     Connectors(Vec<ConnectorStatus>),
     Team(Team),
     Library(Vec<LibraryEntry>),
+    ChatPlan {
+        plan: Option<crate::chat_plan::ChatPlan>,
+        auto_approve: bool,
+    },
+    AutoApprove(bool),
     Artifact {
         hash: String,
         filename: String,
         bytes: Vec<u8>,
     },
     Transcribed(Transcription),
+    /// One uploaded chat attachment; the session keeps it on the draft.
+    Attached(crate::api::AttachmentInfo),
     /// Voice/OCR readiness from `GET /v1/settings/voice`.
     Voice(VoiceSettings),
     AdminSaved,
@@ -559,6 +588,12 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::History => client.history(conversation).map(Reply::History),
         Operation::Apply(selection) => client.select(conversation, selection).map(Reply::Selection),
         Operation::Submit(text) => client.submit(conversation, text).map(Reply::Task),
+        Operation::SubmitWith { text, attachments } => client
+            .submit_with(conversation, text, attachments)
+            .map(Reply::Task),
+        Operation::UploadAttachment { filename, bytes } => client
+            .upload_attachment(conversation, filename, bytes)
+            .map(Reply::Attached),
         Operation::Task(id) => client.task(id).map(Reply::Task),
         Operation::Approvals => client.approvals().map(Reply::Approvals),
         Operation::Decide { id, decision } => client
@@ -635,6 +670,12 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
             .set_team(conversation, members, *mode, rules)
             .map(Reply::Team),
         Operation::Library => client.library(conversation).map(Reply::Library),
+        Operation::ChatPlan => client
+            .chat_state(conversation)
+            .map(|(plan, auto_approve)| Reply::ChatPlan { plan, auto_approve }),
+        Operation::SetAutoApprove { enabled } => client
+            .set_auto_approve(conversation, *enabled)
+            .map(Reply::AutoApprove),
         Operation::FetchArtifact { hash } => {
             client
                 .artifact(hash)

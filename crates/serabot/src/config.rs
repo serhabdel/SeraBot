@@ -1687,6 +1687,8 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "browser_press",
     "browser_screenshot",
     "browser_close",
+    "browser_tabs",
+    "browser_new_tab",
     "google_drive_list",
     "google_sheets_read",
     "google_calendar_list_events",
@@ -1696,6 +1698,9 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "notion_query_database",
     "agentmail_inboxes_list",
     "agentmail_send",
+    "local_list",
+    "local_read",
+    "local_write",
 ];
 
 const DEFAULT_SPECIALIST_TOOLS: &[&str] = &["skill_list", "skill_search", "skill_load"];

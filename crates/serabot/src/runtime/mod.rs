@@ -87,6 +87,9 @@ pub struct TurnPayload {
     /// and never routed to bots that are not room team members.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mentions: Vec<String>,
+    /// Chat attachment ids (already validated as the owner's) for this turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,7 +370,7 @@ fn render_tool_list(tools: &[ToolSpec]) -> String {
         .collect();
     if !browser.is_empty() {
         lines.push(format!(
-            "- You can control a real web browser on the server: {}. Open pages with browser_navigate, read them with browser_snapshot, act with browser_click, browser_type and browser_press; vault_list names the owner's stored logins, which browser_type can fill without ever showing you the secret.",
+            "- You can control a real web browser on the server: {}. Open pages with browser_navigate, read them with browser_snapshot, act with browser_click, browser_type and browser_press; vault_list names the owner's stored logins, which browser_type can fill without ever showing you the secret. Element refs such as e12 are internal handles for your tool calls: never write them in a reply to the user; name an element by its visible text (for example the Sign in button) instead.",
             browser.join(", ")
         ));
     }

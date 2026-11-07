@@ -169,18 +169,20 @@ pub enum SettingsSection {
     Chat,
     Telegram,
     Voice,
+    LocalFolders,
     Admin,
     About,
 }
 
 impl SettingsSection {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Account,
         Self::Appearance,
         Self::Notifications,
         Self::Chat,
         Self::Telegram,
         Self::Voice,
+        Self::LocalFolders,
         Self::Admin,
         Self::About,
     ];
@@ -193,6 +195,7 @@ impl SettingsSection {
             Self::Chat => "Chat",
             Self::Telegram => "Telegram",
             Self::Voice => "Voice",
+            Self::LocalFolders => "Local folders",
             Self::Admin => "Admin",
             Self::About => "About",
         }
@@ -490,11 +493,16 @@ impl Drop for TelegramUi {
     }
 }
 
+/// Files chosen in the attachment dialog: bytes, or why one was skipped.
+type PickedFiles = Vec<Result<(String, Vec<u8>), String>>;
+
 /// What to do with a saved artifact once the download completes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingOpen {
     Open,
     Reveal,
+    /// Ask where to save with the native Save As dialog.
+    SaveAs,
 }
 
 pub struct Session {
@@ -560,6 +568,19 @@ pub struct Session {
     download_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// What to do with the saved file once the download completes.
     pending_open: Option<PendingOpen>,
+    /// Folders on this PC the bots may use (default empty = off). Device-local.
+    pub local_folders: Vec<crate::local_folders::LocalFolder>,
+    local_agent: Option<(crate::local_folders::LocalAgent, usize)>,
+    /// Message under the Local folders card.
+    pub local_notice: Option<String>,
+    folder_pick_rx: Option<std::sync::mpsc::Receiver<Option<(std::path::PathBuf, bool)>>>,
+    /// Files already uploaded and attached to the composer draft.
+    pub composer_files: Vec<crate::AttachmentInfo>,
+    /// Picked files waiting for upload, one request at a time.
+    upload_queue: std::collections::VecDeque<(String, Vec<u8>)>,
+    /// An upload request is in flight.
+    pub uploading: bool,
+    pick_rx: Option<std::sync::mpsc::Receiver<PickedFiles>>,
     /// Toast text from browser/Explorer launches, which run on a helper thread.
     launch_tx: std::sync::mpsc::Sender<String>,
     launch_rx: std::sync::mpsc::Receiver<String>,
@@ -688,6 +709,16 @@ impl Session {
             downloading: false,
             download_rx: None,
             pending_open: None,
+            local_folders: creds::settings_dir()
+                .map(|dir| crate::local_folders::load(&dir))
+                .unwrap_or_default(),
+            local_agent: None,
+            local_notice: None,
+            folder_pick_rx: None,
+            composer_files: Vec::new(),
+            upload_queue: std::collections::VecDeque::new(),
+            uploading: false,
+            pick_rx: None,
             launch_tx,
             launch_rx,
             session_expires: None,
@@ -852,6 +883,10 @@ impl Session {
             worker.set_epoch(self.state.scope.epoch);
         }
         self.composer.zeroize();
+        // Attachments belong to the conversation they were uploaded to.
+        self.composer_files.clear();
+        self.upload_queue.clear();
+        self.uploading = false;
         self.pending = None;
         self.bot_detail_pending = None;
         self.bot_config_pending = None;
@@ -1540,6 +1575,7 @@ impl Session {
                         Err(error) => format!("Saved to {path}, but could not open it: {error}"),
                     });
                 }
+                Some(PendingOpen::SaveAs) => self.toast = Some(format!("Saved to {path}")),
                 Some(PendingOpen::Reveal) => {
                     self.toast = Some(format!("Saved to {path}"));
                     self.launch(move || match reveal_in_explorer(&path) {
@@ -1862,12 +1898,20 @@ impl Session {
     }
 
     pub fn submit(&mut self) {
-        if !self.state.can_send() || !valid_text(&self.composer) || !self.ready() {
+        let has_files = !self.composer_files.is_empty();
+        let text_ok = valid_text(&self.composer) || (has_files && self.composer.trim().is_empty());
+        if !self.state.can_send()
+            || !text_ok
+            || !self.ready()
+            || self.uploading
+            || !self.upload_queue.is_empty()
+        {
             return;
         }
         self.state.error = None;
         self.state.activity.clear();
         let text = std::mem::take(&mut self.composer);
+        let files = std::mem::take(&mut self.composer_files);
         self.state.messages.push(Message {
             id: format!("opt-{}", Instant::now().elapsed().as_nanos()),
             role: Role::User,
@@ -1875,8 +1919,185 @@ impl Session {
             created_at: "Just now".into(),
             name: None,
             bot: None,
+            attachments: files.clone(),
         });
-        self.start_request(Operation::Submit(zeroize::Zeroizing::new(text)));
+        if files.is_empty() {
+            self.start_request(Operation::Submit(zeroize::Zeroizing::new(text)));
+        } else {
+            self.start_request(Operation::SubmitWith {
+                text: zeroize::Zeroizing::new(text),
+                attachments: files.into_iter().map(|file| file.id).collect(),
+            });
+        }
+    }
+
+    /// The paperclip: pick files in a native dialog (off the UI thread),
+    /// check name and size, and queue them for upload.
+    pub fn pick_attachments(&mut self) {
+        if self.pick_rx.is_some() {
+            return;
+        }
+        let room = crate::MAX_ATTACHMENTS
+            .saturating_sub(self.composer_files.len() + self.upload_queue.len());
+        if room == 0 {
+            self.toast = Some(format!("Attach at most {} files.", crate::MAX_ATTACHMENTS));
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.pick_rx = Some(receiver);
+        if std::thread::Builder::new()
+            .name("serabot-attach".into())
+            .spawn(move || {
+                let _ = sender.send(pick_files(room));
+            })
+            .is_err()
+        {
+            self.pick_rx = None;
+            self.toast = Some("Could not open the file picker.".into());
+        }
+    }
+
+    /// Settings > Local folders > "Add folder": native folder picker off the
+    /// UI thread; the folder is added read-only (the user can widen it later).
+    pub fn pick_local_folder(&mut self) {
+        if self.folder_pick_rx.is_some() {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.folder_pick_rx = Some(receiver);
+        if std::thread::Builder::new()
+            .name("serabot-folder-pick".into())
+            .spawn(move || {
+                let _ = sender.send(pick_folder().map(|path| (path, false)));
+            })
+            .is_err()
+        {
+            self.folder_pick_rx = None;
+            self.local_notice = Some("Could not open the folder picker.".into());
+        }
+    }
+
+    fn poll_folder_pick(&mut self) {
+        let Some(receiver) = &self.folder_pick_rx else {
+            return;
+        };
+        let Ok(picked) = receiver.try_recv() else {
+            return;
+        };
+        self.folder_pick_rx = None;
+        let Some((path, _)) = picked else {
+            return;
+        };
+        let app_dir = creds::settings_dir();
+        match crate::local_folders::add_folder(
+            &mut self.local_folders,
+            &path,
+            crate::local_folders::FolderMode::Read,
+            app_dir.as_deref(),
+        ) {
+            Ok(id) => {
+                self.local_notice = Some(format!(
+                    "Added. The bot can read this folder as \"{id}\". Switch it to read and write only if you want it to save files here."
+                ));
+                self.persist_local_folders();
+            }
+            Err(message) => self.local_notice = Some(message),
+        }
+    }
+
+    pub fn remove_local_folder(&mut self, id: &str) {
+        self.local_folders.retain(|folder| folder.id != id);
+        self.persist_local_folders();
+        self.local_notice = Some("Removed. The bot can no longer see that folder.".into());
+    }
+
+    pub fn set_local_folder_mode(&mut self, id: &str, mode: crate::local_folders::FolderMode) {
+        if let Some(folder) = self.local_folders.iter_mut().find(|folder| folder.id == id) {
+            folder.mode = mode;
+        }
+        self.persist_local_folders();
+    }
+
+    fn persist_local_folders(&mut self) {
+        if let Some(dir) = creds::settings_dir()
+            && let Err(error) = crate::local_folders::save(&dir, &self.local_folders)
+        {
+            self.local_notice = Some(format!("Could not save the folder list: {error}"));
+        }
+        // Takes effect for requests already in flight too.
+        if let Some((agent, _)) = &self.local_agent {
+            agent.update(self.local_folders.clone());
+        }
+    }
+
+    /// Keep the relay agent running only while signed in with folders allowed.
+    fn sync_local_agent(&mut self) {
+        let wanted = self.state.connected && !self.local_folders.is_empty();
+        let credentials = match (&self.credentials, wanted) {
+            (Some(credentials), true) => Arc::clone(credentials),
+            _ => {
+                self.local_agent = None;
+                return;
+            }
+        };
+        let key = Arc::as_ptr(&credentials) as usize;
+        if self.local_agent.as_ref().is_some_and(|(_, k)| *k == key) {
+            return;
+        }
+        self.local_agent = None;
+        if let Ok(client) = ApiClient::new(credentials.endpoint.clone(), credentials.token.clone())
+            && let Some(agent) =
+                crate::local_folders::LocalAgent::start(client, self.local_folders.clone())
+        {
+            self.local_agent = Some((agent, key));
+        }
+    }
+
+    /// True while the relay agent is running for this session.
+    pub fn local_agent_running(&self) -> bool {
+        self.local_agent.is_some()
+    }
+
+    /// Picked files still waiting to be uploaded.
+    pub fn upload_pending(&self) -> usize {
+        self.upload_queue.len()
+    }
+
+    /// Drop one attachment from the draft (the uploaded copy stays unattached
+    /// on the server and is never sent to the bot).
+    pub fn remove_attachment(&mut self, id: &str) {
+        self.composer_files.retain(|file| file.id != id);
+    }
+
+    /// Drain the file picker and feed the upload queue one request at a time.
+    fn poll_attachments(&mut self) {
+        if let Some(receiver) = &self.pick_rx
+            && let Ok(picked) = receiver.try_recv()
+        {
+            self.pick_rx = None;
+            for item in picked {
+                match item {
+                    Ok(file) => self.upload_queue.push_back(file),
+                    Err(message) => self.toast = Some(message),
+                }
+            }
+        }
+        if !self.uploading
+            && self.ready()
+            && self.pending.is_none()
+            && let Some((filename, bytes)) = self.upload_queue.pop_front()
+        {
+            self.uploading = true;
+            self.start_request(Operation::UploadAttachment { filename, bytes });
+            if self.pending.is_none() {
+                self.uploading = false;
+            }
+        }
+    }
+
+    /// Download an artifact and ask where to save it (native Save As dialog).
+    pub fn save_artifact_as(&mut self, hash: String) {
+        self.start_download(hash, Some(PendingOpen::SaveAs));
     }
 
     pub fn apply_model(&mut self, selection: Selection) {
@@ -1958,6 +2179,9 @@ impl Session {
         self.poll_sign_in();
         self.poll_telegram();
         self.poll_download();
+        self.poll_attachments();
+        self.poll_folder_pick();
+        self.sync_local_agent();
         self.poll_launches();
         self.hydrate_bot_settings();
         self.pump_panel();
@@ -2058,6 +2282,15 @@ impl Session {
                         // Step events only feed the live view; the transcript
                         // is not re-read for each one.
                         if self.state.activity.apply(&kind, &payload) {
+                            continue;
+                        }
+                        // Plan updates feed the plan panel only.
+                        if crate::chat_plan::ChatPlan::apply_event(
+                            &mut self.state.plan,
+                            &self.conversation,
+                            &kind,
+                            &payload,
+                        ) {
                             continue;
                         }
                         self.last_event_kind = kind;
@@ -2296,6 +2529,25 @@ impl Session {
                             self.state.library_error = Some(message.clone());
                             self.state.library_loading = false;
                             self.state.error = None;
+                            self.schedule(Operation::ChatPlan, Duration::ZERO);
+                        }
+                        OperationKind::ChatPlan => {
+                            // The plan panel is optional; a failed read leaves
+                            // it hidden instead of raising a banner.
+                            self.state.error = None;
+                        }
+                        OperationKind::ChatAutoApprove => {
+                            // The switch shows the server's value, never a guess:
+                            // read it back and tell the owner.
+                            self.toast = Some(format!("Auto-approve was not changed: {message}"));
+                            self.state.error = None;
+                            self.schedule(Operation::ChatPlan, Duration::ZERO);
+                        }
+                        OperationKind::Attach => {
+                            // A rejected file never blocks the composer.
+                            self.uploading = false;
+                            self.toast = Some(format!("Attachment failed: {message}"));
+                            self.state.error = None;
                         }
                         OperationKind::FetchArtifact => {
                             self.toast = Some(format!("Download failed: {message}"));
@@ -2324,10 +2576,15 @@ impl Session {
                         self.downloading = true;
                         let (sender, receiver) = std::sync::mpsc::channel();
                         self.download_rx = Some(receiver);
+                        let save_as = self.pending_open == Some(PendingOpen::SaveAs);
                         if std::thread::Builder::new()
                             .name("serabot-download".into())
                             .spawn(move || {
-                                let result = save_download(&filename, &bytes);
+                                let result = if save_as {
+                                    save_download_as(&filename, &bytes)
+                                } else {
+                                    save_download(&filename, &bytes)
+                                };
                                 let _ = sender.send(result);
                             })
                             .is_err()
@@ -2339,6 +2596,13 @@ impl Session {
                         continue;
                     }
                     // Capture the ack before the state consumes the reply.
+                    if let Reply::Attached(file) = reply {
+                        self.uploading = false;
+                        if self.composer_files.len() < crate::MAX_ATTACHMENTS {
+                            self.composer_files.push(file);
+                        }
+                        continue;
+                    }
                     let bot_config_saved = match &reply {
                         Reply::BotConfigSaved { restart_required } => Some(*restart_required),
                         _ => None,
@@ -2587,6 +2851,10 @@ impl Session {
                             // conversation loads right behind it.
                             self.state.library_loading = true;
                             self.schedule(Operation::Library, Duration::ZERO);
+                        }
+                        // The plan and auto-approve switch load after the library.
+                        OperationKind::Library => {
+                            self.schedule(Operation::ChatPlan, Duration::ZERO);
                         }
                         OperationKind::OAuthSignIn => {
                             self.admin_error = None;
@@ -3418,6 +3686,17 @@ impl Session {
         self.start_request(Operation::ArchiveConversation { id });
     }
 
+    /// Flip the open conversation's auto-approve switch. Turning it off is
+    /// applied locally at once and then confirmed by the server; turning it on
+    /// waits for the server's answer so the switch never shows a state the
+    /// server did not accept.
+    pub fn set_auto_approve(&mut self, enabled: bool) {
+        if !enabled {
+            self.state.auto_approve = false;
+        }
+        self.start_request(Operation::SetAutoApprove { enabled });
+    }
+
     pub fn unarchive_conversation(&mut self, id: String) {
         self.start_request(Operation::UnarchiveConversation { id });
     }
@@ -3686,6 +3965,85 @@ fn save_download(filename: &str, bytes: &[u8]) -> Result<String, String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// Windows file dialog for the paperclip. Names and sizes are checked before
+/// any bytes are read; a bad pick becomes a message, not an upload.
+#[cfg(windows)]
+fn pick_files(room: usize) -> PickedFiles {
+    let Some(paths) = rfd::FileDialog::new()
+        .set_title("Attach files")
+        .add_filter("Supported files", crate::ATTACHMENT_EXTENSIONS)
+        .pick_files()
+    else {
+        return Vec::new();
+    };
+    paths
+        .into_iter()
+        .take(room)
+        .map(|path| {
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            if !crate::valid_attachment_name(&name) {
+                return Err(format!("{name}: this file type cannot be attached."));
+            }
+            let size = std::fs::metadata(&path)
+                .map_err(|_| format!("{name}: could not read the file."))?
+                .len();
+            if size == 0 || size > crate::MAX_ATTACHMENT_BYTES as u64 {
+                return Err(format!("{name}: files must be between 1 byte and 25 MB."));
+            }
+            let bytes =
+                std::fs::read(&path).map_err(|_| format!("{name}: could not read the file."))?;
+            Ok((name, bytes))
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn pick_folder() -> Option<std::path::PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Choose a folder the bot may use")
+        .pick_folder()
+}
+
+#[cfg(not(windows))]
+fn pick_folder() -> Option<std::path::PathBuf> {
+    None
+}
+
+#[cfg(not(windows))]
+fn pick_files(_room: usize) -> PickedFiles {
+    vec![Err("Attachments need the Windows app.".into())]
+}
+
+/// Native Save As for a downloaded artifact. Cancelling is not an error.
+#[cfg(windows)]
+fn save_download_as(filename: &str, bytes: &[u8]) -> Result<String, String> {
+    let suggested: String = filename
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            other => other,
+        })
+        .collect();
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("Save as")
+        .set_file_name(suggested.trim())
+        .save_file()
+    else {
+        return Err("Save cancelled.".into());
+    };
+    std::fs::write(&path, bytes).map_err(|err| err.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[cfg(not(windows))]
+fn save_download_as(filename: &str, bytes: &[u8]) -> Result<String, String> {
+    save_download(filename, bytes)
+}
+
 /// Never overwrite a file the owner already has. `report.docx` becomes
 /// `report (2).docx`, then `report (3).docx`.
 fn unique_download_path(dir: &std::path::Path, filename: &str) -> std::path::PathBuf {
@@ -3853,8 +4211,8 @@ mod tests {
                 .filter(|section| section.visible(admin))
                 .count()
         };
-        assert_eq!(count(true), 8);
-        assert_eq!(count(false), 7);
+        assert_eq!(count(true), 9);
+        assert_eq!(count(false), 8);
         assert!(!SettingsSection::Admin.visible(false));
     }
 

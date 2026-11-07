@@ -26,6 +26,7 @@ zeroize = "1"
 
 [target.'cfg(windows)'.dependencies]
 dioxus = { version = "0.7", features = ["desktop"] }
+rfd = { version = "0.17", default-features = false }
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
 tokio = { version = "1", features = ["time"] }
 

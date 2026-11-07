@@ -7,11 +7,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use zeroize::Zeroizing;
 
-use super::manager::{BrowserBackend, BrowserLauncher, BrowserManager, PageInfo, SecretResolver};
+use super::manager::{
+    BrowserBackend, BrowserLauncher, BrowserManager, PageInfo, Pointer, SecretResolver, TabInfo,
+};
 use super::outline::{Outline, RefTarget};
 use crate::error::{Result, SeraError};
 
 pub(crate) const FAKE_SECRET: &str = "s3cr3t-value-123";
+
+/// Tabs as `(label, url)`, the active label, and the next tab number.
+type TabState = (Vec<(String, String)>, String, u32);
 
 pub(crate) struct FakeBackend {
     pub user: String,
@@ -19,7 +24,43 @@ pub(crate) struct FakeBackend {
     pub calls: std::sync::Mutex<Vec<String>>,
     pub alive: AtomicBool,
     pub shutdown_count: Arc<AtomicUsize>,
-    url: std::sync::Mutex<String>,
+    /// `(label, url)` per tab and the active label.
+    tab_state: std::sync::Mutex<TabState>,
+    pointer: std::sync::Mutex<Option<Pointer>>,
+}
+
+impl FakeBackend {
+    fn url(&self) -> String {
+        let state = self.tab_state.lock().unwrap();
+        state
+            .0
+            .iter()
+            .find(|(label, _)| *label == state.1)
+            .map(|(_, url)| url.clone())
+            .unwrap_or_default()
+    }
+
+    fn set_url(&self, url: &str) {
+        let mut state = self.tab_state.lock().unwrap();
+        let active = state.1.clone();
+        if let Some(entry) = state.0.iter_mut().find(|(label, _)| *label == active) {
+            entry.1 = url.to_owned();
+        }
+    }
+
+    fn tab_list(&self) -> Vec<TabInfo> {
+        let state = self.tab_state.lock().unwrap();
+        state
+            .0
+            .iter()
+            .map(|(label, url)| TabInfo {
+                id: label.clone(),
+                url: url.clone(),
+                title: format!("title of {}", self.user),
+                active: *label == state.1,
+            })
+            .collect()
+    }
 }
 
 impl FakeBackend {
@@ -32,7 +73,7 @@ impl FakeBackend {
 impl BrowserBackend for FakeBackend {
     async fn navigate(&self, url: &str) -> Result<PageInfo> {
         self.record(format!("navigate {url}"));
-        *self.url.lock().unwrap() = url.to_owned();
+        self.set_url(url);
         Ok(PageInfo {
             url: url.to_owned(),
             title: format!("title of {}", self.user),
@@ -65,6 +106,16 @@ impl BrowserBackend for FakeBackend {
     }
     async fn click_at(&self, x: f64, y: f64) -> Result<()> {
         self.record(format!("click_at {x} {y}"));
+        let mut slot = self.pointer.lock().unwrap();
+        let seq = slot.map_or(0, |p| p.seq) + 1;
+        *slot = Some(Pointer {
+            x,
+            y,
+            action: "click",
+            seq,
+            vw: 1280,
+            vh: 800,
+        });
         Ok(())
     }
     async fn insert_text(&self, text: &str) -> Result<()> {
@@ -87,7 +138,7 @@ impl BrowserBackend for FakeBackend {
     }
     async fn info(&self) -> Result<PageInfo> {
         Ok(PageInfo {
-            url: self.url.lock().unwrap().clone(),
+            url: self.url(),
             title: format!("title of {}", self.user),
         })
     }
@@ -97,6 +148,50 @@ impl BrowserBackend for FakeBackend {
     async fn shutdown(&self) {
         self.shutdown_count.fetch_add(1, Ordering::SeqCst);
         self.alive.store(false, Ordering::SeqCst);
+    }
+    async fn tabs(&self) -> Result<Vec<TabInfo>> {
+        Ok(self.tab_list())
+    }
+    async fn open_tab(&self, url: &str) -> Result<Vec<TabInfo>> {
+        self.record(format!("open_tab {url}"));
+        {
+            let mut state = self.tab_state.lock().unwrap();
+            if state.0.len() >= 8 {
+                return Err(SeraError::Validation("at most 8 tabs".into()));
+            }
+            state.2 += 1;
+            let label = format!("t{}", state.2);
+            state.0.push((label.clone(), url.to_owned()));
+            state.1 = label;
+        }
+        Ok(self.tab_list())
+    }
+    async fn switch_tab(&self, tab: &str) -> Result<()> {
+        self.record(format!("switch_tab {tab}"));
+        let mut state = self.tab_state.lock().unwrap();
+        if !state.0.iter().any(|(label, _)| label == tab) {
+            return Err(SeraError::Validation(format!("no tab {tab}")));
+        }
+        state.1 = tab.to_owned();
+        Ok(())
+    }
+    async fn close_tab(&self, tab: &str) -> Result<()> {
+        self.record(format!("close_tab {tab}"));
+        let mut state = self.tab_state.lock().unwrap();
+        if state.0.len() <= 1 {
+            return Err(SeraError::Validation("that is the last tab".into()));
+        }
+        if !state.0.iter().any(|(label, _)| label == tab) {
+            return Err(SeraError::Validation(format!("no tab {tab}")));
+        }
+        state.0.retain(|(label, _)| label != tab);
+        if state.1 == tab {
+            state.1 = state.0[0].0.clone();
+        }
+        Ok(())
+    }
+    fn pointer(&self) -> Option<Pointer> {
+        *self.pointer.lock().unwrap()
     }
 }
 
@@ -158,7 +253,12 @@ impl BrowserLauncher for FakeLauncher {
             calls: Default::default(),
             alive: AtomicBool::new(true),
             shutdown_count: self.shutdowns.clone(),
-            url: std::sync::Mutex::new("about:blank".into()),
+            tab_state: std::sync::Mutex::new((
+                vec![("t1".into(), "about:blank".into())],
+                "t1".into(),
+                1,
+            )),
+            pointer: Default::default(),
         });
         self.backends.lock().unwrap().push(backend.clone());
         Ok(backend)

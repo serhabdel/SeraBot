@@ -57,6 +57,8 @@ mod browser;
 mod composio;
 mod connectors;
 mod conversations;
+mod files;
+mod local;
 mod memories;
 mod messages;
 mod profiles;
@@ -161,6 +163,8 @@ pub struct ApiState {
     /// Model call behind the onboarding interview; None uses the runtime.
     /// Tests script it so no request leaves the process.
     onboarding_drafter: Option<Arc<dyn crate::onboarding::Drafter>>,
+    /// Desktop relay for the local folder tools (0.18).
+    local: Arc<crate::local_relay::LocalRelay>,
 }
 
 impl ApiState {
@@ -211,8 +215,16 @@ impl ApiState {
             oauth_inflight: Arc::default(),
             browser: None,
             onboarding_drafter: None,
+            local: crate::local_relay::LocalRelay::new(),
             config,
         })
+    }
+
+    /// Share the relay the local folder tools use, so the desktop's polls
+    /// reach the same queue as the tools' calls.
+    pub fn with_local_relay(mut self, local: Arc<crate::local_relay::LocalRelay>) -> Self {
+        self.local = local;
+        self
     }
 
     /// Share the per-user connector service the tools already use, so a
@@ -259,6 +271,15 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/browser/sessions/{id}/handback", post(session_handback))
         .route("/v1/browser/sessions/{id}/input", post(session_input))
         .route("/v1/browser/sessions/{id}/close", post(session_close))
+        .route("/v1/browser/sessions/{id}/tabs", post(session_tab_open))
+        .route(
+            "/v1/browser/sessions/{id}/tabs/{tab}/switch",
+            post(session_tab_switch),
+        )
+        .route(
+            "/v1/browser/sessions/{id}/tabs/{tab}/close",
+            post(session_tab_close),
+        )
         .route(
             "/v1/browser/profiles",
             get(profiles_list).post(profile_create),
@@ -364,6 +385,11 @@ pub fn router(state: ApiState) -> Router {
             get(conversation_team).put(set_conversation_team),
         )
         .route("/v1/conversations/{id}/library", get(conversation_library))
+        .route("/v1/conversations/{id}/plan", get(get_conversation_plan))
+        .route(
+            "/v1/conversations/{id}/auto-approve",
+            get(get_auto_approve).put(set_auto_approve),
+        )
         .route("/v1/tasks/{id}", get(task))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}/decide", post(decide_approval))
@@ -422,6 +448,8 @@ pub fn router(state: ApiState) -> Router {
     let protected = protected
         .merge(audio)
         .merge(profiles::routes())
+        .merge(files::routes())
+        .merge(local::routes())
         .layer(middleware::from_fn_with_state(shared.clone(), rate_limit))
         .layer(middleware::from_fn_with_state(shared.clone(), authorize));
     crate::web::router()
