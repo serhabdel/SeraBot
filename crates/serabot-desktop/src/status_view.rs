@@ -105,7 +105,7 @@ mod tests {
         assert_eq!(format_bytes(1536), "1.5 KB");
         assert_eq!(format_bytes(15 * 1024 * 1024), "15 MB");
         assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
-        assert_eq!(format_bytes(u64::MAX).ends_with("TB"), true);
+        assert!(format_bytes(u64::MAX).ends_with("TB"));
     }
 
     #[test]

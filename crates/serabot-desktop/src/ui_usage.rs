@@ -295,7 +295,7 @@ fn ServerHealthCard(session: Signal<Session>) -> Element {
     let storage_pct = percent(storage_used, storage_total);
     let open = expanded();
     let mut categories = status.storage.categories.clone();
-    categories.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    categories.sort_by_key(|category| std::cmp::Reverse(category.bytes));
     let biggest = categories.first().map(|c| c.bytes).unwrap_or(0);
     let process_pct = percent(status.process.memory_bytes, status.host.memory_total_bytes);
     rsx! {
