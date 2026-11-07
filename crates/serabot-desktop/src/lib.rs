@@ -18,6 +18,7 @@ pub mod local_folders;
 pub mod net_policy;
 pub mod oauth;
 pub mod panel;
+pub mod pc_stats;
 pub mod provider_presets;
 pub mod session;
 pub mod signin;
