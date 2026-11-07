@@ -299,6 +299,8 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
     "browser_press",
     "browser_screenshot",
     "browser_close",
+    "browser_tabs",
+    "browser_new_tab",
     "vault_list",
     "google_drive_list",
     "google_sheets_read",

@@ -46,6 +46,8 @@ when you must run as root.
 | `browser_press{key}` | yes | Enter, Tab, Escape, arrows, a single letter or digit, ... |
 | `browser_screenshot{}` | no | JPEG stored as an artifact; not returned to the model. |
 | `browser_close{}` | no | Close the session. |
+| `browser_tabs{action?, tab?}` | no | List tabs (`t1`, `t2`, ...) or `switch`/`close` one by id. The active tab is the one the other tools act on; switching clears the refs. |
+| `browser_new_tab{url}` | yes | Open a public http(s) URL in a new active tab (at most 8 tabs; same URL policy as `browser_navigate`). |
 
 While the owner has taken over (`controller = user`) every bot tool, including
 `browser_close`, fails with "the user is in control of the browser".

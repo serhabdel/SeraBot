@@ -374,6 +374,13 @@ fn tool_sentence(tool: &str, summary: &str, done: bool) -> Option<String> {
         }
         .to_owned(),
         "browser_snapshot" | "browser_screenshot" => "Looked at the page".to_owned(),
+        "browser_tabs" => "Checked the browser tabs".to_owned(),
+        "browser_new_tab" => if done {
+            "Opened a new tab"
+        } else {
+            "Wants to open a new tab"
+        }
+        .to_owned(),
         "browser_close" => if done {
             "Closed the browser"
         } else {

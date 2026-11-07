@@ -27,6 +27,32 @@ pub struct PageInfo {
     pub title: String,
 }
 
+/// One tab of a session. `id` is a short stable label (`t1`, `t2`, ...).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TabInfo {
+    pub id: String,
+    pub url: String,
+    pub title: String,
+    pub active: bool,
+}
+
+/// Where the bot (or the user) last moved/clicked, in viewport pixels
+/// (`vw` x `vh`). `seq` grows with every action so a viewer can tell a new
+/// click from the same one it already drew.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+pub struct Pointer {
+    pub x: f64,
+    pub y: f64,
+    pub action: &'static str,
+    pub seq: u64,
+    pub vw: u32,
+    pub vh: u32,
+}
+
+fn tabs_unsupported() -> SeraError {
+    SeraError::Validation("this browser does not support tabs".into())
+}
+
 /// One live browser page. Implemented by the Chromium/CDP backend and by a
 /// fake in tests.
 #[async_trait]
@@ -45,6 +71,26 @@ pub trait BrowserBackend: Send + Sync {
     async fn info(&self) -> Result<PageInfo>;
     async fn is_alive(&self) -> bool;
     async fn shutdown(&self);
+    /// Tabs of this browser, in opening order; empty when unsupported.
+    async fn tabs(&self) -> Result<Vec<TabInfo>> {
+        Ok(Vec::new())
+    }
+    /// Open `url` (already checked against the public-URL policy) in a new
+    /// active tab.
+    async fn open_tab(&self, _url: &str) -> Result<Vec<TabInfo>> {
+        Err(tabs_unsupported())
+    }
+    async fn switch_tab(&self, _tab: &str) -> Result<()> {
+        Err(tabs_unsupported())
+    }
+    /// The last tab cannot be closed; close the session instead.
+    async fn close_tab(&self, _tab: &str) -> Result<()> {
+        Err(tabs_unsupported())
+    }
+    /// The last pointer action, if any.
+    fn pointer(&self) -> Option<Pointer> {
+        None
+    }
 }
 
 #[async_trait]
@@ -79,6 +125,12 @@ pub struct BrowserInfo {
     pub title: Option<String>,
     pub controller: Controller,
     pub updated_at: String,
+    /// Open tabs (empty when the backend has none to report).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tabs: Vec<TabInfo>,
+    /// Last pointer action, for the live view overlay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pointer: Option<Pointer>,
     /// Bot that last drove this session (sessions API only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bot: Option<String>,
@@ -108,6 +160,8 @@ impl BrowserInfo {
             title: None,
             controller: Controller::Bot,
             updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            tabs: Vec::new(),
+            pointer: None,
             bot: None,
             conversation_id: None,
         }
@@ -386,6 +440,8 @@ impl BrowserManager {
             title: Some(page.title),
             controller,
             updated_at: updated_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+            tabs: session.backend.tabs().await.unwrap_or_default(),
+            pointer: session.backend.pointer(),
             bot,
             conversation_id,
         }

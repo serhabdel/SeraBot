@@ -1090,3 +1090,135 @@ async fn session_control_replies_carry_id_and_profile_name() {
         assert!(info["updated_at"].is_string() && info["controller"].is_string());
     }
 }
+
+#[tokio::test]
+async fn tabs_and_pointer_flow_through_the_session_api() {
+    let rig = rig(true);
+    drop(
+        rig.manager
+            .bot_lease(&rig.admin_id, "default", true, None)
+            .await
+            .unwrap(),
+    );
+    let base = "/v1/browser/sessions/default";
+    // Tab operations need the user in control, like input.
+    let open = json!({"url": "https://93.184.216.34/two"});
+    let (status, _) = call(
+        &rig.app,
+        admin_req(
+            &rig.app,
+            "POST",
+            &format!("{base}/tabs"),
+            Some(open.clone()),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    call(
+        &rig.app,
+        admin_req(&rig.app, "POST", &format!("{base}/takeover"), None),
+    )
+    .await;
+
+    let (status, info) = call(
+        &rig.app,
+        admin_req(&rig.app, "POST", &format!("{base}/tabs"), Some(open)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    let tabs = info["tabs"].as_array().unwrap();
+    assert_eq!(tabs.len(), 2);
+    assert_eq!(tabs[1]["id"], "t2");
+    assert_eq!(tabs[1]["active"], true);
+    assert_eq!(tabs[1]["url"], "https://93.184.216.34/two");
+    assert_eq!(tabs[0]["active"], false);
+
+    // Non-public URLs never open a tab.
+    for url in [
+        "http://10.0.0.1/",
+        "http://localhost:9222/",
+        "file:///etc/passwd",
+    ] {
+        let (status, _) = call(
+            &rig.app,
+            admin_req(
+                &rig.app,
+                "POST",
+                &format!("{base}/tabs"),
+                Some(json!({"url": url})),
+            ),
+        )
+        .await;
+        assert!(
+            status == StatusCode::UNPROCESSABLE_ENTITY || status == StatusCode::BAD_REQUEST,
+            "{url}: {status}"
+        );
+    }
+    assert_eq!(
+        rig.manager.info(&rig.admin_id, "default").await.tabs.len(),
+        2
+    );
+
+    let (status, info) = call(
+        &rig.app,
+        admin_req(&rig.app, "POST", &format!("{base}/tabs/t1/switch"), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(info["tabs"][0]["active"], true);
+    for bad in ["x1", "t", "t1234567"] {
+        let (status, _) = call(
+            &rig.app,
+            admin_req(&rig.app, "POST", &format!("{base}/tabs/{bad}/close"), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{bad}");
+    }
+    let (status, _) = call(
+        &rig.app,
+        admin_req(&rig.app, "POST", &format!("{base}/tabs/t9/close"), None),
+    )
+    .await;
+    assert!(status.is_client_error() && status != StatusCode::NOT_FOUND, "{status}");
+    let (status, info) = call(
+        &rig.app,
+        admin_req(&rig.app, "POST", &format!("{base}/tabs/t2/close"), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(info["tabs"].as_array().unwrap().len(), 1);
+    // The last tab cannot be closed.
+    let (status, _) = call(
+        &rig.app,
+        admin_req(&rig.app, "POST", &format!("{base}/tabs/t1/close"), None),
+    )
+    .await;
+    assert!(status.is_client_error() && status != StatusCode::NOT_FOUND, "{status}");
+
+    // The last click is reported for the live-view cursor, with a growing seq.
+    let click = |x: u32, y: u32| {
+        admin_req(
+            &rig.app,
+            "POST",
+            &format!("{base}/input"),
+            Some(json!({"type": "click", "x": x, "y": y})),
+        )
+    };
+    let (_, info) = call(&rig.app, click(30, 40)).await;
+    assert_eq!(info["pointer"]["x"], 30.0);
+    assert_eq!(info["pointer"]["action"], "click");
+    assert_eq!(info["pointer"]["seq"], 1);
+    assert_eq!(info["pointer"]["vw"], 1280);
+    let (_, info) = call(&rig.app, click(31, 41)).await;
+    assert_eq!(info["pointer"]["seq"], 2);
+
+    // Another user has no session here and sees none of it.
+    let (status, _) = call(
+        &rig.app,
+        member_req(&rig, "POST", &format!("{base}/tabs/t1/switch"), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, member) = call(&rig.app, member_req(&rig, "GET", "/v1/browser", None)).await;
+    assert!(member.get("tabs").is_none() && member.get("pointer").is_none());
+}
