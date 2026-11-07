@@ -9,8 +9,8 @@ use zeroize::Zeroize;
 
 use crate::cloud_code::{self, CLOUD_CODE_API_CLIENT, CLOUD_CODE_USER_AGENT, CloudCodeCompletion};
 use crate::providers::{
-    OAuthMaterial, OAuthStyle, USER_AGENT, enforce_oauth_target, muse_mint_api_key,
-    parse_model_ids, parse_official_catalog, refresh_token_grant,
+    ModelCatalog, OAuthMaterial, OAuthStyle, USER_AGENT, enforce_oauth_target, muse_mint_api_key,
+    parse_model_catalog, refresh_token_grant,
 };
 
 use crate::domain::{LlmMessage, Role, ToolCall};
@@ -280,13 +280,14 @@ impl LlmClient {
     pub async fn list_models(&self) -> Result<std::collections::BTreeSet<String>> {
         self.fetch_model_catalog(&format!("{}/models", self.base_url), false)
             .await
+            .map(|catalog| catalog.into_keys().collect())
     }
 
     pub(crate) async fn fetch_model_catalog(
         &self,
         catalog_url: &str,
         strict: bool,
-    ) -> Result<std::collections::BTreeSet<String>> {
+    ) -> Result<ModelCatalog> {
         if url::Url::parse(catalog_url)
             .ok()
             .is_some_and(|url| url.path().ends_with(":fetchAvailableModels"))
@@ -324,11 +325,7 @@ impl LlmClient {
                             .bytes()
                             .await
                             .map_err(|_| SeraError::External("model catalog read failed".into()))?;
-                        return if strict {
-                            parse_official_catalog(&bytes)
-                        } else {
-                            parse_model_ids(&bytes)
-                        };
+                        return parse_model_catalog(&bytes, strict);
                     }
                     // Drop the body. Provider errors can echo credentials; the status is enough.
                     let _ = response.bytes().await;
@@ -559,10 +556,7 @@ impl LlmClient {
         })
     }
 
-    async fn fetch_cloud_code_catalog(
-        &self,
-        catalog_url: &str,
-    ) -> Result<std::collections::BTreeSet<String>> {
+    async fn fetch_cloud_code_catalog(&self, catalog_url: &str) -> Result<ModelCatalog> {
         let urls = cloud_code::catalog_urls(catalog_url)?;
         let project = self.cloud_code.clone().unwrap_or_default();
         let body = if project.is_empty() {
@@ -576,7 +570,13 @@ impl LlmClient {
             let mut restart = false;
             for url in &urls {
                 match self.post_cloud(url, &body, "", false).await? {
-                    CloudPost::Ready(bytes) => return cloud_code::parse_cloud_code_catalog(&bytes),
+                    CloudPost::Ready(bytes) => {
+                        return cloud_code::parse_cloud_code_catalog(&bytes).map(|ids| {
+                            ids.into_iter()
+                                .map(|id| (id, crate::providers::ModelMeta::default()))
+                                .collect()
+                        });
+                    }
                     CloudPost::Unauthorized if !refreshed && self.oauth.is_some() => {
                         refreshed = true;
                         self.refresh_oauth().await?;

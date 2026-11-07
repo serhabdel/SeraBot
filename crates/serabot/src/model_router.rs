@@ -10,8 +10,8 @@ use crate::error::{Result, SeraError};
 use crate::gateway::ToolSpec;
 use crate::llm::{LlmClient, LlmResponse};
 use crate::providers::{
-    AuthPlan, auth_plan, canonical_kind, check_profile, resolve_base_url, resolve_catalog,
-    valid_model_id,
+    AuthPlan, ModelCatalog, auth_plan, canonical_kind, check_profile, resolve_base_url,
+    resolve_catalog, valid_model_id,
 };
 use crate::util::sha256_hex;
 
@@ -64,6 +64,12 @@ pub struct ProviderView {
     pub kind: String,
     pub catalog_fetch: bool,
     pub catalog_verified: bool,
+    /// Where `models` came from: `live` (the provider's own list for this
+    /// account) or `fallback` (the configured allowlist).
+    pub model_source: &'static str,
+    /// How the last live fetch for this account went: `ok`, `key_rejected`,
+    /// `unreachable`, or `unchecked` (no fetch yet, or fetching is off).
+    pub status: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,6 +78,14 @@ pub struct CatalogEntry {
     pub model: String,
     pub data_egress_approved: bool,
     pub catalog_verified: bool,
+    /// Friendly name, context window and capability tags, when the provider's
+    /// own list supplied them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,13 +96,26 @@ pub struct CatalogRefresh {
     pub model_count: usize,
 }
 
+/// One account's last good live model list for one provider.
 #[derive(Clone)]
-enum CatalogSnapshot {
-    Closed,
-    Verified {
-        at: Instant,
-        models: BTreeSet<String>,
-    },
+struct CatalogSnapshot {
+    at: Instant,
+    models: ModelCatalog,
+}
+
+/// Why the last live fetch for an account failed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FetchFailure {
+    KeyRejected,
+    Unreachable,
+}
+
+/// Per-account live catalogs for one provider. A failed fetch drops that
+/// account's snapshot, so routing falls back to the configured allowlist.
+#[derive(Default)]
+struct CatalogState {
+    snapshots: BTreeMap<String, CatalogSnapshot>,
+    failures: BTreeMap<String, FetchFailure>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -118,7 +145,7 @@ struct Provider {
     catalog_ttl: Duration,
     catalog_url: String,
     catalog_strict: bool,
-    catalog: Arc<Mutex<CatalogSnapshot>>,
+    catalog: Arc<Mutex<CatalogState>>,
 }
 
 #[derive(Clone)]
@@ -260,7 +287,7 @@ impl ModelRouter {
                     catalog_ttl: Duration::from_secs(profile.catalog_ttl_secs.max(1)),
                     catalog_url,
                     catalog_strict,
-                    catalog: Arc::new(Mutex::new(CatalogSnapshot::Closed)),
+                    catalog: Arc::new(Mutex::new(CatalogState::default())),
                 },
             );
         }
@@ -336,11 +363,17 @@ impl ModelRouter {
             .filter(|provider| provider.available(user_id))
             .map(|provider| ProviderView {
                 id: provider.id.clone(),
-                models: provider.advertised(),
+                models: provider.advertised(user_id),
                 data_egress_approved: provider.data_egress_approved,
                 kind: provider.kind.clone(),
                 catalog_fetch: provider.catalog_fetch,
-                catalog_verified: provider.catalog_verified(),
+                catalog_verified: provider.catalog_verified(user_id),
+                model_source: if provider.live_models(user_id).is_some() {
+                    "live"
+                } else {
+                    "fallback"
+                },
+                status: provider.fetch_status(user_id),
             })
             .collect()
     }
@@ -350,16 +383,28 @@ impl ModelRouter {
             .values()
             .filter(|provider| provider.available(user_id))
             .flat_map(|provider| {
-                let verified = provider.catalog_verified();
+                let verified = provider.catalog_verified(user_id);
+                let live = provider.live_models(user_id);
                 provider
-                    .advertised()
+                    .advertised(user_id)
                     .into_iter()
-                    .map(move |model| CatalogEntry {
-                        provider: provider.id.clone(),
-                        model,
-                        data_egress_approved: provider.data_egress_approved,
-                        catalog_verified: verified,
+                    .map(move |model| {
+                        let meta = live
+                            .as_ref()
+                            .and_then(|catalog| catalog.get(&model))
+                            .cloned()
+                            .unwrap_or_default();
+                        CatalogEntry {
+                            provider: provider.id.clone(),
+                            model,
+                            data_egress_approved: provider.data_egress_approved,
+                            catalog_verified: verified,
+                            name: meta.name,
+                            context_length: meta.context_length,
+                            tags: meta.tags,
+                        }
                     })
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -375,6 +420,21 @@ impl ModelRouter {
         Ok(reports)
     }
 
+    /// Refresh one provider's live list for the acting user and report the
+    /// outcome. Used by the providers page "Test" button.
+    pub async fn test_provider(&self, user_id: &str, id: &str) -> Result<CatalogRefresh> {
+        let provider = self
+            .providers
+            .get(id)
+            .ok_or_else(|| SeraError::Validation("unknown model provider".into()))?;
+        if !provider.available(user_id) {
+            return Err(no_credential_error(id));
+        }
+        // A test always asks the provider, never the cache.
+        provider.forget_snapshot(user_id);
+        self.refresh_provider(id, user_id).await
+    }
+
     pub fn catalog_gate(&self, user_id: &str, selection: &ModelSelection) -> Result<()> {
         let provider = self
             .providers
@@ -386,7 +446,7 @@ impl ModelRouter {
         if !provider.catalog_fetch || !provider.data_egress_approved {
             return Ok(());
         }
-        if provider.verified_contains(&selection.model) {
+        if provider.allows(user_id, &selection.model) {
             return Ok(());
         }
         Err(SeraError::Forbidden(
@@ -401,27 +461,24 @@ impl ModelRouter {
                 provider: id.to_owned(),
                 fetched: false,
                 verified: false,
-                model_count: provider.advertised().len(),
+                model_count: provider.advertised(user_id).len(),
             });
         }
-        if provider.is_fresh() {
+        if provider.is_fresh(user_id) {
             return Ok(CatalogRefresh {
                 provider: id.to_owned(),
                 fetched: false,
                 verified: true,
-                model_count: provider.advertised().len(),
+                model_count: provider.advertised(user_id).len(),
             });
         }
         if provider.catalog_url.is_empty() {
-            *provider
-                .catalog
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = CatalogSnapshot::Closed;
+            provider.record_failure(user_id, FetchFailure::Unreachable);
             return Ok(CatalogRefresh {
                 provider: id.to_owned(),
                 fetched: true,
                 verified: false,
-                model_count: 0,
+                model_count: provider.advertised(user_id).len(),
             });
         }
         match provider
@@ -430,32 +487,30 @@ impl ModelRouter {
             .await
         {
             Ok(models) => {
-                *provider
-                    .catalog
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()) = CatalogSnapshot::Verified {
-                    at: Instant::now(),
-                    models,
-                };
+                provider.record_snapshot(user_id, models);
                 Ok(CatalogRefresh {
                     provider: id.to_owned(),
                     fetched: true,
                     verified: true,
-                    // The report counts what is now offered (live catalog
-                    // intersected with the allowlist).
-                    model_count: provider.advertised().len(),
+                    model_count: provider.advertised(user_id).len(),
                 })
             }
-            Err(_) => {
-                *provider
-                    .catalog
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()) = CatalogSnapshot::Closed;
+            Err(error) => {
+                // The error text carries a status code at most, never a body
+                // or a key; it only decides which message the page shows.
+                let text = error.to_string();
+                let failure = if text.contains("status 401") || text.contains("status 403") {
+                    FetchFailure::KeyRejected
+                } else {
+                    FetchFailure::Unreachable
+                };
+                provider.record_failure(user_id, failure);
                 Ok(CatalogRefresh {
                     provider: id.to_owned(),
                     fetched: true,
                     verified: false,
-                    model_count: 0,
+                    // The configured allowlist is what is offered now.
+                    model_count: provider.advertised(user_id).len(),
                 })
             }
         }
@@ -484,7 +539,7 @@ impl ModelRouter {
             .providers
             .values()
             .find(|provider| provider.available(user_id))
-            && let Some(model) = provider.advertised().into_iter().next()
+            && let Some(model) = provider.advertised(user_id).into_iter().next()
         {
             return ModelSelection {
                 provider: provider.id.clone(),
@@ -632,7 +687,7 @@ impl ModelRouter {
     fn find_available_model(&self, user_id: &str, model: &str) -> Option<ModelSelection> {
         self.providers
             .values()
-            .find(|provider| provider.available(user_id) && provider.models.contains(model))
+            .find(|provider| provider.available(user_id) && provider.allows(user_id, model))
             .map(|provider| ModelSelection {
                 provider: provider.id.clone(),
                 model: model.to_owned(),
@@ -689,7 +744,7 @@ impl ModelRouter {
 
     fn first_approved(&self, user_id: &str) -> Option<ModelSelection> {
         for (id, provider) in &self.providers {
-            for model in provider.advertised() {
+            for model in provider.advertised(user_id) {
                 if provider.is_routable(user_id, &model) {
                     return Some(ModelSelection {
                         provider: id.clone(),
@@ -709,7 +764,7 @@ impl ModelRouter {
         if !provider.available(user_id) {
             return Err(no_credential_error(&selection.provider));
         }
-        if !provider.models.contains(&selection.model) {
+        if !provider.allows(user_id, &selection.model) {
             return Err(SeraError::Validation(
                 "model is not allowed for this provider".into(),
             ));
@@ -739,7 +794,7 @@ impl ModelRouter {
             .providers
             .get(&selection.provider)
             .ok_or_else(|| SeraError::Validation("unknown model provider".into()))?;
-        if !provider.models.contains(&selection.model) {
+        if !provider.accepts_config(&selection.model) {
             return Err(SeraError::Validation(
                 "model is not allowed for this provider".into(),
             ));
@@ -773,7 +828,7 @@ impl ModelRouter {
         if provider.catalog_fetch {
             self.refresh_provider(&route.selection.provider, user_id)
                 .await?;
-            if !provider.verified_contains(&route.selection.model) {
+            if !provider.verified_contains(user_id, &route.selection.model) {
                 return Err(SeraError::Forbidden(
                     "model is not in the verified provider catalog".into(),
                 ));
@@ -830,21 +885,85 @@ impl Provider {
         }
     }
 
-    fn lock_catalog(&self) -> std::sync::MutexGuard<'_, CatalogSnapshot> {
+    fn lock_catalog(&self) -> std::sync::MutexGuard<'_, CatalogState> {
         self.catalog
             .lock()
             .unwrap_or_else(|error| error.into_inner())
     }
 
-    fn is_fresh(&self) -> bool {
-        match &*self.lock_catalog() {
-            CatalogSnapshot::Verified { at, .. } => at.elapsed() < self.catalog_ttl,
-            CatalogSnapshot::Closed => false,
+    /// The account's last good live list, however old. `None` when the
+    /// provider does not fetch, nothing was fetched yet, or the last fetch
+    /// failed (the allowlist is the fallback then).
+    fn live_models(&self, user_id: &str) -> Option<ModelCatalog> {
+        if !self.catalog_fetch {
+            return None;
+        }
+        self.lock_catalog()
+            .snapshots
+            .get(user_id)
+            .map(|snapshot| snapshot.models.clone())
+    }
+
+    fn is_fresh(&self, user_id: &str) -> bool {
+        self.lock_catalog()
+            .snapshots
+            .get(user_id)
+            .is_some_and(|snapshot| snapshot.at.elapsed() < self.catalog_ttl)
+    }
+
+    fn catalog_verified(&self, user_id: &str) -> bool {
+        self.catalog_fetch && self.data_egress_approved && self.is_fresh(user_id)
+    }
+
+    fn record_snapshot(&self, user_id: &str, models: ModelCatalog) {
+        let mut state = self.lock_catalog();
+        state.failures.remove(user_id);
+        state.snapshots.insert(
+            user_id.to_owned(),
+            CatalogSnapshot {
+                at: Instant::now(),
+                models,
+            },
+        );
+    }
+
+    fn record_failure(&self, user_id: &str, failure: FetchFailure) {
+        let mut state = self.lock_catalog();
+        state.snapshots.remove(user_id);
+        state.failures.insert(user_id.to_owned(), failure);
+    }
+
+    fn forget_snapshot(&self, user_id: &str) {
+        let mut state = self.lock_catalog();
+        state.snapshots.remove(user_id);
+        state.failures.remove(user_id);
+    }
+
+    fn fetch_status(&self, user_id: &str) -> &'static str {
+        if !self.catalog_fetch {
+            return "unchecked";
+        }
+        let state = self.lock_catalog();
+        if state.snapshots.contains_key(user_id) {
+            return "ok";
+        }
+        match state.failures.get(user_id) {
+            Some(FetchFailure::KeyRejected) => "key_rejected",
+            Some(FetchFailure::Unreachable) => "unreachable",
+            None => "unchecked",
         }
     }
 
-    fn catalog_verified(&self) -> bool {
-        self.catalog_fetch && self.data_egress_approved && self.is_fresh()
+    /// Whether `model` may be selected and sent by this account: the live
+    /// list when the account has one, otherwise the configured allowlist (no
+    /// fetching, or the fetch failed).
+    fn allows(&self, user_id: &str, model: &str) -> bool {
+        if self.catalog_fetch
+            && let Some(snapshot) = self.lock_catalog().snapshots.get(user_id)
+        {
+            return snapshot.models.contains_key(model);
+        }
+        self.models.contains(model)
     }
 
     /// Models shown to the user: exactly the models `pin` plus
@@ -852,47 +971,40 @@ impl Provider {
     /// model the server then rejects.
     ///
     /// A provider without data-egress approval offers nothing (`pin`
-    /// refuses it). Without `catalog_fetch` the configured allowlist is
-    /// offered. With `catalog_fetch` the offer is the intersection of the
-    /// allowlist and a fresh verified live catalog; a stale or closed
-    /// snapshot offers nothing (`catalog_gate` refuses it).
-    fn advertised(&self) -> Vec<String> {
+    /// refuses it). Otherwise the offer is the account's live list when it
+    /// has one, else the configured allowlist.
+    fn advertised(&self, user_id: &str) -> Vec<String> {
         if !self.data_egress_approved {
             return Vec::new();
         }
-        if !self.catalog_fetch {
-            return self.models.iter().cloned().collect();
-        }
-        match &*self.lock_catalog() {
-            CatalogSnapshot::Verified { at, models } if at.elapsed() < self.catalog_ttl => self
-                .models
-                .iter()
-                .filter(|model| models.contains(*model))
-                .cloned()
-                .collect(),
-            _ => Vec::new(),
-        }
-    }
-    fn verified_contains(&self, model: &str) -> bool {
-        if !self.models.contains(model) {
-            return false;
-        }
-        if !self.catalog_fetch {
-            return true;
-        }
-        if !self.data_egress_approved {
-            return false;
-        }
-        match &*self.lock_catalog() {
-            CatalogSnapshot::Verified { at, models } => {
-                at.elapsed() < self.catalog_ttl && models.contains(model)
-            }
-            CatalogSnapshot::Closed => false,
+        match self.live_models(user_id) {
+            Some(live) => live.into_keys().collect(),
+            None => self.models.iter().cloned().collect(),
         }
     }
 
+    fn verified_contains(&self, user_id: &str, model: &str) -> bool {
+        if self.catalog_fetch && !self.data_egress_approved {
+            return false;
+        }
+        self.allows(user_id, model)
+    }
+
     fn is_routable(&self, user_id: &str, model: &str) -> bool {
-        self.available(user_id) && self.data_egress_approved && self.verified_contains(model)
+        self.available(user_id)
+            && self.data_egress_approved
+            && self.verified_contains(user_id, model)
+    }
+
+    /// Account-independent check used when pinning a route: a fetching
+    /// provider may serve any well-formed id (the per-account list is checked
+    /// by `catalog_gate`); a fixed provider only its allowlist.
+    fn accepts_config(&self, model: &str) -> bool {
+        if self.catalog_fetch {
+            valid_model_id(model)
+        } else {
+            self.models.contains(model)
+        }
     }
 }
 
@@ -1399,7 +1511,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_catalog_advertises_only_allowlisted_live_models() {
+    async fn fresh_live_catalog_is_authoritative_over_the_allowlist() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/models"))
@@ -1433,34 +1545,40 @@ mod tests {
         let reports = router.refresh_catalogs(TEST_USER).await.unwrap();
         assert_eq!(reports.len(), 1);
         assert!(reports[0].fetched && reports[0].verified);
-        // The refresh report counts what is offered: the allowlist
-        // intersection, not the full live list.
-        assert_eq!(reports[0].model_count, 1);
-        // A fresh verified snapshot offers only live models that are also
-        // allowlisted ("extra" is live only; " bad" was dropped by the
-        // catalog parser; "missing" is allowlisted only).
+        // The refresh report counts the live list (" bad" was dropped by the
+        // catalog parser).
+        assert_eq!(reports[0].model_count, 2);
+        // A fresh verified snapshot offers the live models, not the
+        // allowlist ("missing" is allowlisted only).
         assert_eq!(
             router.catalog(TEST_USER)[0].models,
-            vec!["kept".to_string()]
+            vec!["extra".to_string(), "kept".to_string()]
         );
+        assert_eq!(router.catalog(TEST_USER)[0].model_source, "live");
+        assert_eq!(router.catalog(TEST_USER)[0].status, "ok");
         assert!(router.catalog(TEST_USER)[0].catalog_verified);
-        // The hard gate still rejects anything not verified: "missing" is
-        // allowlisted but absent from the snapshot, "extra" is live but not
-        // allowlisted.
-        for model in ["missing", "extra"] {
-            assert!(
-                router
-                    .catalog_gate(
-                        TEST_USER,
-                        &ModelSelection {
-                            provider: "default".into(),
-                            model: model.into(),
-                        }
-                    )
-                    .is_err(),
-                "{model} must be gated"
-            );
-        }
+        // The gate rejects what the live list lacks: "missing" is
+        // allowlisted but absent from the snapshot.
+        assert!(
+            router
+                .catalog_gate(
+                    TEST_USER,
+                    &ModelSelection {
+                        provider: "default".into(),
+                        model: "missing".into(),
+                    }
+                )
+                .is_err()
+        );
+        router
+            .catalog_gate(
+                TEST_USER,
+                &ModelSelection {
+                    provider: "default".into(),
+                    model: "extra".into(),
+                },
+            )
+            .unwrap();
         let kept = router
             .pin(&ModelSelection {
                 provider: "default".into(),
@@ -1495,23 +1613,20 @@ mod tests {
                 .await
                 .is_err()
         );
-        // A live-but-not-allowlisted model cannot even be pinned.
-        assert!(
-            router
-                .pin(&ModelSelection {
-                    provider: "default".into(),
-                    model: "extra".into(),
-                })
-                .is_err()
-        );
     }
 
     #[tokio::test]
-    async fn failed_catalog_refresh_does_not_send_chat() {
+    async fn failed_catalog_refresh_falls_back_to_the_allowlist() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/models"))
             .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_ok()))
+            .expect(1)
             .mount(&server)
             .await;
         let config = LlmConfig {
@@ -1529,9 +1644,14 @@ mod tests {
         let router = ModelRouter::new(&config, clients).unwrap();
         let reports = router.refresh_catalogs(TEST_USER).await.unwrap();
         assert!(reports[0].fetched && !reports[0].verified);
-        // A closed snapshot offers nothing: selection is gated
-        // (verified_contains is false).
-        assert!(router.catalog(TEST_USER)[0].models.is_empty());
+        // No live list: the configured allowlist is what is offered, and it
+        // is not reported as verified.
+        assert_eq!(
+            router.catalog(TEST_USER)[0].models,
+            vec!["kept".to_string()]
+        );
+        assert_eq!(router.catalog(TEST_USER)[0].model_source, "fallback");
+        assert_eq!(router.catalog(TEST_USER)[0].status, "unreachable");
         assert!(!router.catalog(TEST_USER)[0].catalog_verified);
         let route = router
             .pin(&ModelSelection {
@@ -1539,23 +1659,27 @@ mod tests {
                 model: "kept".into(),
             })
             .unwrap();
+        router
+            .complete(
+                TEST_USER,
+                &route,
+                &[LlmMessage::user("synthetic")],
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        // A model outside the allowlist is still refused.
         assert!(
             router
-                .complete(
+                .catalog_gate(
                     TEST_USER,
-                    &route,
-                    &[LlmMessage::user("synthetic")],
-                    &[],
-                    None
+                    &ModelSelection {
+                        provider: "default".into(),
+                        model: "other".into(),
+                    }
                 )
-                .await
                 .is_err()
-        );
-        let requests = server.received_requests().await.unwrap();
-        assert!(
-            requests
-                .iter()
-                .all(|request| request.url.path() != "/chat/completions")
         );
     }
 
@@ -1592,7 +1716,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_catalog_is_not_reused_after_a_failed_refresh() {
+    async fn failed_refresh_drops_the_stale_live_list_for_the_allowlist() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/models"))
@@ -1624,7 +1748,7 @@ mod tests {
         )]);
         let router = ModelRouter::new(&config, clients).unwrap();
         router.refresh_catalogs(TEST_USER).await.unwrap();
-        // Fresh snapshot: the live models that are also allowlisted.
+        // Fresh snapshot: the live models.
         assert_eq!(
             router.catalog(TEST_USER)[0].models,
             vec!["kept".to_string()]
@@ -1632,14 +1756,18 @@ mod tests {
         assert!(router.catalog(TEST_USER)[0].catalog_verified);
         tokio::time::sleep(Duration::from_millis(1100)).await;
         router.refresh_catalogs(TEST_USER).await.unwrap();
-        // Stale snapshot + failed refresh: `catalog_gate` rejects every
-        // model, so nothing is offered.
-        assert!(router.catalog(TEST_USER)[0].models.is_empty());
+        // Stale snapshot + failed refresh: the live list is dropped and the
+        // configured allowlist is offered, unverified.
+        assert_eq!(
+            router.catalog(TEST_USER)[0].models,
+            vec!["fallback-model".to_string(), "kept".to_string()]
+        );
+        assert_eq!(router.catalog(TEST_USER)[0].model_source, "fallback");
         assert!(!router.catalog(TEST_USER)[0].catalog_verified);
     }
 
     #[tokio::test]
-    async fn minimax_catalog_offers_the_allowlisted_live_models_and_rejects_loose_shapes() {
+    async fn minimax_catalog_offers_the_live_models_and_rejects_loose_shapes() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
@@ -1718,34 +1846,14 @@ mod tests {
         .unwrap();
         let loose_reports = loose_router.refresh_catalogs(TEST_USER).await.unwrap();
         assert!(loose_reports[0].fetched && !loose_reports[0].verified);
-        // Closed snapshot: nothing is offered.
-        assert!(loose_router.catalog(TEST_USER)[0].models.is_empty());
-        let route = loose_router
-            .pin(&ModelSelection {
-                provider: "default".into(),
-                model: "MiniMax-M3.1-Flash".into(),
-            })
-            .unwrap();
-        assert!(
-            loose_router
-                .complete(
-                    TEST_USER,
-                    &route,
-                    &[LlmMessage::user("synthetic")],
-                    &[],
-                    None
-                )
-                .await
-                .is_err()
+        // A loose shape is refused for a strict provider: the allowlist is
+        // offered instead, unverified.
+        assert_eq!(
+            loose_router.catalog(TEST_USER)[0].models,
+            vec!["MiniMax-M3.1-Flash".to_string()]
         );
-        assert!(
-            loose
-                .received_requests()
-                .await
-                .unwrap()
-                .iter()
-                .all(|request| request.url.path() != "/v1/chat/completions")
-        );
+        assert_eq!(loose_router.catalog(TEST_USER)[0].model_source, "fallback");
+        assert!(!loose_router.catalog(TEST_USER)[0].catalog_verified);
     }
 
     #[tokio::test]
@@ -1779,12 +1887,11 @@ mod tests {
         )]);
         let router = ModelRouter::new(&config, clients).unwrap();
         router.refresh_catalogs(TEST_USER).await.unwrap();
-        // Fresh snapshot: the allowlist intersection ("deepseek-chat" is
-        // allowlisted but not live, "deepseek-v4-pro" is live but not
-        // allowlisted).
+        // Fresh snapshot: the live list ("deepseek-chat" is allowlisted but
+        // not live).
         assert_eq!(
             router.catalog(TEST_USER)[0].models,
-            vec!["deepseek-flash".to_string()]
+            vec!["deepseek-flash".to_string(), "deepseek-v4-pro".to_string()]
         );
         let paths: Vec<_> = server
             .received_requests()
@@ -1835,10 +1942,10 @@ mod tests {
         let router = ModelRouter::new(&config, clients).unwrap();
         let reports = router.refresh_catalogs(TEST_USER).await.unwrap();
         assert!(reports[0].fetched && reports[0].verified);
-        assert_eq!(reports[0].model_count, 1);
+        assert_eq!(reports[0].model_count, 2);
         assert_eq!(
             router.catalog(TEST_USER)[0].models,
-            vec!["kept-model".to_string()]
+            vec!["extra-model".to_string(), "kept-model".to_string()]
         );
         assert!(
             router
@@ -1883,12 +1990,13 @@ mod tests {
         .unwrap();
         let loose_reports = loose_router.refresh_catalogs(TEST_USER).await.unwrap();
         assert!(loose_reports[0].fetched && !loose_reports[0].verified);
-        // Closed snapshot: nothing is offered.
-        assert!(loose_router.catalog(TEST_USER)[0].models.is_empty());
+        // The loose shape is refused: the allowlist is offered, unverified.
+        assert_eq!(loose_router.catalog(TEST_USER)[0].model_source, "fallback");
+        assert!(!loose_router.catalog(TEST_USER)[0].catalog_verified);
     }
 
     #[tokio::test]
-    async fn stale_or_closed_snapshot_and_unapproved_egress_offer_nothing() {
+    async fn live_list_replaces_the_allowlist_and_unapproved_egress_offers_nothing() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/models"))
@@ -1918,25 +2026,25 @@ mod tests {
         router.refresh_catalogs(TEST_USER).await.unwrap();
         assert!(router.catalog(TEST_USER)[0].models.is_empty());
         assert!(!router.catalog(TEST_USER)[0].catalog_verified);
-        // Fresh verified snapshot with no overlap: nothing is offered.
+        // Fresh verified snapshot with no overlap: the live list is offered.
         let router = ModelRouter::new(&base_config(true), clients()).unwrap();
         router.refresh_catalogs(TEST_USER).await.unwrap();
-        assert!(router.catalog(TEST_USER)[0].models.is_empty());
-        assert!(router.catalog(TEST_USER)[0].catalog_verified);
-        // Selection of a live model outside the allowlist, or of an allowlisted
-        // model absent from the snapshot, is still rejected by the hard gate
-        // even though the live list is advertised.
-        assert!(
-            router
-                .catalog_gate(
-                    TEST_USER,
-                    &ModelSelection {
-                        provider: "default".into(),
-                        model: "live-a".into(),
-                    }
-                )
-                .is_err()
+        assert_eq!(
+            router.catalog(TEST_USER)[0].models,
+            vec!["live-a".to_string(), "live-b".to_string()]
         );
+        assert!(router.catalog(TEST_USER)[0].catalog_verified);
+        // A live model outside the allowlist passes; an allowlisted model
+        // absent from the live list is rejected.
+        router
+            .catalog_gate(
+                TEST_USER,
+                &ModelSelection {
+                    provider: "default".into(),
+                    model: "live-a".into(),
+                },
+            )
+            .unwrap();
         assert!(
             router
                 .catalog_gate(
@@ -2012,6 +2120,8 @@ mod tests {
             ("default", "mistral-large-latest"),
             ("default", "mistral-medium-latest"),
             ("default", "mistral-small-latest"),
+            ("default", "pixtral-large-latest"),
+            ("default", "voxtral-mini-latest"),
             ("own", "own-a"),
             ("own", "own-b"),
         ]
@@ -2034,9 +2144,9 @@ mod tests {
             router.catalog_gate("alice", &selection).unwrap();
             router.validate_selection("alice", &selection).unwrap();
         }
-        // Live-only and allowlisted-but-not-live models are neither listed
-        // nor savable.
-        for model in ["pixtral-large-latest", "ministral-8b-latest"] {
+        // Allowlisted-but-not-live and non-chat models are neither listed nor
+        // savable.
+        for model in ["ministral-8b-latest", "mistral-embed"] {
             assert!(!listed.contains(&("default".to_owned(), model.to_owned())));
             let selection = ModelSelection {
                 provider: "default".into(),
@@ -2061,6 +2171,82 @@ mod tests {
             };
             assert!(router.catalog_gate("bob", &selection).is_err());
         }
+    }
+
+    /// Each account has its own live list (a different key can see different
+    /// models), a rejected key reports `key_rejected` and falls back to the
+    /// allowlist, and no response body reaches the catalog the desktop reads.
+    #[tokio::test]
+    async fn live_lists_are_per_account_and_a_rejected_key_is_reported() {
+        let live = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer alice-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "id": "a-model", "name": "A Model", "context_length": 32000,
+                    "supported_parameters": ["tools"]
+                }]
+            })))
+            .mount(&live)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer bob-key"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("synthetic-body-secret"))
+            .mount(&live)
+            .await;
+        let config = LlmConfig {
+            base_url: live.uri(),
+            model: "static-model".into(),
+            data_egress_approved: true,
+            kind: "openai-compatible".into(),
+            catalog_fetch: true,
+            catalog_ttl_secs: 60,
+            ..LlmConfig::default()
+        };
+        let credentials = Arc::new(FakeCredentials::new(&[
+            ("alice", "alice-key"),
+            ("bob", "bob-key"),
+        ]));
+        let router = ModelRouter::with_credentials(&config, credentials).unwrap();
+        router.refresh_catalogs("alice").await.unwrap();
+        router.refresh_catalogs("bob").await.unwrap();
+
+        let alice = &router.catalog("alice")[0];
+        assert_eq!(alice.models, vec!["a-model".to_string()]);
+        assert_eq!((alice.model_source, alice.status), ("live", "ok"));
+        let entry = &router.catalog_entries("alice")[0];
+        assert_eq!(entry.name.as_deref(), Some("A Model"));
+        assert_eq!(entry.context_length, Some(32_000));
+        assert_eq!(entry.tags, vec!["tools".to_string()]);
+
+        let bob = &router.catalog("bob")[0];
+        assert_eq!(bob.models, vec!["static-model".to_string()]);
+        assert_eq!((bob.model_source, bob.status), ("fallback", "key_rejected"));
+        let pick = |model: &str| ModelSelection {
+            provider: "default".into(),
+            model: model.into(),
+        };
+        router.catalog_gate("alice", &pick("a-model")).unwrap();
+        assert!(router.catalog_gate("alice", &pick("static-model")).is_err());
+        router.catalog_gate("bob", &pick("static-model")).unwrap();
+        assert!(router.catalog_gate("bob", &pick("a-model")).is_err());
+
+        let shown = serde_json::to_string(&(
+            router.catalog("bob"),
+            router.catalog_entries("bob"),
+            router.catalog("alice"),
+        ))
+        .unwrap();
+        assert!(!shown.contains("synthetic-body-secret"));
+        assert!(!shown.contains("bob-key") && !shown.contains("alice-key"));
+
+        // The Test button always asks the provider again.
+        let report = router.test_provider("bob", "default").await.unwrap();
+        assert!(report.fetched && !report.verified);
+        assert!(router.test_provider("nobody", "default").await.is_err());
+        assert!(router.test_provider("alice", "missing").await.is_err());
     }
 
     #[tokio::test]
