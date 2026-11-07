@@ -4675,7 +4675,7 @@ async fn usage_scope_all_is_admin_only_and_members_only_see_their_own_rows() {
         .oneshot(request(&app, "GET", "/v1/usage?scope=everyone", true, None))
         .await
         .unwrap();
-    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(bad.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
     // The admin sees only their own rows by default and everyone's on request.
     let admin_own = read_json(
