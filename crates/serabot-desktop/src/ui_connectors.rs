@@ -13,8 +13,8 @@ use crate::ui::{BrandLogo, Icon};
 use dioxus::prelude::*;
 use serabot_desktop::ConnectorStatus;
 use serabot_desktop::connector_card::{
-    CardState, DEFAULT_ADMIN_HINT, GOOGLE_CONSOLE_URL, GOOGLE_SETUP_STEPS, NOTION_HELP_URL,
-    NOTION_SHARE_HINT, connector_card_state, editable_roles, google_is_set_up, google_redirect_uri,
+    CardState, DEFAULT_ADMIN_HINT, GOOGLE_CONSOLE_URL, GOOGLE_SETUP_STEPS, NOTION_SHARE_HINT,
+    connector_card_state, editable_roles, google_is_set_up, google_redirect_uri,
     google_setup_offered, is_internal_role, legacy_connected, supports_sign_in, token_help,
     uses_api_key,
 };

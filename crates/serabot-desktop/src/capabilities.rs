@@ -417,7 +417,14 @@ mod tests {
 
     #[test]
     fn every_capability_has_a_known_group_in_order() {
-        let groups = ["Web", "Files", "Messages", "Media", "Memory"];
+        let groups = [
+            "Web",
+            "Files",
+            "Messages",
+            "Code and tasks",
+            "Media",
+            "Memory",
+        ];
         let mut last = 0;
         for capability in CAPABILITIES {
             let at = groups
