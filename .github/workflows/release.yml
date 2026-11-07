@@ -72,8 +72,8 @@ jobs:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
       # Optional repository secret, origin only. Never the token.
       SERABOT_OWNER_API_URL: ${{ secrets.SERABOT_OWNER_API_URL }}
-      # Optional Android release keystore. Unset variables fall back to the
-      # Android debug key. Values are never echoed.
+      # Required Android release keystore (the job fails without it). Values are
+      # never echoed.
       ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
       ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
       ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
@@ -103,11 +103,21 @@ jobs:
       - name: Configure release signing
         working-directory: apps/serabot_mobile
         run: |
-          if [ -n "${ANDROID_KEYSTORE_BASE64}" ]; then
-            printf '%s' "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > "$RUNNER_TEMP/release.keystore"
-            chmod 600 "$RUNNER_TEMP/release.keystore"
-            echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+          # Release builds must carry the stable key: Android refuses to install
+          # an update signed with a different key, and the in-app updater relies
+          # on that. Never fall back to the debug key here.
+          missing=""
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then missing="$missing $name"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Release signing secrets missing:$missing. Run scripts/make-android-keystore.ps1 and set the secrets it prints." >&2
+            exit 1
           fi
+          printf '%s' "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > "$RUNNER_TEMP/release.keystore"
+          chmod 600 "$RUNNER_TEMP/release.keystore"
+          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+          echo "SERABOT_REQUIRE_RELEASE_SIGNING=1" >> "$GITHUB_ENV"
       - name: Build release APK
         working-directory: apps/serabot_mobile
         run: |
