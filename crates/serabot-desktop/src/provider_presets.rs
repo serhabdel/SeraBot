@@ -26,12 +26,19 @@ pub struct ProviderPreset {
     pub secret_name: &'static str,
     /// Whether to fetch the live model list (/models).
     pub catalog_fetch: bool,
-    /// Auth type: "api_key" or "oauth".
+    /// Auth type: "api_key", "oauth" (sign-in only) or "none" (local server).
     pub auth: &'static str,
     /// Badge label: "OAuth", "API Key", "Local", "Custom".
     pub badge: &'static str,
     /// One short line for the owner.
     pub note: &'static str,
+    /// The provider's own page for creating an API key. Empty when the
+    /// provider has no key page (sign-in only, or a local server).
+    pub key_url: &'static str,
+    /// A real sign-in flow the provider documents for apps: pkce (browser
+    /// authorization code), device (device code) or pkce_google (Google
+    /// Cloud Code). Empty for providers that only take an API key.
+    pub sign_in: &'static str,
 }
 
 const PRESETS: &[ProviderPreset] = &[
@@ -53,6 +60,8 @@ const PRESETS: &[ProviderPreset] = &[
         auth: "oauth",
         badge: "OAuth",
         note: "Google Cloud Code OAuth (PKCE) — Gemini & Claude models",
+        key_url: "",
+        sign_in: "pkce_google",
     },
     ProviderPreset {
         id: "deepseek",
@@ -67,6 +76,8 @@ const PRESETS: &[ProviderPreset] = &[
         auth: "api_key",
         badge: "API Key",
         note: "DeepSeek V3, R1 & Reasoner API",
+        key_url: "https://platform.deepseek.com/api_keys",
+        sign_in: "",
     },
     ProviderPreset {
         id: "minimax",
@@ -81,6 +92,8 @@ const PRESETS: &[ProviderPreset] = &[
         auth: "api_key",
         badge: "API Key",
         note: "MiniMax M3.1 Flash, M3 & M-Plan API",
+        key_url: "https://platform.minimax.io/user-center/basic-information/interface-key",
+        sign_in: "",
     },
     ProviderPreset {
         id: "minimax-cn",
@@ -95,6 +108,8 @@ const PRESETS: &[ProviderPreset] = &[
         auth: "api_key",
         badge: "API Key",
         note: "MiniMax China domestic endpoint",
+        key_url: "https://platform.minimaxi.com/user-center/basic-information/interface-key",
+        sign_in: "",
     },
     ProviderPreset {
         id: "mistral",
@@ -134,6 +149,8 @@ const PRESETS: &[ProviderPreset] = &[
         auth: "api_key",
         badge: "API Key",
         note: "Mistral Large, Magistral, Codestral, Ministral, Pixtral & open models",
+        key_url: "https://console.mistral.ai/api-keys",
+        sign_in: "",
     },
     ProviderPreset {
         id: "openai",
@@ -159,6 +176,8 @@ const PRESETS: &[ProviderPreset] = &[
         auth: "api_key",
         badge: "API Key",
         note: "GPT-5, GPT-4.1, GPT-4o & o-series reasoning",
+        key_url: "https://platform.openai.com/api-keys",
+        sign_in: "",
     },
     ProviderPreset {
         id: "openrouter",
@@ -175,8 +194,10 @@ const PRESETS: &[ProviderPreset] = &[
         secret_name: "openrouter_api_key",
         catalog_fetch: true,
         auth: "api_key",
-        badge: "API Key",
+        badge: "Sign in or API key",
         note: "Unified router for Claude, Gemini, Llama & DeepSeek",
+        key_url: "https://openrouter.ai/settings/keys",
+        sign_in: "pkce",
     },
     ProviderPreset {
         id: "groq",
@@ -195,6 +216,8 @@ const PRESETS: &[ProviderPreset] = &[
         auth: "api_key",
         badge: "API Key",
         note: "Ultra-fast LPU inference for Llama & Qwen",
+        key_url: "https://console.groq.com/keys",
+        sign_in: "",
     },
     ProviderPreset {
         id: "xai",
@@ -209,6 +232,8 @@ const PRESETS: &[ProviderPreset] = &[
         auth: "api_key",
         badge: "API Key",
         note: "Grok 3 & Grok 3 Mini API",
+        key_url: "https://console.x.ai",
+        sign_in: "",
     },
     ProviderPreset {
         id: "moonshot",
@@ -223,6 +248,8 @@ const PRESETS: &[ProviderPreset] = &[
         auth: "api_key",
         badge: "API Key",
         note: "Kimi K2 & Moonshot v1 long-context API",
+        key_url: "https://platform.moonshot.ai/console/api-keys",
+        sign_in: "",
     },
     ProviderPreset {
         id: "cerebras",
@@ -237,6 +264,8 @@ const PRESETS: &[ProviderPreset] = &[
         auth: "api_key",
         badge: "API Key",
         note: "Wafer-scale high-speed inference",
+        key_url: "https://cloud.cerebras.ai/platform",
+        sign_in: "",
     },
     ProviderPreset {
         id: "together",
@@ -254,6 +283,8 @@ const PRESETS: &[ProviderPreset] = &[
         auth: "api_key",
         badge: "API Key",
         note: "Open-weights cloud inference",
+        key_url: "https://api.together.ai/settings/api-keys",
+        sign_in: "",
     },
     ProviderPreset {
         id: "fireworks",
@@ -271,6 +302,88 @@ const PRESETS: &[ProviderPreset] = &[
         auth: "api_key",
         badge: "API Key",
         note: "Fast production open-model inference",
+        key_url: "https://app.fireworks.ai/settings/users/api-keys",
+        sign_in: "",
+    },
+    ProviderPreset {
+        id: "gemini",
+        label: "Google Gemini",
+        subtitle: "Gemini 2.5 Pro, Flash and newer, through Google's OpenAI-compatible endpoint",
+        base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+        kind: "gemini",
+        default_id: "gemini",
+        models: &["gemini-2.5-pro", "gemini-2.5-flash"],
+        secret_name: "gemini_api_key",
+        catalog_fetch: true,
+        auth: "api_key",
+        badge: "API Key",
+        note: "Gemini API key from Google AI Studio",
+        key_url: "https://aistudio.google.com/apikey",
+        sign_in: "",
+    },
+    ProviderPreset {
+        id: "perplexity",
+        label: "Perplexity",
+        subtitle: "Sonar models with live web search and citations",
+        base_url: "https://api.perplexity.ai",
+        kind: "perplexity",
+        default_id: "perplexity",
+        models: &["sonar", "sonar-pro", "sonar-reasoning-pro"],
+        secret_name: "perplexity_api_key",
+        catalog_fetch: true,
+        auth: "api_key",
+        badge: "API Key",
+        note: "Sonar models with web search",
+        key_url: "https://www.perplexity.ai/account/api/keys",
+        sign_in: "",
+    },
+    ProviderPreset {
+        id: "huggingface",
+        label: "Hugging Face",
+        subtitle: "Inference Providers router: open models from many hosts, one token",
+        base_url: "https://router.huggingface.co/v1",
+        kind: "huggingface",
+        default_id: "huggingface",
+        models: &["meta-llama/Llama-3.3-70B-Instruct", "Qwen/Qwen2.5-72B-Instruct"],
+        secret_name: "huggingface_api_key",
+        catalog_fetch: true,
+        auth: "api_key",
+        badge: "API Key",
+        note: "Hugging Face access token with inference permission",
+        key_url: "https://huggingface.co/settings/tokens",
+        sign_in: "",
+    },
+    ProviderPreset {
+        id: "nebius",
+        label: "Nebius Token Factory",
+        subtitle: "Open models on Nebius infrastructure",
+        base_url: "https://api.tokenfactory.nebius.com/v1",
+        kind: "nebius",
+        default_id: "nebius",
+        models: &["meta-llama/Llama-3.3-70B-Instruct"],
+        secret_name: "nebius_api_key",
+        catalog_fetch: true,
+        auth: "api_key",
+        badge: "API Key",
+        note: "Open models on Nebius infrastructure",
+        key_url: "https://tokenfactory.nebius.com",
+        sign_in: "",
+    },
+    ProviderPreset {
+        id: "sambanova",
+        label: "SambaNova Cloud",
+        subtitle: "Fast open-model inference on SambaNova chips",
+        base_url: "https://api.sambanova.ai/v1",
+        kind: "sambanova",
+        default_id: "sambanova",
+        models: &["Meta-Llama-3.3-70B-Instruct"],
+        secret_name: "sambanova_api_key",
+        catalog_fetch: true,
+        auth: "api_key",
+        badge: "API Key",
+        note: "Fast open-model inference on SambaNova chips",
+        key_url: "https://cloud.sambanova.ai/apis",
+        sign_in: "",
     },
     ProviderPreset {
         id: "muse-code",
@@ -285,20 +398,24 @@ const PRESETS: &[ProviderPreset] = &[
         auth: "oauth",
         badge: "OAuth",
         note: "Muse Spark OAuth device sign-in",
+        key_url: "",
+        sign_in: "device",
     },
     ProviderPreset {
         id: "ollama",
         label: "Ollama (Local)",
-        subtitle: "Local model server on 127.0.0.1:11434",
+        subtitle: "Your own Ollama server. No key needed. Change the address for another machine.",
         base_url: "http://127.0.0.1:11434/v1",
         kind: "openai-compatible",
         default_id: "ollama",
         models: &["llama3.3", "qwen2.5-coder:32b"],
         secret_name: "ollama_api_key",
-        catalog_fetch: false,
-        auth: "api_key",
+        catalog_fetch: true,
+        auth: "none",
         badge: "Local",
         note: "Local model server on 127.0.0.1:11434",
+        key_url: "",
+        sign_in: "",
     },
     ProviderPreset {
         id: "custom",
@@ -313,6 +430,8 @@ const PRESETS: &[ProviderPreset] = &[
         auth: "api_key",
         badge: "Custom",
         note: "Any /v1/chat/completions gateway or proxy",
+        key_url: "",
+        sign_in: "",
     },
 ];
 
@@ -341,7 +460,7 @@ mod tests {
             assert!(!preset.note.is_empty(), "{:?}", preset.id);
             assert!(!preset.badge.is_empty(), "{:?}", preset.id);
             assert!(
-                matches!(preset.auth, "api_key" | "oauth"),
+                matches!(preset.auth, "api_key" | "oauth" | "none"),
                 "{:?}",
                 preset.id
             );
@@ -404,6 +523,11 @@ mod tests {
                         | "together"
                         | "fireworks"
                         | "muse-code"
+                        | "gemini"
+                        | "perplexity"
+                        | "huggingface"
+                        | "nebius"
+                        | "sambanova"
                 ),
                 "{:?}",
                 preset.id
@@ -471,5 +595,38 @@ mod tests {
         for expected in ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4o-mini"] {
             assert!(openai.models.contains(&expected), "{expected}");
         }
+    }
+
+    #[test]
+    fn auth_is_honest_for_every_preset() {
+        for preset in presets() {
+            // Only these providers document a sign-in flow for apps.
+            let expected_sign_in = match preset.id {
+                "openrouter" => "pkce",
+                "antigravity" => "pkce_google",
+                "muse-code" => "device",
+                _ => "",
+            };
+            assert_eq!(preset.sign_in, expected_sign_in, "{:?}", preset.id);
+            match preset.auth {
+                // A key provider names the page where the key is created.
+                "api_key" if preset.id != "custom" => {
+                    assert!(preset.key_url.starts_with("https://"), "{:?}", preset.id)
+                }
+                // A sign-in-only provider has no key to get.
+                "oauth" => {
+                    assert!(!preset.sign_in.is_empty(), "{:?}", preset.id);
+                    assert!(preset.key_url.is_empty(), "{:?}", preset.id);
+                }
+                "none" => assert!(preset.key_url.is_empty(), "{:?}", preset.id),
+                _ => {}
+            }
+        }
+        // Key-only providers never claim a sign-in.
+        for id in ["openai", "mistral", "gemini", "perplexity", "huggingface"] {
+            let preset = preset_for(id).unwrap();
+            assert_eq!((preset.auth, preset.sign_in), ("api_key", ""), "{id}");
+        }
+        assert_eq!(preset_for("ollama").unwrap().auth, "none");
     }
 }
