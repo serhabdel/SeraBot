@@ -299,6 +299,27 @@ pub struct UsageRollup {
     pub totals: UsageTotals,
     pub per_day: Vec<UsageDay>,
     pub per_bot: Vec<UsageBot>,
+    pub per_model: Vec<UsageModel>,
+    pub tools: Vec<UsageTool>,
+}
+
+/// Calls and tokens of one provider/model pair.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct UsageModel {
+    pub provider: String,
+    pub model: String,
+    pub calls: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+}
+
+/// Completed and failed runs of one tool.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct UsageTool {
+    pub tool: String,
+    pub completed: i64,
+    pub failed: i64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -2705,17 +2726,30 @@ impl Store {
         bot: Option<&str>,
         conversation_id: Option<&str>,
     ) -> Result<UsageRollup> {
+        self.usage_rollup_for(Some(user_id), since, bot, conversation_id)
+    }
+
+    /// Same rollup, but `None` covers every user. Only the admin-gated
+    /// `scope=all` endpoint passes `None`; every other caller is scoped.
+    pub fn usage_rollup_for(
+        &self,
+        user_id: Option<&str>,
+        since: DateTime<Utc>,
+        bot: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Result<UsageRollup> {
         use rusqlite::types::Value as SqlValue;
 
-        let mut where_clause = String::from(
+        let mut tail = String::new();
+        let mut args: Vec<SqlValue> = vec![SqlValue::Text(to_string(since))];
+        if let Some(user_id) = user_id {
+            tail.push_str(" AND COALESCE(t.user_id, a.actor) = ?");
+            args.push(SqlValue::Text(user_id.to_owned()));
+        }
+        let mut where_clause = format!(
             " FROM audit_log a LEFT JOIN tasks t ON t.id = a.task_id
-              WHERE a.event = 'model.used' AND a.at >= ?2
-                AND COALESCE(t.user_id, a.actor) = ?1",
+              WHERE a.event = 'model.used' AND a.at >= ?1{tail}"
         );
-        let mut args: Vec<SqlValue> = vec![
-            SqlValue::Text(user_id.to_owned()),
-            SqlValue::Text(to_string(since)),
-        ];
         if let Some(bot) = bot {
             where_clause
                 .push_str(" AND COALESCE(t.bot, json_extract(a.details_json, '$.bot')) = ?");
@@ -2779,10 +2813,51 @@ impl Store {
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
+        let per_model = {
+            let sql = format!(
+                "SELECT COALESCE(json_extract(a.details_json, '$.provider'), 'unknown'),
+                        COALESCE(json_extract(a.details_json, '$.model'), 'unknown'), {token_sums}{where_clause}
+                 GROUP BY 1, 2 ORDER BY 6 DESC, 1 ASC, 2 ASC LIMIT 100"
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                Ok(UsageModel {
+                    provider: row.get(0)?,
+                    model: row.get(1)?,
+                    calls: row.get(2)?,
+                    prompt_tokens: row.get(3)?,
+                    completion_tokens: row.get(4)?,
+                    total_tokens: row.get(5)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let tools = {
+            let tool_where = where_clause.replace(
+                "a.event = 'model.used'",
+                "a.event IN ('tool.completed', 'tool.failed') AND a.tool IS NOT NULL",
+            );
+            let sql = format!(
+                "SELECT a.tool, COALESCE(SUM(a.event = 'tool.completed'), 0),
+                        COALESCE(SUM(a.event = 'tool.failed'), 0){tool_where}
+                 GROUP BY a.tool ORDER BY 2 + 3 DESC, a.tool ASC LIMIT 100"
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                Ok(UsageTool {
+                    tool: row.get(0)?,
+                    completed: row.get(1)?,
+                    failed: row.get(2)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
         Ok(UsageRollup {
             totals,
             per_day,
             per_bot,
+            per_model,
+            tools,
         })
     }
 

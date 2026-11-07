@@ -55,6 +55,8 @@ const SIGNED_OUT_OFFLINE: &str = "You are signed out on this device. The server 
 pub enum Theme {
     Dark,
     Light,
+    /// Follow the operating system.
+    System,
 }
 
 impl Theme {
@@ -62,13 +64,15 @@ impl Theme {
         match self {
             Self::Dark => "dark",
             Self::Light => "light",
+            Self::System => "system",
         }
     }
 
     pub fn from_stored(value: Option<&str>) -> Self {
         match value {
             Some("dark") => Self::Dark,
-            // Light is the default until the owner picks dark.
+            Some("system") => Self::System,
+            // Light is the default until the owner picks something else.
             _ => Self::Light,
         }
     }
@@ -76,7 +80,7 @@ impl Theme {
     pub fn toggled(self) -> Self {
         match self {
             Self::Dark => Self::Light,
-            Self::Light => Self::Dark,
+            Self::Light | Self::System => Self::Dark,
         }
     }
 }
@@ -123,11 +127,12 @@ pub enum Section {
     Approvals,
     Browser,
     Vault,
+    Usage,
     Settings,
 }
 
 impl Section {
-    pub const NAV: [Self; 8] = [
+    pub const NAV: [Self; 9] = [
         Self::Chat,
         Self::Conversations,
         Self::Browser,
@@ -136,6 +141,7 @@ impl Section {
         Self::Connectors,
         Self::Approvals,
         Self::Vault,
+        Self::Usage,
     ];
 
     pub fn label(self) -> &'static str {
@@ -148,8 +154,53 @@ impl Section {
             Self::Approvals => "Approvals",
             Self::Browser => "Browser",
             Self::Vault => "Vault",
+            Self::Usage => "Usage",
             Self::Settings => "Settings",
         }
+    }
+}
+
+/// The sections of the Settings page, in list order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsSection {
+    Account,
+    Appearance,
+    Notifications,
+    Chat,
+    Telegram,
+    Voice,
+    Admin,
+    About,
+}
+
+impl SettingsSection {
+    pub const ALL: [Self; 8] = [
+        Self::Account,
+        Self::Appearance,
+        Self::Notifications,
+        Self::Chat,
+        Self::Telegram,
+        Self::Voice,
+        Self::Admin,
+        Self::About,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Account => "Account",
+            Self::Appearance => "Appearance",
+            Self::Notifications => "Notifications",
+            Self::Chat => "Chat",
+            Self::Telegram => "Telegram",
+            Self::Voice => "Voice",
+            Self::Admin => "Admin",
+            Self::About => "About",
+        }
+    }
+
+    /// Only admins see the Admin section.
+    pub fn visible(self, is_admin: bool) -> bool {
+        self != Self::Admin || is_admin
     }
 }
 
@@ -463,6 +514,13 @@ pub struct Session {
     pub connect_error: Option<String>,
     pub connecting: bool,
     pub theme: Theme,
+    /// Device-local look and chat preferences (Settings page).
+    pub prefs: creds::UiPrefs,
+    pub settings_section: SettingsSection,
+    seen_approvals: Option<usize>,
+    /// Usage page range in days (7, 30 or 90) and whether a load is running.
+    pub usage_days: u32,
+    pub usage_loading: bool,
     /// Pinned bots/conversations shown in the inspector strip. Persisted in
     /// settings.json through [`creds::Settings::pins`].
     pub pins: Vec<String>,
@@ -561,6 +619,7 @@ impl Session {
             .unwrap_or_default();
         let worker = Worker::start().ok();
         let mut session = Self::assemble(server, theme, pins, token, worker);
+        session.prefs = settings.prefs.clone().unwrap_or_default().sanitized();
         if session.worker.is_some()
             && !session.server.trim().is_empty()
             && valid_token(&session.token)
@@ -595,7 +654,12 @@ impl Session {
             connect_error: None,
             connecting: false,
             theme,
+            prefs: creds::UiPrefs::default(),
+            settings_section: SettingsSection::Account,
+            seen_approvals: None,
             pins,
+            usage_days: 30,
+            usage_loading: false,
             section: Section::Chat,
             conversation: "windows-owner".into(),
             composer: String::new(),
@@ -843,6 +907,7 @@ impl Session {
             server: origin,
             theme: Some(self.theme.as_str().into()),
             pins: (!self.pins.is_empty()).then(|| self.pins.clone()),
+            prefs: Some(self.prefs.clone()),
         })
     }
 
@@ -859,6 +924,21 @@ impl Session {
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
         self.save_ui_settings();
+    }
+
+    /// Change the device preferences and persist them.
+    pub fn set_prefs(&mut self, prefs: creds::UiPrefs) {
+        self.prefs = prefs.sanitized();
+        self.save_ui_settings();
+    }
+
+    /// Toast when a new approval request appears, if the user asked for it.
+    fn note_approvals(&mut self) {
+        let count = self.state.approvals.len();
+        if self.prefs.notify_approvals && self.seen_approvals.is_some_and(|seen| count > seen) {
+            self.toast = Some("A bot is waiting for your OK.".into());
+        }
+        self.seen_approvals = Some(count);
     }
 
     /// Toggle a pinned bot id or conversation id. The id is validated
@@ -948,6 +1028,9 @@ impl Session {
         self.panel.set_page_open(section == Section::Browser);
         if section == Section::Vault {
             self.panel.ask_vault_list();
+        }
+        if section == Section::Usage {
+            self.load_usage_days(self.usage_days);
         }
         if section == Section::Settings {
             self.refresh_status();
@@ -1559,6 +1642,18 @@ impl Session {
         self.start_request(Operation::UpdateBotConfig { id, update });
     }
 
+    /// Usage page: pick a range (7, 30 or 90 days) and load it.
+    pub fn load_usage_days(&mut self, days: u32) {
+        let days = if matches!(days, 7 | 30 | 90) {
+            days
+        } else {
+            30
+        };
+        self.usage_days = days;
+        self.usage_loading = true;
+        self.load_usage(days);
+    }
+
     /// Load the token usage report for the last `days` days (1–365).
     pub fn load_usage(&mut self, days: u32) {
         self.load_usage_scoped(days, None, None);
@@ -2148,6 +2243,7 @@ impl Session {
                         );
                 }
                 Err(error) => {
+                    self.usage_loading = false;
                     let message = error.to_string();
                     let rate_limited = error == ApiError::Http(429);
                     self.state.fail(&completion.scope, completion.kind, error);
@@ -2247,6 +2343,9 @@ impl Session {
                     };
                     if !self.state.receive(&completion.scope, reply) {
                         continue;
+                    }
+                    if matches!(completion.kind, OperationKind::Approvals) {
+                        self.note_approvals();
                     }
                     match completion.kind {
                         OperationKind::Health if self.state.connected => {
@@ -2541,7 +2640,7 @@ impl Session {
                         // The detail is cached in the state; nothing else to do.
                         OperationKind::BotDetail => {}
                         // The usage report is cached in the state.
-                        OperationKind::Usage => {}
+                        OperationKind::Usage => self.usage_loading = false,
                         OperationKind::BotConfigWrite => {
                             if let Some((id, update)) = bot_config {
                                 // Optimistic update of the cached detail; the
@@ -2620,7 +2719,7 @@ impl Session {
             Section::Providers => (!self.state.providers_loaded).then_some(Operation::Providers),
             Section::Connectors => (!self.state.connectors_loaded).then_some(Operation::Connectors),
             Section::Approvals => (!self.state.approvals_loaded).then_some(Operation::Approvals),
-            Section::Browser | Section::Vault | Section::Settings => None,
+            Section::Browser | Section::Vault | Section::Usage | Section::Settings => None,
         }
     }
 
@@ -3732,12 +3831,33 @@ fn parse_rfc3339_unix(stamp: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::SettingsSection;
     use super::{
         AtomicBool, Duration, EventRefresh, Instant, Ordering, Session, SignInPhase, SignInUi,
         Theme, event_refresh, telegram_error,
     };
     use crate::ApiError;
     use std::sync::Arc;
+
+    #[test]
+    fn admin_settings_section_is_hidden_from_members() {
+        let count = |admin| {
+            SettingsSection::ALL
+                .iter()
+                .filter(|section| section.visible(admin))
+                .count()
+        };
+        assert_eq!(count(true), 8);
+        assert_eq!(count(false), 7);
+        assert!(!SettingsSection::Admin.visible(false));
+    }
+
+    #[test]
+    fn system_theme_round_trips_and_toggles_to_dark() {
+        assert_eq!(Theme::from_stored(Some("system")), Theme::System);
+        assert_eq!(Theme::System.as_str(), "system");
+        assert_eq!(Theme::System.toggled(), Theme::Dark);
+    }
 
     #[test]
     fn a_team_event_refreshes_the_team_only_in_a_room() {

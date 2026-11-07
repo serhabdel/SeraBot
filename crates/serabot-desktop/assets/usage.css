@@ -1,0 +1,78 @@
+
+/* Usage page (0.17). Tokens only; nothing here hard-codes a colour. */
+.usage-range {
+  flex: 0 0 auto;
+}
+
+.usage-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
+}
+
+.usage-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 14px 16px;
+  border-radius: var(--r-md);
+  background: var(--card-bg);
+  border: 1px solid var(--glass-edge);
+}
+
+.usage-tile-label {
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+}
+
+.usage-tile-value {
+  color: var(--label-1);
+  font-size: var(--fs-display);
+  font-weight: 600;
+}
+
+.usage-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 140px;
+  padding-top: 8px;
+}
+
+.usage-bar-col {
+  flex: 1;
+  min-width: 3px;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+}
+
+.usage-bar {
+  width: 100%;
+  border-radius: var(--r-xs) var(--r-xs) 0 0;
+  background: var(--accent);
+}
+
+.usage-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-body-2);
+}
+
+.usage-table th,
+.usage-table td {
+  padding: 8px 6px;
+  text-align: left;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.usage-table th {
+  color: var(--label-2);
+  font-weight: 500;
+  font-size: var(--fs-caption);
+}
+
+.usage-table .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
