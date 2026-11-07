@@ -1342,6 +1342,12 @@ pub struct MemoryConfig {
     /// Upper bound for the background extraction and summary call.
     #[serde(default = "default_extract_timeout")]
     pub extract_timeout_secs: u64,
+    /// Model for extraction and summaries. Unset: the bot's own model.
+    #[serde(default)]
+    pub extract_model: Option<String>,
+    /// Minimum seconds between two extraction runs for one user (0..=3600).
+    #[serde(default = "default_extract_min_interval")]
+    pub extract_min_interval_secs: u64,
 }
 
 impl Default for MemoryConfig {
@@ -1354,6 +1360,8 @@ impl Default for MemoryConfig {
             mem0_api_base: default_mem0_base(),
             mem0_timeout_secs: default_mem0_timeout(),
             extract_timeout_secs: default_extract_timeout(),
+            extract_model: None,
+            extract_min_interval_secs: default_extract_min_interval(),
         }
     }
 }
@@ -1390,6 +1398,18 @@ impl MemoryConfig {
                 "memory.extract_timeout_secs must be 5..=120".into(),
             ));
         }
+        if !(0..=3600).contains(&self.extract_min_interval_secs) {
+            return Err(SeraError::Config(
+                "memory.extract_min_interval_secs must be 0..=3600".into(),
+            ));
+        }
+        if let Some(model) = &self.extract_model
+            && (model.is_empty() || model.len() > 128 || model.chars().any(char::is_whitespace))
+        {
+            return Err(SeraError::Config(
+                "memory.extract_model must be a model id without spaces".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -1420,6 +1440,10 @@ fn default_mem0_timeout() -> u64 {
 
 fn default_extract_timeout() -> u64 {
     45
+}
+
+fn default_extract_min_interval() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

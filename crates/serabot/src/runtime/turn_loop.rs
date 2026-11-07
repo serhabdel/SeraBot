@@ -544,7 +544,15 @@ impl Runtime {
                     && !state.ask_mode
                     && let Some(owner) = extract::owner_text(&state.messages)
                 {
-                    self.spawn_post_turn_memory(&user, &turn.bot, conversation_id, owner, &text);
+                    let untrusted = extract::turn_used_untrusted_source(&state.messages);
+                    self.spawn_post_turn_memory(
+                        &user,
+                        &turn.bot,
+                        conversation_id,
+                        owner,
+                        &text,
+                        untrusted,
+                    );
                 }
                 return Ok(TurnOutcome::Completed);
             }

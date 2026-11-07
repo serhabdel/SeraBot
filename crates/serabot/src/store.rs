@@ -569,9 +569,9 @@ impl Store {
             crate::memory::backfill_content_hashes(&connection)?;
             connection.pragma_update(None, "user_version", 26)?;
         }
-        // VACUUM INTO (backups) may renumber rowids; the external-content
-        // FTS index must match them again on every open.
-        crate::memory::rebuild_fts(&connection)?;
+        // VACUUM INTO (backups) may renumber rowids; rebuild the external-content
+        // FTS index only when its row count no longer matches `memories`.
+        crate::memory::refresh_fts_if_stale(&connection);
         let stored_dimension: Option<String> = connection
             .query_row(
                 "SELECT value FROM kv WHERE key = 'embedding_dimension'",

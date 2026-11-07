@@ -2622,6 +2622,31 @@ impl ApiClient {
         Ok(response.memory)
     }
 
+    /// Approve (`active`) or archive (`superseded`) a held memory.
+    pub fn set_memory_status(&self, id: &str, status: &str) -> Result<MemoryEntry, ApiError> {
+        if !valid_memory_id(id) {
+            return Err(ApiError::Validation("Invalid memory id."));
+        }
+        if !matches!(status, "active" | "superseded") {
+            return Err(ApiError::Validation("Invalid memory status."));
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            status: &'a str,
+        }
+        let response: MemoryEnvelope = self.request(
+            Method::PATCH,
+            &["v1", "memories", id],
+            &[],
+            Some(&Body { status }),
+        )?;
+        check_memory(&response.memory)?;
+        if response.memory.id != id {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(response.memory)
+    }
+
     pub fn memory_stats(&self) -> Result<MemoryStatsView, ApiError> {
         #[derive(Deserialize)]
         struct Envelope {

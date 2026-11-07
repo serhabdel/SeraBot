@@ -87,11 +87,27 @@ as every model request.
   digit runs, and long hex strings. Blocklisted text is dropped too.
 - The `memory.extracted` audit row records counts only, never text. The console
   shows the last run.
-- Owner messages under 12 characters, ask-mode turns, handoffs, and team turns
-  are not extracted from.
+- Owner messages under 12 characters, slash commands, pure questions (ending in
+  `?` with no first-person statement such as I, my, me, je, mon, nous), ask-mode
+  turns, handoffs, and team turns are not extracted from.
+- The owner's message is the primary source. The assistant reply is context
+  only. If the turn called a tool that reads outside content (`fetch_url`,
+  `rag_search`, `browser_*`, `firecrawl_*`, `tavily_*`, `composio_*`, `pdf_*`,
+  `docx_*`, `xlsx_*`, `pptx_*`, `local_read`, and similar), the extracted facts
+  are stored `pending`. Pending facts are never recalled until the owner approves
+  them on the Memory page ("To review" chip, Approve or Discard).
+- Cost controls: one post-turn job per user at a time (a turn that finds one
+  running is skipped), and at most one extraction per user every
+  `memory.extract_min_interval_secs` (default 60). `memory.extract_model`
+  routes extraction and summaries to a named model; unset, they use the bot's
+  own model.
 
 Extraction failures (provider errors, timeouts, malformed output) are logged
 without content and do not affect the turn.
+
+Model-initiated writes (`memory_save`, `memory_update`) refuse credential-shaped
+text with "That looks like a credential; store it in the Vault instead." The
+owner API and console are not affected by that check.
 
 ## Session summaries
 
@@ -137,6 +153,8 @@ provider = "builtin"        # "builtin" (default) or "mem0"
 auto_extract = true         # background extraction after owner turns
 recall_k = 8                # facts per turn, 1..=20
 summary_every = 30          # 0 = off, otherwise 10..=500
+# extract_model = "model-id"              # unset: the bot's own model
+# extract_min_interval_secs = 60          # 0..=3600 between extractions per user
 # mem0_api_base = "https://api.mem0.ai"   # https, or http on loopback
 # mem0_timeout_secs = 8                   # 2..=30
 # extract_timeout_secs = 45               # 5..=120
@@ -172,8 +190,10 @@ Migration `0026_memory_v2.sql` adds the provenance, status, importance, and
 recall columns to `memories`, creates the external-content FTS5 table
 `memories_fts` (tokenizer `unicode61 remove_diacritics 2`) with insert, update,
 and delete triggers, and creates `session_summaries`. The store backfills
-`content_hash` for existing rows and rebuilds the FTS index on every open,
-because `VACUUM INTO` backups may renumber rowids.
+`content_hash` for existing rows. On open it rebuilds the FTS index only when
+its row count differs from `memories` (a restored or renumbered database). A
+failed check or rebuild is logged and never stops startup. A stale index with
+equal counts is not detected.
 
 ## Shortcuts and known gaps
 
@@ -182,6 +202,7 @@ because `VACUUM INTO` backups may renumber rowids.
   tokens are not found, and CJK text with single-character tokens is only matched
   by the tokenizer's own rules.
 - Query tokens shorter than two characters are ignored.
-- The `pending` status is reserved for a review queue. Nothing writes it yet.
+- Facts from untrusted-source turns are the only pending rows. The untrusted
+  tool list is a name-based heuristic, so a new reader tool must be added to it.
 - Bot template changes reach a user's fleet only when the fleet is re-seeded;
   existing bot rows keep their stored tool lists.

@@ -4948,6 +4948,7 @@ const MEMORY_FILTERS: &[(&str, &str)] = &[
     ("saved", "Saved"),
     ("learned", "Learned"),
     ("superseded", "Superseded"),
+    ("review", "To review"),
 ];
 
 /// One memory card, prepared before rendering so the markup stays plain.
@@ -4958,6 +4959,8 @@ struct MemoryRow {
     kind: String,
     origin: &'static str,
     superseded: bool,
+    pending: bool,
+    delete_label: &'static str,
     bot: Option<String>,
     importance: String,
     created: String,
@@ -4977,6 +4980,12 @@ fn memory_rows(memories: &[MemoryEntry]) -> Vec<MemoryRow> {
                 "Saved"
             },
             superseded: memory.status == "superseded",
+            pending: memory.status == "pending",
+            delete_label: if memory.status == "pending" {
+                "Discard"
+            } else {
+                "Delete"
+            },
             bot: memory.bot.clone(),
             importance: format!(
                 "{:.0}% important",
@@ -5121,6 +5130,9 @@ fn MemoryView(session: Signal<Session>) -> Element {
                                 if memory.superseded {
                                     span { class: "chip", "Superseded" }
                                 }
+                                if memory.pending {
+                                    span { class: "chip accent", "To review" }
+                                }
                                 span { class: "tiny", "{memory.importance}" }
                             }
                             if editing.as_deref() == Some(memory.id.as_str()) {
@@ -5144,6 +5156,16 @@ fn MemoryView(session: Signal<Session>) -> Element {
                             } else {
                                 p { "{memory.content}" }
                                 p { class: "tiny", "{memory.created} · {memory.recalled}" }
+                                if memory.pending {
+                                    button {
+                                        class: "btn primary sm",
+                                        onclick: {
+                                            let id = memory.id.clone();
+                                            move |_| session.write().approve_memory(id.clone())
+                                        },
+                                        "Approve"
+                                    }
+                                }
                                 button {
                                     class: "btn ghost sm",
                                     onclick: {
@@ -5170,7 +5192,7 @@ fn MemoryView(session: Signal<Session>) -> Element {
                                         let id = memory.id.clone();
                                         move |_| session.write().memory.delete_confirm = Some(id.clone())
                                     },
-                                    "Delete"
+                                    "{memory.delete_label}"
                                 }
                             }
                         }

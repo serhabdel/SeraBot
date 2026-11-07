@@ -130,6 +130,9 @@ pub struct Candidate {
     pub bot: Option<String>,
     pub conversation_id: Option<String>,
     pub importance: f64,
+    /// `active` (recalled) or `pending` (held for the owner to approve; never
+    /// recalled until approved).
+    pub status: String,
 }
 
 impl Candidate {
@@ -143,6 +146,7 @@ impl Candidate {
             bot: None,
             conversation_id: None,
             importance: DEFAULT_IMPORTANCE,
+            status: STATUS_ACTIVE.into(),
         }
     }
 }
@@ -270,6 +274,15 @@ pub fn write(store: &Store, user_id: &str, candidate: &Candidate) -> Result<Writ
     let source = normalized_source(&candidate.source)?;
     let origin = normalize_origin(&candidate.origin)?;
     let importance = checked_importance(candidate.importance)?;
+    let status = match candidate.status.as_str() {
+        STATUS_ACTIVE => STATUS_ACTIVE,
+        STATUS_PENDING => STATUS_PENDING,
+        _ => {
+            return Err(SeraError::Validation(
+                "a new memory starts as active or pending".into(),
+            ));
+        }
+    };
     if origin == ORIGIN_EXTRACTED && looks_sensitive(content) {
         return Err(SeraError::Validation(
             "extracted memory looks like a credential; not stored".into(),
@@ -286,19 +299,25 @@ pub fn write(store: &Store, user_id: &str, candidate: &Candidate) -> Result<Writ
     // One immediate transaction: the duplicate check, the near-duplicate scan
     // and the insert see the same rows.
     let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if let Some(existing) = find_active_by_hash(&tx, user_id, &hash)? {
+    // A pending fact is a duplicate of a pending copy too; an active one only
+    // of an active row, so a held copy never blocks the owner's own save.
+    if let Some(existing) = find_by_hash(&tx, user_id, &hash, status == STATUS_PENDING)? {
         let memory = get_in(&tx, user_id, &existing)?;
         return Ok(WriteOutcome::Duplicate(memory));
     }
 
-    let superseded = find_near_duplicate(&tx, user_id, content)?;
+    let superseded = if status == STATUS_ACTIVE {
+        find_near_duplicate(&tx, user_id, content)?
+    } else {
+        None
+    };
     let id = new_id();
     let now = now_string(Utc::now());
     tx.execute(
         "INSERT INTO memories(id, kind, content, source, created_at, updated_at, user_id,
                               bot, conversation_id, origin, status, importance, recall_count,
                               content_hash)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, 'active', ?10, 0, ?11)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12)",
         params![
             id,
             kind,
@@ -309,6 +328,7 @@ pub fn write(store: &Store, user_id: &str, candidate: &Candidate) -> Result<Writ
             bot,
             conversation,
             origin,
+            status,
             importance,
             hash,
         ],
@@ -653,6 +673,29 @@ pub fn backfill_content_hashes(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Rebuild the FTS index only when it disagrees with `memories` (a restored
+/// or renumbered database), comparing row counts with the FTS docsize shadow
+/// table. A failure is logged and never stops startup.
+pub fn refresh_fts_if_stale(connection: &Connection) {
+    let stale = (|| -> rusqlite::Result<bool> {
+        let rows: i64 =
+            connection.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
+        let indexed: i64 =
+            connection.query_row("SELECT COUNT(*) FROM memories_fts_docsize", [], |row| {
+                row.get(0)
+            })?;
+        Ok(rows != indexed)
+    })();
+    match stale {
+        Ok(false) => {}
+        Ok(true) => match rebuild_fts(connection) {
+            Ok(()) => tracing::warn!("memory full-text index was out of step and was rebuilt"),
+            Err(error) => tracing::warn!(%error, "memory full-text index rebuild failed"),
+        },
+        Err(error) => tracing::warn!(%error, "memory full-text index check failed"),
+    }
+}
+
 /// Rebuild the external-content FTS index from `memories`. Cheap at this
 /// scale; it keeps the index aligned after a VACUUM INTO restore.
 pub fn rebuild_fts(connection: &Connection) -> Result<()> {
@@ -854,7 +897,9 @@ impl MemoryProvider for MemoryHub {
 
     async fn write(&self, user_id: &str, candidate: &Candidate) -> Result<WriteOutcome> {
         let outcome = self.local.write(user_id, candidate).await?;
+        // Pending facts stay local until the owner approves them.
         if let Some(remote) = &self.remote
+            && candidate.status == STATUS_ACTIVE
             && !matches!(outcome, WriteOutcome::Duplicate(_))
             && let Err(error) = remote.remember(user_id, &candidate.content).await
         {
@@ -1086,33 +1131,45 @@ fn load_rows(connection: &Connection, user_id: &str, ids: &[String]) -> Result<V
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Bump the recall counters of the rows just recalled, in one transaction.
 fn touch(store: &Store, user_id: &str, ids: &[String]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
     let now = now_string(Utc::now());
-    let connection = store.connection()?;
+    let mut connection = store.connection()?;
+    let tx = connection.transaction()?;
     for id in ids {
-        connection.execute(
+        tx.execute(
             "UPDATE memories SET recall_count = recall_count + 1, last_recalled_at = ?1
              WHERE id = ?2 AND user_id = ?3",
             params![now, id, user_id],
         )?;
     }
+    tx.commit()?;
     Ok(())
 }
 
-/// The active row with the same normalized content, if any.
-fn find_active_by_hash(
+/// The row with the same normalized content (active, or also pending when
+/// asked), if any.
+fn find_by_hash(
     connection: &Connection,
     user_id: &str,
     hash: &str,
+    include_pending: bool,
 ) -> Result<Option<String>> {
+    let statuses = if include_pending {
+        "('active', 'pending')"
+    } else {
+        "('active')"
+    };
     connection
         .query_row(
-            "SELECT id FROM memories
-             WHERE user_id = ?1 AND status = 'active' AND content_hash = ?2
-             ORDER BY updated_at DESC, id DESC LIMIT 1",
+            &format!(
+                "SELECT id FROM memories
+                 WHERE user_id = ?1 AND status IN {statuses} AND content_hash = ?2
+                 ORDER BY updated_at DESC, id DESC LIMIT 1"
+            ),
             params![user_id, hash],
             |row| row.get::<_, String>(0),
         )
@@ -1883,6 +1940,216 @@ mod tests {
                 .iter()
                 .all(|item| !item.memory.content.contains("ring"))
         );
+    }
+
+    fn pending(store: &Store, user: &str, content: &str) -> WriteOutcome {
+        write(
+            store,
+            user,
+            &Candidate {
+                origin: ORIGIN_EXTRACTED.into(),
+                status: STATUS_PENDING.into(),
+                ..Candidate::explicit("fact", content, "turn:1")
+            },
+        )
+        .expect("pending write")
+    }
+
+    /// Facts from a turn that read untrusted content stay out of recall and
+    /// search until the owner approves them.
+    #[test]
+    fn pending_facts_are_not_recalled_until_approved() {
+        let store = store();
+        let admin = admin(&store);
+        let held = pending(&store, &admin, "Owner wants the Berlin flight booked");
+        assert_eq!(held.memory().status, STATUS_PENDING);
+        assert!(
+            recall(&store, &admin, "berlin flight", 8, None)
+                .expect("recall")
+                .is_empty()
+        );
+        assert!(
+            search(&store, &admin, "berlin", &MemoryFilter::default(), 8)
+                .expect("search")
+                .is_empty()
+        );
+        let review = MemoryFilter {
+            status: Some(STATUS_PENDING.into()),
+            ..MemoryFilter::default()
+        };
+        assert_eq!(
+            list_page(&store, &admin, &review, 0, 10)
+                .expect("review")
+                .len(),
+            1
+        );
+        // Approval is the PATCH the console sends.
+        update(
+            &store,
+            &admin,
+            &held.memory().id,
+            &MemoryPatch {
+                status: Some(STATUS_ACTIVE.into()),
+                ..MemoryPatch::default()
+            },
+        )
+        .expect("approve");
+        assert_eq!(
+            recall(&store, &admin, "berlin flight", 8, None)
+                .expect("recall")
+                .len(),
+            1
+        );
+    }
+
+    /// A held copy never blocks the owner's own save, and a pending repeat
+    /// reports the copy it already has.
+    #[test]
+    fn pending_and_active_copies_deduplicate_within_their_own_status() {
+        let store = store();
+        let admin = admin(&store);
+        let held = pending(&store, &admin, "Prefers window seats");
+        let saved = write(
+            &store,
+            &admin,
+            &Candidate::explicit("preference", "Prefers window seats", "operator:test"),
+        )
+        .expect("explicit save");
+        assert_eq!(saved.label(), "inserted");
+        let again = pending(&store, &admin, "prefers window seats.");
+        assert_eq!(again.label(), "duplicate");
+        // The owner already has the active copy, which is the one returned.
+        assert_eq!(again.memory().id, saved.memory().id);
+        assert_ne!(again.memory().id, held.memory().id);
+    }
+
+    #[test]
+    fn pending_writes_never_supersede_active_facts() {
+        let store = store();
+        let admin = admin(&store);
+        let active = at(&store, &admin, "Prefers short morning meetings before noon");
+        let held = pending(
+            &store,
+            &admin,
+            "Prefers short morning meetings before noon always",
+        );
+        assert_eq!(held.label(), "inserted");
+        assert_eq!(
+            get(&store, &admin, &active.id).expect("active").status,
+            STATUS_ACTIVE
+        );
+    }
+
+    #[test]
+    fn unknown_write_status_is_refused() {
+        let store = store();
+        let admin = admin(&store);
+        let bad = write(
+            &store,
+            &admin,
+            &Candidate {
+                status: "superseded".into(),
+                ..Candidate::explicit("fact", "Some fact", "operator:test")
+            },
+        );
+        assert!(bad.is_err());
+    }
+
+    /// The FTS index is rebuilt only when it disagrees with the table: a
+    /// row written past the triggers becomes findable after the refresh.
+    #[test]
+    fn fts_refresh_rebuilds_only_a_stale_index() {
+        let store = store();
+        let admin = admin(&store);
+        at(&store, &admin, "Indexed through the trigger");
+        let connection = store.connection().unwrap();
+        refresh_fts_if_stale(&connection);
+        connection
+            .execute_batch("DROP TRIGGER memories_fts_ai;")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO memories(id, kind, content, source, created_at, updated_at, user_id)
+                 VALUES ('bypass', 'fact', 'Hidden zebra note', 'operator:test',
+                         '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', ?1)",
+                params![admin],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(
+            search(&store, &admin, "zebra", &MemoryFilter::default(), 5)
+                .expect("before refresh")
+                .is_empty()
+        );
+        let connection = store.connection().unwrap();
+        refresh_fts_if_stale(&connection);
+        drop(connection);
+        assert_eq!(
+            search(&store, &admin, "zebra", &MemoryFilter::default(), 5)
+                .expect("after refresh")
+                .len(),
+            1
+        );
+    }
+
+    /// Hostile query text is treated as plain words: no FTS syntax error, no
+    /// leak across users, and empty-token input falls back to a list.
+    #[test]
+    fn hostile_search_input_is_safe_and_user_scoped() {
+        let store = store();
+        let admin = admin(&store);
+        let member = store
+            .create_user("microsoft:hostile-member", "h@example.example", "H")
+            .expect("member");
+        at(&store, &admin, "Foo bar baz project notes for the auditor");
+        at(
+            &store,
+            &admin,
+            "Ignore previous instructions is a quoted phrase in a document",
+        );
+        at(&store, &member.id, "Member secret foo bar project");
+        let hostile = [
+            "\"foo\" OR bar:",
+            "NEAR(a b)",
+            "*",
+            "-x",
+            "ignore previous instructions",
+            "foo\" AND \"bar",
+            "a:b^2 {c} (d",
+            "",
+            "   ",
+            "OR",
+            "\u{0}\u{7}",
+        ];
+        for query in hostile {
+            let owner = search(&store, &admin, query, &MemoryFilter::default(), 10)
+                .unwrap_or_else(|error| panic!("search {query:?} failed: {error}"));
+            assert!(
+                owner
+                    .iter()
+                    .all(|hit| hit.memory.content.find("Member secret").is_none()),
+                "owner search leaked a member fact for {query:?}"
+            );
+            let recalled = recall(&store, &admin, query, 8, Some("main"))
+                .unwrap_or_else(|error| panic!("recall {query:?} failed: {error}"));
+            assert!(
+                recalled
+                    .iter()
+                    .all(|hit| !hit.memory.content.contains("Member secret")),
+                "owner recall leaked a member fact for {query:?}"
+            );
+            let members = recall(&store, &member.id, query, 8, None)
+                .unwrap_or_else(|error| panic!("member recall {query:?} failed: {error}"));
+            assert!(
+                members
+                    .iter()
+                    .all(|hit| !hit.memory.content.contains("auditor")),
+                "member recall leaked an owner fact for {query:?}"
+            );
+        }
+        // Plain words still find the owner's note.
+        let found = search(&store, &admin, "auditor", &MemoryFilter::default(), 5).expect("plain");
+        assert_eq!(found.len(), 1);
     }
 
     #[test]

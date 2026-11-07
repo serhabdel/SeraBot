@@ -165,6 +165,7 @@ pub struct Runtime {
     worker_id: String,
     shutdown: CancellationToken,
     memory: MemoryHub,
+    extract_gate: Arc<extract::ExtractGate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +220,13 @@ impl Runtime {
         }
         let semaphore = Arc::new(Semaphore::new(config.runtime.max_concurrent_turns));
         let memory = MemoryHub::new(&config.memory, gateway.clone())?;
+        if let Some(model) = &config.memory.extract_model
+            && router.provider_for_model(model).is_none()
+        {
+            return Err(SeraError::Config(format!(
+                "memory.extract_model {model} is not served by any configured provider"
+            )));
+        }
         Ok(Self {
             config,
             store,
@@ -230,6 +238,7 @@ impl Runtime {
             worker_id: format!("worker-{}", &uuid::Uuid::new_v4().to_string()[..8]),
             shutdown,
             memory,
+            extract_gate: Arc::new(extract::ExtractGate::default()),
         })
     }
 

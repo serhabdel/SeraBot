@@ -291,6 +291,7 @@ pub fn memory_filter_params(filter: &str) -> (&'static str, &'static str) {
         "saved" => ("explicit", "active"),
         "learned" => ("extracted", "active"),
         "superseded" => ("all", "superseded"),
+        "review" => ("all", "pending"),
         _ => ("all", "active"),
     }
 }
@@ -2814,7 +2815,8 @@ impl Session {
                         }
                         OperationKind::AddMemory
                         | OperationKind::DeleteMemory
-                        | OperationKind::UpdateMemory => {
+                        | OperationKind::UpdateMemory
+                        | OperationKind::SetMemoryStatus => {
                             if completion.kind == OperationKind::AddMemory {
                                 self.memory.content.zeroize();
                             }
@@ -3555,6 +3557,14 @@ impl Session {
         self.memory.edit_content = content.to_owned();
         self.memory.editing = Some(id);
         self.memory.delete_confirm = None;
+    }
+
+    /// Approve a held memory: it becomes active and can be recalled.
+    pub fn approve_memory(&mut self, id: String) {
+        self.start_request(Operation::SetMemoryStatus {
+            id,
+            status: "active".into(),
+        });
     }
 
     pub fn cancel_memory_edit(&mut self) {

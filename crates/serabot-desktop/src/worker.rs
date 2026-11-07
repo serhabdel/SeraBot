@@ -45,6 +45,7 @@ pub enum OperationKind {
     ListMemories,
     AddMemory,
     UpdateMemory,
+    SetMemoryStatus,
     DeleteMemory,
     MemoryStats,
     Providers,
@@ -152,6 +153,10 @@ pub enum Operation {
     UpdateMemory {
         id: String,
         content: Zeroizing<String>,
+    },
+    SetMemoryStatus {
+        id: String,
+        status: String,
     },
     DeleteMemory {
         id: String,
@@ -297,6 +302,7 @@ impl Operation {
             Self::ListMemories { .. } => OperationKind::ListMemories,
             Self::AddMemory { .. } => OperationKind::AddMemory,
             Self::UpdateMemory { .. } => OperationKind::UpdateMemory,
+            Self::SetMemoryStatus { .. } => OperationKind::SetMemoryStatus,
             Self::DeleteMemory { .. } => OperationKind::DeleteMemory,
             Self::MemoryStats => OperationKind::MemoryStats,
             Self::Providers => OperationKind::Providers,
@@ -677,6 +683,9 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::UpdateMemory { id, content } => {
             client.update_memory(id, content).map(Reply::UpdatedMemory)
         }
+        Operation::SetMemoryStatus { id, status } => client
+            .set_memory_status(id, status)
+            .map(Reply::UpdatedMemory),
         Operation::DeleteMemory { id } => client
             .delete_memory(id)
             .map(|_| Reply::DeletedMemory(id.clone())),

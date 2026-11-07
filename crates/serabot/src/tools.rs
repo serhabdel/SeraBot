@@ -401,6 +401,17 @@ impl Tool for DocumentIndexTool {
     }
 }
 
+/// Model-initiated memory writes never store credentials: those belong in the
+/// Vault. The owner API and console are not affected by this check.
+fn reject_credential_text(content: &str) -> Result<()> {
+    if crate::memory::looks_sensitive(content) {
+        return Err(SeraError::Validation(
+            "That looks like a credential; store it in the Vault instead.".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn normalize_memory_category(cat: &str) -> &'static str {
     match cat.trim().to_ascii_lowercase().as_str() {
         "preference" => "preference",
@@ -479,6 +490,7 @@ impl Tool for MemorySaveTool {
                 SeraError::Validation("importance must be a number between 0 and 1".into())
             })?,
         };
+        reject_credential_text(content)?;
         let source = format!("chat:{}", context.bot);
         let candidate = crate::memory::Candidate {
             kind: kind.into(),
@@ -488,6 +500,7 @@ impl Tool for MemorySaveTool {
             bot: Some(context.bot.clone()),
             conversation_id: context.conversation_id.clone(),
             importance,
+            status: crate::memory::STATUS_ACTIVE.into(),
         };
         // A repeat of a saved fact is reported, not stored twice; a near
         // repeat replaces the older wording (see `memory::write`).
@@ -790,6 +803,7 @@ impl Tool for MemoryUpdateTool {
                 "content exceeds 2000 characters".into(),
             ));
         }
+        reject_credential_text(content)?;
         let memory = crate::memory::update_content(&self.store, &context.user_id, id, content)?;
         self.store.record_audit(
             &context.actor,
@@ -1165,5 +1179,63 @@ mod memory_tool_tests {
             .await
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod memory_credential_guard_tests {
+    use super::*;
+    use crate::gateway::ToolContext;
+    use std::collections::HashSet;
+
+    fn context(user: &str) -> ToolContext {
+        ToolContext {
+            user_id: user.into(),
+            actor: user.into(),
+            bot: "main".into(),
+            task_id: None,
+            turn_id: None,
+            conversation_id: Some("dir:main".into()),
+            allowed_tools: HashSet::new(),
+            require_approval: HashSet::new(),
+        }
+    }
+
+    /// Model-initiated writes refuse credential-shaped text with a pointer to
+    /// the Vault, and store nothing.
+    #[tokio::test]
+    async fn model_writes_refuse_credentials_and_point_to_the_vault() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let save = MemorySaveTool::new(store.clone());
+        let error = save
+            .execute(
+                json!({"content": "The portal password is hunter2"}),
+                &context(&admin),
+            )
+            .await
+            .expect_err("credential refused");
+        assert!(
+            error
+                .to_string()
+                .contains("That looks like a credential; store it in the Vault instead."),
+            "{error}"
+        );
+        assert!(crate::memory::list(&store, &admin, 10).unwrap().is_empty());
+
+        let memory =
+            crate::memory::add(&store, &admin, "fact", "Lives in Rome", "operator:test").unwrap();
+        let update = MemoryUpdateTool::new(store.clone());
+        assert!(
+            update
+                .execute(
+                    json!({"id": memory.id, "content": "API key sk-live_abcdef123456789"}),
+                    &context(&admin),
+                )
+                .await
+                .is_err()
+        );
+        let stored = crate::memory::get(&store, &admin, &memory.id).unwrap();
+        assert_eq!(stored.content, "Lives in Rome");
     }
 }
