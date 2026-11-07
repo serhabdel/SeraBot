@@ -900,7 +900,10 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
                 let fw = l_trim.split_whitespace().next().unwrap_or("");
                 if l_trim.is_empty() && !items.is_empty() {
                     // A blank line inside a loose list keeps it one list.
-                    let next = lines[i + 1..].iter().map(|l| l.trim()).find(|l| !l.is_empty());
+                    let next = lines[i + 1..]
+                        .iter()
+                        .map(|l| l.trim())
+                        .find(|l| !l.is_empty());
                     let continues = next.is_some_and(|l| {
                         let w = l.split_whitespace().next().unwrap_or("");
                         w.ends_with('.')
@@ -2669,11 +2672,10 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         .and_then(|task| (!task.status.terminal()).then_some(task.status));
     let (steps, steps_summary, sending) = {
         let state = session.read();
-        let sending = state
-            .state
-            .messages
-            .last()
-            .is_some_and(|message| message.role == Role::User && message.id.starts_with("opt-"));
+        let sending =
+            state.state.messages.last().is_some_and(|message| {
+                message.role == Role::User && message.id.starts_with("opt-")
+            });
         (
             state.state.activity.steps.clone(),
             state.state.activity.summary(),
@@ -5933,8 +5935,10 @@ mod tests {
 
     #[test]
     fn ordered_lists_keep_their_start_number_and_loose_items() {
-        let blocks = parse_markdown_blocks("3. three
-4. four");
+        let blocks = parse_markdown_blocks(
+            "3. three
+4. four",
+        );
         assert_eq!(
             blocks,
             vec![MdBlock::OrderedList {
@@ -5943,11 +5947,13 @@ mod tests {
             }]
         );
         // Blank lines between items keep one list rather than N lists of "1.".
-        let loose = parse_markdown_blocks("1. a
+        let loose = parse_markdown_blocks(
+            "1. a
 
 2. b
 
-3. c");
+3. c",
+        );
         assert_eq!(
             loose,
             vec![MdBlock::OrderedList {
@@ -5956,12 +5962,17 @@ mod tests {
             }]
         );
         // A list resumed after another block starts at its own number.
-        let resumed = parse_markdown_blocks("1. a
+        let resumed = parse_markdown_blocks(
+            "1. a
 
 break
 
-2. b");
-        assert!(matches!(resumed.last(), Some(MdBlock::OrderedList { start: 2, .. })));
+2. b",
+        );
+        assert!(matches!(
+            resumed.last(),
+            Some(MdBlock::OrderedList { start: 2, .. })
+        ));
     }
 
     #[test]

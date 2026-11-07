@@ -227,6 +227,9 @@ mod tests {
     fn delegation_names_the_specialist() {
         let view = describe_step("delegate", &json!({}), Some("analyst"));
         assert_eq!(view.label, "Asking Analyst");
-        assert_eq!(describe_step("delegate", &json!({}), None).label, "Asking a specialist");
+        assert_eq!(
+            describe_step("delegate", &json!({}), None).label,
+            "Asking a specialist"
+        );
     }
 }

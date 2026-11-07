@@ -440,7 +440,11 @@ mod tests {
             assert!(!ext.is_empty() && ext.chars().all(|c| c.is_ascii_lowercase()));
         }
         for needed in ["png", "jpg", "jpeg", "webp"] {
-            assert!(AVATAR_FILE_ACCEPT.split(',').any(|t| t == format!(".{needed}")));
+            assert!(
+                AVATAR_FILE_ACCEPT
+                    .split(',')
+                    .any(|t| t == format!(".{needed}"))
+            );
         }
     }
 

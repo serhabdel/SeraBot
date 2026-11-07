@@ -155,7 +155,10 @@ mod tests {
         let mut p = ev("t1", "c1", "waiting_approval");
         p["approval_id"] = json!("appr-1");
         a.apply("turn.step", &p);
-        assert_eq!(a.waiting().and_then(|s| s.approval_id.as_deref()), Some("appr-1"));
+        assert_eq!(
+            a.waiting().and_then(|s| s.approval_id.as_deref()),
+            Some("appr-1")
+        );
         a.apply("turn.step", &ev("t1", "c1", "done"));
         assert!(a.waiting().is_none());
     }
