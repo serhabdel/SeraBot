@@ -347,14 +347,17 @@ All three act for the authenticated user only.
 ## Memory
 
 Owner-scoped memory with mandatory provenance. Mutations are audited and
-content is scanned by the content policy. The orchestrator system prompt
-includes the 20 most recently updated memories as owner-approved facts;
-`delegate` handoffs can attach up to five explicit ids.
+content is scanned by the content policy. Each turn injects the facts recalled
+for the owner's message (ranked, bounded, framed as data) and the conversation
+summary; `delegate` handoffs can attach up to five explicit ids. See
+`docs/memory.md`.
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| `GET` | `/v1/memories?limit=100&query=<text>` | Newest first. `query` filters kind, content, and source case-insensitively. At most 500 entries. |
-| `POST` | `/v1/memories` | `{"kind": "preference", "content": "...", "source": "optional"}` |
+| `GET` | `/v1/memories?limit=100&offset=0&q=<text>&origin=<origin>&status=<status>&bot=<bot>` | Newest first. `origin` is `explicit`, `extracted`, or `all`; `status` is `active` (default), `superseded`, `pending`, or `all`. `q` is a lexical search over every memory that passes the filters (`query` is an older alias); a search ignores `offset`. At most 500 entries. |
+| `POST` | `/v1/memories` | `{"kind": "preference", "content": "...", "source": "optional"}`. An exact repeat is reported as the existing memory. |
+| `PATCH` | `/v1/memories/{id}` | `{"content": "...", "importance": 0.7, "status": "active"}`; every field is optional, unknown fields are rejected. |
+| `GET` | `/v1/memories/stats` | Active count, counts by origin and status, and the last extraction time. |
 | `DELETE` | `/v1/memories/{id}` | Deletes exactly one memory. |
 
 Kinds: `preference`, `fact`, `decision`, `context`, `note`. Content is 1–4,000

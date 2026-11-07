@@ -203,6 +203,22 @@ impl Runtime {
         system: &str,
         input: &str,
     ) -> Result<String> {
+        self.bounded_completion_for("onboarding", user_id, bot, system, input)
+            .await
+    }
+
+    /// One tool-less model call under the acting user, on the bot's default
+    /// route, for an auxiliary task. `purpose` is recorded on the `model.used`
+    /// audit row. Model requests pass the same blocklist and vault redaction
+    /// as turns.
+    pub async fn bounded_completion_for(
+        &self,
+        purpose: &str,
+        user_id: &str,
+        bot: &str,
+        system: &str,
+        input: &str,
+    ) -> Result<String> {
         let selection = self.effective_model_selection(user_id, &format!("dir:{bot}"), bot)?;
         let route = Some(self.router.pin(&selection)?);
         let route = self.checked_route(user_id, &route)?;
@@ -225,7 +241,7 @@ impl Runtime {
                 "provider": route.selection.provider,
                 "model": route.selection.model,
                 "usage": response.usage,
-                "purpose": "onboarding",
+                "purpose": purpose,
             })),
         )?;
         Ok(response.message.content.unwrap_or_default())

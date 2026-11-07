@@ -3,8 +3,9 @@ use crate::{
     BotDetail, BotSettingsUpdate, BotSummary, Catalog, ConnectorStatus, ConnectorTestResult,
     ConnectorUpdate, ConversationKind, ConversationPage, ConversationSummary, CreatedBot,
     CreatedConversation, CreatedGroup, CreatedSkill, Health, History, LibraryEntry, MemoryEntry,
-    NewGroup, NewProvider, Onboarding, ProviderStatus, Scope, Selection, SkillSummary, Task, Team,
-    TeamMode, Transcription, UsageReport, VoiceSettings, VoiceUpdate, avatars::AvatarTarget,
+    MemoryStatsView, NewGroup, NewProvider, Onboarding, ProviderStatus, Scope, Selection,
+    SkillSummary, Task, Team, TeamMode, Transcription, UsageReport, VoiceSettings, VoiceUpdate,
+    avatars::AvatarTarget,
 };
 use secrecy::SecretString;
 use std::sync::{
@@ -43,7 +44,9 @@ pub enum OperationKind {
     UnarchiveConversation,
     ListMemories,
     AddMemory,
+    UpdateMemory,
     DeleteMemory,
+    MemoryStats,
     Providers,
     Connectors,
     Team,
@@ -138,15 +141,22 @@ pub enum Operation {
     },
     ListMemories {
         query: Option<String>,
+        origin: String,
+        status: String,
     },
     AddMemory {
         kind: String,
         content: Zeroizing<String>,
         source: String,
     },
+    UpdateMemory {
+        id: String,
+        content: Zeroizing<String>,
+    },
     DeleteMemory {
         id: String,
     },
+    MemoryStats,
     Providers,
     Connectors,
     GetTeam,
@@ -286,7 +296,9 @@ impl Operation {
             Self::UnarchiveConversation { .. } => OperationKind::UnarchiveConversation,
             Self::ListMemories { .. } => OperationKind::ListMemories,
             Self::AddMemory { .. } => OperationKind::AddMemory,
+            Self::UpdateMemory { .. } => OperationKind::UpdateMemory,
             Self::DeleteMemory { .. } => OperationKind::DeleteMemory,
+            Self::MemoryStats => OperationKind::MemoryStats,
             Self::Providers => OperationKind::Providers,
             Self::Connectors => OperationKind::Connectors,
             Self::GetTeam => OperationKind::Team,
@@ -346,7 +358,9 @@ pub enum Reply {
     UnarchivedConversation(String),
     Memories(Vec<MemoryEntry>),
     AddedMemory(MemoryEntry),
+    UpdatedMemory(MemoryEntry),
     DeletedMemory(String),
+    MemoryStats(MemoryStatsView),
     Providers(Vec<ProviderStatus>),
     Connectors(Vec<ConnectorStatus>),
     Team(Team),
@@ -646,9 +660,13 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::UnarchiveConversation { id } => client
             .unarchive_conversation(id)
             .map(|_| Reply::UnarchivedConversation(id.clone())),
-        Operation::ListMemories { query } => {
-            client.list_memories(query.as_deref()).map(Reply::Memories)
-        }
+        Operation::ListMemories {
+            query,
+            origin,
+            status,
+        } => client
+            .list_memories(query.as_deref(), origin, status)
+            .map(Reply::Memories),
         Operation::AddMemory {
             kind,
             content,
@@ -656,9 +674,13 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         } => client
             .add_memory(kind, content, source)
             .map(Reply::AddedMemory),
+        Operation::UpdateMemory { id, content } => {
+            client.update_memory(id, content).map(Reply::UpdatedMemory)
+        }
         Operation::DeleteMemory { id } => client
             .delete_memory(id)
             .map(|_| Reply::DeletedMemory(id.clone())),
+        Operation::MemoryStats => client.memory_stats().map(Reply::MemoryStats),
         Operation::Providers => client.providers().map(Reply::Providers),
         Operation::Connectors => client.connectors().map(Reply::Connectors),
         Operation::GetTeam => client.get_team(conversation).map(Reply::Team),

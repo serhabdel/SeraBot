@@ -308,7 +308,11 @@ pub fn router(state: ApiState) -> Router {
             post(unarchive_conversation),
         )
         .route("/v1/memories", get(list_memories).post(add_memory))
-        .route("/v1/memories/{id}", delete(delete_memory))
+        .route("/v1/memories/stats", get(memory_stats))
+        .route(
+            "/v1/memories/{id}",
+            patch(patch_memory).delete(delete_memory),
+        )
         .route("/v1/vault", get(list_vault))
         .route("/v1/vault/{name}", put(put_vault).delete(delete_vault))
         .route("/v1/providers", get(list_providers))

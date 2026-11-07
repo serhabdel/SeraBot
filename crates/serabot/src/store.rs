@@ -64,6 +64,7 @@ const MIGRATION_18: &str = include_str!("../migrations/0018_conversation_origin.
 const MIGRATION_19: &str = include_str!("../migrations/0019_browser_profiles.sql");
 const MIGRATION_21: &str = include_str!("../migrations/0021_chat_plans_yolo.sql");
 const MIGRATION_25: &str = include_str!("../migrations/0025_chat_attachments.sql");
+const MIGRATION_26: &str = include_str!("../migrations/0026_memory_v2.sql");
 
 /// Fixed admin id written by migration 0008 and mirrored in
 /// `kv['admin_user_id']`. Code resolves the admin through the kv entry (the
@@ -562,6 +563,15 @@ impl Store {
             connection.execute_batch(MIGRATION_25)?;
             connection.pragma_update(None, "user_version", 25)?;
         }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 26 {
+            connection.execute_batch(MIGRATION_26)?;
+            crate::memory::backfill_content_hashes(&connection)?;
+            connection.pragma_update(None, "user_version", 26)?;
+        }
+        // VACUUM INTO (backups) may renumber rowids; the external-content
+        // FTS index must match them again on every open.
+        crate::memory::rebuild_fts(&connection)?;
         let stored_dimension: Option<String> = connection
             .query_row(
                 "SELECT value FROM kv WHERE key = 'embedding_dimension'",
@@ -2878,7 +2888,7 @@ impl Store {
     pub fn count_memories(&self, user_id: &str) -> Result<i64> {
         let connection = self.connection()?;
         Ok(connection.query_row(
-            "SELECT COUNT(*) FROM memories WHERE user_id = ?1",
+            "SELECT COUNT(*) FROM memories WHERE user_id = ?1 AND status = 'active'",
             params![user_id],
             |row| row.get(0),
         )?)
@@ -4622,7 +4632,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 25);
+        assert_eq!(version, 26);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -4687,7 +4697,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 25);
+        assert_eq!(version, 26);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -4700,6 +4710,100 @@ mod tests {
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
         assert_eq!(admin.role, UserRole::Admin);
+    }
+
+    /// A database at `user_version = 25` keeps its memories through the
+    /// memory v2 batch: rows become explicit, active, importance 0.5, get a
+    /// content hash, and are searchable through the rebuilt FTS index.
+    #[test]
+    fn migrates_a_version_twenty_five_database_with_memory_v2() {
+        let path = std::env::temp_dir().join(format!("serabot-store-v25-{}.db", new_id()));
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            let migrations: [(i64, &str); 15] = [
+                (1, MIGRATION_1),
+                (2, MIGRATION_2),
+                (3, MIGRATION_3),
+                (4, MIGRATION_4),
+                (5, MIGRATION_5),
+                (6, MIGRATION_6),
+                (7, MIGRATION_7),
+                (8, MIGRATION_8),
+                (9, MIGRATION_9),
+                (10, MIGRATION_10),
+                (11, MIGRATION_11),
+                (12, MIGRATION_12),
+                (13, MIGRATION_13),
+                (14, MIGRATION_14),
+                (15, MIGRATION_15),
+            ];
+            for (version, sql) in migrations {
+                connection.execute_batch(sql).unwrap();
+                connection
+                    .pragma_update(None, "user_version", version)
+                    .unwrap();
+            }
+            for (version, sql) in [
+                (17, MIGRATION_17),
+                (18, MIGRATION_18),
+                (19, MIGRATION_19),
+                (21, MIGRATION_21),
+                (25, MIGRATION_25),
+            ] {
+                connection.execute_batch(sql).unwrap();
+                connection
+                    .pragma_update(None, "user_version", version)
+                    .unwrap();
+            }
+            connection
+                .execute(
+                    "INSERT INTO memories(id, kind, content, source, created_at, updated_at, user_id)
+                     VALUES ('mem-legacy', 'fact', 'Keeps the harbour boat in Genoa',
+                             'operator:test', '2026-01-01T00:00:00.000Z',
+                             '2026-01-01T00:00:00.000Z', '00000000-0000-7000-8000-000000000001')",
+                    [],
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path, 384, 5000).unwrap();
+        let version: i64 = store
+            .connection()
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 26);
+        let admin = admin(&store);
+        let memory = crate::memory::get(&store, &admin, "mem-legacy").unwrap();
+        assert_eq!(memory.origin, "explicit");
+        assert_eq!(memory.status, "active");
+        assert_eq!(memory.importance, 0.5);
+        assert_eq!(memory.recall_count, 0);
+        let hashed: i64 = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE content_hash IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hashed, 0, "existing rows get a content hash");
+        let hits = crate::memory::search(
+            &store,
+            &admin,
+            "harbour",
+            &crate::memory::MemoryFilter::default(),
+            5,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1, "the FTS index covers migrated rows");
+        assert_eq!(hits[0].memory.id, "mem-legacy");
+        // The summaries table arrives with the batch.
+        assert!(
+            crate::memory::latest_summary(&store, &admin, "dir:main")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// A database at `user_version = 7` (the last single-operator schema)
@@ -4756,7 +4860,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 25);
+        assert_eq!(version, 26);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -4887,7 +4991,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 25);
+        assert_eq!(version, 26);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -5042,7 +5146,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 25);
+        assert_eq!(version, 26);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.

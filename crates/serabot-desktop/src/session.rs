@@ -256,6 +256,11 @@ pub struct MemoryDraft {
     pub source: String,
     pub query: String,
     pub delete_confirm: Option<String>,
+    /// Filter chip: `all`, `saved`, `learned`, or `superseded`.
+    pub filter: String,
+    /// The memory whose wording is being edited inline, if any.
+    pub editing: Option<String>,
+    pub edit_content: String,
 }
 
 impl Default for MemoryDraft {
@@ -266,6 +271,9 @@ impl Default for MemoryDraft {
             source: "operator:desktop".into(),
             query: String::new(),
             delete_confirm: None,
+            filter: "all".into(),
+            editing: None,
+            edit_content: String::new(),
         }
     }
 }
@@ -273,6 +281,17 @@ impl Default for MemoryDraft {
 impl Drop for MemoryDraft {
     fn drop(&mut self) {
         self.content.zeroize();
+        self.edit_content.zeroize();
+    }
+}
+
+/// Origin and status query values behind a Memory page filter chip.
+pub fn memory_filter_params(filter: &str) -> (&'static str, &'static str) {
+    match filter {
+        "saved" => ("explicit", "active"),
+        "learned" => ("extracted", "active"),
+        "superseded" => ("all", "superseded"),
+        _ => ("all", "active"),
     }
 }
 
@@ -917,6 +936,7 @@ impl Session {
             self.state.conversations_loaded = false;
             self.state.memories.clear();
             self.state.memories_loaded = false;
+            self.state.memory_stats = None;
             self.state.providers.clear();
             self.state.providers_loaded = false;
             self.state.connectors.clear();
@@ -932,6 +952,8 @@ impl Session {
             crate::avatars::publish(&std::collections::BTreeMap::new());
             self.bot_settings = BotSettings::default();
             self.memory.content.zeroize();
+            self.memory.edit_content.zeroize();
+            self.memory.editing = None;
             self.memory.delete_confirm = None;
         }
     }
@@ -2790,14 +2812,26 @@ impl Session {
                             );
                             self.schedule(Operation::ListArchived, Duration::ZERO);
                         }
-                        OperationKind::AddMemory | OperationKind::DeleteMemory => {
+                        OperationKind::AddMemory
+                        | OperationKind::DeleteMemory
+                        | OperationKind::UpdateMemory => {
                             if completion.kind == OperationKind::AddMemory {
                                 self.memory.content.zeroize();
                             }
+                            if completion.kind == OperationKind::UpdateMemory {
+                                self.memory.edit_content.zeroize();
+                                self.memory.editing = None;
+                            }
                             self.memory.delete_confirm = None;
-                            let query = self.memory.query.trim();
-                            let query = (!query.is_empty()).then(|| query.to_owned());
-                            self.schedule(Operation::ListMemories { query }, Duration::ZERO);
+                            // Counts are stale after any change; the next list reloads them.
+                            self.state.memory_stats = None;
+                            let list = self.memory_list_operation();
+                            self.schedule(list, Duration::ZERO);
+                        }
+                        OperationKind::ListMemories => {
+                            if self.state.memory_stats.is_none() {
+                                self.schedule(Operation::MemoryStats, Duration::ZERO);
+                            }
                         }
                         OperationKind::Task
                             if self
@@ -2984,10 +3018,7 @@ impl Session {
                 if self.state.memories_loaded {
                     None
                 } else {
-                    let query = self.memory.query.trim();
-                    Some(Operation::ListMemories {
-                        query: (!query.is_empty()).then(|| query.to_owned()),
-                    })
+                    Some(self.memory_list_operation())
                 }
             }
             Section::Providers => (!self.state.providers_loaded).then_some(Operation::Providers),
@@ -3499,9 +3530,50 @@ impl Session {
     }
 
     pub fn load_memories(&mut self) {
+        let list = self.memory_list_operation();
+        self.start_request(list);
+    }
+
+    /// The list request for the current search text and filter chip.
+    fn memory_list_operation(&self) -> Operation {
         let query = self.memory.query.trim();
-        self.start_request(Operation::ListMemories {
+        let (origin, status) = memory_filter_params(&self.memory.filter);
+        Operation::ListMemories {
             query: (!query.is_empty()).then(|| query.to_owned()),
+            origin: origin.into(),
+            status: status.into(),
+        }
+    }
+
+    pub fn set_memory_filter(&mut self, filter: &str) {
+        self.memory.filter = filter.into();
+        self.load_memories();
+    }
+
+    pub fn begin_memory_edit(&mut self, id: String, content: &str) {
+        self.memory.edit_content.zeroize();
+        self.memory.edit_content = content.to_owned();
+        self.memory.editing = Some(id);
+        self.memory.delete_confirm = None;
+    }
+
+    pub fn cancel_memory_edit(&mut self) {
+        self.memory.edit_content.zeroize();
+        self.memory.editing = None;
+    }
+
+    pub fn save_memory_edit(&mut self) {
+        let Some(id) = self.memory.editing.clone() else {
+            return;
+        };
+        if !valid_memory_content(&self.memory.edit_content) {
+            self.state.error =
+                Some("Memory must be 1–4,000 characters, without control characters.".into());
+            return;
+        }
+        self.start_request(Operation::UpdateMemory {
+            id,
+            content: zeroize::Zeroizing::new(self.memory.edit_content.clone()),
         });
     }
 

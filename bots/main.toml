@@ -11,6 +11,8 @@ tools = [
   "skill_load",
   "memory_save",
   "memory_list",
+  "memory_search",
+  "memory_update",
   "memory_delete",
   "rag_search",
   "deck_build",

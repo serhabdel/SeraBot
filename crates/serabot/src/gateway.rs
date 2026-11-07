@@ -250,6 +250,13 @@ impl Gateway {
         self
     }
 
+    /// The per-user secret store, when the gateway was built with one. Only
+    /// per-user adapters (for example Mem0) read secrets through it, always
+    /// under the acting user's id.
+    pub fn user_secrets(&self) -> Option<Arc<UserSecrets>> {
+        self.vault.clone()
+    }
+
     /// Redact the acting user's vault values from `text`. Fails closed: if
     /// the vault cannot be read, the text is not returned.
     pub fn redact_text(&self, user_id: &str, text: &str) -> Result<String> {

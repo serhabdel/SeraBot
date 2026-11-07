@@ -120,6 +120,7 @@ fn app_with_stack(
     }
     config.llm.data_egress_approved = egress_approved;
     config.llm.model = "test".into();
+    config.memory.auto_extract = false;
     config.llm.base_url = "https://example.com/v1".into();
     config.llm.models = vec!["test-alternative".into()];
     if auth_issuer.is_some() {
@@ -1964,6 +1965,204 @@ async fn memory_writes_respect_the_content_policy() {
     )
     .await;
     assert!(listed["memories"].as_array().unwrap().is_empty());
+}
+
+/// Memory v2 over HTTP: hybrid search finds an old fact, filters and paging
+/// work, PATCH edits only named fields, stats count by origin, and a member
+/// never sees, edits, or deletes the owner's memories.
+#[tokio::test]
+async fn memory_v2_api_searches_filters_edits_and_isolates_users() {
+    let (app, _, store) = app();
+    let admin_id = admin(&store);
+    let (_member, member_token) = member_with_session(&store);
+
+    let created = read_json(
+        app.clone()
+            .oneshot(request(
+                &app,
+                "POST",
+                "/v1/memories",
+                true,
+                Some(json!({
+                    "kind": "fact",
+                    "content": "Dentist appointment is on the ninth floor"
+                })),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let explicit_id = created["memory"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(created["memory"]["origin"], "explicit");
+    assert_eq!(created["memory"]["status"], "active");
+
+    let learned = crate::memory::write(
+        &store,
+        &admin_id,
+        &crate::memory::Candidate {
+            origin: crate::memory::ORIGIN_EXTRACTED.into(),
+            ..crate::memory::Candidate::explicit("fact", "Prefers train travel to Milan", "turn:1")
+        },
+    )
+    .unwrap();
+    let learned_id = learned.memory().id.clone();
+
+    // Search finds the owner's facts; the member's search finds nothing.
+    let found = read_json(
+        app.clone()
+            .oneshot(request_with_token_auth("GET", "/v1/memories?q=dentist"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(found["memories"].as_array().unwrap().len(), 1);
+    assert_eq!(found["memories"][0]["id"], explicit_id);
+    let member_found = read_json(
+        app.clone()
+            .oneshot(request_with_token(
+                "GET",
+                "/v1/memories?q=dentist",
+                &member_token,
+                None,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(member_found["memories"].as_array().unwrap().is_empty());
+
+    // Origin filter and the console's status filter.
+    let learned_only = read_json(
+        app.clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/memories?origin=extracted",
+                true,
+                None,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(learned_only["memories"].as_array().unwrap().len(), 1);
+    assert_eq!(learned_only["memories"][0]["id"], learned_id);
+
+    // PATCH changes only the named field and keeps provenance.
+    let patched = read_json(
+        app.clone()
+            .oneshot(request(
+                &app,
+                "PATCH",
+                &format!("/v1/memories/{explicit_id}"),
+                true,
+                Some(json!({"content": "Dentist appointment moved to the second floor"})),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        patched["memory"]["content"],
+        "Dentist appointment moved to the second floor"
+    );
+    assert_eq!(patched["memory"]["origin"], "explicit");
+
+    // The member cannot patch or delete the owner's memory.
+    let member_patch = app
+        .clone()
+        .oneshot(request_with_token(
+            "PATCH",
+            &format!("/v1/memories/{explicit_id}"),
+            &member_token,
+            Some(json!({"importance": 0.9})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(member_patch.status(), StatusCode::NOT_FOUND);
+    let member_delete = app
+        .clone()
+        .oneshot(request_with_token(
+            "DELETE",
+            &format!("/v1/memories/{explicit_id}"),
+            &member_token,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(member_delete.status(), StatusCode::NOT_FOUND);
+
+    // Unknown fields and statuses outside active/superseded are rejected.
+    let unknown_field = app
+        .clone()
+        .oneshot(request(
+            &app,
+            "PATCH",
+            &format!("/v1/memories/{explicit_id}"),
+            true,
+            Some(json!({"origin": "extracted"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unknown_field.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bad_status = app
+        .clone()
+        .oneshot(request(
+            &app,
+            "PATCH",
+            &format!("/v1/memories/{explicit_id}"),
+            true,
+            Some(json!({"status": "pending"})),
+        ))
+        .await
+        .unwrap();
+    assert!(!bad_status.status().is_success());
+
+    // Stats count the owner's rows only.
+    let stats = read_json(
+        app.clone()
+            .oneshot(request(&app, "GET", "/v1/memories/stats", true, None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(stats["stats"]["active"], 2);
+    assert_eq!(stats["stats"]["by_origin"]["extracted"], 1);
+    let member_stats = read_json(
+        app.clone()
+            .oneshot(request_with_token(
+                "GET",
+                "/v1/memories/stats",
+                &member_token,
+                None,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(member_stats["stats"]["active"], 0);
+
+    // Paging: one row per page, offset moves the window.
+    let page = read_json(
+        app.clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/memories?limit=1&offset=1",
+                true,
+                None,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(page["memories"].as_array().unwrap().len(), 1);
+    assert_eq!(page["offset"], 1);
+}
+
+/// Owner bearer request helper for the memory v2 test.
+fn request_with_token_auth(method: &str, uri: &str) -> Request<Body> {
+    request_with_token(method, uri, "test-token-that-is-long-enough-123", None)
 }
 
 #[tokio::test]

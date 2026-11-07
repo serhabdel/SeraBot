@@ -313,6 +313,8 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
     "agentmail_send",
     "memory_save",
     "memory_list",
+    "memory_search",
+    "memory_update",
     "memory_delete",
     "local_list",
     "local_read",
@@ -925,8 +927,10 @@ pub struct ConversationPage {
     pub next_cursor: Option<String>,
 }
 
-/// Operator-reviewable fact with mandatory provenance.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+/// Operator-reviewable fact with mandatory provenance. `origin` is `explicit`
+/// (the owner asked) or `extracted` (learned from a turn); `status` is
+/// `active`, `superseded` or `pending`.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct MemoryEntry {
     pub id: String,
     pub kind: String,
@@ -934,6 +938,31 @@ pub struct MemoryEntry {
     pub source: String,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub origin: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub bot: Option<String>,
+    #[serde(default)]
+    pub importance: f64,
+    #[serde(default)]
+    pub last_recalled_at: Option<String>,
+    #[serde(default)]
+    pub recall_count: i64,
+}
+
+/// Counts shown in the Memory page header (`GET /v1/memories/stats`).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct MemoryStatsView {
+    #[serde(default)]
+    pub active: i64,
+    #[serde(default)]
+    pub by_origin: std::collections::BTreeMap<String, i64>,
+    #[serde(default)]
+    pub by_status: std::collections::BTreeMap<String, i64>,
+    #[serde(default)]
+    pub last_extraction_at: Option<String>,
 }
 
 /// Presence-only secret status. Values never appear in API responses.
@@ -2489,15 +2518,23 @@ impl ApiClient {
         Ok(())
     }
 
-    pub fn list_memories(&self, query: Option<&str>) -> Result<Vec<MemoryEntry>, ApiError> {
-        let mut params = vec![("limit", "200")];
+    /// List the owner's memories. `origin` is `all`, `explicit` or
+    /// `extracted`; `status` is `active`, `superseded` or `all`. Search text
+    /// is a lexical match over every memory that passes the filters.
+    pub fn list_memories(
+        &self,
+        query: Option<&str>,
+        origin: &str,
+        status: &str,
+    ) -> Result<Vec<MemoryEntry>, ApiError> {
+        let mut params = vec![("limit", "200"), ("origin", origin), ("status", status)];
         if let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) {
             if query.chars().count() > 200 || query.chars().any(|c| c.is_control()) {
                 return Err(ApiError::Validation(
                     "Search text must be at most 200 characters.",
                 ));
             }
-            params.push(("query", query));
+            params.push(("q", query));
         }
         let response: MemoriesEnvelope = self.get(&["v1", "memories"], &params)?;
         if response.memories.len() > 200 {
@@ -2556,6 +2593,42 @@ impl ApiClient {
             return Err(ApiError::InvalidResponse);
         }
         Ok(response.memory)
+    }
+
+    /// Replace the wording of one memory. Only the content changes here.
+    pub fn update_memory(&self, id: &str, content: &str) -> Result<MemoryEntry, ApiError> {
+        if !valid_memory_id(id) {
+            return Err(ApiError::Validation("Invalid memory id."));
+        }
+        if !valid_memory_content(content) {
+            return Err(ApiError::Validation(
+                "Memory must be 1–4,000 characters, without control characters.",
+            ));
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            content: &'a str,
+        }
+        let response: MemoryEnvelope = self.request(
+            Method::PATCH,
+            &["v1", "memories", id],
+            &[],
+            Some(&Body { content }),
+        )?;
+        check_memory(&response.memory)?;
+        if response.memory.id != id {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(response.memory)
+    }
+
+    pub fn memory_stats(&self) -> Result<MemoryStatsView, ApiError> {
+        #[derive(Deserialize)]
+        struct Envelope {
+            stats: MemoryStatsView,
+        }
+        let response: Envelope = self.get(&["v1", "memories", "stats"], &[])?;
+        Ok(response.stats)
     }
 
     pub fn delete_memory(&self, id: &str) -> Result<(), ApiError> {
@@ -3599,6 +3672,24 @@ fn check_memory(memory: &MemoryEntry) -> Result<(), ApiError> {
         || !valid_memory_source(&memory.source)
         || !bounded_text(&memory.created_at, 64)
         || !bounded_text(&memory.updated_at, 64)
+        || !matches!(
+            memory.origin.as_str(),
+            "" | "explicit" | "extracted" | "mem0"
+        )
+        || !matches!(
+            memory.status.as_str(),
+            "" | "active" | "superseded" | "pending"
+        )
+        || memory
+            .bot
+            .as_deref()
+            .is_some_and(|bot| !bounded_text(bot, 64))
+        || !memory.importance.is_finite()
+        || !(0.0..=1.0).contains(&memory.importance)
+        || memory
+            .last_recalled_at
+            .as_deref()
+            .is_some_and(|value| !bounded_text(value, 64))
     {
         return Err(ApiError::InvalidResponse);
     }

@@ -438,6 +438,12 @@ impl Tool for MemorySaveTool {
                     "category": {
                         "type": "string",
                         "description": "Optional category (e.g. preference, project, contact, deadline, general)"
+                    },
+                    "importance": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "description": "Optional importance from 0 to 1 (default 0.5); higher facts are recalled first"
                     }
                 },
                 "required": ["content"],
@@ -467,8 +473,26 @@ impl Tool for MemorySaveTool {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or("general");
         let kind = normalize_memory_category(category);
+        let importance = match args.get("importance") {
+            None | Some(Value::Null) => crate::memory::DEFAULT_IMPORTANCE,
+            Some(value) => value.as_f64().ok_or_else(|| {
+                SeraError::Validation("importance must be a number between 0 and 1".into())
+            })?,
+        };
         let source = format!("chat:{}", context.bot);
-        let memory = crate::memory::add(&self.store, &context.user_id, kind, content, &source)?;
+        let candidate = crate::memory::Candidate {
+            kind: kind.into(),
+            content: content.into(),
+            source: source.clone(),
+            origin: crate::memory::ORIGIN_EXPLICIT.into(),
+            bot: Some(context.bot.clone()),
+            conversation_id: context.conversation_id.clone(),
+            importance,
+        };
+        // A repeat of a saved fact is reported, not stored twice; a near
+        // repeat replaces the older wording (see `memory::write`).
+        let outcome = crate::memory::write(&self.store, &context.user_id, &candidate)?;
+        let memory = outcome.memory().clone();
         self.store.record_audit(
             &context.actor,
             "memory.created",
@@ -482,12 +506,15 @@ impl Tool for MemorySaveTool {
                 "kind": memory.kind,
                 "category": category,
                 "source": memory.source,
+                "outcome": outcome.label(),
             })),
         )?;
         let result = json!({
             "id": memory.id,
             "content": memory.content,
             "category": category,
+            "outcome": outcome.label(),
+            "importance": memory.importance,
         });
         Ok(ToolOutput {
             content: serde_json::to_string(&result)?,
@@ -543,24 +570,26 @@ impl Tool for MemoryListTool {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let memories = crate::memory::list(&self.store, &context.user_id, limit)?;
-        let filtered = if let Some(q) = query {
-            let q_lower = q.to_lowercase();
-            memories
-                .into_iter()
-                .filter(|m| {
-                    m.content.to_lowercase().contains(&q_lower)
-                        || m.category.to_lowercase().contains(&q_lower)
-                })
-                .collect()
-        } else {
-            memories
+        // A query searches every active memory (not just the newest rows).
+        let memories: Vec<crate::memory::Memory> = match query {
+            Some(q) => crate::memory::search(
+                &self.store,
+                &context.user_id,
+                q,
+                &crate::memory::MemoryFilter::default(),
+                limit,
+            )?
+            .into_iter()
+            .map(|item| item.memory)
+            .collect(),
+            None => crate::memory::list(&self.store, &context.user_id, limit)?,
         };
         let result = json!({
-            "memories": filtered.into_iter().map(|m| json!({
+            "memories": memories.into_iter().map(|m| json!({
                 "id": m.id,
                 "content": m.content,
                 "category": m.category,
+                "origin": m.origin,
                 "created_at": m.created_at,
             })).collect::<Vec<_>>()
         });
@@ -634,12 +663,165 @@ impl Tool for MemoryDeleteTool {
     }
 }
 
+pub struct MemorySearchTool {
+    store: Store,
+}
+
+impl MemorySearchTool {
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl Tool for MemorySearchTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "memory_search".into(),
+            description: "Search the owner's saved and learned facts by keyword across all of their memories, including old ones. Use it when the owner refers to something they told you before.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keywords to search for (max 200 chars)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max memories to return (1..20, default 8)"
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| SeraError::Validation("query is required".into()))?;
+        if query.chars().count() > 200 {
+            return Err(SeraError::Validation("query exceeds 200 characters".into()));
+        }
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(8)
+            .clamp(1, 20) as usize;
+        let hits = crate::memory::search(
+            &self.store,
+            &context.user_id,
+            query,
+            &crate::memory::MemoryFilter::default(),
+            limit,
+        )?;
+        let result = json!({
+            "memories": hits.into_iter().map(|hit| json!({
+                "id": hit.memory.id,
+                "content": hit.memory.content,
+                "kind": hit.memory.kind,
+                "origin": hit.memory.origin,
+                "bot": hit.memory.bot,
+                "importance": hit.memory.importance,
+                "updated_at": hit.memory.updated_at,
+            })).collect::<Vec<_>>()
+        });
+        Ok(ToolOutput {
+            content: serde_json::to_string(&result)?,
+            data: Some(result),
+            ..ToolOutput::default()
+        })
+    }
+}
+
+pub struct MemoryUpdateTool {
+    store: Store,
+}
+
+impl MemoryUpdateTool {
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl Tool for MemoryUpdateTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "memory_update".into(),
+            description: "Correct the wording of one saved owner memory by its id, when the owner changes or corrects a fact. Keeps the id, kind and origin; it does not delete.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Memory ID to update (from memory_search or memory_list)"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The corrected fact (max 2000 chars)"
+                    }
+                },
+                "required": ["id", "content"],
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let id = args
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| SeraError::Validation("id is required".into()))?;
+        let content = args
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SeraError::Validation("content is required".into()))?;
+        if content.chars().count() > 2000 {
+            return Err(SeraError::Validation(
+                "content exceeds 2000 characters".into(),
+            ));
+        }
+        let memory = crate::memory::update_content(&self.store, &context.user_id, id, content)?;
+        self.store.record_audit(
+            &context.actor,
+            "memory.updated",
+            Some("memory_update"),
+            context.task_id.as_deref(),
+            None,
+            None,
+            None,
+            Some(&json!({"id": memory.id})),
+        )?;
+        let result = json!({
+            "id": memory.id,
+            "content": memory.content,
+            "updated": true,
+        });
+        Ok(ToolOutput {
+            content: serde_json::to_string(&result)?,
+            data: Some(result),
+            ..ToolOutput::default()
+        })
+    }
+}
+
 pub fn register_memory_tools(
     registry: &mut crate::gateway::ToolRegistry,
     store: Store,
 ) -> Result<()> {
     registry.register(MemorySaveTool::new(store.clone()))?;
     registry.register(MemoryListTool::new(store.clone()))?;
+    registry.register(MemorySearchTool::new(store.clone()))?;
+    registry.register(MemoryUpdateTool::new(store.clone()))?;
     registry.register(crate::plans::PlanUpdateTool::new(store.clone()))?;
     registry.register(MemoryDeleteTool::new(store))?;
     Ok(())
@@ -667,6 +849,8 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "document_index",
         "memory_save",
         "memory_list",
+        "memory_search",
+        "memory_update",
         "memory_delete",
         "plan_update",
         "vault_list",
@@ -832,4 +1016,154 @@ pub fn register_docx_tools(
     registry.register(crate::docx_ops::DocxInspectTool::new(artifacts.clone()))?;
     registry.register(crate::docx_ops::DocxReadTool::new(artifacts))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod memory_tool_tests {
+    use super::*;
+    use crate::gateway::{ToolContext, is_destructive_tool};
+    use std::collections::HashSet;
+
+    fn context(user: &str) -> ToolContext {
+        ToolContext {
+            user_id: user.into(),
+            actor: user.into(),
+            bot: "main".into(),
+            task_id: None,
+            turn_id: None,
+            conversation_id: Some("dir:main".into()),
+            allowed_tools: HashSet::new(),
+            require_approval: HashSet::new(),
+        }
+    }
+
+    fn store() -> Store {
+        Store::open_in_memory(384).unwrap()
+    }
+
+    /// The old fact is far outside the newest 20 rows, yet search and the
+    /// list-with-query path both reach it; another user never does.
+    #[tokio::test]
+    async fn memory_search_and_list_query_reach_old_facts_and_stay_scoped() {
+        let store = store();
+        let admin = store.admin_user_id().unwrap();
+        let member = store
+            .create_user("microsoft:tool-member", "t@example.example", "T")
+            .unwrap();
+        let old = crate::memory::add(
+            &store,
+            &admin,
+            "fact",
+            "Passport renewal is due in March",
+            "operator:test",
+        )
+        .unwrap();
+        for index in 0..25 {
+            crate::memory::add(
+                &store,
+                &admin,
+                "note",
+                &format!("Unrelated note {index} about groceries"),
+                "operator:test",
+            )
+            .unwrap();
+        }
+
+        let search = MemorySearchTool::new(store.clone());
+        let output = search
+            .execute(json!({"query": "passport"}), &context(&admin))
+            .await
+            .unwrap();
+        assert_eq!(output.data.unwrap()["memories"][0]["id"], old.id);
+
+        let list = MemoryListTool::new(store.clone());
+        let output = list
+            .execute(json!({"query": "passport", "limit": 5}), &context(&admin))
+            .await
+            .unwrap();
+        assert_eq!(output.data.unwrap()["memories"][0]["id"], old.id);
+
+        let member_output = search
+            .execute(json!({"query": "passport"}), &context(&member.id))
+            .await
+            .unwrap();
+        assert!(
+            member_output.data.unwrap()["memories"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            search
+                .execute(json!({"query": "   "}), &context(&admin))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_update_edits_in_place_and_refuses_other_users() {
+        let store = store();
+        let admin = store.admin_user_id().unwrap();
+        let member = store
+            .create_user("microsoft:tool-update", "u@example.example", "U")
+            .unwrap();
+        let memory =
+            crate::memory::add(&store, &admin, "fact", "Lives in Rome", "operator:test").unwrap();
+        let tool = MemoryUpdateTool::new(store.clone());
+        let output = tool
+            .execute(
+                json!({"id": memory.id, "content": "Lives in Milan"}),
+                &context(&admin),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.data.unwrap()["updated"], true);
+        let stored = crate::memory::get(&store, &admin, &memory.id).unwrap();
+        assert_eq!(stored.content, "Lives in Milan");
+        assert_eq!(stored.kind, "fact");
+        assert_eq!(stored.source, "operator:test");
+        assert!(
+            tool.execute(
+                json!({"id": memory.id, "content": "Hijacked"}),
+                &context(&member.id),
+            )
+            .await
+            .is_err()
+        );
+        // Editing is not destructive; deleting still is.
+        assert!(!is_destructive_tool("memory_update"));
+        assert!(is_destructive_tool("memory_delete"));
+    }
+
+    #[tokio::test]
+    async fn memory_save_reports_duplicates_and_validates_importance() {
+        let store = store();
+        let admin = store.admin_user_id().unwrap();
+        let save = MemorySaveTool::new(store.clone());
+        let first = save
+            .execute(
+                json!({"content": "Prefers espresso", "importance": 0.9}),
+                &context(&admin),
+            )
+            .await
+            .unwrap();
+        let first = first.data.unwrap();
+        assert_eq!(first["outcome"], "inserted");
+        assert_eq!(first["importance"], 0.9);
+        let again = save
+            .execute(json!({"content": "prefers espresso."}), &context(&admin))
+            .await
+            .unwrap();
+        assert_eq!(again.data.unwrap()["outcome"], "duplicate");
+        assert_eq!(crate::memory::list(&store, &admin, 10).unwrap().len(), 1);
+        assert!(
+            save.execute(
+                json!({"content": "Another fact", "importance": 3}),
+                &context(&admin),
+            )
+            .await
+            .is_err()
+        );
+    }
 }

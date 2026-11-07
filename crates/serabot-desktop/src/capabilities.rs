@@ -142,7 +142,13 @@ pub const CAPABILITIES: &[Capability] = &[
     Capability {
         label: "Remember things for you",
         hint: "Save and recall notes between chats.",
-        tools: &["memory_save", "memory_list", "memory_delete"],
+        tools: &[
+            "memory_save",
+            "memory_list",
+            "memory_search",
+            "memory_update",
+            "memory_delete",
+        ],
     },
     Capability {
         label: "Use skills",
