@@ -724,6 +724,26 @@ struct ApiErrorBody {
 
 impl IntoResponse for SeraError {
     fn into_response(self) -> Response {
+        if let SeraError::Upstream { code, message, .. } = &self {
+            // A bad key, plan, or request is the caller's to fix (422). An
+            // outage is a gateway failure (502). A rate limit is a 503 and
+            // not 502: the call was never run, so clients must not treat it
+            // as an unknown outcome. Never 401: the desktop treats that as an
+            // expired session.
+            let status = match *code {
+                "composio_unavailable" => StatusCode::BAD_GATEWAY,
+                "composio_rate_limited" => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::UNPROCESSABLE_ENTITY,
+            };
+            return (
+                status,
+                Json(ApiErrorBody {
+                    error: message.clone(),
+                    code,
+                }),
+            )
+                .into_response();
+        }
         let (status, code, message) = match &self {
             SeraError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found", "not found"),
             SeraError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden", "forbidden"),

@@ -69,6 +69,13 @@ pub enum ApiError {
     Validation(&'static str),
     /// A safe, server-authored administration message. Never contains a secret.
     Rejected(String),
+    /// A server-authored message with a stable machine `code` (for example
+    /// `composio_rejected`). Same safety rule as `Rejected`.
+    Coded {
+        status: u16,
+        code: String,
+        message: String,
+    },
     Http(u16),
     Transport,
     InvalidResponse,
@@ -78,10 +85,16 @@ pub enum ApiError {
 impl ApiError {
     pub fn unknown_outcome(&self) -> bool {
         // In particular, a gateway/request timeout does not prove rejection.
-        !matches!(
-            self,
-            Self::Validation(_) | Self::Rejected(_) | Self::Http(400..=407 | 409..=499)
-        )
+        match self {
+            // A rate limit is refused before the call runs, so it proves
+            // nothing was done. Only an outage or transport failure is unknown.
+            Self::Coded { code, .. } if code == "composio_rate_limited" => false,
+            Self::Coded { status, .. } => *status >= 500,
+            _ => !matches!(
+                self,
+                Self::Validation(_) | Self::Rejected(_) | Self::Http(400..=407 | 409..=499)
+            ),
+        }
     }
 }
 
@@ -90,6 +103,7 @@ impl fmt::Display for ApiError {
         match self {
             Self::Validation(message) => f.write_str(message),
             Self::Rejected(message) => f.write_str(message),
+            Self::Coded { message, .. } => f.write_str(message),
             Self::Http(401) => f.write_str("Your session ended. Sign in again."),
             Self::Http(403) => f.write_str(
                 "Forbidden (403). Server policy or data-egress approval blocks this request.",
