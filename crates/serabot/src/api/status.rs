@@ -43,10 +43,14 @@ pub(super) struct UsageQuery {
     bot: Option<String>,
     #[serde(default)]
     conversation_id: Option<String>,
+    /// `all` (admin only) rolls up every user; anything else is rejected.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 /// `GET /v1/usage` rolls up `model.used` audit rows. `days` defaults to 7 and
 /// is clamped to 1..=90; `bot` and `conversation_id` are optional filters.
+/// `scope=all` (admin only) covers every user; the default is the caller.
 pub(super) async fn usage(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
@@ -61,9 +65,17 @@ pub(super) async fn usage(
     if let Some(conversation_id) = &query.conversation_id {
         validate_conversation_id(conversation_id)?;
     }
+    let all_users = match query.scope.as_deref() {
+        None | Some("") | Some("me") => false,
+        Some("all") => {
+            require_admin(&user)?;
+            true
+        }
+        Some(_) => return Err(SeraError::Validation("scope must be me or all".into())),
+    };
     let since = Utc::now() - chrono::Duration::days(days);
-    let rollup = state.store.usage_rollup(
-        &user.id,
+    let rollup = state.store.usage_rollup_for(
+        (!all_users).then_some(user.id.as_str()),
         since,
         query.bot.as_deref(),
         query.conversation_id.as_deref(),
@@ -72,6 +84,9 @@ pub(super) async fn usage(
         "totals": rollup.totals,
         "per_day": rollup.per_day,
         "per_bot": rollup.per_bot,
+        "per_model": rollup.per_model,
+        "tools": rollup.tools,
+        "scope": if all_users { "all" } else { "me" },
     });
     // Same egress scan as the model catalog endpoints.
     state
