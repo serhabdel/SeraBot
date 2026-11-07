@@ -15,6 +15,9 @@ use crate::error::{Result, SeraError};
 
 pub(crate) const FAKE_SECRET: &str = "s3cr3t-value-123";
 
+/// Tabs as `(label, url)`, the active label, and the next tab number.
+type TabState = (Vec<(String, String)>, String, u32);
+
 pub(crate) struct FakeBackend {
     pub user: String,
     pub profile: String,
@@ -22,7 +25,7 @@ pub(crate) struct FakeBackend {
     pub alive: AtomicBool,
     pub shutdown_count: Arc<AtomicUsize>,
     /// `(label, url)` per tab and the active label.
-    tab_state: std::sync::Mutex<(Vec<(String, String)>, String, u32)>,
+    tab_state: std::sync::Mutex<TabState>,
     pointer: std::sync::Mutex<Option<Pointer>>,
 }
 

@@ -840,10 +840,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            h.manager.info("alice", "default").await.tabs[0].active,
-            true
-        );
+        assert!(h.manager.info("alice", "default").await.tabs[0].active);
         assert!(
             run(
                 &h,
