@@ -4636,12 +4636,7 @@ async fn usage_scope_all_is_admin_only_and_members_only_see_their_own_rows() {
     // The member sees only their own model and tool rows.
     let own = read_json(
         app.clone()
-            .oneshot(request_with_token(
-                "GET",
-                "/v1/usage",
-                &member_token,
-                None,
-            ))
+            .oneshot(request_with_token("GET", "/v1/usage", &member_token, None))
             .await
             .unwrap(),
     )

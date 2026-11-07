@@ -597,7 +597,11 @@ fn App() -> Element {
         let s = session.read();
         (
             s.prefs.text_size.clone(),
-            if s.prefs.reduce_motion { "reduce" } else { "full" },
+            if s.prefs.reduce_motion {
+                "reduce"
+            } else {
+                "full"
+            },
         )
     };
     let _revision = revision();

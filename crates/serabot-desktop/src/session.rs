@@ -1643,7 +1643,11 @@ impl Session {
 
     /// Usage page: pick a range (7, 30 or 90 days) and load it.
     pub fn load_usage_days(&mut self, days: u32) {
-        let days = if matches!(days, 7 | 30 | 90) { days } else { 30 };
+        let days = if matches!(days, 7 | 30 | 90) {
+            days
+        } else {
+            30
+        };
         self.usage_days = days;
         self.usage_loading = true;
         self.load_usage(days);
@@ -3820,11 +3824,11 @@ fn parse_rfc3339_unix(stamp: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::SettingsSection;
     use super::{
         AtomicBool, Duration, EventRefresh, Instant, Ordering, Session, SignInPhase, SignInUi,
         Theme, event_refresh, telegram_error,
     };
-    use super::SettingsSection;
     use crate::ApiError;
     use std::sync::Arc;
 
