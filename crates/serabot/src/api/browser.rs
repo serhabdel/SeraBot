@@ -69,7 +69,25 @@ async fn controller_for(
     browser
         .set_controller(&user.id, profile, controller)
         .await?;
-    Ok(Json(browser.info(&user.id, profile).await.to_json()))
+    session_reply(state, user, profile, browser.info(&user.id, profile).await.to_json())
+}
+
+/// The shape the desktop expects for a session: the live info plus the
+/// profile `id` and `profile_name` (the list route adds the same two).
+fn session_reply(
+    state: &ApiState,
+    user: &ActingUser,
+    profile: &str,
+    mut info: Value,
+) -> Result<Json<Value>> {
+    let name = state
+        .store
+        .get_browser_profile(&user.id, profile)?
+        .map(|p| p.name)
+        .unwrap_or_else(|| profile.to_owned());
+    info["id"] = json!(profile);
+    info["profile_name"] = json!(name);
+    Ok(Json(info))
 }
 
 async fn close_for(state: &ApiState, user: &ActingUser, profile: &str) -> Result<Json<Value>> {
@@ -272,7 +290,7 @@ async fn input_for(
         _ => {}
     }
     drop(lease);
-    Ok(Json(browser.info(&user.id, profile).await.to_json()))
+    session_reply(state, user, profile, browser.info(&user.id, profile).await.to_json())
 }
 
 // ---- profiles ----

@@ -1061,3 +1061,32 @@ async fn bot_settings_do_not_leak_between_users() {
         call(&rig.app, admin_req(&rig.app, "GET", "/v1/bots/notes", None)).await;
     assert_eq!(admin_detail["display_name"], "Admin Notes");
 }
+
+/// Regression: the desktop parses the takeover/handback/input reply as a
+/// session (`id` + `profile_name` required). A reply without them made
+/// "Take control" fail with an API error although the server had switched.
+#[tokio::test]
+async fn session_control_replies_carry_id_and_profile_name() {
+    let rig = rig(true);
+    drop(
+        rig.manager
+            .bot_lease(&rig.admin_id, "default", true, None)
+            .await
+            .unwrap(),
+    );
+    for (uri, body) in [
+        ("/v1/browser/sessions/default/takeover", None),
+        (
+            "/v1/browser/sessions/default/input",
+            Some(json!({"type": "key", "key": "Tab"})),
+        ),
+        ("/v1/browser/sessions/default/handback", None),
+        ("/v1/browser/takeover", None),
+    ] {
+        let (status, info) = call(&rig.app, admin_req(&rig.app, "POST", uri, body)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(info["id"], "default", "{uri}");
+        assert_eq!(info["profile_name"], "Default", "{uri}");
+        assert!(info["updated_at"].is_string() && info["controller"].is_string());
+    }
+}
