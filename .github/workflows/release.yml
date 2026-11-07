@@ -151,6 +151,10 @@ jobs:
 
   publish:
     needs: [desktop, mobile]
+    # The desktop and server release must not wait on Android signing: when
+    # the mobile job fails (for example, signing secrets not set yet), publish
+    # still ships the desktop assets. The mobile job stays red as the signal.
+    if: ${{ !cancelled() && needs.desktop.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
