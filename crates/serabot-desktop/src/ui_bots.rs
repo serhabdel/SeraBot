@@ -7,7 +7,7 @@
 use crate::ui::{Icon, Overlay, avatar_style, group_avatar_style, human_model, human_provider};
 use dioxus::prelude::*;
 use serabot_desktop::capabilities;
-use serabot_desktop::session::{ImageSlot, Session};
+use serabot_desktop::session::{ImageSlot, Section, Session};
 use serabot_desktop::{AVATAR_FILE_ACCEPT, MAX_AVATAR_UPLOAD_BYTES, MAX_TEAM_MEMBERS, preview_id};
 
 /// Choose an image from disk. The bytes are read off the UI event and handed
@@ -599,43 +599,74 @@ pub fn OnboardingView(session: Signal<Session>) -> Element {
     }
 }
 
-/// Plain-language capability switches for one bot, with the raw tool ids
-/// only under "Advanced".
+/// Plain-language ability switches for one bot, under short headings. They
+/// edit the settings draft (Save applies them). An ability that needs a
+/// connector that is not connected says so and offers "Connect". The raw tool
+/// ids are only under "Advanced".
 #[component]
 pub fn CapabilityToggles(session: Signal<Session>, bot: String) -> Element {
-    let tools = session.read().bot_tools(&bot);
-    let rows: Vec<(usize, &'static str, &'static str, bool)> = capabilities::CAPABILITIES
-        .iter()
-        .enumerate()
-        .map(|(index, capability)| {
-            (
-                index,
-                capability.label,
-                capability.hint,
-                capabilities::is_on(capability, &tools),
-            )
-        })
-        .collect();
+    let _ = &bot;
+    let tools = session.read().bot_settings.draft.tools.clone();
+    let hydrated = session.read().bot_settings.hydrated;
+    let mut last_group = "";
+    let mut rows = Vec::new();
+    for (index, capability) in capabilities::CAPABILITIES.iter().enumerate() {
+        let heading = (capability.group != last_group).then_some(capability.group);
+        last_group = capability.group;
+        rows.push((
+            index,
+            heading,
+            capability.label,
+            capability.hint,
+            capabilities::is_on(capability, &tools),
+            session.read().capability_missing(index),
+        ));
+    }
     let raw = tools.clone();
     let uncovered = capabilities::uncovered(&tools);
     rsx! {
         div { class: "cap-list",
-            for (index, label, hint, on) in rows {
-                label { key: "{index}", class: "cap-row",
-                    span { class: "cap-copy",
-                        span { class: "cap-label", "{label}" }
-                        span { class: "cap-hint", "{hint}" }
+            for (index, heading, label, hint, on, missing) in rows {
+                if let Some(heading) = heading {
+                    h3 { key: "h{index}", class: "cap-group", "{heading}" }
+                }
+                if let Some(missing) = missing {
+                    div { key: "{index}", class: "cap-row cap-needs",
+                        span { class: "cap-copy",
+                            span { class: "cap-label", "{label}" }
+                            span { class: "cap-hint", "Needs {missing.name}" }
+                        }
+                        button {
+                            class: "btn sm",
+                            r#type: "button",
+                            "aria-label": "Connect {missing.name} for {label}",
+                            onclick: move |_| {
+                                let section = match missing.page {
+                                    capabilities::MissingPage::Connectors => Section::Connectors,
+                                    capabilities::MissingPage::Settings => Section::Settings,
+                                };
+                                session.write().open_section(section);
+                            },
+                            "Connect"
+                        }
                     }
-                    input {
-                        class: "switch",
-                        "type": "checkbox",
-                        role: "switch",
-                        "aria-label": "{label}",
-                        checked: on,
-                        onchange: {
-                            let bot = bot.clone();
-                            move |event| session.write().toggle_capability(bot.clone(), index, event.checked())
-                        },
+                } else {
+                    label { key: "{index}", class: "cap-row",
+                        span { class: "cap-copy",
+                            span { class: "cap-label", "{label}" }
+                            span { class: "cap-hint", "{hint}" }
+                        }
+                        input {
+                            class: "switch",
+                            "type": "checkbox",
+                            role: "switch",
+                            "aria-label": "{label}",
+                            checked: on,
+                            disabled: !hydrated,
+                            onchange: move |event| {
+                                session.write().toggle_draft_capability(index, event.checked())
+                            },
+                        }
                     }
                 }
             }

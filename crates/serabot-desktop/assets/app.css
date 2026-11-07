@@ -4377,6 +4377,43 @@ html[data-reduce-transparency="true"] .chat-header {
   border-bottom: 0;
 }
 
+.cap-group {
+  margin: 14px 0 2px;
+  font-size: var(--fs-caption);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--label-3);
+}
+
+.cap-group:first-child {
+  margin-top: 0;
+}
+
+.cap-needs {
+  cursor: default;
+}
+
+.cap-needs .cap-label {
+  color: var(--label-3);
+}
+
+.settings-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 16px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--r-md, 10px);
+  background: var(--surface-2);
+}
+
+.settings-confirm-title {
+  font-weight: 600;
+  color: var(--label-1);
+}
+
 .cap-copy {
   display: flex;
   flex-direction: column;

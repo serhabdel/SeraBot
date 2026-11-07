@@ -5,7 +5,6 @@
 
 use super::*;
 use crate::avatars::{self, AvatarTarget};
-use crate::capabilities;
 
 /// An image the owner picked but has not uploaded yet.
 pub struct PickedImage {
@@ -394,25 +393,5 @@ impl Session {
             .find(|bot| bot.id == id)
             .map(|bot| bot.tools.clone())
             .unwrap_or_default()
-    }
-
-    /// Switch one plain-language capability on or off for a bot.
-    pub fn toggle_capability(&mut self, id: String, index: usize, on: bool) {
-        let Some(capability) = capabilities::CAPABILITIES.get(index) else {
-            return;
-        };
-        if !valid_speaker(&id) {
-            return;
-        }
-        if !self.ready() {
-            self.toast = Some("Wait for the current request, then retry.".into());
-            return;
-        }
-        let tools = capabilities::toggled(capability, &self.bot_tools(&id), on);
-        if let Err(error) = validate_tool_list(&tools) {
-            self.toast = Some(error.to_string());
-            return;
-        }
-        self.start_request(Operation::SetBotTools { id, tools });
     }
 }

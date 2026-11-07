@@ -4,8 +4,8 @@
 //! The draft is plain data. [`BotDraft::changes`] builds the smallest
 //! `PUT /v1/bots/{id}` body from what the owner edited, and the `*_error`
 //! helpers give the inline messages, so all of it is unit-tested without a
-//! window. The picture and the capability switches save on their own (as in
-//! 0.15); everything else waits for Save.
+//! window. Only the picture saves on its own; the capability switches are
+//! part of the draft, so Save and Cancel cover them too (0.20).
 
 use super::*;
 use crate::{
@@ -32,6 +32,8 @@ pub struct BotDraft {
     pub instructions: String,
     pub model: String,
     pub browser_profile: String,
+    /// The tool ids the capability switches add up to.
+    pub tools: Vec<String>,
 }
 
 /// `provider|model` for the model picker's option values.
@@ -106,12 +108,26 @@ impl BotDraft {
                     .then(|| self.browser_profile.clone()),
             );
         }
+        if !same_tools(&self.tools, &original.tools) {
+            update.tools = Some(self.tools.clone());
+        }
         update
     }
 
     pub fn dirty(&self, original: &Self) -> bool {
         !self.changes(original).is_empty()
     }
+}
+
+/// Tool lists are sets: order and duplicates do not count as a change.
+fn same_tools(a: &[String], b: &[String]) -> bool {
+    let mut a: Vec<&String> = a.iter().collect();
+    let mut b: Vec<&String> = b.iter().collect();
+    a.sort();
+    a.dedup();
+    b.sort();
+    b.dedup();
+    a == b
 }
 
 #[derive(Default)]
@@ -127,6 +143,11 @@ pub struct BotSettings {
     pub saving: bool,
     pub error: Option<String>,
     pub notice: Option<String>,
+    /// Closing was asked for with unsaved edits: the panel is asking
+    /// "Save changes?".
+    pub confirm_close: bool,
+    /// Close the panel once the save in flight succeeds.
+    close_after_save: bool,
     /// The bot whose Delete is waiting for its confirm step.
     pub confirm_delete: Option<String>,
     /// A switch-off or delete is on its way; the buttons wait.
@@ -152,6 +173,8 @@ impl Session {
         self.bot_settings.tab = SettingsTab::Settings;
         self.bot_settings.error = None;
         self.bot_settings.notice = None;
+        self.bot_settings.confirm_close = false;
+        self.bot_settings.close_after_save = false;
         if first || !self.bot_settings.hydrated {
             let draft = BotDraft {
                 display_name: self.bot_display_name(&id),
@@ -162,6 +185,7 @@ impl Session {
                     .find(|bot| bot.id == id)
                     .and_then(|bot| bot.description.clone())
                     .unwrap_or_default(),
+                tools: self.bot_tools(&id),
                 ..BotDraft::default()
             };
             self.bot_settings.original = draft.clone();
@@ -171,6 +195,13 @@ impl Session {
         self.panel.ask_profiles();
         if !self.state.skills_loaded && self.state.connected {
             self.schedule(Operation::ListSkills, Duration::ZERO);
+        }
+        // The switches need to know which connectors are connected.
+        if !self.state.connectors_loaded && self.state.connected {
+            self.schedule(Operation::Connectors, Duration::ZERO);
+        }
+        if !self.telegram.loaded && self.state.connected {
+            self.refresh_telegram();
         }
         // Always read the record fresh: the cached one may predate an edit.
         self.state.bot_details.remove(&id);
@@ -192,6 +223,69 @@ impl Session {
     pub fn close_bot_settings(&mut self) {
         self.bot_settings.open = false;
         self.bot_settings.error = None;
+        self.bot_settings.confirm_close = false;
+        self.bot_settings.close_after_save = false;
+    }
+
+    /// The X button: close at once, or ask "Save changes?" when there are
+    /// unsaved edits.
+    pub fn request_close_bot_settings(&mut self) {
+        if self.bot_settings.dirty() && !self.bot_settings.saving {
+            self.bot_settings.confirm_close = true;
+        } else {
+            self.close_bot_settings();
+        }
+    }
+
+    /// "Keep editing" on the close question.
+    pub fn keep_editing_bot_settings(&mut self) {
+        self.bot_settings.confirm_close = false;
+    }
+
+    /// "Save" on the close question: save, and close once it is written.
+    pub fn save_and_close_bot_settings(&mut self) {
+        self.bot_settings.confirm_close = false;
+        self.bot_settings.close_after_save = true;
+        self.save_bot_settings();
+        if !self.bot_settings.saving {
+            // Nothing was sent (invalid, or nothing to save): stay open so
+            // the message is seen.
+            self.bot_settings.close_after_save = false;
+        }
+    }
+
+    /// Switch one ability on or off in the draft. Nothing is sent until Save.
+    pub fn toggle_draft_capability(&mut self, index: usize, on: bool) {
+        let Some(capability) = crate::capabilities::CAPABILITIES.get(index) else {
+            return;
+        };
+        if !self.bot_settings.hydrated {
+            return;
+        }
+        let tools = crate::capabilities::toggled(capability, &self.bot_settings.draft.tools, on);
+        if let Err(error) = crate::validate_tool_list(&tools) {
+            self.bot_settings.error = Some(error.to_string());
+            return;
+        }
+        self.bot_settings.draft.tools = tools;
+        self.bot_settings.error = None;
+        self.bot_settings.notice = None;
+    }
+
+    /// What the ability at `index` still needs, from what the desktop knows
+    /// about connectors and Telegram.
+    pub fn capability_missing(&self, index: usize) -> Option<crate::capabilities::Missing> {
+        let capability = crate::capabilities::CAPABILITIES.get(index)?;
+        let connectors = self
+            .state
+            .connectors_loaded
+            .then_some(self.state.connectors.as_slice());
+        let telegram = self
+            .telegram
+            .status
+            .as_ref()
+            .map(|status| status.telegram_chat_id.is_some());
+        crate::capabilities::missing(capability.needs, connectors, telegram)
     }
 
     /// Throw the edits away and close the panel.
@@ -233,6 +327,7 @@ impl Session {
                 .clone()
                 .filter(|profile| valid_profile_id(profile))
                 .unwrap_or_default(),
+            tools: detail.tools.clone(),
         };
         self.bot_settings.original = draft.clone();
         self.bot_settings.draft = draft;
@@ -275,8 +370,11 @@ impl Session {
     pub(super) fn bot_settings_saved(&mut self) {
         self.bot_settings.saving = false;
         self.bot_settings.error = None;
-        self.bot_settings.notice = Some("Saved.".into());
+        self.bot_settings.notice = Some("Saved".into());
         self.bot_settings.original = self.bot_settings.draft.clone();
+        if std::mem::take(&mut self.bot_settings.close_after_save) {
+            self.bot_settings.open = false;
+        }
         self.panel.ask_profiles();
         if let Some(id) = self.bot_settings.bot.clone() {
             self.state.bot_details.remove(&id);
@@ -346,6 +444,7 @@ impl Session {
 
     pub(super) fn bot_settings_failed(&mut self, error: &ApiError) {
         self.bot_settings.saving = false;
+        self.bot_settings.close_after_save = false;
         self.bot_settings.error = Some(if error.unknown_outcome() {
             "Not sure that was saved. Close this panel, open it again to see what the bot has now, then retry if needed."
                 .to_owned()
@@ -366,7 +465,26 @@ mod tests {
             instructions: "Be brief.".into(),
             model: String::new(),
             browser_profile: String::new(),
+            tools: vec!["vault_list".into(), "mystery_tool".into()],
         }
+    }
+
+    #[test]
+    fn tools_are_part_of_the_draft() {
+        let original = base();
+        let mut draft = original.clone();
+        // Order and duplicates are not a change.
+        draft.tools = vec![
+            "mystery_tool".into(),
+            "vault_list".into(),
+            "vault_list".into(),
+        ];
+        assert!(!draft.dirty(&original));
+        draft.tools.push("memory_save".into());
+        assert!(draft.dirty(&original));
+        let update = draft.changes(&original);
+        assert!(update.tools.as_ref().is_some_and(|t| t.len() == 4));
+        assert!(update.display_name.is_none());
     }
 
     #[test]
