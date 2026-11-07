@@ -373,6 +373,11 @@ pub fn router(state: ApiState) -> Router {
             get(conversation_team).put(set_conversation_team),
         )
         .route("/v1/conversations/{id}/library", get(conversation_library))
+        .route("/v1/conversations/{id}/plan", get(get_conversation_plan))
+        .route(
+            "/v1/conversations/{id}/auto-approve",
+            get(get_auto_approve).put(set_auto_approve),
+        )
         .route("/v1/tasks/{id}", get(task))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}/decide", post(decide_approval))

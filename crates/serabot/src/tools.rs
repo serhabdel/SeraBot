@@ -640,6 +640,7 @@ pub fn register_memory_tools(
 ) -> Result<()> {
     registry.register(MemorySaveTool::new(store.clone()))?;
     registry.register(MemoryListTool::new(store.clone()))?;
+    registry.register(crate::plans::PlanUpdateTool::new(store.clone()))?;
     registry.register(MemoryDeleteTool::new(store))?;
     Ok(())
 }
@@ -667,6 +668,7 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "memory_save",
         "memory_list",
         "memory_delete",
+        "plan_update",
         "vault_list",
         "pdf_inspect",
         "pdf_edit",

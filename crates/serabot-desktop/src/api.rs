@@ -2585,6 +2585,63 @@ impl ApiClient {
         Ok(response.artifacts)
     }
 
+    /// The goal and todo list of one conversation, plus its auto-approve
+    /// switch. An older server without these routes yields no plan and off.
+    pub fn chat_state(
+        &self,
+        conversation: &str,
+    ) -> Result<(Option<crate::chat_plan::ChatPlan>, bool), ApiError> {
+        check_id(conversation)?;
+        let plan: Result<serde_json::Value, ApiError> =
+            self.get(&["v1", "conversations", conversation, "plan"], &[]);
+        let plan = match plan {
+            Ok(body) => body
+                .get("plan")
+                .and_then(crate::chat_plan::ChatPlan::from_value),
+            Err(ApiError::Http(404)) => None,
+            Err(error) => return Err(error),
+        };
+        let auto = match self.auto_approve(conversation) {
+            Ok(enabled) => enabled,
+            Err(ApiError::Http(404)) => false,
+            Err(error) => return Err(error),
+        };
+        Ok((plan, auto))
+    }
+
+    /// `GET /v1/conversations/{id}/auto-approve`.
+    pub fn auto_approve(&self, conversation: &str) -> Result<bool, ApiError> {
+        check_id(conversation)?;
+        #[derive(Deserialize)]
+        struct Envelope {
+            enabled: bool,
+        }
+        let response: Envelope =
+            self.get(&["v1", "conversations", conversation, "auto-approve"], &[])?;
+        Ok(response.enabled)
+    }
+
+    /// `PUT /v1/conversations/{id}/auto-approve`: the owner's per-conversation
+    /// switch. Returns the value the server stored.
+    pub fn set_auto_approve(&self, conversation: &str, enabled: bool) -> Result<bool, ApiError> {
+        check_id(conversation)?;
+        #[derive(Serialize)]
+        struct Body {
+            enabled: bool,
+        }
+        #[derive(Deserialize)]
+        struct Envelope {
+            enabled: bool,
+        }
+        let response: Envelope = self.request(
+            Method::PUT,
+            &["v1", "conversations", conversation, "auto-approve"],
+            &[],
+            Some(&Body { enabled }),
+        )?;
+        Ok(response.enabled)
+    }
+
     /// Transcribe one recorded audio note. The body is the raw recording; the
     /// transcript is model output and stays untrusted until the owner sends it.
     pub fn transcribe_audio(

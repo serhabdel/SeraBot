@@ -628,6 +628,37 @@ fn a_library_response_with_an_unshaped_hash_is_rejected() {
     handle.join().unwrap();
 }
 
+#[test]
+fn chat_plan_and_auto_approve_use_their_routes_and_tolerate_old_servers() {
+    let (client, handle) = server(vec![
+        (
+            200,
+            r#"{"plan":{"goal":"Ship it","items":[{"text":"Build","status":"doing"}]}}"#.into(),
+        ),
+        (
+            200,
+            r#"{"conversation_id":"dir:main","enabled":true}"#.into(),
+        ),
+        (
+            200,
+            r#"{"conversation_id":"dir:main","enabled":false}"#.into(),
+        ),
+        // An older server without the routes: no plan, switch off.
+        (404, r#"{"error":"not found"}"#.into()),
+        (404, r#"{"error":"not found"}"#.into()),
+    ]);
+    let (plan, auto) = client.chat_state("dir:main").unwrap();
+    assert_eq!(plan.unwrap().goal, "Ship it");
+    assert!(auto);
+    assert!(!client.set_auto_approve("dir:main", false).unwrap());
+    let (plan, auto) = client.chat_state("dir:main").unwrap();
+    assert!(plan.is_none() && !auto);
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("GET /v1/conversations/dir:main/plan "));
+    assert!(requests[1].starts_with("GET /v1/conversations/dir:main/auto-approve "));
+    assert!(requests[2].starts_with("PUT /v1/conversations/dir:main/auto-approve "));
+}
+
 const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 const STATE: &str = "synthetic-client-state-0123456789";
 const RETURN_TO: &str = "http://127.0.0.1:51121/auth-done";

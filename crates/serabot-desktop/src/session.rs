@@ -2060,6 +2060,15 @@ impl Session {
                         if self.state.activity.apply(&kind, &payload) {
                             continue;
                         }
+                        // Plan updates feed the plan panel only.
+                        if crate::chat_plan::ChatPlan::apply_event(
+                            &mut self.state.plan,
+                            &self.conversation,
+                            &kind,
+                            &payload,
+                        ) {
+                            continue;
+                        }
                         self.last_event_kind = kind;
                         self.events_dirty = true;
                     }
@@ -2296,6 +2305,19 @@ impl Session {
                             self.state.library_error = Some(message.clone());
                             self.state.library_loading = false;
                             self.state.error = None;
+                            self.schedule(Operation::ChatPlan, Duration::ZERO);
+                        }
+                        OperationKind::ChatPlan => {
+                            // The plan panel is optional; a failed read leaves
+                            // it hidden instead of raising a banner.
+                            self.state.error = None;
+                        }
+                        OperationKind::ChatAutoApprove => {
+                            // The switch shows the server's value, never a guess:
+                            // read it back and tell the owner.
+                            self.toast = Some(format!("Auto-approve was not changed: {message}"));
+                            self.state.error = None;
+                            self.schedule(Operation::ChatPlan, Duration::ZERO);
                         }
                         OperationKind::FetchArtifact => {
                             self.toast = Some(format!("Download failed: {message}"));
@@ -2587,6 +2609,10 @@ impl Session {
                             // conversation loads right behind it.
                             self.state.library_loading = true;
                             self.schedule(Operation::Library, Duration::ZERO);
+                        }
+                        // The plan and auto-approve switch load after the library.
+                        OperationKind::Library => {
+                            self.schedule(Operation::ChatPlan, Duration::ZERO);
                         }
                         OperationKind::OAuthSignIn => {
                             self.admin_error = None;
@@ -3416,6 +3442,17 @@ impl Session {
     pub fn archive_conversation(&mut self, id: String) {
         self.archive_confirm = Some(id.clone());
         self.start_request(Operation::ArchiveConversation { id });
+    }
+
+    /// Flip the open conversation's auto-approve switch. Turning it off is
+    /// applied locally at once and then confirmed by the server; turning it on
+    /// waits for the server's answer so the switch never shows a state the
+    /// server did not accept.
+    pub fn set_auto_approve(&mut self, enabled: bool) {
+        if !enabled {
+            self.state.auto_approve = false;
+        }
+        self.start_request(Operation::SetAutoApprove { enabled });
     }
 
     pub fn unarchive_conversation(&mut self, id: String) {

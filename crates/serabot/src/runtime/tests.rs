@@ -734,6 +734,92 @@ async fn approval_suspends_then_resumes_once() {
     }
 }
 
+fn upload_then_reply_server_responses() -> Vec<Value> {
+    vec![
+        serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "onedrive_upload", "arguments": "{\"dest\":\"folder\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+        serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "delivered"}, "finish_reason": "stop"}]
+        }),
+    ]
+}
+
+/// With auto-approve on in the conversation the turn runs the tool without
+/// stopping for the owner; in another conversation it still waits.
+#[tokio::test]
+async fn yolo_turn_runs_without_asking_only_in_its_own_conversation() {
+    for (yolo_conversation, expect_calls, expect_pending) in
+        [("owner", 1usize, 0usize), ("elsewhere", 0, 1)]
+    {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(Sequence::new(upload_then_reply_server_responses()))
+            .mount(&server)
+            .await;
+        let notifier = Arc::new(Capture::default());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (runtime, store) = setup(&server.uri(), notifier.clone(), calls.clone());
+        let admin_id = admin(&store);
+        store.set_yolo(&admin_id, yolo_conversation, true).unwrap();
+        runtime
+            .submit_text(&admin_id, "owner", "deliver it", None)
+            .unwrap();
+        let task = store.claim_task("test", 30).unwrap().unwrap();
+        runtime.process_task(task).await.unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            expect_calls,
+            "{yolo_conversation}"
+        );
+        assert_eq!(
+            store.list_pending_approvals(&admin_id, 10).unwrap().len(),
+            expect_pending,
+            "{yolo_conversation}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn system_prompt_carries_the_plan_and_keep_going_rules() {
+    let server = MockServer::start().await;
+    let (runtime, store) = setup(
+        &server.uri(),
+        Arc::new(Capture::default()),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    let admin_id = admin(&store);
+    let prompt = runtime.system_prompt(&admin_id, "owner", &bot(), false, &[]);
+    assert!(prompt.contains("plan_update"));
+    assert!(prompt.contains("without asking the owner more questions"));
+    assert!(!prompt.contains("CURRENT PLAN"));
+    let items = vec![crate::plans::PlanItem {
+        text: "Draft the memo".into(),
+        status: crate::plans::PlanStatus::Doing,
+    }];
+    store
+        .set_plan(&admin_id, "owner", "Send a memo", &items)
+        .unwrap();
+    let prompt = runtime.system_prompt(&admin_id, "owner", &bot(), false, &[]);
+    assert!(prompt.contains("Goal: Send a memo"));
+    assert!(prompt.contains("- [~] Draft the memo"));
+    // Another conversation of the same user does not see it.
+    let other = runtime.system_prompt(&admin_id, "elsewhere", &bot(), false, &[]);
+    assert!(!other.contains("Send a memo"));
+}
+
 fn orchestrator_bots() -> Vec<LoadedBot> {
     vec![
         LoadedBot {

@@ -385,7 +385,7 @@ impl Runtime {
         let user = task.user_id.clone();
         let context = self.tool_context(task, turn, &bot, &state)?;
         let mut tool_names = bot.config.tools.clone();
-        for extra in [TEAM_ASK_TOOL, TEAM_REPLY_TOOL] {
+        for extra in [TEAM_ASK_TOOL, TEAM_REPLY_TOOL, crate::plans::PLAN_TOOL] {
             if context.allowed_tools.contains(extra) && !tool_names.iter().any(|name| name == extra)
             {
                 tool_names.push(extra.to_string());

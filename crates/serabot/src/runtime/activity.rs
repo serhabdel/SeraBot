@@ -86,6 +86,7 @@ pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -
         "document_index" => ("file", "Reading a document".into()),
         "memory_save" => ("brain", "Saving to memory".into()),
         "memory_list" | "memory_delete" => ("brain", "Checking memory".into()),
+        "plan_update" => ("bolt", "Updating the plan".into()),
         "skill_list" | "skill_search" | "skill_load" => ("bolt", "Looking up a skill".into()),
         "watch_now" => ("eye", "Checking watched pages".into()),
         "agentmail_send" | "outlook_send" => ("mail", "Sending an email".into()),

@@ -47,6 +47,9 @@ pub const DESTRUCTIVE_TOOLS: &[&str] = &[
     "onedrive_upload",
 ];
 
+/// Audit reason recorded when the owner's YOLO setting approved a call.
+pub const YOLO_AUDIT_REASON: &str = "auto-approved by user YOLO setting";
+
 /// Risk class of a tool by name: true when it needs approval.
 pub fn is_destructive_tool(name: &str) -> bool {
     DESTRUCTIVE_TOOLS.contains(&name)
@@ -365,9 +368,10 @@ impl Gateway {
             if let Some(output) = self.check_standing_grant(&spec, &args, &hash, context)? {
                 return self.dispatch(tool.as_ref(), args, context, output).await;
             }
-            return self
+            let outcome = self
                 .request_approval(tool.as_ref(), args, context, &canonical, &hash)
-                .await;
+                .await?;
+            return self.maybe_auto_approve(outcome, &canonical, context).await;
         }
 
         let started = std::time::Instant::now();
@@ -376,6 +380,53 @@ impl Gateway {
         output.map(ToolOutcome::Completed)
     }
 
+    /// Per-conversation auto-approve ("YOLO"), set by the conversation's own
+    /// owner. The call still goes through the full approval chain: the action
+    /// and approval rows are created and bound to the user, canonical
+    /// arguments, destination, artifact hash and policy version, the approval
+    /// is decided as approved-once, and the action runs through
+    /// `execute_approved`. Only the human click is replaced, and the audit
+    /// ledger says so. The switch is read fresh on every call, so turning it
+    /// off takes effect on the next tool call. Content the policy rejects is
+    /// never auto-approved; it stays pending for the owner.
+    async fn maybe_auto_approve(
+        &self,
+        outcome: ToolOutcome,
+        canonical: &str,
+        context: &ToolContext,
+    ) -> Result<ToolOutcome> {
+        let ToolOutcome::PendingApproval {
+            approval_id,
+            action_id,
+            ..
+        } = &outcome
+        else {
+            return Ok(outcome);
+        };
+        let Some(conversation_id) = context.conversation_id.as_deref() else {
+            return Ok(outcome);
+        };
+        if !self.store.yolo_enabled(&context.user_id, conversation_id)
+            || !self.policy.is_allowed(canonical)
+        {
+            return Ok(outcome);
+        }
+        self.decide(&context.user_id, approval_id, Decision::Once)?;
+        self.store.record_audit(
+            &context.actor,
+            "approval.auto_approved",
+            None,
+            context.task_id.as_deref(),
+            Some(approval_id),
+            Some(action_id),
+            Some(self.policy.version()),
+            Some(&serde_json::json!({
+                "reason": YOLO_AUDIT_REASON,
+                "conversation_id": conversation_id,
+            })),
+        )?;
+        self.execute_approved(action_id, context).await
+    }
     fn check_standing_grant(
         &self,
         spec: &ToolSpec,
@@ -1185,6 +1236,147 @@ mod tests {
                 .await,
             Err(SeraError::PolicyViolation)
         ));
+    }
+
+    fn in_conversation(context: &ToolContext, conversation: &str) -> ToolContext {
+        let mut context = context.clone();
+        context.conversation_id = Some(conversation.into());
+        context
+    }
+
+    /// YOLO replaces the click, not the chain: the call runs, an approval and
+    /// action row exist, and the audit ledger names the setting.
+    #[tokio::test]
+    async fn yolo_auto_approves_through_the_full_chain_and_audits_it() {
+        let (gateway, calls, context) = setup();
+        let context = in_conversation(&context, "dir:main");
+        gateway
+            .store()
+            .set_yolo(&context.user_id, "dir:main", true)
+            .unwrap();
+        let outcome = gateway
+            .execute(
+                "onedrive_upload",
+                serde_json::json!({"dest": "folder"}),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ToolOutcome::Completed(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let audit = gateway
+            .store()
+            .list_audit_for_user(&context.user_id, 50)
+            .unwrap();
+        let auto = audit
+            .iter()
+            .find(|entry| entry.event == "approval.auto_approved")
+            .expect("auto approval is audited");
+        assert_eq!(
+            auto.details.as_ref().unwrap()["reason"],
+            "auto-approved by user YOLO setting"
+        );
+        assert!(auto.approval_id.is_some() && auto.action_id.is_some());
+        for event in ["approval.requested", "approval.approved", "action.executed"] {
+            assert!(audit.iter().any(|entry| entry.event == event), "{event}");
+        }
+        // No standing grant is left behind: switching YOLO off asks again.
+        gateway
+            .store()
+            .set_yolo(&context.user_id, "dir:main", false)
+            .unwrap();
+        let again = gateway
+            .execute(
+                "onedrive_upload",
+                serde_json::json!({"dest": "folder"}),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(again, ToolOutcome::PendingApproval { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// One user's YOLO never reaches another conversation or another user,
+    /// even when the conversation ids are the same string.
+    #[tokio::test]
+    async fn yolo_never_leaks_to_another_chat_or_user() {
+        let (gateway, calls, admin_context) = setup();
+        let member = gateway
+            .store()
+            .create_user("microsoft:yolo-member", "y@example.example", "Y")
+            .unwrap();
+        gateway
+            .store()
+            .set_yolo(&admin_context.user_id, "dir:main", true)
+            .unwrap();
+        let mut member_context = in_conversation(&admin_context, "dir:main");
+        member_context.user_id = member.id.clone();
+        member_context.actor = member.id.clone();
+        member_context.task_id = None;
+        let args = serde_json::json!({"dest": "folder"});
+        // Same conversation id, different user: still asks.
+        let outcome = gateway
+            .execute("onedrive_upload", args.clone(), &member_context)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ToolOutcome::PendingApproval { .. }));
+        // Same user, different conversation: still asks.
+        let other_chat = in_conversation(&admin_context, "dir:other");
+        let outcome = gateway
+            .execute("onedrive_upload", args.clone(), &other_chat)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ToolOutcome::PendingApproval { .. }));
+        // No conversation at all (scheduler, API-less paths): still asks.
+        let outcome = gateway
+            .execute("onedrive_upload", args.clone(), &admin_context)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ToolOutcome::PendingApproval { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // The member turning their own switch on does not touch the admin's.
+        gateway
+            .store()
+            .set_yolo(&member.id, "dir:main", true)
+            .unwrap();
+        gateway
+            .store()
+            .set_yolo(&member.id, "dir:main", false)
+            .unwrap();
+        assert!(
+            gateway
+                .store()
+                .yolo_enabled(&admin_context.user_id, "dir:main")
+        );
+        let admin_chat = in_conversation(&admin_context, "dir:main");
+        let outcome = gateway
+            .execute("onedrive_upload", args, &admin_chat)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ToolOutcome::Completed(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Content the policy rejects is not auto-approved: it stays pending.
+    #[tokio::test]
+    async fn yolo_does_not_approve_blocklisted_arguments() {
+        let (gateway, calls, context) = setup();
+        let context = in_conversation(&context, "dir:main");
+        gateway
+            .store()
+            .set_yolo(&context.user_id, "dir:main", true)
+            .unwrap();
+        let outcome = gateway
+            .execute(
+                "onedrive_upload",
+                serde_json::json!({"dest": "TopSecret"}),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ToolOutcome::PendingApproval { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
