@@ -1159,7 +1159,7 @@ fn orchestrator_bots() -> Vec<LoadedBot> {
                 temperature: None,
                 thinking: None,
                 role: crate::orchestration::BotRole::Orchestrator,
-                delegates: vec!["analyst".into()],
+                delegates: vec!["analyst".into(), "maker".into()],
             },
             prompt: "orchestrator".into(),
         },
@@ -1325,6 +1325,66 @@ async fn delegate_queues_child_without_blocking_parent_permit() {
         .expect("specialist message");
     assert_eq!(specialist.content, "Synthetic analyst summary.");
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn delegate_fans_out_to_parallel_subagents_in_one_round() {
+    let server = MockServer::start().await;
+    // One round with two delegate calls queues two specialist turns (0.27).
+    Mock::given(method("POST"))
+        .respond_with(Sequence::new(vec![json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call_delegate_a",
+                            "type": "function",
+                            "function": {
+                                "name": "delegate",
+                                "arguments": "{\"to_bot\":\"analyst\",\"objective\":\"Summarize synthetic cash position.\",\"model_class\":\"routine\"}"
+                            }
+                        },
+                        {
+                            "id": "call_delegate_b",
+                            "type": "function",
+                            "function": {
+                                "name": "delegate",
+                                "arguments": "{\"to_bot\":\"maker\",\"objective\":\"Draft a synthetic one-pager.\",\"model_class\":\"synthesis\"}"
+                            }
+                        }
+                    ]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })]))
+        .mount(&server)
+        .await;
+    let notifier = Arc::new(Capture::default());
+    let (runtime, store) = setup_orchestration(&server.uri(), notifier.clone());
+    runtime
+        .submit_text(&admin(&store), "owner", "fan out", None)
+        .unwrap();
+    let parent = store.claim_task("worker", 30).unwrap().unwrap();
+    runtime.process_task(parent.clone()).await.unwrap();
+    // Both specialist turns are queued and the reply names both bots.
+    assert_eq!(store.pending_task_count(&admin(&store)).unwrap(), 2);
+    assert!(
+        notifier
+            .texts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|text| text.contains("Queued handoffs to analyst, maker"))
+    );
+    let first = store.claim_task("worker", 30).unwrap().unwrap();
+    let second = store.claim_task("worker", 30).unwrap().unwrap();
+    let mut bots = vec![first.bot.clone(), second.bot.clone()];
+    bots.sort();
+    assert_eq!(bots, vec!["analyst", "maker"]);
+    // One model call only: the fan-out happened in a single round.
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]

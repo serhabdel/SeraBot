@@ -1588,15 +1588,20 @@ impl MediaPoller for McpMediaPoller {
             .mcp
             .call(user_id, tool, &Value::Object(arguments))
             .await?;
-        if let Some(media) = outcome.media.first() {
-            // The call saved the file already; the job saves it again under its own
-            // owner and checks, so the bytes are read back from the store.
-            let stored = self.mcp.artifacts.load(&media.hash)?;
-            return Ok(PollResult::Done(MediaArtifact {
-                bytes: stored.bytes,
-                filename: media.filename.clone(),
-                title: Some(media.title.clone()),
-            }));
+        if !outcome.media.is_empty() {
+            // The call saved every file already; the job saves them again under its
+            // own owner and checks, so the bytes are read back from the store. All
+            // variants are delivered, not just the first (0.27).
+            let mut files = Vec::with_capacity(outcome.media.len());
+            for media in &outcome.media {
+                let stored = self.mcp.artifacts.load(&media.hash)?;
+                files.push(MediaArtifact {
+                    bytes: stored.bytes,
+                    filename: media.filename.clone(),
+                    title: Some(media.title.clone()),
+                });
+            }
+            return Ok(PollResult::Done(files));
         }
         Ok(match outcome.status.as_deref() {
             Some(word) if FAILED_STATUSES.contains(&word) => {
@@ -2760,9 +2765,10 @@ mod tests {
             .await
             .unwrap()
         {
-            PollResult::Done(artifact) => {
-                assert_eq!(artifact.bytes, b"\x89PNGdone");
-                assert!(artifact.filename.ends_with(".png"));
+            PollResult::Done(files) => {
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].bytes, b"\x89PNGdone");
+                assert!(files[0].filename.ends_with(".png"));
             }
             other => panic!("expected a finished file, got {other:?}"),
         }

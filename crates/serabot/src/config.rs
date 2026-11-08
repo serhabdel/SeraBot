@@ -2088,6 +2088,7 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "memory_search",
     "memory_update",
     "memory_delete",
+    "conversation_library",
     "rag_search",
     "xlsx_analyze",
     "timesheet_analyze",

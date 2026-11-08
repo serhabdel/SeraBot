@@ -31,6 +31,8 @@ tools = [
   "xlsx_build",
   "fetch_url",
   "tavily_search",
+  "conversation_library",
+  "telegram_send_document",
 ]
 require_approval = []
 enabled = true

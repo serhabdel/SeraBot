@@ -800,8 +800,80 @@ pub fn register_memory_tools(
     registry.register(MemorySearchTool::new(store.clone()))?;
     registry.register(MemoryUpdateTool::new(store.clone()))?;
     registry.register(crate::plans::PlanUpdateTool::new(store.clone()))?;
-    registry.register(MemoryDeleteTool::new(store))?;
+    registry.register(MemoryDeleteTool::new(store.clone()))?;
+    registry.register(ConversationLibraryTool::new(store))?;
     Ok(())
+}
+
+pub const CONVERSATION_LIBRARY_TOOL: &str = "conversation_library";
+
+/// Read-only lookup of everything this conversation produced (0.27): artifact
+/// hashes with filenames, background media jobs with their result hashes, and
+/// files written to the owner's PC. Bots call this to find a file themselves
+/// instead of asking the owner for a hash or a path.
+pub struct ConversationLibraryTool {
+    store: Store,
+}
+
+impl ConversationLibraryTool {
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl Tool for ConversationLibraryTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: CONVERSATION_LIBRARY_TOOL.into(),
+            description: "List what this conversation produced: artifacts with their hash and filename, \
+                          background media jobs with their status and result hash, and files written to the \
+                          owner's PC (local:<root>/<path>). Use it to find a hash or file yourself instead \
+                          of asking the owner. Takes no arguments; reads only."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, _args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let conversation_id = context.conversation_id.as_deref().ok_or_else(|| {
+            SeraError::InvalidState("conversation_library requires a conversation".into())
+        })?;
+        let artifacts = self
+            .store
+            .list_conversation_library(&context.user_id, conversation_id)?;
+        let media_jobs = self
+            .store
+            .list_media_jobs(&context.user_id, conversation_id)?;
+        let local_files = self
+            .store
+            .list_local_file_destinations(&context.user_id, conversation_id)?;
+        let data = json!({
+            "artifacts": artifacts,
+            "media_jobs": media_jobs
+                .iter()
+                .map(|job| json!({
+                    "id": job.id,
+                    "kind": job.kind.as_str(),
+                    "status": job.status.as_str(),
+                    "artifact_hash": job.artifact_hash,
+                    "error": job.error,
+                    "created_at": job.created_at,
+                }))
+                .collect::<Vec<_>>(),
+            "local_files": local_files,
+        });
+        Ok(ToolOutput {
+            content: serde_json::to_string_pretty(&data)?,
+            data: Some(data),
+            ..ToolOutput::default()
+        })
+    }
 }
 
 /// Every tool name this binary can register, regardless of whether the
@@ -847,6 +919,7 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "delegate",
         "team_ask",
         "team_reply",
+        "conversation_library",
         // Conditional on configuration.
         "audio_transcribe",
         "audio_understand",
@@ -1171,6 +1244,122 @@ mod memory_tool_tests {
             .await
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod conversation_library_tests {
+    use super::*;
+    use crate::gateway::ToolContext;
+    use crate::media_jobs::{MediaJobStatus, MediaKind};
+    use rusqlite::params;
+    use std::collections::HashSet;
+
+    fn context(user: &str) -> ToolContext {
+        ToolContext {
+            user_id: user.into(),
+            actor: user.into(),
+            bot: "main".into(),
+            task_id: None,
+            turn_id: None,
+            conversation_id: Some("dir:main".into()),
+            allowed_tools: HashSet::new(),
+            require_approval: HashSet::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_library_lists_artifacts_jobs_and_local_files_scoped_to_the_user() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let member = store
+            .create_user("microsoft:lib-member", "l@example.example", "L")
+            .unwrap();
+        store
+            .create_conversation(&admin, "dir:main", "direct", None)
+            .unwrap();
+        store
+            .record_conversation_artifact(
+                &admin,
+                "dir:main",
+                None,
+                "media:elevenlabs_key",
+                "abc123",
+                "clip.mp4",
+                Some("Clip"),
+            )
+            .unwrap();
+        let job = store
+            .create_media_job(
+                &admin,
+                "dir:main",
+                "maker",
+                "fake",
+                MediaKind::Video,
+                "ext-1",
+            )
+            .unwrap();
+        store
+            .finish_media_job(&admin, &job.id, MediaJobStatus::Done, Some("abc123"), None)
+            .unwrap();
+        // A PC write recorded as an action with a local: destination.
+        let task = store
+            .enqueue_task(
+                &admin,
+                "turn",
+                "main",
+                &json!({"conversation_id": "dir:main"}),
+                0,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let turn = store
+            .create_turn(&admin, &task.id, "main", "dir:main", &json!({}))
+            .unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO actions
+                    (id, user_id, tool, task_id, turn_id, canonical_args, canonical_hash, destination,
+                     policy_version, status, created_at, updated_at)
+                 VALUES ('a1', ?3, 'local_write', ?1, ?2, '{}', 'h1', 'local:docs/report.md',
+                         'p1', 'completed', datetime('now'), datetime('now'))",
+                params![task.id, turn.id, admin],
+            )
+            .unwrap();
+
+        let tool = ConversationLibraryTool::new(store.clone());
+        let data = tool
+            .execute(json!({}), &context(&admin))
+            .await
+            .unwrap()
+            .data
+            .unwrap();
+        assert_eq!(data["artifacts"][0]["hash"], "abc123");
+        assert_eq!(data["artifacts"][0]["filename"], "clip.mp4");
+        assert_eq!(data["media_jobs"][0]["status"], "done");
+        assert_eq!(data["media_jobs"][0]["artifact_hash"], "abc123");
+        assert_eq!(
+            data["local_files"][0]["destination"],
+            "local:docs/report.md"
+        );
+
+        // Another user's context sees none of it.
+        let member_data = tool
+            .execute(json!({}), &context(&member.id))
+            .await
+            .unwrap()
+            .data
+            .unwrap();
+        assert!(member_data["artifacts"].as_array().unwrap().is_empty());
+        assert!(member_data["media_jobs"].as_array().unwrap().is_empty());
+        assert!(member_data["local_files"].as_array().unwrap().is_empty());
+
+        // No conversation in context is a hard error, not an empty list.
+        let mut no_conversation = context(&admin);
+        no_conversation.conversation_id = None;
+        assert!(tool.execute(json!({}), &no_conversation).await.is_err());
     }
 }
 

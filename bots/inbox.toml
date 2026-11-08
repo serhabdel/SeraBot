@@ -27,6 +27,8 @@ tools = [
   "gmail_list_messages",
   "outlook_list_messages",
   "outlook_calendar_list_events",
+  "conversation_library",
+  "telegram_send_document",
 ]
 require_approval = ["composio_execute"]
 enabled = true

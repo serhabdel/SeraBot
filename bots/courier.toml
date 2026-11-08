@@ -21,6 +21,7 @@ tools = [
   "memory_list",
   "memory_delete",
   "telegram_send_document",
+  "conversation_library",
   "composio_search_tools",
   "composio_connect",
   "composio_execute",

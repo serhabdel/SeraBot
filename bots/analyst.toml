@@ -56,6 +56,8 @@ tools = [
   "local_stat",
   "local_read",
   "local_import",
+  "conversation_library",
+  "telegram_send_document",
 ]
 require_approval = []
 enabled = true

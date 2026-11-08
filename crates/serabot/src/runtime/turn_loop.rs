@@ -127,6 +127,7 @@ impl Runtime {
             route: payload.route.clone(),
             handoff_queued: false,
             handoff_to_bot: None,
+            handoffs: Vec::new(),
             handoff: payload.handoff.clone(),
             team: payload.team.clone(),
             team_asked: false,
@@ -695,8 +696,20 @@ impl Runtime {
                 return self.suspend_for_approval(task, turn, state, pending).await;
             }
             if state.handoff_queued {
-                let label = state.handoff_to_bot.as_deref().unwrap_or("specialist");
-                let text = format!("Queued handoff to {label}.");
+                // 0.27: several handoffs may be queued in one turn, fanning out
+                // to parallel specialist subagents; the reply names them all.
+                let text = if state.handoffs.len() == 1 {
+                    format!(
+                        "Queued handoff to {}.",
+                        state
+                            .handoffs
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("specialist")
+                    )
+                } else {
+                    format!("Queued handoffs to {}.", state.handoffs.join(", "))
+                };
                 self.notifier
                     .send_text(&user, conversation_id, &text)
                     .await?;
@@ -710,7 +723,7 @@ impl Runtime {
                 self.store.append_event(
                     &user,
                     "turn.completed",
-                    &json!({"turn_id": turn.id, "task_id": task.id, "handoff_queued": true}),
+                    &json!({"turn_id": turn.id, "task_id": task.id, "handoff_queued": true, "handoffs": state.handoffs}),
                 )?;
                 return Ok(TurnOutcome::Completed);
             }
@@ -884,10 +897,10 @@ impl Runtime {
                         "only the orchestrator may delegate".into(),
                     ));
                 }
-                if state.handoff_queued {
-                    return Err(SeraError::Validation(
-                        "only one handoff is allowed per turn".into(),
-                    ));
+                if state.handoffs.len() >= MAX_HANDOFFS_PER_TURN {
+                    return Err(SeraError::Validation(format!(
+                        "at most {MAX_HANDOFFS_PER_TURN} handoffs are allowed per turn"
+                    )));
                 }
             }
             if call.name == TEAM_ASK_TOOL {
@@ -933,12 +946,15 @@ impl Runtime {
                             == Some(true)
                     {
                         state.handoff_queued = true;
-                        state.handoff_to_bot = output
+                        if let Some(to_bot) = output
                             .data
                             .as_ref()
                             .and_then(|data| data.get("to_bot"))
                             .and_then(Value::as_str)
-                            .map(str::to_owned);
+                        {
+                            state.handoffs.push(to_bot.to_owned());
+                            state.handoff_to_bot = Some(to_bot.to_owned());
+                        }
                     }
                     if call.name == TEAM_ASK_TOOL
                         && output

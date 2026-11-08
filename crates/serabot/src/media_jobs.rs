@@ -11,7 +11,8 @@
 //!    provider name ([`register_media_poller`]).
 //! 3. A finished job is claimed (`pending` to `finishing`) by one pass, which
 //!    saves its file to the owner's artifact store, records it in the
-//!    conversation, posts "Your <kind> is ready.", and only then moves the job
+//!    conversation, posts one "Your <kind> is ready." line naming every variant
+//!    with its hash, and only then moves the job
 //!    to `done`. A failed job, or one still pending at its deadline, posts a
 //!    short note instead. Each step under a claim is taken once, so a second
 //!    pass cannot post the same file again.
@@ -153,11 +154,13 @@ pub struct MediaArtifact {
     pub title: Option<String>,
 }
 
-/// What a poll found. `Pending` means still rendering.
+/// What a poll found. `Pending` means still rendering. `Done` carries every
+/// file the generation produced (0.27): one generation can yield several
+/// variants, and all of them are delivered, not just the first.
 #[derive(Debug, Clone)]
 pub enum PollResult {
     Pending,
-    Done(MediaArtifact),
+    Done(Vec<MediaArtifact>),
     Failed(String),
 }
 
@@ -527,85 +530,115 @@ fn finish_failed(store: &Store, job: &MediaJob, error: &str) -> Result<()> {
     Ok(())
 }
 
-/// Save a claimed job's finished file, record it, post the ready line, and
-/// only then mark the job done. The job is `finishing` from the claim until the
-/// last step, so no other pass saves or posts it meanwhile.
+/// Save a claimed job's finished files, record each one, post one ready line
+/// that names every variant with its hash, and only then mark the job done.
+/// The job is `finishing` from the claim until the last step, so no other pass
+/// saves or posts it meanwhile.
 fn finish_done(
     store: &Store,
     artifacts: &ArtifactStore,
     policy: &Policy,
     job: &MediaJob,
-    artifact: MediaArtifact,
+    files: Vec<MediaArtifact>,
 ) -> Result<()> {
-    let filename = if artifact.filename.trim().is_empty() {
-        format!("{}-{}", job.kind.as_str(), job.id)
-    } else {
-        artifact.filename.clone()
-    };
-    let title = artifact.title.clone().unwrap_or_else(|| filename.clone());
-    // The blocklist covers what is saved and shown: the name and the title.
-    if !policy.is_allowed(&filename) || !policy.is_allowed(&title) {
-        store.record_audit(
-            &job.user_id,
-            "media_job.blocked",
-            None,
-            None,
-            None,
-            None,
-            Some(policy.version()),
-            Some(&json!({"job_id": job.id, "kind": job.kind.as_str()})),
-        )?;
-        return finish_failed(
-            store,
-            job,
-            "the file name or title was blocked by the content policy",
-        );
-    }
-    if artifact.bytes.len() > MAX_MEDIA_BYTES {
-        warn!(job = %job.id, bytes = artifact.bytes.len(), "a finished media file is over the size cap");
-        return finish_failed(
-            store,
-            job,
-            "the finished file is larger than the 100 MiB limit",
-        );
-    }
-    let stored = match artifacts.save(
-        &artifact.bytes,
-        &filename,
-        ArtifactMeta {
-            title: title.clone(),
-            filename: filename.clone(),
-            language: Language::En,
-            source_artifact: None,
-            created_at: Utc::now(),
-        },
-    ) {
-        Ok(stored) => stored,
-        Err(error) => {
-            warn!(job = %job.id, %error, "could not store a finished media file");
-            return finish_failed(store, job, "the finished file could not be stored");
+    let mut stored = Vec::with_capacity(files.len());
+    for artifact in files {
+        let filename = if artifact.filename.trim().is_empty() {
+            format!("{}-{}", job.kind.as_str(), job.id)
+        } else {
+            artifact.filename.clone()
+        };
+        let title = artifact.title.clone().unwrap_or_else(|| filename.clone());
+        // The blocklist covers what is saved and shown: the name and the title.
+        if !policy.is_allowed(&filename) || !policy.is_allowed(&title) {
+            store.record_audit(
+                &job.user_id,
+                "media_job.blocked",
+                None,
+                None,
+                None,
+                None,
+                Some(policy.version()),
+                Some(&json!({"job_id": job.id, "kind": job.kind.as_str()})),
+            )?;
+            return finish_failed(
+                store,
+                job,
+                "the file name or title was blocked by the content policy",
+            );
         }
+        if artifact.bytes.len() > MAX_MEDIA_BYTES {
+            warn!(job = %job.id, bytes = artifact.bytes.len(), "a finished media file is over the size cap");
+            return finish_failed(
+                store,
+                job,
+                "the finished file is larger than the 100 MiB limit",
+            );
+        }
+        match artifacts.save(
+            &artifact.bytes,
+            &filename,
+            ArtifactMeta {
+                title: title.clone(),
+                filename: filename.clone(),
+                language: Language::En,
+                source_artifact: None,
+                created_at: Utc::now(),
+            },
+        ) {
+            Ok(saved) => stored.push(saved),
+            Err(error) => {
+                warn!(job = %job.id, %error, "could not store a finished media file");
+                return finish_failed(store, job, "the finished file could not be stored");
+            }
+        }
+    }
+    if stored.is_empty() {
+        return finish_failed(
+            store,
+            job,
+            "the provider reported a finished generation with no file",
+        );
+    }
+    for saved in &stored {
+        store.record_conversation_artifact(
+            &job.user_id,
+            &job.conversation_id,
+            None,
+            &format!("media:{}", job.provider),
+            &saved.hash,
+            &saved.filename,
+            Some(&saved.meta.title),
+        )?;
+    }
+    // The ready line names every variant and its hash, so the bot can send
+    // each one to the owner's chat without asking for a hash (0.27).
+    let listing = stored
+        .iter()
+        .map(|saved| format!("{} ({})", saved.filename, saved.hash))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ready = if stored.len() == 1 {
+        format!("Your {} is ready: {}.", job.kind.as_str(), listing)
+    } else {
+        format!(
+            "Your {} is ready: {} variants — {}.",
+            job.kind.as_str(),
+            stored.len(),
+            listing
+        )
     };
-    store.record_conversation_artifact(
-        &job.user_id,
-        &job.conversation_id,
-        None,
-        &format!("media:{}", job.provider),
-        &stored.hash,
-        &stored.filename,
-        Some(&title),
-    )?;
-    post_job_message(store, job, &format!("Your {} is ready.", job.kind.as_str()))?;
+    post_job_message(store, job, &ready)?;
     if !store.finish_media_job(
         &job.user_id,
         &job.id,
         MediaJobStatus::Done,
-        Some(&stored.hash),
+        Some(&stored[0].hash),
         None,
     )? {
         warn!(job = %job.id, "a finished media job was not open when it was marked done");
     }
-    audit_job(store, job, "delivered", Some(&stored.hash))?;
+    audit_job(store, job, "delivered", Some(&stored[0].hash))?;
     Ok(())
 }
 
@@ -676,13 +709,13 @@ async fn handle_job(
             expire_if_due(store, job)?;
             Ok(false)
         }
-        Ok(PollResult::Done(artifact)) => {
+        Ok(PollResult::Done(files)) => {
             // The claim is taken before any save or post, so a second pass
             // that polled the same job cannot finish it too.
             if !store.claim_media_job(&job.user_id, &job.id)? {
                 return Ok(false);
             }
-            finish_done(store, artifacts, policy, job, artifact)?;
+            finish_done(store, artifacts, policy, job, files)?;
             Ok(true)
         }
         Ok(PollResult::Failed(error)) => {
@@ -894,7 +927,10 @@ mod tests {
         let provider = provider_name("done");
         let polls = scripted(
             &provider,
-            vec![Ok(PollResult::Pending), Ok(PollResult::Done(video_bytes()))],
+            vec![
+                Ok(PollResult::Pending),
+                Ok(PollResult::Done(vec![video_bytes()])),
+            ],
         );
         let job = store
             .create_media_job(
@@ -943,10 +979,17 @@ mod tests {
         let messages = store.list_visible_messages(&admin, "dir:main", 20).unwrap();
         let ready: Vec<_> = messages
             .iter()
-            .filter(|message| message.content == "Your video is ready.")
+            .filter(|message| message.content.starts_with("Your video is ready: "))
             .collect();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].name.as_deref(), Some("maker"));
+        // The ready line names the file and its hash, so the bot can send it
+        // without asking the owner (0.27).
+        assert!(
+            ready[0].content.contains("clip.mp4 (") && ready[0].content.contains(&hash),
+            "{}",
+            ready[0].content
+        );
         // The background delivery leaves an audit record for the job's owner.
         let audit = store.list_audit_for_user(&admin, 50).unwrap();
         assert!(
@@ -954,6 +997,63 @@ mod tests {
                 .iter()
                 .any(|entry| entry.event == "media_job.delivered" && entry.actor == admin)
         );
+    }
+
+    #[tokio::test]
+    async fn a_multi_variant_generation_posts_one_ready_line_with_every_hash() {
+        let (store, admin) = setup();
+        let provider = provider_name("variants");
+        let mut first = video_bytes();
+        first.filename = "a.mp4".into();
+        let mut second = video_bytes();
+        second.filename = "b.mp4".into();
+        // Different bytes, so the two variants get different hashes.
+        second.bytes = b"synthetic video bytes, variant b".to_vec();
+        scripted(&provider, vec![Ok(PollResult::Done(vec![first, second]))]);
+        let job = store
+            .create_media_job(
+                &admin,
+                "dir:main",
+                "maker",
+                &provider,
+                MediaKind::Video,
+                "ext-variants",
+            )
+            .unwrap();
+
+        let dir = artifact_dir();
+        assert_eq!(
+            poll_media_jobs_once(&store, dir.path(), &Policy::empty())
+                .await
+                .unwrap(),
+            1
+        );
+        let stored = store.get_media_job(&admin, &job.id).unwrap();
+        assert_eq!(stored.status, MediaJobStatus::Done);
+        // Both variants are recorded in the conversation library.
+        let artifacts = store.list_conversation_library(&admin, "dir:main").unwrap();
+        assert_eq!(artifacts.len(), 2);
+        let hashes: Vec<_> = artifacts.iter().map(|entry| entry.hash.clone()).collect();
+        assert!(
+            hashes
+                .iter()
+                .any(|hash| Some(hash.as_str()) == stored.artifact_hash.as_deref())
+        );
+        // One ready line names both variants and both hashes.
+        let messages = store.list_visible_messages(&admin, "dir:main", 20).unwrap();
+        let ready: Vec<_> = messages
+            .iter()
+            .filter(|message| message.content.starts_with("Your video is ready: "))
+            .collect();
+        assert_eq!(ready.len(), 1);
+        let text = &ready[0].content;
+        assert!(text.contains("2 variants"), "{text}");
+        for entry in &artifacts {
+            assert!(
+                text.contains(&entry.filename) && text.contains(&entry.hash),
+                "{text}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1127,7 +1227,7 @@ mod tests {
     async fn a_claimed_job_is_neither_polled_nor_posted_by_another_pass() {
         let (store, admin) = setup();
         let provider = provider_name("claimed");
-        let polls = scripted(&provider, vec![Ok(PollResult::Done(video_bytes()))]);
+        let polls = scripted(&provider, vec![Ok(PollResult::Done(vec![video_bytes()]))]);
         let job = create_video_job(&store, &admin, &provider, "ext-8");
         assert!(store.claim_media_job(&admin, &job.id).unwrap());
         assert!(!store.claim_media_job(&admin, &job.id).unwrap());
@@ -1157,7 +1257,7 @@ mod tests {
             vec![Err(SeraError::External("provider said no".into()))],
         );
         let quick = provider_name("quick");
-        scripted(&quick, vec![Ok(PollResult::Done(video_bytes()))]);
+        scripted(&quick, vec![Ok(PollResult::Done(vec![video_bytes()]))]);
         let first = create_video_job(&store, &admin, &failing, "ext-9");
         let second = create_video_job(&store, &admin, &quick, "ext-10");
 
@@ -1184,7 +1284,7 @@ mod tests {
         let hung = provider_name("hung");
         register_media_poller(&hung, Arc::new(HangingPoller)).unwrap();
         let quick = provider_name("prompt");
-        scripted(&quick, vec![Ok(PollResult::Done(video_bytes()))]);
+        scripted(&quick, vec![Ok(PollResult::Done(vec![video_bytes()]))]);
         let slow_job = create_video_job(&store, &admin, &hung, "ext-11");
         let quick_job = create_video_job(&store, &admin, &quick, "ext-12");
 
@@ -1214,11 +1314,11 @@ mod tests {
         let provider = provider_name("blocked");
         scripted(
             &provider,
-            vec![Ok(PollResult::Done(MediaArtifact {
+            vec![Ok(PollResult::Done(vec![MediaArtifact {
                 bytes: b"synthetic".to_vec(),
                 filename: "TopSecret.mp4".into(),
                 title: Some("Clip".into()),
-            }))],
+            }]))],
         );
         let job = create_video_job(&store, &admin, &provider, "ext-13");
 
@@ -1244,11 +1344,11 @@ mod tests {
         let provider = provider_name("oversize");
         scripted(
             &provider,
-            vec![Ok(PollResult::Done(MediaArtifact {
+            vec![Ok(PollResult::Done(vec![MediaArtifact {
                 bytes: vec![0u8; MAX_MEDIA_BYTES + 1],
                 filename: "clip.mp4".into(),
                 title: None,
-            }))],
+            }]))],
         );
         let job = create_video_job(&store, &admin, &provider, "ext-14");
 
@@ -1291,7 +1391,7 @@ mod tests {
     async fn a_stalled_claim_fails_once_and_is_never_polled_again() {
         let (store, admin) = setup();
         let provider = provider_name("stalled");
-        let polls = scripted(&provider, vec![Ok(PollResult::Done(video_bytes()))]);
+        let polls = scripted(&provider, vec![Ok(PollResult::Done(vec![video_bytes()]))]);
         let job = create_video_job(&store, &admin, &provider, "ext-15");
         stall_claim(
             &store,

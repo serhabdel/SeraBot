@@ -27,7 +27,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::ask::{ABSTENTION, validate_citations};
 use crate::config::{Config, LoadedBot};
-use crate::delegate::{DELEGATE_TOOL, HANDOFF_QUEUED_KEY};
+use crate::delegate::{DELEGATE_TOOL, HANDOFF_QUEUED_KEY, MAX_HANDOFFS_PER_TURN};
 use crate::domain::{Action, Approval, LlmMessage, Role, Task, ToolCall, Turn, new_id};
 use crate::error::{Result, SeraError};
 use crate::fleet::FleetRegistry;
@@ -130,6 +130,10 @@ struct TurnState {
     handoff_queued: bool,
     #[serde(default)]
     handoff_to_bot: Option<String>,
+    /// Every specialist the orchestrator queued a handoff to this turn (0.27:
+    /// several handoffs per turn fan out to parallel subagents).
+    #[serde(default)]
+    handoffs: Vec<String>,
     /// Present for specialist turns created by `delegate`. Kept on the turn so
     /// approval resumes, whose task payload is a `ResumePayload`, still finish
     /// the handoff instead of parsing the parent turn body.
