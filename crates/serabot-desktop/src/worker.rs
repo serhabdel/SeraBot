@@ -110,6 +110,10 @@ pub enum OperationKind {
     TaskSyncStatus,
     RunTaskSync,
     TaskCalendar,
+    /// The owner-only log ring buffer (0.28.0), for the Logs tab.
+    Logs,
+    /// A server-rendered artifact preview (0.28.0), for the preview pane.
+    DocPreview,
 }
 
 impl OperationKind {
@@ -252,6 +256,15 @@ pub enum Operation {
     },
     /// The open conversation's background media jobs.
     MediaJobs,
+    /// `GET /v1/logs?level=&q=` with the Logs tab's current filter.
+    Logs {
+        level: Option<String>,
+        query: String,
+    },
+    /// `GET /v1/artifacts/{hash}/preview` for one document artifact.
+    DocPreview {
+        hash: String,
+    },
     /// `GET /v1/settings/turn-limits`.
     TurnLimits,
     /// `PUT /v1/settings/turn-limits` with the owner's chosen values.
@@ -447,6 +460,8 @@ impl Operation {
             Self::FetchArtifact { .. } => OperationKind::FetchArtifact,
             Self::PreviewArtifact { .. } => OperationKind::PreviewArtifact,
             Self::MediaJobs => OperationKind::MediaJobs,
+            Self::Logs { .. } => OperationKind::Logs,
+            Self::DocPreview { .. } => OperationKind::DocPreview,
             Self::TurnLimits => OperationKind::TurnLimits,
             Self::SaveTurnLimits { .. } | Self::ResetTurnLimits => OperationKind::TurnLimitsWrite,
             Self::TranscribeAudio { .. } => OperationKind::Transcribe,
@@ -546,6 +561,14 @@ pub enum Reply {
     Voice(VoiceSettings),
     /// The open conversation's background media jobs.
     MediaJobs(Vec<crate::api::MediaJob>),
+    /// The Logs tab read. `None` when the server has no logs route yet (404).
+    Logs(Option<Vec<crate::logs::LogEntry>>),
+    /// One artifact's server-rendered preview; `None` means "no preview,
+    /// use the download route".
+    DocPreview {
+        hash: String,
+        preview: Option<crate::preview::ArtifactPreview>,
+    },
     /// The owner's turn limits, after a read, a save or a reset.
     TurnLimits(crate::api::TurnLimitsView),
     /// A media file as a data URL, ready for an inline player.
@@ -975,6 +998,15 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
                 })
         }
         Operation::MediaJobs => client.media_jobs(conversation).map(Reply::MediaJobs),
+        Operation::Logs { level, query } => client.logs(level.as_deref(), query).map(Reply::Logs),
+        Operation::DocPreview { hash } => {
+            client
+                .artifact_preview(hash)
+                .map(|preview| Reply::DocPreview {
+                    hash: hash.clone(),
+                    preview,
+                })
+        }
         Operation::TurnLimits => client.turn_limits().map(Reply::TurnLimits),
         Operation::SaveTurnLimits { calls, rounds } => client
             .set_turn_limits(*calls, *rounds)

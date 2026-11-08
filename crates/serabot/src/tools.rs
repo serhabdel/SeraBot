@@ -801,6 +801,7 @@ pub fn register_memory_tools(
     registry.register(MemoryUpdateTool::new(store.clone()))?;
     registry.register(crate::plans::PlanUpdateTool::new(store.clone()))?;
     registry.register(MemoryDeleteTool::new(store.clone()))?;
+    registry.register(crate::plans::YoloToggleTool::new(store.clone()))?;
     registry.register(ConversationLibraryTool::new(store))?;
     Ok(())
 }
@@ -920,15 +921,11 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "team_ask",
         "team_reply",
         "conversation_library",
+        "yolo_toggle",
         // Conditional on configuration.
         "audio_transcribe",
         "audio_understand",
-        "elevenlabs_key_list_voices",
-        "elevenlabs_key_text_to_speech",
-        "elevenlabs_key_sound_effect",
-        "elevenlabs_key_transcribe",
-        "elevenlabs_key_generate_image",
-        "elevenlabs_key_generate_video",
+        "openrouter_generate_image",
         "elevenlabs_mcp_search_tools",
         "elevenlabs_mcp_describe_tool",
         "elevenlabs_mcp_call",
@@ -1283,7 +1280,7 @@ mod conversation_library_tests {
                 &admin,
                 "dir:main",
                 None,
-                "media:elevenlabs_key",
+                "media:elevenlabs_mcp",
                 "abc123",
                 "clip.mp4",
                 Some("Clip"),

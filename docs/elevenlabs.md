@@ -1,13 +1,10 @@
 # ElevenLabs
 
-SeraBot has two independent ElevenLabs connectors. Each has its own switch, status, connect and disconnect in the console.
+Since 0.28.0 SeraBot has exactly one ElevenLabs connector: the account sign-in through ElevenLabs' hosted MCP server (the subscription connector). The legacy API-key connector and its native `elevenlabs_key_*` tools were removed entirely — code, config (`[elevenlabs.api_key]`, `api_key_secret`), docs, bot lists and rename rules. There is no API key to store anymore.
 
 | Connector | What it is | Credential | Tools | Recommended |
 |-----------|------------|------------|-------|-------------|
-| **ElevenLabs** | Account sign-in through ElevenLabs' hosted MCP server | Each account's own OAuth sign-in, sealed in that account's credential store | `elevenlabs_mcp_search_tools`, `elevenlabs_mcp_describe_tool`, `elevenlabs_mcp_call` | Yes |
-| **ElevenLabs API key** | Legacy native REST tools | The owner's API key, in the server secret store (`elevenlabs_api_key`) | `elevenlabs_key_*` | Only when the sign-in does not fit |
-
-The two never share a credential and never run on the same request.
+| **ElevenLabs** | Account sign-in through ElevenLabs' hosted MCP server | Each account's own OAuth sign-in, sealed in that account's credential store | `elevenlabs_mcp_search_tools`, `elevenlabs_mcp_describe_tool`, `elevenlabs_mcp_call` | Yes — the only one |
 
 ## ElevenLabs: account sign-in (hosted MCP)
 
@@ -36,7 +33,7 @@ Rules the tools enforce, and the guidance the model is given:
 2. The sign-in takes effect at once. No restart is needed for it.
 3. **Disconnect** removes this account's sign-in. Tool calls fail with "not connected" until you sign in again.
 
-API equivalents (owner only): `POST /v1/admin/connectors/elevenlabs/oauth/start` returns the consent URL; `POST /v1/admin/connectors/elevenlabs/oauth/complete` takes `{code, verifier, redirect_uri}`; `DELETE /v1/admin/connectors/elevenlabs/oauth` disconnects. `POST /v1/admin/connectors/elevenlabs/test` checks the per-account sign-in; `DELETE /v1/admin/connectors/elevenlabs_api_key/secrets` removes the saved API key from the server store (the console's "Remove saved key" button).
+API equivalents (owner only): `POST /v1/admin/connectors/elevenlabs/oauth/start` returns the consent URL; `POST /v1/admin/connectors/elevenlabs/oauth/complete` takes `{code, verifier, redirect_uri}`; `DELETE /v1/admin/connectors/elevenlabs/oauth` disconnects. `POST /v1/admin/connectors/elevenlabs/test` checks the per-account sign-in.
 
 The authorization request is PKCE S256 with a CIMD client (`[elevenlabs].oauth_client_id`, the https URL of the metadata document this server publishes at `/.well-known/serabot-oauth-client.json`). The redirect is the fixed loopback `http://127.0.0.1:51122/oauth-callback`. The authorize and token endpoints are pinned in code. Scope: `[elevenlabs].oauth_scope`. The authorize, token and refresh requests all carry the RFC 8707 `resource` (`https://api.us.elevenlabs.io/v1/mcp`), because the token is minted for the MCP server, not the REST API; without it MCP calls are rejected.
 
@@ -59,33 +56,6 @@ mcp_enabled = true
 
 Enabling or disabling the connector in the console takes effect after a restart of `serabot.service`, because the tools are registered at startup. The sign-in itself does not.
 
-## ElevenLabs API key (legacy native tools)
-
-For an owner who prefers a key over the account sign-in. These are the native REST tools:
-
-| Tool | Effect | Notes |
-|------|--------|-------|
-| `elevenlabs_key_list_voices` | read-only | `GET /v2/voices` |
-| `elevenlabs_key_text_to_speech` | external, approval | `POST /v1/text-to-speech/{voice_id}` → artifact |
-| `elevenlabs_key_sound_effect` | external, approval | `POST /v1/sound-generation` → artifact |
-| `elevenlabs_key_transcribe` | external, approval | `POST /v1/speech-to-text` from an artifact hash or inbox path |
-| `elevenlabs_key_generate_image` | external, approval | `POST /v1/flows/image`, looked up for up to 20 s in the call → artifact, or a media job (`status: generating`) |
-| `elevenlabs_key_generate_video` | external, approval | `POST /v1/flows/video`, looked up for up to 20 s in the call → artifact, or a media job (`status: generating`) |
-
-### Enable
-
-1. Store the key without printing it: `serabot secrets set elevenlabs_api_key`. Keys are `sk_` followed by 48 hex characters. A truncated key is rejected at save time.
-2. Set the switch in `serabot.toml` (or in the console, then restart):
-   ```toml
-   [elevenlabs.api_key]
-   enabled = true
-   ```
-3. Allowlist the tools on the bots that should use them, for example `tools = ["elevenlabs_key_list_voices", "elevenlabs_key_text_to_speech"]` with `require_approval` for the generation tools.
-
-The native tools are registered only when this connector is enabled **and** a key is stored. With the switch on and no key, the server logs a warning and registers nothing. The API key is server-wide, owned by the owner. It is not a per-account credential.
-
-Prompts and text are checked against the blocklist before they leave the host. Tool output is scanned again by the gateway.
-
 ## Configuration
 
 ```toml
@@ -97,36 +67,29 @@ mcp_url = "https://api.us.elevenlabs.io/v1/mcp"
 oauth_client_id = "https://bot.seradyx.tech/.well-known/serabot-oauth-client.json"
 oauth_scope = "convai_read convai_write text_to_speech speech_history_read flows image_video_generation voice_generation"
 
-[elevenlabs.api_key]
-enabled = false                     # the API-key connector
-
-api_base = "https://api.elevenlabs.io"
-api_key_secret = "elevenlabs_api_key"
-timeout_secs = 120                  # API-key connector REST calls
+# Optional default voice when tools omit voice_id (set after listing voices).
+default_voice_id = ""
+tts_model = "eleven_multilingual_v2"
+stt_model = "scribe_v2"
+image_model = "gemini-2.5-flash-image"
+video_model = "bytedance-seedance-v2-mini"
+max_tts_chars = 5000
+poll_interval_ms = 2000
+poll_max_attempts = 60
 ```
 
-### Upgrading from 0.23
+There is no `[elevenlabs.api_key]` section and no `api_key_secret`: the API-key connector no longer exists. Old configs that still carry them load fine; the section is ignored.
 
-The old keys are still read, once, and folded into the new switches:
+### Upgrading from 0.27 and earlier
 
-- `enabled = true` with `auth = "oauth"` becomes `mcp_enabled = true`.
-- `enabled = true` with `auth = "api_key"`, or with no `auth` (the old default), becomes `[elevenlabs.api_key] enabled = true`.
+Bot files, stored bot rows, console overrides and tool lists that name the removed native tools are cleaned on load: the old native names (`elevenlabs_text_to_speech` and the like) and the `elevenlabs_key_*` spellings are dropped, because the MCP tools are the only ElevenLabs connector now. A list that ends up with a name twice keeps the first.
 
-A deprecation warning is logged. The console's old auth-mode toggle is gone, and an old `admin-overrides.json` that carries it still applies.
-
-Bot files, stored bot rows, console overrides and tool lists sent by an older console are renamed on load:
-
-- `elevenlabs_list_voices` → `elevenlabs_key_list_voices` (and the other four native names), unless the bot also has MCP tools. A bot with `elevenlabs_mcp_*` tools was in account-sign-in mode, so its old native names are dropped and the MCP tools take their place.
 - `elevenlabs_mcp_list_tools` → `elevenlabs_mcp_search_tools`, and `elevenlabs_mcp_describe_tool` is added beside it.
-- A list that ends up with a name twice keeps the first.
-
-The connector view keeps `auth_modes: ["oauth"]` for one release so an older console still finds its sign-in mode.
 
 ## Limits
 
 - **Members cannot sign in to the ElevenLabs connector.** The sign-in is owner-console only. A member who calls an MCP tool is told to sign in. Member sign-in needs a second redirect on the metadata document or a member-facing consent flow; that is not built.
-- The API-key connector's key is server-wide. It is not a per-user credential. Moving it to the per-user store is a separate change.
-- Enabling or disabling either connector needs a restart; the tool list is built at startup.
+- Enabling or disabling the connector needs a restart; the tool list is built at startup.
 - Some reads (for example `agents_list`) do not match the read prefixes, so they still ask for approval. Words that merely contain a write word (`voice_settings`) ask too. The classification is deliberately conservative.
 - Scopes are product-scoped and the authorization server is per-region. The code pins the global/US endpoints. Verify each tool against a real account before relying on it.
 

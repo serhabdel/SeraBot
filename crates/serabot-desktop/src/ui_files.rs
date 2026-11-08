@@ -245,16 +245,30 @@ pub fn ComposerFiles(session: Signal<Session>) -> Element {
 /// Cards for the newest files produced in this conversation.
 #[component]
 pub fn MediaCards(session: Signal<Session>) -> Element {
+    let mut open_previews = use_signal(std::collections::BTreeSet::<String>::new);
     let (entries, pending, downloading) = {
         let state = session.read();
+        let open = open_previews();
+        let entries: Vec<(
+            serabot_desktop::LibraryEntry,
+            Option<serabot_desktop::preview::PreviewKind>,
+            bool,
+        )> = state
+            .state
+            .library
+            .iter()
+            .take(MAX_CARDS)
+            .cloned()
+            .map(|entry| {
+                let kind = serabot_desktop::preview::preview_kind_for_name(
+                    entry.filename.as_deref().unwrap_or_default(),
+                );
+                let is_open = open.contains(&entry.hash);
+                (entry, kind, is_open)
+            })
+            .collect();
         (
-            state
-                .state
-                .library
-                .iter()
-                .take(MAX_CARDS)
-                .cloned()
-                .collect::<Vec<_>>(),
+            entries,
             serabot_desktop::media_view::pending_jobs(&state.state.media_jobs)
                 .into_iter()
                 .cloned()
@@ -277,7 +291,9 @@ pub fn MediaCards(session: Signal<Session>) -> Element {
                     }
                 }
             }
-            for entry in entries {
+            for (entry, preview_kind, preview_open) in entries {
+                // 0.28.0: documents the server can render (pdf/pptx/xlsx/docx/md)
+                // get a Preview toggle next to Open.
                 div { key: "{entry.hash}", class: "media-card", role: "listitem",
                     span { class: "media-card-icon",
                         Icon {
@@ -294,6 +310,30 @@ pub fn MediaCards(session: Signal<Session>) -> Element {
                             session,
                             hash: entry.hash.clone(),
                             mime: entry.mime.clone().unwrap_or_default(),
+                        }
+                        if let Some(kind) = preview_kind {
+                            button {
+                                class: "btn small",
+                                onclick: {
+                                    let hash = entry.hash.clone();
+                                    move |_| {
+                                        let mut open = open_previews.write();
+                                        if !open.remove(&hash) {
+                                            open.insert(hash.clone());
+                                        }
+                                        drop(open);
+                                        session.write().request_doc_preview(hash.clone());
+                                    }
+                                },
+                                if preview_open { "Hide preview" } else { "Preview" }
+                            }
+                            if preview_open {
+                                DocPreviewPane {
+                                    session,
+                                    hash: entry.hash.clone(),
+                                    label: kind.label().to_owned(),
+                                }
+                            }
                         }
                     }
                     button {
@@ -317,6 +357,63 @@ pub fn MediaCards(session: Signal<Session>) -> Element {
                 }
             }
         }
+    }
+}
+
+/// The server-rendered preview pane for one document artifact (0.28.0):
+/// `GET /v1/artifacts/{hash}/preview`. While the read runs it shows a
+/// spinner; a missing preview (older server, 404) or a malformed one says
+/// so and the card's Open/Save stay the fallback.
+#[component]
+fn DocPreviewPane(session: Signal<Session>, hash: String, label: String) -> Element {
+    let cached = session.read().state.doc_previews.get(&hash).cloned();
+    let pending = session.read().doc_previews_pending.contains(&hash);
+    match cached {
+        Some(Some(preview)) => match preview.render() {
+            Some(serabot_desktop::preview::PreviewContent::Image(url)) => rsx! {
+                div { class: "doc-preview",
+                    div { class: "doc-preview-head",
+                        span { class: "grow", "{label}" }
+                    }
+                    div { class: "doc-preview-body",
+                        img { src: "{url}", alt: "Preview of the file" }
+                    }
+                }
+            },
+            Some(serabot_desktop::preview::PreviewContent::Text(text)) => rsx! {
+                div { class: "doc-preview",
+                    div { class: "doc-preview-head",
+                        span { class: "grow", "{label}" }
+                    }
+                    div { class: "doc-preview-body",
+                        pre { "{text}" }
+                    }
+                }
+            },
+            None => rsx! {
+                div { class: "doc-preview",
+                    div { class: "doc-preview-head",
+                        span { class: "grow", "No preview available for this file. Use Open." }
+                    }
+                }
+            },
+        },
+        Some(None) => rsx! {
+            div { class: "doc-preview",
+                div { class: "doc-preview-head",
+                    span { class: "grow", "The server has no preview for this file. Use Open." }
+                }
+            }
+        },
+        None if pending => rsx! {
+            div { class: "doc-preview",
+                div { class: "doc-preview-head", role: "status",
+                    span { class: "spinner", "aria-hidden": "true" }
+                    span { class: "grow", "Loading preview\u{2026}" }
+                }
+            }
+        },
+        None => rsx! {},
     }
 }
 

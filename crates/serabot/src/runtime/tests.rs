@@ -190,6 +190,37 @@ impl Tool for FakeUpload {
     }
 }
 
+/// A non-destructive tool that still asks for approval, so YOLO behaviour can
+/// be tested without touching the destructive list (0.28: YOLO never covers
+/// destructive tools).
+struct FakeNote {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for FakeNote {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "fake_note".into(),
+            description: "fake approval-gated note".into(),
+            parameters: serde_json::json!({"type": "object"}),
+            external_effect: false,
+        }
+    }
+
+    fn requires_approval(&self, _args: &Value) -> bool {
+        true
+    }
+
+    async fn execute(&self, _args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ToolOutput {
+            content: "noted".into(),
+            ..ToolOutput::default()
+        })
+    }
+}
+
 fn bot() -> LoadedBot {
     LoadedBot {
         config: BotConfig {
@@ -200,7 +231,7 @@ fn bot() -> LoadedBot {
             model: None,
             system_prompt: "prompts/main.txt".into(),
             skills: vec![],
-            tools: vec!["onedrive_upload".into()],
+            tools: vec!["onedrive_upload".into(), "fake_note".into()],
             require_approval: vec![],
             enabled: true,
             temperature: None,
@@ -250,7 +281,12 @@ fn setup_custom(
     )
     .unwrap();
     let mut registry = ToolRegistry::default();
-    registry.register(FakeUpload { calls }).unwrap();
+    registry
+        .register(FakeUpload {
+            calls: calls.clone(),
+        })
+        .unwrap();
+    registry.register(FakeNote { calls }).unwrap();
     let gateway = Gateway::new(
         store.clone(),
         Arc::new(crate::policy::Policy::empty()),
@@ -1078,17 +1114,39 @@ fn upload_then_reply_server_responses() -> Vec<Value> {
     ]
 }
 
-/// With auto-approve on in the conversation the turn runs the tool without
-/// stopping for the owner; in another conversation it still waits.
+/// With auto-approve on in the conversation the turn runs a non-destructive
+/// approval-gated tool without stopping for the owner; in another conversation
+/// it still waits. Destructive tools never auto-approve (see gateway tests).
 #[tokio::test]
 async fn yolo_turn_runs_without_asking_only_in_its_own_conversation() {
+    let note_then_reply = || {
+        vec![
+            serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "fake_note", "arguments": "{}"}
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }),
+            serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "noted"}, "finish_reason": "stop"}]
+            }),
+        ]
+    };
     for (yolo_conversation, expect_calls, expect_pending) in
         [("owner", 1usize, 0usize), ("elsewhere", 0, 1)]
     {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .respond_with(Sequence::new(upload_then_reply_server_responses()))
+            .respond_with(Sequence::new(note_then_reply()))
             .mount(&server)
             .await;
         let notifier = Arc::new(Capture::default());

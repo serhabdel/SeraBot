@@ -287,6 +287,99 @@ class LibraryEntry {
 
 bool validHash(String h) => RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(h);
 
+/// The file formats the server can render a preview for (0.28.0).
+const previewableExtensions = ['pdf', 'pptx', 'xlsx', 'docx', 'md'];
+
+/// The preview kind for a file name, or null when the file is not previewable.
+PreviewKind? previewKindForName(String name) {
+  final lower = name.trim().toLowerCase();
+  final dot = lower.lastIndexOf('.');
+  if (dot < 0 || dot == lower.length - 1) {
+    return null;
+  }
+  return switch (lower.substring(dot + 1)) {
+    'pdf' => PreviewKind.pdf,
+    'pptx' => PreviewKind.slide,
+    'xlsx' => PreviewKind.sheet,
+    'docx' => PreviewKind.doc,
+    'md' => PreviewKind.markdown,
+    _ => null,
+  };
+}
+
+enum PreviewKind {
+  pdf,
+  slide,
+  sheet,
+  doc,
+  markdown;
+
+  String get label => switch (this) {
+        PreviewKind.pdf => 'PDF page 1',
+        PreviewKind.slide => 'Slide 1',
+        PreviewKind.sheet => 'First rows',
+        PreviewKind.doc => 'First blocks',
+        PreviewKind.markdown => 'Markdown',
+      };
+}
+
+/// One server-rendered artifact preview (0.28.0):
+/// `GET /v1/artifacts/{hash}/preview` -> `{content_type, text?, image_b64?}`.
+/// Values are bounded and control characters stripped before display.
+class ArtifactPreview {
+  const ArtifactPreview({
+    required this.contentType,
+    this.text,
+    this.imageB64,
+  });
+
+  static const maxTextChars = 200000;
+  static const maxImageB64Chars = 8 * 1024 * 1024;
+
+  static ArtifactPreview? fromJson(Map<String, dynamic> json) {
+    final contentType = _str(json['content_type']) ?? '';
+    if (contentType.isEmpty || contentType.runes.length > 128) {
+      return null;
+    }
+    String? text = _str(json['text']);
+    if (text != null) {
+      if (text.runes.length > maxTextChars) {
+        text = String.fromCharCodes(text.runes.take(maxTextChars));
+      }
+      text = text.replaceAll(RegExp(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]'), '');
+    }
+    String? imageB64 = _str(json['image_b64']);
+    if (imageB64 != null) {
+      final trimmed = imageB64.trim();
+      final valid = trimmed.isNotEmpty &&
+          trimmed.runes.length <= maxImageB64Chars &&
+          RegExp(r'^[A-Za-z0-9+/]+=*$').hasMatch(trimmed);
+      imageB64 = valid ? trimmed : null;
+    }
+    return ArtifactPreview(
+      contentType: contentType,
+      text: (text != null && text.trim().isEmpty) ? null : text,
+      imageB64: imageB64,
+    );
+  }
+
+  final String contentType;
+  final String? text;
+  final String? imageB64;
+
+  /// The image as a data URL, when the server sent a valid one.
+  String? get imageDataUrl {
+    final b64 = imageB64;
+    if (b64 == null) {
+      return null;
+    }
+    final mime = contentType.startsWith('image/') ? contentType : 'image/png';
+    return 'data:$mime;base64,$b64';
+  }
+
+  bool get hasContent => imageB64 != null || (text != null && text!.isNotEmpty);
+}
+
 /// `GET /v1/bots` row.
 class BotSummary {
   const BotSummary({

@@ -24,8 +24,8 @@ pub mod documents;
 #[cfg(feature = "docx")]
 pub mod docx_ops;
 pub mod domain;
-pub mod elevenlabs;
 pub mod elevenlabs_mcp;
+pub mod elevenlabs_oauth;
 pub mod embeddings;
 pub mod error;
 pub mod fetch;
@@ -37,6 +37,7 @@ pub mod llm;
 pub mod local_bulk;
 pub mod local_relay;
 pub mod local_transfer;
+pub mod logging;
 pub mod maker;
 pub mod mcp_client;
 pub mod media_jobs;

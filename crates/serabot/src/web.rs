@@ -121,7 +121,7 @@ where
         .route("/app/latest.apk", get(latest_apk))
         .route("/app/SHA256SUMS", get(sha256sums))
         .route("/healthz", get(healthz))
-        .route(crate::elevenlabs::CIMD_PATH, get(cimd))
+        .route(crate::elevenlabs_oauth::CIMD_PATH, get(cimd))
 }
 
 /// Public CIMD client metadata document, used as the ElevenLabs OAuth
@@ -135,7 +135,7 @@ async fn cimd() -> Response {
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
             (header::CONTENT_SECURITY_POLICY, CSP),
         ],
-        Json(crate::elevenlabs::cimd_document()),
+        Json(crate::elevenlabs_oauth::cimd_document()),
     )
         .into_response()
 }
@@ -371,10 +371,13 @@ mod tests {
             .await
             .unwrap();
         let doc: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(doc["client_id"], json!(crate::elevenlabs::cimd_client_id()));
+        assert_eq!(
+            doc["client_id"],
+            json!(crate::elevenlabs_oauth::cimd_client_id())
+        );
         assert_eq!(
             doc["redirect_uris"],
-            json!([crate::elevenlabs::oauth_callback_uri()])
+            json!([crate::elevenlabs_oauth::oauth_callback_uri()])
         );
         assert!(!bytes.windows(3).any(|w| w == b"sk_"));
     }

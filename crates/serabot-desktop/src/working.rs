@@ -169,6 +169,20 @@ impl WorkingBots {
         })
     }
 
+    /// Live entries in one conversation as `(bot, activity)` pairs, for the
+    /// Jobs/Activity panel (0.28.0). The conversation's own bot is included;
+    /// callers decide what counts as a handoff.
+    pub fn conversation_entries(
+        &self,
+        conversation: &str,
+        now: Instant,
+    ) -> Vec<(String, BotActivity)> {
+        self.live(now)
+            .filter(|entry| same_conversation(&entry.conversation, conversation))
+            .map(|entry| (entry.bot.clone(), entry.activity.clone()))
+            .collect()
+    }
+
     /// The bots that are working right now, sorted.
     pub fn working_bots(&self, now: Instant) -> Vec<String> {
         let mut bots: Vec<String> = self

@@ -13,7 +13,10 @@ mod cards_api;
 mod chat_api;
 mod composio_api;
 mod files_api;
+mod jobs_api;
+mod logs_api;
 mod personal_api;
+mod preview_api;
 mod profiles_api;
 mod status_api;
 mod vault_http;
@@ -225,6 +228,82 @@ fn app_with_stack(
         state.auth = Some(Arc::new(service));
     }
     (router(state), config, store)
+}
+
+/// Same stack, also returning the artifact store so a test can save
+/// synthetic artifacts into the same store the handlers read.
+fn app_with_artifacts(
+    egress_approved: bool,
+    policy: Policy,
+    base_dir: std::path::PathBuf,
+) -> (Router, Arc<Config>, Store, Arc<ArtifactStore>) {
+    let mut config = Config::default();
+    config.api.enabled = true;
+    config.api.token_hash = sha256_hex("test-token-that-is-long-enough-123");
+    config.llm.data_egress_approved = egress_approved;
+    config.llm.model = "test".into();
+    config.memory.auto_extract = false;
+    config.llm.base_url = "https://example.com/v1".into();
+    config.llm.models = vec!["test-alternative".into()];
+    config.base_dir = base_dir.canonicalize().unwrap_or_else(|_| base_dir.clone());
+    let directory = std::env::temp_dir().join(format!("serabot-api-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&directory).unwrap();
+    config.database.path = directory.join("serabot.db").to_string_lossy().into_owned();
+    let config = Arc::new(config);
+    let store = Store::open(&config.database.path, 384, 5000).unwrap();
+    let gateway = Gateway::new(
+        store.clone(),
+        Arc::new(policy),
+        ToolRegistry::default(),
+        1,
+        false,
+    );
+    let llm = LlmClient::new("https://example.com/v1", "test", 5, 50)
+        .unwrap()
+        .with_model("test");
+    let runtime = Runtime::new(
+        config.clone(),
+        store.clone(),
+        gateway,
+        crate::model_router::ModelRouter::new(
+            &config.llm,
+            std::collections::BTreeMap::from([("default".into(), llm)]),
+        )
+        .unwrap(),
+        vec![test_bot(
+            "main",
+            crate::orchestration::BotRole::Orchestrator,
+        )],
+        Arc::new(NullNotifier),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .unwrap();
+    let artifacts = Arc::new(
+        ArtifactStore::new(
+            std::env::temp_dir().join(format!("serabot-api-test-{}", uuid::Uuid::new_v4())),
+        )
+        .unwrap(),
+    );
+    let secrets = SharedSecrets::new(crate::secrets::SecretStore::from_map(
+        std::collections::BTreeMap::from([(
+            config.llm.api_key_secret.clone(),
+            "synthetic-test-key".to_string(),
+        )]),
+    ));
+    let users = Arc::new(
+        crate::user_secrets::UserSecrets::with_master_key(store.clone(), [9u8; 32]).unwrap(),
+    );
+    let state = ApiState::new(
+        runtime,
+        store.clone(),
+        config.clone(),
+        artifacts.clone(),
+        secrets,
+        users,
+        None,
+    )
+    .unwrap();
+    (router(state), config, store, artifacts)
 }
 
 /// An app with sign-in enabled and the auth service pointed at a
@@ -1062,7 +1141,7 @@ async fn new_conversation_routes_validate_identity_and_require_authentication() 
 }
 
 #[tokio::test]
-async fn connector_catalog_lists_both_elevenlabs_connectors_in_voice_group() {
+async fn connector_catalog_lists_only_the_elevenlabs_subscription_in_voice_group() {
     let (app, _, _) = app();
     let response = app
         .clone()
@@ -1071,30 +1150,26 @@ async fn connector_catalog_lists_both_elevenlabs_connectors_in_voice_group() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = read_json(response).await;
-    let find = |id: &str| {
-        body["connectors"]
-            .as_array()
-            .unwrap()
+    let list = body["connectors"].as_array().unwrap();
+    // 0.28: the API-key connector is gone; only the account sign-in remains.
+    assert!(
+        !list
             .iter()
-            .find(|connector| connector["id"] == id)
-            .cloned()
-            .unwrap_or_else(|| panic!("{id} listed"))
-    };
+            .any(|connector| connector["id"] == "elevenlabs_api_key"),
+        "elevenlabs_api_key must not be listed"
+    );
     // The account sign-in: per-account state, no server-wide secrets.
-    let signin = find("elevenlabs");
+    let signin = list
+        .iter()
+        .find(|connector| connector["id"] == "elevenlabs")
+        .cloned()
+        .expect("elevenlabs listed");
     assert_eq!(signin["kind"], "oauth");
     assert_eq!(signin["enabled"], false);
     assert_eq!(signin["connected"], false);
     assert_eq!(signin["group"], "Voice & Media");
     assert!(signin.get("auth").is_none());
     assert_eq!(signin["auth_modes"], json!(["oauth"]));
-    // The API-key connector: its own key, its own switch.
-    let key = find("elevenlabs_api_key");
-    assert_eq!(key["kind"], "api_key");
-    assert_eq!(key["enabled"], false);
-    assert_eq!(key["group"], "Voice & Media");
-    assert_eq!(key["secrets"]["api_key"]["name"], "elevenlabs_api_key");
-    assert_eq!(key["secrets"]["api_key"]["configured"], false);
 }
 
 #[tokio::test]
@@ -1126,13 +1201,7 @@ async fn connector_test_is_owner_only_and_reports_missing_secrets_without_networ
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-    for id in [
-        "elevenlabs_api_key",
-        "tavily",
-        "firecrawl",
-        "agentmail",
-        "gmail",
-    ] {
+    for id in ["tavily", "firecrawl", "agentmail", "gmail"] {
         let response = app
             .clone()
             .oneshot(request(
@@ -1201,9 +1270,9 @@ async fn admin_can_remove_saved_connector_secrets_but_not_per_account_signins() 
         .await
         .unwrap();
     assert_eq!(per_account.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    // The API-key connector's server-wide secret is removed; only its name
-    // comes back, never a value.
-    let removed = app
+    // 0.28: the API-key connector no longer exists, so its secrets route is
+    // gone too.
+    let gone = app
         .clone()
         .oneshot(request(
             &app,
@@ -1214,10 +1283,24 @@ async fn admin_can_remove_saved_connector_secrets_but_not_per_account_signins() 
         ))
         .await
         .unwrap();
+    assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+    // Another API-key connector's server-wide secret is removed; only its
+    // name comes back, never a value.
+    let removed = app
+        .clone()
+        .oneshot(request(
+            &app,
+            "DELETE",
+            "/v1/admin/connectors/tavily/secrets",
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
     assert_eq!(removed.status(), StatusCode::OK);
     let body = read_json(removed).await;
-    assert_eq!(body["id"], "elevenlabs_api_key");
-    assert_eq!(body["removed"], json!(["elevenlabs_api_key"]));
+    assert_eq!(body["id"], "tavily");
+    assert_eq!(body["removed"], json!(["tavily_api_key"]));
     assert!(!body.to_string().contains("sk_"));
 }
 
@@ -2963,7 +3046,8 @@ async fn providers_and_connectors_report_status_without_secret_values() {
     )
     .await;
     let list = connectors["connectors"].as_array().unwrap();
-    assert_eq!(list.len(), 17);
+    // 0.28: the ElevenLabs API-key connector was removed (17 → 16).
+    assert_eq!(list.len(), 16);
     let gmail = list
         .iter()
         .find(|connector| connector["id"] == "gmail")

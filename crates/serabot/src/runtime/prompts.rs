@@ -16,7 +16,8 @@ const ASK_RULES: &str = "- If the request is ambiguous and a wrong guess would w
 const AUTONOMY_RULES: &str = "- Finish the task end to end with the tools you have. Do not stop midway to ask the owner how to proceed; state your assumptions in the reply instead.\n\
 - When a tool call fails with a transient error (timeout, rate limit, not found, PC app offline), fix the arguments or try a different approach and call again, up to 3 attempts per step. Never retry a call the owner denied.\n\
 - Find things yourself before asking: call conversation_library to get artifact hashes, generated media results and files written to the owner's PC, and local_list or local_search to locate files in the shared folders. Never ask the owner for a hash, a file path, or a job id you can look up.\n\
-- When you generate images, audio or video, deliver every variant to the owner's chat with telegram_send_document (it needs approval) so the owner can see each one; use conversation_library to get the hashes when a generation finished in the background.\n";
+- When you generate images, audio or video, deliver every variant to the owner's chat with telegram_send_document (it needs approval) so the owner can see each one; use conversation_library to get the hashes when a generation finished in the background.\n\
+- 0.28: if the task calls for running without approval prompts, call yolo_toggle to enable auto-approve for this conversation. Destructive actions (sends, uploads, writes, deletes) always still ask the owner — YOLO never covers them.\n";
 
 /// The bot's tool that asks the vault for a secret.
 const VAULT_REQUEST_TOOL: &str = crate::vault::REQUEST_SECRET_TOOL;
@@ -96,6 +97,9 @@ impl Runtime {
             // globally), regardless of what its stored tool list says.
             crate::tools::CONVERSATION_LIBRARY_TOOL,
             crate::maker::TELEGRAM_SEND_DOCUMENT_TOOL,
+            // 0.28: every bot may flip its conversation's YOLO switch itself
+            // (audited; destructive tools still always ask the owner).
+            crate::plans::YOLO_TOOL,
         ] {
             if self.gateway.is_registered(tool) {
                 allowed_tools.insert(tool.to_string());
@@ -368,6 +372,8 @@ mod tests {
             "local_list or local_search",
             "Never ask the owner for a hash",
             "deliver every variant to the owner's chat with telegram_send_document",
+            "call yolo_toggle to enable auto-approve",
+            "YOLO never covers them",
         ] {
             assert!(AUTONOMY_RULES.contains(phrase), "{phrase}");
         }

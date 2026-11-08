@@ -28,6 +28,7 @@ use serabot::gateway::{Gateway, ToolRegistry};
 use serabot::maker::{
     ArtifactStore, DeckBuildTool, OneDriveListTool, OneDriveUploadTool, TelegramDocumentTool,
 };
+use serabot::openrouter::OpenRouterGenerateImageTool;
 use serabot::policy::Policy;
 use serabot::retrieval::{Retriever, SqliteRetriever};
 use serabot::runtime::{CompositeNotifier, Notifier, RagSearchTool, Runtime, ScheduledPayload};
@@ -171,12 +172,19 @@ enum TokenCommand {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "serabot=info,tower_http=warn".into()),
-        )
-        .init();
+    // 0.28: rolling file logs + a redacting in-memory ring buffer for the
+    // console Logs tab, installed before anything logs. Falls back to stdout
+    // only when the log directory cannot be created.
+    let log_dir = std::env::temp_dir().join("serabot-logs");
+    if let Err(error) = serabot::logging::install_default(&log_dir) {
+        eprintln!("file logging disabled, stdout only: {error}");
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "serabot=info,tower_http=warn".into()),
+            )
+            .init();
+    }
 
     let cli = Cli::parse();
     match cli.command {
@@ -733,7 +741,6 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     let elevenlabs = serabot::elevenlabs_mcp::register_elevenlabs_connectors(
         &mut registry,
         config.clone(),
-        &secrets,
         users.clone(),
         artifacts.clone(),
         policy.clone(),
@@ -816,6 +823,24 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         registry.register(TavilySearchTool::new(
             client,
             TavilyLimits::from_config(&config.tavily),
+        ))?;
+    }
+    // OpenRouter image generation (0.28.0): registered when an OpenRouter
+    // provider is configured; the acting user's own OpenRouter sign-in key is
+    // used per call. Non-destructive, so no approval is asked.
+    if let Some((provider_id, base_url)) = serabot::openrouter::openrouter_provider(&config) {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.llm.timeout_secs.max(30)))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .context("build OpenRouter image HTTP client")?;
+        registry.register(OpenRouterGenerateImageTool::new(
+            http,
+            users.clone(),
+            artifacts.clone(),
+            provider_id,
+            base_url,
         ))?;
     }
     // Local folder tools relay to the user's desktop; they are inert until a

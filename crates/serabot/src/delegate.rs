@@ -18,9 +18,10 @@ use crate::teams::enqueue_turn_task_with_id;
 
 pub const DELEGATE_TOOL: &str = "delegate";
 pub const HANDOFF_QUEUED_KEY: &str = "handoff_queued";
-/// How many handoffs the orchestrator may queue in one turn (0.27). Several
-/// `delegate` calls in the same round fan out to parallel specialist subagents.
-pub const MAX_HANDOFFS_PER_TURN: usize = 8;
+/// How many handoffs the orchestrator may queue in one turn (0.27, raised to
+/// 16 in 0.28). Several `delegate` calls in the same round fan out to
+/// parallel specialist subagents.
+pub const MAX_HANDOFFS_PER_TURN: usize = 16;
 
 #[derive(Clone)]
 pub struct DelegateTool {
@@ -51,7 +52,7 @@ impl Tool for DelegateTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: DELEGATE_TOOL.into(),
-            description: "Queue a bounded handoff from the orchestrator to an enabled specialist. Only main may call this; up to 8 handoffs per turn, so call it several times in one round to fan out parallel subagents.".into(),
+            description: "Queue a bounded handoff from the orchestrator to an enabled specialist. Only main may call this; up to 16 handoffs per turn, so call it several times in one round to fan out parallel subagents.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {

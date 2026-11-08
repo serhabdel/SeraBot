@@ -184,18 +184,15 @@ morning_brief_enabled = true
 silent_when_empty = false
 
 [elevenlabs]
-# Two independent connectors (see docs/elevenlabs.md):
-# - "ElevenLabs": each account signs in with its own ElevenLabs account. The
-#   hosted MCP server exposes the whole catalog; this is the recommended one.
-# - "ElevenLabs API key": the owner's API key, legacy native elevenlabs_key_* tools.
+# The one ElevenLabs connector since 0.28.0 (see docs/elevenlabs.md): each
+# account signs in with its own ElevenLabs subscription account. The hosted
+# MCP server exposes the whole catalog. The legacy API-key connector
+# ([elevenlabs.api_key], elevenlabs_key_* tools) was removed.
 mcp_enabled = false
 # Request timeouts for the MCP tools: list, search and read calls, and calls
 # that generate media or spend credits.
 mcp_timeout_secs = 60
 mcp_generate_timeout_secs = 300
-api_base = "https://api.elevenlabs.io"
-api_key_secret = "elevenlabs_api_key"
-timeout_secs = 120
 # Optional default voice when tools omit voice_id (set after listing voices).
 default_voice_id = ""
 tts_model = "eleven_multilingual_v2"
@@ -205,11 +202,6 @@ video_model = "bytedance-seedance-v2-mini"
 max_tts_chars = 5000
 poll_interval_ms = 2000
 poll_max_attempts = 60
-
-[elevenlabs.api_key]
-# The "ElevenLabs API key" connector. Its tools register at startup when this is
-# true and the key is stored in the server secret store.
-enabled = false
 
 [onedrive]
 # Availability + defaults. Each account connects its own drive from the
