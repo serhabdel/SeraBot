@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use super::guard::{host_of, validate_navigation_url, validate_resolved};
 use super::manager::{BrowserManager, Driver, Lease, PageInfo, SecretResolver, TabInfo};
+use super::signin::signin_block_hint;
 use crate::domain::Language;
 use crate::error::{Result, SeraError};
 use crate::gateway::{ApprovalDetails, Tool, ToolContext, ToolOutput, ToolSpec};
@@ -100,10 +101,19 @@ fn opt_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 
 fn page_lines(info: &PageInfo) -> String {
     format!(
-        "url: {}\ntitle: {}",
+        "url: {}\ntitle: {}{}",
         truncate_chars(&info.url, 300),
-        truncate_chars(&info.title, 200)
+        truncate_chars(&info.title, 200),
+        signin_note(&info.url)
     )
+}
+
+/// A note for the model when the page is a provider refusing this browser's
+/// sign-in. Our own words, not page data.
+fn signin_note(url: &str) -> String {
+    signin_block_hint(url)
+        .map(|block| format!("\nnote: {}", block.bot_note))
+        .unwrap_or_default()
 }
 
 fn text_output(lease: &Lease, body: String, data: Value) -> ToolOutput {
@@ -430,9 +440,14 @@ impl Tool for BrowserTool {
                     }
                 }
                 let tabs = lease.backend().tabs().await?;
+                let note = tabs
+                    .iter()
+                    .find(|tab| tab.active)
+                    .map(|tab| signin_note(&tab.url))
+                    .unwrap_or_default();
                 Ok(text_output(
                     &lease,
-                    tab_lines(&tabs),
+                    format!("{}{note}", tab_lines(&tabs)),
                     json!({"tabs": tabs.len()}),
                 ))
             }
@@ -450,9 +465,10 @@ impl Tool for BrowserTool {
                         "navigation ended on a non-public address and the tab was closed".into(),
                     ));
                 }
+                let note = active.map(|tab| signin_note(&tab.url)).unwrap_or_default();
                 Ok(text_output(
                     &lease,
-                    format!("opened a new tab\n{}", tab_lines(&tabs)),
+                    format!("opened a new tab\n{}{note}", tab_lines(&tabs)),
                     json!({"tabs": tabs.len()}),
                 ))
             }
@@ -532,6 +548,22 @@ mod tests {
             .unwrap()
             .execute(args, &ctx(user))
             .await
+    }
+
+    #[test]
+    fn a_sign_in_refusal_adds_a_note_for_the_model_only() {
+        let refused = PageInfo {
+            url: "https://accounts.google.com/v3/signin/rejected?continue=x".into(),
+            title: "Sign in".into(),
+        };
+        let text = page_lines(&refused);
+        assert!(text.contains("note: Google refused the sign-in"), "{text}");
+        assert!(text.contains("Do not retry"), "{text}");
+        let plain = PageInfo {
+            url: "https://93.184.216.34/".into(),
+            title: "Example".into(),
+        };
+        assert!(!page_lines(&plain).contains("note:"));
     }
 
     #[test]

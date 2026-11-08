@@ -3,13 +3,15 @@
 //! Layout: `guard` (navigation/SSRF), `ws` + `cdp` (hand-rolled DevTools
 //! client), `outline` (accessibility outline and refs), `manager` (sessions,
 //! controller, capacity), `chromium` (launcher + backend), `tools` (gateway
-//! tools). Page content returned to the model is untrusted data.
+//! tools), `signin` (identity-provider refusal pages). Page content returned
+//! to the model is untrusted data.
 
 pub mod cdp;
 pub mod chromium;
 pub mod guard;
 pub mod manager;
 pub mod outline;
+pub mod signin;
 pub mod tools;
 pub mod ws;
 

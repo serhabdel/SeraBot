@@ -17,6 +17,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use zeroize::Zeroizing;
 
 use super::outline::Outline;
+use super::signin::{SigninBlock, signin_block_hint};
 use crate::error::{Result, SeraError};
 
 pub const MAX_SECRETS_TRACKED: usize = 16;
@@ -53,6 +54,10 @@ fn tabs_unsupported() -> SeraError {
     SeraError::Validation("this browser does not support tabs".into())
 }
 
+fn history_unsupported() -> SeraError {
+    SeraError::Validation("this browser does not support back, forward or reload".into())
+}
+
 /// One live browser page. Implemented by the Chromium/CDP backend and by a
 /// fake in tests.
 #[async_trait]
@@ -86,6 +91,14 @@ pub trait BrowserBackend: Send + Sync {
     /// The last tab cannot be closed; close the session instead.
     async fn close_tab(&self, _tab: &str) -> Result<()> {
         Err(tabs_unsupported())
+    }
+    /// Step through the active tab's history: -1 back, +1 forward. Fails when
+    /// there is no entry that way. The caller checks the URL it lands on.
+    async fn history_step(&self, _delta: i64) -> Result<PageInfo> {
+        Err(history_unsupported())
+    }
+    async fn reload(&self) -> Result<PageInfo> {
+        Err(history_unsupported())
     }
     /// The last pointer action, if any.
     fn pointer(&self) -> Option<Pointer> {
@@ -137,6 +150,12 @@ pub struct BrowserInfo {
     /// Conversation of the last bot turn that used this session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
+    /// Seconds since the last bot or owner action (not since the last poll).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_secs: Option<u64>,
+    /// Set while the active tab shows a sign-in refusal from a provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signin_blocked: Option<SigninBlock>,
 }
 
 /// Which bot (and conversation) is driving a session.
@@ -164,6 +183,8 @@ impl BrowserInfo {
             pointer: None,
             bot: None,
             conversation_id: None,
+            idle_secs: None,
+            signin_blocked: None,
         }
     }
 
@@ -426,16 +447,18 @@ impl BrowserManager {
 
     async fn info_of(session: &Arc<Session>) -> BrowserInfo {
         let page = session.backend.info().await.unwrap_or_default();
-        let (controller, updated_at, bot, conversation_id) = session.with_state(|state| {
+        let (controller, updated_at, bot, conversation_id, idle) = session.with_state(|state| {
             (
                 state.controller,
                 state.updated_at,
                 state.bot.clone(),
                 state.conversation_id.clone(),
+                state.last_used.elapsed().as_secs(),
             )
         });
         BrowserInfo {
             active: true,
+            signin_blocked: signin_block_hint(&page.url),
             url: Some(page.url),
             title: Some(page.title),
             controller,
@@ -444,6 +467,7 @@ impl BrowserManager {
             pointer: session.backend.pointer(),
             bot,
             conversation_id,
+            idle_secs: Some(idle),
         }
     }
 

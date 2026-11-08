@@ -13,10 +13,10 @@
 use crate::composio_flow::ComposioFlow;
 use crate::worker::Credentials;
 use crate::{
-    ApiClient, ApiError, BrowserController, BrowserInfo, BrowserInput, BrowserProfile,
-    BrowserSessionInfo, ConnectorUpdate, DEFAULT_PROFILE, MAX_VAULT_DOMAINS, MAX_VAULT_NOTE_CHARS,
-    MAX_VAULT_USERNAME_CHARS, VaultEntry, VaultKind, VaultPut, normalize_vault_domain,
-    valid_vault_name, validate_vault_put,
+    ApiClient, ApiError, BrowserController, BrowserHistory, BrowserInfo, BrowserInput,
+    BrowserProfile, BrowserSessionInfo, ConnectorUpdate, DEFAULT_PROFILE, MAX_VAULT_DOMAINS,
+    MAX_VAULT_NOTE_CHARS, MAX_VAULT_USERNAME_CHARS, VaultEntry, VaultKind, VaultPut,
+    normalize_vault_domain, valid_vault_name, validate_vault_put,
 };
 use crate::{ComposioAccount, ComposioApp};
 use std::{
@@ -75,6 +75,10 @@ pub enum PanelOp {
     Input(String, BrowserInput),
     /// Switch to or close a tab (user in control).
     Tab(String, TabAction),
+    /// Open a new tab at a public address (user in control).
+    TabOpen(String, String),
+    /// Back, forward or reload on the active tab (user in control).
+    History(String, BrowserHistory),
     ProfilesList,
     ProfileCreate(String),
     ProfileRename {
@@ -143,7 +147,9 @@ impl PanelOp {
             Self::Takeover(_) => PanelKind::Takeover,
             Self::Handback(_) => PanelKind::Handback,
             Self::Close(_) => PanelKind::Close,
-            Self::Input(..) | Self::Tab(..) => PanelKind::Input,
+            Self::Input(..) | Self::Tab(..) | Self::TabOpen(..) | Self::History(..) => {
+                PanelKind::Input
+            }
             Self::ProfilesList => PanelKind::ProfilesList,
             Self::ProfileCreate(_) | Self::ProfileRename { .. } | Self::ProfileDelete(_) => {
                 PanelKind::ProfileChange
@@ -312,6 +318,10 @@ fn execute(job: &PanelJob, cache: &mut Option<ApiClient>) -> Result<PanelReply, 
             TabAction::Close(tab) => client.browser_tab_close(id, tab),
         }
         .map(PanelReply::Input),
+        PanelOp::TabOpen(id, url) => client.browser_tab_open(id, url).map(PanelReply::Input),
+        PanelOp::History(id, action) => client
+            .browser_session_history(id, *action)
+            .map(PanelReply::Input),
         PanelOp::ProfilesList => client.browser_profiles().map(PanelReply::Profiles),
         PanelOp::ProfileCreate(name) => client.browser_profile_create(name).map(|profile| {
             PanelReply::ProfileChanged(format!("Added \u{201c}{}\u{201d}.", profile.name))
@@ -984,6 +994,37 @@ impl PanelState {
         self.queue_tab(TabAction::Close(tab.to_owned()));
     }
 
+    /// Open a new tab at the address typed in the address bar. Ignored
+    /// unless the user holds control or the address is not a web address.
+    pub fn open_tab(&mut self, raw_address: &str) -> bool {
+        let Some(url) = address_to_url(raw_address) else {
+            return false;
+        };
+        if !self.user_in_control() {
+            return false;
+        }
+        let Some(id) = self.control_target() else {
+            return false;
+        };
+        if self.queue.len() < MAX_QUEUED_INPUTS {
+            self.queue.push_back(PanelOp::TabOpen(id, url));
+        }
+        true
+    }
+
+    /// Back, forward or reload. Ignored unless the user holds control.
+    pub fn history(&mut self, action: BrowserHistory) {
+        if !self.user_in_control() {
+            return;
+        }
+        let Some(id) = self.control_target() else {
+            return;
+        };
+        if self.queue.len() < MAX_QUEUED_INPUTS {
+            self.queue.push_back(PanelOp::History(id, action));
+        }
+    }
+
     fn queue_tab(&mut self, action: TabAction) {
         if !self.user_in_control() || !crate::valid_tab_id(action.tab()) {
             return;
@@ -1245,7 +1286,10 @@ impl PanelState {
             return Some(PanelOp::VaultList);
         }
         if let Some(front) = self.queue.front() {
-            let is_input = matches!(front, PanelOp::Input(..) | PanelOp::Tab(..));
+            let is_input = matches!(
+                front,
+                PanelOp::Input(..) | PanelOp::Tab(..) | PanelOp::TabOpen(..) | PanelOp::History(..)
+            );
             if !is_input || self.inputs_inflight < MAX_INPUTS_IN_FLIGHT {
                 let op = self.queue.pop_front()?;
                 if is_input {
@@ -1607,6 +1651,26 @@ pub fn host_label(url: Option<&str>) -> String {
         .unwrap_or_else(|| "No page open".to_owned())
 }
 
+/// "1 tab", "3 tabs": the count a grid card shows.
+pub fn tab_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 tab".to_owned()
+    } else {
+        format!("{count} tabs")
+    }
+}
+
+/// "Idle 42s", "Idle 7m", "Idle 3h": how long since the last bot or owner
+/// action. `None` when the server did not say.
+pub fn idle_label(idle_secs: Option<u64>) -> Option<String> {
+    let secs = idle_secs?;
+    Some(match secs {
+        0..=59 => "Idle under a minute".to_owned(),
+        60..=3599 => format!("Idle {}m", secs / 60),
+        _ => format!("Idle {}h", secs / 3600),
+    })
+}
+
 /// The bots that browse with this profile.
 pub fn profile_users(profile: &BrowserProfile) -> &[String] {
     &profile.bots
@@ -1640,6 +1704,8 @@ mod tests {
             pointer: None,
             bot: Some("main".into()),
             conversation_id: Some("dir:main".into()),
+            signin_blocked: None,
+            idle_secs: None,
             updated_at: "2026-11-06T12:00:00Z".into(),
         }
     }
@@ -1966,6 +2032,61 @@ mod tests {
             state.next_op(t0),
             Some(PanelOp::Tab(_, TabAction::Close(tab))) if tab == "t3"
         ));
+    }
+
+    #[test]
+    fn open_tab_and_history_need_user_control() {
+        let mut state = PanelState::new();
+        let t0 = Instant::now();
+        state.apply(
+            done(
+                &state,
+                PanelKind::Status,
+                Ok(PanelReply::Sessions(vec![info(
+                    true,
+                    BrowserController::Bot,
+                )])),
+            ),
+            t0,
+        );
+        assert!(!state.open_tab("https://example.test/a"), "bot in control");
+        state.history(BrowserHistory::Back);
+        assert!(state.queue.is_empty(), "bot in control: ignored");
+        state.apply(
+            done(
+                &state,
+                PanelKind::Takeover,
+                Ok(PanelReply::Control(info(true, BrowserController::User))),
+            ),
+            t0,
+        );
+        // A blank address is refused here; a bare host becomes https.
+        assert!(!state.open_tab("   "));
+        assert!(state.open_tab("example.test/a"));
+        state.history(BrowserHistory::Reload);
+        match state.next_op(t0) {
+            Some(PanelOp::TabOpen(id, url)) => {
+                assert_eq!(id, "default");
+                assert_eq!(url, "https://example.test/a");
+            }
+            _ => panic!("expected a tab open"),
+        }
+        assert!(matches!(
+            state.next_op(t0),
+            Some(PanelOp::History(_, BrowserHistory::Reload))
+        ));
+    }
+
+    #[test]
+    fn labels_for_tab_count_and_idle_time() {
+        assert_eq!(tab_count_label(1), "1 tab");
+        assert_eq!(tab_count_label(3), "3 tabs");
+        assert_eq!(idle_label(None), None);
+        assert_eq!(idle_label(Some(0)).as_deref(), Some("Idle under a minute"));
+        assert_eq!(idle_label(Some(59)).as_deref(), Some("Idle under a minute"));
+        assert_eq!(idle_label(Some(60)).as_deref(), Some("Idle 1m"));
+        assert_eq!(idle_label(Some(3599)).as_deref(), Some("Idle 59m"));
+        assert_eq!(idle_label(Some(3600)).as_deref(), Some("Idle 1h"));
     }
 
     #[test]
