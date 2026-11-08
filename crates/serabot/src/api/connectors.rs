@@ -1010,6 +1010,34 @@ pub(super) async fn admin_test_connector(
     })))
 }
 
+/// Owner "remove saved credentials": delete the connector's server-wide
+/// secrets from the age store. Per-account sign-in tokens are not touched
+/// here; those go through `DELETE /v1/admin/connectors/{id}/oauth`. Secret
+/// values are never returned, only the removed secret names.
+pub(super) async fn admin_remove_connector_secrets(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
+    let roles = connector_secret_roles(&state.config, &id).map_err(admin_error)?;
+    let names: Vec<String> = roles.iter().map(|(_, name)| name.clone()).collect();
+    if names.is_empty() {
+        return Err(admin_error(SeraError::Validation(
+            "this connector keeps its credentials per account; use Disconnect".into(),
+        )));
+    }
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    state.secrets.remove(&name_refs).map_err(admin_error)?;
+    audit_config(
+        &state,
+        &user.id,
+        "config.connector_secrets_removed",
+        json!({"connector": id, "secrets": names}),
+    )?;
+    Ok(Json(json!({"id": id, "removed": names})))
+}
+
 pub(super) fn oauth_connector_view(
     state: &ApiState,
     id: &str,

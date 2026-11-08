@@ -16,11 +16,11 @@ use crate::config::Config;
 use crate::error::{Result, SeraError};
 use crate::store::Store;
 
-pub const DEFAULT_TOOL_CALLS_PER_TURN: usize = 150;
-pub const DEFAULT_TOOL_ROUNDS_PER_TURN: usize = 60;
+pub const DEFAULT_TOOL_CALLS_PER_TURN: usize = 1500;
+pub const DEFAULT_TOOL_ROUNDS_PER_TURN: usize = 200;
 /// Hard server ceilings. No configuration or owner override goes above them.
-pub const TOOL_CALLS_CEILING: usize = 500;
-pub const TOOL_ROUNDS_CEILING: usize = 200;
+pub const TOOL_CALLS_CEILING: usize = 1500;
+pub const TOOL_ROUNDS_CEILING: usize = 1500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnLimits {
@@ -222,8 +222,8 @@ mod tests {
         };
         let view = turn_limits_view(defaults(), Some(owner));
         assert_eq!(view["max_tool_calls_per_turn"], 20);
-        assert_eq!(view["default"]["max_tool_calls_per_turn"], 150);
-        assert_eq!(view["ceiling"]["max_tool_rounds"], 200);
+        assert_eq!(view["default"]["max_tool_calls_per_turn"], 1500);
+        assert_eq!(view["ceiling"]["max_tool_rounds"], 1500);
         assert_eq!(view["overridden"], true);
         assert_eq!(turn_limits_view(defaults(), None)["overridden"], false);
     }

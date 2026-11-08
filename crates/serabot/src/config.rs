@@ -1881,6 +1881,20 @@ pub struct LoadedBot {
     pub prompt: String,
 }
 
+/// `tools = ["all"]` expands to every tool the binary can register, so the
+/// shipped main bot enables everything by default (0.26.0).
+pub(crate) fn expand_all_tools(bot: &mut BotConfig) {
+    if bot.tools.iter().any(|tool| tool == "all") {
+        let mut all = crate::tools::known_tool_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        all.sort();
+        all.dedup();
+        bot.tools = all;
+    }
+}
+
 pub fn load_bots(config: &Config, dir: impl AsRef<Path>) -> Result<Vec<LoadedBot>> {
     let dir = config.path(dir);
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)?
@@ -1896,6 +1910,7 @@ pub fn load_bots(config: &Config, dir: impl AsRef<Path>) -> Result<Vec<LoadedBot
         let mut bot: BotConfig = toml::from_str(&raw)
             .map_err(|error| SeraError::Config(format!("{}: {error}", path.display())))?;
         rename_legacy_tools(&mut bot);
+        expand_all_tools(&mut bot);
         if bot.name.is_empty() || bot.name.len() > 64 {
             return Err(SeraError::Config(format!(
                 "{}: invalid bot name",
@@ -2610,7 +2625,7 @@ fn default_lease() -> u64 {
     300
 }
 fn default_turn_max_secs() -> u64 {
-    1800
+    7200
 }
 fn default_poll() -> u64 {
     500
@@ -2778,8 +2793,9 @@ mod tests {
                 continue;
             }
             let raw = std::fs::read_to_string(&path).expect("bot file");
-            let config: BotConfig =
+            let mut config: BotConfig =
                 toml::from_str(&raw).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            super::expand_all_tools(&mut config);
             for tool in &config.tools {
                 assert!(
                     known.contains(&tool.as_str()),
@@ -2988,7 +3004,10 @@ mod tests {
     fn shipped_bot(name: &str) -> BotConfig {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bots");
         let raw = std::fs::read_to_string(root.join(format!("{name}.toml"))).expect("bot file");
-        toml::from_str(&raw).unwrap_or_else(|error| panic!("{name}: {error}"))
+        let mut bot: BotConfig =
+            toml::from_str(&raw).unwrap_or_else(|error| panic!("{name}: {error}"));
+        super::expand_all_tools(&mut bot);
+        bot
     }
 
     /// A prompt may name a tool only when its bot is granted it, or when the
@@ -3015,8 +3034,9 @@ mod tests {
                 continue;
             }
             let raw = std::fs::read_to_string(&path).expect("bot file");
-            let bot: BotConfig =
+            let mut bot: BotConfig =
                 toml::from_str(&raw).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            super::expand_all_tools(&mut bot);
             let prompt_path = repo.join(&bot.system_prompt);
             let prompt = std::fs::read_to_string(&prompt_path).expect("prompt file");
             for word in

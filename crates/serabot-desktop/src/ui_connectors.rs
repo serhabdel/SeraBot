@@ -19,6 +19,16 @@ use serabot_desktop::connector_card::{
 };
 use serabot_desktop::session::{Session, humanize_label};
 
+/// Connectors whose saved credentials live in the server-wide store and can
+/// be removed from the card (0.26.0). Per-account sign-ins use Disconnect.
+const REMOVABLE_SECRET_CONNECTORS: &[&str] = &[
+    "elevenlabs_api_key",
+    "tavily",
+    "firecrawl",
+    "agentmail",
+    "notion",
+];
+
 /// The provider authorization pages the console can open.
 ///
 /// These are the same fixed endpoints the server uses
@@ -419,6 +429,36 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
                             },
                             if busy { "Working…" } else { "Disconnect" }
                         }
+                        {
+                            let testing = session.read().state.connector_tests.contains_key(&id);
+                            rsx! {
+                                button {
+                                    class: "btn ghost sm",
+                                    title: "Run a read-only check against the provider with the saved credentials",
+                                    disabled: busy || testing,
+                                    onclick: {
+                                        let id = id.clone();
+                                        move |_| session.write().test_connector(id.clone())
+                                    },
+                                    if testing { "Testing…" } else { "Test" }
+                                }
+                            }
+                        }
+                        if is_admin && REMOVABLE_SECRET_CONNECTORS.contains(&id.as_str()) {
+                            button {
+                                class: "btn ghost sm",
+                                title: "Delete the saved credentials from the server (the sign-in itself stays per account)",
+                                disabled: busy,
+                                onclick: {
+                                    let id = id.clone();
+                                    move |_| session.write().panel.remove_connector_secrets(&id)
+                                },
+                                "Remove saved key"
+                            }
+                        }
+                    }
+                    if let Some(result) = session.read().state.connector_tests.get(&id) {
+                        p { class: if result.ok { "tiny ok" } else { "tiny err" }, role: "status", "{result.message}" }
                     }
                 },
                 CardState::Error { message } => rsx! {

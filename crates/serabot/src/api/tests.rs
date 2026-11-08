@@ -1159,6 +1159,68 @@ async fn connector_test_is_owner_only_and_reports_missing_secrets_without_networ
     }
 }
 
+#[tokio::test]
+async fn admin_can_remove_saved_connector_secrets_but_not_per_account_signins() {
+    let (app, _, _) = app();
+    // Non-admin is refused.
+    let denied = app
+        .clone()
+        .oneshot(request(
+            &app,
+            "DELETE",
+            "/v1/admin/connectors/elevenlabs_api_key/secrets",
+            false,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    // Unknown connector.
+    let missing = app
+        .clone()
+        .oneshot(request(
+            &app,
+            "DELETE",
+            "/v1/admin/connectors/no-such/secrets",
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    // The sign-in connector keeps its tokens per account: refused here.
+    let per_account = app
+        .clone()
+        .oneshot(request(
+            &app,
+            "DELETE",
+            "/v1/admin/connectors/elevenlabs/secrets",
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(per_account.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // The API-key connector's server-wide secret is removed; only its name
+    // comes back, never a value.
+    let removed = app
+        .clone()
+        .oneshot(request(
+            &app,
+            "DELETE",
+            "/v1/admin/connectors/elevenlabs_api_key/secrets",
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), StatusCode::OK);
+    let body = read_json(removed).await;
+    assert_eq!(body["id"], "elevenlabs_api_key");
+    assert_eq!(body["removed"], json!(["elevenlabs_api_key"]));
+    assert!(!body.to_string().contains("sk_"));
+}
+
 async fn read_json(response: Response) -> Value {
     let bytes = http_body_util::BodyExt::collect(response.into_body())
         .await
@@ -2359,6 +2421,41 @@ async fn provider_oauth_endpoints_are_owner_gated_and_validate_before_any_networ
         let body = read_json(wrong_kind).await;
         assert!(body["error"].as_str().unwrap().contains("does not use"));
     }
+}
+
+#[tokio::test]
+async fn replacing_tools_prunes_stale_require_approval_instead_of_rejecting() {
+    let root = temp_base();
+    let mut notes = test_bot("notes", crate::orchestration::BotRole::Specialist);
+    notes.config.tools = vec!["skill_list".into(), "memory_save".into()];
+    notes.config.require_approval = vec!["memory_save".into()];
+    let (app, _, _) = app_with_fleet(
+        true,
+        Policy::empty(),
+        root,
+        vec![
+            test_bot("main", crate::orchestration::BotRole::Orchestrator),
+            notes,
+        ],
+    );
+    // Toggling the memory capability off removes memory_save; the stored
+    // approval entry must be pruned, not fail the whole save (0.26.0).
+    let saved = app
+        .clone()
+        .oneshot(request(
+            &app,
+            "PUT",
+            "/v1/bots/notes",
+            true,
+            Some(json!({"tools": ["skill_list"]})),
+        ))
+        .await
+        .unwrap();
+    let status = saved.status();
+    let body = read_json(saved).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["bot"]["tools"], json!(["skill_list"]));
+    assert_eq!(body["bot"]["require_approval"], json!([]));
 }
 
 #[tokio::test]
@@ -3832,10 +3929,10 @@ async fn turn_limits_are_per_user_validated_and_resettable() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = read_json(response).await;
-    assert_eq!(body["max_tool_calls_per_turn"], json!(150));
-    assert_eq!(body["max_tool_rounds"], json!(60));
-    assert_eq!(body["ceiling"]["max_tool_calls_per_turn"], json!(500));
-    assert_eq!(body["ceiling"]["max_tool_rounds"], json!(200));
+    assert_eq!(body["max_tool_calls_per_turn"], json!(1500));
+    assert_eq!(body["max_tool_rounds"], json!(200));
+    assert_eq!(body["ceiling"]["max_tool_calls_per_turn"], json!(1500));
+    assert_eq!(body["ceiling"]["max_tool_rounds"], json!(1500));
     assert_eq!(body["overridden"], json!(false));
 
     let response = router
@@ -3857,8 +3954,9 @@ async fn turn_limits_are_per_user_validated_and_resettable() {
 
     // Above the ceiling, or zero, is refused and nothing changes.
     for bad in [
-        json!({"max_tool_calls_per_turn": 501, "max_tool_rounds": 12}),
+        json!({"max_tool_calls_per_turn": 1501, "max_tool_rounds": 12}),
         json!({"max_tool_calls_per_turn": 40, "max_tool_rounds": 0}),
+        json!({"max_tool_calls_per_turn": 40, "max_tool_rounds": 1501}),
     ] {
         let response = router
             .clone()
@@ -3907,7 +4005,7 @@ async fn turn_limits_are_per_user_validated_and_resettable() {
         .await
         .unwrap();
     let body = read_json(response).await;
-    assert_eq!(body["max_tool_calls_per_turn"], json!(150));
+    assert_eq!(body["max_tool_calls_per_turn"], json!(1500));
     assert_eq!(body["overridden"], json!(false));
 
     // Reset drops the owner's override.
@@ -3923,7 +4021,7 @@ async fn turn_limits_are_per_user_validated_and_resettable() {
         .await
         .unwrap();
     let body = read_json(response).await;
-    assert_eq!(body["max_tool_calls_per_turn"], json!(150));
+    assert_eq!(body["max_tool_calls_per_turn"], json!(1500));
     assert_eq!(body["overridden"], json!(false));
 }
 

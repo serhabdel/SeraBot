@@ -35,7 +35,7 @@ Rules the tools enforce, and the guidance the model is given:
 2. The sign-in takes effect at once. No restart is needed for it.
 3. **Disconnect** removes this account's sign-in. Tool calls fail with "not connected" until you sign in again.
 
-API equivalents (owner only): `POST /v1/admin/connectors/elevenlabs/oauth/start` returns the consent URL; `POST /v1/admin/connectors/elevenlabs/oauth/complete` takes `{code, verifier, redirect_uri}`; `DELETE /v1/admin/connectors/elevenlabs/oauth` disconnects.
+API equivalents (owner only): `POST /v1/admin/connectors/elevenlabs/oauth/start` returns the consent URL; `POST /v1/admin/connectors/elevenlabs/oauth/complete` takes `{code, verifier, redirect_uri}`; `DELETE /v1/admin/connectors/elevenlabs/oauth` disconnects. `POST /v1/admin/connectors/elevenlabs/test` checks the per-account sign-in; `DELETE /v1/admin/connectors/elevenlabs_api_key/secrets` removes the saved API key from the server store (the console's "Remove saved key" button).
 
 The authorization request is PKCE S256 with a CIMD client (`[elevenlabs].oauth_client_id`, the https URL of the metadata document this server publishes at `/.well-known/serabot-oauth-client.json`). The redirect is the fixed loopback `http://127.0.0.1:51122/oauth-callback`. The authorize and token endpoints are pinned in code. Scope: `[elevenlabs].oauth_scope`. The authorize, token and refresh requests all carry the RFC 8707 `resource` (`https://api.us.elevenlabs.io/v1/mcp`), because the token is minted for the MCP server, not the REST API; without it MCP calls are rejected.
 

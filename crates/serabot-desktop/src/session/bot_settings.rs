@@ -267,7 +267,18 @@ impl Session {
         if !self.bot_settings.hydrated {
             return;
         }
-        let tools = crate::capabilities::toggled(capability, &self.bot_settings.draft.tools, on);
+        let allow_delegate = self
+            .state
+            .listed_bots
+            .iter()
+            .find(|bot| Some(bot.id.as_str()) == self.bot_settings.bot.as_deref())
+            .is_some_and(|bot| bot.role == "orchestrator");
+        let tools = crate::capabilities::toggled(
+            capability,
+            &self.bot_settings.draft.tools,
+            on,
+            allow_delegate,
+        );
         if let Err(error) = crate::validate_tool_edit(&tools) {
             self.bot_settings.error = Some(error.to_string());
             return;
