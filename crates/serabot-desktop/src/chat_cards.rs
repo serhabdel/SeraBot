@@ -56,6 +56,8 @@ pub struct SecretCard {
     pub username: Option<String>,
     pub domains: Vec<String>,
     pub reason: String,
+    /// A save for a name that already has a vault entry: the value replaces it.
+    pub replaces: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,6 +166,7 @@ fn secret_from(payload: &serde_json::Value) -> Option<SecretCard> {
         return None;
     }
     let reason = clean(payload.get("reason")?.as_str()?, MAX_CONTEXT).unwrap_or_default();
+    let replaces = payload.get("replaces").and_then(serde_json::Value::as_bool) == Some(true);
     Some(SecretCard {
         purpose,
         name,
@@ -171,6 +174,7 @@ fn secret_from(payload: &serde_json::Value) -> Option<SecretCard> {
         username,
         domains,
         reason,
+        replaces,
     })
 }
 
@@ -349,7 +353,27 @@ mod tests {
         assert_eq!(secret.domains, vec!["vendor.example"]);
         assert_eq!(secret_title(secret.purpose), "Bot wants to save a secret");
         assert_eq!(secret_kind_label(secret.kind), "Password");
+        assert!(!secret.replaces);
         assert!(!format!("{view:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn a_card_that_replaces_an_entry_says_so() {
+        let mut payload = secret_payload();
+        payload["replaces"] = json!(true);
+        let view = CardView::from_card(&card("secret_request", "pending", payload)).unwrap();
+        let CardBody::Secret(secret) = view.body else {
+            panic!("expected a secret request");
+        };
+        assert!(secret.replaces);
+        // Anything other than a true flag is not a replacement.
+        let mut stringy = secret_payload();
+        stringy["replaces"] = json!("true");
+        let view = CardView::from_card(&card("secret_request", "pending", stringy)).unwrap();
+        let CardBody::Secret(secret) = view.body else {
+            panic!("expected a secret request");
+        };
+        assert!(!secret.replaces);
     }
 
     #[test]

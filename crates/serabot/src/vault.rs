@@ -626,9 +626,10 @@ pub(crate) fn record_fill(
 
 /// Replaces the acting user's vault values with `[vault:<name>]`.
 ///
-/// Built per call from the user's own entries, so a value is only ever
-/// scrubbed for the user who owns it. Values shorter than
-/// [`MIN_REDACT_CHARS`] are skipped. `Debug` shows names only.
+/// Built per call from the user's own entries and from the values recently
+/// read from their password managers, so a value is only ever scrubbed for
+/// the user who owns it. Values shorter than [`MIN_REDACT_CHARS`] are skipped.
+/// `Debug` shows names only.
 pub struct Redactor {
     /// Longest value first, so a value that contains another wins.
     secrets: Vec<(String, Zeroizing<String>)>,
@@ -646,9 +647,14 @@ impl std::fmt::Debug for Redactor {
 }
 
 impl Redactor {
-    /// Load the acting user's values. A decrypt failure is an error: the
-    /// caller must not forward unredacted text.
-    pub fn for_user(users: &UserSecrets, user_id: &str) -> Result<Self> {
+    /// Load the acting user's values: their sealed local values, and the
+    /// values recently read from a password manager (`resolved`). A decrypt
+    /// failure is an error: the caller must not forward unredacted text.
+    pub fn for_user(
+        users: &UserSecrets,
+        user_id: &str,
+        resolved: &vault_providers::ResolvedValues,
+    ) -> Result<Self> {
         let mut secrets = Vec::new();
         for entry in list(users, user_id)? {
             let Some(value) = users.get_vault(user_id, &entry.name)? else {
@@ -657,6 +663,11 @@ impl Redactor {
             let value = value.expose_secret();
             if value.chars().count() >= MIN_REDACT_CHARS {
                 secrets.push((entry.name, Zeroizing::new(value.clone())));
+            }
+        }
+        for (name, value) in resolved.live(user_id) {
+            if value.chars().count() >= MIN_REDACT_CHARS {
+                secrets.push((name, value));
             }
         }
         secrets.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
@@ -932,17 +943,31 @@ impl Tool for VaultRequestSecretTool {
         ) {
             return secret_reply(json!({"requested": false, "note": SECRET_NO_CARD_NOTE}));
         }
-        let payload = parse_secret_request(&args)?;
+        let mut payload = parse_secret_request(&args)?;
         if !self.policy_allows(&payload) {
             return Err(SeraError::Validation(
                 "secret request is withheld by content policy".into(),
             ));
         }
-        let name = payload["name"].as_str().unwrap_or_default();
-        if payload["purpose"] == "provide" && get(&self.users, user, name)?.is_some() {
+        let name = payload["name"].as_str().unwrap_or_default().to_owned();
+        let existing = get(&self.users, user, &name)?;
+        if payload["purpose"] == "provide" && existing.is_some() {
             return secret_reply(
                 json!({"requested": false, "exists": true, "note": SECRET_EXISTS_NOTE}),
             );
+        }
+        if let Some(entry) = &existing
+            && payload["purpose"] == "save"
+        {
+            // A password manager entry is never overwritten by a card.
+            if entry.source.is_external() {
+                return Err(SeraError::Validation(
+                    "a password manager entry with this name already exists; choose another name"
+                        .into(),
+                ));
+            }
+            // The card says it replaces the entry, so the owner sees that.
+            payload["replaces"] = json!(true);
         }
         let store = self.users.store();
         if let Some(pending) = store.pending_secret_request(user, conversation_id)? {
@@ -1276,10 +1301,11 @@ mod tests {
     #[test]
     fn redactor_replaces_only_the_owners_values() {
         let (_, users, a, b) = setup();
+        let none = vault_providers::ResolvedValues::default();
         put(&users, &a, "site", &password("synthetic-pw-a", &[])).unwrap();
         put(&users, &a, "tiny", &password("abc", &[])).unwrap();
         put(&users, &b, "other", &password("synthetic-pw-b", &[])).unwrap();
-        let redactor = Redactor::for_user(&users, &a).unwrap();
+        let redactor = Redactor::for_user(&users, &a, &none).unwrap();
         assert_eq!(
             redactor.redact("login synthetic-pw-a then synthetic-pw-b, abc, synthetic-pw-a"),
             "login [vault:site] then synthetic-pw-b, abc, [vault:site]"
@@ -1289,20 +1315,28 @@ mod tests {
         assert_eq!(value, json!({"a": ["x [vault:site]"], "n": 1}));
         let debug = format!("{redactor:?}");
         assert!(debug.contains("site") && !debug.contains("synthetic-pw-a"));
-        assert_eq!(Redactor::for_user(&users, &b).unwrap().redact("abc"), "abc");
+        assert_eq!(
+            Redactor::for_user(&users, &b, &none).unwrap().redact("abc"),
+            "abc"
+        );
     }
 
     #[test]
     fn redactor_prefers_the_longest_value_and_handles_multibyte() {
         let (_, users, a, _) = setup();
+        let none = vault_providers::ResolvedValues::default();
         put(&users, &a, "short", &password("hunter22", &[])).unwrap();
         put(&users, &a, "long", &password("hunter22-extended", &[])).unwrap();
-        let redactor = Redactor::for_user(&users, &a).unwrap();
+        let redactor = Redactor::for_user(&users, &a, &none).unwrap();
         assert_eq!(
             redactor.redact("é hunter22-extended ü hunter22"),
             "é [vault:long] ü [vault:short]"
         );
-        assert!(Redactor::for_user(&users, "nobody").unwrap().is_empty());
+        assert!(
+            Redactor::for_user(&users, "nobody", &none)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1549,6 +1583,74 @@ mod tests {
             .unwrap();
         assert_eq!(out["requested"], false);
         assert!(store.list_cards(&a, "20").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_save_over_an_existing_name_is_a_replacement_but_never_a_password_manager_entry() {
+        let (store, users, a, _) = setup();
+        let users = Arc::new(users);
+        put(
+            &users,
+            &a,
+            "vendor",
+            &password("synthetic-existing", &["vendor.example"]),
+        )
+        .unwrap();
+        put(
+            &users,
+            &a,
+            "bank-login",
+            &VaultInput {
+                kind: VaultKind::Password,
+                username: None,
+                value: Zeroizing::new(String::new()),
+                domains: vec!["bank.example".into()],
+                note: None,
+                source: VaultSource::OnePassword,
+                reference: Some("op://Vault/Bank/password".into()),
+            },
+        )
+        .unwrap();
+        let tool = VaultRequestSecretTool::new(users.clone(), Arc::new(Policy::empty()));
+        let save = |name: &str, site: &str| json!({"name": name, "kind": "password", "domains": [site], "reason": "log in", "purpose": "save"});
+        // A local entry of that name: the card says it replaces the entry.
+        let out = tool
+            .execute(
+                save("vendor", "vendor.example"),
+                &secret_context(&a, "dir:replace"),
+            )
+            .await
+            .unwrap()
+            .data
+            .unwrap();
+        let card = store
+            .get_card(&a, out["card_id"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(card.payload["replaces"], true);
+        // A password manager entry is never offered for replacement.
+        assert!(matches!(
+            tool.execute(
+                save("bank-login", "bank.example"),
+                &secret_context(&a, "dir:external")
+            )
+            .await,
+            Err(SeraError::Validation(_))
+        ));
+        assert!(store.list_cards(&a, "dir:external").unwrap().is_empty());
+        // A new name is not a replacement.
+        let out = tool
+            .execute(
+                save("fresh", "fresh.example"),
+                &secret_context(&a, "dir:fresh"),
+            )
+            .await
+            .unwrap()
+            .data
+            .unwrap();
+        let card = store
+            .get_card(&a, out["card_id"].as_str().unwrap())
+            .unwrap();
+        assert!(card.payload.get("replaces").is_none());
     }
 
     #[tokio::test]

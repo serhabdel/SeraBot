@@ -1275,6 +1275,11 @@ pub struct VaultConfig {
     pub op_path: String,
     #[serde(default)]
     pub pass_cli_path: String,
+    /// Read Proton Pass references. Off by default: experimental until the
+    /// `pass-cli` token variable and item flags are checked against the
+    /// installed release (see docs/vault.md).
+    #[serde(default)]
+    pub protonpass_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

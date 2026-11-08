@@ -3,20 +3,24 @@
 //! value. The value is read through that account's own CLI when the browser
 //! types it. It is never stored, logged or returned by the API.
 //!
-//! The CLI runs with an argument array, never through a shell. The owner's
-//! access token is passed only in the child's environment. Stdout is the
-//! value, stderr is discarded, and only the exit code is logged, so no
-//! provider message can reach a log line or an error.
+//! The CLI runs with an argument array, never through a shell, and with a
+//! cleared environment: the owner's access token and a private, per-call home
+//! directory are all it gets beyond `PATH`. Stdout is the value, stderr is
+//! discarded, and only the exit code is logged, so no provider message can
+//! reach a log line or an error. A value read is remembered in memory for the
+//! model redactor (see [`ResolvedValues`]).
 //!
 //! The argument shapes are in [`read_args`], the one place to change when a
 //! CLI release renames a flag. The 1Password form (`op read --no-newline`) is
 //! the documented one. The Proton Pass `pass-cli item view` flags are not
 //! verified against every release.
 
+use std::collections::{HashMap, VecDeque};
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use secrecy::ExposeSecret;
@@ -26,7 +30,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::config::VaultConfig;
 use crate::error::{Result, SeraError};
 use crate::user_secrets::UserSecrets;
-use crate::vault::{self, VaultField, VaultSource};
+use crate::vault::{self, VaultEntry, VaultField, VaultSource};
 
 /// How long one CLI call may run before it is killed.
 pub const CLI_TIMEOUT: Duration = Duration::from_secs(15);
@@ -113,11 +117,22 @@ impl Provider {
             Self::ProtonPass => "pass://",
         }
     }
+
+    /// Whether the server reads from this manager. Proton Pass is off unless
+    /// `[vault] protonpass_enabled` is set.
+    pub fn enabled(self, config: &VaultConfig) -> bool {
+        match self {
+            Self::OnePassword => true,
+            Self::ProtonPass => config.protonpass_enabled,
+        }
+    }
 }
 
 /// Check the shape of a password manager reference. 1Password references are
-/// `op://vault/item/field` (or with a section, four segments). Proton Pass
-/// references use this server's own notation, `pass://vault/item/field`.
+/// `op://vault/item/field` (or with a section, four segments), optionally
+/// ending in `?attribute=<name>`. Proton Pass references use this server's own
+/// notation, `pass://vault/item/field`, with no query. No segment may start
+/// with `-`, so a CLI can never read it as an option.
 pub fn validate_reference(source: VaultSource, reference: &str) -> Result<()> {
     let provider = Provider::from_source(source).ok_or_else(|| {
         SeraError::Validation("only a password manager entry takes a reference".into())
@@ -136,7 +151,24 @@ pub fn validate_reference(source: VaultSource, reference: &str) -> Result<()> {
             "the reference must not contain control characters, or spaces for 1Password".into(),
         ));
     }
-    let segments: Vec<&str> = reference
+    let (path, query) = match reference.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (reference, None),
+    };
+    if let Some(query) = query {
+        let attribute = query.strip_prefix("attribute=").unwrap_or_default();
+        let word_ok = !attribute.is_empty()
+            && attribute.len() <= 32
+            && attribute
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        if provider != Provider::OnePassword || !word_ok {
+            return Err(SeraError::Validation(
+                "only a 1Password reference may end with ?attribute=<name>".into(),
+            ));
+        }
+    }
+    let segments: Vec<&str> = path
         .strip_prefix(provider.scheme())
         .unwrap_or_default()
         .split('/')
@@ -145,7 +177,11 @@ pub fn validate_reference(source: VaultSource, reference: &str) -> Result<()> {
         Provider::OnePassword => (3..=4).contains(&segments.len()),
         Provider::ProtonPass => segments.len() == 3,
     };
-    if !count_ok || segments.iter().any(|segment| segment.is_empty()) {
+    if !count_ok
+        || segments
+            .iter()
+            .any(|segment| segment.is_empty() || segment.starts_with('-'))
+    {
         return Err(SeraError::Validation(format!(
             "the reference must look like {}vault/item/field",
             provider.scheme()
@@ -200,6 +236,43 @@ pub trait SecretCommand: Send + Sync {
     fn run(&self, program: &Path, args: &[String], env: &[(&str, &str)]) -> Result<CommandOutput>;
 }
 
+/// Variables a CLI reads for its config, cache or data. Each one points at the
+/// call's private home, so nothing the CLI writes lands in the server's own
+/// profile.
+const HOME_VARS: &[&str] = &[
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "APPDATA",
+    "LOCALAPPDATA",
+];
+
+/// The environment a password manager CLI runs in. Nothing is inherited but
+/// `PATH` (and `SYSTEMROOT` on Windows, which system calls need). Then every
+/// home variable points at `home`, then the caller's variables (the token).
+fn child_environment(home: &Path, extra: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+    let mut inherited = vec!["PATH"];
+    if cfg!(windows) {
+        inherited.push("SYSTEMROOT");
+    }
+    let mut env: Vec<(OsString, OsString)> = inherited
+        .into_iter()
+        .filter_map(|key| std::env::var_os(key).map(|value| (key.into(), value)))
+        .collect();
+    env.extend(
+        HOME_VARS
+            .iter()
+            .map(|key| ((*key).into(), home.as_os_str().to_owned())),
+    );
+    env.extend(
+        extra
+            .iter()
+            .map(|(key, value)| ((*key).into(), (*value).into())),
+    );
+    env
+}
+
 /// Spawns the CLI directly (no shell), with a timeout that kills it.
 pub struct ProcessCommand {
     pub timeout: Duration,
@@ -215,29 +288,45 @@ impl Default for ProcessCommand {
 
 impl SecretCommand for ProcessCommand {
     fn run(&self, program: &Path, args: &[String], env: &[(&str, &str)]) -> Result<CommandOutput> {
+        // Private to this call and removed when it returns. The child has
+        // exited by then on every path below.
+        let home = tempfile::TempDir::new().map_err(|_| {
+            SeraError::External("the password manager command could not be started".into())
+        })?;
         let mut command = Command::new(program);
         command
             .args(args)
+            .env_clear()
+            .envs(child_environment(home.path(), env))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        for (key, value) in env {
-            command.env(key, value);
-        }
         let mut child = command.spawn().map_err(|_| {
             SeraError::External("the password manager command could not be started".into())
         })?;
         // Read stdout on its own thread so a full pipe cannot block the wait.
+        // The buffer is sized up front and never grows, so no stale copy of
+        // the value is left behind by a reallocation.
         let (sender, receiver) = std::sync::mpsc::channel();
         let stdout = child.stdout.take();
         std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(stdout) = stdout {
-                let _ = stdout
-                    .take(MAX_OUTPUT_BYTES as u64 + 1)
-                    .read_to_end(&mut bytes);
+            let mut bytes = Vec::with_capacity(MAX_OUTPUT_BYTES + 1);
+            if let Some(mut stdout) = stdout {
+                let mut chunk = [0u8; 4096];
+                while bytes.len() <= MAX_OUTPUT_BYTES {
+                    let room = (MAX_OUTPUT_BYTES + 1 - bytes.len()).min(chunk.len());
+                    match stdout.read(&mut chunk[..room]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                chunk.zeroize();
             }
-            let _ = sender.send(bytes);
+            // The receiver is gone when the caller timed out: wipe what was read.
+            if let Err(error) = sender.send(bytes) {
+                let mut bytes = error.0;
+                bytes.zeroize();
+            }
         });
         let deadline = Instant::now() + self.timeout;
         let status = loop {
@@ -255,6 +344,7 @@ impl SecretCommand for ProcessCommand {
                 }
                 Err(_) => {
                     let _ = child.kill();
+                    let _ = child.wait();
                     return Err(SeraError::External(
                         "the password manager command failed".into(),
                     ));
@@ -313,10 +403,81 @@ pub fn program_for(provider: Provider, config: &VaultConfig) -> Option<PathBuf> 
     path.is_file().then_some(path)
 }
 
+/// How long a value read from a password manager stays in the model redactor.
+/// A fill is typed right after the read, so this only covers page text and
+/// tool output that may echo it back.
+pub const RESOLVED_TTL: Duration = Duration::from_secs(600);
+/// Most resolved values kept per user; the oldest goes first.
+pub const RESOLVED_PER_USER: usize = 32;
+
+struct Resolved {
+    name: String,
+    value: Zeroizing<String>,
+    at: Instant,
+}
+
+/// Values recently read from a password manager, per user, so the model
+/// redactor can scrub them. The values exist only here, in memory, for
+/// [`RESOLVED_TTL`]; they are never written anywhere. Keyed by entry name:
+/// a second read of the same entry replaces the first.
+#[derive(Default)]
+pub struct ResolvedValues {
+    by_user: Mutex<HashMap<String, VecDeque<Resolved>>>,
+}
+
+impl ResolvedValues {
+    /// Remember a value just read for the acting user's entry `name`.
+    pub fn remember(&self, user_id: &str, name: &str, value: &Zeroizing<String>) {
+        self.remember_at(user_id, name, value, Instant::now());
+    }
+
+    /// The acting user's values that are still within their TTL, as
+    /// `(entry name, value)`.
+    pub fn live(&self, user_id: &str) -> Vec<(String, Zeroizing<String>)> {
+        self.live_at(user_id, Instant::now())
+    }
+
+    fn remember_at(&self, user_id: &str, name: &str, value: &Zeroizing<String>, now: Instant) {
+        let mut map = self.map();
+        let entries = map.entry(user_id.to_owned()).or_default();
+        entries.retain(|entry| entry.name != name && now < entry.at + RESOLVED_TTL);
+        entries.push_back(Resolved {
+            name: name.to_owned(),
+            value: Zeroizing::new(value.to_string()),
+            at: now,
+        });
+        // Dropping an evicted entry zeroizes its value.
+        while entries.len() > RESOLVED_PER_USER {
+            entries.pop_front();
+        }
+    }
+
+    fn live_at(&self, user_id: &str, now: Instant) -> Vec<(String, Zeroizing<String>)> {
+        let mut map = self.map();
+        let Some(entries) = map.get_mut(user_id) else {
+            return Vec::new();
+        };
+        entries.retain(|entry| now < entry.at + RESOLVED_TTL);
+        entries
+            .iter()
+            .map(|entry| (entry.name.clone(), Zeroizing::new(entry.value.to_string())))
+            .collect()
+    }
+
+    /// A poisoned lock still holds the values, so it is used as is: a panic
+    /// elsewhere must not make the redactor forget them.
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, VecDeque<Resolved>>> {
+        self.by_user
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// Reads references through a CLI. Built once at startup from `[vault]`.
 pub struct Providers {
     config: VaultConfig,
     runner: Arc<dyn SecretCommand>,
+    resolved: Arc<ResolvedValues>,
 }
 
 impl Providers {
@@ -328,21 +489,44 @@ impl Providers {
         Self {
             config: config.clone(),
             runner,
+            resolved: Arc::default(),
         }
+    }
+
+    /// The registry of values read through these providers. Share it with the
+    /// gateway so the model redactor scrubs them.
+    pub fn resolved_values(&self) -> Arc<ResolvedValues> {
+        self.resolved.clone()
     }
 
     pub fn cli_found(&self, provider: Provider) -> bool {
         program_for(provider, &self.config).is_some()
     }
 
+    pub fn enabled(&self, provider: Provider) -> bool {
+        provider.enabled(&self.config)
+    }
+
+    /// Refuses a provider the server has not enabled, before anything runs.
+    fn require_enabled(&self, provider: Provider) -> Result<()> {
+        if self.enabled(provider) {
+            return Ok(());
+        }
+        Err(SeraError::Validation(format!(
+            "{} is disabled on this server (experimental): set [vault] protonpass_enabled = true to use it",
+            provider.label()
+        )))
+    }
+
     /// Read one reference's value with the owner's token. The value is
-    /// returned to the caller and not kept anywhere.
+    /// returned to the caller; the caller may remember it for redaction.
     pub async fn read(
         &self,
         provider: Provider,
         reference: &str,
         token: &str,
     ) -> Result<Zeroizing<String>> {
+        self.require_enabled(provider)?;
         let args = read_args(provider, reference)?;
         let program = program_for(provider, &self.config).ok_or_else(|| {
             SeraError::External(format!(
@@ -404,6 +588,8 @@ pub struct ProviderStatus {
     pub configured: bool,
     /// The CLI is installed on the server.
     pub cli_found: bool,
+    /// The server reads from this manager (Proton Pass is opt-in).
+    pub enabled: bool,
     pub install_url: &'static str,
 }
 
@@ -420,14 +606,34 @@ pub fn status(
             .vault_provider_token(user_id, provider.id())?
             .is_some(),
         cli_found: providers.cli_found(provider),
+        enabled: providers.enabled(provider),
         install_url: provider.install_url(),
     })
 }
 
+/// The browser fill's approval-time check: the entry must allow `host` (and
+/// hold `field`), and a password manager value needs its provider enabled.
+/// Nothing is read or decrypted.
+pub fn authorize_for_browser(
+    users: &UserSecrets,
+    providers: &Providers,
+    user_id: &str,
+    name: &str,
+    host: &str,
+    field: VaultField,
+) -> Result<VaultEntry> {
+    let entry = vault::authorize_fill(users, user_id, name, host, field)?;
+    if let (VaultField::Value, Some(provider)) = (field, Provider::from_source(entry.source)) {
+        providers.require_enabled(provider)?;
+    }
+    Ok(entry)
+}
+
 /// The browser fill for one entry: authorize the host, then read the value
 /// from the sealed store (local) or from the owner's password manager
-/// (reference). The fill is recorded as a `vault.resolve` audit row with the
-/// name and host only.
+/// (reference). A value read from a password manager is remembered for the
+/// model redactor. The fill is recorded as a `vault.resolve` audit row with
+/// the name and host only.
 pub async fn resolve_for_browser(
     users: &UserSecrets,
     providers: &Providers,
@@ -436,7 +642,7 @@ pub async fn resolve_for_browser(
     host: &str,
     field: VaultField,
 ) -> Result<Zeroizing<String>> {
-    let entry = vault::authorize_fill(users, user_id, name, host, field)?;
+    let entry = authorize_for_browser(users, providers, user_id, name, host, field)?;
     let value = match (field, Provider::from_source(entry.source)) {
         (VaultField::Username, _) => vault::username_of(&entry)?,
         (VaultField::Value, None) => vault::local_value(users, user_id, name)?,
@@ -452,9 +658,11 @@ pub async fn resolve_for_browser(
             let reference = entry.reference.as_deref().ok_or_else(|| {
                 SeraError::InvalidState("a password manager entry has no reference".into())
             })?;
-            providers
+            let value = providers
                 .read(provider, reference, token.expose_secret())
-                .await?
+                .await?;
+            providers.resolved.remember(user_id, name, &value);
+            value
         }
     };
     vault::record_fill(users, user_id, name, host)?;
@@ -466,7 +674,7 @@ mod tests {
     use super::*;
     use crate::store::Store;
     use crate::user_secrets::KEY_BYTES;
-    use crate::vault::{VaultInput, VaultKind};
+    use crate::vault::{Redactor, VaultInput, VaultKind};
     use std::sync::Mutex;
 
     /// Program, arguments and child environment of one recorded call.
@@ -515,6 +723,7 @@ mod tests {
         VaultConfig {
             op_path: "Z:/synthetic/op-missing.exe".into(),
             pass_cli_path: "Z:/synthetic/pass-cli-missing.exe".into(),
+            protonpass_enabled: false,
         }
     }
 
@@ -557,6 +766,16 @@ mod tests {
             "op://Vault/It em/password",
             "op://Vault/Item/pass\nword",
             "",
+            // A segment that a CLI could read as an option.
+            "op://-Vault/Item/password",
+            "op://Vault/-Item/password",
+            "op://Vault/Item/-password",
+            // A query other than one attribute name.
+            "op://Vault/Item/password?vault=x",
+            "op://Vault/Item/password?attribute=",
+            "op://Vault/Item/password?attribute=otp&x=1",
+            "op://Vault/Item/password?attribute=a/b",
+            "op://Vault?attribute=otp/Item/password",
         ];
         for reference in bad {
             assert!(
@@ -564,6 +783,11 @@ mod tests {
                 "{reference}"
             );
         }
+        validate_reference(
+            VaultSource::OnePassword,
+            "op://Vault/Item/password?attribute=otp",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -580,6 +804,9 @@ mod tests {
             "pass://Personal/github",
             "pass://Personal/github/password/extra",
             "pass://Personal//password",
+            "pass://-Personal/github/password",
+            "pass://Personal/-github/password",
+            "pass://Personal/github/password?attribute=otp",
         ] {
             assert!(
                 validate_reference(VaultSource::ProtonPass, reference).is_err(),
@@ -850,5 +1077,185 @@ mod tests {
         assert!(status.configured && !status.cli_found);
         assert!(clear_token(&users, &user, Provider::OnePassword).unwrap());
         assert!(!clear_token(&users, &user, Provider::OnePassword).unwrap());
+    }
+
+    #[test]
+    fn the_child_environment_inherits_only_path_and_its_own_home() {
+        let home = tempfile::TempDir::new().unwrap();
+        let env = child_environment(
+            home.path(),
+            &[("OP_SERVICE_ACCOUNT_TOKEN", "synthetic-token")],
+        );
+        let allowed = [
+            "PATH",
+            "SYSTEMROOT",
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "OP_SERVICE_ACCOUNT_TOKEN",
+        ];
+        for (key, _) in &env {
+            assert!(allowed.contains(&key.to_str().unwrap()), "{key:?}");
+        }
+        let value = |name: &str| {
+            env.iter()
+                .find(|(key, _)| key.to_str() == Some(name))
+                .map(|(_, value)| value.to_str().unwrap().to_owned())
+        };
+        let home_text = home.path().to_str().unwrap().to_owned();
+        for name in HOME_VARS {
+            assert_eq!(value(name).as_deref(), Some(home_text.as_str()), "{name}");
+        }
+        assert_eq!(
+            value("OP_SERVICE_ACCOUNT_TOKEN").unwrap(),
+            "synthetic-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn proton_pass_is_refused_until_the_server_enables_it() {
+        let (_, users, user) = setup();
+        vault::put(
+            &users,
+            &user,
+            "bank",
+            &reference_entry(
+                VaultSource::ProtonPass,
+                "pass://Personal/bank/password",
+                &["bank.example"],
+            ),
+        )
+        .unwrap();
+        users
+            .set_vault_provider_token(&user, "protonpass", "synthetic-token")
+            .unwrap();
+        let runner = fake(Some(0), "synthetic-pass-value");
+        let disabled = Providers::with_runner(&config(), runner.clone());
+        let error = resolve_for_browser(
+            &users,
+            &disabled,
+            &user,
+            "bank",
+            "bank.example",
+            VaultField::Value,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("disabled on this server"));
+        assert!(runner.calls.lock().unwrap().is_empty());
+        assert!(
+            !status(&users, &disabled, &user, Provider::ProtonPass)
+                .unwrap()
+                .enabled
+        );
+        // The approval is refused too, before anything is asked of the owner.
+        assert!(
+            authorize_for_browser(
+                &users,
+                &disabled,
+                &user,
+                "bank",
+                "bank.example",
+                VaultField::Value
+            )
+            .is_err()
+        );
+
+        let mut enabled_config = config();
+        enabled_config.protonpass_enabled = true;
+        enabled_config.pass_cli_path = std::env::current_exe().unwrap().display().to_string();
+        let enabled = Providers::with_runner(&enabled_config, runner.clone());
+        assert!(
+            status(&users, &enabled, &user, Provider::ProtonPass)
+                .unwrap()
+                .enabled
+        );
+        let value = resolve_for_browser(
+            &users,
+            &enabled,
+            &user,
+            "bank",
+            "bank.example",
+            VaultField::Value,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value.as_str(), "synthetic-pass-value");
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_provider_value_is_redacted_after_it_is_typed_and_only_for_its_owner() {
+        let (store, users, user) = setup();
+        let other = store
+            .create_user("subject-vp-r", "vpr@example.example", "Synthetic VPR")
+            .unwrap()
+            .id;
+        let providers =
+            Providers::with_runner(&config_with_op(), fake(Some(0), "synthetic-op-value"));
+        vault::put(
+            &users,
+            &user,
+            "bank",
+            &reference_entry(
+                VaultSource::OnePassword,
+                "op://Vault/Bank/password",
+                &["bank.example"],
+            ),
+        )
+        .unwrap();
+        users
+            .set_vault_provider_token(&user, "onepassword", "synthetic-token")
+            .unwrap();
+        resolve_for_browser(
+            &users,
+            &providers,
+            &user,
+            "bank",
+            "bank.example",
+            VaultField::Value,
+        )
+        .await
+        .unwrap();
+        let resolved = providers.resolved_values();
+        let redactor = Redactor::for_user(&users, &user, &resolved).unwrap();
+        assert_eq!(
+            redactor.redact("the page shows synthetic-op-value"),
+            "the page shows [vault:bank]"
+        );
+        let others = Redactor::for_user(&users, &other, &resolved).unwrap();
+        assert_eq!(others.redact("synthetic-op-value"), "synthetic-op-value");
+    }
+
+    #[test]
+    fn resolved_values_expire_after_their_ttl_and_stay_bounded() {
+        let registry = ResolvedValues::default();
+        let start = Instant::now();
+        let value = Zeroizing::new("synthetic-resolved".to_owned());
+        registry.remember_at("u", "bank", &value, start);
+        let just_before = start + RESOLVED_TTL - Duration::from_secs(1);
+        assert_eq!(registry.live_at("u", just_before).len(), 1);
+        assert!(registry.live_at("u", start + RESOLVED_TTL).is_empty());
+        assert!(registry.live_at("v", start).is_empty());
+
+        // At most RESOLVED_PER_USER per user: the oldest go first.
+        for index in 0..RESOLVED_PER_USER + 8 {
+            registry.remember_at("u", &format!("entry-{index}"), &value, start);
+        }
+        let live = registry.live_at("u", start);
+        assert_eq!(live.len(), RESOLVED_PER_USER);
+        assert!(live.iter().all(|(name, _)| name != "entry-0"));
+        assert!(live.iter().any(|(name, _)| name == "entry-39"));
+
+        // Re-reading an entry replaces its value rather than adding a second one.
+        registry.remember_at("u", "entry-39", &value, start);
+        let again = registry.live_at("u", start);
+        assert_eq!(
+            again.iter().filter(|(name, _)| name == "entry-39").count(),
+            1
+        );
     }
 }

@@ -179,10 +179,19 @@ pub(super) async fn decline_card(
 pub(super) const SECRET_BODY_LIMIT_BYTES: usize = 16 * 1024;
 
 /// `{"value": "..."}` for a secret request. Never logged: `Debug` redacts it.
+/// The value is zeroized on drop, and wrapped as soon as its field is parsed.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SecretRequest {
-    value: String,
+    #[serde(deserialize_with = "deserialize_secret")]
+    value: Zeroizing<String>,
+}
+
+fn deserialize_secret<'de, D>(deserializer: D) -> std::result::Result<Zeroizing<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Zeroizing::new)
 }
 
 impl std::fmt::Debug for SecretRequest {
@@ -197,15 +206,17 @@ impl std::fmt::Debug for SecretRequest {
 /// `POST /v1/cards/{id}/secret`: seal the owner's value into the vault under
 /// the card's name, kind, username and sites. The bot is told the entry was
 /// saved (never the value), and the card is marked saved. A value for an
-/// existing name replaces it only when the card asked to save; a card that
-/// asked to provide a login never overwrites one.
+/// existing name replaces it only when the card is a save that says it
+/// replaces (`replaces: true`, set when the card was raised for that name).
+/// A card that asked to provide a login never overwrites one, and no card
+/// replaces a password manager entry.
 pub(super) async fn submit_secret_card(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
     Json(request): Json<SecretRequest>,
 ) -> Result<Json<Value>> {
-    let value = Zeroizing::new(request.value);
+    let value = request.value;
     let _claim = CardClaim::take(&state.card_claims, &id)?;
     let card = state.store.get_card(&user.id, &id)?;
     if card.kind != CardKind::SecretRequest {
@@ -222,10 +233,18 @@ pub(super) async fn submit_secret_card(
     let kind: VaultKind = serde_json::from_value(payload["kind"].clone())
         .map_err(|_| SeraError::Internal("stored card has an unknown kind".into()))?;
     let purpose = payload["purpose"].as_str().unwrap_or_default();
-    if purpose != "save" && crate::vault::get(&state.users, &user.id, &name)?.is_some() {
-        return Err(SeraError::InvalidState(
-            "a vault entry with this name already exists".into(),
-        ));
+    if let Some(existing) = crate::vault::get(&state.users, &user.id, &name)? {
+        if existing.source.is_external() {
+            return Err(SeraError::InvalidState(
+                "a password manager entry with this name cannot be replaced".into(),
+            ));
+        }
+        let replaces = purpose == "save" && payload["replaces"].as_bool() == Some(true);
+        if !replaces {
+            return Err(SeraError::InvalidState(
+                "a vault entry with this name already exists".into(),
+            ));
+        }
     }
     let entry = crate::vault::put(
         &state.users,

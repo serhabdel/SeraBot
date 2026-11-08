@@ -25,7 +25,7 @@ or sends something to a third party that cannot be recalled. The list lives in
 
 ## Not destructive (no approval)
 
-- Browser: `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_press`, `browser_screenshot`, `browser_close`. Typing a vault secret into a page whose host is not in the entry's allowed domains still fails closed. Typing a vault secret always asks for approval bound to the entry name and the page host (see `docs/vault.md`).
+- Browser: `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_press`, `browser_screenshot`, `browser_close`. Typing a vault secret into a page whose host is not in the entry's allowed domains still fails closed. Typing a vault secret always asks for approval bound to the entry name and the page host, on an https page only (see `docs/vault.md`). "Always" is never a standing grant for a vault secret: it acts as "once".
 - Vault: `vault_list` and `vault_request_secret` are not destructive; the second one asks the owner for the value in a secure card instead.
 - Memory: `memory_save`, `memory_list`.
 - Research and media: `firecrawl_scrape`, `firecrawl_map`, `firecrawl_search`, `firecrawl_crawl`, `firecrawl_extract`, `tavily_search`, `fetch_url`, `watch_now`, `audio_transcribe`, `audio_understand`, `elevenlabs_list_voices`, `elevenlabs_text_to_speech`, `elevenlabs_sound_effect`, `elevenlabs_transcribe`, `elevenlabs_generate_image`, `elevenlabs_generate_video`.

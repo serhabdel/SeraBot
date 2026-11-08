@@ -164,6 +164,8 @@ pub struct PasswordManager {
     pub configured: bool,
     /// The CLI is installed on the server.
     pub cli_found: bool,
+    /// The server reads from this manager (Proton Pass is opt-in).
+    pub enabled: bool,
     pub install_url: String,
 }
 

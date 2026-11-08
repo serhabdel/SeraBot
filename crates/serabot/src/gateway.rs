@@ -26,6 +26,7 @@ use crate::store::Store;
 use crate::user_secrets::UserSecrets;
 use crate::util::{canonical_hash, canonical_json, sha256_hex, truncate_chars};
 use crate::vault::Redactor;
+use crate::vault_providers::ResolvedValues;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -158,6 +159,13 @@ pub trait Tool: Send + Sync {
         self.spec().destructive()
     }
 
+    /// Whether the owner's "always" choice may remember this call. A call that
+    /// is too sensitive for a standing grant (a vault secret typed into a
+    /// page) returns false: "always" then acts as "once" and asks again.
+    fn allow_standing_grant(&self, _args: &Value) -> bool {
+        true
+    }
+
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput>;
 }
 
@@ -250,6 +258,8 @@ pub struct Gateway {
     respect_bot_lists: bool,
     /// Vault redaction source; `None` leaves tool output untouched.
     vault: Option<Arc<UserSecrets>>,
+    /// Values recently read from a password manager, scrubbed with the vault.
+    resolved: Arc<ResolvedValues>,
 }
 
 impl Gateway {
@@ -268,6 +278,7 @@ impl Gateway {
             standing_consent,
             respect_bot_lists: false,
             vault: None,
+            resolved: Arc::default(),
         }
     }
 
@@ -285,6 +296,13 @@ impl Gateway {
         self
     }
 
+    /// The password manager values the redactor also scrubs. Pass the same
+    /// registry the browser fills read through (`Providers::resolved_values`).
+    pub fn with_resolved_values(mut self, resolved: Arc<ResolvedValues>) -> Self {
+        self.resolved = resolved;
+        self
+    }
+
     /// The per-user secret store, when the gateway was built with one. Only
     /// per-user adapters (for example Mem0) read secrets through it, always
     /// under the acting user's id.
@@ -296,7 +314,7 @@ impl Gateway {
     /// the vault cannot be read, the text is not returned.
     pub fn redact_text(&self, user_id: &str, text: &str) -> Result<String> {
         match &self.vault {
-            Some(users) => Ok(Redactor::for_user(users, user_id)?.redact(text)),
+            Some(users) => Ok(Redactor::for_user(users, user_id, &self.resolved)?.redact(text)),
             None => Ok(text.to_owned()),
         }
     }
@@ -312,7 +330,7 @@ impl Gateway {
         let Some(users) = &self.vault else {
             return Ok(messages.to_vec());
         };
-        let redactor = Redactor::for_user(users, user_id)?;
+        let redactor = Redactor::for_user(users, user_id, &self.resolved)?;
         if redactor.is_empty() {
             return Ok(messages.to_vec());
         }
@@ -344,7 +362,7 @@ impl Gateway {
             return output;
         };
         let mut output = output?;
-        let redactor = Redactor::for_user(users, &context.user_id)?;
+        let redactor = Redactor::for_user(users, &context.user_id, &self.resolved)?;
         if redactor.is_empty() {
             return Ok(output);
         }
@@ -484,6 +502,9 @@ impl Gateway {
         hash: &str,
         context: &ToolContext,
     ) -> Result<Option<ToolOutput>> {
+        if !tool.allow_standing_grant(args) {
+            return Ok(None);
+        }
         let spec = tool.spec();
         let details = tool.approval_details_for(args, context).await?;
         if self.store.matching_grant(
@@ -866,6 +887,16 @@ impl Gateway {
         Ok(())
     }
 
+    /// Whether the action's tool allows a standing grant for its arguments. A
+    /// tool that is no longer registered allows none.
+    fn standing_grant_allowed(&self, action: &Action) -> bool {
+        let Some(tool) = self.registry.get(&action.tool) else {
+            return false;
+        };
+        serde_json::from_str::<Value>(&action.canonical_args)
+            .is_ok_and(|args| tool.allow_standing_grant(&args))
+    }
+
     /// Apply an approval decision for the acting user.
     ///
     /// The decision resolves within the acting user's rows: reads and writes
@@ -899,6 +930,14 @@ impl Gateway {
             )?;
             return Err(SeraError::PolicyViolation);
         }
+        // "Always" remembers the call. The tool may refuse that for this call
+        // (a vault secret typed into a page): the choice then covers this
+        // action only, and the next identical call asks again.
+        let decision = if decision == Decision::Always && !self.standing_grant_allowed(&action) {
+            Decision::Once
+        } else {
+            decision
+        };
         match decision {
             Decision::Deny => {
                 if !self.store.transition_approval(
@@ -1197,6 +1236,11 @@ mod tests {
             self.auto_ok
         }
 
+        // Like a vault secret fill: "always" never remembers it.
+        fn allow_standing_grant(&self, _args: &Value) -> bool {
+            false
+        }
+
         async fn execute(&self, _args: Value, _context: &ToolContext) -> Result<ToolOutput> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ToolOutput {
@@ -1393,6 +1437,72 @@ mod tests {
             .unwrap();
         assert!(matches!(changed, ToolOutcome::PendingApproval { .. }));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn always_is_downgraded_for_a_call_the_tool_will_not_remember() {
+        let (gateway, calls, _page, context) = live_setup(false, "login.bank.example");
+        let args = serde_json::json!({"field": "password"});
+        let ToolOutcome::PendingApproval {
+            approval_id,
+            action_id,
+            ..
+        } = gateway
+            .execute("onedrive_upload", args.clone(), &context)
+            .await
+            .unwrap()
+        else {
+            panic!("expected approval");
+        };
+        // The owner picks "always": the approval is recorded as once only.
+        let decided = gateway
+            .decide(&context.user_id, &approval_id, Decision::Always)
+            .unwrap();
+        assert_eq!(decided.approval.state, ApprovalState::ApprovedOnce.as_str());
+        gateway
+            .execute_approved(&action_id, &context)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // No grant was left behind, so the same call asks again.
+        let again = gateway
+            .execute("onedrive_upload", args.clone(), &context)
+            .await
+            .unwrap();
+        assert!(matches!(again, ToolOutcome::PendingApproval { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_standing_grant_row_is_ignored_for_a_call_the_tool_will_not_remember() {
+        let (gateway, calls, _page, context) = live_setup(false, "login.bank.example");
+        let args = serde_json::json!({"field": "password"});
+        let ToolOutcome::PendingApproval { approval_id, .. } = gateway
+            .execute("onedrive_upload", args.clone(), &context)
+            .await
+            .unwrap()
+        else {
+            panic!("expected approval");
+        };
+        // A grant row that matches this call exactly, as an older build could
+        // have written it. The gateway must not honour it.
+        gateway
+            .store()
+            .insert_grant(
+                &context.user_id,
+                "onedrive_upload",
+                &canonical_hash(&args).unwrap(),
+                Some("vault:bank → login.bank.example"),
+                gateway.policy().version(),
+                &approval_id,
+            )
+            .unwrap();
+        let outcome = gateway
+            .execute("onedrive_upload", args, &context)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ToolOutcome::PendingApproval { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

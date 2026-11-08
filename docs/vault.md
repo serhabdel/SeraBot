@@ -49,9 +49,15 @@ A bot that needs a login it does not have calls `vault_request_secret`
   conversation: `Secret “<name>” was saved to the vault for <sites>. Use it
   with browser_type secret=<name>.` The message and the card response never
   contain the value.
-- The route reads at most 16 KiB. A card resolves once. A `save` card
-  replaces an existing entry of that name. A `provide` card never overwrites
-  one (409).
+- The route reads at most 16 KiB. A card resolves once.
+- A `save` card for a name that already has an entry is raised with
+  `replaces: true`. The card says **This replaces your existing “<name>”
+  entry**, and the value replaces it only when the card carries that flag.
+  Without the flag the value is refused (409) and the card stays pending.
+  A `provide` card never overwrites an entry (409).
+- No card replaces a password manager entry (1Password or Proton Pass),
+  even with the flag. The tool refuses to raise such a card, and the route
+  refuses the value (409). Choose another name.
 - At most one secret request is pending per conversation. Telegram chats have
   no card view, so the tool refuses there.
 - Autonomy (yolo or a goal) does not skip a secret request. A secret always
@@ -65,6 +71,8 @@ A bot that needs a login it does not have calls `vault_request_secret`
 
 1. The entry must allow the **current page's host**. An empty site list
    allows nothing. A refused host fails before any approval is asked.
+   The page must be **https**. Plain http is refused, except for a loopback
+   address (`localhost`, `127.0.0.1`, `::1`), which is for local testing.
 2. Typing a secret **always needs your approval**, even in autonomy mode. The
    approval binds:
    - your user id and the entry name,
@@ -76,7 +84,13 @@ A bot that needs a login it does not have calls `vault_request_secret`
 4. The gateway re-reads the page's host just before dispatch. If it no longer
    matches the approved destination, the action is invalidated and nothing is
    typed. A new approval is needed.
-5. A "remember" grant matches only the same entry, host and arguments.
+5. The page is checked again after the value is read. A password manager read
+   can take up to 15 seconds, and the page can move meanwhile. If the page is
+   no longer on the same https host, nothing is typed (`the page moved; not
+   typing the secret`), and the value is dropped.
+6. **"Always" is never offered as a standing grant for a secret.** Each typing
+   asks again. An "always" choice on a secret is recorded as "once", and any
+   grant row that matches a secret typing is ignored.
 
 The page host is read from the bot's own session. It is not taken from the
 model.
@@ -96,24 +110,46 @@ The server finds the CLI on `PATH`, or at the path set in config:
 
 ```toml
 [vault]
-op_path = ""          # empty: look up `op` on PATH
-pass_cli_path = ""    # empty: look up `pass-cli` on PATH
+op_path = ""                 # empty: look up `op` on PATH
+pass_cli_path = ""           # empty: look up `pass-cli` on PATH
+protonpass_enabled = false   # experimental: see Proton Pass below
 ```
 
 `GET /v1/vault/providers` reports, for each manager, whether a token is
-saved (`configured`) and whether its CLI is installed (`cli_found`). The
-token is written with `PUT /v1/vault/providers/{id}` `{"token": "..."}` and
-removed with `DELETE`.
+saved (`configured`), whether its CLI is installed (`cli_found`) and whether
+the server reads from it (`enabled`). The token is written with
+`PUT /v1/vault/providers/{id}` `{"token": "..."}` and removed with `DELETE`.
 
-Reading a value runs the CLI with an argument array (never a shell), the
-token only in the child's environment, a 15 second timeout (the process is
-killed), and at most 64 KiB of output. Only the exit code is logged. Stderr is
-discarded. The read is read-only: `op read --no-newline <ref>` for 1Password.
+Reading a value runs the CLI with an argument array (never a shell), a 15
+second timeout (the process is killed), and at most 64 KiB of output. Only
+the exit code is logged. Stderr is discarded. The read is read-only:
+`op read --no-newline <ref>` for 1Password.
+
+- **Environment.** The child's environment is cleared. It gets only `PATH`
+  (and `SYSTEMROOT` on Windows), the owner's token variable, and a private
+  home directory for the call (`HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`,
+  `XDG_DATA_HOME`, `APPDATA` and `LOCALAPPDATA` all point at it). The
+  directory is removed when the call returns. The CLI cannot read the
+  server's own profile or write into it.
+- **References.** A segment may not start with `-`, so no CLI can read it as
+  an option. A 1Password reference may end with `?attribute=<name>` (one
+  word, such as `?attribute=otp`). Nothing else takes a query.
+- **Redaction.** A value read through a manager is kept in server memory for
+  10 minutes, at most 32 per user, keyed by entry name. The model redactor
+  scrubs it from model-facing text as `[vault:<name>]`, so a page or tool
+  output that echoes it back is not shown to the model. The values are never
+  written to disk, and another user never sees them.
+
+**Proton Pass is off by default** (`protonpass_enabled = false`). It is
+experimental. While it is off, a Proton Pass fill is refused before approval
+and before anything runs, with a message that names the setting. The status
+reports `enabled: false`, and the desktop says so. The token variable
+`PROTON_PASS_PERSONAL_ACCESS_TOKEN` and the arguments below are **not verified
+against every CLI release**. Set the flag to `true` only after you have
+checked both against your installed `pass-cli`.
 
 The Proton Pass arguments are `item view --vault-name <v> --item-title <i>
---field <f>`. **These flags are not verified against every CLI release.** The
-shape lives in one function, `vault_providers::read_args`. Check it against
-your installed `pass-cli` before relying on Proton Pass.
+--field <f>`. The shape lives in one function, `vault_providers::read_args`.
 
 ## Importing from this PC
 
@@ -133,6 +169,10 @@ during the import. Names are made unique automatically.
 
 If the CLI is not on the PC, the picker says so and links the install page.
 
+An imported Proton Pass entry is a reference like any other. The server
+refuses to read it while `protonpass_enabled` is off, so importing does not
+make a Proton Pass login usable by itself.
+
 ## API
 
 | Method | Route | Notes |
@@ -140,10 +180,10 @@ If the CLI is not on the PC, the picker says so and links the install page.
 | `GET` | `/v1/vault` | Entries (metadata only). Each has `source` and `reference`. |
 | `PUT` | `/v1/vault/{name}` | `{kind, value, domains, username?, note?, source?, reference?}`. A reference takes `value: ""`. |
 | `DELETE` | `/v1/vault/{name}` | |
-| `GET` | `/v1/vault/providers` | Password manager status. No token. |
+| `GET` | `/v1/vault/providers` | Password manager status: `configured`, `cli_found`, `enabled`. No token. |
 | `PUT` | `/v1/vault/providers/{id}` | `{"token": "..."}`. Write-only. |
 | `DELETE` | `/v1/vault/providers/{id}` | |
-| `POST` | `/v1/cards/{id}/secret` | `{"value": "..."}` for a secret request card. Body ≤ 16 KiB. |
+| `POST` | `/v1/cards/{id}/secret` | `{"value": "..."}` for a secret request card. Body ≤ 16 KiB. 409 when the name exists and the card does not say `replaces`, for a `provide` card, and for a password manager entry. |
 
 ## Bot tools
 
@@ -156,8 +196,11 @@ If the CLI is not on the PC, the picker says so and links the install page.
 
 - The model never receives a value. Tool output is redacted (`[vault:<name>]`),
   and the browser lease scrubs values it typed from later page text.
-- Provider-read values are not in the model redactor. They exist only in the
-  browser lease, for the duration of one type.
+- Provider-read values are in the model redactor for 10 minutes after they
+  are read (see Password managers). They live only in server memory, in a
+  registry that a restart empties. They are never written to disk or audit.
+- A password manager value is typed only into an https page (or loopback
+  http), and only if the page is still on the approved host after the read.
 - Audit rows carry the entry name and host, never a value. `vault.saved_via_card`
   records the name and card id.
 - Secret cards are owner-scoped: another account gets 404 on the card.
@@ -166,8 +209,11 @@ If the CLI is not on the PC, the picker says so and links the install page.
 
 ## Known limits
 
-- The Proton Pass CLI flags and the Proton Pass listing shape are assumptions
-  until checked against the installed CLI.
+- The Proton Pass CLI flags, the token variable and the Proton Pass listing
+  shape are assumptions until checked against the installed CLI. The server
+  reads Proton Pass only when `protonpass_enabled` is set.
+- The desktop's Proton Pass import lists items from the PC's CLI, whatever the
+  server setting. The server only refuses to read them.
 - A pending secret request does not expire. The owner can decline it.
 - A reference is typed only by a bot that holds `browser_type`. Telegram
   chats cannot receive a secret card.

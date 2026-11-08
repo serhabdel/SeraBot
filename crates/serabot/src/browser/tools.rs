@@ -116,6 +116,26 @@ fn signin_note(url: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The host a vault secret may be typed into, read from the page URL. Only an
+/// https page counts; plain http is allowed for a loopback address (a local
+/// test server). Anything else fails closed, so a secret never travels in the
+/// clear.
+fn secret_page_host(url: &str) -> Result<String> {
+    let host = host_of(url)
+        .ok_or_else(|| SeraError::Validation("open a page before typing a secret".into()))?;
+    let scheme = url::Url::parse(url)
+        .map(|parsed| parsed.scheme().to_owned())
+        .unwrap_or_default();
+    let loopback = matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]");
+    match scheme.as_str() {
+        "https" => Ok(host),
+        "http" if loopback => Ok(host),
+        _ => Err(SeraError::Validation(
+            "a vault secret is typed only on an https page".into(),
+        )),
+    }
+}
+
 fn text_output(lease: &Lease, body: String, data: Value) -> ToolOutput {
     ToolOutput {
         content: lease.redact(&format!("{UNTRUSTED_BANNER}\n{body}")),
@@ -130,8 +150,8 @@ impl BrowserTool {
         self.kind == Kind::Type && opt_str(args, "secret").is_some()
     }
 
-    /// The host of the page the bot is on. Reads the session without
-    /// launching one or recording the bot as its driver.
+    /// The host of the page the bot is on, for a secret: https only. Reads
+    /// the session without launching one or recording the bot as its driver.
     async fn page_host(&self, context: &ToolContext) -> Result<String> {
         let profile = self
             .deps
@@ -143,8 +163,7 @@ impl BrowserTool {
             .bot_lease(&context.user_id, profile.as_str(), false, None)
             .await?;
         let info = lease.backend().info().await?;
-        host_of(&info.url)
-            .ok_or_else(|| SeraError::Validation("open a page before typing a secret".into()))
+        secret_page_host(&info.url)
     }
 
     /// The approval for typing a vault secret into the current page. The
@@ -257,6 +276,11 @@ impl Tool for BrowserTool {
     fn requires_approval(&self, args: &Value) -> bool {
         // Typing a vault secret always needs the owner, even in autonomy mode.
         self.types_secret(args)
+    }
+
+    fn allow_standing_grant(&self, args: &Value) -> bool {
+        // "Always" never covers a vault secret: each typing asks again.
+        !self.types_secret(args)
     }
 
     async fn approval_details_for(
@@ -437,15 +461,22 @@ impl Tool for BrowserTool {
                         }
                         let lease = manager.bot_lease(user, profile, false, driver).await?;
                         let info = lease.backend().info().await?;
-                        let host = host_of(&info.url).ok_or_else(|| {
-                            SeraError::Validation("open a page before typing a secret".into())
-                        })?;
+                        let host = secret_page_host(&info.url)?;
                         // Fails closed on unknown name or host outside the entry's domains.
                         let value = self
                             .deps
                             .resolver
                             .resolve(user, secret, field, &host)
                             .await?;
+                        // A password manager read can take seconds, and the page
+                        // can move meanwhile. Type only into the page the host
+                        // was checked for; otherwise the value is dropped here.
+                        let after = lease.backend().info().await?;
+                        if secret_page_host(&after.url).ok().as_deref() != Some(host.as_str()) {
+                            return Err(SeraError::Validation(
+                                "the page moved; not typing the secret".into(),
+                            ));
+                        }
                         lease.remember_secret(secret, &value);
                         lease
                             .backend()
@@ -927,6 +958,115 @@ mod tests {
             tool.approval_details_for(&json!({"ref":"e1","secret":"nope"}), &ctx("alice"))
                 .await
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn secrets_need_an_https_page_or_a_loopback_http_one() {
+        for ok in [
+            "https://login.bank.example/",
+            "https://93.184.216.34/",
+            "http://localhost:8080/",
+            "http://127.0.0.1/",
+            "http://[::1]:8080/",
+        ] {
+            assert!(secret_page_host(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://login.bank.example/",
+            "http://93.184.216.34/",
+            "ftp://login.bank.example/",
+            "about:blank",
+        ] {
+            assert!(secret_page_host(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_secret_is_never_typed_into_a_plain_http_page() {
+        let h = harness();
+        let backend = h
+            .manager
+            .bot_lease("alice", "default", true, None)
+            .await
+            .unwrap();
+        backend
+            .backend()
+            .navigate("http://login.bank.example/")
+            .await
+            .unwrap();
+        drop(backend);
+        let args = json!({"ref":"e1","secret":"bank","field":"password"});
+        let tool = h.registry.get("browser_type").unwrap();
+        // Refused before an approval is asked for, and before the entry is read.
+        assert!(matches!(
+            tool.approval_details_for(&args, &ctx("alice")).await,
+            Err(SeraError::Validation(_))
+        ));
+        assert!(matches!(
+            run(&h, "alice", "browser_type", args).await,
+            Err(SeraError::Validation(_))
+        ));
+        assert!(h.resolver.requests.lock().unwrap().is_empty());
+        assert!(
+            !h.launcher
+                .calls_for("alice")
+                .iter()
+                .any(|c| c.starts_with("type"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_that_moves_during_the_read_gets_no_secret() {
+        let h = harness();
+        let backend = h
+            .manager
+            .bot_lease("alice", "default", true, None)
+            .await
+            .unwrap();
+        backend
+            .backend()
+            .navigate("https://login.bank.example/")
+            .await
+            .unwrap();
+        drop(backend);
+        // The page leaves the approved site while the value is being read.
+        *h.resolver.moves_page.lock().unwrap() =
+            Some((h.launcher.clone(), "https://evil.example/".into()));
+        let err = run(
+            &h,
+            "alice",
+            "browser_type",
+            json!({"ref":"e1","secret":"bank","field":"password"}),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, SeraError::Validation(text) if text == "the page moved; not typing the secret"),
+            "{err}"
+        );
+        assert!(
+            !h.launcher
+                .calls_for("alice")
+                .iter()
+                .any(|c| c.starts_with("type")),
+            "nothing typed"
+        );
+    }
+
+    #[test]
+    fn a_vault_secret_is_never_covered_by_an_always_grant() {
+        let h = harness();
+        let tool = h.registry.get("browser_type").unwrap();
+        assert!(
+            !tool.allow_standing_grant(&json!({"ref":"e1","secret":"bank","field":"password"}))
+        );
+        assert!(tool.allow_standing_grant(&json!({"ref":"e1","text":"hi"})));
+        assert!(
+            h.registry
+                .get("browser_navigate")
+                .unwrap()
+                .allow_standing_grant(&json!({"url":"https://93.184.216.34/"}))
         );
     }
 

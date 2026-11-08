@@ -163,6 +163,9 @@ fn SecretPrompt(
                     span { "Username: {username}" }
                 }
             }
+            if secret.replaces {
+                p { class: "chat-card-note", "This replaces your existing “{secret.name}” entry." }
+            }
             if !secret.domains.is_empty() {
                 div { class: "chat-card-domains", "aria-label": "Sites",
                     for domain in secret.domains.clone() {
