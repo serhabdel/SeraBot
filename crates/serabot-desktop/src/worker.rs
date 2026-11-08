@@ -60,6 +60,14 @@ pub enum OperationKind {
     /// Stop the running turn(s) of the open conversation.
     StopTurn,
     FetchArtifact,
+    /// A file's bytes, read back as a preview for an inline player.
+    PreviewArtifact,
+    /// The open conversation's background media jobs.
+    MediaJobs,
+    /// The owner's per-turn work limits.
+    TurnLimits,
+    /// Save or reset the owner's per-turn work limits.
+    TurnLimitsWrite,
     Transcribe,
     AdminWrite,
     /// Save the account's own key for a provider.
@@ -70,6 +78,7 @@ pub enum OperationKind {
     DefaultRoute,
     ConnectorTest,
     OAuthSignIn,
+    ConnectorSignOut,
     BotSettingsWrite,
     BotLifecycle,
     AdminRestart,
@@ -203,6 +212,23 @@ pub enum Operation {
     FetchArtifact {
         hash: String,
     },
+    /// Read a media file back for an inline player. `mime` comes from the
+    /// library entry; the bytes become a data URL off the UI thread.
+    PreviewArtifact {
+        hash: String,
+        mime: String,
+    },
+    /// The open conversation's background media jobs.
+    MediaJobs,
+    /// `GET /v1/settings/turn-limits`.
+    TurnLimits,
+    /// `PUT /v1/settings/turn-limits` with the owner's chosen values.
+    SaveTurnLimits {
+        calls: usize,
+        rounds: usize,
+    },
+    /// `DELETE /v1/settings/turn-limits`: back to the config defaults.
+    ResetTurnLimits,
     TranscribeAudio {
         filename: String,
         bytes: Vec<u8>,
@@ -245,6 +271,10 @@ pub enum Operation {
     ConnectorOAuthSignIn {
         id: String,
         callback_uri: String,
+    },
+    /// Forget this account's sign-in for a connector (ElevenLabs).
+    ConnectorSignOut {
+        id: String,
     },
     /// `PUT /v1/bots/{id}`: name, description, instructions, model, profile.
     UpdateBot {
@@ -375,6 +405,10 @@ impl Operation {
             Self::SetThinking { .. } => OperationKind::Thinking,
             Self::StopTurn => OperationKind::StopTurn,
             Self::FetchArtifact { .. } => OperationKind::FetchArtifact,
+            Self::PreviewArtifact { .. } => OperationKind::PreviewArtifact,
+            Self::MediaJobs => OperationKind::MediaJobs,
+            Self::TurnLimits => OperationKind::TurnLimits,
+            Self::SaveTurnLimits { .. } | Self::ResetTurnLimits => OperationKind::TurnLimitsWrite,
             Self::TranscribeAudio { .. } => OperationKind::Transcribe,
             Self::AdminSaveProvider(_)
             | Self::AdminRemoveProvider(_)
@@ -388,6 +422,7 @@ impl Operation {
             Self::TestConnector { .. } => OperationKind::ConnectorTest,
             Self::OAuthSignIn { .. } => OperationKind::OAuthSignIn,
             Self::ConnectorOAuthSignIn { .. } => OperationKind::OAuthSignIn,
+            Self::ConnectorSignOut { .. } => OperationKind::ConnectorSignOut,
             Self::UpdateBot { .. } => OperationKind::BotSettingsWrite,
             Self::SetBotEnabled { .. } | Self::DeleteBot { .. } => OperationKind::BotLifecycle,
             Self::AdminRestart => OperationKind::AdminRestart,
@@ -461,6 +496,15 @@ pub enum Reply {
     Attached(crate::api::AttachmentInfo),
     /// Voice/OCR readiness from `GET /v1/settings/voice`.
     Voice(VoiceSettings),
+    /// The open conversation's background media jobs.
+    MediaJobs(Vec<crate::api::MediaJob>),
+    /// The owner's turn limits, after a read, a save or a reset.
+    TurnLimits(crate::api::TurnLimitsView),
+    /// A media file as a data URL, ready for an inline player.
+    Preview {
+        hash: String,
+        data_url: String,
+    },
     AdminSaved,
     ProviderKeySaved,
     DefaultRouteSaved,
@@ -679,17 +723,8 @@ fn connector_oauth_sign_in(
         oauth::wait_for_callback(&listener, &pkce.state, std::time::Duration::from_secs(180))
             .map_err(|error| ApiError::Rejected(error.to_string()))?;
     drop(listener);
+    // The server seals the tokens to this account; the card reads it back.
     client.admin_connector_oauth_complete(id, &code, &pkce.verifier, &redirect)?;
-    // The server stores the tokens but keeps its old mode: switch to the
-    // sign-in so the card shows Connected without a second click.
-    client.admin_set_connector(
-        id,
-        &crate::ConnectorUpdate {
-            enabled: true,
-            values: Default::default(),
-            auth: Some("oauth".to_owned()),
-        },
-    )?;
     Ok(Reply::OAuthSignedIn {
         id: id.to_owned(),
         device_code: None,
@@ -856,6 +891,28 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
                     bytes,
                 })
         }
+        Operation::PreviewArtifact { hash, mime } => {
+            // A type that cannot play inline is refused before any download.
+            if crate::media_view::inline_player(mime).is_none() {
+                return Err(ApiError::Validation("Only video and audio play inline."));
+            }
+            client
+                .artifact_capped(hash, crate::media_view::MAX_PREVIEW_BYTES as u64)
+                .and_then(|(_, bytes)| {
+                    crate::media_view::preview_data_url_for(mime, &bytes).map(|data_url| {
+                        Reply::Preview {
+                            hash: hash.clone(),
+                            data_url,
+                        }
+                    })
+                })
+        }
+        Operation::MediaJobs => client.media_jobs(conversation).map(Reply::MediaJobs),
+        Operation::TurnLimits => client.turn_limits().map(Reply::TurnLimits),
+        Operation::SaveTurnLimits { calls, rounds } => client
+            .set_turn_limits(*calls, *rounds)
+            .map(Reply::TurnLimits),
+        Operation::ResetTurnLimits => client.reset_turn_limits().map(Reply::TurnLimits),
         Operation::TranscribeAudio { filename, bytes } => client
             .transcribe_audio(filename, bytes)
             .map(Reply::Transcribed),
@@ -886,6 +943,9 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::ConnectorOAuthSignIn { id, callback_uri } => {
             connector_oauth_sign_in(client, id, callback_uri)
         }
+        Operation::ConnectorSignOut { id } => client
+            .admin_connector_oauth_disconnect(id)
+            .map(|_| Reply::AdminSaved),
         Operation::TestConnector { id } => {
             client.admin_test_connector(id).map(Reply::ConnectorTested)
         }

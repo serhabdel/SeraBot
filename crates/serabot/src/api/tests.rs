@@ -1062,7 +1062,7 @@ async fn new_conversation_routes_validate_identity_and_require_authentication() 
 }
 
 #[tokio::test]
-async fn connector_catalog_lists_elevenlabs_in_voice_group() {
+async fn connector_catalog_lists_both_elevenlabs_connectors_in_voice_group() {
     let (app, _, _) = app();
     let response = app
         .clone()
@@ -1071,17 +1071,30 @@ async fn connector_catalog_lists_elevenlabs_in_voice_group() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = read_json(response).await;
-    let entry = body["connectors"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|connector| connector["id"] == "elevenlabs")
-        .expect("elevenlabs listed");
-    assert_eq!(entry["kind"], "api_key");
-    assert_eq!(entry["enabled"], false);
-    assert_eq!(entry["group"], "Voice & Media");
-    assert_eq!(entry["secrets"]["api_key"]["name"], "elevenlabs_api_key");
-    assert_eq!(entry["secrets"]["api_key"]["configured"], false);
+    let find = |id: &str| {
+        body["connectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|connector| connector["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("{id} listed"))
+    };
+    // The account sign-in: per-account state, no server-wide secrets.
+    let signin = find("elevenlabs");
+    assert_eq!(signin["kind"], "oauth");
+    assert_eq!(signin["enabled"], false);
+    assert_eq!(signin["connected"], false);
+    assert_eq!(signin["group"], "Voice & Media");
+    assert!(signin.get("auth").is_none());
+    assert_eq!(signin["auth_modes"], json!(["oauth"]));
+    // The API-key connector: its own key, its own switch.
+    let key = find("elevenlabs_api_key");
+    assert_eq!(key["kind"], "api_key");
+    assert_eq!(key["enabled"], false);
+    assert_eq!(key["group"], "Voice & Media");
+    assert_eq!(key["secrets"]["api_key"]["name"], "elevenlabs_api_key");
+    assert_eq!(key["secrets"]["api_key"]["configured"], false);
 }
 
 #[tokio::test]
@@ -1113,7 +1126,13 @@ async fn connector_test_is_owner_only_and_reports_missing_secrets_without_networ
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-    for id in ["elevenlabs", "tavily", "firecrawl", "agentmail", "gmail"] {
+    for id in [
+        "elevenlabs_api_key",
+        "tavily",
+        "firecrawl",
+        "agentmail",
+        "gmail",
+    ] {
         let response = app
             .clone()
             .oneshot(request(
@@ -2847,7 +2866,7 @@ async fn providers_and_connectors_report_status_without_secret_values() {
     )
     .await;
     let list = connectors["connectors"].as_array().unwrap();
-    assert_eq!(list.len(), 16);
+    assert_eq!(list.len(), 17);
     let gmail = list
         .iter()
         .find(|connector| connector["id"] == "gmail")
@@ -3793,6 +3812,119 @@ async fn voice_settings_report_readiness_and_are_admin_writable() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// Per-turn work limits: the owner reads, sets, validates and resets their own
+/// override; a member's override is separate.
+#[tokio::test]
+async fn turn_limits_are_per_user_validated_and_resettable() {
+    let (router, _, store) = app();
+    let response = router
+        .clone()
+        .oneshot(request(
+            &router,
+            "GET",
+            "/v1/settings/turn-limits",
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["max_tool_calls_per_turn"], json!(150));
+    assert_eq!(body["max_tool_rounds"], json!(60));
+    assert_eq!(body["ceiling"]["max_tool_calls_per_turn"], json!(500));
+    assert_eq!(body["ceiling"]["max_tool_rounds"], json!(200));
+    assert_eq!(body["overridden"], json!(false));
+
+    let response = router
+        .clone()
+        .oneshot(request(
+            &router,
+            "PUT",
+            "/v1/settings/turn-limits",
+            true,
+            Some(json!({"max_tool_calls_per_turn": 40, "max_tool_rounds": 12})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["max_tool_calls_per_turn"], json!(40));
+    assert_eq!(body["max_tool_rounds"], json!(12));
+    assert_eq!(body["overridden"], json!(true));
+
+    // Above the ceiling, or zero, is refused and nothing changes.
+    for bad in [
+        json!({"max_tool_calls_per_turn": 501, "max_tool_rounds": 12}),
+        json!({"max_tool_calls_per_turn": 40, "max_tool_rounds": 0}),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(request(
+                &router,
+                "PUT",
+                "/v1/settings/turn-limits",
+                true,
+                Some(bad),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let response = router
+        .clone()
+        .oneshot(request(
+            &router,
+            "GET",
+            "/v1/settings/turn-limits",
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_json(response).await["max_tool_calls_per_turn"],
+        json!(40)
+    );
+
+    // A member sees the defaults, not the owner's override.
+    let member = store
+        .create_user("microsoft:limits-member", "l@example.example", "L")
+        .unwrap();
+    let member_token = store
+        .mint_session(&member.id, chrono::Duration::hours(1))
+        .unwrap();
+    let response = router
+        .clone()
+        .oneshot(request_with_token(
+            "GET",
+            "/v1/settings/turn-limits",
+            &member_token,
+            None,
+        ))
+        .await
+        .unwrap();
+    let body = read_json(response).await;
+    assert_eq!(body["max_tool_calls_per_turn"], json!(150));
+    assert_eq!(body["overridden"], json!(false));
+
+    // Reset drops the owner's override.
+    let response = router
+        .clone()
+        .oneshot(request(
+            &router,
+            "DELETE",
+            "/v1/settings/turn-limits",
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    let body = read_json(response).await;
+    assert_eq!(body["max_tool_calls_per_turn"], json!(150));
+    assert_eq!(body["overridden"], json!(false));
 }
 
 /// Reply mode is per conversation and per user.

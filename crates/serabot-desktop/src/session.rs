@@ -340,8 +340,6 @@ pub struct ConnectorDraft {
     pub enabled: bool,
     pub values: BTreeMap<String, String>,
     pub saving: bool,
-    /// ElevenLabs only: "api_key" or "oauth" (sent on Save connector).
-    pub auth: Option<String>,
 }
 
 impl Drop for ConnectorDraft {
@@ -2105,6 +2103,7 @@ impl Session {
             name: None,
             bot: None,
             attachments: files.clone(),
+            limit_reached: false,
         });
         if files.is_empty() {
             self.start_request(Operation::Submit(zeroize::Zeroizing::new(text)));
@@ -2114,6 +2113,77 @@ impl Session {
                 attachments: files.into_iter().map(|file| file.id).collect(),
             });
         }
+    }
+
+    /// Continue under a reply that a tool limit ended (0.24). Sends the fixed
+    /// Continue text as the owner's next message. The composer draft is left
+    /// as it is, and the same send guards as `submit` apply.
+    pub fn continue_from_limit(&mut self) {
+        if !self.state.can_send()
+            || !self.ready()
+            || self.uploading
+            || !self.upload_queue.is_empty()
+        {
+            return;
+        }
+        self.state.error = None;
+        self.state.activity.clear();
+        self.state.messages.push(Message {
+            id: format!("opt-{}", Instant::now().elapsed().as_nanos()),
+            role: Role::User,
+            content: crate::media_view::CONTINUE_TEXT.into(),
+            created_at: "Just now".into(),
+            name: None,
+            bot: None,
+            attachments: Vec::new(),
+            limit_reached: false,
+        });
+        self.start_request(Operation::Submit(zeroize::Zeroizing::new(
+            crate::media_view::CONTINUE_TEXT.into(),
+        )));
+    }
+
+    /// Read back a video or audio file for an inline player, unless it is
+    /// already here. The bytes come from the artifact route and are turned into
+    /// a data URL off the UI thread.
+    pub fn request_preview(&mut self, hash: String, mime: String) {
+        if self.state.media_previews.contains(&hash) {
+            return;
+        }
+        self.schedule(Operation::PreviewArtifact { hash, mime }, Duration::ZERO);
+    }
+
+    /// Read the owner's per-turn work limits (Settings).
+    pub fn load_turn_limits(&mut self) {
+        self.schedule(Operation::TurnLimits, Duration::ZERO);
+    }
+
+    /// Save the Settings form. Both fields must be whole numbers within the
+    /// server ceiling; a bad field is named in `turn_limits_error` and nothing
+    /// is sent.
+    pub fn save_turn_limits(&mut self, calls: &str, rounds: &str) {
+        let ceiling = match self.state.turn_limits.as_ref() {
+            Some(view) => view.ceiling,
+            None => {
+                self.state.turn_limits_error = Some("Wait for the limits to load first.".into());
+                return;
+            }
+        };
+        match crate::media_view::parse_turn_limits(calls, rounds, ceiling) {
+            Ok(limits) => {
+                self.state.turn_limits_error = None;
+                self.start_request(Operation::SaveTurnLimits {
+                    calls: limits.max_tool_calls_per_turn,
+                    rounds: limits.max_tool_rounds,
+                });
+            }
+            Err(message) => self.state.turn_limits_error = Some(message),
+        }
+    }
+
+    /// Go back to the config defaults (Settings).
+    pub fn reset_turn_limits(&mut self) {
+        self.start_request(Operation::ResetTurnLimits);
     }
 
     /// The paperclip: pick files in a native dialog (off the UI thread),
@@ -2265,6 +2335,14 @@ impl Session {
     pub fn set_local_folder_mode(&mut self, id: &str, mode: crate::local_folders::FolderMode) {
         if let Some(folder) = self.local_folders.iter_mut().find(|folder| folder.id == id) {
             folder.mode = mode;
+        }
+        self.persist_local_folders();
+    }
+
+    /// Which bots may use a folder. The server applies it on the next poll.
+    pub fn set_local_folder_bots(&mut self, id: &str, bots: crate::local_folders::BotScope) {
+        if let Some(folder) = self.local_folders.iter_mut().find(|folder| folder.id == id) {
+            folder.bots = bots;
         }
         self.persist_local_folders();
     }
@@ -2755,6 +2833,11 @@ impl Session {
             Operation::AvatarUpload { .. } | Operation::AvatarRemove { .. } => {
                 self.avatar_op = Some(AvatarOp::Write)
             }
+            // One read per file at a time: a request while one is in flight
+            // (or the file is cached) sends nothing.
+            Operation::PreviewArtifact { hash, .. } if !self.state.media_previews.begin(hash) => {
+                return;
+            }
             _ => {}
         }
         let job = Job {
@@ -2766,6 +2849,7 @@ impl Session {
             self.state.error = Some("Network worker unavailable. Reconnect.".into());
             self.refreshing = false;
             self.poll_paused = true;
+            self.state.media_previews.fail_in_flight();
             return;
         }
         self.pending = Some(kind);
@@ -2872,6 +2956,7 @@ impl Session {
                             | OperationKind::DefaultRoute
                             | OperationKind::ConnectorTest
                             | OperationKind::OAuthSignIn
+                            | OperationKind::ConnectorSignOut
                             | OperationKind::AdminRestart
                     ) =>
                 {
@@ -2962,7 +3047,24 @@ impl Session {
                             self.state.library_error = Some(message.clone());
                             self.state.library_loading = false;
                             self.state.error = None;
+                            self.schedule(Operation::MediaJobs, Duration::ZERO);
+                        }
+                        OperationKind::MediaJobs => {
+                            // The placeholder cards are optional; a failed read
+                            // leaves them out.
+                            self.state.error = None;
                             self.schedule(Operation::ChatPlan, Duration::ZERO);
+                        }
+                        OperationKind::PreviewArtifact => {
+                            self.state.media_previews.fail_in_flight();
+                            self.toast = Some(format!("This file cannot play here: {message}"));
+                        }
+                        OperationKind::TurnLimits => {
+                            self.state.turn_limits_error = Some(message.clone());
+                        }
+                        OperationKind::TurnLimitsWrite => {
+                            self.state.turn_limits_error = Some(message.clone());
+                            self.toast = Some(format!("Work limits were not saved: {message}"));
                         }
                         OperationKind::ChatPlan => {
                             // The plan panel is optional; a failed read leaves
@@ -3338,6 +3440,9 @@ impl Session {
                         }
                         // The plan and auto-approve switch load after the library.
                         OperationKind::Library => {
+                            self.schedule(Operation::MediaJobs, Duration::ZERO);
+                        }
+                        OperationKind::MediaJobs => {
                             self.schedule(Operation::ChatPlan, Duration::ZERO);
                         }
                         OperationKind::OAuthSignIn => {
@@ -3378,6 +3483,12 @@ impl Session {
                             self.admin_error = None;
                             self.admin_notice = None;
                             self.connector_testing = None;
+                        }
+                        OperationKind::ConnectorSignOut => {
+                            self.admin_error = None;
+                            self.admin_notice = Some("Signed out for this account.".into());
+                            self.state.connectors_loaded = false;
+                            self.schedule(Operation::Connectors, Duration::ZERO);
                         }
                         OperationKind::ProviderKey => {
                             for value in self.provider_key_drafts.values_mut() {
@@ -3684,31 +3795,16 @@ impl Session {
         self.save_connector(id);
     }
 
-    /// Sign-in connector (ElevenLabs): use the pasted API key instead of the
-    /// account sign-in. Turns the connector on and switches the mode.
-    pub fn use_api_key_instead(&mut self, id: String) {
-        let draft = self.connector_drafts.entry(id.clone()).or_default();
-        draft.enabled = true;
-        draft.auth = Some("api_key".to_owned());
-        self.save_connector(id);
-    }
-
-    /// Sign-in connector: stop using the account sign-in. The server keeps
-    /// whatever it stored; the mode switch is what ends use of it.
+    /// Sign-in connector (ElevenLabs): forget this account's sign-in on the
+    /// server. Tool calls fail until the account signs in again.
     pub fn sign_out_connector(&mut self, id: String) {
-        let enabled = self
-            .state
-            .connectors
-            .iter()
-            .find(|connector| connector.id == id)
-            .map(|connector| connector.enabled);
-        let draft = self.connector_drafts.entry(id.clone()).or_default();
-        if let Some(enabled) = enabled {
-            draft.enabled = enabled;
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
         }
-        draft.auth = Some("api_key".to_owned());
-        draft.values.clear();
-        self.save_connector(id);
+        self.admin_error = None;
+        self.admin_notice = None;
+        self.start_request(Operation::ConnectorSignOut { id });
     }
 
     pub fn can_admin(&self) -> bool {
@@ -3878,7 +3974,6 @@ impl Session {
             return;
         };
         let enabled = draft.enabled;
-        let auth = draft.auth.clone();
         let values = draft
             .values
             .iter()
@@ -3897,17 +3992,8 @@ impl Session {
         }
         self.start_request(Operation::AdminSetConnector {
             id,
-            update: ConnectorUpdate {
-                enabled,
-                values,
-                auth,
-            },
+            update: ConnectorUpdate { enabled, values },
         });
-    }
-
-    pub fn set_connector_auth(&mut self, id: &str, auth: String) {
-        let draft = self.connector_drafts.entry(id.to_owned()).or_default();
-        draft.auth = Some(auth);
     }
 
     /// Browser sign-in for a connector with OAuth support (ElevenLabs).
@@ -4024,9 +4110,6 @@ impl Session {
                 .entry(connector.id.clone())
                 .or_default();
             draft.enabled = connector.enabled;
-            // The server's mode wins: sign-in and sign-out change it outside
-            // the draft, and a stale draft must not hide the real state.
-            draft.auth = connector.auth.clone();
         }
         self.connector_drafts.retain(|id, _| seen.contains(id));
     }

@@ -60,7 +60,8 @@ model = "mistral-large-latest"
 api_key_secret = "llm_api_key"
 timeout_secs = 120
 # Tool rounds: runtime.max_tool_iterations and llm.max_tool_rounds; loop uses the higher value.
-max_tool_rounds = 10
+# Owners can override both in Settings; the server ceiling is 200 rounds and 500 calls.
+max_tool_rounds = 60
 # Provider may advertise 1M+ context; SeraBot forwards max_tokens only (no local input cap).
 max_output_tokens = 32768
 # Set true only after you accept that selected prompt/document passages leave this host.
@@ -183,7 +184,15 @@ morning_brief_enabled = true
 silent_when_empty = false
 
 [elevenlabs]
-enabled = false
+# Two independent connectors (see docs/elevenlabs.md):
+# - "ElevenLabs": each account signs in with its own ElevenLabs account. The
+#   hosted MCP server exposes the whole catalog; this is the recommended one.
+# - "ElevenLabs API key": the owner's API key, legacy native elevenlabs_key_* tools.
+mcp_enabled = false
+# Request timeouts for the MCP tools: list, search and read calls, and calls
+# that generate media or spend credits.
+mcp_timeout_secs = 60
+mcp_generate_timeout_secs = 300
 api_base = "https://api.elevenlabs.io"
 api_key_secret = "elevenlabs_api_key"
 timeout_secs = 120
@@ -196,6 +205,11 @@ video_model = "bytedance-seedance-v2-mini"
 max_tts_chars = 5000
 poll_interval_ms = 2000
 poll_max_attempts = 60
+
+[elevenlabs.api_key]
+# The "ElevenLabs API key" connector. Its tools register at startup when this is
+# true and the key is stored in the server secret store.
+enabled = false
 
 [onedrive]
 # Availability + defaults. Each account connects its own drive from the
@@ -237,8 +251,9 @@ max_pages = 30
 
 [runtime]
 max_concurrent_turns = 2
-max_tool_calls_per_turn = 12
-max_tool_iterations = 10
+# Per-turn caps. Owners can override them in Settings (ceiling: 500 calls, 200 rounds).
+max_tool_calls_per_turn = 150
+max_tool_iterations = 60
 task_lease_secs = 300
 worker_poll_ms = 500
 history_limit = 50

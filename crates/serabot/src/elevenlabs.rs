@@ -1,9 +1,12 @@
-//! Native ElevenLabs client and gateway tools (TTS, STT, sound effects, image/video flows).
+//! ElevenLabs REST client and the native `elevenlabs_key_*` gateway tools
+//! (TTS, STT, sound effects, image/video flows) of the "ElevenLabs API key"
+//! connector.
 //!
-//! Outbound calls use the configured HTTPS API base and authenticate with
-//! either the age-stored API key (`xi-api-key` header) or an OAuth bearer
-//! token from an ElevenLabs sign-in. The REST API rejects requests that carry
-//! both headers, so exactly one mode is used per client.
+//! Outbound calls use the configured HTTPS API base and the owner's API key
+//! from the age store (`xi-api-key` header). These tools are registered only
+//! when that connector is enabled. The account sign-in ("ElevenLabs"
+//! connector) does not use this client: it goes through the hosted MCP server
+//! in `elevenlabs_mcp`, and the OAuth sign-in helpers in this module serve it.
 //! Media generation tools require owner approval via the gateway.
 
 use std::path::Path;
@@ -11,8 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{Duration as ChronoDuration, Utc};
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use chrono::Utc;
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::multipart::{Form, Part};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -25,14 +28,22 @@ use crate::error::{Result, SeraError};
 use crate::gateway::{ApprovalDetails, Tool, ToolContext, ToolOutput, ToolRegistry, ToolSpec};
 use crate::llm::validate_base_url;
 use crate::maker::{ArtifactMeta, ArtifactStore};
+use crate::media_jobs::{
+    MediaArtifact, MediaKind, MediaPoller, PollResult, read_capped, register_media_poller,
+};
 use crate::policy::Policy;
-use crate::secrets::SharedSecrets;
+use crate::secrets::CredentialWriter;
+use crate::store::Store;
 use crate::util::truncate_chars;
 
 pub(crate) const MAX_FLOW_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
 const MAX_SOUND_PROMPT_CHARS: usize = 500;
 const MAX_IMAGE_PROMPT_CHARS: usize = 4_000;
 const MAX_VIDEO_PROMPT_CHARS: usize = 4_000;
+/// How long a generation tool waits in the call before its job takes over.
+const IN_CALL_WAIT: Duration = Duration::from_secs(20);
+/// The provider name of the native generation jobs, the poller's registry key.
+pub const KEY_MEDIA_PROVIDER: &str = "elevenlabs_key";
 
 // --- OAuth sign-in (CIMD public client, PKCE S256, fixed loopback redirect) ---
 //
@@ -356,36 +367,79 @@ async fn token_request(
     })
 }
 
-#[derive(Clone)]
-enum ClientAuth {
-    ApiKey(SecretString),
-    Oauth(Arc<OauthSession>),
-}
-
+/// One account's ElevenLabs sign-in: the access token is renewed from the
+/// refresh token, and a rotated refresh token goes back to the account's own
+/// sealed credential through `writer`.
 pub struct OauthSession {
     tokens: tokio::sync::Mutex<OauthTokens>,
     client_id: String,
     token_url: String,
-    refresh_secret_name: String,
-    secrets: Option<SharedSecrets>,
+    writer: Option<Arc<dyn CredentialWriter>>,
     http: reqwest::Client,
 }
 
 struct OauthTokens {
     access_token: SecretString,
-    expires_at: Option<chrono::DateTime<Utc>>,
+    /// Unix seconds; `None` means unknown, so the next use renews.
+    expires_at: Option<i64>,
     refresh_token: SecretString,
 }
 
 impl OauthSession {
+    /// A session for one stored sign-in. An empty access token or an unknown
+    /// expiry is fine: the first use refreshes. `writer` receives refreshed
+    /// tokens and their expiry.
+    pub(crate) fn new(
+        client_id: impl Into<String>,
+        token_url: &str,
+        access_token: &str,
+        refresh_token: &str,
+        expires_at: Option<i64>,
+        writer: Option<Arc<dyn CredentialWriter>>,
+    ) -> Result<Self> {
+        if refresh_token.trim().is_empty() {
+            return Err(SeraError::Config(
+                "ElevenLabs OAuth refresh token is missing".into(),
+            ));
+        }
+        let token_url = pin_oauth_endpoint(token_url, ELEVENLABS_TOKEN_URL)?.to_string();
+        Ok(Self {
+            tokens: tokio::sync::Mutex::new(OauthTokens {
+                access_token: SecretString::new(access_token.to_owned()),
+                expires_at,
+                refresh_token: SecretString::new(refresh_token.to_owned()),
+            }),
+            client_id: client_id.into(),
+            token_url,
+            writer,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|error| SeraError::External(error.to_string()))?,
+        })
+    }
+
     /// Current access token, refreshing first when missing or near expiry
-    /// (30 s skew). A rotated refresh token is persisted to the age store;
-    /// a failed write fails the call so the rotation is never lost.
+    /// (30 s skew). The refresh holds the session lock, so concurrent callers
+    /// share one refresh. A rotated refresh token is written back through the
+    /// writer; a failed write fails the call so the rotation is never lost.
     pub(crate) async fn current_access_token(&self) -> Result<SecretString> {
+        self.access(None).await
+    }
+
+    /// The server rejected `rejected`: renew it, unless another caller already
+    /// replaced it while this one waited, in which case the new token is used.
+    pub(crate) async fn renew_after_rejection(&self, rejected: &str) -> Result<SecretString> {
+        self.access(Some(rejected)).await
+    }
+
+    async fn access(&self, rejected: Option<&str>) -> Result<SecretString> {
         let mut guard = self.tokens.lock().await;
-        let stale = match guard.expires_at {
-            Some(at) => at <= Utc::now() + ChronoDuration::seconds(30),
-            None => true,
+        let stale = match (rejected, guard.expires_at) {
+            (Some(rejected), _) => guard.access_token.expose_secret() == rejected,
+            (None, Some(at)) => at <= Utc::now().timestamp() + 30,
+            (None, None) => true,
         };
         if stale {
             let pair = refresh_grant_at(
@@ -398,36 +452,39 @@ impl OauthSession {
             .map_err(|error| {
                 SeraError::External(format!("ElevenLabs token refresh failed: {error}"))
             })?;
-            if let Some(refresh) = &pair.refresh_token {
-                if let Some(secrets) = &self.secrets {
-                    secrets
-                        .persist(&[(self.refresh_secret_name.as_str(), refresh.as_str())])
-                        .map_err(|error| {
-                            SeraError::External(format!(
-                                "rotated ElevenLabs refresh token was not persisted: {error}"
-                            ))
-                        })?;
-                }
-                guard.refresh_token = SecretString::new(refresh.clone());
+            let expires_at = pair
+                .expires_in
+                .map(|seconds| Utc::now().timestamp() + seconds.min(86_400 * 7) as i64);
+            if let Some(writer) = &self.writer {
+                writer
+                    .persist_refresh(
+                        pair.refresh_token.as_deref(),
+                        pair.access_token.as_str(),
+                        expires_at,
+                    )
+                    .map_err(|error| {
+                        SeraError::External(format!(
+                            "refreshed ElevenLabs token was not persisted: {error}"
+                        ))
+                    })?;
             }
-            guard.expires_at = pair.expires_in.map(|seconds| {
-                Utc::now() + ChronoDuration::seconds(seconds.min(86_400 * 7) as i64)
-            });
+            if let Some(refresh) = pair.refresh_token {
+                guard.refresh_token = SecretString::new(refresh);
+            }
+            guard.expires_at = expires_at;
             guard.access_token = SecretString::new(pair.access_token);
         }
         Ok(guard.access_token.clone())
     }
-
-    pub(crate) async fn invalidate(&self) {
-        self.tokens.lock().await.expires_at = None;
-    }
 }
 
+/// The API-key connector's REST client (`xi-api-key`). The account sign-in
+/// does not use this client: it goes through the hosted MCP server.
 #[derive(Clone)]
 pub struct ElevenLabsClient {
     http: reqwest::Client,
     base_url: String,
-    auth: ClientAuth,
+    api_key: SecretString,
 }
 
 impl std::fmt::Debug for ElevenLabsClient {
@@ -448,83 +505,6 @@ impl ElevenLabsClient {
         if api_key.trim().is_empty() {
             return Err(SeraError::Config("ElevenLabs credential is missing".into()));
         }
-        Self::with_auth(
-            base_url,
-            ClientAuth::ApiKey(SecretString::new(api_key)),
-            timeout_secs,
-        )
-    }
-
-    /// OAuth mode: the stored access token may already be expired, so the
-    /// first request refreshes it.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_oauth(
-        base_url: impl Into<String>,
-        access_token: impl Into<String>,
-        refresh_token: impl Into<String>,
-        client_id: impl Into<String>,
-        refresh_secret_name: impl Into<String>,
-        secrets: Option<SharedSecrets>,
-        timeout_secs: u64,
-    ) -> Result<Self> {
-        let access_token = access_token.into();
-        let refresh_token = refresh_token.into();
-        if access_token.trim().is_empty() || refresh_token.trim().is_empty() {
-            return Err(SeraError::Config(
-                "ElevenLabs OAuth tokens are missing".into(),
-            ));
-        }
-        Self::new_oauth_at(
-            base_url,
-            access_token,
-            refresh_token,
-            client_id,
-            ELEVENLABS_TOKEN_URL,
-            refresh_secret_name,
-            secrets,
-            timeout_secs,
-        )
-    }
-
-    /// `new_oauth` against an explicit token URL (loopback in tests).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_oauth_at(
-        base_url: impl Into<String>,
-        access_token: impl Into<String>,
-        refresh_token: impl Into<String>,
-        client_id: impl Into<String>,
-        token_url: &str,
-        refresh_secret_name: impl Into<String>,
-        secrets: Option<SharedSecrets>,
-        timeout_secs: u64,
-    ) -> Result<Self> {
-        let access_token = access_token.into();
-        let refresh_token = refresh_token.into();
-        if access_token.trim().is_empty() || refresh_token.trim().is_empty() {
-            return Err(SeraError::Config(
-                "ElevenLabs OAuth tokens are missing".into(),
-            ));
-        }
-        let session = OauthSession {
-            tokens: tokio::sync::Mutex::new(OauthTokens {
-                access_token: SecretString::new(access_token),
-                expires_at: None,
-                refresh_token: SecretString::new(refresh_token),
-            }),
-            client_id: client_id.into(),
-            token_url: token_url.to_owned(),
-            refresh_secret_name: refresh_secret_name.into(),
-            secrets,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(|error| SeraError::External(error.to_string()))?,
-        };
-        Self::with_auth(base_url, ClientAuth::Oauth(Arc::new(session)), timeout_secs)
-    }
-
-    fn with_auth(base_url: impl Into<String>, auth: ClientAuth, timeout_secs: u64) -> Result<Self> {
         let base_url = validate_base_url(&base_url.into())?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs.max(1)))
@@ -534,63 +514,25 @@ impl ElevenLabsClient {
         Ok(Self {
             http,
             base_url,
-            auth,
+            api_key: SecretString::new(api_key),
         })
     }
 
-    /// The OAuth session behind this client, when signed in with OAuth.
-    pub fn oauth_session(&self) -> Option<Arc<OauthSession>> {
-        match &self.auth {
-            ClientAuth::Oauth(session) => Some(session.clone()),
-            ClientAuth::ApiKey(_) => None,
-        }
-    }
-
-    async fn auth_headers(&self) -> Result<HeaderMap> {
-        let mut headers = HeaderMap::new();
-        match &self.auth {
-            ClientAuth::ApiKey(key) => {
-                headers.insert(
-                    "xi-api-key",
-                    HeaderValue::from_str(key.expose_secret())
-                        .map_err(|_| SeraError::Config("invalid ElevenLabs API key".into()))?,
-                );
-            }
-            ClientAuth::Oauth(session) => {
-                let token = session.current_access_token().await?;
-                headers.insert(
-                    AUTHORIZATION,
-                    HeaderValue::from_str(&format!("Bearer {}", token.expose_secret()))
-                        .map_err(|_| SeraError::Config("invalid ElevenLabs access token".into()))?,
-                );
-            }
-        }
-        Ok(headers)
-    }
-
-    /// Send a request with the current credential. On a 401 in OAuth mode the
-    /// access token is refreshed once and the request retried once. The REST
-    /// API rejects requests carrying both auth headers, so only one is set.
+    /// Send a request with the `xi-api-key` header.
     async fn send(
         &self,
-        build: impl Fn(HeaderMap) -> Result<reqwest::RequestBuilder> + Clone,
+        build: impl Fn(HeaderMap) -> Result<reqwest::RequestBuilder>,
     ) -> Result<reqwest::Response> {
-        let response = build(self.auth_headers().await?)?
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "xi-api-key",
+            HeaderValue::from_str(self.api_key.expose_secret())
+                .map_err(|_| SeraError::Config("invalid ElevenLabs API key".into()))?,
+        );
+        build(headers)?
             .send()
             .await
-            .map_err(|error| SeraError::External(format!("ElevenLabs request failed: {error}")))?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED
-            && let ClientAuth::Oauth(session) = &self.auth
-        {
-            session.invalidate().await;
-            return build(self.auth_headers().await?)?
-                .send()
-                .await
-                .map_err(|error| {
-                    SeraError::External(format!("ElevenLabs request failed: {error}"))
-                });
-        }
-        Ok(response)
+            .map_err(|error| SeraError::External(format!("ElevenLabs request failed: {error}")))
     }
 
     pub async fn list_voices(&self, page_size: u32, search: Option<&str>) -> Result<Value> {
@@ -729,16 +671,6 @@ impl ElevenLabsClient {
         self.post_flow("/v1/flows/video", &body).await
     }
 
-    pub async fn get_image_generation(&self, generation_id: &str) -> Result<Value> {
-        self.get_flow(&format!("/v1/flows/image/{generation_id}"))
-            .await
-    }
-
-    pub async fn get_video_generation(&self, generation_id: &str) -> Result<Value> {
-        self.get_flow(&format!("/v1/flows/video/{generation_id}"))
-            .await
-    }
-
     async fn post_flow(&self, path: &str, body: &Value) -> Result<FlowCreateResponse> {
         let response = self
             .send(|headers| {
@@ -775,64 +707,76 @@ impl ElevenLabsClient {
         read_json_response(response, &format!("flow status {path}")).await
     }
 
-    pub async fn poll_flow<F>(
+    /// One look at a flow generation. A finished one is downloaded; a failed one
+    /// gives the provider's message, or the plan message when the plan is the cause.
+    pub(crate) async fn flow_state(
         &self,
-        mut fetch: F,
-        poll_interval: Duration,
-        max_attempts: u32,
-    ) -> Result<CompletedFlow>
-    where
-        F: FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send>>,
-    {
-        for attempt in 0..max_attempts.max(1) {
-            let value = fetch().await?;
-            match value.get("status").and_then(Value::as_str) {
-                Some("completed") => {
-                    let content_url = value
-                        .get("content_url")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| {
-                            SeraError::External("completed flow missing content_url".into())
-                        })?;
-                    let mime = value
-                        .get("content_mime_type")
-                        .and_then(Value::as_str)
-                        .unwrap_or("application/octet-stream")
-                        .to_owned();
-                    let bytes = self.download_signed_url(content_url).await?;
-                    return Ok(CompletedFlow {
-                        id: value
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        content_mime_type: mime,
-                        bytes,
-                    });
-                }
-                Some("failed") => {
-                    let message = value
-                        .get("error_message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("generation failed");
-                    if let Some(plan) = plan_error_message(None, message) {
-                        return Err(SeraError::External(plan.into()));
-                    }
-                    return Err(SeraError::External(format!(
-                        "ElevenLabs generation failed: {message}"
-                    )));
-                }
-                _ if attempt + 1 >= max_attempts.max(1) => {
-                    return Err(SeraError::External(
-                        "ElevenLabs generation timed out while polling".into(),
-                    ));
-                }
-                _ => tokio::time::sleep(poll_interval).await,
-            }
+        kind: FlowKind,
+        generation_id: &str,
+    ) -> Result<FlowState> {
+        // The id becomes a URL path segment, so only a plain id is looked up.
+        if !valid_generation_id(generation_id) {
+            return Ok(FlowState::Failed(
+                "ElevenLabs returned a generation id that cannot be looked up".into(),
+            ));
         }
-        Err(SeraError::External(
-            "ElevenLabs generation polling exhausted".into(),
-        ))
+        let value = self
+            .get_flow(&format!("{}/{generation_id}", kind.path()))
+            .await?;
+        match value.get("status").and_then(Value::as_str) {
+            Some("completed") => {
+                let Some(content_url) = value.get("content_url").and_then(Value::as_str) else {
+                    return Ok(FlowState::Failed(
+                        "ElevenLabs finished the generation without a file".into(),
+                    ));
+                };
+                let mime = value
+                    .get("content_mime_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("application/octet-stream")
+                    .to_owned();
+                let bytes = self.download_signed_url(content_url).await?;
+                Ok(FlowState::Completed(CompletedFlow {
+                    id: generation_id.to_owned(),
+                    content_mime_type: mime,
+                    bytes,
+                }))
+            }
+            Some("failed") => {
+                let message = value
+                    .get("error_message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("generation failed");
+                Ok(FlowState::Failed(match plan_error_message(None, message) {
+                    Some(plan) => plan.to_owned(),
+                    None => format!("ElevenLabs generation failed: {message}"),
+                }))
+            }
+            _ => Ok(FlowState::Pending),
+        }
+    }
+
+    /// Check a generation until it finishes, fails, or `within` has passed. A
+    /// generation still rendering at the end is `Pending`, not an error.
+    pub(crate) async fn wait_flow(
+        &self,
+        kind: FlowKind,
+        generation_id: &str,
+        within: Duration,
+        interval: Duration,
+    ) -> Result<FlowState> {
+        let started = std::time::Instant::now();
+        loop {
+            let state = self.flow_state(kind, generation_id).await?;
+            if !matches!(state, FlowState::Pending) {
+                return Ok(state);
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= within {
+                return Ok(FlowState::Pending);
+            }
+            tokio::time::sleep(interval.min(within - elapsed)).await;
+        }
     }
 
     async fn download_signed_url(&self, url: &str) -> Result<Vec<u8>> {
@@ -857,21 +801,7 @@ impl ElevenLabsClient {
                 response.status()
             )));
         }
-        let mut body = Vec::new();
-        let mut stream = response.bytes_stream();
-        use futures::StreamExt;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| {
-                SeraError::External(format!("media download read failed: {error}"))
-            })?;
-            if body.len() + chunk.len() > MAX_FLOW_DOWNLOAD_BYTES {
-                return Err(SeraError::Validation(
-                    "generated media exceeds size limit".into(),
-                ));
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(body)
+        read_capped(response, MAX_FLOW_DOWNLOAD_BYTES).await
     }
 }
 
@@ -888,6 +818,80 @@ pub struct CompletedFlow {
     pub bytes: Vec<u8>,
 }
 
+/// The two flows that render files: the native generation tools use them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlowKind {
+    Image,
+    Video,
+}
+
+impl FlowKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Video => "video",
+        }
+    }
+
+    fn path(self) -> &'static str {
+        match self {
+            Self::Image => "/v1/flows/image",
+            Self::Video => "/v1/flows/video",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Image => "ElevenLabs image",
+            Self::Video => "ElevenLabs video",
+        }
+    }
+
+    fn media_kind(self) -> MediaKind {
+        match self {
+            Self::Image => MediaKind::Image,
+            Self::Video => MediaKind::Video,
+        }
+    }
+
+    /// The media job's external id: `image:<generation id>` or `video:<...>`.
+    /// The kind is part of it, because the poller gets no other hint. `None`
+    /// when the id is not one this job can carry.
+    fn external_id(self, generation_id: &str) -> Option<String> {
+        valid_generation_id(generation_id).then(|| format!("{}:{generation_id}", self.label()))
+    }
+
+    /// Split a job's external id back into its kind and generation id.
+    fn parse_external(external_id: &str) -> Option<(Self, &str)> {
+        let (label, generation_id) = external_id.split_once(':')?;
+        let kind = match label {
+            "image" => Self::Image,
+            "video" => Self::Video,
+            _ => return None,
+        };
+        valid_generation_id(generation_id).then_some((kind, generation_id))
+    }
+}
+
+/// A generation id as ElevenLabs issues it: letters, digits, `-` and `_`, up
+/// to 128 characters. Anything else never reaches a URL path or a job row.
+pub(crate) fn valid_generation_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+/// What one look at a flow generation found.
+#[derive(Debug)]
+pub(crate) enum FlowState {
+    Pending,
+    Completed(CompletedFlow),
+    /// The message to show, already the plan message when the plan is the cause.
+    Failed(String),
+}
+
 #[derive(Clone)]
 struct ElevenLabsToolDeps {
     client: Arc<ElevenLabsClient>,
@@ -895,6 +899,11 @@ struct ElevenLabsToolDeps {
     policy: Arc<Policy>,
     app_config: Arc<Config>,
     config: ElevenLabsConfig,
+    /// Records the background job when a generation is still rendering after
+    /// the wait.
+    store: Store,
+    /// How long a generation tool waits in the call before a job takes over.
+    wait: Duration,
 }
 
 pub(crate) fn check_outbound_text(policy: &Policy, text: &str) -> Result<()> {
@@ -1105,13 +1114,23 @@ pub fn register_elevenlabs_tools(
     policy: Arc<Policy>,
     app_config: Arc<Config>,
     config: ElevenLabsConfig,
+    store: Store,
 ) -> Result<()> {
+    // The poller only looks up generations the tools hand over; it never submits.
+    register_media_poller(
+        KEY_MEDIA_PROVIDER,
+        Arc::new(ElevenLabsKeyPoller {
+            client: client.clone(),
+        }),
+    )?;
     let deps = ElevenLabsToolDeps {
         client,
         artifacts,
         policy,
         app_config,
         config,
+        store,
+        wait: IN_CALL_WAIT,
     };
     registry.register(ElevenLabsListVoicesTool { deps: deps.clone() })?;
     registry.register(ElevenLabsTextToSpeechTool { deps: deps.clone() })?;
@@ -1120,6 +1139,151 @@ pub fn register_elevenlabs_tools(
     registry.register(ElevenLabsGenerateImageTool { deps: deps.clone() })?;
     registry.register(ElevenLabsGenerateVideoTool { deps })?;
     Ok(())
+}
+
+/// Polls the generations that a native tool handed to the background loop. The
+/// external id is `image:<id>` or `video:<id>`; the poller only looks it up.
+struct ElevenLabsKeyPoller {
+    client: Arc<ElevenLabsClient>,
+}
+
+#[async_trait]
+impl MediaPoller for ElevenLabsKeyPoller {
+    async fn poll(&self, _user_id: &str, external_id: &str) -> Result<PollResult> {
+        let Some((kind, generation_id)) = FlowKind::parse_external(external_id) else {
+            return Ok(PollResult::Failed(
+                "the job has no valid generation id".into(),
+            ));
+        };
+        Ok(match self.client.flow_state(kind, generation_id).await? {
+            FlowState::Pending => PollResult::Pending,
+            FlowState::Failed(message) => PollResult::Failed(message),
+            FlowState::Completed(done) => PollResult::Done(MediaArtifact {
+                filename: format!(
+                    "elevenlabs-{}.{}",
+                    kind.label(),
+                    extension_for_mime(&done.content_mime_type)
+                ),
+                title: Some(kind.title().to_owned()),
+                bytes: done.bytes,
+            }),
+        })
+    }
+}
+
+/// The result of a generation tool once its generation was submitted. A file
+/// that is ready in the wait is stored and returned as before. Otherwise a job
+/// takes over and the tool says so, so the bot ends its turn and does not submit
+/// the request again. A submission is never repeated here.
+async fn deliver_flow(
+    deps: &ElevenLabsToolDeps,
+    kind: FlowKind,
+    generation_id: &str,
+    filename: Option<&str>,
+    context: &ToolContext,
+) -> Result<ToolOutput> {
+    let interval = Duration::from_millis(deps.config.poll_interval_ms.max(500));
+    // The configured attempts bound the wait too, so a short budget stays short.
+    let budget = interval.saturating_mul(deps.config.poll_max_attempts.max(1));
+    let state = match deps
+        .client
+        .wait_flow(kind, generation_id, deps.wait.min(budget), interval)
+        .await
+    {
+        Ok(state) => state,
+        // A transient error after a submission still leaves the generation running:
+        // the job's poller keeps looking, so it is handed over rather than reported.
+        Err(error) => {
+            tracing::warn!(%error, "a generation check failed in the call; handing it to a job");
+            FlowState::Pending
+        }
+    };
+    let completed = match state {
+        FlowState::Completed(done) => done,
+        FlowState::Failed(message) => return Err(SeraError::External(message)),
+        FlowState::Pending => return hand_off_flow(deps, kind, generation_id, context),
+    };
+    let ext = extension_for_mime(&completed.content_mime_type);
+    let filename = filename
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("elevenlabs-{}.{ext}", kind.label()));
+    let (hash, filename) =
+        store_media_artifact(&deps.artifacts, &completed.bytes, &filename, kind.title())?;
+    Ok(ToolOutput {
+        content: format!(
+            "{} generation {generation_id} completed. artifact_hash={hash} filename={filename}",
+            kind.label()
+        ),
+        data: Some(json!({
+            "generation_id": generation_id,
+            "artifact_hash": hash,
+            "filename": filename,
+            "content_mime_type": completed.content_mime_type,
+        })),
+        artifact_path: Some(format!("artifacts/{filename}")),
+        artifact_hash: Some(hash),
+        filename: Some(filename),
+        destination: Some(format!("elevenlabs:flows:{}", kind.label())),
+    })
+}
+
+/// Record a job for a generation that is still rendering. If the job cannot be
+/// recorded, the reply still names the generation and forbids a new submission:
+/// the provider has accepted the work, so a retry would spend credits twice.
+fn hand_off_flow(
+    deps: &ElevenLabsToolDeps,
+    kind: FlowKind,
+    generation_id: &str,
+    context: &ToolContext,
+) -> Result<ToolOutput> {
+    let label = kind.label();
+    let job = match (
+        context.conversation_id.as_deref(),
+        kind.external_id(generation_id),
+    ) {
+        (Some(conversation_id), Some(external_id)) => match deps.store.create_media_job(
+            &context.user_id,
+            conversation_id,
+            &context.bot,
+            KEY_MEDIA_PROVIDER,
+            kind.media_kind(),
+            &external_id,
+        ) {
+            Ok(job) => Some(job.id),
+            Err(error) => {
+                tracing::warn!(%error, "could not record a media job for a generation still rendering");
+                None
+            }
+        },
+        _ => None,
+    };
+    let (status, note) = match &job {
+        Some(_) => (
+            "generating",
+            format!(
+                "The {label} is being generated; it will appear in this chat when ready. Do not submit it again."
+            ),
+        ),
+        None => (
+            "pending",
+            format!(
+                "The {label} is still rendering and could not be followed in this chat. Do not submit it again; tell the owner the generation id."
+            ),
+        ),
+    };
+    let payload = json!({
+        "status": status,
+        "job_id": job,
+        "kind": label,
+        "generation_id": generation_id,
+        "note": note,
+    });
+    Ok(ToolOutput {
+        content: payload.to_string(),
+        data: Some(payload),
+        destination: Some(format!("elevenlabs:flows:{label}")),
+        ..ToolOutput::default()
+    })
 }
 
 #[derive(Clone)]
@@ -1131,7 +1295,7 @@ struct ElevenLabsListVoicesTool {
 impl Tool for ElevenLabsListVoicesTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "elevenlabs_list_voices".into(),
+            name: "elevenlabs_key_list_voices".into(),
             description:
                 "List ElevenLabs voices available to the workspace (search and pagination). \
                  Returns untrusted metadata only; does not spend generation credits."
@@ -1170,7 +1334,7 @@ struct ElevenLabsTextToSpeechTool {
 impl Tool for ElevenLabsTextToSpeechTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "elevenlabs_text_to_speech".into(),
+            name: "elevenlabs_key_text_to_speech".into(),
             description:
                 "Generate speech audio from text with ElevenLabs and store it as a local artifact."
                     .into(),
@@ -1274,7 +1438,7 @@ struct ElevenLabsSoundEffectTool {
 impl Tool for ElevenLabsSoundEffectTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "elevenlabs_sound_effect".into(),
+            name: "elevenlabs_key_sound_effect".into(),
             description: "Generate a sound effect from a text prompt with ElevenLabs.".into(),
             parameters: json!({
                 "type": "object",
@@ -1354,7 +1518,7 @@ struct ElevenLabsTranscribeTool {
 impl Tool for ElevenLabsTranscribeTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "elevenlabs_transcribe".into(),
+            name: "elevenlabs_key_transcribe".into(),
             description:
                 "Transcribe audio from a local artifact hash or a path relative to the document inbox."
                     .into(),
@@ -1399,7 +1563,8 @@ impl Tool for ElevenLabsTranscribeTool {
                 let artifact = self.deps.artifacts.load(hash)?;
                 (artifact.bytes, artifact.filename)
             } else if let Some(path) = args.get("path").and_then(Value::as_str) {
-                let resolved = resolve_inbox_audio(self.deps.app_config.as_ref(), path)?;
+                let resolved =
+                    resolve_inbox_audio(self.deps.app_config.as_ref(), &_context.user_id, path)?;
                 let bytes = std::fs::read(&resolved)?;
                 let filename = resolved
                     .file_name()
@@ -1445,10 +1610,13 @@ struct ElevenLabsGenerateImageTool {
 impl Tool for ElevenLabsGenerateImageTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "elevenlabs_generate_image".into(),
-            description:
-                "Generate an image with ElevenLabs Image & Video flows, poll until complete, and store the result."
-                    .into(),
+            name: "elevenlabs_key_generate_image".into(),
+            description: "Generate an image with ElevenLabs Image & Video flows and store the \
+                          result. Usually the file is returned at once. If it is still rendering, \
+                          the reply has status \"generating\" and a job_id: tell the owner it is \
+                          being generated and end your turn; it appears in this chat when ready. \
+                          Never submit the same request again."
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1477,7 +1645,7 @@ impl Tool for ElevenLabsGenerateImageTool {
         })
     }
 
-    async fn execute(&self, args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
         let prompt = args
             .get("prompt")
             .and_then(Value::as_str)
@@ -1494,56 +1662,20 @@ impl Tool for ElevenLabsGenerateImageTool {
             .get("aspect_ratio")
             .and_then(Value::as_str)
             .unwrap_or("16:9");
+        // Submitted once. From here on the generation is never submitted again.
         let created = self
             .deps
             .client
             .create_image(model_id, prompt, aspect_ratio)
             .await?;
-        let generation_id = created.id.clone();
-        let generation_id_log = generation_id.clone();
-        let client = self.deps.client.clone();
-        let poll_interval = Duration::from_millis(self.deps.config.poll_interval_ms.max(500));
-        let max_attempts = self.deps.config.poll_max_attempts;
-        let completed = self
-            .deps
-            .client
-            .poll_flow(
-                move || {
-                    let client = client.clone();
-                    let id = generation_id.clone();
-                    Box::pin(async move { client.get_image_generation(&id).await })
-                },
-                poll_interval,
-                max_attempts,
-            )
-            .await?;
-        let ext = extension_for_mime(&completed.content_mime_type);
-        let filename = args
-            .get("filename")
-            .and_then(Value::as_str)
-            .map(|value| value.to_owned())
-            .unwrap_or_else(|| format!("elevenlabs-image.{ext}"));
-        let (hash, filename) = store_media_artifact(
-            &self.deps.artifacts,
-            &completed.bytes,
-            &filename,
-            "ElevenLabs image",
-        )?;
-        Ok(ToolOutput {
-            content: format!(
-                "Image generation {generation_id_log} completed. artifact_hash={hash} filename={filename}"
-            ),
-            data: Some(json!({
-                "generation_id": generation_id_log,
-                "artifact_hash": hash,
-                "filename": filename,
-                "content_mime_type": completed.content_mime_type,
-            })),
-            artifact_path: Some(format!("artifacts/{filename}")),
-            artifact_hash: Some(hash),
-            filename: Some(filename),
-            destination: Some("elevenlabs:flows:image".into()),
-        })
+        deliver_flow(
+            &self.deps,
+            FlowKind::Image,
+            &created.id,
+            args.get("filename").and_then(Value::as_str),
+            context,
+        )
+        .await
     }
 }
 
@@ -1556,9 +1688,13 @@ struct ElevenLabsGenerateVideoTool {
 impl Tool for ElevenLabsGenerateVideoTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "elevenlabs_generate_video".into(),
+            name: "elevenlabs_key_generate_video".into(),
             description:
-                "Generate a short video with ElevenLabs Image & Video flows, poll until complete, and store the result."
+                "Generate a short video with ElevenLabs Image & Video flows and store the \
+                          result. Usually the file is returned at once. If it is still rendering, \
+                          the reply has status \"generating\" and a job_id: tell the owner it is \
+                          being generated and end your turn; it appears in this chat when ready. \
+                          Never submit the same request again."
                     .into(),
             parameters: json!({
                 "type": "object",
@@ -1589,7 +1725,7 @@ impl Tool for ElevenLabsGenerateVideoTool {
         })
     }
 
-    async fn execute(&self, args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
         let prompt = args
             .get("prompt")
             .and_then(Value::as_str)
@@ -1610,62 +1746,27 @@ impl Tool for ElevenLabsGenerateVideoTool {
             .get("duration_secs")
             .and_then(Value::as_u64)
             .unwrap_or(5) as u32;
+        // Submitted once. From here on the generation is never submitted again.
         let created = self
             .deps
             .client
             .create_video(model_id, prompt, aspect_ratio, duration_secs)
             .await?;
-        let generation_id = created.id.clone();
-        let generation_id_log = generation_id.clone();
-        let client = self.deps.client.clone();
-        let poll_interval = Duration::from_millis(self.deps.config.poll_interval_ms.max(500));
-        let max_attempts = self.deps.config.poll_max_attempts;
-        let completed = self
-            .deps
-            .client
-            .poll_flow(
-                move || {
-                    let client = client.clone();
-                    let id = generation_id.clone();
-                    Box::pin(async move { client.get_video_generation(&id).await })
-                },
-                poll_interval,
-                max_attempts,
-            )
-            .await?;
-        let ext = extension_for_mime(&completed.content_mime_type);
-        let filename = args
-            .get("filename")
-            .and_then(Value::as_str)
-            .map(|value| value.to_owned())
-            .unwrap_or_else(|| format!("elevenlabs-video.{ext}"));
-        let (hash, filename) = store_media_artifact(
-            &self.deps.artifacts,
-            &completed.bytes,
-            &filename,
-            "ElevenLabs video",
-        )?;
-        Ok(ToolOutput {
-            content: format!(
-                "Video generation {generation_id_log} completed. artifact_hash={hash} filename={filename}"
-            ),
-            data: Some(json!({
-                "generation_id": generation_id_log,
-                "artifact_hash": hash,
-                "filename": filename,
-                "content_mime_type": completed.content_mime_type,
-            })),
-            artifact_path: Some(format!("artifacts/{filename}")),
-            artifact_hash: Some(hash),
-            filename: Some(filename),
-            destination: Some("elevenlabs:flows:video".into()),
-        })
+        deliver_flow(
+            &self.deps,
+            FlowKind::Video,
+            &created.id,
+            args.get("filename").and_then(Value::as_str),
+            context,
+        )
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media_jobs::MediaJobStatus;
     use wiremock::matchers::{body_string_contains, header, method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1785,8 +1886,21 @@ mod tests {
         assert!(!text.contains("vvvv"));
     }
 
+    #[derive(Default)]
+    struct RecordingWriter(std::sync::Mutex<Vec<(String, Option<String>)>>);
+
+    impl CredentialWriter for RecordingWriter {
+        fn persist_rotation(&self, refresh: &str, access: Option<&str>) -> Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((refresh.to_owned(), access.map(str::to_owned)));
+            Ok(())
+        }
+    }
+
     #[tokio::test]
-    async fn oauth_client_refreshes_stale_token_and_sends_bearer_only() {
+    async fn oauth_session_refreshes_once_and_writes_back_the_rotation() {
         let as_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/token"))
@@ -1798,26 +1912,76 @@ mod tests {
             })))
             .mount(&as_server)
             .await;
-        let api = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v2/voices"))
-            .and(header("authorization", "Bearer fresh-access"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"voices": []})))
-            .mount(&api)
-            .await;
-        let client = ElevenLabsClient::new_oauth_at(
-            api.uri(),
-            "stale-access",
-            "old-refresh",
+        let writer = Arc::new(RecordingWriter::default());
+        let session = OauthSession::new(
             cimd_client_id(),
             &format!("{}/token", as_server.uri()),
-            "elevenlabs_refresh_token",
+            "",
+            "old-refresh",
             None,
-            10,
+            Some(writer.clone()),
         )
         .unwrap();
-        let value = client.list_voices(1, None).await.unwrap();
-        assert_eq!(value["voices"], json!([]));
+        let token = session.current_access_token().await.unwrap();
+        assert_eq!(token.expose_secret(), "fresh-access");
+        // The rotated refresh token and the access token it came with.
+        assert_eq!(
+            writer.0.lock().unwrap().as_slice(),
+            [(
+                "rotated-refresh".to_owned(),
+                Some("fresh-access".to_owned())
+            )]
+        );
+        // Still fresh: no second refresh.
+        session.current_access_token().await.unwrap();
+        assert_eq!(as_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn oauth_session_needs_a_refresh_token() {
+        assert!(
+            OauthSession::new(cimd_client_id(), ELEVENLABS_TOKEN_URL, "a", " ", None, None)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_session_seeded_with_a_fresh_token_does_not_refresh() {
+        let as_server = MockServer::start().await;
+        let future = Utc::now().timestamp() + 3_600;
+        let session = OauthSession::new(
+            cimd_client_id(),
+            &format!("{}/token", as_server.uri()),
+            "stored-access",
+            "stored-refresh",
+            Some(future),
+            None,
+        )
+        .unwrap();
+        let token = session.current_access_token().await.unwrap();
+        assert_eq!(token.expose_secret(), "stored-access");
+        assert!(as_server.received_requests().await.unwrap().is_empty());
+        // A rejection of a token that is still current renews it, once.
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "renewed-access",
+                "expires_in": 3600,
+            })))
+            .mount(&as_server)
+            .await;
+        let renewed = session
+            .renew_after_rejection("stored-access")
+            .await
+            .unwrap();
+        assert_eq!(renewed.expose_secret(), "renewed-access");
+        // A second rejection of the old token finds the renewed one: no refresh.
+        let again = session
+            .renew_after_rejection("stored-access")
+            .await
+            .unwrap();
+        assert_eq!(again.expose_secret(), "renewed-access");
+        assert_eq!(as_server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1938,27 +2102,80 @@ mod tests {
         assert_eq!(bytes, b"SFX");
     }
 
-    #[tokio::test]
-    async fn image_flow_polls_until_completed() {
-        let server = MockServer::start().await;
+    /// A chat context for the generation tools: the owner's `dir:main`.
+    fn chat_context(user: &str) -> ToolContext {
+        ToolContext {
+            user_id: user.to_owned(),
+            actor: user.to_owned(),
+            bot: "maker".into(),
+            task_id: None,
+            turn_id: None,
+            conversation_id: Some("dir:main".into()),
+            allowed_tools: Default::default(),
+            require_approval: Default::default(),
+        }
+    }
+
+    fn image_tool(
+        server: &MockServer,
+        store: &Store,
+        dir: &std::path::Path,
+        wait: Duration,
+    ) -> ElevenLabsGenerateImageTool {
+        ElevenLabsGenerateImageTool {
+            deps: ElevenLabsToolDeps {
+                client: Arc::new(mock_client(server)),
+                artifacts: Arc::new(ArtifactStore::new(dir.join("artifacts")).unwrap()),
+                policy: Arc::new(Policy::empty()),
+                app_config: Arc::new(Config::default()),
+                config: ElevenLabsConfig::default(),
+                store: store.clone(),
+                wait,
+            },
+        }
+    }
+
+    async fn count_requests(server: &MockServer, verb: &str) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.method.as_str() == verb)
+            .count()
+    }
+
+    /// Mounts a flow create answer for `id` and a status answer for it.
+    async fn mount_image_flow(server: &MockServer, id: &str, status: Value) {
         Mock::given(method("POST"))
             .and(path("/v1/flows/image"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "gen1",
+                "id": id,
                 "status": "pending"
             })))
-            .mount(&server)
+            .mount(server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/v1/flows/image/gen1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            .and(path(format!("/v1/flows/image/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(status))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn image_flow_waits_until_completed() {
+        let server = MockServer::start().await;
+        mount_image_flow(
+            &server,
+            "gen1",
+            json!({
                 "id": "gen1",
                 "status": "completed",
                 "content_mime_type": "image/png",
                 "content_url": format!("{}/media.png", server.uri())
-            })))
-            .mount(&server)
-            .await;
+            }),
+        )
+        .await;
         Mock::given(method("GET"))
             .and(path("/media.png"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PNG"))
@@ -1969,20 +2186,238 @@ mod tests {
             .create_image("gemini-2.5-flash-image", "A red cube", "1:1")
             .await
             .unwrap();
-        let id = created.id.clone();
-        let client2 = mock_client(&server);
-        let completed = client
-            .poll_flow(
-                move || {
-                    let client = client2.clone();
-                    let id = id.clone();
-                    Box::pin(async move { client.get_image_generation(&id).await })
-                },
+        let state = client
+            .wait_flow(
+                FlowKind::Image,
+                &created.id,
+                Duration::from_secs(5),
                 Duration::from_millis(10),
-                5,
             )
             .await
             .unwrap();
-        assert_eq!(completed.bytes, b"PNG");
+        match state {
+            FlowState::Completed(done) => assert_eq!(done.bytes, b"PNG"),
+            other => panic!("expected a finished image, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_generation_still_rendering_at_the_end_of_the_wait_is_pending() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/flows/video/gen-w1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "processing"})))
+            .mount(&server)
+            .await;
+        let state = mock_client(&server)
+            .wait_flow(
+                FlowKind::Video,
+                "gen-w1",
+                Duration::from_millis(50),
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(state, FlowState::Pending));
+    }
+
+    #[tokio::test]
+    async fn a_failed_generation_gives_the_provider_message_and_a_bad_id_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/flows/image/gen-f1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "failed",
+                "error_message": "the prompt was refused"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let poller = ElevenLabsKeyPoller {
+            client: Arc::new(mock_client(&server)),
+        };
+        match poller.poll("owner", "image:gen-f1").await.unwrap() {
+            PollResult::Failed(message) => assert!(message.contains("the prompt was refused")),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        // A path-shaped id never reaches the provider, from the job or the tool path.
+        assert!(matches!(
+            poller.poll("owner", "image:../gen-f1").await.unwrap(),
+            PollResult::Failed(_)
+        ));
+        assert!(matches!(
+            mock_client(&server)
+                .flow_state(FlowKind::Image, "../gen-f1")
+                .await
+                .unwrap(),
+            FlowState::Failed(_)
+        ));
+        assert_eq!(count_requests(&server, "GET").await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_finished_image_is_stored_in_the_call() {
+        let server = MockServer::start().await;
+        mount_image_flow(
+            &server,
+            "gen-h2",
+            json!({
+                "status": "completed",
+                "content_mime_type": "image/png",
+                "content_url": format!("{}/media.png", server.uri())
+            }),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/media.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PNG"))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        store
+            .create_conversation(&admin, "dir:main", "direct", None)
+            .unwrap();
+        let tool = image_tool(&server, &store, dir.path(), Duration::ZERO);
+        let output = tool
+            .execute(json!({"prompt": "a red cube"}), &chat_context(&admin))
+            .await
+            .unwrap();
+        assert!(output.artifact_hash.is_some());
+        assert!(
+            store
+                .list_media_jobs(&admin, "dir:main")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_image_becomes_a_job_and_is_never_submitted_again() {
+        let server = MockServer::start().await;
+        mount_image_flow(
+            &server,
+            "gen-h1",
+            json!({"id": "gen-h1", "status": "processing"}),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        store
+            .create_conversation(&admin, "dir:main", "direct", None)
+            .unwrap();
+        let tool = image_tool(&server, &store, dir.path(), Duration::ZERO);
+        let output = tool
+            .execute(json!({"prompt": "a red cube"}), &chat_context(&admin))
+            .await
+            .unwrap();
+
+        assert!(output.artifact_hash.is_none());
+        assert!(output.content.contains("Do not submit it again"));
+        let data = output.data.unwrap();
+        assert_eq!(data["status"], "generating");
+        let job_id = data["job_id"].as_str().unwrap();
+        let job = store.get_media_job(&admin, job_id).unwrap();
+        assert_eq!(job.provider, KEY_MEDIA_PROVIDER);
+        assert_eq!(job.kind, MediaKind::Image);
+        assert_eq!(job.external_id, "image:gen-h1");
+        assert_eq!(job.status, MediaJobStatus::Pending);
+        assert_eq!(count_requests(&server, "POST").await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_check_after_submission_still_hands_the_generation_to_a_job() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/flows/image"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "gen-h3",
+                "status": "pending"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/flows/image/gen-h3"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({"detail": "busy"})))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        store
+            .create_conversation(&admin, "dir:main", "direct", None)
+            .unwrap();
+        let tool = image_tool(&server, &store, dir.path(), Duration::ZERO);
+        let output = tool
+            .execute(json!({"prompt": "a red cube"}), &chat_context(&admin))
+            .await
+            .unwrap();
+        let job_id = output.data.unwrap()["job_id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            store.get_media_job(&admin, &job_id).unwrap().external_id,
+            "image:gen-h3"
+        );
+        assert_eq!(count_requests(&server, "POST").await, 1);
+    }
+
+    #[tokio::test]
+    async fn the_poller_waits_for_a_generation_then_delivers_its_file() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/flows/video/gen-p1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "processing"})))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/flows/video/gen-p1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "completed",
+                "content_mime_type": "video/mp4",
+                "content_url": format!("{}/clip.mp4", server.uri())
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/clip.mp4"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"MP4"))
+            .mount(&server)
+            .await;
+        let poller = ElevenLabsKeyPoller {
+            client: Arc::new(mock_client(&server)),
+        };
+        assert!(matches!(
+            poller.poll("owner", "video:gen-p1").await.unwrap(),
+            PollResult::Pending
+        ));
+        match poller.poll("owner", "video:gen-p1").await.unwrap() {
+            PollResult::Done(artifact) => {
+                assert_eq!(artifact.bytes, b"MP4");
+                assert_eq!(artifact.filename, "elevenlabs-video.mp4");
+                assert_eq!(artifact.title.as_deref(), Some("ElevenLabs video"));
+            }
+            other => panic!("expected a finished video, got {other:?}"),
+        }
+        // The poller only looks up: it never submits.
+        assert_eq!(count_requests(&server, "POST").await, 0);
+    }
+
+    #[test]
+    fn external_ids_carry_the_kind_and_only_safe_generation_ids() {
+        assert_eq!(
+            FlowKind::Image.external_id("abc-123_X").as_deref(),
+            Some("image:abc-123_X")
+        );
+        assert!(FlowKind::Video.external_id("a/b").is_none());
+        assert!(FlowKind::Video.external_id("").is_none());
+        assert!(matches!(
+            FlowKind::parse_external("video:abc-1"),
+            Some((FlowKind::Video, "abc-1"))
+        ));
+        assert!(FlowKind::parse_external("audio:abc").is_none());
+        assert!(FlowKind::parse_external("abc").is_none());
+        assert!(FlowKind::parse_external("image:a:b").is_none());
     }
 }

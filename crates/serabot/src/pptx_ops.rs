@@ -490,6 +490,40 @@ fn summarize(bytes: &[u8]) -> Result<PptxInfo> {
     Ok(inspect(&presentation))
 }
 
+/// Plain text of every slide, slide by slide, including speaker notes, bounded
+/// by `max_chars`. Each slide starts with a `--- slide N ---` marker. Used by
+/// `local_extract`; the package is read only.
+pub fn slide_plain_text(bytes: &[u8], max_chars: usize) -> Result<String> {
+    let presentation = open(bytes)?;
+    let mut out = String::new();
+    // Characters written so far, counted once per slide rather than per check.
+    let mut written = 0usize;
+    for (index, slide) in presentation.slides.iter().enumerate() {
+        if written >= max_chars {
+            out.push_str("[more slides not shown: text limit reached]\n");
+            break;
+        }
+        let mut body = String::new();
+        walk(&slide.shapes, &mut |shape, _| {
+            if let Some(text) = &shape.text {
+                let value = text.text();
+                if !value.trim().is_empty() {
+                    body.push_str(value.trim());
+                    body.push('\n');
+                }
+            }
+        });
+        let mut section = format!("--- slide {} ---\n{body}", index + 1);
+        let notes = slide.notes.text();
+        if !notes.trim().is_empty() {
+            section.push_str(&format!("speaker notes:\n{}\n", notes.trim()));
+        }
+        written += section.chars().count();
+        out.push_str(&section);
+    }
+    Ok(out)
+}
+
 /// Human-readable summary.
 ///
 /// This is the text the model actually reads, so it carries the shape indices
@@ -1056,8 +1090,16 @@ impl Tool for PptxImportTool {
             (Some(path), None) => {
                 let artifacts = self.artifacts.clone();
                 let inbox = self.inbox.clone();
+                let user_id = context.user_id.clone();
                 let (stored, info) = tokio::task::spawn_blocking(move || {
-                    artifacts.ingest_inbox_file(&inbox, &path, &["pptx"], MAX_PPTX_BYTES, summarize)
+                    artifacts.ingest_inbox_file(
+                        &inbox,
+                        &user_id,
+                        &path,
+                        &["pptx"],
+                        MAX_PPTX_BYTES,
+                        summarize,
+                    )
                 })
                 .await
                 .map_err(|error| SeraError::Internal(format!("PPTX task failed: {error}")))??;
@@ -1186,8 +1228,16 @@ impl Tool for PptxPdfTool {
             (Some(path), None) => {
                 let artifacts = self.artifacts.clone();
                 let inbox = self.inbox.clone();
+                let user_id = context.user_id.clone();
                 let (stored, _) = tokio::task::spawn_blocking(move || {
-                    artifacts.ingest_inbox_file(&inbox, &path, &["pptx"], MAX_PPTX_BYTES, summarize)
+                    artifacts.ingest_inbox_file(
+                        &inbox,
+                        &user_id,
+                        &path,
+                        &["pptx"],
+                        MAX_PPTX_BYTES,
+                        summarize,
+                    )
                 })
                 .await
                 .map_err(|error| SeraError::Internal(format!("PPTX task failed: {error}")))??;
@@ -1603,6 +1653,24 @@ mod tests {
         deckcraft_pptx::export(&fixture()).unwrap()
     }
 
+    #[test]
+    fn slide_text_keeps_every_slide_and_its_speaker_notes() {
+        let text = slide_plain_text(&exported(), 100_000).unwrap();
+        assert!(
+            text.contains("--- slide 1 ---") && text.contains("--- slide 3 ---"),
+            "{text}"
+        );
+        assert!(text.contains("speaker notes:\nSpeaker note"), "{text}");
+        assert!(
+            text.contains("North report") && text.contains("Alpha body"),
+            "{text}"
+        );
+        // The character budget stops the walk with a marker, not a panic.
+        let short = slide_plain_text(&exported(), 10).unwrap();
+        assert!(short.contains("[more slides not shown"), "{short}");
+        assert!(slide_plain_text(b"not a package", 100).is_err());
+    }
+
     fn parts(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
         let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
         let mut out = Vec::new();
@@ -1663,9 +1731,14 @@ mod tests {
     }
 
     async fn imported(harness: &Harness, name: &str, bytes: &[u8]) -> String {
-        std::fs::write(harness.inbox.join(name), bytes).unwrap();
+        let owner = harness.inbox.join(crate::store::ADMIN_USER_ID);
+        std::fs::create_dir_all(&owner).unwrap();
+        std::fs::write(owner.join(name), bytes).unwrap();
         let output = import_tool(harness)
-            .execute(json!({"path": name}), &context())
+            .execute(
+                json!({"path": format!("{}/{name}", crate::store::ADMIN_USER_ID)}),
+                &context(),
+            )
             .await
             .unwrap();
         output.artifact_hash.unwrap()
@@ -2137,8 +2210,11 @@ mod tests {
     async fn rejects_paths_outside_the_inbox() {
         let harness = harness();
         let tool = import_tool(&harness);
-        std::fs::write(harness.inbox.join("deck.pptx"), exported()).unwrap();
-        std::fs::write(harness.inbox.join("deck.txt"), b"not a deck").unwrap();
+        let owner = harness.inbox.join(crate::store::ADMIN_USER_ID);
+        std::fs::create_dir_all(&owner).unwrap();
+        std::fs::write(owner.join("deck.pptx"), exported()).unwrap();
+        std::fs::write(owner.join("deck.txt"), b"not a deck").unwrap();
+        let prefixed = |name: &str| format!("{}/{name}", crate::store::ADMIN_USER_ID);
         // A real package one level above the inbox, reachable by traversal.
         let outside = harness.inbox.parent().unwrap().join("outside.pptx");
         std::fs::write(&outside, exported()).unwrap();
@@ -2147,20 +2223,22 @@ mod tests {
             json!({"path": "../outside.pptx"}),
             json!({"path": outside.to_string_lossy().to_string()}),
             json!({"path": "C:outside.pptx"}),
-            json!({"path": "deck.txt"}),
-            json!({"path": "missing.pptx"}),
-            json!({"path": "deck.pptx", "artifact": "0".repeat(64)}),
+            json!({"path": prefixed("deck.txt")}),
+            json!({"path": prefixed("missing.pptx")}),
+            json!({"path": prefixed("deck.pptx"), "artifact": "0".repeat(64)}),
             json!({}),
-            json!({"path": "deck.pptx", "extra": true}),
+            json!({"path": prefixed("deck.pptx"), "extra": true}),
+            // Another user's folder, by name, is not found.
+            json!({"path": "bob/deck.pptx"}),
         ] {
             assert!(
                 tool.execute(args.clone(), &context()).await.is_err(),
                 "accepted {args}"
             );
         }
-        // The same file inside the inbox is accepted.
+        // The same file inside the user's inbox area is accepted.
         assert!(
-            tool.execute(json!({"path": "deck.pptx"}), &context())
+            tool.execute(json!({"path": prefixed("deck.pptx")}), &context())
                 .await
                 .is_ok()
         );

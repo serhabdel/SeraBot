@@ -1,8 +1,40 @@
 //! The durable turn loop: model rounds, tool execution, approvals and replies.
 
 use super::*;
+use crate::turn_limits::{TurnLimits, config_defaults, resolve_turn_limits};
+
+/// Appended to the transcript for the one model call a turn makes after it hits
+/// a tool limit. That call offers no tools, so the answer uses only what ran.
+const LIMIT_NOTE: &str = "You reached this turn's tool limit. Using only what you have gathered so far, give the owner your best answer now, then list briefly what you did not get to. Do not claim to have done anything you did not do.";
+/// Turn status for a turn a tool limit ended. The chat offers Continue under
+/// the reply of such a turn.
+pub(crate) const LIMIT_REACHED_STATUS: &str = "limit_reached";
+const LIMIT_BARE_REPLY: &str = "I stopped because this turn reached its tool limit.";
+
+/// Which limit a turn hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LimitKind {
+    Calls,
+    Rounds,
+}
+
+impl LimitKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Calls => "tool_calls",
+            Self::Rounds => "tool_rounds",
+        }
+    }
+}
 
 impl Runtime {
+    /// The limits a user's turns run under: the owner's stored override when
+    /// one exists, otherwise the config defaults, clamped to the ceiling.
+    pub(super) fn turn_limits_for(&self, user_id: &str) -> Result<TurnLimits> {
+        let owner = self.store.get_user_turn_limits(user_id)?;
+        Ok(resolve_turn_limits(config_defaults(&self.config), owner))
+    }
+
     pub(super) async fn run_turn(&self, task: &Task) -> Result<TurnOutcome> {
         let payload: TurnPayload = serde_json::from_value(task.payload.clone())
             .map_err(|error| SeraError::Validation(format!("invalid turn payload: {error}")))?;
@@ -28,6 +60,14 @@ impl Runtime {
                 return Err(SeraError::External(
                     "response delivery has an unknown outcome; not resending automatically".into(),
                 ));
+            }
+            // A turn that already stored its final reply is never answered
+            // again, so a retried task cannot post a second reply (0.24).
+            if matches!(
+                existing.status.as_str(),
+                LIMIT_REACHED_STATUS | "completed" | "stopped"
+            ) {
+                return Ok(TurnOutcome::Completed);
             }
             let state: TurnState = serde_json::from_value(existing.state.clone())
                 .map_err(|_| SeraError::InvalidState("stored turn state is invalid".into()))?;
@@ -507,13 +547,8 @@ impl Runtime {
         let temperature = bot.config.temperature;
         self.checked_route(&user, &state.route)?;
 
-        let tool_round_cap = self
-            .config
-            .runtime
-            .max_tool_iterations
-            .max(self.config.llm.max_tool_rounds)
-            .max(1);
-        for _ in 0..tool_round_cap {
+        let limits = self.turn_limits_for(&user)?;
+        for _ in 0..limits.max_tool_rounds {
             if self.shutdown.is_cancelled() {
                 return Err(SeraError::Internal("shutting down".into()));
             }
@@ -634,17 +669,21 @@ impl Runtime {
 
             let tool_calls = assistant.tool_calls.clone();
             let requested = state.tool_calls + tool_calls.len();
-            if requested > self.config.runtime.max_tool_calls_per_turn {
-                let text = "I stopped because this turn exceeded the tool-call limit.".to_string();
-                self.finish_reply(&user, conversation_id, task, turn, &state, &text)
-                    .await?;
-                self.store.update_turn(
-                    &user,
-                    &turn.id,
-                    "stopped",
-                    &serde_json::to_value(&state)?,
-                )?;
-                return Ok(TurnOutcome::Completed);
+            if requested > limits.max_tool_calls_per_turn {
+                // The requested calls never run, so the owner is told which.
+                let skipped: Vec<String> =
+                    tool_calls.iter().map(|call| call.name.clone()).collect();
+                return self
+                    .finish_at_limit(
+                        task,
+                        turn,
+                        &bot,
+                        &state,
+                        conversation_id,
+                        LimitKind::Calls,
+                        &skipped,
+                    )
+                    .await;
             }
             state
                 .messages
@@ -697,12 +736,128 @@ impl Runtime {
             self.store
                 .update_turn(&user, &turn.id, "active", &serde_json::to_value(&state)?)?;
         }
-        let text = "I stopped because the turn reached its tool-iteration limit.".to_string();
-        self.finish_reply(&user, conversation_id, task, turn, &state, &text)
+        self.finish_at_limit(
+            task,
+            turn,
+            &bot,
+            &state,
+            conversation_id,
+            LimitKind::Rounds,
+            &[],
+        )
+        .await
+    }
+
+    /// End a turn that hit a tool limit. One last model call runs without
+    /// tools, with `LIMIT_NOTE` appended, and its text becomes the reply. If
+    /// that call fails or returns no text, a summary of the tools that ran
+    /// becomes the reply. The turn is stored as `limit_reached`, which lets the
+    /// chat offer Continue. The tool steps stay in the activity list.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_at_limit(
+        &self,
+        task: &Task,
+        turn: &Turn,
+        bot: &LoadedBot,
+        state: &TurnState,
+        conversation_id: &str,
+        kind: LimitKind,
+        skipped: &[String],
+    ) -> Result<TurnOutcome> {
+        let user = task.user_id.clone();
+        let mut transcript = state.messages.clone();
+        let mut note = LIMIT_NOTE.to_string();
+        if !skipped.is_empty() {
+            note.push_str(&format!(
+                " These tool calls were requested but did not run: {}.",
+                skipped.join(", ")
+            ));
+        }
+        transcript.push(LlmMessage::system(note));
+        let answer = self
+            .limit_answer(&user, bot, state, conversation_id, &transcript)
+            .await;
+        let answered = answer.is_some();
+        let mut text = answer.unwrap_or_else(|| limit_summary(state, skipped));
+        if self.gateway.scan_egress(&user, &text).is_err() {
+            text = limit_summary(state, skipped);
+            if self.gateway.scan_egress(&user, &text).is_err() {
+                text = LIMIT_BARE_REPLY.to_string();
+            }
+        }
+        self.store.update_turn(
+            &user,
+            &turn.id,
+            "sending_response",
+            &serde_json::to_value(state)?,
+        )?;
+        self.finish_reply(&user, conversation_id, task, turn, state, &text)
             .await?;
+        self.store.update_turn(
+            &user,
+            &turn.id,
+            LIMIT_REACHED_STATUS,
+            &serde_json::to_value(state)?,
+        )?;
+        let details = json!({
+            "turn_id": turn.id,
+            "task_id": task.id,
+            "conversation_id": conversation_id,
+            "limit": kind.as_str(),
+            "tool_calls": state.tool_calls,
+            "answered_by_model": answered,
+        });
+        self.store.record_audit(
+            &user,
+            "turn.limit_reached",
+            None,
+            Some(&task.id),
+            None,
+            None,
+            Some(self.gateway.policy().version()),
+            Some(&details),
+        )?;
         self.store
-            .update_turn(&user, &turn.id, "stopped", &serde_json::to_value(&state)?)?;
+            .append_event(&user, "turn.limit_reached", &details)?;
+        self.store.append_event(
+            &user,
+            "turn.completed",
+            &json!({"turn_id": turn.id, "task_id": task.id, "limit_reached": true}),
+        )?;
         Ok(TurnOutcome::Completed)
+    }
+
+    /// The final no-tools model call of a limited turn. Returns `None` when the
+    /// call fails, is refused, or returns no text; the caller then uses the
+    /// summary instead.
+    async fn limit_answer(
+        &self,
+        user: &str,
+        bot: &LoadedBot,
+        state: &TurnState,
+        conversation_id: &str,
+        transcript: &[LlmMessage],
+    ) -> Option<String> {
+        let route = self.checked_route(user, &state.route).ok()?;
+        self.scan_model_messages(user, transcript).ok()?;
+        let outgoing = self.gateway.redact_messages(user, transcript).ok()?;
+        let thinking = self.turn_thinking(conversation_id, bot);
+        let response = self
+            .router
+            .complete_with_thinking(
+                user,
+                route,
+                &outgoing,
+                &[],
+                bot.config.temperature,
+                thinking.as_deref(),
+            )
+            .await
+            .ok()?;
+        // With no tools offered, any tool calls in the response are ignored.
+        let text = response.message.content?;
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_string())
     }
 
     async fn execute_calls(
@@ -714,8 +869,9 @@ impl Runtime {
         calls: Vec<ToolCall>,
         context: &ToolContext,
     ) -> Result<Option<PendingTool>> {
+        let max_calls = self.turn_limits_for(&task.user_id)?.max_tool_calls_per_turn;
         for (index, call) in calls.iter().enumerate() {
-            if state.tool_calls >= self.config.runtime.max_tool_calls_per_turn {
+            if state.tool_calls >= max_calls {
                 break;
             }
             // Calls not yet started are dropped: the owner stopped the turn.
@@ -940,4 +1096,52 @@ impl Runtime {
             .await?;
         Ok(TurnOutcome::Suspended)
     }
+}
+
+/// The reply when the model could not answer at a limit: the tool steps this
+/// turn ran, each with a short target, and what was left undone.
+fn limit_summary(state: &TurnState, skipped: &[String]) -> String {
+    // Only this turn's steps: everything after the owner's latest message.
+    let start = state
+        .messages
+        .iter()
+        .rposition(|message| message.role == Role::User)
+        .map_or(0, |index| index + 1);
+    let mut lines = Vec::new();
+    for message in &state.messages[start..] {
+        for call in &message.tool_calls {
+            lines.push(match tool_target(&call.arguments) {
+                Some(target) => format!("- {} ({target})", call.name),
+                None => format!("- {}", call.name),
+            });
+        }
+    }
+    let mut text = String::from("I reached this turn's tool limit before I could finish.");
+    if lines.is_empty() {
+        text.push_str(" No tool steps ran in this turn.");
+    } else {
+        text.push_str(&format!(
+            " Steps that ran ({}):\n{}",
+            lines.len(),
+            lines.join("\n")
+        ));
+    }
+    if skipped.is_empty() {
+        text.push_str("\nNot done: the rest of the request.");
+    } else {
+        text.push_str(&format!("\nNot done: {}.", skipped.join(", ")));
+    }
+    text.push_str(" Use Continue to pick up from here.");
+    text
+}
+
+/// A short target for a tool call: its first non-empty string argument,
+/// truncated. Full arguments are never shown.
+fn tool_target(arguments: &Value) -> Option<String> {
+    let value = arguments
+        .as_object()?
+        .values()
+        .filter_map(Value::as_str)
+        .find(|text| !text.trim().is_empty())?;
+    Some(truncate_chars(value.trim(), 60))
 }

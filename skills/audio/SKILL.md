@@ -33,4 +33,4 @@ Allowed extensions: wav, mp3, mpeg, ogg, oga, opus, m4a, aac, flac, webm. Paths 
 
 ## ElevenLabs
 
-`elevenlabs_transcribe` is a different tool. Use it only when that skill is loaded and the tool is allowlisted.
+`elevenlabs_key_transcribe` is a different tool. Use it only when that skill is loaded and the tool is allowlisted.

@@ -28,6 +28,21 @@ pub trait CredentialWriter: Send + Sync {
     /// Persist a rotated refresh token and, when the provider issued one, the
     /// matching access token.
     fn persist_rotation(&self, refresh: &str, access: Option<&str>) -> Result<()>;
+
+    /// Persist a token refresh: the access token with its expiry (Unix
+    /// seconds) and, when the provider rotated it, the refresh token. Writers
+    /// that keep no expiry store only a rotation, which is what the default does.
+    fn persist_refresh(
+        &self,
+        refresh: Option<&str>,
+        access: &str,
+        _expires_at: Option<i64>,
+    ) -> Result<()> {
+        match refresh {
+            Some(refresh) => self.persist_rotation(refresh, Some(access)),
+            None => Ok(()),
+        }
+    }
 }
 
 /// [`CredentialWriter`] backed by the age secret store.
@@ -243,6 +258,24 @@ impl SharedSecrets {
         let mut updated = SecretStore::open_paths(&guard.path, &guard.identity_path)?;
         for (name, value) in updates {
             updated.set(name, value)?;
+        }
+        updated.save()?;
+        *guard = updated;
+        Ok(())
+    }
+
+    /// Remove names from the store and write it back. Names that are not
+    /// stored are ignored.
+    pub fn remove(&self, names: &[&str]) -> Result<()> {
+        let mut guard = self.lock();
+        if guard.path.as_os_str().is_empty() || guard.identity_path.as_os_str().is_empty() {
+            return Err(SeraError::Secrets(
+                "cannot persist an in-memory secret store".into(),
+            ));
+        }
+        let mut updated = SecretStore::open_paths(&guard.path, &guard.identity_path)?;
+        for name in names {
+            updated.remove(name);
         }
         updated.save()?;
         *guard = updated;

@@ -409,8 +409,8 @@ pub(super) async fn admin_connector_oauth_start(
 }
 
 /// Complete the ElevenLabs sign-in: the server exchanges the code at the
-/// pinned token endpoint and persists both tokens to the age store. Tokens
-/// are never returned to the caller.
+/// pinned token endpoint and seals both tokens to the acting account's own
+/// credential. Tokens are never returned to the caller.
 pub(super) async fn admin_connector_oauth_complete(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
@@ -437,30 +437,68 @@ pub(super) async fn admin_connector_oauth_complete(
     )
     .await
     .map_err(admin_error)?;
-    let access_name = state.config.elevenlabs.oauth_access_token_secret.clone();
-    let refresh_name = state.config.elevenlabs.oauth_refresh_token_secret.clone();
-    let refresh_value = match &pair.refresh_token {
+    // A refresh the exchange did not rotate keeps the one this account has.
+    let refresh = match &pair.refresh_token {
         Some(refresh) => refresh.clone(),
-        None => state.secrets.get(&refresh_name).ok_or_else(|| {
-            admin_error(SeraError::External(
-                "ElevenLabs did not return a refresh token".into(),
-            ))
-        })?,
+        None => state
+            .users
+            .get(&user.id, crate::elevenlabs_mcp::CREDENTIAL_PROVIDER)
+            .map_err(admin_error)?
+            .and_then(|stored| crate::user_secrets::ProviderCredential::parse(&stored).ok())
+            .map(|credential| credential.refresh_token)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| {
+                admin_error(SeraError::External(
+                    "ElevenLabs did not return a refresh token".into(),
+                ))
+            })?,
     };
-    state
-        .secrets
-        .persist(&[
-            (access_name.as_str(), pair.access_token.as_str()),
-            (refresh_name.as_str(), refresh_value.as_str()),
-        ])
-        .map_err(admin_error)?;
+    crate::elevenlabs_mcp::store_sign_in(
+        &state.users,
+        &user.id,
+        &pair.access_token,
+        &refresh,
+        pair.expires_in,
+    )
+    .map_err(admin_error)?;
+    if let Some(elevenlabs) = &state.elevenlabs {
+        elevenlabs.forget(&user.id).await;
+    }
     audit_config(
         &state,
         &user.id,
         "config.connector_oauth_signed_in",
         json!({"connector": id, "ok": true}),
     )?;
-    Ok(Json(json!({"signed_in": true, "restart_required": true})))
+    // Tools are registered at startup; the sign-in itself takes effect at once.
+    Ok(Json(json!({"signed_in": true, "restart_required": false})))
+}
+
+/// Forget the acting account's ElevenLabs sign-in. Calls fail from then on
+/// until the account signs in again.
+pub(super) async fn admin_connector_oauth_disconnect(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> AdminResult<Json<Value>> {
+    require_admin(&user).map_err(admin_error)?;
+    if id != "elevenlabs" {
+        return Err(admin_error(SeraError::NotFound(format!(
+            "connector {id} does not support sign-in"
+        ))));
+    }
+    let removed =
+        crate::elevenlabs_mcp::remove_sign_in(&state.users, &user.id).map_err(admin_error)?;
+    if let Some(elevenlabs) = &state.elevenlabs {
+        elevenlabs.forget(&user.id).await;
+    }
+    audit_config(
+        &state,
+        &user.id,
+        "config.connector_oauth_signed_out",
+        json!({"connector": id, "removed": removed}),
+    )?;
+    Ok(Json(json!({"signed_in": false, "removed": removed})))
 }
 
 #[derive(Deserialize)]
@@ -468,9 +506,6 @@ pub(super) struct ConnectorRequest {
     enabled: bool,
     #[serde(default)]
     values: BTreeMap<String, String>,
-    /// ElevenLabs only: switch auth mode ("api_key" or "oauth").
-    #[serde(default)]
-    auth: Option<String>,
 }
 
 pub(super) async fn admin_set_connector(
@@ -481,23 +516,6 @@ pub(super) async fn admin_set_connector(
 ) -> AdminResult<Json<Value>> {
     require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
-    if let Some(auth) = &request.auth {
-        if id != "elevenlabs" {
-            return Err(admin_error(SeraError::Validation(
-                "auth mode is only supported for the elevenlabs connector".into(),
-            )));
-        }
-        let mode = match auth.as_str() {
-            "api_key" => crate::config::ElevenLabsAuth::ApiKey,
-            "oauth" => crate::config::ElevenLabsAuth::Oauth,
-            other => {
-                return Err(admin_error(SeraError::Validation(format!(
-                    "unknown elevenlabs auth mode '{other}'"
-                ))));
-            }
-        };
-        admin.set_elevenlabs_auth(mode).map_err(admin_error)?;
-    }
     admin
         .set_connector(
             &state.config,
@@ -511,7 +529,7 @@ pub(super) async fn admin_set_connector(
         &state,
         &user.id,
         "config.connector_saved",
-        json!({"connector": id, "enabled": request.enabled, "credentials": request.values.keys().collect::<Vec<_>>(), "auth": request.auth}),
+        json!({"connector": id, "enabled": request.enabled, "credentials": request.values.keys().collect::<Vec<_>>()}),
     )?;
     Ok(Json(json!({"saved": true, "restart_required": true})))
 }
@@ -901,10 +919,17 @@ pub(super) async fn admin_update_bot_config(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
-    Json(request): Json<BotConfigRequest>,
+    Json(mut request): Json<BotConfigRequest>,
 ) -> AdminResult<Json<Value>> {
     require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
+    // A console from before a tool rename still sends the old names.
+    if let Some(tools) = request.tools.as_mut() {
+        crate::config::rename_tool_list(tools);
+    }
+    if let Some(approval) = request.require_approval.as_mut() {
+        crate::config::rename_tool_list(approval);
+    }
     let configured = state
         .runtime
         .fleet()

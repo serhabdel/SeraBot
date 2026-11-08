@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -34,25 +34,9 @@ impl XlsxAnalyzeTool {
         })
     }
 
-    fn resolve(&self, value: &str) -> Result<PathBuf> {
-        if value.is_empty() || value.len() > 512 {
-            return Err(SeraError::Validation("invalid workbook path".into()));
-        }
-        let raw = Path::new(value);
-        if raw.is_absolute() {
-            return Err(SeraError::Forbidden(
-                "workbook paths must be relative to the configured inbox".into(),
-            ));
-        }
-        let candidate = self.root.join(raw);
-        let canonical = candidate
-            .canonicalize()
-            .map_err(|_| SeraError::NotFound("workbook not found".into()))?;
-        if !canonical.starts_with(&self.root) {
-            return Err(SeraError::Forbidden(
-                "workbook path escapes the configured inbox".into(),
-            ));
-        }
+    /// A workbook inside the acting user's own inbox area.
+    fn resolve(&self, value: &str, user_id: &str) -> Result<PathBuf> {
+        let canonical = crate::user_inbox::resolve(&self.root, user_id, value)?;
         let extension = canonical
             .extension()
             .and_then(|value| value.to_str())
@@ -89,12 +73,12 @@ impl Tool for XlsxAnalyzeTool {
         }
     }
 
-    async fn execute(&self, args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
         let path = args
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| SeraError::Validation("path is required".into()))?;
-        let path = self.resolve(path)?;
+        let path = self.resolve(path, &context.user_id)?;
         let limits = self.limits.clone();
         let analysis = tokio::task::spawn_blocking(move || analyze_workbook(&path, &limits))
             .await
@@ -302,31 +286,10 @@ impl DocumentIndexTool {
         }
     }
 
-    fn resolve(&self, value: &str) -> Result<PathBuf> {
-        if value.is_empty() || value.len() > 512 {
-            return Err(SeraError::Validation("invalid document path".into()));
-        }
-        let raw = Path::new(value);
-        if raw.is_absolute() {
-            return Err(SeraError::Forbidden(
-                "document paths must be relative to the configured inbox".into(),
-            ));
-        }
-        let root = self
-            .config
-            .path(&self.config.documents.watch_dir)
-            .canonicalize()
-            .map_err(|_| SeraError::NotFound("document inbox is unavailable".into()))?;
-        let candidate = root
-            .join(raw)
-            .canonicalize()
-            .map_err(|_| SeraError::NotFound("document not found".into()))?;
-        if !candidate.starts_with(&root) {
-            return Err(SeraError::Forbidden(
-                "document path escapes the configured inbox".into(),
-            ));
-        }
-        Ok(candidate)
+    /// A document or folder inside the acting user's own inbox area.
+    fn resolve(&self, value: &str, user_id: &str) -> Result<PathBuf> {
+        let root = self.config.path(&self.config.documents.watch_dir);
+        crate::user_inbox::resolve(&root, user_id, value)
     }
 }
 
@@ -358,7 +321,7 @@ impl Tool for DocumentIndexTool {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| SeraError::Validation("path is required".into()))?;
-        let path = self.resolve(path)?;
+        let path = self.resolve(path, &context.user_id)?;
         let metadata = std::fs::metadata(&path)?;
         if metadata.is_dir() {
             let report = index_directory(
@@ -887,13 +850,14 @@ pub fn known_tool_names() -> Vec<&'static str> {
         // Conditional on configuration.
         "audio_transcribe",
         "audio_understand",
-        "elevenlabs_list_voices",
-        "elevenlabs_text_to_speech",
-        "elevenlabs_sound_effect",
-        "elevenlabs_transcribe",
-        "elevenlabs_generate_image",
-        "elevenlabs_generate_video",
-        "elevenlabs_mcp_list_tools",
+        "elevenlabs_key_list_voices",
+        "elevenlabs_key_text_to_speech",
+        "elevenlabs_key_sound_effect",
+        "elevenlabs_key_transcribe",
+        "elevenlabs_key_generate_image",
+        "elevenlabs_key_generate_video",
+        "elevenlabs_mcp_search_tools",
+        "elevenlabs_mcp_describe_tool",
         "elevenlabs_mcp_call",
         "telegram_send_document",
         "firecrawl_scrape",
@@ -946,6 +910,9 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "local_write",
         "local_import",
         "local_export",
+        "local_read_many",
+        "local_extract",
+        "local_brief",
     ];
     #[cfg(feature = "docx")]
     names.extend([

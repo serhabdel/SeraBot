@@ -5,6 +5,14 @@ trigger = "command"
 system_prompt = "prompts/inbox.txt"
 skills = ["email-triage", "messaging-etiquette"]
 tools = [
+  "local_list",
+  "local_search",
+  "local_stat",
+  "local_read",
+  "local_read_many",
+  "local_extract",
+  "local_brief",
+  "local_import",
   "ask_user",
   "skill_list",
   "skill_search",

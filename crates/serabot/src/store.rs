@@ -67,6 +67,9 @@ const MIGRATION_25: &str = include_str!("../migrations/0025_chat_attachments.sql
 const MIGRATION_26: &str = include_str!("../migrations/0026_memory_v2.sql");
 const MIGRATION_27: &str = include_str!("../migrations/0027_chat_cards.sql");
 const MIGRATION_28: &str = include_str!("../migrations/0028_vault_providers.sql");
+const MIGRATION_29: &str = include_str!("../migrations/0029_media_jobs.sql");
+const MIGRATION_30: &str = include_str!("../migrations/0030_user_turn_limits.sql");
+const MIGRATION_31: &str = include_str!("../migrations/0031_media_job_finishing.sql");
 
 /// Fixed admin id written by migration 0008 and mirrored in
 /// `kv['admin_user_id']`. Code resolves the admin through the kv entry (the
@@ -580,6 +583,21 @@ impl Store {
         if version < 28 {
             connection.execute_batch(MIGRATION_28)?;
             connection.pragma_update(None, "user_version", 28)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 29 {
+            connection.execute_batch(MIGRATION_29)?;
+            connection.pragma_update(None, "user_version", 29)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 30 {
+            connection.execute_batch(MIGRATION_30)?;
+            connection.pragma_update(None, "user_version", 30)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 31 {
+            connection.execute_batch(MIGRATION_31)?;
+            connection.pragma_update(None, "user_version", 31)?;
         }
         // VACUUM INTO (backups) may renumber rowids; rebuild the external-content
         // FTS index only when its row count no longer matches `memories`.
@@ -1908,6 +1926,7 @@ impl Store {
             name: name.map(str::to_owned),
             bot: None,
             tool_call_id: None,
+            limit_reached: false,
             created_at: utc_now(),
         };
         self.insert_message(user_id, &message)?;
@@ -2372,6 +2391,7 @@ impl Store {
                 name: row.get(5)?,
                 bot: None,
                 tool_call_id: row.get(6)?,
+                limit_reached: false,
                 created_at: parse_datetime(&row.get::<_, String>(7)?),
             })
         })?;
@@ -2502,7 +2522,7 @@ impl Store {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT m.id, m.conversation_id, m.turn_id, m.role, m.content, m.name,
-                    m.created_at, t.bot
+                    m.created_at, t.bot, t.status
              FROM messages m LEFT JOIN turns t ON t.id = m.turn_id
              WHERE m.conversation_id = ?1 AND m.user_id = ?2 AND m.role IN ('user', 'assistant')
              ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?3",
@@ -2519,6 +2539,8 @@ impl Store {
                     name: row.get(5)?,
                     bot: row.get(7)?,
                     tool_call_id: None,
+                    limit_reached: row.get::<_, Option<String>>(8)?.as_deref()
+                        == Some(crate::runtime::LIMIT_REACHED_STATUS),
                     created_at: parse_datetime(&row.get::<_, String>(6)?),
                 })
             },
@@ -3408,6 +3430,25 @@ impl Store {
             "UPDATE tasks SET status='done', lease_until=NULL, worker_id=NULL, updated_at=?1
              WHERE id=?2 AND fencing_token=?3 AND status='running' AND user_id=?4",
             params![now_string(), id, fencing_token, user_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Extend a running task's lease to `until`. Only the holder of the current
+    /// fencing token renews, so a task that was reclaimed after its lease
+    /// expired cannot be kept alive by the worker that lost it.
+    pub fn renew_task_lease(
+        &self,
+        user_id: &str,
+        id: &str,
+        fencing_token: i64,
+        until: DateTime<Utc>,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE tasks SET lease_until=?1, updated_at=?2
+             WHERE id=?3 AND fencing_token=?4 AND status='running' AND user_id=?5",
+            params![to_string(until), now_string(), id, fencing_token, user_id],
         )?;
         Ok(changed == 1)
     }
@@ -4673,7 +4714,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 28);
+        assert_eq!(version, 31);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -4738,7 +4779,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 28);
+        assert_eq!(version, 31);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -4812,7 +4853,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 28);
+        assert_eq!(version, 31);
         let admin = admin(&store);
         let memory = crate::memory::get(&store, &admin, "mem-legacy").unwrap();
         assert_eq!(memory.origin, "explicit");
@@ -4901,7 +4942,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 28);
+        assert_eq!(version, 31);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -5032,7 +5073,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 28);
+        assert_eq!(version, 31);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -5187,7 +5228,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 28);
+        assert_eq!(version, 31);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.
@@ -6077,6 +6118,90 @@ mod tests {
         let recovered = store.get_task(&admin, &task.id).unwrap();
         assert_eq!(recovered.status, "failed");
         assert_eq!(recovered.fencing_token, claimed.fencing_token);
+    }
+
+    #[test]
+    fn lease_renewal_keeps_a_running_task_from_recovery() {
+        let store = store();
+        let admin = admin(&store);
+        store
+            .enqueue_task(&admin, "turn", "main", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        let claimed = store.claim_task("worker", 1).unwrap().unwrap();
+        let expired = utc_now() - chrono::Duration::seconds(5);
+        let connection = store.connection().unwrap();
+        connection
+            .execute(
+                "UPDATE tasks SET lease_until=?1 WHERE id=?2",
+                params![to_string(expired), claimed.id],
+            )
+            .unwrap();
+        drop(connection);
+
+        // A stale token renews nothing.
+        assert!(
+            !store
+                .renew_task_lease(
+                    &admin,
+                    &claimed.id,
+                    claimed.fencing_token + 1,
+                    utc_now() + chrono::Duration::seconds(300),
+                )
+                .unwrap()
+        );
+        // The current token renews, and recovery then leaves the task alone.
+        assert!(
+            store
+                .renew_task_lease(
+                    &admin,
+                    &claimed.id,
+                    claimed.fencing_token,
+                    utc_now() + chrono::Duration::seconds(300),
+                )
+                .unwrap()
+        );
+        assert_eq!(store.recover_expired_tasks().unwrap(), 0);
+        let running = store.get_task(&admin, &claimed.id).unwrap();
+        assert_eq!(running.status, "running");
+        assert!(running.lease_until.unwrap() > utc_now());
+
+        // Another user's id cannot renew the task.
+        assert!(
+            !store
+                .renew_task_lease(
+                    "00000000-0000-7000-8000-0000000000ff",
+                    &claimed.id,
+                    claimed.fencing_token,
+                    utc_now() + chrono::Duration::seconds(300),
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn expired_lease_without_renewal_is_requeued() {
+        let store = store();
+        let admin = admin(&store);
+        store
+            .enqueue_task(&admin, "turn", "main", &serde_json::json!({}), 0, utc_now())
+            .unwrap();
+        let claimed = store.claim_task("worker", 1).unwrap().unwrap();
+        let connection = store.connection().unwrap();
+        connection
+            .execute(
+                "UPDATE tasks SET lease_until=?1 WHERE id=?2",
+                params![
+                    to_string(utc_now() - chrono::Duration::seconds(5)),
+                    claimed.id
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(store.recover_expired_tasks().unwrap(), 1);
+        assert_eq!(
+            store.get_task(&admin, &claimed.id).unwrap().status,
+            "queued"
+        );
     }
 
     #[test]

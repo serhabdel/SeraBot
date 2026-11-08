@@ -896,7 +896,7 @@ impl SourceResolver {
 
     /// Resolve exactly one of `artifact` (store hash) or `path` (inbox
     /// relative) into bytes.
-    fn resolve(&self, args: &Value) -> Result<ResolvedSource> {
+    fn resolve(&self, args: &Value, user_id: &str) -> Result<ResolvedSource> {
         let artifact = args
             .get("artifact")
             .and_then(Value::as_str)
@@ -917,7 +917,7 @@ impl SourceResolver {
                 })
             }
             (None, Some(path)) => {
-                let path = self.resolve_inbox(path)?;
+                let path = self.resolve_inbox(user_id, path)?;
                 let bytes = std::fs::read(&path)?;
                 check_input_size(bytes.len())?;
                 let filename = path
@@ -936,26 +936,9 @@ impl SourceResolver {
         }
     }
 
-    fn resolve_inbox(&self, value: &str) -> Result<PathBuf> {
-        if value.is_empty() || value.len() > 512 {
-            return Err(invalid("invalid PDF path"));
-        }
-        let raw = Path::new(value);
-        if raw.is_absolute() {
-            return Err(SeraError::Forbidden(
-                "PDF paths must be relative to the configured inbox".into(),
-            ));
-        }
-        let candidate = self
-            .inbox
-            .join(raw)
-            .canonicalize()
-            .map_err(|_| SeraError::NotFound("PDF not found in the configured inbox".into()))?;
-        if !candidate.starts_with(&self.inbox) {
-            return Err(SeraError::Forbidden(
-                "PDF path escapes the configured inbox".into(),
-            ));
-        }
+    /// An inbox PDF, inside the acting user's own inbox area.
+    fn resolve_inbox(&self, user_id: &str, value: &str) -> Result<PathBuf> {
+        let candidate = crate::user_inbox::resolve(&self.inbox, user_id, value)?;
         let extension = candidate
             .extension()
             .and_then(|value| value.to_str())
@@ -1099,9 +1082,9 @@ impl Tool for PdfInspectTool {
         }
     }
 
-    async fn execute(&self, args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
         reject_unknown_keys(&args, &["artifact", "path"])?;
-        let source = self.sources.resolve(&args)?;
+        let source = self.sources.resolve(&args, &context.user_id)?;
         let bytes = source.bytes;
         let info = tokio::task::spawn_blocking(move || inspect(&bytes))
             .await
@@ -1277,7 +1260,7 @@ impl Tool for PdfEditTool {
                 ));
             }
         };
-        let source = self.sources.resolve(&args)?;
+        let source = self.sources.resolve(&args, &context.user_id)?;
         let source_artifact = self.sources.record(&source)?;
         let label = kind.label();
         let summary = kind.summary();
@@ -1413,7 +1396,9 @@ impl Tool for PdfMergeTool {
                 .as_object()
                 .ok_or_else(|| invalid("each source must be an object with artifact or path"))?;
             reject_unknown_keys(&Value::Object(object.clone()), &["artifact", "path"])?;
-            let source = self.sources.resolve(&Value::Object(object.clone()))?;
+            let source = self
+                .sources
+                .resolve(&Value::Object(object.clone()), &context.user_id)?;
             source_artifacts.push(self.sources.record(&source)?);
             if first_filename.is_none() {
                 first_filename = Some(source.filename.clone());
@@ -1912,5 +1897,35 @@ mod tests {
                 .is_err()
         );
         let _ = store;
+    }
+
+    #[test]
+    fn an_inbox_pdf_is_only_resolved_for_its_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let inbox = directory.path().join("inbox");
+        std::fs::create_dir_all(inbox.join("alice").join("local")).unwrap();
+        std::fs::write(
+            inbox.join("alice").join("local").join("q3.pdf"),
+            b"%PDF-1.4 synthetic",
+        )
+        .unwrap();
+        let artifacts = Arc::new(ArtifactStore::new(directory.path().join("artifacts")).unwrap());
+        let sources = SourceResolver::new(artifacts, &inbox).unwrap();
+        assert!(
+            sources
+                .resolve(&json!({"path": "alice/local/q3.pdf"}), "alice")
+                .is_ok()
+        );
+        // Bob names Alice's file, directly or through a traversal: not found.
+        for value in ["alice/local/q3.pdf", "bob/../alice/local/q3.pdf"] {
+            let error = sources
+                .resolve(&json!({"path": value}), "bob")
+                .err()
+                .expect("another user's PDF must not resolve");
+            assert!(
+                matches!(error, SeraError::NotFound(_) | SeraError::Forbidden(_)),
+                "{value}: {error}"
+            );
+        }
     }
 }

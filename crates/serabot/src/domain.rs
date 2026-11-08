@@ -85,6 +85,10 @@ pub struct StoredMessage {
     #[serde(default)]
     pub bot: Option<String>,
     pub tool_call_id: Option<String>,
+    /// True for the reply of a turn that a tool limit ended (the chat offers
+    /// Continue under it).
+    #[serde(default)]
+    pub limit_reached: bool,
     pub created_at: DateTime<Utc>,
 }
 

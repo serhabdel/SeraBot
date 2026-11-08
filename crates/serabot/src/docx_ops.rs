@@ -567,8 +567,10 @@ fn clip_to_block(text: &str) -> (String, bool) {
 pub fn plain_text(bytes: &[u8], max_chars: usize) -> Result<String> {
     let document = load(bytes)?;
     let mut out = String::new();
+    // Characters written so far, counted once per block rather than per check.
+    let mut written = 0usize;
     for block in &document.body {
-        if out.chars().count() >= max_chars {
+        if written >= max_chars {
             break;
         }
         let text = match block.as_ref() {
@@ -578,6 +580,7 @@ pub fn plain_text(bytes: &[u8], max_chars: usize) -> Result<String> {
         if text.trim().is_empty() {
             continue;
         }
+        written += text.chars().count() + 1;
         out.push_str(&text);
         out.push('\n');
     }
@@ -1516,8 +1519,16 @@ impl Tool for DocxImportTool {
             (Some(path), None) => {
                 let artifacts = self.artifacts.clone();
                 let inbox = self.inbox.clone();
+                let user_id = context.user_id.clone();
                 let (stored, info) = tokio::task::spawn_blocking(move || {
-                    artifacts.ingest_inbox_file(&inbox, &path, &["docx"], MAX_DOCX_BYTES, inspect)
+                    artifacts.ingest_inbox_file(
+                        &inbox,
+                        &user_id,
+                        &path,
+                        &["docx"],
+                        MAX_DOCX_BYTES,
+                        inspect,
+                    )
                 })
                 .await
                 .map_err(|error| SeraError::Internal(format!("DOCX task failed: {error}")))??;
@@ -1644,8 +1655,16 @@ impl Tool for DocxPdfTool {
             (Some(path), None) => {
                 let artifacts = self.artifacts.clone();
                 let inbox = self.inbox.clone();
+                let user_id = context.user_id.clone();
                 let (stored, _) = tokio::task::spawn_blocking(move || {
-                    artifacts.ingest_inbox_file(&inbox, &path, &["docx"], MAX_DOCX_BYTES, inspect)
+                    artifacts.ingest_inbox_file(
+                        &inbox,
+                        &user_id,
+                        &path,
+                        &["docx"],
+                        MAX_DOCX_BYTES,
+                        inspect,
+                    )
                 })
                 .await
                 .map_err(|error| SeraError::Internal(format!("DOCX task failed: {error}")))??;
@@ -3001,13 +3020,17 @@ mod tests {
         );
         let store = Store::open_in_memory(384).expect("an in-memory store");
         let inbox = directory.path().join("inbox");
-        std::fs::create_dir_all(&inbox).expect("an inbox");
+        let owner = inbox.join(crate::store::ADMIN_USER_ID);
+        std::fs::create_dir_all(&owner).expect("an inbox");
         let bytes = build(&spec()).expect("the fixture builds");
-        std::fs::write(inbox.join("owner.docx"), &bytes).expect("the fixture file");
+        std::fs::write(owner.join("owner.docx"), &bytes).expect("the fixture file");
 
         let tool = DocxImportTool::new(artifacts.clone(), store, &inbox).expect("the import tool");
         let output = tool
-            .execute(json!({"path": "owner.docx"}), &context("docx_import"))
+            .execute(
+                json!({"path": format!("{}/owner.docx", crate::store::ADMIN_USER_ID)}),
+                &context("docx_import"),
+            )
             .await
             .expect("the owner file imports");
         let hash = output.artifact_hash.expect("an imported hash");
@@ -3026,13 +3049,17 @@ mod tests {
         );
         let store = Store::open_in_memory(384).expect("an in-memory store");
         let inbox = directory.path().join("inbox");
-        std::fs::create_dir_all(&inbox).expect("an inbox");
+        let owner = inbox.join(crate::store::ADMIN_USER_ID);
+        std::fs::create_dir_all(&owner).expect("an inbox");
         let bytes = build(&spec()).expect("the fixture builds");
-        std::fs::write(inbox.join("owner.docx"), &bytes).expect("the fixture file");
+        std::fs::write(owner.join("owner.docx"), &bytes).expect("the fixture file");
 
         let tool = DocxPdfTool::new(artifacts.clone(), store, &inbox).expect("the PDF tool");
         let output = tool
-            .execute(json!({"path": "owner.docx"}), &context("docx_pdf"))
+            .execute(
+                json!({"path": format!("{}/owner.docx", crate::store::ADMIN_USER_ID)}),
+                &context("docx_pdf"),
+            )
             .await
             .expect("the document converts");
         let hash = output.artifact_hash.expect("a PDF artifact hash");

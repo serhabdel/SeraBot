@@ -177,6 +177,25 @@ pub(super) async fn list_connectors(
             "api_key": secret_status(&state.secrets, Some(agentmail.api_key_secret.as_str())),
         },
     }));
+    // ElevenLabs sign-in: a per-account connector. `connected` is this
+    // account's own sign-in; the tokens never appear.
+    views.push(json!({
+        "id": "elevenlabs",
+        "kind": "oauth",
+        "enabled": state.config.elevenlabs.mcp_enabled,
+        "redirect_uri": Value::Null,
+        "connected": crate::elevenlabs_mcp::is_signed_in(&state.users, &user.id)?,
+        // Kept for one release so an older console still finds its OAuth mode.
+        "auth_modes": ["oauth"],
+        "secrets": {},
+        "oauth": {
+            "client_id": state.config.elevenlabs.oauth_client_id,
+            "authorize_url": crate::elevenlabs::ELEVENLABS_AUTHORIZE_URL,
+            "cimd_path": crate::elevenlabs::CIMD_PATH,
+            "callback_uri": crate::elevenlabs::oauth_callback_uri(),
+            "scope": state.config.elevenlabs.oauth_scope,
+        },
+    }));
     for (id, enabled, api_base, key_secret) in [
         (
             "tavily",
@@ -191,8 +210,8 @@ pub(super) async fn list_connectors(
             state.config.firecrawl.api_key_secret.as_str(),
         ),
         (
-            "elevenlabs",
-            state.config.elevenlabs.enabled,
+            "elevenlabs_api_key",
+            state.config.elevenlabs.api_key.enabled,
             state.config.elevenlabs.api_base.as_str(),
             state.config.elevenlabs.api_key_secret.as_str(),
         ),
@@ -207,29 +226,6 @@ pub(super) async fn list_connectors(
                 "api_key": secret_status(&state.secrets, Some(key_secret)),
             },
         }));
-        if id == "elevenlabs" {
-            let view = views.last_mut().expect("just pushed");
-            view["auth"] = json!(match state.config.elevenlabs.auth {
-                crate::config::ElevenLabsAuth::ApiKey => "api_key",
-                crate::config::ElevenLabsAuth::Oauth => "oauth",
-            });
-            view["auth_modes"] = json!(["api_key", "oauth"]);
-            view["secrets"]["access_token"] = secret_status(
-                &state.secrets,
-                Some(state.config.elevenlabs.oauth_access_token_secret.as_str()),
-            );
-            view["secrets"]["refresh_token"] = secret_status(
-                &state.secrets,
-                Some(state.config.elevenlabs.oauth_refresh_token_secret.as_str()),
-            );
-            view["oauth"] = json!({
-                "client_id": state.config.elevenlabs.oauth_client_id,
-                "authorize_url": crate::elevenlabs::ELEVENLABS_AUTHORIZE_URL,
-                "cimd_path": crate::elevenlabs::CIMD_PATH,
-                "callback_uri": crate::elevenlabs::oauth_callback_uri(),
-                "scope": state.config.elevenlabs.oauth_scope,
-            });
-        }
     }
     // Composio: a per-user key, so the card reports only this account's state.
     views.push(json!({
@@ -447,6 +443,7 @@ pub(super) async fn provider_oauth_complete(
     let credential = ProviderCredential {
         api_key: key,
         refresh_token: String::new(),
+        ..Default::default()
     };
     state.users.set(&user.id, &id, &credential.encode()?)?;
     state.runtime.invalidate_model_credentials(Some(&user.id));
@@ -480,6 +477,7 @@ pub(super) async fn set_provider_key(
     let credential = ProviderCredential {
         api_key: request.api_key.trim().to_owned(),
         refresh_token: String::new(),
+        ..Default::default()
     };
     state.users.set(&user.id, &id, &credential.encode()?)?;
     state.runtime.invalidate_model_credentials(Some(&user.id));
@@ -937,7 +935,7 @@ pub(super) async fn unlink_telegram(
 /// Console grouping only; it carries no security meaning.
 pub(super) fn connector_group(id: &str) -> &'static str {
     match id {
-        "elevenlabs" => "Voice & Media",
+        "elevenlabs" | "elevenlabs_api_key" => "Voice & Media",
         "tavily" | "firecrawl" => "Web Research",
         "agentmail" => "Email",
         "composio" => "Apps & tools",
@@ -955,14 +953,7 @@ pub(super) fn api_key_probe<'a>(config: &'a Config, id: &str) -> Option<ApiKeyPr
         )),
         "tavily" => Some(ApiKeyProbe::Tavily(&config.tavily.api_base)),
         "firecrawl" => Some(ApiKeyProbe::Firecrawl(&config.firecrawl.api_base)),
-        "elevenlabs" => Some(match config.elevenlabs.auth {
-            crate::config::ElevenLabsAuth::ApiKey => {
-                ApiKeyProbe::ElevenLabs(&config.elevenlabs.api_base)
-            }
-            crate::config::ElevenLabsAuth::Oauth => {
-                ApiKeyProbe::ElevenLabsOauth(&config.elevenlabs.api_base)
-            }
-        }),
+        "elevenlabs_api_key" => Some(ApiKeyProbe::ElevenLabs(&config.elevenlabs.api_base)),
         _ => None,
     }
 }
@@ -990,6 +981,14 @@ pub(super) async fn admin_test_connector(
             match probe_api_key(probe, &key).await {
                 Ok(()) => (true, "Key accepted".to_owned()),
                 Err(message) => (false, message),
+            }
+        }
+        // The sign-in is per account: the check is whether this account has one.
+        (None, None) if id == "elevenlabs" => {
+            if crate::elevenlabs_mcp::is_signed_in(&state.users, &user.id).map_err(admin_error)? {
+                (true, "Signed in with ElevenLabs for this account.".to_owned())
+            } else {
+                (false, "Not signed in with ElevenLabs for this account.".to_owned())
             }
         }
         (None, None) => (

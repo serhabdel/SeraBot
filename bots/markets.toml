@@ -5,6 +5,14 @@ trigger = "command"
 system_prompt = "prompts/markets.txt"
 skills = ["equity-research", "financial-analysis"]
 tools = [
+  "local_list",
+  "local_search",
+  "local_stat",
+  "local_read",
+  "local_read_many",
+  "local_extract",
+  "local_brief",
+  "local_import",
   "ask_user",
   "skill_list",
   "skill_search",

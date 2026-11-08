@@ -11,13 +11,11 @@ use serabot::audio::{
     AudioTranscribeTool, AudioUnderstandTool, MistralAudioClient, resolve_audio_provider,
 };
 use serabot::browser::{BrowserToolDeps, VaultResolver, register_browser_tools};
-use serabot::config::{Config, ElevenLabsAuth, load_bots};
+use serabot::config::{Config, load_bots};
 use serabot::connectors::register_connector_tools;
 use serabot::deck::Brand;
 use serabot::documents::index_directory;
 use serabot::documents::ingest_file;
-use serabot::elevenlabs::{ElevenLabsClient, register_elevenlabs_tools};
-use serabot::elevenlabs_mcp::{ElevenLabsMcp, register_elevenlabs_mcp_tools};
 use serabot::embeddings::{Embedder, FastEmbedder, LazyEmbedder};
 use serabot::error::SeraError;
 use serabot::fetch::SafeFetcher;
@@ -710,71 +708,37 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         ))?;
         registry.register(AudioUnderstandTool::new(audio_client, config.clone()))?;
     }
-    if config.elevenlabs.enabled {
-        let elevenlabs = match config.elevenlabs.auth {
-            ElevenLabsAuth::ApiKey => {
-                let api_key =
-                    secrets
-                        .require(&config.elevenlabs.api_key_secret)
-                        .map_err(|error| {
-                            anyhow::anyhow!(
-                                "{error}; run `serabot secrets set {}` before enabling ElevenLabs",
-                                config.elevenlabs.api_key_secret
-                            )
-                        })?;
-                Arc::new(ElevenLabsClient::new(
-                    &config.elevenlabs.api_base,
-                    api_key,
-                    config.elevenlabs.timeout_secs,
-                )?)
-            }
-            ElevenLabsAuth::Oauth => {
-                let access_token = secrets
-                    .require(&config.elevenlabs.oauth_access_token_secret)
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "{error}; sign in with ElevenLabs in the console first ({})",
-                            config.elevenlabs.oauth_access_token_secret
-                        )
-                    })?;
-                let refresh_token = secrets
-                    .require(&config.elevenlabs.oauth_refresh_token_secret)
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "{error}; sign in with ElevenLabs in the console first ({})",
-                            config.elevenlabs.oauth_refresh_token_secret
-                        )
-                    })?;
-                Arc::new(ElevenLabsClient::new_oauth(
-                    &config.elevenlabs.api_base,
-                    access_token,
-                    refresh_token,
-                    &config.elevenlabs.oauth_client_id,
-                    &config.elevenlabs.oauth_refresh_token_secret,
-                    Some(secrets.clone()),
-                    config.elevenlabs.timeout_secs,
-                )?)
-            }
-        };
-        if let Some(session) = elevenlabs.oauth_session() {
-            // Signed in with OAuth: also offer the hosted MCP server.
-            let mcp = Arc::new(ElevenLabsMcp::new(
-                &config.elevenlabs.mcp_url,
-                session,
-                artifacts.clone(),
-                config.elevenlabs.timeout_secs,
-            )?);
-            register_elevenlabs_mcp_tools(&mut registry, mcp, policy.clone())?;
+    // Before 0.24 the one ElevenLabs sign-in was server-wide. It moves to the
+    // owner's own credential once, and the server-wide names are removed. A
+    // failure is logged and boot goes on; the names stay for a later start.
+    let migrated = store.admin_user_id().and_then(|owner_id| {
+        serabot::elevenlabs_mcp::migrate_server_sign_in(
+            &secrets,
+            &users,
+            &owner_id,
+            &config.elevenlabs.oauth_access_token_secret,
+            &config.elevenlabs.oauth_refresh_token_secret,
+        )
+    });
+    match migrated {
+        Ok(true) => {
+            tracing::info!("moved the server-wide ElevenLabs sign-in to the owner's account")
         }
-        register_elevenlabs_tools(
-            &mut registry,
-            elevenlabs,
-            artifacts.clone(),
-            policy.clone(),
-            config.clone(),
-            config.elevenlabs.clone(),
-        )?;
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "could not move the server-wide ElevenLabs sign-in; it stays in place until a later start"
+        ),
     }
+    let elevenlabs = serabot::elevenlabs_mcp::register_elevenlabs_connectors(
+        &mut registry,
+        config.clone(),
+        &secrets,
+        users.clone(),
+        artifacts.clone(),
+        policy.clone(),
+        store.clone(),
+    )?;
 
     let shutdown = CancellationToken::new();
     let mut notifiers: Vec<Arc<dyn Notifier>> = Vec::new();
@@ -971,6 +935,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     let notifier = Arc::new(CompositeNotifier::new(notifiers));
 
     let startup_policy = policy.clone();
+    let media_policy = policy.clone();
     let gateway = Gateway::new(
         store.clone(),
         policy,
@@ -993,6 +958,13 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     )?;
 
     let worker = tokio::spawn(runtime.clone().run_worker());
+    // Background media jobs (0.24): polls provider renders until they finish.
+    let media_jobs = tokio::spawn(serabot::media_jobs::run_media_jobs(
+        store.clone(),
+        config.artifacts_dir(),
+        media_policy,
+        shutdown.clone(),
+    ));
     let mut services = Vec::new();
 
     if config.api.enabled {
@@ -1007,6 +979,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         )?
         .with_personal(personal_connectors.clone())
         .with_local_relay(local_relay.clone())
+        .with_elevenlabs(elevenlabs.clone())
         .with_browser(browser_manager.clone());
         if let Some(manager) = &browser_manager {
             // Closes idle sessions, and every session on shutdown.
@@ -1140,6 +1113,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     tracing::info!("shutdown requested");
     shutdown.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(20), worker).await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), media_jobs).await;
     for service in services {
         let _ = tokio::time::timeout(Duration::from_secs(10), service).await;
     }
@@ -1179,6 +1153,7 @@ fn store_admin_provider_login(
     let credential = serabot::user_secrets::ProviderCredential {
         api_key: api_key.to_owned(),
         refresh_token: refresh_token.to_owned(),
+        ..Default::default()
     };
     users.set(&admin, provider, &credential.encode()?)?;
     println!("stored the {provider} credential for the admin account");

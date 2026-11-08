@@ -178,30 +178,16 @@ pub fn editable_roles(connector: &ConnectorStatus) -> Vec<String> {
 }
 
 /// A connector the person signs in to (ElevenLabs): the server lists an OAuth
-/// sign-in for it and offers `oauth` as one of its auth modes.
+/// sign-in for it.
 pub fn supports_sign_in(connector: &ConnectorStatus) -> bool {
-    connector.oauth.is_some() && connector.auth_modes.iter().any(|mode| mode == "oauth")
+    connector.oauth.is_some()
 }
 
-fn secret_configured(connector: &ConnectorStatus, role: &str) -> bool {
-    connector
-        .secrets
-        .get(role)
-        .is_some_and(|secret| secret.configured)
-}
-
-/// Whether a server-wide card counts as connected. A sign-in connector is
-/// connected through whichever mode is active: stored sign-in tokens in
-/// `oauth` mode, the API key otherwise. Others keep the server's own answer.
-pub fn legacy_connected(connector: &ConnectorStatus, auth_mode: &str) -> bool {
+/// Whether a server-wide card counts as connected. A sign-in connector reports
+/// this account's own sign-in; others keep the server's own answer.
+pub fn legacy_connected(connector: &ConnectorStatus) -> bool {
     if supports_sign_in(connector) {
-        return if auth_mode == "oauth" {
-            INTERNAL_SECRET_ROLES
-                .iter()
-                .any(|role| secret_configured(connector, role))
-        } else {
-            secret_configured(connector, "api_key")
-        };
+        return connector.connected == Some(true);
     }
     connector.connected.unwrap_or_else(|| {
         connector
@@ -209,11 +195,6 @@ pub fn legacy_connected(connector: &ConnectorStatus, auth_mode: &str) -> bool {
             .iter()
             .any(|(role, secret)| !is_internal_role(role) && secret.configured)
     })
-}
-
-/// Whether a sign-in connector currently runs on a pasted API key.
-pub fn uses_api_key(connector: &ConnectorStatus, auth_mode: &str) -> bool {
-    supports_sign_in(connector) && auth_mode != "oauth" && secret_configured(connector, "api_key")
 }
 
 const GOOGLE_IDS: [&str; 4] = ["google_drive", "google_sheets", "google_calendar", "gmail"];
@@ -381,24 +362,11 @@ mod tests {
         ));
     }
 
-    fn elevenlabs(auth: &str, configured: &[&str]) -> ConnectorStatus {
-        let secrets = ["api_key", "access_token", "refresh_token"]
-            .into_iter()
-            .map(|role| {
-                (
-                    role.to_owned(),
-                    crate::SecretStatus {
-                        name: Some(format!("elevenlabs_{role}")),
-                        configured: configured.contains(&role),
-                    },
-                )
-            })
-            .collect();
+    /// The account sign-in card: an OAuth block, no server-wide secrets.
+    fn elevenlabs_sign_in(connected: Option<bool>) -> ConnectorStatus {
         ConnectorStatus {
             id: "elevenlabs".into(),
-            kind: "api_key".into(),
-            auth: Some(auth.into()),
-            auth_modes: vec!["api_key".into(), "oauth".into()],
+            kind: "oauth".into(),
             oauth: Some(crate::ConnectorOauth {
                 client_id: "https://example.example/client.json".into(),
                 authorize_url: None,
@@ -406,41 +374,26 @@ mod tests {
                 callback_uri: Some("http://127.0.0.1:1/cb".into()),
                 scope: None,
             }),
-            secrets,
+            connected,
             ..Default::default()
         }
     }
 
     #[test]
-    fn oauth_outputs_are_never_editable_fields() {
-        let card = elevenlabs("oauth", &["access_token", "refresh_token"]);
-        assert_eq!(editable_roles(&card), vec!["api_key".to_owned()]);
-        assert!(is_internal_role("access_token"));
-        assert!(is_internal_role("refresh_token"));
-        assert!(!is_internal_role("api_key"));
-        assert!(!is_internal_role("client_secret"));
-    }
-
-    #[test]
-    fn a_sign_in_connector_is_connected_through_its_active_mode() {
-        let signed_in = elevenlabs("oauth", &["access_token", "refresh_token"]);
-        assert!(supports_sign_in(&signed_in));
-        assert!(legacy_connected(&signed_in, "oauth"));
-        // Tokens left over from an earlier sign-in do not count once the key
-        // mode is active.
-        assert!(!legacy_connected(&signed_in, "api_key"));
-        let keyed = elevenlabs("api_key", &["api_key"]);
-        assert!(legacy_connected(&keyed, "api_key"));
-        assert!(uses_api_key(&keyed, "api_key"));
-        assert!(!legacy_connected(&keyed, "oauth"));
-        assert!(!legacy_connected(&elevenlabs("oauth", &[]), "oauth"));
+    fn the_sign_in_card_has_no_editable_fields_and_follows_this_account() {
+        let card = elevenlabs_sign_in(Some(true));
+        assert!(supports_sign_in(&card));
+        assert!(editable_roles(&card).is_empty());
+        assert!(legacy_connected(&card));
+        assert!(!legacy_connected(&elevenlabs_sign_in(Some(false))));
+        assert!(!legacy_connected(&elevenlabs_sign_in(None)));
     }
 
     #[test]
     fn plain_key_connectors_ignore_internal_roles_when_counting() {
         let mut tavily = status("tavily", None);
         assert!(!supports_sign_in(&tavily));
-        assert!(!legacy_connected(&tavily, ""));
+        assert!(!legacy_connected(&tavily));
         tavily.secrets.insert(
             "api_key".into(),
             crate::SecretStatus {
@@ -448,9 +401,9 @@ mod tests {
                 configured: true,
             },
         );
-        assert!(legacy_connected(&tavily, ""));
+        assert!(legacy_connected(&tavily));
         tavily.connected = Some(false);
-        assert!(!legacy_connected(&tavily, ""));
+        assert!(!legacy_connected(&tavily));
     }
 
     #[test]

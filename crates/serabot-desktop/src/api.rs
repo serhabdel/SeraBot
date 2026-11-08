@@ -21,6 +21,8 @@ pub use panel::*;
 pub use profiles::*;
 
 const MAX_RESPONSE: u64 = 2 * 1024 * 1024;
+/// Server cap for one artifact download (100 MiB).
+const MAX_ARTIFACT_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Seconds from the most recent `Retry-After` header on a 429 (0 = none seen).
 static LAST_RETRY_AFTER_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -294,13 +296,14 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
     "firecrawl_search",
     "firecrawl_crawl",
     "firecrawl_extract",
-    "elevenlabs_list_voices",
-    "elevenlabs_text_to_speech",
-    "elevenlabs_sound_effect",
-    "elevenlabs_transcribe",
-    "elevenlabs_generate_image",
-    "elevenlabs_generate_video",
-    "elevenlabs_mcp_list_tools",
+    "elevenlabs_key_list_voices",
+    "elevenlabs_key_text_to_speech",
+    "elevenlabs_key_sound_effect",
+    "elevenlabs_key_transcribe",
+    "elevenlabs_key_generate_image",
+    "elevenlabs_key_generate_video",
+    "elevenlabs_mcp_search_tools",
+    "elevenlabs_mcp_describe_tool",
     "elevenlabs_mcp_call",
     "deck_build",
     "docx_build",
@@ -1255,11 +1258,6 @@ pub struct ConnectorStatus {
     pub default_inbox_id: Option<String>,
     #[serde(default)]
     pub secrets: BTreeMap<String, SecretStatus>,
-    /// Current auth mode ("api_key" / "oauth"), when the connector has one.
-    #[serde(default)]
-    pub auth: Option<String>,
-    #[serde(default)]
-    pub auth_modes: Vec<String>,
     /// OAuth sign-in details when the server offers them.
     #[serde(default)]
     pub oauth: Option<ConnectorOauth>,
@@ -1331,9 +1329,6 @@ pub struct ConnectorUpdate {
     pub enabled: bool,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub values: BTreeMap<String, String>,
-    /// ElevenLabs only: "api_key" or "oauth".
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1759,6 +1754,10 @@ pub struct Message {
     /// Files the user attached to this (user) message.
     #[serde(default)]
     pub attachments: Vec<AttachmentInfo>,
+    /// True on the reply of a turn that a tool limit ended (0.24): the chat
+    /// offers Continue under it.
+    #[serde(default)]
+    pub limit_reached: bool,
 }
 
 /// One uploaded chat attachment as the server reports it. No server path.
@@ -1844,6 +1843,53 @@ pub struct ChatCard {
 struct CardListing {
     #[serde(default)]
     cards: Vec<ChatCard>,
+}
+
+/// One background media job (0.24), as the chat shows it. `kind` is `image`,
+/// `video` or `audio`; `status` is `pending`, `done`, `failed` or `expired`.
+/// The provider's error text is never shown; `error` is a short local reason.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct MediaJob {
+    pub id: String,
+    pub bot: String,
+    pub kind: String,
+    pub status: String,
+    #[serde(default)]
+    pub artifact_hash: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Deserialize)]
+struct MediaJobListing {
+    #[serde(default)]
+    media_jobs: Vec<MediaJob>,
+}
+
+/// One pair of per-turn work limits (0.24).
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub struct TurnLimitPair {
+    pub max_tool_calls_per_turn: usize,
+    pub max_tool_rounds: usize,
+}
+
+/// `GET /v1/settings/turn-limits`: what applies now, the config default, the
+/// server ceiling, and whether the owner set an override.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub struct TurnLimitsView {
+    pub max_tool_calls_per_turn: usize,
+    pub max_tool_rounds: usize,
+    pub default: TurnLimitPair,
+    pub ceiling: TurnLimitPair,
+    #[serde(default)]
+    pub overridden: bool,
+}
+
+#[derive(Serialize)]
+struct TurnLimitsBody {
+    max_tool_calls_per_turn: usize,
+    max_tool_rounds: usize,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -2234,6 +2280,49 @@ impl ApiClient {
             self.get(&["v1", "conversations", conversation, "cards"], &[])?;
         Ok(listing.cards)
     }
+
+    /// `GET /v1/conversations/{id}/media-jobs`: the owner's background media
+    /// jobs in this conversation (0.24), oldest first.
+    pub fn media_jobs(&self, conversation: &str) -> Result<Vec<MediaJob>, ApiError> {
+        check_id(conversation)?;
+        let listing: MediaJobListing =
+            self.get(&["v1", "conversations", conversation, "media-jobs"], &[])?;
+        Ok(listing.media_jobs)
+    }
+
+    /// `GET /v1/settings/turn-limits` (0.24).
+    pub fn turn_limits(&self) -> Result<TurnLimitsView, ApiError> {
+        self.request(
+            Method::GET,
+            &["v1", "settings", "turn-limits"],
+            &[],
+            None::<&()>,
+        )
+    }
+
+    /// `PUT /v1/settings/turn-limits` (0.24). The server refuses values
+    /// outside 1 to its ceiling.
+    pub fn set_turn_limits(&self, calls: usize, rounds: usize) -> Result<TurnLimitsView, ApiError> {
+        self.request(
+            Method::PUT,
+            &["v1", "settings", "turn-limits"],
+            &[],
+            Some(&TurnLimitsBody {
+                max_tool_calls_per_turn: calls,
+                max_tool_rounds: rounds,
+            }),
+        )
+    }
+
+    /// `DELETE /v1/settings/turn-limits` (0.24): back to the config defaults.
+    pub fn reset_turn_limits(&self) -> Result<TurnLimitsView, ApiError> {
+        self.request(
+            Method::DELETE,
+            &["v1", "settings", "turn-limits"],
+            &[],
+            None::<&()>,
+        )
+    }
     /// `PUT /v1/conversations/{id}/thinking`: set the conversation's thinking
     /// level (`None` goes back to the model's default).
     pub fn set_thinking(
@@ -2426,7 +2515,7 @@ impl ApiClient {
         if !valid_id(id) {
             return Err(ApiError::Validation("Invalid attachment id."));
         }
-        self.fetch_file(&["v1", "attachments", id], id)
+        self.fetch_file(&["v1", "attachments", id], id, MAX_ARTIFACT_BYTES)
     }
 
     pub fn submit(&self, conversation: &str, text: &str) -> Result<Task, ApiError> {
@@ -3528,12 +3617,32 @@ impl ApiClient {
         if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(ApiError::Validation("Invalid artifact hash."));
         }
-        self.fetch_file(&["v1", "artifacts", hash], hash)
+        self.fetch_file(&["v1", "artifacts", hash], hash, MAX_ARTIFACT_BYTES)
     }
 
-    /// Authenticated GET of a file route (artifact or own attachment). Server
-    /// cap 100 MiB; the filename comes from `content-disposition`.
-    fn fetch_file(&self, route: &[&str], fallback: &str) -> Result<(String, Vec<u8>), ApiError> {
+    /// Download one artifact for an inline player (0.24), refused above
+    /// `max_bytes`. A file the server says is larger is refused before its body
+    /// is read; otherwise the read stops at the cap.
+    pub fn artifact_capped(
+        &self,
+        hash: &str,
+        max_bytes: u64,
+    ) -> Result<(String, Vec<u8>), ApiError> {
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ApiError::Validation("Invalid artifact hash."));
+        }
+        self.fetch_file(&["v1", "artifacts", hash], hash, max_bytes)
+    }
+
+    /// Authenticated GET of a file route (artifact or own attachment). The
+    /// filename comes from `content-disposition`. Bodies above `max_bytes` are
+    /// refused.
+    fn fetch_file(
+        &self,
+        route: &[&str],
+        fallback: &str,
+        max_bytes: u64,
+    ) -> Result<(String, Vec<u8>), ApiError> {
         let mut url = self.endpoint.clone();
         url.path_segments_mut()
             .map_err(|_| ApiError::InvalidResponse)?
@@ -3546,6 +3655,9 @@ impl ApiClient {
             .send()
             .map_err(|_| ApiError::Transport)?;
         let status = response.status();
+        if status.is_success() && response.content_length().is_some_and(|len| len > max_bytes) {
+            return Err(ApiError::TooLarge);
+        }
         let filename = response
             .headers()
             .get("content-disposition")
@@ -3555,13 +3667,12 @@ impl ApiClient {
             .map(str::trim)
             .filter(|name| !name.is_empty() && name.chars().count() <= 256)
             .map(str::to_owned);
-        const MAX_ARTIFACT: u64 = 100 * 1024 * 1024;
         let mut bytes = Zeroizing::new(Vec::new());
         response
-            .take(MAX_ARTIFACT + 1)
+            .take(max_bytes + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| ApiError::Transport)?;
-        if bytes.len() as u64 > MAX_ARTIFACT {
+        if bytes.len() as u64 > max_bytes {
             return Err(ApiError::TooLarge);
         }
         if !status.is_success() {
@@ -3856,6 +3967,18 @@ impl ApiClient {
             code,
             verifier,
             redirect_uri,
+        )
+    }
+
+    /// Forget the acting account's sign-in for a connector (ElevenLabs).
+    pub fn admin_connector_oauth_disconnect(&self, id: &str) -> Result<AdminAck, ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Connector id is not valid."));
+        }
+        self.admin_request(
+            Method::DELETE,
+            &["v1", "admin", "connectors", id, "oauth"],
+            &serde_json::json!({}),
         )
     }
 
@@ -5133,5 +5256,56 @@ mod tests {
         let mut empty_code = link;
         empty_code.code.clear();
         assert!(check_telegram_link(empty_code).is_err());
+    }
+
+    /// Answers one connection on a loopback port with `response`.
+    fn serve_once(response: Vec<u8>) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(&response);
+            }
+        });
+        port
+    }
+
+    fn client_for(port: u16) -> ApiClient {
+        let endpoint = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        ApiClient::new(endpoint, SecretString::new("t".repeat(40))).unwrap()
+    }
+
+    #[test]
+    fn a_preview_download_is_refused_above_its_cap() {
+        let hash = "a".repeat(64);
+        // The server declares 1000 bytes: refused before the body is read.
+        let declared = client_for(serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n".to_vec(),
+        ));
+        assert!(matches!(
+            declared.artifact_capped(&hash, 100),
+            Err(ApiError::TooLarge)
+        ));
+        // No declared length: the read stops past the cap and is refused.
+        let mut undeclared = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+        undeclared.extend(std::iter::repeat_n(b'x', 200));
+        assert!(matches!(
+            client_for(serve_once(undeclared)).artifact_capped(&hash, 100),
+            Err(ApiError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn a_preview_download_within_its_cap_returns_the_file() {
+        let hash = "b".repeat(64);
+        let response = b"HTTP/1.1 200 OK\r\nContent-Disposition: attachment; filename=\"clip.mp4\"\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_vec();
+        let (filename, bytes) = client_for(serve_once(response))
+            .artifact_capped(&hash, 100)
+            .unwrap();
+        assert_eq!(filename, "clip.mp4");
+        assert_eq!(bytes, b"hello");
     }
 }

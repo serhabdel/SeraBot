@@ -34,6 +34,7 @@ use crate::ui_files::{
 use crate::ui_settings::SettingsPanel;
 use crate::ui_settings_page::{
     AboutCard, AppearanceCard, ChatPrefsCard, LocalFoldersCard, NotificationsCard, SettingsNav,
+    TurnLimitsCard,
 };
 use crate::ui_usage::UsagePage;
 use crate::ui_vault::VaultPage;
@@ -78,6 +79,8 @@ struct MsgView {
     edit: bool,
     /// The last bot reply while idle: Regenerate sends this text again.
     regen: Option<String>,
+    /// The newest reply a tool limit ended, while idle: offers Continue (0.24).
+    continue_offer: bool,
 }
 
 /// A roster row: bot id, display name, avatar, enabled, live, role.
@@ -333,12 +336,15 @@ fn capability_label(tool: &str) -> Option<&'static str> {
         "fetch_url" | "watch_now" | "firecrawl_scrape" | "firecrawl_map" | "firecrawl_search"
         | "firecrawl_crawl" | "exa_search" | "exa_get_contents" => Some("Web research"),
         "audio_transcribe" | "audio_understand" => Some("Audio notes"),
-        "elevenlabs_text_to_speech"
-        | "elevenlabs_sound_effect"
-        | "elevenlabs_transcribe"
-        | "elevenlabs_generate_image"
-        | "elevenlabs_generate_video" => Some("Voice and media"),
-        "elevenlabs_mcp_list_tools" | "elevenlabs_mcp_call" => Some("ElevenLabs tools"),
+        "elevenlabs_key_list_voices"
+        | "elevenlabs_key_text_to_speech"
+        | "elevenlabs_key_sound_effect"
+        | "elevenlabs_key_transcribe"
+        | "elevenlabs_key_generate_image"
+        | "elevenlabs_key_generate_video" => Some("Voice and media"),
+        "elevenlabs_mcp_search_tools" | "elevenlabs_mcp_describe_tool" | "elevenlabs_mcp_call" => {
+            Some("ElevenLabs tools")
+        }
         "onedrive_upload" | "onedrive_list" => Some("OneDrive files"),
         "github_search_repos"
         | "github_list_issues"
@@ -2976,6 +2982,8 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                 } else {
                     None
                 },
+                continue_offer: idle
+                    && serabot_desktop::media_view::offers_continue(&state.state.messages, index),
             });
         }
         rows
@@ -3466,6 +3474,16 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                                 onclick: move |_| session.write().regenerate(text.clone()),
                                                 Icon { name: "refresh", size: 13 }
                                                 span { class: "msg-action-label", "Regenerate" }
+                                            }
+                                        }
+                                        if row.continue_offer {
+                                            button {
+                                                class: "msg-action",
+                                                "aria-label": "Continue from where the bot stopped",
+                                                title: "Ask the bot to carry on from its tool limit",
+                                                onclick: move |_| session.write().continue_from_limit(),
+                                                Icon { name: "refresh", size: 13 }
+                                                span { class: "msg-action-label", "Continue" }
                                             }
                                         }
                                     }
@@ -6202,6 +6220,7 @@ fn SettingsView(session: Signal<Session>) -> Element {
         }
         if sel == SettingsSection::Chat {
             ChatPrefsCard { session }
+            TurnLimitsCard { session }
         }
         if sel == SettingsSection::LocalFolders {
             LocalFoldersCard { session }

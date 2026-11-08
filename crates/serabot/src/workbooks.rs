@@ -839,18 +839,28 @@ pub fn import(bytes: &[u8]) -> Result<Workbook> {
 pub fn plain_text(bytes: &[u8], max_chars: usize) -> Result<String> {
     let (workbook, _) = load(bytes)?;
     let mut out = String::new();
+    // Characters written and cells visited so far. A sparse sheet visits only
+    // its stored cells, and the cell budget bounds that work too.
+    let mut written = 0usize;
+    let mut visited = 0usize;
+    let mut cut = false;
     for sheet in &workbook.sheets {
-        if out.chars().count() >= max_chars {
+        if written >= max_chars || visited >= PLAIN_TEXT_MAX_CELLS {
+            cut = true;
             break;
         }
         let Some(used) = sheet.cells.used_range() else {
             continue;
         };
-        out.push_str(&format!("# {}\n", sheet.name));
+        let header = format!("# {}\n", sheet.name);
+        written += header.chars().count();
+        out.push_str(&header);
         for (cell_ref, cell) in sheet.cells.iter_range(used) {
-            if out.chars().count() >= max_chars {
+            if written >= max_chars || visited >= PLAIN_TEXT_MAX_CELLS {
+                cut = true;
                 break;
             }
+            visited += 1;
             let record = cell_record(&workbook, sheet, cell_ref, cell);
             let value = match (&record.formula, &record.cached, &record.value) {
                 (Some(formula), cached, _) => match cached {
@@ -863,11 +873,19 @@ pub fn plain_text(bytes: &[u8], max_chars: usize) -> Result<String> {
             if value.trim().is_empty() {
                 continue;
             }
-            out.push_str(&format!("{}!{}: {value}\n", sheet.name, cell_ref.a1()));
+            let line = format!("{}!{}: {value}\n", sheet.name, cell_ref.a1());
+            written += line.chars().count();
+            out.push_str(&line);
         }
+    }
+    if cut {
+        out.push_str("[more cells not shown: text limit reached]\n");
     }
     Ok(out)
 }
+
+/// Cells one [`plain_text`] pass visits, empty ones included.
+const PLAIN_TEXT_MAX_CELLS: usize = 200_000;
 
 /// Read the values of one worksheet range, so a caller can see what is in a cell before editing
 /// it. Read-only: nothing is written and no artifact is produced.
@@ -2707,8 +2725,16 @@ impl Tool for XlsxImportTool {
             (Some(path), None) => {
                 let artifacts = self.artifacts.clone();
                 let inbox = self.inbox.clone();
+                let user_id = context.user_id.clone();
                 let (stored, summary) = tokio::task::spawn_blocking(move || {
-                    artifacts.ingest_inbox_file(&inbox, &path, &["xlsx"], MAX_INPUT_BYTES, import)
+                    artifacts.ingest_inbox_file(
+                        &inbox,
+                        &user_id,
+                        &path,
+                        &["xlsx"],
+                        MAX_INPUT_BYTES,
+                        import,
+                    )
                 })
                 .await
                 .map_err(|error| SeraError::Internal(format!("workbook task failed: {error}")))??;
@@ -4061,13 +4087,17 @@ mod tests {
         let artifacts = Arc::new(ArtifactStore::new(dir.path().join("artifacts")).unwrap());
         let store = Store::open_in_memory(384).unwrap();
         let inbox = dir.path().join("inbox");
-        std::fs::create_dir_all(&inbox).unwrap();
+        let owner = inbox.join(crate::store::ADMIN_USER_ID);
+        std::fs::create_dir_all(&owner).unwrap();
         let bytes = build(&spec()).unwrap();
-        std::fs::write(inbox.join("owner.xlsx"), &bytes).unwrap();
+        std::fs::write(owner.join("owner.xlsx"), &bytes).unwrap();
 
         let tool = XlsxImportTool::new(artifacts.clone(), store, &inbox).unwrap();
         let output = tool
-            .execute(json!({"path": "owner.xlsx"}), &context("xlsx_import"))
+            .execute(
+                json!({"path": format!("{}/owner.xlsx", crate::store::ADMIN_USER_ID)}),
+                &context("xlsx_import"),
+            )
             .await
             .unwrap();
         let hash = output.artifact_hash.unwrap();

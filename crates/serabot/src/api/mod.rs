@@ -60,9 +60,11 @@ mod connectors;
 mod conversations;
 mod files;
 mod local;
+mod media;
 mod memories;
 mod messages;
 mod profiles;
+mod settings;
 mod skills;
 mod status;
 #[cfg(test)]
@@ -78,8 +80,10 @@ use cards::*;
 use composio::*;
 use connectors::*;
 use conversations::*;
+use media::*;
 use memories::*;
 use messages::*;
+use settings::*;
 use skills::*;
 use status::*;
 use vault::*;
@@ -148,6 +152,9 @@ pub struct ApiState {
     composio: Arc<crate::composio::ComposioService>,
     /// Per-user GitHub, Todoist, Slack and Exa tokens.
     token_connectors: Arc<crate::token_connectors::TokenConnectors>,
+    /// The ElevenLabs MCP service, shared with the tools; `None` while the
+    /// "ElevenLabs" connector is off. Sign-in and sign-out drop its session.
+    elevenlabs: Option<Arc<crate::elevenlabs_mcp::ElevenLabsMcp>>,
     token_hash: String,
     /// Per-user request buckets for the per-minute limit. Keyed by the
     /// acting user id (never a token); public sign-in routes without an
@@ -220,6 +227,7 @@ impl ApiState {
             personal,
             composio,
             token_connectors,
+            elevenlabs: None,
             token_hash: config.api.token_hash.to_ascii_lowercase(),
             rate: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: config.server.rate_limit_per_minute.max(1) as usize,
@@ -249,6 +257,16 @@ impl ApiState {
     /// disconnect also drops the tools' cached access tokens.
     pub fn with_personal(mut self, personal: Arc<PersonalConnectors>) -> Self {
         self.personal = personal;
+        self
+    }
+
+    /// Share the ElevenLabs MCP service the tools use, so a sign-in or
+    /// sign-out drops that account's cached session and catalog.
+    pub fn with_elevenlabs(
+        mut self,
+        elevenlabs: Option<Arc<crate::elevenlabs_mcp::ElevenLabsMcp>>,
+    ) -> Self {
+        self.elevenlabs = elevenlabs;
         self
     }
 
@@ -401,6 +419,10 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/connectors/{id}/oauth/complete",
             post(admin_connector_oauth_complete),
         )
+        .route(
+            "/v1/admin/connectors/{id}/oauth",
+            delete(admin_connector_oauth_disconnect),
+        )
         .route("/v1/admin/audio", put(admin_set_audio))
         .route(
             "/v1/settings/voice",
@@ -427,7 +449,17 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/conversations/{id}/library", get(conversation_library))
         .route("/v1/conversations/{id}/plan", get(get_conversation_plan))
+        .route(
+            "/v1/settings/turn-limits",
+            get(get_turn_limits)
+                .put(put_turn_limits)
+                .delete(reset_turn_limits),
+        )
         .route("/v1/conversations/{id}/cards", get(list_conversation_cards))
+        .route(
+            "/v1/conversations/{id}/media-jobs",
+            get(list_conversation_media_jobs),
+        )
         .route("/v1/cards/{id}/answer", post(answer_card))
         .route("/v1/cards/{id}/decline", post(decline_card))
         // A secret value is at most 8 KiB; the route reads no more than 16 KiB.
