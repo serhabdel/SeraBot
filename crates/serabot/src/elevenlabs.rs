@@ -29,7 +29,7 @@ use crate::policy::Policy;
 use crate::secrets::SharedSecrets;
 use crate::util::truncate_chars;
 
-const MAX_FLOW_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
+pub(crate) const MAX_FLOW_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
 const MAX_SOUND_PROMPT_CHARS: usize = 500;
 const MAX_IMAGE_PROMPT_CHARS: usize = 4_000;
 const MAX_VIDEO_PROMPT_CHARS: usize = 4_000;
@@ -39,6 +39,8 @@ const MAX_VIDEO_PROMPT_CHARS: usize = 4_000;
 // Endpoints are pinned to the documented ElevenLabs authorization server
 // (global/US region). Loopback URLs are accepted only in tests.
 pub const ELEVENLABS_AUTHORIZE_URL: &str = "https://elevenlabs.io/app/oauth/authorize";
+/// ElevenLabs hosted MCP server (Streamable HTTP; OAuth bearer, no API key).
+pub const ELEVENLABS_MCP_URL: &str = "https://api.elevenlabs.io/v1/mcp";
 pub const ELEVENLABS_TOKEN_URL: &str = "https://api.us.elevenlabs.io/v1/oauth/token";
 /// Public host that serves this server's client metadata document.
 pub const PUBLIC_HOST: &str = "bot.seradyx.tech";
@@ -360,7 +362,7 @@ enum ClientAuth {
     Oauth(Arc<OauthSession>),
 }
 
-struct OauthSession {
+pub struct OauthSession {
     tokens: tokio::sync::Mutex<OauthTokens>,
     client_id: String,
     token_url: String,
@@ -379,7 +381,7 @@ impl OauthSession {
     /// Current access token, refreshing first when missing or near expiry
     /// (30 s skew). A rotated refresh token is persisted to the age store;
     /// a failed write fails the call so the rotation is never lost.
-    async fn current_access_token(&self) -> Result<SecretString> {
+    pub(crate) async fn current_access_token(&self) -> Result<SecretString> {
         let mut guard = self.tokens.lock().await;
         let stale = match guard.expires_at {
             Some(at) => at <= Utc::now() + ChronoDuration::seconds(30),
@@ -416,7 +418,7 @@ impl OauthSession {
         Ok(guard.access_token.clone())
     }
 
-    async fn invalidate(&self) {
+    pub(crate) async fn invalidate(&self) {
         self.tokens.lock().await.expires_at = None;
     }
 }
@@ -485,9 +487,8 @@ impl ElevenLabsClient {
     }
 
     /// `new_oauth` against an explicit token URL (loopback in tests).
-    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
-    fn new_oauth_at(
+    pub(crate) fn new_oauth_at(
         base_url: impl Into<String>,
         access_token: impl Into<String>,
         refresh_token: impl Into<String>,
@@ -535,6 +536,14 @@ impl ElevenLabsClient {
             base_url,
             auth,
         })
+    }
+
+    /// The OAuth session behind this client, when signed in with OAuth.
+    pub fn oauth_session(&self) -> Option<Arc<OauthSession>> {
+        match &self.auth {
+            ClientAuth::Oauth(session) => Some(session.clone()),
+            ClientAuth::ApiKey(_) => None,
+        }
     }
 
     async fn auth_headers(&self) -> Result<HeaderMap> {
@@ -740,7 +749,7 @@ impl ElevenLabsClient {
                     .json(body))
             })
             .await?;
-        let value = read_json_response(response, "flow create").await?;
+        let value = read_json_response(response, &format!("flow create {path}")).await?;
         let id = value
             .get("id")
             .and_then(Value::as_str)
@@ -763,7 +772,7 @@ impl ElevenLabsClient {
                     .headers(headers))
             })
             .await?;
-        read_json_response(response, "flow status").await
+        read_json_response(response, &format!("flow status {path}")).await
     }
 
     pub async fn poll_flow<F>(
@@ -806,6 +815,9 @@ impl ElevenLabsClient {
                         .get("error_message")
                         .and_then(Value::as_str)
                         .unwrap_or("generation failed");
+                    if let Some(plan) = plan_error_message(None, message) {
+                        return Err(SeraError::External(plan.into()));
+                    }
                     return Err(SeraError::External(format!(
                         "ElevenLabs generation failed: {message}"
                     )));
@@ -885,7 +897,7 @@ struct ElevenLabsToolDeps {
     config: ElevenLabsConfig,
 }
 
-fn check_outbound_text(policy: &Policy, text: &str) -> Result<()> {
+pub(crate) fn check_outbound_text(policy: &Policy, text: &str) -> Result<()> {
     if !policy.is_allowed(text) {
         return Err(SeraError::PolicyViolation);
     }
@@ -941,11 +953,16 @@ fn mime_for_filename(filename: &str) -> &'static str {
     }
 }
 
-fn extension_for_mime(mime: &str) -> &'static str {
+pub(crate) fn extension_for_mime(mime: &str) -> &'static str {
     match mime {
-        "audio/mpeg" => "mp3",
+        "audio/mpeg" | "audio/mp3" => "mp3",
         "audio/wav" | "audio/x-wav" => "wav",
         "audio/ogg" => "ogg",
+        "audio/flac" => "flac",
+        "audio/aac" => "aac",
+        "audio/mp4" => "m4a",
+        "audio/webm" => "weba",
+        "image/gif" => "gif",
         "image/png" => "png",
         "image/jpeg" => "jpg",
         "image/webp" => "webp",
@@ -962,10 +979,7 @@ async fn read_json_response(response: reqwest::Response, context: &str) -> Resul
         .await
         .map_err(|error| SeraError::External(format!("{context} read failed: {error}")))?;
     if !status.is_success() {
-        return Err(SeraError::External(format!(
-            "{context} failed with status {status}: {}",
-            sanitize_provider_error(&bytes)
-        )));
+        return Err(provider_failure(context, status.as_u16(), &bytes));
     }
     serde_json::from_slice(&bytes)
         .map_err(|error| SeraError::External(format!("{context} returned invalid JSON: {error}")))
@@ -984,10 +998,7 @@ async fn read_bytes_response(response: reqwest::Response, context: &str) -> Resu
         .await
         .map_err(|error| SeraError::External(format!("{context} read failed: {error}")))?;
     if !status.is_success() {
-        return Err(SeraError::External(format!(
-            "{context} failed with status {status}: {}",
-            sanitize_provider_error(&bytes)
-        )));
+        return Err(provider_failure(context, status.as_u16(), &bytes));
     }
     if content_type.contains("json") {
         return Err(SeraError::External(format!(
@@ -998,7 +1009,53 @@ async fn read_bytes_response(response: reqwest::Response, context: &str) -> Resu
     Ok(bytes.to_vec())
 }
 
-fn sanitize_provider_error(body: &[u8]) -> String {
+/// Shown when ElevenLabs refuses image or video because of the plan.
+pub const PLAN_IMAGE_VIDEO_MESSAGE: &str = "Your ElevenLabs plan does not include image and video. Upgrade at elevenlabs.io/pricing, or ask for voice or sound instead.";
+/// Shown when ElevenLabs refuses anything else because of plan or quota.
+pub const PLAN_GENERIC_MESSAGE: &str = "Your ElevenLabs plan does not include this, or its credits are used up. Upgrade at elevenlabs.io/pricing, or ask for something your plan includes.";
+
+/// A clear plan/quota message when ElevenLabs refused because of the
+/// subscription (HTTP 402, or wording such as "requires a Pro plan",
+/// "quota exceeded", "insufficient credits"); `None` for other failures.
+pub(crate) fn plan_error_message(status: Option<u16>, text: &str) -> Option<&'static str> {
+    let lower = text.to_ascii_lowercase();
+    let has = |needle: &str| lower.contains(needle);
+    let plan_words = has("plan")
+        && (has("require") || has("upgrade") || has("not include") || has("available on"));
+    let quota_words = (has("quota") || has("credit"))
+        && (has("exceed")
+            || has("insufficient")
+            || has("not enough")
+            || has("out of")
+            || has("exhaust"));
+    let hit = status == Some(402)
+        || plan_words
+        || quota_words
+        || has("payment_required")
+        || has("paid_plan_required");
+    if !hit {
+        return None;
+    }
+    if has("image") || has("video") || has("flows") {
+        Some(PLAN_IMAGE_VIDEO_MESSAGE)
+    } else {
+        Some(PLAN_GENERIC_MESSAGE)
+    }
+}
+
+/// The error for a non-success provider answer: a plan message when the
+/// plan or quota is the cause, the sanitized provider text otherwise.
+fn provider_failure(context: &str, status: u16, body: &[u8]) -> SeraError {
+    let text = sanitize_provider_error(body);
+    // The request context (flows/image, flows/video) refines the message.
+    let probe = format!("{context} {text}");
+    if let Some(message) = plan_error_message(Some(status).filter(|s| *s == 402), &probe) {
+        return SeraError::External(message.into());
+    }
+    SeraError::External(format!("{context} failed with status {status}: {text}"))
+}
+
+pub(crate) fn sanitize_provider_error(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
     let parsed: Option<Value> = serde_json::from_str(&text).ok();
     parsed
@@ -1024,7 +1081,7 @@ fn sanitize_provider_error(body: &[u8]) -> String {
         .collect()
 }
 
-fn store_media_artifact(
+pub(crate) fn store_media_artifact(
     artifacts: &ArtifactStore,
     bytes: &[u8],
     filename: &str,
@@ -1773,6 +1830,48 @@ mod tests {
             .mount(&api)
             .await;
         mock_client(&api).list_voices(1, None).await.unwrap();
+    }
+
+    #[test]
+    fn plan_and_quota_wording_maps_to_a_clear_message() {
+        assert_eq!(
+            plan_error_message(None, "Image & Video requires a Pro plan or above"),
+            Some(PLAN_IMAGE_VIDEO_MESSAGE)
+        );
+        assert_eq!(
+            plan_error_message(Some(402), "flow create /v1/flows/video"),
+            Some(PLAN_IMAGE_VIDEO_MESSAGE)
+        );
+        assert_eq!(
+            plan_error_message(None, "quota_exceeded: you have insufficient credits"),
+            Some(PLAN_GENERIC_MESSAGE)
+        );
+        assert_eq!(
+            plan_error_message(Some(402), "text-to-speech"),
+            Some(PLAN_GENERIC_MESSAGE)
+        );
+        assert_eq!(plan_error_message(Some(500), "internal error"), None);
+        assert_eq!(plan_error_message(Some(403), "invalid api key"), None);
+    }
+
+    #[tokio::test]
+    async fn image_plan_refusal_is_reported_as_a_plan_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/flows/image"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                "detail": {"status": "forbidden", "message": "Image & Video requires a Pro plan or above"}
+            })))
+            .mount(&server)
+            .await;
+        let error = mock_client(&server)
+            .create_image("m", "a cube", "1:1")
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().ends_with(PLAN_IMAGE_VIDEO_MESSAGE),
+            "{error}"
+        );
     }
 
     #[test]

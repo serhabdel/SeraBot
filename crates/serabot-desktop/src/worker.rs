@@ -55,6 +55,8 @@ pub enum OperationKind {
     Library,
     ChatPlan,
     ChatAutoApprove,
+    /// Set the open conversation's thinking level.
+    Thinking,
     /// Stop the running turn(s) of the open conversation.
     StopTurn,
     FetchArtifact,
@@ -185,6 +187,10 @@ pub enum Operation {
     ChatPlan,
     SetAutoApprove {
         enabled: bool,
+    },
+    /// Set (or with None, clear) the open conversation's thinking level.
+    SetThinking {
+        level: Option<String>,
     },
     /// Ask the open conversation's running turns to stop.
     StopTurn,
@@ -340,6 +346,7 @@ impl Operation {
             Self::Library => OperationKind::Library,
             Self::ChatPlan => OperationKind::ChatPlan,
             Self::SetAutoApprove { .. } => OperationKind::ChatAutoApprove,
+            Self::SetThinking { .. } => OperationKind::Thinking,
             Self::StopTurn => OperationKind::StopTurn,
             Self::FetchArtifact { .. } => OperationKind::FetchArtifact,
             Self::TranscribeAudio { .. } => OperationKind::Transcribe,
@@ -409,6 +416,8 @@ pub enum Reply {
         auto_approve: bool,
     },
     AutoApprove(bool),
+    /// The thinking level the server stored for the open conversation.
+    Thinking(Option<String>),
     /// Turns marked to stop (0 when nothing was running).
     Stopping(usize),
     Artifact {
@@ -797,6 +806,9 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::SetAutoApprove { enabled } => client
             .set_auto_approve(conversation, *enabled)
             .map(Reply::AutoApprove),
+        Operation::SetThinking { level } => client
+            .set_thinking(conversation, level.as_deref())
+            .map(Reply::Thinking),
         Operation::StopTurn => client.stop_conversation(conversation).map(Reply::Stopping),
         Operation::FetchArtifact { hash } => {
             client

@@ -34,6 +34,8 @@ pub struct State {
     pub task: Option<Task>,
     /// Live steps of the latest turn, from the event stream.
     pub activity: crate::activity::Activity,
+    /// Which bots are working now (rail, header and room rings).
+    pub working: crate::working::WorkingBots,
     pub approvals: Vec<Approval>,
     pub approvals_loaded: bool,
     pub conversations: Vec<ConversationSummary>,
@@ -125,6 +127,7 @@ impl Default for State {
             history_loaded: false,
             task: None,
             activity: Default::default(),
+            working: Default::default(),
             approvals: Vec::new(),
             approvals_loaded: false,
             conversations: Vec::new(),
@@ -451,6 +454,11 @@ impl State {
                 self.auto_approve = auto_approve;
             }
             Reply::AutoApprove(enabled) => self.auto_approve = enabled,
+            Reply::Thinking(level) => {
+                if let Some(catalog) = self.catalog.as_mut() {
+                    catalog.thinking.level = level;
+                }
+            }
             Reply::Transcribed(transcription) => {
                 self.transcript = Some(transcription.text);
                 self.transcript_error = None;
@@ -566,6 +574,21 @@ mod tests {
 
     fn catalog() -> Catalog {
         serde_json::from_str(r#"{"providers":[{"id":"approved","models":["small","large"],"data_egress_approved":true}],"selection":{"provider":"approved","model":"small"}}"#).unwrap()
+    }
+
+    #[test]
+    fn thinking_reply_updates_the_catalog_level() {
+        let mut state = State::default();
+        state.new_scope("first".into(), false);
+        let scope = state.scope.clone();
+        state.receive(&scope, Reply::Catalog(catalog()));
+        state.receive(&scope, Reply::Thinking(Some("high".into())));
+        assert_eq!(
+            state.catalog.as_ref().unwrap().thinking.level.as_deref(),
+            Some("high")
+        );
+        state.receive(&scope, Reply::Thinking(None));
+        assert!(state.catalog.as_ref().unwrap().thinking.level.is_none());
     }
 
     #[test]

@@ -300,6 +300,8 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
     "elevenlabs_transcribe",
     "elevenlabs_generate_image",
     "elevenlabs_generate_video",
+    "elevenlabs_mcp_list_tools",
+    "elevenlabs_mcp_call",
     "deck_build",
     "docx_build",
     "docx_import",
@@ -381,9 +383,10 @@ pub const MAX_SKILL_DESCRIPTION_CHARS: usize = 500;
 pub const MAX_SKILL_BODY_BYTES: usize = 96_000;
 const MAX_SKILL_LIST: usize = 256;
 const MAX_BOT_LIST: usize = 64;
-const MAX_BOT_SUMMARY_ITEMS: usize = 64;
+/// Matches the server's 128-tool bot cap (every ability on is ~96 tools).
+const MAX_BOT_SUMMARY_ITEMS: usize = 128;
 /// Cap for every string array on a bot detail or bot config update.
-pub const MAX_BOT_CONFIG_ITEMS: usize = 64;
+pub const MAX_BOT_CONFIG_ITEMS: usize = 128;
 /// Bounds for the optional instructions blob of a bot detail.
 const MAX_BOT_INSTRUCTIONS_CHARS: usize = 96_000;
 const MAX_BOT_INSTRUCTIONS_BYTES: usize = 512_000;
@@ -534,6 +537,29 @@ pub fn valid_bot_description(text: &str) -> bool {
             .any(|c| c.is_control() && c != '\n' && c != '\t')
 }
 
+/// Rules for EDITING an existing bot's tools (bot settings, config update).
+///
+/// Unlike [`validate_tool_list`] (new specialists), an edit may carry tools
+/// the console cannot grant itself but the bot already has: `delegate` on the
+/// orchestrator, or a tool whose connector is switched off (`tavily_search`).
+/// Those are server-owned, so this only checks shape, count and uniqueness;
+/// the server checks role and registry and stays authoritative.
+pub fn validate_tool_edit(tools: &[String]) -> Result<(), ApiError> {
+    if tools.len() > MAX_BOT_CONFIG_ITEMS {
+        return Err(ApiError::Validation("A bot can hold at most 128 tools."));
+    }
+    let mut seen = HashSet::with_capacity(tools.len());
+    for tool in tools {
+        if !valid_speaker(tool) {
+            return Err(ApiError::Validation("A tool name is not valid."));
+        }
+        if !seen.insert(tool.as_str()) {
+            return Err(ApiError::Validation("Each tool can be selected once."));
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_tool_list(tools: &[String]) -> Result<(), ApiError> {
     if tools.len() > MAX_SCAFFOLD_TOOLS {
         return Err(ApiError::Validation("Choose at most 32 specialist tools."));
@@ -595,7 +621,7 @@ pub fn validate_bot_config_update(update: &BotConfigUpdate) -> Result<(), ApiErr
     {
         if items.len() > MAX_BOT_CONFIG_ITEMS {
             return Err(ApiError::Validation(
-                "Each list can hold at most 64 entries.",
+                "Each list can hold at most 128 entries.",
             ));
         }
         let mut seen = HashSet::with_capacity(items.len());
@@ -606,13 +632,7 @@ pub fn validate_bot_config_update(update: &BotConfigUpdate) -> Result<(), ApiErr
         }
     }
     if let Some(tools) = &update.tools {
-        for tool in tools {
-            if tool == "delegate" || !SPECIALIST_TOOLS.contains(&tool.as_str()) {
-                return Err(ApiError::Validation(
-                    "Choose tools from the specialist list.",
-                ));
-            }
-        }
+        validate_tool_edit(tools)?;
     }
     if let Some(skills) = &update.skills {
         for skill in skills {
@@ -833,6 +853,12 @@ pub struct BotDetail {
     /// The browser profile this bot uses; `None` means the default profile.
     #[serde(default)]
     pub browser_profile: Option<String>,
+    /// The bot's thinking level; `None` means the model's default.
+    #[serde(default)]
+    pub thinking: Option<String>,
+    /// Levels the bot's model accepts; empty when it has no thinking control.
+    #[serde(default)]
+    pub thinking_levels: Vec<String>,
 }
 
 /// Body of `PUT /v1/admin/bots/{id}/config`. Every field is optional; the
@@ -1572,6 +1598,34 @@ pub struct CatalogEntry {
     pub context_length: Option<u64>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Thinking levels the model accepts, weakest first; empty when it has
+    /// no thinking control.
+    #[serde(default)]
+    pub thinking: Vec<String>,
+}
+
+/// The open conversation's thinking level and the levels its model accepts.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct ThinkingInfo {
+    /// The level the owner picked, or `None` for the model's default.
+    #[serde(default)]
+    pub level: Option<String>,
+    #[serde(default)]
+    pub levels: Vec<String>,
+}
+
+/// A plain label for a thinking level.
+pub fn thinking_label(level: &str) -> &'static str {
+    match level {
+        "off" => "Off",
+        "minimal" => "Minimal",
+        "low" => "Low",
+        "medium" => "Medium",
+        "high" => "High",
+        "xhigh" => "Extra high",
+        "max" => "Max",
+        _ => "Default",
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1582,6 +1636,8 @@ pub struct Catalog {
     pub selection: Selection,
     #[serde(default)]
     pub effective_selection: Option<Selection>,
+    #[serde(default)]
+    pub thinking: ThinkingInfo,
 }
 
 impl Catalog {
@@ -2120,6 +2176,37 @@ impl ApiClient {
             return Err(ApiError::InvalidResponse);
         }
         Ok(history)
+    }
+    /// `PUT /v1/conversations/{id}/thinking`: set the conversation's thinking
+    /// level (`None` goes back to the model's default).
+    pub fn set_thinking(
+        &self,
+        conversation: &str,
+        level: Option<&str>,
+    ) -> Result<Option<String>, ApiError> {
+        check_id(conversation)?;
+        if level
+            .is_some_and(|level| level.len() > 16 || level.chars().any(|c| !c.is_ascii_lowercase()))
+        {
+            return Err(ApiError::Validation(
+                "Choose a thinking level from the list.",
+            ));
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            level: Option<&'a str>,
+        }
+        #[derive(Deserialize)]
+        struct Reply {
+            thinking: ThinkingInfo,
+        }
+        let reply: Reply = self.request(
+            Method::PUT,
+            &["v1", "conversations", conversation, "thinking"],
+            &[],
+            Some(&Body { level }),
+        )?;
+        Ok(reply.thinking.level)
     }
     pub fn select(&self, conversation: &str, selection: &Selection) -> Result<Selection, ApiError> {
         check_id(conversation)?;
@@ -4335,6 +4422,25 @@ mod tests {
     }
 
     #[test]
+    fn catalog_reads_thinking_levels_and_older_servers_omit_them() {
+        let catalog: Catalog = serde_json::from_str(
+            r#"{"providers":[],"entries":[{"provider":"default","model":"m","thinking":["off","high"]}],
+               "selection":{"provider":"default","model":"m"},
+               "thinking":{"level":"high","levels":["off","high"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(catalog.thinking.level.as_deref(), Some("high"));
+        assert_eq!(catalog.thinking.levels, ["off", "high"]);
+        assert_eq!(catalog.entries[0].thinking, ["off", "high"]);
+        let old: Catalog =
+            serde_json::from_str(r#"{"providers":[],"selection":{"provider":"auto","model":""}}"#)
+                .unwrap();
+        assert!(old.thinking.levels.is_empty() && old.thinking.level.is_none());
+        assert_eq!(thinking_label("xhigh"), "Extra high");
+        assert_eq!(thinking_label("bogus"), "Default");
+    }
+
+    #[test]
     fn admin_inputs_reject_reserved_ids_and_unsafe_values() {
         assert!(valid_provider_id("work"));
         assert!(!valid_provider_id("auto"));
@@ -4557,7 +4663,7 @@ mod tests {
 
         let mut too_many = base.clone();
         too_many["tools"] =
-            serde_json::json!((0..65).map(|i| format!("tool{i}")).collect::<Vec<_>>());
+            serde_json::json!((0..129).map(|i| format!("tool{i}")).collect::<Vec<_>>());
         assert!(parse(too_many).is_err());
 
         let mut negative = base.clone();
@@ -4586,17 +4692,20 @@ mod tests {
         assert!(validate_bot_config_update(&empty).is_ok());
         assert_eq!(serde_json::to_value(&empty).unwrap(), serde_json::json!({}));
 
-        let delegate = BotConfigUpdate {
-            tools: Some(vec!["delegate".into()]),
+        // An edit keeps server-owned tools the bot already has (delegate on
+        // the orchestrator, a switched-off connector's tool); the server
+        // decides role and registry.
+        let kept = BotConfigUpdate {
+            tools: Some(vec!["delegate".into(), "tavily_search".into()]),
             ..BotConfigUpdate::default()
         };
-        assert!(validate_bot_config_update(&delegate).is_err());
+        assert!(validate_bot_config_update(&kept).is_ok());
 
-        let unknown_tool = BotConfigUpdate {
-            tools: Some(vec!["not-a-tool".into()]),
+        let bad_shape = BotConfigUpdate {
+            tools: Some(vec!["../secret".into()]),
             ..BotConfigUpdate::default()
         };
-        assert!(validate_bot_config_update(&unknown_tool).is_err());
+        assert!(validate_bot_config_update(&bad_shape).is_err());
 
         let duplicate = BotConfigUpdate {
             skills: Some(vec!["ask".into(), "ask".into()]),
@@ -4605,7 +4714,7 @@ mod tests {
         assert!(validate_bot_config_update(&duplicate).is_err());
 
         let too_many = BotConfigUpdate {
-            skills: Some((0..65).map(|i| format!("skill-{i}")).collect()),
+            skills: Some((0..129).map(|i| format!("skill-{i}")).collect()),
             ..BotConfigUpdate::default()
         };
         assert!(validate_bot_config_update(&too_many).is_err());

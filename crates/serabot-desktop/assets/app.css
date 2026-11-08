@@ -5022,6 +5022,40 @@ html[data-reduce-transparency="true"] .chat-header {
   gap: 6px;
 }
 
+/* A collapsed "Thinking" step: the model's reasoning text, plain. */
+.step-thinking {
+  flex: 1;
+  min-width: 0;
+}
+
+.step-thinking > summary {
+  cursor: pointer;
+  list-style: none;
+  color: var(--label-2);
+}
+
+.step-thinking > summary::-webkit-details-marker {
+  display: none;
+}
+
+.step-thinking-text {
+  margin: 6px 0 0;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+  font-size: 12px;
+  color: var(--label-2);
+}
+
+/* Thinking-level picker next to the model chip. */
+.thinking-select {
+  width: auto;
+  max-width: 170px;
+  font-size: 12px;
+}
+
 /* Model chip inside the composer. */
 .model-bar.compact {
   flex-wrap: nowrap;
@@ -5936,4 +5970,145 @@ html[data-reduce-transparency="true"] .chat-header {
   font-size: var(--fs-micro);
   color: var(--label-3);
   font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+/* ------------------------------------------------- who is working ------ */
+/* A soft halo breathes around the avatar of a bot that is running a turn.
+   The wrapper carries data-activity: working (halo), waiting (amber dot, no
+   motion) or idle. With reduced motion (OS setting or the in-app switch) the
+   halo is replaced by a still coloured dot. */
+
+.avatar-wrap {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  border-radius: var(--r-avatar);
+}
+
+.avatar-wrap::before {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: calc(var(--r-avatar) + 3px);
+  border: 1.5px solid var(--accent);
+  opacity: 0;
+  transform: scale(0.94);
+  transition:
+    opacity 240ms var(--ease-out, ease-out),
+    transform 240ms var(--ease-out, ease-out);
+  pointer-events: none;
+}
+
+.avatar-wrap.sm::before {
+  inset: -2px;
+  border-width: 1px;
+}
+
+.avatar-wrap::after {
+  content: "";
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 0 2px var(--bg);
+  opacity: 0;
+  transform: scale(0.6);
+  transition:
+    opacity 200ms ease-out,
+    transform 200ms ease-out;
+  pointer-events: none;
+}
+
+.avatar-wrap.sm::after {
+  width: 7px;
+  height: 7px;
+}
+
+.avatar-wrap[data-activity="working"]::before {
+  opacity: 0.9;
+  transform: scale(1);
+  animation: bot-halo 1.9s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+.avatar-wrap[data-activity="waiting"]::after {
+  background: var(--warn);
+  opacity: 1;
+  transform: scale(1);
+}
+
+@keyframes bot-halo {
+  0% {
+    box-shadow: 0 0 0 0 var(--accent-soft);
+  }
+  70% {
+    box-shadow: 0 0 0 7px transparent;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+.working-label {
+  color: var(--accent-ink);
+  font-size: var(--fs-caption);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  animation: fade-in 200ms ease-out;
+}
+
+.team-chip .working-label {
+  margin-left: 6px;
+}
+
+/* The label replaces the role line while the bot works. */
+.thread[data-activity="working"] .thread-meta:not(.working-label),
+.thread[data-activity="waiting"] .thread-meta:not(.working-label) {
+  display: none;
+}
+
+.avatar-stack .avatar-wrap {
+  margin-left: -6px;
+}
+
+.avatar-stack .avatar-wrap:first-child {
+  margin-left: 0;
+}
+
+.avatar-stack .avatar-wrap .avatar {
+  margin-left: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .avatar-wrap[data-activity="working"]::before {
+    animation: none;
+    opacity: 0;
+  }
+
+  .avatar-wrap[data-activity="working"]::after {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  .working-label {
+    animation: none;
+  }
+}
+
+.root[data-motion="reduce"] .avatar-wrap[data-activity="working"]::before,
+[data-motion="reduced"] .avatar-wrap[data-activity="working"]::before {
+  animation: none;
+  opacity: 0;
+}
+
+.root[data-motion="reduce"] .avatar-wrap[data-activity="working"]::after,
+[data-motion="reduced"] .avatar-wrap[data-activity="working"]::after {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.root[data-motion="reduce"] .working-label {
+  animation: none;
 }

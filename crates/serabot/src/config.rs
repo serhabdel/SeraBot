@@ -360,6 +360,11 @@ impl Config {
                 ));
             }
             if self.elevenlabs.auth == ElevenLabsAuth::Oauth {
+                if crate::mcp_client::parse_url(&self.elevenlabs.mcp_url).is_none() {
+                    return Err(SeraError::Config(
+                        "elevenlabs.mcp_url must be an http(s) URL without credentials".into(),
+                    ));
+                }
                 let client_id = self.elevenlabs.oauth_client_id.trim();
                 match reqwest::Url::parse(client_id) {
                     Ok(url)
@@ -1308,6 +1313,10 @@ pub struct ElevenLabsConfig {
     pub api_key_secret: String,
     #[serde(default)]
     pub auth: ElevenLabsAuth,
+    /// ElevenLabs hosted MCP endpoint (Streamable HTTP, OAuth bearer). Used
+    /// only with OAuth sign-in.
+    #[serde(default = "default_elevenlabs_mcp_url")]
+    pub mcp_url: String,
     /// CIMD client_id: the https URL of the client metadata document this
     /// server publishes publicly (see `web::cimd_document`).
     #[serde(default = "default_elevenlabs_oauth_client_id")]
@@ -1345,6 +1354,7 @@ impl Default for ElevenLabsConfig {
             api_base: default_elevenlabs_api_base(),
             api_key_secret: default_elevenlabs_api_key_secret(),
             auth: ElevenLabsAuth::default(),
+            mcp_url: default_elevenlabs_mcp_url(),
             oauth_client_id: default_elevenlabs_oauth_client_id(),
             oauth_scope: default_elevenlabs_oauth_scope(),
             oauth_access_token_secret: default_elevenlabs_oauth_access_token_secret(),
@@ -1714,6 +1724,10 @@ pub struct BotConfig {
     pub enabled: bool,
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// Thinking level for models that support one (off, low, medium,
+    /// high, ...). Ignored when the chosen model has no such level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
     #[serde(default)]
     pub role: BotRole,
     #[serde(default)]
@@ -1898,6 +1912,8 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "elevenlabs_transcribe",
     "elevenlabs_generate_image",
     "elevenlabs_generate_video",
+    "elevenlabs_mcp_list_tools",
+    "elevenlabs_mcp_call",
     "deck_build",
     "docx_build",
     "docx_import",
@@ -2035,6 +2051,7 @@ pub fn build_specialist_bot(
         require_approval: require_approval.clone(),
         enabled: false,
         temperature: None,
+        thinking: None,
         role: BotRole::Specialist,
         delegates: Vec::new(),
     };
@@ -2474,6 +2491,9 @@ fn default_telegram_audio_max_bytes() -> u64 {
 fn default_elevenlabs_api_base() -> String {
     "https://api.elevenlabs.io".into()
 }
+fn default_elevenlabs_mcp_url() -> String {
+    crate::elevenlabs::ELEVENLABS_MCP_URL.into()
+}
 fn default_elevenlabs_api_key_secret() -> String {
     "elevenlabs_api_key".into()
 }
@@ -2676,6 +2696,7 @@ mod tests {
                 require_approval: Vec::new(),
                 enabled: true,
                 temperature: None,
+                thinking: None,
                 role: BotRole::default(),
                 delegates: Vec::new(),
             },

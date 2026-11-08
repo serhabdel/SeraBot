@@ -64,6 +64,7 @@ fn test_bot(name: &str, role: crate::orchestration::BotRole) -> LoadedBot {
             require_approval: vec![],
             enabled: true,
             temperature: None,
+            thinking: None,
             role,
             delegates: vec![],
         },

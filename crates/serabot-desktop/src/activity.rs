@@ -10,6 +10,8 @@ use serde_json::Value;
 /// Most steps kept for one turn.
 const MAX_STEPS: usize = 64;
 const MAX_TEXT: usize = 120;
+/// Longest reasoning text a Thinking step keeps.
+const MAX_DETAIL: usize = 4_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepPhase {
@@ -38,6 +40,9 @@ pub struct Step {
     pub label: String,
     pub phase: StepPhase,
     pub approval_id: Option<String>,
+    /// Reasoning text of a Thinking step, shown collapsed. Untrusted
+    /// display data: bounded, control characters dropped, rendered as text.
+    pub detail: Option<String>,
 }
 
 /// Steps of the most recent turn. Cleared when the owner sends again.
@@ -54,6 +59,18 @@ fn clean(value: &Value, key: &str) -> Option<String> {
         .chars()
         .filter(|c| !c.is_control())
         .take(MAX_TEXT)
+        .collect();
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// Like [`clean`] for long text: newlines and tabs survive.
+fn clean_detail(value: &Value, key: &str) -> Option<String> {
+    let text: String = value
+        .get(key)?
+        .as_str()?
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .take(MAX_DETAIL)
         .collect();
     (!text.trim().is_empty()).then_some(text)
 }
@@ -89,10 +106,12 @@ impl Activity {
         }
         let icon = clean(payload, "icon").unwrap_or_else(|| "bolt".into());
         let approval_id = clean(payload, "approval_id");
+        let detail = clean_detail(payload, "detail");
         if let Some(step) = self.steps.iter_mut().find(|step| step.call_id == call_id) {
             step.phase = phase;
             step.label = label;
             step.icon = icon;
+            step.detail = detail.or(step.detail.take());
             step.approval_id = approval_id.or(step.approval_id.take());
             if phase != StepPhase::WaitingApproval {
                 step.approval_id = None;
@@ -104,6 +123,7 @@ impl Activity {
                 label,
                 phase,
                 approval_id,
+                detail,
             });
         }
         true
@@ -161,6 +181,22 @@ mod tests {
         );
         a.apply("turn.step", &ev("t1", "c1", "done"));
         assert!(a.waiting().is_none());
+    }
+
+    #[test]
+    fn thinking_step_keeps_bounded_reasoning_text() {
+        let mut a = Activity::default();
+        let mut p = ev("t1", "think-1", "done");
+        p["label"] = json!("Thinking");
+        p["detail"] = json!(format!("first\nsecond\u{7}{}", "x".repeat(MAX_DETAIL * 2)));
+        assert!(a.apply("turn.step", &p));
+        let detail = a.steps[0].detail.as_deref().unwrap();
+        assert!(detail.starts_with("first\nsecond"));
+        assert!(!detail.contains('\u{7}'));
+        assert!(detail.chars().count() <= MAX_DETAIL);
+        // A later update without detail keeps what was shown.
+        assert!(a.apply("turn.step", &ev("t1", "think-1", "done")));
+        assert!(a.steps[0].detail.is_some());
     }
 
     #[test]

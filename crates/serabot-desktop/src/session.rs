@@ -2649,6 +2649,10 @@ impl Session {
                     EventUpdate::Unauthorized => unauthorized = true,
                     EventUpdate::Event { id, kind, payload } => {
                         self.last_event_id = self.last_event_id.max(id);
+                        // Rings and "Working..." labels follow the same stream.
+                        // This never consumes the event: turn.completed and
+                        // task.failed still refresh the transcript below.
+                        self.state.working.apply(&kind, &payload, Instant::now());
                         // Step events only feed the live view; the transcript
                         // is not re-read for each one.
                         if self.state.activity.apply(&kind, &payload) {
@@ -2945,6 +2949,13 @@ impl Session {
                             self.toast = Some(format!("Auto-approve was not changed: {message}"));
                             self.state.error = None;
                             self.schedule(Operation::ChatPlan, Duration::ZERO);
+                        }
+                        OperationKind::Thinking => {
+                            // The picker shows the server's value, never a guess:
+                            // read it back and tell the owner.
+                            self.toast = Some(format!("Thinking level was not changed: {message}"));
+                            self.state.error = None;
+                            self.schedule(Operation::Catalog, Duration::ZERO);
                         }
                         OperationKind::StopTurn => {
                             // The reply keeps running; Stop can be pressed again.
@@ -4302,6 +4313,12 @@ impl Session {
             self.state.auto_approve = false;
         }
         self.start_request(Operation::SetAutoApprove { enabled });
+    }
+
+    /// Pick the open conversation's thinking level (None for the model's
+    /// default). The server stores it only when the model accepts it.
+    pub fn set_thinking(&mut self, level: Option<String>) {
+        self.start_request(Operation::SetThinking { level });
     }
 
     pub fn unarchive_conversation(&mut self, id: String) {

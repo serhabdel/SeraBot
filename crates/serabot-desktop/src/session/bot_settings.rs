@@ -32,6 +32,8 @@ pub struct BotDraft {
     pub instructions: String,
     pub model: String,
     pub browser_profile: String,
+    /// Thinking level; empty means the model's default.
+    pub thinking: String,
     /// The tool ids the capability switches add up to.
     pub tools: Vec<String>,
 }
@@ -107,6 +109,9 @@ impl BotDraft {
                     && self.browser_profile != crate::DEFAULT_PROFILE)
                     .then(|| self.browser_profile.clone()),
             );
+        }
+        if self.thinking != original.thinking {
+            update.thinking = Some((!self.thinking.is_empty()).then(|| self.thinking.clone()));
         }
         if !same_tools(&self.tools, &original.tools) {
             update.tools = Some(self.tools.clone());
@@ -263,7 +268,7 @@ impl Session {
             return;
         }
         let tools = crate::capabilities::toggled(capability, &self.bot_settings.draft.tools, on);
-        if let Err(error) = crate::validate_tool_list(&tools) {
+        if let Err(error) = crate::validate_tool_edit(&tools) {
             self.bot_settings.error = Some(error.to_string());
             return;
         }
@@ -293,6 +298,35 @@ impl Session {
         self.bot_settings.draft = self.bot_settings.original.clone();
         self.bot_settings.saving = false;
         self.close_bot_settings();
+    }
+
+    /// The thinking levels the draft's model accepts: read from the live
+    /// catalog for a pinned model, else the levels the bot's own model has.
+    pub fn bot_thinking_levels(&self) -> Vec<String> {
+        let Some(id) = self.bot_settings.bot.as_deref() else {
+            return Vec::new();
+        };
+        let from_detail = || {
+            self.state
+                .bot_details
+                .get(id)
+                .map(|detail| detail.thinking_levels.clone())
+                .unwrap_or_default()
+        };
+        let Some(pick) = model_pick(&self.bot_settings.draft.model) else {
+            return from_detail();
+        };
+        self.state
+            .catalog
+            .as_ref()
+            .and_then(|catalog| {
+                catalog
+                    .entries
+                    .iter()
+                    .find(|entry| entry.provider == pick.provider && entry.model == pick.model)
+            })
+            .map(|entry| entry.thinking.clone())
+            .unwrap_or_else(from_detail)
     }
 
     /// Fill the draft from the full record once it has arrived. The pump
@@ -327,6 +361,7 @@ impl Session {
                 .clone()
                 .filter(|profile| valid_profile_id(profile))
                 .unwrap_or_default(),
+            thinking: detail.thinking.clone().unwrap_or_default(),
             tools: detail.tools.clone(),
         };
         self.bot_settings.original = draft.clone();
@@ -465,6 +500,7 @@ mod tests {
             instructions: "Be brief.".into(),
             model: String::new(),
             browser_profile: String::new(),
+            thinking: String::new(),
             tools: vec!["vault_list".into(), "mystery_tool".into()],
         }
     }
@@ -485,6 +521,23 @@ mod tests {
         let update = draft.changes(&original);
         assert!(update.tools.as_ref().is_some_and(|t| t.len() == 4));
         assert!(update.display_name.is_none());
+    }
+
+    #[test]
+    fn thinking_level_is_sent_only_when_changed_and_default_is_null() {
+        let original = base();
+        let mut draft = original.clone();
+        assert!(draft.changes(&original).thinking.is_none());
+        draft.thinking = "high".into();
+        assert_eq!(
+            draft.changes(&original).thinking,
+            Some(Some("high".to_owned()))
+        );
+        let mut back = draft.clone();
+        back.thinking = String::new();
+        assert_eq!(back.changes(&draft).thinking, Some(None));
+        let body = serde_json::to_value(draft.changes(&original)).unwrap();
+        assert_eq!(body["thinking"], "high");
     }
 
     #[test]

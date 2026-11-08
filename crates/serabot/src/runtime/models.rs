@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// Longest the first message after a restart waits for a provider's live
+/// model list before falling back to the configured allowlist.
+const ENSURE_CATALOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
 impl Runtime {
     pub async fn refresh_model_catalogs(&self, user_id: &str) -> Result<()> {
         for report in self.router.refresh_catalogs(user_id).await? {
@@ -24,6 +28,195 @@ impl Runtime {
             )?;
         }
         Ok(())
+    }
+
+    /// Load the acting user's live model lists when they have none yet (the
+    /// first message after a restart), so validation compares against what
+    /// the provider really offers and not the short configured allowlist.
+    /// Bounded and infallible: on any problem the allowlist stays in force.
+    pub async fn ensure_model_catalogs(&self, user_id: &str) {
+        self.router
+            .ensure_catalogs(user_id, ENSURE_CATALOG_TIMEOUT)
+            .await;
+    }
+
+    /// Whether `error` means the chosen model is simply not on offer (as
+    /// opposed to a missing credential or a policy block).
+    fn is_model_gone(error: &SeraError) -> bool {
+        matches!(
+            error,
+            SeraError::Rejected {
+                code: "model_unavailable" | "unknown_provider",
+                ..
+            }
+        )
+    }
+
+    /// A route the account can use right now when its chosen one is gone:
+    /// its default route, then the bot's or server default, then the first
+    /// routable model of any provider they hold.
+    fn fallback_selection(&self, user_id: &str, bot_hint: Option<&str>) -> Option<ModelSelection> {
+        let candidates = [
+            self.default_route(user_id).ok().flatten(),
+            Some(self.router.default_selection(user_id, bot_hint)),
+            Some(self.router.default_selection(user_id, None)),
+            self.router.first_approved(user_id),
+        ];
+        candidates.into_iter().flatten().find(|candidate| {
+            !candidate.is_auto_mode()
+                && self.router.validate_selection(user_id, candidate).is_ok()
+                && self.router.pin(candidate).is_ok()
+        })
+    }
+
+    /// Resolve the conversation's chosen route, falling back when a stored
+    /// model is no longer valid. The bool is true when a fallback was used.
+    fn selection_or_fallback(
+        &self,
+        user_id: &str,
+        intended: ModelSelection,
+        bot_hint: Option<&str>,
+    ) -> Result<(ModelSelection, bool)> {
+        if intended.is_auto_mode() {
+            return Ok((intended, false));
+        }
+        match self.router.validate_selection(user_id, &intended) {
+            Ok(()) => Ok((intended, false)),
+            Err(error) if Self::is_model_gone(&error) => {
+                match self.fallback_selection(user_id, bot_hint) {
+                    Some(fallback) => Ok((fallback, true)),
+                    None => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Before a message is queued: when the conversation's stored (or
+    /// default) model is gone, switch the conversation to a working route and
+    /// tell the user once in the chat. A conversation already on a valid
+    /// route is untouched.
+    pub(super) fn heal_conversation_model(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        bot: &crate::config::LoadedBot,
+    ) -> Result<()> {
+        let hint = self.bot_model_hint(bot);
+        let intended = match self.stored_model_selection(conversation_id)? {
+            Some(stored) => stored,
+            None => self.user_default_selection(user_id, hint.as_deref()),
+        };
+        let (resolved, fell_back) =
+            self.selection_or_fallback(user_id, intended.clone(), hint.as_deref())?;
+        if !fell_back {
+            return Ok(());
+        }
+        warn!(
+            from_provider = %intended.provider,
+            from_model = %intended.model,
+            to_provider = %resolved.provider,
+            to_model = %resolved.model,
+            "stored model is no longer available; fell back"
+        );
+        self.store.kv_set(
+            &format!("model_selection:{conversation_id}"),
+            &serde_json::to_string(&resolved)?,
+        )?;
+        self.store.append_message(
+            user_id,
+            conversation_id,
+            None,
+            Role::Assistant,
+            &format!(
+                "The model {} is no longer available, using {}",
+                intended.model, resolved.model
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn thinking_key(conversation_id: &str) -> String {
+        format!("thinking:{conversation_id}")
+    }
+
+    /// The conversation's own thinking level, when the owner picked one.
+    pub fn conversation_thinking(&self, conversation_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .store
+            .kv_get(&Self::thinking_key(conversation_id))?
+            .filter(|level| crate::thinking::is_known_level(level)))
+    }
+
+    /// The thinking levels the conversation's current model accepts.
+    pub fn conversation_thinking_levels(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        bot: &str,
+    ) -> Result<Vec<&'static str>> {
+        let selection = self.effective_model_selection(user_id, conversation_id, bot)?;
+        Ok(self.router.thinking_levels(user_id, &selection))
+    }
+
+    /// Set (or with `None`, clear) the conversation's thinking level. The
+    /// level must be one the current model accepts; a later model change that
+    /// does not accept it simply stops applying it.
+    pub fn set_conversation_thinking(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        bot: &str,
+        level: Option<&str>,
+    ) -> Result<Option<String>> {
+        validate_conversation_id(conversation_id)?;
+        self.guard_conversation_scope(user_id, conversation_id)?;
+        let key = Self::thinking_key(conversation_id);
+        let Some(level) = level else {
+            self.store.kv_set(&key, "")?;
+            return Ok(None);
+        };
+        let levels = self.conversation_thinking_levels(user_id, conversation_id, bot)?;
+        if !levels.contains(&level) {
+            return Err(SeraError::Rejected {
+                code: "thinking_unavailable",
+                message: if levels.is_empty() {
+                    "This model has no thinking levels".into()
+                } else {
+                    "That thinking level isn't available for this model".into()
+                },
+            });
+        }
+        self.store.kv_set(&key, level)?;
+        self.store.record_audit(
+            user_id,
+            "model.thinking_set",
+            None,
+            None,
+            None,
+            None,
+            Some(self.gateway.policy().version()),
+            Some(&json!({"level": level})),
+        )?;
+        Ok(Some(level.to_owned()))
+    }
+
+    /// The level a turn applies: the conversation's, else the bot's. The
+    /// router ignores it when the model does not support it.
+    pub(super) fn turn_thinking(
+        &self,
+        conversation_id: &str,
+        bot: &crate::config::LoadedBot,
+    ) -> Option<String> {
+        self.conversation_thinking(conversation_id)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                bot.config
+                    .thinking
+                    .clone()
+                    .filter(|level| crate::thinking::is_known_level(level))
+            })
     }
 
     /// The acting user's routable provider catalog. A provider they hold no
@@ -198,12 +391,8 @@ impl Runtime {
             Some(stored) => stored,
             None => self.user_default_selection(user_id, self.bot_model_hint(bot).as_deref()),
         };
-        if selection.is_auto_mode() {
-            self.gateway
-                .scan_egress(user_id, &serde_json::to_string(&selection)?)?;
-            return Ok(selection);
-        }
-        self.router.validate_selection(user_id, &selection)?;
+        let (selection, _) =
+            self.selection_or_fallback(user_id, selection, self.bot_model_hint(bot).as_deref())?;
         self.gateway
             .scan_egress(user_id, &serde_json::to_string(&selection)?)?;
         Ok(selection)
@@ -225,6 +414,8 @@ impl Runtime {
             Some(stored) => stored,
             None => self.user_default_selection(user_id, self.bot_model_hint(bot).as_deref()),
         };
+        let (stored, _) =
+            self.selection_or_fallback(user_id, stored, self.bot_model_hint(bot).as_deref())?;
         let resolved = self.router.resolve_selection(
             user_id,
             &stored,

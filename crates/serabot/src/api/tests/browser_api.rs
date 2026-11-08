@@ -1229,3 +1229,48 @@ async fn tabs_and_pointer_flow_through_the_session_api() {
     let (_, member) = call(&rig.app, member_req(&rig, "GET", "/v1/browser", None)).await;
     assert!(member.get("tabs").is_none() && member.get("pointer").is_none());
 }
+
+#[tokio::test]
+async fn bot_thinking_level_is_validated_stored_and_returned() {
+    let rig = rig(true);
+    let (status, put) = call(
+        &rig.app,
+        admin_req(
+            &rig.app,
+            "PUT",
+            "/v1/bots/notes",
+            Some(json!({"thinking": "high"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{put}");
+    assert_eq!(put["bot"]["thinking"], "high");
+    let (_, detail) = call(&rig.app, admin_req(&rig.app, "GET", "/v1/bots/notes", None)).await;
+    assert_eq!(detail["thinking"], "high");
+    // The test model has no thinking control, so no levels are offered.
+    assert_eq!(detail["thinking_levels"], json!([]));
+    let (status, body) = call(
+        &rig.app,
+        admin_req(
+            &rig.app,
+            "PUT",
+            "/v1/bots/notes",
+            Some(json!({"thinking": "extreme"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["code"], "thinking_unavailable");
+    let (status, put) = call(
+        &rig.app,
+        admin_req(
+            &rig.app,
+            "PUT",
+            "/v1/bots/notes",
+            Some(json!({"thinking": null})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{put}");
+    assert!(put["bot"]["thinking"].is_null());
+}

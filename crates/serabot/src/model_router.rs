@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use tracing::{debug, warn};
 
 use crate::config::{LlmConfig, ProviderConfig};
 use crate::domain::LlmMessage;
@@ -14,6 +15,10 @@ use crate::providers::{
     resolve_catalog, valid_model_id,
 };
 use crate::util::sha256_hex;
+
+/// How long a failed live-catalog fetch is remembered before `ensure_catalogs`
+/// asks the provider again.
+const ENSURE_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// Stored conversation preference when the owner enables automatic routing.
 pub const AUTO_PROVIDER: &str = "auto";
@@ -86,6 +91,10 @@ pub struct CatalogEntry {
     pub context_length: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Thinking levels the model accepts, weakest first; absent when it has
+    /// no thinking control.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub thinking: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +125,8 @@ enum FetchFailure {
 struct CatalogState {
     snapshots: BTreeMap<String, CatalogSnapshot>,
     failures: BTreeMap<String, FetchFailure>,
+    /// When each account's last fetch failed (for the retry back-off).
+    failed_at: BTreeMap<String, Instant>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -396,6 +407,11 @@ impl ModelRouter {
                             .unwrap_or_default();
                         CatalogEntry {
                             provider: provider.id.clone(),
+                            thinking: crate::thinking::levels_for(
+                                &provider.kind,
+                                &model,
+                                &meta.tags,
+                            ),
                             model,
                             data_egress_approved: provider.data_egress_approved,
                             catalog_verified: verified,
@@ -407,6 +423,35 @@ impl ModelRouter {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    /// Make sure every fetching provider the account can use has a live
+    /// snapshot before a route is validated. Bounded by `timeout` per call;
+    /// a provider whose fetch failed recently is not asked again until
+    /// `ENSURE_RETRY_AFTER` has passed, so a down provider never delays every
+    /// message. Never fails: on any problem the allowlist stays in force.
+    pub async fn ensure_catalogs(&self, user_id: &str, timeout: Duration) {
+        for (id, provider) in &self.providers {
+            if !provider.catalog_fetch
+                || !provider.data_egress_approved
+                || !provider.available(user_id)
+                || provider.live_models(user_id).is_some()
+                || provider.failed_recently(user_id)
+            {
+                continue;
+            }
+            match tokio::time::timeout(timeout, self.refresh_provider(id, user_id)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    debug!(provider = %id, %error, "catalog refresh failed");
+                    provider.record_failure(user_id, FetchFailure::Unreachable);
+                }
+                Err(_) => {
+                    debug!(provider = %id, "catalog refresh timed out");
+                    provider.record_failure(user_id, FetchFailure::Unreachable);
+                }
+            }
+        }
     }
 
     pub async fn refresh_catalogs(&self, user_id: &str) -> Result<Vec<CatalogRefresh>> {
@@ -449,9 +494,7 @@ impl ModelRouter {
         if provider.allows(user_id, &selection.model) {
             return Ok(());
         }
-        Err(SeraError::Forbidden(
-            "model is not in the verified provider catalog".into(),
-        ))
+        Err(model_unavailable_error(provider, &selection.model))
     }
 
     async fn refresh_provider(&self, id: &str, user_id: &str) -> Result<CatalogRefresh> {
@@ -481,8 +524,23 @@ impl ModelRouter {
                 model_count: provider.advertised(user_id).len(),
             });
         }
-        match provider
-            .client_for(id, user_id)?
+        // A client that cannot be built (missing or corrupt credential) is a
+        // failed fetch like any other: the allowlist stays in force and the
+        // caller is never blocked by it.
+        let client = match provider.client_for(id, user_id) {
+            Ok(client) => client,
+            Err(error) => {
+                debug!(provider = id, %error, "catalog client unavailable");
+                provider.record_failure(user_id, FetchFailure::KeyRejected);
+                return Ok(CatalogRefresh {
+                    provider: id.to_owned(),
+                    fetched: true,
+                    verified: false,
+                    model_count: provider.advertised(user_id).len(),
+                });
+            }
+        };
+        match client
             .fetch_model_catalog(&provider.catalog_url, provider.catalog_strict)
             .await
         {
@@ -742,7 +800,7 @@ impl ModelRouter {
         None
     }
 
-    fn first_approved(&self, user_id: &str) -> Option<ModelSelection> {
+    pub(crate) fn first_approved(&self, user_id: &str) -> Option<ModelSelection> {
         for (id, provider) in &self.providers {
             for model in provider.advertised(user_id) {
                 if provider.is_routable(user_id, &model) {
@@ -760,14 +818,12 @@ impl ModelRouter {
         let provider = self
             .providers
             .get(&selection.provider)
-            .ok_or_else(|| SeraError::Validation("unknown model provider".into()))?;
+            .ok_or_else(|| unknown_provider_error(&selection.provider))?;
         if !provider.available(user_id) {
             return Err(no_credential_error(&selection.provider));
         }
         if !provider.allows(user_id, &selection.model) {
-            return Err(SeraError::Validation(
-                "model is not allowed for this provider".into(),
-            ));
+            return Err(model_unavailable_error(provider, &selection.model));
         }
         Ok(())
     }
@@ -793,11 +849,9 @@ impl ModelRouter {
         let provider = self
             .providers
             .get(&selection.provider)
-            .ok_or_else(|| SeraError::Validation("unknown model provider".into()))?;
+            .ok_or_else(|| unknown_provider_error(&selection.provider))?;
         if !provider.accepts_config(&selection.model) {
-            return Err(SeraError::Validation(
-                "model is not allowed for this provider".into(),
-            ));
+            return Err(model_unavailable_error(provider, &selection.model));
         }
         Ok(())
     }
@@ -820,6 +874,31 @@ impl ModelRouter {
         tools: &[ToolSpec],
         temperature: Option<f32>,
     ) -> Result<LlmResponse> {
+        self.complete_with_thinking(user_id, route, messages, tools, temperature, None)
+            .await
+    }
+
+    /// The thinking levels the acting user's account can pick for `selection`
+    /// (empty when the model has no thinking control). Detection reads the
+    /// live catalog's capability tags when the account has a list.
+    pub fn thinking_levels(&self, user_id: &str, selection: &ModelSelection) -> Vec<&'static str> {
+        self.providers
+            .get(&selection.provider)
+            .map(|provider| provider.thinking_levels(user_id, &selection.model))
+            .unwrap_or_default()
+    }
+
+    /// Like [`Self::complete`], applying a thinking `level` when the model
+    /// supports it. An unsupported level is ignored, never sent.
+    pub(crate) async fn complete_with_thinking(
+        &self,
+        user_id: &str,
+        route: &PinnedRoute,
+        messages: &[LlmMessage],
+        tools: &[ToolSpec],
+        temperature: Option<f32>,
+        thinking: Option<&str>,
+    ) -> Result<LlmResponse> {
         self.validate_pinned(route)?;
         let provider = &self.providers[&route.selection.provider];
         if !provider.available(user_id) {
@@ -829,15 +908,72 @@ impl ModelRouter {
             self.refresh_provider(&route.selection.provider, user_id)
                 .await?;
             if !provider.verified_contains(user_id, &route.selection.model) {
-                return Err(SeraError::Forbidden(
-                    "model is not in the verified provider catalog".into(),
-                ));
+                return Err(model_unavailable_error(provider, &route.selection.model));
             }
         }
+        let extra = thinking.and_then(|level| {
+            crate::thinking::wire_fields(
+                &provider.kind,
+                &route.selection.model,
+                &provider.model_tags(user_id, &route.selection.model),
+                level,
+            )
+        });
         provider
             .client_for(&route.selection.provider, user_id)?
-            .complete(messages, tools, Some(&route.selection.model), temperature)
+            .complete_with(
+                messages,
+                tools,
+                Some(&route.selection.model),
+                temperature,
+                extra.as_ref(),
+            )
             .await
+    }
+}
+
+/// A readable name for a provider in user-facing messages: the configured id,
+/// or the provider kind for the unnamed `[llm]` provider.
+fn provider_label(provider: &Provider) -> String {
+    let raw = if provider.id == "default" && !provider.kind.is_empty() {
+        provider.kind.as_str()
+    } else {
+        provider.id.as_str()
+    };
+    let mut chars = raw.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => raw.to_owned(),
+    }
+}
+
+fn unknown_provider_error(provider: &str) -> SeraError {
+    warn!(
+        provider,
+        reason = "unknown_provider",
+        "model route rejected"
+    );
+    SeraError::Rejected {
+        code: "unknown_provider",
+        message: "That model provider isn't set up on this server".into(),
+    }
+}
+
+/// The model is not offered by the provider for this account right now. The
+/// message names only the provider label, never the model id the caller sent.
+fn model_unavailable_error(provider: &Provider, model: &str) -> SeraError {
+    warn!(
+        provider = %provider.id,
+        model,
+        reason = "model_unavailable",
+        "model route rejected"
+    );
+    SeraError::Rejected {
+        code: "model_unavailable",
+        message: format!(
+            "That model isn't available for {} right now",
+            provider_label(provider)
+        ),
     }
 }
 
@@ -904,6 +1040,25 @@ impl Provider {
             .map(|snapshot| snapshot.models.clone())
     }
 
+    /// Capability tags the account's live list gives `model` (empty without a
+    /// list).
+    fn model_tags(&self, user_id: &str, model: &str) -> Vec<String> {
+        self.live_models(user_id)
+            .and_then(|catalog| catalog.get(model).map(|meta| meta.tags.clone()))
+            .unwrap_or_default()
+    }
+
+    fn thinking_levels(&self, user_id: &str, model: &str) -> Vec<&'static str> {
+        crate::thinking::levels_for(&self.kind, model, &self.model_tags(user_id, model))
+    }
+
+    fn failed_recently(&self, user_id: &str) -> bool {
+        self.lock_catalog()
+            .failed_at
+            .get(user_id)
+            .is_some_and(|at| at.elapsed() < ENSURE_RETRY_AFTER)
+    }
+
     fn is_fresh(&self, user_id: &str) -> bool {
         self.lock_catalog()
             .snapshots
@@ -918,6 +1073,7 @@ impl Provider {
     fn record_snapshot(&self, user_id: &str, models: ModelCatalog) {
         let mut state = self.lock_catalog();
         state.failures.remove(user_id);
+        state.failed_at.remove(user_id);
         state.snapshots.insert(
             user_id.to_owned(),
             CatalogSnapshot {
@@ -931,12 +1087,14 @@ impl Provider {
         let mut state = self.lock_catalog();
         state.snapshots.remove(user_id);
         state.failures.insert(user_id.to_owned(), failure);
+        state.failed_at.insert(user_id.to_owned(), Instant::now());
     }
 
     fn forget_snapshot(&self, user_id: &str) {
         let mut state = self.lock_catalog();
         state.snapshots.remove(user_id);
         state.failures.remove(user_id);
+        state.failed_at.remove(user_id);
     }
 
     fn fetch_status(&self, user_id: &str) -> &'static str {
@@ -2279,5 +2437,157 @@ mod tests {
             })
         );
         assert_eq!(router.fallback_for_model("other"), None);
+    }
+}
+
+#[cfg(test)]
+mod live_catalog_tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const USER: &str = "owner";
+
+    /// A Mistral-style default provider whose live list holds a model the
+    /// short configured allowlist does not.
+    async fn mistral_router(server: &MockServer) -> ModelRouter {
+        let config = LlmConfig {
+            base_url: format!("{}/v1", server.uri()),
+            model: "mistral-large-latest".into(),
+            data_egress_approved: true,
+            kind: "mistral".into(),
+            catalog_fetch: true,
+            catalog_ttl_secs: 60,
+            ..LlmConfig::default()
+        };
+        let clients = BTreeMap::from([(
+            "default".into(),
+            LlmClient::new(format!("{}/v1", server.uri()), "synthetic-key", 1, 100).unwrap(),
+        )]);
+        ModelRouter::new(&config, clients).unwrap()
+    }
+
+    fn live(id: &str) -> ModelSelection {
+        ModelSelection {
+            provider: "default".into(),
+            model: id.into(),
+        }
+    }
+
+    /// Reproduces the 0.21.0 failure: after a restart there is no live list,
+    /// so a model the picker offered earlier (live-only) fails validation.
+    #[tokio::test]
+    async fn live_only_model_is_rejected_until_the_list_is_loaded() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [
+                    {"id": "mistral-large-latest", "object": "model", "capabilities": {"completion_chat": true}},
+                    {"id": "magistral-medium-latest", "object": "model", "capabilities": {"completion_chat": true}}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let router = mistral_router(&server).await;
+        let error = router
+            .validate_selection(USER, &live("magistral-medium-latest"))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SeraError::Rejected {
+                code: "model_unavailable",
+                ..
+            }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "That model isn't available for Mistral right now"
+        );
+        router.ensure_catalogs(USER, Duration::from_secs(5)).await;
+        router
+            .validate_selection(USER, &live("magistral-medium-latest"))
+            .unwrap();
+        // A second call finds the snapshot and does not ask again.
+        router.ensure_catalogs(USER, Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn failed_ensure_keeps_the_allowlist_and_backs_off() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let router = mistral_router(&server).await;
+        router.ensure_catalogs(USER, Duration::from_secs(5)).await;
+        let after_first = server.received_requests().await.unwrap().len();
+        assert!(after_first >= 1);
+        router.ensure_catalogs(USER, Duration::from_secs(5)).await;
+        // The failure is remembered: the second call does not ask again.
+        assert_eq!(server.received_requests().await.unwrap().len(), after_first);
+        router
+            .validate_selection(USER, &live("mistral-large-latest"))
+            .unwrap();
+        assert_eq!(router.catalog(USER)[0].status, "unreachable");
+    }
+
+    #[tokio::test]
+    async fn slow_provider_is_bounded_by_the_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data": [{"id": "late"}]}))
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+        let router = mistral_router(&server).await;
+        let started = Instant::now();
+        router
+            .ensure_catalogs(USER, Duration::from_millis(150))
+            .await;
+        assert!(started.elapsed() < Duration::from_secs(3));
+        router
+            .validate_selection(USER, &live("mistral-large-latest"))
+            .unwrap();
+        assert!(router.validate_selection(USER, &live("late")).is_err());
+    }
+
+    /// The imported-credential shape: the account "has" the provider but the
+    /// stored credential cannot build a client. Refreshing must not error.
+    #[tokio::test]
+    async fn unbuildable_client_never_fails_a_refresh() {
+        struct Broken;
+        impl ProviderCredentials for Broken {
+            fn available(&self, _user: &str, _provider: &str) -> bool {
+                true
+            }
+            fn client(&self, _u: &str, _p: &str, _profile: &ProviderConfig) -> Result<LlmClient> {
+                Err(SeraError::Forbidden("corrupt credential".into()))
+            }
+        }
+        let server = MockServer::start().await;
+        let config = LlmConfig {
+            base_url: format!("{}/v1", server.uri()),
+            model: "mistral-large-latest".into(),
+            data_egress_approved: true,
+            kind: "mistral".into(),
+            catalog_fetch: true,
+            ..LlmConfig::default()
+        };
+        let router = ModelRouter::with_credentials(&config, Arc::new(Broken)).unwrap();
+        let reports = router.refresh_catalogs(USER).await.unwrap();
+        assert!(!reports[0].verified);
+        router.ensure_catalogs(USER, Duration::from_secs(1)).await;
+        router
+            .validate_selection(USER, &live("mistral-large-latest"))
+            .unwrap();
     }
 }

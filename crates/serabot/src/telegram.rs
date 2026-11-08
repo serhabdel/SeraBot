@@ -1407,9 +1407,9 @@ fn model_command(
                     "Selected {} / {} for future turns in this conversation. Existing history will be sent to this provider. Running turns are unchanged.",
                     selection.provider, selection.model
                 ),
-                Err(SeraError::Validation(_) | SeraError::NotFound(_)) => {
-                    "Unknown provider or model. Use /models to see configured choices.".into()
-                }
+                Err(
+                    SeraError::Validation(_) | SeraError::NotFound(_) | SeraError::Rejected { .. },
+                ) => "Unknown provider or model. Use /models to see configured choices.".into(),
                 Err(error @ SeraError::Forbidden(_)) => {
                     if error.to_string().contains("catalog") {
                         "That model is not in the verified provider catalog.".into()
@@ -2104,6 +2104,7 @@ mod tests {
                 require_approval: vec![],
                 enabled: true,
                 temperature: None,
+                thinking: None,
                 role: crate::orchestration::BotRole::Orchestrator,
                 delegates: vec![],
             },

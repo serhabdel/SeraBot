@@ -167,6 +167,9 @@ pub struct BotSettingsUpdate {
     pub model: Option<Option<ModelPick>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browser_profile: Option<Option<String>>,
+    /// A thinking level, or Some(None) to use the model's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<Option<String>>,
     /// The bot's tool ids (the capability switches).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
@@ -223,7 +226,7 @@ pub fn validate_bot_settings(update: &BotSettingsUpdate) -> Result<(), ApiError>
         ));
     }
     if let Some(tools) = &update.tools {
-        validate_tool_list(tools)?;
+        validate_tool_edit(tools)?;
     }
     Ok(())
 }
@@ -528,15 +531,44 @@ mod tests {
                 model: "gpt-x".into(),
             })),
             browser_profile: Some(Some("work".into())),
+            thinking: Some(Some("high".into())),
             enabled: None,
             tools: Some(vec!["vault_list".into()]),
         };
         assert!(validate_bot_settings(&ok).is_ok());
+        // The orchestrator keeps `delegate` and other server-owned tools when
+        // its abilities are edited (0.22: "Choose tools from the specialist
+        // list" blocked every Save on Main).
+        let main_tools = BotSettingsUpdate {
+            tools: Some(vec![
+                "delegate".into(),
+                "tavily_search".into(),
+                "local_list".into(),
+            ]),
+            ..BotSettingsUpdate::default()
+        };
+        assert!(validate_bot_settings(&main_tools).is_ok());
         let bad_tools = BotSettingsUpdate {
-            tools: Some(vec!["delegate".into()]),
+            tools: Some(vec!["Bad Tool".into(), "vault_list".into()]),
             ..BotSettingsUpdate::default()
         };
         assert!(validate_bot_settings(&bad_tools).is_err());
+        let doubled = BotSettingsUpdate {
+            tools: Some(vec!["vault_list".into(), "vault_list".into()]),
+            ..BotSettingsUpdate::default()
+        };
+        assert!(validate_bot_settings(&doubled).is_err());
+        // Every ability on at once still fits.
+        let every: Vec<String> = crate::SPECIALIST_TOOLS
+            .iter()
+            .map(|tool| (*tool).to_owned())
+            .chain(["delegate".to_owned()])
+            .collect();
+        let all_on = BotSettingsUpdate {
+            tools: Some(every),
+            ..BotSettingsUpdate::default()
+        };
+        assert!(validate_bot_settings(&all_on).is_ok());
         let bad_name = BotSettingsUpdate {
             display_name: Some("  ".into()),
             ..Default::default()

@@ -22,7 +22,6 @@ class OwnerSession extends ChangeNotifier {
   ApiClient? _client;
   String? _endpoint;
   UserInfo? _user;
-  String _conversationId = 'android-owner';
   String? _serverVersion;
   String? _statusMessage;
   bool _busy = false;
@@ -30,7 +29,6 @@ class OwnerSession extends ChangeNotifier {
   bool get connected => _client != null;
   String? get endpoint => _endpoint;
   UserInfo? get user => _user;
-  String get conversationId => _conversationId;
   String? get serverVersion => _serverVersion;
   String? get statusMessage => _statusMessage;
   bool get busy => _busy;
@@ -41,11 +39,6 @@ class OwnerSession extends ChangeNotifier {
       throw StateError('not connected');
     }
     return c;
-  }
-
-  void setConversationId(String id) {
-    _conversationId = id;
-    notifyListeners();
   }
 
   /// Reuse a stored token if the server still accepts it. Returns whether the

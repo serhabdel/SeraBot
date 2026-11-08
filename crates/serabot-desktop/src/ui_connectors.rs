@@ -168,7 +168,9 @@ fn connector_blurb(id: &str) -> &'static str {
         "slack" => "Read channels and post with your approval.",
         "agentmail" => "A mailbox for your bots.",
         "tavily" | "firecrawl" | "exa" => "Let bots search and read the web.",
-        "elevenlabs" => "Voices and sound.",
+        "elevenlabs" => {
+            "Sign in with ElevenLabs gives access to voice, music, sound, images and video your plan includes."
+        }
         _ => "",
     }
 }

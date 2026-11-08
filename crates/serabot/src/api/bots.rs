@@ -323,6 +323,14 @@ pub(super) async fn bot_detail(
         .router()
         .provider_for_model(&model)
         .unwrap_or_else(|| "default".into());
+    let thinking = loaded.as_ref().and_then(|bot| bot.config.thinking.clone());
+    let thinking_levels = state.runtime.router().thinking_levels(
+        &user.id,
+        &ModelSelection {
+            provider: provider.clone(),
+            model: model.clone(),
+        },
+    );
     let fallback = state.runtime.router().fallback_for_model(&model);
     let routing_classes = state.runtime.router().classes_for_model(&model);
     let (tools, skills, require_approval) = if user.is_admin() {
@@ -353,6 +361,8 @@ pub(super) async fn bot_detail(
         "enabled": entry.enabled,
         "provider": provider,
         "model": model,
+        "thinking": thinking,
+        "thinking_levels": thinking_levels,
         "fallback_provider": fallback.as_ref().map(|route| route.provider.clone()),
         "fallback_model": fallback.as_ref().map(|route| route.model.clone()),
         "routing_classes": routing_classes,
@@ -392,6 +402,10 @@ pub(super) struct UpdateBotRequest {
     /// `{"provider","model"}`, or `null` for the default model.
     #[serde(default, deserialize_with = "double_option")]
     pub(super) model: Option<Option<ModelChoice>>,
+    /// A thinking level (`off`, `low`, ...), or `null` to use the model's
+    /// default. Applied only when the chosen model supports it.
+    #[serde(default, deserialize_with = "double_option")]
+    pub(super) thinking: Option<Option<String>>,
     /// A browser profile id, or `null` for the default profile.
     #[serde(default, deserialize_with = "double_option")]
     pub(super) browser_profile: Option<Option<String>>,
@@ -434,11 +448,16 @@ pub(super) async fn update_bot(
         && request.display_name.is_none()
         && request.description.is_none()
         && request.model.is_none()
+        && request.thinking.is_none()
         && request.browser_profile.is_none()
     {
         return Err(SeraError::Validation(
-            "at least one of enabled, prompt, tools, skills, require_approval, display_name, description, model, browser_profile is required".into(),
+            "at least one of enabled, prompt, tools, skills, require_approval, display_name, description, model, thinking, browser_profile is required".into(),
         ));
+    }
+    if request.model.as_ref().is_some_and(Option::is_some) {
+        // A live-only model must be checked against the live list.
+        state.runtime.ensure_model_catalogs(&user.id).await;
     }
     // Untrusted input is scanned before it is validated or stored.
     for list in [&request.tools, &request.skills, &request.require_approval]
@@ -511,16 +530,27 @@ pub(super) async fn update_bot(
                     .runtime
                     .scan_owner_output(&user.id, &choice.provider)?;
                 state.runtime.scan_owner_output(&user.id, &choice.model)?;
-                if !state
-                    .runtime
-                    .router()
-                    .provider_serves_model(&choice.provider, &choice.model)
-                {
-                    return Err(SeraError::Validation(
-                        "unknown model for that provider".into(),
-                    ));
-                }
+                state.runtime.router().validate_selection(
+                    &user.id,
+                    &ModelSelection {
+                        provider: choice.provider.clone(),
+                        model: choice.model.clone(),
+                    },
+                )?;
                 Some(choice.model.clone())
+            }
+        };
+    }
+
+    if let Some(choice) = &request.thinking {
+        config.thinking = match choice.as_deref() {
+            None | Some("") => None,
+            Some(level) if crate::thinking::is_known_level(level) => Some(level.to_owned()),
+            Some(_) => {
+                return Err(SeraError::Rejected {
+                    code: "thinking_unavailable",
+                    message: "That thinking level isn't available".into(),
+                });
             }
         };
     }
@@ -587,6 +617,7 @@ pub(super) async fn update_bot(
     config.require_approval = require_approval.clone();
     let role = config.role.as_str().to_owned();
     let config_model = config.model.clone();
+    let config_thinking = config.thinking.clone();
     let config = serde_json::to_value(&config)?;
     if !state
         .store
@@ -630,6 +661,7 @@ pub(super) async fn update_bot(
             "display_name": settings.display_name,
             "description": settings.description,
             "model": config_model,
+            "thinking": config_thinking,
             "browser_profile": settings
                 .browser_profile
                 .clone()
