@@ -1,17 +1,32 @@
 import 'package:flutter/material.dart';
 
+import '../app_state.dart';
+import '../device.dart';
 import '../session.dart';
-import '../update_flow.dart';
-import '../validation.dart';
-import 'approvals_tab.dart';
-import 'chat_tab.dart';
-import 'fleet_tab.dart';
-import 'voice_tab.dart';
+import '../theme.dart';
+import 'approvals_screen.dart';
+import 'bots_screen.dart';
+import 'chats_screen.dart';
+import 'settings_screen.dart';
 
+/// Signed-in shell: Chats, Approvals (badge), Bots, Settings. It owns the
+/// [AppState] so the conversation list, unread counts and event stream live
+/// as long as the user is signed in.
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key, required this.session});
+  const HomeScreen({
+    super.key,
+    required this.session,
+    required this.theme,
+    this.device,
+    this.startEvents = true,
+  });
 
   final OwnerSession session;
+  final ThemeController theme;
+  final DeviceActions? device;
+
+  /// Tests turn the live stream off.
+  final bool startEvents;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -19,71 +34,80 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   int _index = 0;
+  late final AppState _app;
+  late final DeviceActions _device;
 
-  Future<void> _signOut() => widget.session.signOut();
+  @override
+  void initState() {
+    super.initState();
+    _app = AppState(widget.session.client);
+    _device = widget.device ?? PlatformDeviceActions();
+    _app.start(events: widget.startEvents);
+  }
+
+  @override
+  void dispose() {
+    _app.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
-    final version = widget.session.serverVersion;
-    final user = widget.session.user;
-    return Scaffold(
-      appBar: AppBar(
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('SeraBot'),
-            if (user != null)
-              Text(
-                user.label,
-                style: Theme.of(context).textTheme.bodySmall,
-                overflow: TextOverflow.ellipsis,
+    return ListenableBuilder(
+      listenable: _app,
+      builder: (context, _) {
+        final unread = _app.unread;
+        final pending = _app.pendingApprovals;
+        return Scaffold(
+          body: IndexedStack(
+            index: _index,
+            children: [
+              ChatsScreen(app: _app, device: _device),
+              ApprovalsScreen(app: _app),
+              BotsScreen(app: _app, device: _device),
+              SettingsScreen(
+                session: widget.session,
+                app: _app,
+                theme: widget.theme,
               ),
-          ],
-        ),
-        actions: [
-          if (version != null && version.isNotEmpty)
-            Center(
-              child: Padding(
-                padding: const EdgeInsets.only(right: 8),
-                child: Text('v$version', style: Theme.of(context).textTheme.bodySmall),
+            ],
+          ),
+          bottomNavigationBar: NavigationBar(
+            selectedIndex: _index,
+            onDestinationSelected: (i) => setState(() => _index = i),
+            destinations: [
+              NavigationDestination(
+                icon: Badge(
+                  isLabelVisible: unread > 0,
+                  label: Text(unread > 99 ? '99+' : '$unread'),
+                  child: const Icon(Icons.chat_bubble_outline),
+                ),
+                selectedIcon: const Icon(Icons.chat_bubble),
+                label: 'Chats',
               ),
-            ),
-          IconButton(
-            tooltip: 'Check for updates',
-            icon: const Icon(Icons.system_update),
-            onPressed: () => checkForUpdates(context),
+              NavigationDestination(
+                icon: Badge(
+                  isLabelVisible: pending > 0,
+                  label: Text('$pending'),
+                  child: const Icon(Icons.gavel_outlined),
+                ),
+                selectedIcon: const Icon(Icons.gavel),
+                label: 'Approvals',
+              ),
+              const NavigationDestination(
+                icon: Icon(Icons.smart_toy_outlined),
+                selectedIcon: Icon(Icons.smart_toy),
+                label: 'Bots',
+              ),
+              const NavigationDestination(
+                icon: Icon(Icons.settings_outlined),
+                selectedIcon: Icon(Icons.settings),
+                label: 'Settings',
+              ),
+            ],
           ),
-          TextButton(onPressed: _signOut, child: const Text('Sign out')),
-        ],
-      ),
-      body: IndexedStack(
-        index: _index,
-        children: [
-          ChatTab(session: widget.session),
-          ApprovalsTab(session: widget.session),
-          FleetTab(
-            session: widget.session,
-            onUseInChat: (id) {
-              if (!validId(id)) {
-                return;
-              }
-              widget.session.setConversationId(id);
-              setState(() => _index = 0);
-            },
-          ),
-          VoiceTab(session: widget.session),
-        ],
-      ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _index,
-        onDestinationSelected: (i) => setState(() => _index = i),
-        destinations: const [
-          NavigationDestination(icon: Icon(Icons.chat), label: 'Chat'),
-          NavigationDestination(icon: Icon(Icons.gavel), label: 'Approvals'),
-          NavigationDestination(icon: Icon(Icons.account_tree), label: 'Fleet'),
-          NavigationDestination(icon: Icon(Icons.graphic_eq), label: 'Voice'),
-        ],
-      ),
+        );
+      },
     );
   }
 }

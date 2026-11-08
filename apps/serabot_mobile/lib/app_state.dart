@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 
@@ -34,7 +34,7 @@ class AppState extends ChangeNotifier {
   int get unread => totalUnread(conversations);
 
   /// Start the event loop and the first loads. Safe to call once.
-  void start() {
+  void start({bool events = true}) {
     if (_running) {
       return;
     }
@@ -42,7 +42,9 @@ class AppState extends ChangeNotifier {
     refreshConversations();
     refreshBots();
     refreshApprovals();
-    _loop();
+    if (events) {
+      _loop();
+    }
   }
 
   Future<void> refreshConversations() async {
@@ -86,6 +88,24 @@ class AppState extends ChangeNotifier {
       conversations = next;
       _notify();
     }
+  }
+
+  final _avatars = <String, Future<Uint8List?>>{};
+
+  /// Bot (ots) or group (conversations) picture, cached per version.
+  /// Null when none is set or the fetch failed.
+  Future<Uint8List?> avatar(String kind, String id, String? version) {
+    if (version == null || version.isEmpty) {
+      return Future.value(null);
+    }
+    return _avatars.putIfAbsent('$kind/$id/$version', () async {
+      try {
+        final b = await client.avatarBytes(kind, id);
+        return b == null ? null : Uint8List.fromList(b);
+      } on ApiException {
+        return null;
+      }
+    });
   }
 
   BotSummary? botById(String? id) {
