@@ -488,6 +488,27 @@ fn expire_if_due(store: &Store, job: &MediaJob) -> Result<bool> {
     Ok(true)
 }
 
+/// Audit one finished job: who, which provider and kind, and the outcome. The
+/// background poll runs outside a turn, so this is its audit trail.
+fn audit_job(store: &Store, job: &MediaJob, outcome: &str, hash: Option<&str>) -> Result<()> {
+    store.record_audit(
+        &job.user_id,
+        &format!("media_job.{outcome}"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(&json!({
+            "job_id": job.id,
+            "provider": job.provider,
+            "kind": job.kind.as_str(),
+            "artifact_hash": hash,
+        })),
+    )?;
+    Ok(())
+}
+
 fn finish_failed(store: &Store, job: &MediaJob, error: &str) -> Result<()> {
     if store.finish_media_job(
         &job.user_id,
@@ -496,6 +517,7 @@ fn finish_failed(store: &Store, job: &MediaJob, error: &str) -> Result<()> {
         None,
         Some(error),
     )? {
+        audit_job(store, job, "failed", None)?;
         post_job_message(
             store,
             job,
@@ -583,6 +605,7 @@ fn finish_done(
     )? {
         warn!(job = %job.id, "a finished media job was not open when it was marked done");
     }
+    audit_job(store, job, "delivered", Some(&stored.hash))?;
     Ok(())
 }
 
@@ -598,6 +621,7 @@ fn finish_stalled(store: &Store, job: &MediaJob) -> Result<bool> {
     )? {
         return Ok(false);
     }
+    audit_job(store, job, "stalled", None)?;
     post_job_message(
         store,
         job,
@@ -923,6 +947,13 @@ mod tests {
             .collect();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].name.as_deref(), Some("maker"));
+        // The background delivery leaves an audit record for the job's owner.
+        let audit = store.list_audit_for_user(&admin, 50).unwrap();
+        assert!(
+            audit
+                .iter()
+                .any(|entry| entry.event == "media_job.delivered" && entry.actor == admin)
+        );
     }
 
     #[tokio::test]
