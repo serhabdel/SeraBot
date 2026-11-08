@@ -773,7 +773,8 @@ pub(super) async fn admin_set_bot_profile(
     Ok(Json(json!({"saved": true, "restart_required": false})))
 }
 
-pub(super) const MAX_BOT_CONFIG_TOOLS: usize = 64;
+/// Every console ability on at once is ~95 tools plus `delegate`.
+pub(super) const MAX_BOT_CONFIG_TOOLS: usize = 128;
 pub(super) const MAX_BOT_CONFIG_SKILLS: usize = 16;
 
 #[derive(Deserialize)]

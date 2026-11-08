@@ -381,9 +381,10 @@ pub const MAX_SKILL_DESCRIPTION_CHARS: usize = 500;
 pub const MAX_SKILL_BODY_BYTES: usize = 96_000;
 const MAX_SKILL_LIST: usize = 256;
 const MAX_BOT_LIST: usize = 64;
-const MAX_BOT_SUMMARY_ITEMS: usize = 64;
+/// Matches the server's 128-tool bot cap (every ability on is ~96 tools).
+const MAX_BOT_SUMMARY_ITEMS: usize = 128;
 /// Cap for every string array on a bot detail or bot config update.
-pub const MAX_BOT_CONFIG_ITEMS: usize = 64;
+pub const MAX_BOT_CONFIG_ITEMS: usize = 128;
 /// Bounds for the optional instructions blob of a bot detail.
 const MAX_BOT_INSTRUCTIONS_CHARS: usize = 96_000;
 const MAX_BOT_INSTRUCTIONS_BYTES: usize = 512_000;
@@ -534,6 +535,31 @@ pub fn valid_bot_description(text: &str) -> bool {
             .any(|c| c.is_control() && c != '\n' && c != '\t')
 }
 
+/// Rules for EDITING an existing bot's tools (bot settings, config update).
+///
+/// Unlike [`validate_tool_list`] (new specialists), an edit may carry tools
+/// the console cannot grant itself but the bot already has: `delegate` on the
+/// orchestrator, or a tool whose connector is switched off (`tavily_search`).
+/// Those are server-owned, so this only checks shape, count and uniqueness;
+/// the server checks role and registry and stays authoritative.
+pub fn validate_tool_edit(tools: &[String]) -> Result<(), ApiError> {
+    if tools.len() > MAX_BOT_CONFIG_ITEMS {
+        return Err(ApiError::Validation(
+            "A bot can hold at most 128 tools.",
+        ));
+    }
+    let mut seen = HashSet::with_capacity(tools.len());
+    for tool in tools {
+        if !valid_speaker(tool) {
+            return Err(ApiError::Validation("A tool name is not valid."));
+        }
+        if !seen.insert(tool.as_str()) {
+            return Err(ApiError::Validation("Each tool can be selected once."));
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_tool_list(tools: &[String]) -> Result<(), ApiError> {
     if tools.len() > MAX_SCAFFOLD_TOOLS {
         return Err(ApiError::Validation("Choose at most 32 specialist tools."));
@@ -595,7 +621,7 @@ pub fn validate_bot_config_update(update: &BotConfigUpdate) -> Result<(), ApiErr
     {
         if items.len() > MAX_BOT_CONFIG_ITEMS {
             return Err(ApiError::Validation(
-                "Each list can hold at most 64 entries.",
+                "Each list can hold at most 128 entries.",
             ));
         }
         let mut seen = HashSet::with_capacity(items.len());
@@ -606,13 +632,7 @@ pub fn validate_bot_config_update(update: &BotConfigUpdate) -> Result<(), ApiErr
         }
     }
     if let Some(tools) = &update.tools {
-        for tool in tools {
-            if tool == "delegate" || !SPECIALIST_TOOLS.contains(&tool.as_str()) {
-                return Err(ApiError::Validation(
-                    "Choose tools from the specialist list.",
-                ));
-            }
-        }
+        validate_tool_edit(tools)?;
     }
     if let Some(skills) = &update.skills {
         for skill in skills {
@@ -4557,7 +4577,7 @@ mod tests {
 
         let mut too_many = base.clone();
         too_many["tools"] =
-            serde_json::json!((0..65).map(|i| format!("tool{i}")).collect::<Vec<_>>());
+            serde_json::json!((0..129).map(|i| format!("tool{i}")).collect::<Vec<_>>());
         assert!(parse(too_many).is_err());
 
         let mut negative = base.clone();
@@ -4586,17 +4606,20 @@ mod tests {
         assert!(validate_bot_config_update(&empty).is_ok());
         assert_eq!(serde_json::to_value(&empty).unwrap(), serde_json::json!({}));
 
-        let delegate = BotConfigUpdate {
-            tools: Some(vec!["delegate".into()]),
+        // An edit keeps server-owned tools the bot already has (delegate on
+        // the orchestrator, a switched-off connector's tool); the server
+        // decides role and registry.
+        let kept = BotConfigUpdate {
+            tools: Some(vec!["delegate".into(), "tavily_search".into()]),
             ..BotConfigUpdate::default()
         };
-        assert!(validate_bot_config_update(&delegate).is_err());
+        assert!(validate_bot_config_update(&kept).is_ok());
 
-        let unknown_tool = BotConfigUpdate {
-            tools: Some(vec!["not-a-tool".into()]),
+        let bad_shape = BotConfigUpdate {
+            tools: Some(vec!["../secret".into()]),
             ..BotConfigUpdate::default()
         };
-        assert!(validate_bot_config_update(&unknown_tool).is_err());
+        assert!(validate_bot_config_update(&bad_shape).is_err());
 
         let duplicate = BotConfigUpdate {
             skills: Some(vec!["ask".into(), "ask".into()]),
@@ -4605,7 +4628,7 @@ mod tests {
         assert!(validate_bot_config_update(&duplicate).is_err());
 
         let too_many = BotConfigUpdate {
-            skills: Some((0..65).map(|i| format!("skill-{i}")).collect()),
+            skills: Some((0..129).map(|i| format!("skill-{i}")).collect()),
             ..BotConfigUpdate::default()
         };
         assert!(validate_bot_config_update(&too_many).is_err());
