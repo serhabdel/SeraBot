@@ -1498,6 +1498,10 @@ pub struct RuntimeConfig {
     pub max_tool_iterations: usize,
     #[serde(default = "default_lease")]
     pub task_lease_secs: u64,
+    /// Wall-clock limit for one task (0.24). A turn past it is stopped and
+    /// failed without a retry, so a stuck provider call cannot hold a worker.
+    #[serde(default = "default_turn_max_secs")]
+    pub turn_max_secs: u64,
     #[serde(default = "default_poll")]
     pub worker_poll_ms: u64,
     #[serde(default = "default_history_limit")]
@@ -1513,6 +1517,7 @@ impl Default for RuntimeConfig {
             max_tool_calls_per_turn: default_max_tool_calls(),
             max_tool_iterations: default_tool_iterations(),
             task_lease_secs: default_lease(),
+            turn_max_secs: default_turn_max_secs(),
             worker_poll_ms: default_poll(),
             history_limit: default_history_limit(),
             owner_standing_consent: false,
@@ -2598,6 +2603,9 @@ fn default_tool_iterations() -> usize {
 }
 fn default_lease() -> u64 {
     300
+}
+fn default_turn_max_secs() -> u64 {
+    1800
 }
 fn default_poll() -> u64 {
     500

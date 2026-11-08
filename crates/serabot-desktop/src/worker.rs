@@ -892,14 +892,20 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
                 })
         }
         Operation::PreviewArtifact { hash, mime } => {
-            client.artifact(hash).and_then(|(_, bytes)| {
-                crate::media_view::preview_data_url_for(mime, &bytes).map(|data_url| {
-                    Reply::Preview {
-                        hash: hash.clone(),
-                        data_url,
-                    }
+            // A type that cannot play inline is refused before any download.
+            if crate::media_view::inline_player(mime).is_none() {
+                return Err(ApiError::Validation("Only video and audio play inline."));
+            }
+            client
+                .artifact_capped(hash, crate::media_view::MAX_PREVIEW_BYTES as u64)
+                .and_then(|(_, bytes)| {
+                    crate::media_view::preview_data_url_for(mime, &bytes).map(|data_url| {
+                        Reply::Preview {
+                            hash: hash.clone(),
+                            data_url,
+                        }
+                    })
                 })
-            })
         }
         Operation::MediaJobs => client.media_jobs(conversation).map(Reply::MediaJobs),
         Operation::TurnLimits => client.turn_limits().map(Reply::TurnLimits),

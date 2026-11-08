@@ -2147,7 +2147,7 @@ impl Session {
     /// already here. The bytes come from the artifact route and are turned into
     /// a data URL off the UI thread.
     pub fn request_preview(&mut self, hash: String, mime: String) {
-        if self.state.media_previews.contains_key(&hash) {
+        if self.state.media_previews.contains(&hash) {
             return;
         }
         self.schedule(Operation::PreviewArtifact { hash, mime }, Duration::ZERO);
@@ -2833,6 +2833,11 @@ impl Session {
             Operation::AvatarUpload { .. } | Operation::AvatarRemove { .. } => {
                 self.avatar_op = Some(AvatarOp::Write)
             }
+            // One read per file at a time: a request while one is in flight
+            // (or the file is cached) sends nothing.
+            Operation::PreviewArtifact { hash, .. } if !self.state.media_previews.begin(hash) => {
+                return;
+            }
             _ => {}
         }
         let job = Job {
@@ -2844,6 +2849,7 @@ impl Session {
             self.state.error = Some("Network worker unavailable. Reconnect.".into());
             self.refreshing = false;
             self.poll_paused = true;
+            self.state.media_previews.fail_in_flight();
             return;
         }
         self.pending = Some(kind);
@@ -3050,6 +3056,7 @@ impl Session {
                             self.schedule(Operation::ChatPlan, Duration::ZERO);
                         }
                         OperationKind::PreviewArtifact => {
+                            self.state.media_previews.fail_in_flight();
                             self.toast = Some(format!("This file cannot play here: {message}"));
                         }
                         OperationKind::TurnLimits => {

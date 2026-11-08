@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -36,6 +37,45 @@ pub struct StoredArtifact {
     pub meta: ArtifactMeta,
 }
 
+/// Largest artifact the store accepts, and the largest file a media job saves.
+pub const MAX_ARTIFACT_BYTES: usize = 100 * 1024 * 1024;
+
+/// The artifacts one tool call saved, and the ones it lists for the owner
+/// beside its primary artifact (0.24).
+#[derive(Debug, Default)]
+pub struct CallArtifacts {
+    pub saved: HashSet<String>,
+    pub listed: Vec<crate::gateway::ExtraArtifact>,
+}
+
+tokio::task_local! {
+    /// Scoped by the gateway around each tool call. A save made on a blocking
+    /// thread is not seen here, so such a file cannot be listed.
+    pub static CALL_ARTIFACTS: Arc<Mutex<CallArtifacts>>;
+}
+
+/// List a file this call saved in the owner's conversation, beside the call's
+/// primary artifact (0.24). A file the call did not save is not listed. Returns
+/// whether it was listed.
+pub fn list_saved_artifact(stored: &StoredArtifact) -> bool {
+    CALL_ARTIFACTS
+        .try_with(|calls| {
+            let Ok(mut calls) = calls.lock() else {
+                return false;
+            };
+            if !calls.saved.contains(&stored.hash) {
+                return false;
+            }
+            calls.listed.push(crate::gateway::ExtraArtifact {
+                hash: stored.hash.clone(),
+                filename: stored.filename.clone(),
+                title: Some(stored.meta.title.clone()),
+            });
+            true
+        })
+        .unwrap_or(false)
+}
+
 pub struct ArtifactStore {
     root: PathBuf,
 }
@@ -48,7 +88,7 @@ impl ArtifactStore {
     }
 
     pub fn save(&self, bytes: &[u8], filename: &str, meta: ArtifactMeta) -> Result<StoredArtifact> {
-        if bytes.is_empty() || bytes.len() > 100 * 1024 * 1024 {
+        if bytes.is_empty() || bytes.len() > MAX_ARTIFACT_BYTES {
             return Err(SeraError::Validation("invalid artifact size".into()));
         }
         let hash = sha256_hex(bytes);
@@ -58,6 +98,11 @@ impl ArtifactStore {
         atomic_write(&data_path, bytes)?;
         let meta_bytes = serde_json::to_vec_pretty(&meta)?;
         atomic_write(&meta_path, &meta_bytes)?;
+        let _ = CALL_ARTIFACTS.try_with(|calls| {
+            if let Ok(mut calls) = calls.lock() {
+                calls.saved.insert(hash.clone());
+            }
+        });
         Ok(StoredArtifact {
             hash,
             filename,
