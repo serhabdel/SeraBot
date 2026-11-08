@@ -2649,6 +2649,10 @@ impl Session {
                     EventUpdate::Unauthorized => unauthorized = true,
                     EventUpdate::Event { id, kind, payload } => {
                         self.last_event_id = self.last_event_id.max(id);
+                        // Rings and "Working..." labels follow the same stream.
+                        // This never consumes the event: turn.completed and
+                        // task.failed still refresh the transcript below.
+                        self.state.working.apply(&kind, &payload, Instant::now());
                         // Step events only feed the live view; the transcript
                         // is not re-read for each one.
                         if self.state.activity.apply(&kind, &payload) {
