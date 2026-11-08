@@ -85,6 +85,11 @@ role = "orchestrator"
 delegates = ["analyst", "maker", "watcher"]
 ```
 
+Optional display fields (0.23): `title` (1 to 40 characters) and `description`
+(at most 200 characters). The console shows them instead of the raw id. A row
+without them is filled at the next upgrade, and a value the row already holds
+is kept. The twelve shipped templates set both.
+
 Startup validation (`load_bots`):
 
 - Exactly one **enabled** orchestrator, and its name must be `main`.

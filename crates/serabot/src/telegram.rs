@@ -2095,6 +2095,8 @@ mod tests {
         .unwrap();
         let bot = LoadedBot {
             config: BotConfig {
+                title: None,
+                description: None,
                 name: "main".into(),
                 trigger: "command".into(),
                 model: None,

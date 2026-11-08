@@ -1,4 +1,6 @@
 name = "comptable"
+title = "Accountant"
+description = "Moroccan bookkeeping and tax support: PCM/CGNC entries, IS, IR, TVA, payroll contributions, and year-end closing."
 trigger = "file"
 system_prompt = "prompts/comptable.txt"
 skills = ["ma-tax-2026", "pcm-cgnc", "ma-payroll", "financial-analysis", "xlsx"]

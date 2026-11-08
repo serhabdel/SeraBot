@@ -193,6 +193,8 @@ impl Tool for FakeUpload {
 fn bot() -> LoadedBot {
     LoadedBot {
         config: BotConfig {
+            title: None,
+            description: None,
             name: "main".into(),
             trigger: "command".into(),
             model: None,
@@ -1090,6 +1092,8 @@ fn orchestrator_bots() -> Vec<LoadedBot> {
     vec![
         LoadedBot {
             config: BotConfig {
+                title: None,
+                description: None,
                 name: "main".into(),
                 trigger: "command".into(),
                 model: None,
@@ -1107,6 +1111,8 @@ fn orchestrator_bots() -> Vec<LoadedBot> {
         },
         LoadedBot {
             config: BotConfig {
+                title: None,
+                description: None,
                 name: "analyst".into(),
                 trigger: "command".into(),
                 model: None,
@@ -1124,6 +1130,8 @@ fn orchestrator_bots() -> Vec<LoadedBot> {
         },
         LoadedBot {
             config: BotConfig {
+                title: None,
+                description: None,
                 name: "maker".into(),
                 trigger: "command".into(),
                 model: None,

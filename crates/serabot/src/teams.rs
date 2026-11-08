@@ -842,6 +842,8 @@ mod tests {
     fn bot(name: &str, role: BotRole) -> LoadedBot {
         LoadedBot {
             config: BotConfig {
+                title: None,
+                description: None,
                 name: name.into(),
                 trigger: "command".into(),
                 model: None,

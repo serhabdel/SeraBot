@@ -1,4 +1,6 @@
 name = "analyst"
+title = "Analyst"
+description = "Reads documents, transcripts, spreadsheets and timesheets, and cites the passage behind every figure."
 trigger = "file"
 system_prompt = "prompts/analyst.txt"
 skills = ["synthesis", "transcript", "xlsx", "docx", "pptx", "timesheets", "ask", "financial-analysis"]

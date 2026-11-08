@@ -1,4 +1,6 @@
 name = "whatsapp"
+title = "WhatsApp"
+description = "Drafts WhatsApp messages and sends them only after you approve the exact text and recipient."
 trigger = "command"
 system_prompt = "prompts/whatsapp.txt"
 skills = ["messaging-etiquette"]

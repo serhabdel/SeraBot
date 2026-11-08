@@ -803,6 +803,10 @@ pub struct BotSummary {
     pub model: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
+    /// The shipped human title (0.23). The server already falls back to it for
+    /// `display_name`, so the console shows it without this field.
+    #[serde(default)]
+    pub title: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]

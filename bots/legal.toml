@@ -1,4 +1,6 @@
 name = "legal"
+title = "Legal"
+description = "Legal research from a curated corpus, with citations and a reminder to consult qualified counsel. Off until a corpus is added."
 trigger = "command"
 system_prompt = "prompts/legal.txt"
 skills = ["legal-rag", "contract-review"]

@@ -1,4 +1,6 @@
 name = "main"
+title = "Main"
+description = "Your front door. Answers directly, routes requests to the right teammate, and searches your documents."
 role = "orchestrator"
 delegates = [
   "analyst",

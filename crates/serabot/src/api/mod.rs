@@ -306,6 +306,8 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/messages", post(send_message))
         .route("/v1/bots", get(list_bots).post(create_bot))
+        .route("/v1/bots/catalog", get(bot_catalog))
+        .route("/v1/bots/catalog/{name}/install", post(install_catalog_bot))
         .route(
             "/v1/bots/{id}",
             get(bot_detail).put(update_bot).delete(delete_bot),

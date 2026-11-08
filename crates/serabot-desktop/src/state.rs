@@ -782,6 +782,7 @@ mod tests {
             live: true,
             model: None,
             display_name: Some("Analyst".into()),
+            title: None,
             description: None,
             avatar: Some("A".into()),
             avatar_version: None,

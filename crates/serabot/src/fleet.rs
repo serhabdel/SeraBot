@@ -143,6 +143,17 @@ pub fn reseed_user(store: &Store, user_id: &str, templates: &[LoadedBot]) -> Res
     Ok(templates.len())
 }
 
+/// One shipped template as the owner sees it on "Meet your team".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogEntry {
+    pub name: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub role: String,
+    /// Whether the acting user has a row for this bot.
+    pub installed: bool,
+}
+
 /// The per-user fleet registry shared by the runtime, the skill tools, and
 /// the delegation/team tools. Cheap to clone (`Arc` inside).
 #[derive(Clone)]
@@ -259,15 +270,21 @@ impl FleetRegistry {
             .clone()
     }
 
-    fn upgrade(&self, user_id: &str) -> Result<usize> {
-        let rows = self.store.list_bots(user_id)?;
-        let mut offerings: Offerings = match self.store.fleet_offerings(user_id)? {
+    /// The user's offering record. An unreadable one is logged and read as
+    /// empty, so the next write replaces it with valid JSON.
+    fn offerings(&self, user_id: &str) -> Result<Offerings> {
+        Ok(match self.store.fleet_offerings(user_id)? {
             Some(raw) => serde_json::from_str(&raw).unwrap_or_else(|error| {
                 warn!(%error, "fleet offering record is unreadable; using defaults");
                 Offerings::default()
             }),
             None => Offerings::default(),
-        };
+        })
+    }
+
+    fn upgrade(&self, user_id: &str) -> Result<usize> {
+        let rows = self.store.list_bots(user_id)?;
+        let mut offerings = self.offerings(user_id)?;
         let original = offerings.clone();
         let mut inserted = 0;
         let mut rows_changed = false;
@@ -321,6 +338,14 @@ impl FleetRegistry {
                 )
             };
             let before = counts(&config);
+            // The title and description are filled only where the row has none;
+            // a value the row already holds, shipped or edited, is kept.
+            let metadata_filled = (config.title.is_none() && template.config.title.is_some())
+                || (config.description.is_none() && template.config.description.is_some());
+            config.title = config.title.or_else(|| template.config.title.clone());
+            config.description = config
+                .description
+                .or_else(|| template.config.description.clone());
             add_gained(&mut config.tools, &template.config.tools, &baseline.tools);
             add_gained(
                 &mut config.skills,
@@ -332,7 +357,7 @@ impl FleetRegistry {
                 &template.config.delegates,
                 &baseline.delegates,
             );
-            if counts(&config) != before || prompt_changed {
+            if counts(&config) != before || prompt_changed || metadata_filled {
                 let prompt = if prompt_changed {
                     template.prompt.as_str()
                 } else {
@@ -424,6 +449,8 @@ impl FleetRegistry {
             .into_iter()
             .map(|bot| ConfiguredBot {
                 id: bot.config.name,
+                title: bot.config.title,
+                description: bot.config.description,
                 role: bot.config.role.as_str().to_owned(),
                 enabled: bot.config.enabled,
                 model: bot.config.model,
@@ -432,6 +459,80 @@ impl FleetRegistry {
                 require_approval: bot.config.require_approval,
             })
             .collect())
+    }
+
+    /// Whether a shipped template with this id exists.
+    pub fn has_template(&self, name: &str) -> bool {
+        self.templates
+            .iter()
+            .any(|template| template.config.name == name)
+    }
+
+    /// Every shipped template, with whether the acting user still has its row.
+    /// A bot the owner removed shows as not installed; nothing else is read.
+    pub fn template_catalog(&self, user_id: &str) -> Result<Vec<CatalogEntry>> {
+        let rows = self.rows(user_id)?;
+        Ok(self
+            .templates
+            .iter()
+            .map(|template| CatalogEntry {
+                name: template.config.name.clone(),
+                title: template.config.title.clone(),
+                description: template.config.description.clone(),
+                role: template.config.role.as_str().to_owned(),
+                installed: rows.iter().any(|row| row.name == template.config.name),
+            })
+            .collect())
+    }
+
+    /// Put one shipped template back into the acting user's fleet: the
+    /// explicit "Add to my team" action. Returns `false` when there is no such
+    /// template or the user already has a row with that name. The fleet the
+    /// install would produce is validated first, and the row and its offering
+    /// record are written together, so a later upgrade treats the bot like any
+    /// other shipped bot the owner kept.
+    pub fn install_template(&self, user_id: &str, name: &str) -> Result<bool> {
+        let Some(template) = self
+            .templates
+            .iter()
+            .find(|template| template.config.name == name)
+        else {
+            return Ok(false);
+        };
+        // Reads (and seeds) the user first, so the lock below is taken alone.
+        let mut candidate = self.candidates(user_id)?;
+        if candidate.iter().any(|bot| bot.config.name == name) {
+            return Ok(false);
+        }
+        candidate.push(template.clone());
+        Self::validate_fleet(&candidate)?;
+
+        let user_lock = self.user_lock(user_id);
+        let _guard = user_lock.lock().unwrap_or_else(|error| error.into_inner());
+        let mut offerings = self.offerings(user_id)?;
+        let config = serde_json::to_value(&template.config)?;
+        if !self.store.insert_bot(
+            user_id,
+            name,
+            &config,
+            &template.prompt,
+            template.config.enabled,
+        )? {
+            return Ok(false);
+        }
+        // Carry the earlier offerings forward, as an upgrade does, so anything
+        // the owner removed before stays recorded as removed.
+        let mut next = BotOffering::of(template);
+        if let Some(previous) = offerings.bots.get(name) {
+            next.tools.extend(previous.tools.iter().cloned());
+            next.skills.extend(previous.skills.iter().cloned());
+            next.delegates.extend(previous.delegates.iter().cloned());
+        }
+        offerings.bots.insert(name.to_owned(), next);
+        self.store
+            .set_fleet_offerings(user_id, &serde_json::to_string(&offerings)?)?;
+        self.evict(user_id);
+        Ok(true)
     }
 
     /// The acting user's effective skill ids: shipped catalog ∪ own rows.
@@ -504,6 +605,8 @@ mod tests {
     fn bot(name: &str, role: BotRole, delegates: Vec<String>, enabled: bool) -> LoadedBot {
         LoadedBot {
             config: BotConfig {
+                title: None,
+                description: None,
                 name: name.into(),
                 trigger: "command".into(),
                 model: None,
@@ -1007,6 +1110,8 @@ mod tests {
         let store = Store::open_in_memory(384).unwrap();
         let admin = store.admin_user_id().unwrap();
         let old = BotConfig {
+            title: None,
+            description: None,
             tools: old_tools,
             ..shipped
         };
@@ -1160,6 +1265,167 @@ mod tests {
 
     /// The upgrade runs once per user per process: the mark is set after the
     /// first seed and cleared by `invalidate`.
+    /// `versioned` plus a `watcher` specialist, titled, that the owner may
+    /// remove (no delegate points at it).
+    fn with_watcher(tools: &[&str]) -> Vec<LoadedBot> {
+        let mut templates = versioned(&[], "v1");
+        let mut watcher = bot("watcher", BotRole::Specialist, vec![], true);
+        watcher.config.title = Some("Watcher".into());
+        watcher.config.description = Some("Monitors sources.".into());
+        watcher.config.tools = tools.iter().map(|tool| (*tool).to_owned()).collect();
+        templates.push(watcher);
+        templates
+    }
+
+    /// An existing row without a title or description is filled from the
+    /// template; a title the row already holds is kept.
+    #[test]
+    fn an_existing_row_gains_a_missing_title_and_keeps_an_edited_one() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let member = member(&store);
+        // Both users start from a template with no metadata (an older release).
+        registry_with(&store, versioned(&[], "v1"))
+            .seed(&admin)
+            .unwrap();
+        registry_with(&store, versioned(&[], "v1"))
+            .seed(&member)
+            .unwrap();
+        assert!(config_of(&store, &member, "main").title.is_none());
+
+        // The member's own main already carries a title the owner chose.
+        let row = store.get_bot(&member, "main").unwrap().unwrap();
+        let mut edited = row.config.clone();
+        edited["title"] = serde_json::json!("My Boss");
+        store
+            .update_bot(&member, "main", &edited, &row.prompt, true)
+            .unwrap();
+
+        let mut templates = versioned(&[], "v1");
+        templates[0].config.title = Some("Main".into());
+        templates[0].config.description = Some("Your front door.".into());
+        templates[1].config.title = Some("Analyst".into());
+        let next = registry_with(&store, templates);
+        // Filling metadata is an update, not an insert.
+        assert_eq!(next.seed(&admin).unwrap(), 0);
+        assert_eq!(next.seed(&member).unwrap(), 0);
+
+        let admin_main = config_of(&store, &admin, "main");
+        assert_eq!(admin_main.title.as_deref(), Some("Main"));
+        assert_eq!(admin_main.description.as_deref(), Some("Your front door."));
+        assert_eq!(
+            config_of(&store, &admin, "analyst").title.as_deref(),
+            Some("Analyst")
+        );
+        let member_main = config_of(&store, &member, "main");
+        assert_eq!(member_main.title.as_deref(), Some("My Boss"));
+        assert_eq!(member_main.description.as_deref(), Some("Your front door."));
+        // The prompt is untouched by a metadata-only upgrade.
+        assert_eq!(store.get_bot(&admin, "main").unwrap().unwrap().prompt, "v1");
+    }
+
+    /// The catalog marks a removed template as not installed; installing it
+    /// restores the row with its title, and a second install does nothing.
+    #[test]
+    fn catalog_lists_a_removed_bot_and_install_restores_it() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let registry = registry_with(&store, with_watcher(&["fetch_url"]));
+        registry.seed(&admin).unwrap();
+        let entry = |catalog: &[CatalogEntry], name: &str| {
+            catalog
+                .iter()
+                .find(|entry| entry.name == name)
+                .cloned()
+                .unwrap()
+        };
+        let catalog = registry.template_catalog(&admin).unwrap();
+        assert!(entry(&catalog, "watcher").installed);
+        assert_eq!(entry(&catalog, "watcher").title.as_deref(), Some("Watcher"));
+        assert_eq!(entry(&catalog, "watcher").role, "specialist");
+
+        store.delete_bot(&admin, "watcher").unwrap();
+        let catalog = registry.template_catalog(&admin).unwrap();
+        assert!(!entry(&catalog, "watcher").installed);
+        assert!(entry(&catalog, "main").installed);
+        // A removed bot is not seeded back by the upgrade on the next read.
+        assert_eq!(registry.seed(&admin).unwrap(), 0);
+        assert!(store.get_bot(&admin, "watcher").unwrap().is_none());
+
+        assert!(registry.has_template("watcher"));
+        assert!(!registry.has_template("ghost"));
+        assert!(registry.install_template(&admin, "watcher").unwrap());
+        let restored = store.get_bot(&admin, "watcher").unwrap().unwrap();
+        assert!(restored.enabled);
+        assert_eq!(restored.config["title"], "Watcher");
+        assert!(
+            registry
+                .template_catalog(&admin)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.name == "watcher" && entry.installed)
+        );
+        // Installing a bot that is already there, or an unknown one, is a no-op.
+        assert!(!registry.install_template(&admin, "watcher").unwrap());
+        assert!(!registry.install_template(&admin, "ghost").unwrap());
+        assert_eq!(store.count_bots(&admin).unwrap(), 3);
+    }
+
+    /// Install writes only the acting user's row: another user's removed bot
+    /// stays removed, and their catalog still says so.
+    #[test]
+    fn install_is_scoped_to_the_acting_user() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let member = member(&store);
+        let registry = registry_with(&store, with_watcher(&[]));
+        registry.seed(&admin).unwrap();
+        registry.seed(&member).unwrap();
+        store.delete_bot(&member, "watcher").unwrap();
+        store.delete_bot(&admin, "watcher").unwrap();
+
+        assert!(registry.install_template(&admin, "watcher").unwrap());
+        assert!(store.get_bot(&admin, "watcher").unwrap().is_some());
+        assert!(store.get_bot(&member, "watcher").unwrap().is_none());
+        let member_catalog = registry.template_catalog(&member).unwrap();
+        assert!(
+            member_catalog
+                .iter()
+                .any(|entry| entry.name == "watcher" && !entry.installed)
+        );
+        // The member's record still holds the removal.
+        assert_eq!(registry.seed(&member).unwrap(), 0);
+        assert!(store.get_bot(&member, "watcher").unwrap().is_none());
+    }
+
+    /// The install records the offering, so the next template release reaches
+    /// the restored bot like any other.
+    #[test]
+    fn an_installed_bot_takes_a_later_template_upgrade() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        registry_with(&store, with_watcher(&["fetch_url"]))
+            .seed(&admin)
+            .unwrap();
+        store.delete_bot(&admin, "watcher").unwrap();
+        let registry = registry_with(&store, with_watcher(&["fetch_url"]));
+        assert!(registry.install_template(&admin, "watcher").unwrap());
+        assert!(
+            store
+                .fleet_offerings(&admin)
+                .unwrap()
+                .unwrap()
+                .contains("\"watcher\"")
+        );
+
+        let next = registry_with(&store, with_watcher(&["fetch_url", "memory_search"]));
+        next.seed(&admin).unwrap();
+        assert_eq!(
+            config_of(&store, &admin, "watcher").tools,
+            vec!["fetch_url".to_owned(), "memory_search".to_owned()]
+        );
+    }
+
     #[test]
     fn the_upgrade_runs_once_until_invalidated() {
         let store = Store::open_in_memory(384).unwrap();

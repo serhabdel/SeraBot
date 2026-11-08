@@ -135,6 +135,42 @@ const LEGAL_SUGGESTIONS: &[&str] = &[
     "Explain the key clauses in this contract",
     "List the deadlines in my documents",
 ];
+const AUDITOR_SUGGESTIONS: &[&str] = &[
+    "Run the audit checklist on these statements",
+    "Check this bank reconciliation for exceptions",
+    "List the evidence I need for a payroll review",
+];
+const COMPTABLE_SUGGESTIONS: &[&str] = &[
+    "Reconcile this bank statement with my ledger",
+    "Estimate my IS for 2026",
+    "Prepare this month's payroll summary",
+    "Explain the TVA return for this quarter",
+];
+const MARKETER_SUGGESTIONS: &[&str] = &[
+    "Draft a launch plan for my new service",
+    "Write three social posts for this offer",
+    "Outline an SEO brief for my product page",
+];
+const MARKETS_SUGGESTIONS: &[&str] = &[
+    "Research the margin trend of this listed company",
+    "Sketch a DCF range with every assumption written out",
+    "Explain the currency exposure in my portfolio",
+];
+const COURIER_SUGGESTIONS: &[&str] = &[
+    "Draft a reminder for a client who is late on payment",
+    "Write a follow-up after our meeting on Tuesday",
+    "Send the signed quote to my own Telegram chat",
+];
+const INBOX_SUGGESTIONS: &[&str] = &[
+    "Rank my unread messages by priority",
+    "Summarize the thread about the delayed delivery",
+    "Draft a polite reply to my latest invoice question",
+];
+const WHATSAPP_SUGGESTIONS: &[&str] = &[
+    "Draft a reminder about tomorrow's appointment",
+    "Write a short follow-up for a supplier who has not replied",
+    "Draft a message to confirm my appointment changes",
+];
 const GENERAL_SUGGESTIONS: &[&str] = &[
     "Summarize the attached file",
     "Help me plan the next step",
@@ -151,6 +187,13 @@ pub fn suggestions(bot_id: Option<&str>) -> &'static [&'static str] {
         Some("maker") => MAKER_SUGGESTIONS,
         Some("watcher") => WATCHER_SUGGESTIONS,
         Some("legal") => LEGAL_SUGGESTIONS,
+        Some("auditor") => AUDITOR_SUGGESTIONS,
+        Some("comptable") => COMPTABLE_SUGGESTIONS,
+        Some("marketer") => MARKETER_SUGGESTIONS,
+        Some("markets") => MARKETS_SUGGESTIONS,
+        Some("courier") => COURIER_SUGGESTIONS,
+        Some("inbox") => INBOX_SUGGESTIONS,
+        Some("whatsapp") => WHATSAPP_SUGGESTIONS,
         _ => GENERAL_SUGGESTIONS,
     }
 }
@@ -239,10 +282,44 @@ mod tests {
             suggestions(Some("maker")),
             suggestions(Some("watcher")),
             suggestions(Some("legal")),
+            suggestions(Some("auditor")),
+            suggestions(Some("comptable")),
+            suggestions(Some("marketer")),
+            suggestions(Some("markets")),
+            suggestions(Some("courier")),
+            suggestions(Some("inbox")),
+            suggestions(Some("whatsapp")),
             suggestions(None),
         ] {
             assert!((2..=4).contains(&set.len()));
             assert!(set.iter().all(|text| !text.contains('\u{2192}')));
         }
+        assert!(
+            suggestions(Some("comptable"))
+                .iter()
+                .any(|s| s.contains("ledger"))
+        );
+    }
+
+    /// Every template in `bots/` has its own starter prompts, so no shipped
+    /// bot falls back to the general set. The directory is read, not listed
+    /// by hand, so a new template without prompts fails here.
+    #[test]
+    fn every_shipped_bot_has_its_own_starter_prompts() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bots");
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(&root).expect("bots directory") {
+            let path = entry.expect("bots entry").path();
+            if path.extension().and_then(|value| value.to_str()) != Some("toml") {
+                continue;
+            }
+            let id = path.file_stem().and_then(|stem| stem.to_str()).unwrap();
+            let set = suggestions(Some(id));
+            assert_ne!(set, GENERAL_SUGGESTIONS, "{id} has no starter prompts");
+            assert!((2..=4).contains(&set.len()), "{id}: {} prompts", set.len());
+            assert!(set.iter().all(|text| !text.trim().is_empty()), "{id}");
+            checked += 1;
+        }
+        assert!(checked >= 12, "expected the twelve shipped bot files");
     }
 }
