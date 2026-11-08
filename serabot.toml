@@ -60,7 +60,8 @@ model = "mistral-large-latest"
 api_key_secret = "llm_api_key"
 timeout_secs = 120
 # Tool rounds: runtime.max_tool_iterations and llm.max_tool_rounds; loop uses the higher value.
-max_tool_rounds = 10
+# Owners can override both in Settings; the server ceiling is 200 rounds and 500 calls.
+max_tool_rounds = 60
 # Provider may advertise 1M+ context; SeraBot forwards max_tokens only (no local input cap).
 max_output_tokens = 32768
 # Set true only after you accept that selected prompt/document passages leave this host.
@@ -237,8 +238,9 @@ max_pages = 30
 
 [runtime]
 max_concurrent_turns = 2
-max_tool_calls_per_turn = 12
-max_tool_iterations = 10
+# Per-turn caps. Owners can override them in Settings (ceiling: 500 calls, 200 rounds).
+max_tool_calls_per_turn = 150
+max_tool_iterations = 60
 task_lease_secs = 300
 worker_poll_ms = 500
 history_limit = 50

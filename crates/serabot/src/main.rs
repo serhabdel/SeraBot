@@ -993,6 +993,12 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     )?;
 
     let worker = tokio::spawn(runtime.clone().run_worker());
+    // Background media jobs (0.24): polls provider renders until they finish.
+    let media_jobs = tokio::spawn(serabot::media_jobs::run_media_jobs(
+        store.clone(),
+        config.artifacts_dir(),
+        shutdown.clone(),
+    ));
     let mut services = Vec::new();
 
     if config.api.enabled {
@@ -1140,6 +1146,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     tracing::info!("shutdown requested");
     shutdown.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(20), worker).await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), media_jobs).await;
     for service in services {
         let _ = tokio::time::timeout(Duration::from_secs(10), service).await;
     }

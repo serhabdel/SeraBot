@@ -3795,6 +3795,119 @@ async fn voice_settings_report_readiness_and_are_admin_writable() {
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+/// Per-turn work limits: the owner reads, sets, validates and resets their own
+/// override; a member's override is separate.
+#[tokio::test]
+async fn turn_limits_are_per_user_validated_and_resettable() {
+    let (router, _, store) = app();
+    let response = router
+        .clone()
+        .oneshot(request(
+            &router,
+            "GET",
+            "/v1/settings/turn-limits",
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["max_tool_calls_per_turn"], json!(150));
+    assert_eq!(body["max_tool_rounds"], json!(60));
+    assert_eq!(body["ceiling"]["max_tool_calls_per_turn"], json!(500));
+    assert_eq!(body["ceiling"]["max_tool_rounds"], json!(200));
+    assert_eq!(body["overridden"], json!(false));
+
+    let response = router
+        .clone()
+        .oneshot(request(
+            &router,
+            "PUT",
+            "/v1/settings/turn-limits",
+            true,
+            Some(json!({"max_tool_calls_per_turn": 40, "max_tool_rounds": 12})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_json(response).await;
+    assert_eq!(body["max_tool_calls_per_turn"], json!(40));
+    assert_eq!(body["max_tool_rounds"], json!(12));
+    assert_eq!(body["overridden"], json!(true));
+
+    // Above the ceiling, or zero, is refused and nothing changes.
+    for bad in [
+        json!({"max_tool_calls_per_turn": 501, "max_tool_rounds": 12}),
+        json!({"max_tool_calls_per_turn": 40, "max_tool_rounds": 0}),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(request(
+                &router,
+                "PUT",
+                "/v1/settings/turn-limits",
+                true,
+                Some(bad),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let response = router
+        .clone()
+        .oneshot(request(
+            &router,
+            "GET",
+            "/v1/settings/turn-limits",
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        read_json(response).await["max_tool_calls_per_turn"],
+        json!(40)
+    );
+
+    // A member sees the defaults, not the owner's override.
+    let member = store
+        .create_user("microsoft:limits-member", "l@example.example", "L")
+        .unwrap();
+    let member_token = store
+        .mint_session(&member.id, chrono::Duration::hours(1))
+        .unwrap();
+    let response = router
+        .clone()
+        .oneshot(request_with_token(
+            "GET",
+            "/v1/settings/turn-limits",
+            &member_token,
+            None,
+        ))
+        .await
+        .unwrap();
+    let body = read_json(response).await;
+    assert_eq!(body["max_tool_calls_per_turn"], json!(150));
+    assert_eq!(body["overridden"], json!(false));
+
+    // Reset drops the owner's override.
+    let response = router
+        .clone()
+        .oneshot(request(
+            &router,
+            "DELETE",
+            "/v1/settings/turn-limits",
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    let body = read_json(response).await;
+    assert_eq!(body["max_tool_calls_per_turn"], json!(150));
+    assert_eq!(body["overridden"], json!(false));
+}
+
 /// Reply mode is per conversation and per user.
 #[tokio::test]
 async fn reply_mode_round_trips_per_conversation() {

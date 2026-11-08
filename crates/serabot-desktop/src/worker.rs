@@ -60,6 +60,14 @@ pub enum OperationKind {
     /// Stop the running turn(s) of the open conversation.
     StopTurn,
     FetchArtifact,
+    /// A file's bytes, read back as a preview for an inline player.
+    PreviewArtifact,
+    /// The open conversation's background media jobs.
+    MediaJobs,
+    /// The owner's per-turn work limits.
+    TurnLimits,
+    /// Save or reset the owner's per-turn work limits.
+    TurnLimitsWrite,
     Transcribe,
     AdminWrite,
     /// Save the account's own key for a provider.
@@ -203,6 +211,23 @@ pub enum Operation {
     FetchArtifact {
         hash: String,
     },
+    /// Read a media file back for an inline player. `mime` comes from the
+    /// library entry; the bytes become a data URL off the UI thread.
+    PreviewArtifact {
+        hash: String,
+        mime: String,
+    },
+    /// The open conversation's background media jobs.
+    MediaJobs,
+    /// `GET /v1/settings/turn-limits`.
+    TurnLimits,
+    /// `PUT /v1/settings/turn-limits` with the owner's chosen values.
+    SaveTurnLimits {
+        calls: usize,
+        rounds: usize,
+    },
+    /// `DELETE /v1/settings/turn-limits`: back to the config defaults.
+    ResetTurnLimits,
     TranscribeAudio {
         filename: String,
         bytes: Vec<u8>,
@@ -375,6 +400,10 @@ impl Operation {
             Self::SetThinking { .. } => OperationKind::Thinking,
             Self::StopTurn => OperationKind::StopTurn,
             Self::FetchArtifact { .. } => OperationKind::FetchArtifact,
+            Self::PreviewArtifact { .. } => OperationKind::PreviewArtifact,
+            Self::MediaJobs => OperationKind::MediaJobs,
+            Self::TurnLimits => OperationKind::TurnLimits,
+            Self::SaveTurnLimits { .. } | Self::ResetTurnLimits => OperationKind::TurnLimitsWrite,
             Self::TranscribeAudio { .. } => OperationKind::Transcribe,
             Self::AdminSaveProvider(_)
             | Self::AdminRemoveProvider(_)
@@ -461,6 +490,15 @@ pub enum Reply {
     Attached(crate::api::AttachmentInfo),
     /// Voice/OCR readiness from `GET /v1/settings/voice`.
     Voice(VoiceSettings),
+    /// The open conversation's background media jobs.
+    MediaJobs(Vec<crate::api::MediaJob>),
+    /// The owner's turn limits, after a read, a save or a reset.
+    TurnLimits(crate::api::TurnLimitsView),
+    /// A media file as a data URL, ready for an inline player.
+    Preview {
+        hash: String,
+        data_url: String,
+    },
     AdminSaved,
     ProviderKeySaved,
     DefaultRouteSaved,
@@ -856,6 +894,22 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
                     bytes,
                 })
         }
+        Operation::PreviewArtifact { hash, mime } => {
+            client.artifact(hash).and_then(|(_, bytes)| {
+                crate::media_view::preview_data_url_for(mime, &bytes).map(|data_url| {
+                    Reply::Preview {
+                        hash: hash.clone(),
+                        data_url,
+                    }
+                })
+            })
+        }
+        Operation::MediaJobs => client.media_jobs(conversation).map(Reply::MediaJobs),
+        Operation::TurnLimits => client.turn_limits().map(Reply::TurnLimits),
+        Operation::SaveTurnLimits { calls, rounds } => client
+            .set_turn_limits(*calls, *rounds)
+            .map(Reply::TurnLimits),
+        Operation::ResetTurnLimits => client.reset_turn_limits().map(Reply::TurnLimits),
         Operation::TranscribeAudio { filename, bytes } => client
             .transcribe_audio(filename, bytes)
             .map(Reply::Transcribed),

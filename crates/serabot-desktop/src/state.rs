@@ -70,6 +70,13 @@ pub struct State {
     pub library_loaded: bool,
     pub library_loading: bool,
     pub library_error: Option<String>,
+    /// Background media jobs of the open conversation (0.24), conversation-scoped.
+    pub media_jobs: Vec<crate::api::MediaJob>,
+    /// Media files already read back for inline players, by artifact hash.
+    pub media_previews: std::collections::BTreeMap<String, String>,
+    /// The owner's per-turn work limits (0.24), once read or saved.
+    pub turn_limits: Option<crate::api::TurnLimitsView>,
+    pub turn_limits_error: Option<String>,
     /// Goal and todo list of the open conversation, conversation-scoped.
     pub plan: Option<crate::chat_plan::ChatPlan>,
     /// The owner's auto-approve switch for the open conversation. Defaults
@@ -162,6 +169,10 @@ impl Default for State {
             library_loaded: false,
             library_loading: false,
             library_error: None,
+            media_jobs: Vec::new(),
+            media_previews: std::collections::BTreeMap::new(),
+            turn_limits: None,
+            turn_limits_error: None,
             plan: None,
             auto_approve: false,
             transcript: None,
@@ -482,6 +493,14 @@ impl State {
                 self.library_loading = false;
                 self.library_error = None;
             }
+            Reply::MediaJobs(jobs) => self.media_jobs = jobs,
+            Reply::Preview { hash, data_url } => {
+                self.media_previews.insert(hash, data_url);
+            }
+            Reply::TurnLimits(view) => {
+                self.turn_limits = Some(view);
+                self.turn_limits_error = None;
+            }
             Reply::ChatPlan { plan, auto_approve } => {
                 self.plan = plan;
                 self.auto_approve = auto_approve;
@@ -742,6 +761,7 @@ mod tests {
             name: Some("analyst".into()),
             bot: Some("analyst".into()),
             attachments: Vec::new(),
+            limit_reached: false,
         });
         state.task = Some(Task {
             id: "t".into(),

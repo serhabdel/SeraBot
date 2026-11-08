@@ -168,6 +168,93 @@ pub fn ChatPrefsCard(session: Signal<Session>) -> Element {
     }
 }
 
+/// The owner's per-turn work limits (0.24): how many tool calls and model
+/// rounds one bot turn may use. The server ceiling and the config default are
+/// shown; an empty field keeps the current value.
+#[component]
+pub fn TurnLimitsCard(session: Signal<Session>) -> Element {
+    let mut session = session;
+    let mut calls = use_signal(String::new);
+    let mut rounds = use_signal(String::new);
+    use_effect(move || session.write().load_turn_limits());
+    let (view, error) = {
+        let s = session.read();
+        (s.state.turn_limits, s.state.turn_limits_error.clone())
+    };
+    let summary = match view {
+        Some(view) => serabot_desktop::media_view::limits_summary(&view),
+        None => "Loading your work limits\u{2026}".to_owned(),
+    };
+    let ceiling = view.map(|view| view.ceiling);
+    rsx! {
+        div { class: "card",
+            div { class: "card-head",
+                h3 { class: "card-title", "Bot work limits" }
+            }
+            p { class: "tiny", "{summary}" }
+            p { class: "tiny",
+                "When a turn reaches a limit, the bot answers with what it has so far and offers Continue."
+            }
+            label { class: "field",
+                span { "Tool calls per turn" }
+                input {
+                    r#type: "number",
+                    min: "1",
+                    max: "{ceiling.map(|c| c.max_tool_calls_per_turn).unwrap_or(0)}",
+                    placeholder: "{view.map(|v| v.max_tool_calls_per_turn).unwrap_or(0)}",
+                    value: "{calls}",
+                    oninput: move |event| calls.set(event.value()),
+                }
+            }
+            label { class: "field",
+                span { "Tool rounds per turn" }
+                input {
+                    r#type: "number",
+                    min: "1",
+                    max: "{ceiling.map(|c| c.max_tool_rounds).unwrap_or(0)}",
+                    placeholder: "{view.map(|v| v.max_tool_rounds).unwrap_or(0)}",
+                    value: "{rounds}",
+                    oninput: move |event| rounds.set(event.value()),
+                }
+            }
+            if let Some(error) = error {
+                p { class: "tiny", role: "alert", "{error}" }
+            }
+            div { class: "row-actions",
+                button {
+                    class: "btn primary small",
+                    onclick: move |_| {
+                        let current = session.read().state.turn_limits;
+                        let calls_text = if calls.read().trim().is_empty() {
+                            current.map(|v| v.max_tool_calls_per_turn.to_string()).unwrap_or_default()
+                        } else {
+                            calls.read().clone()
+                        };
+                        let rounds_text = if rounds.read().trim().is_empty() {
+                            current.map(|v| v.max_tool_rounds.to_string()).unwrap_or_default()
+                        } else {
+                            rounds.read().clone()
+                        };
+                        session.write().save_turn_limits(&calls_text, &rounds_text);
+                        calls.set(String::new());
+                        rounds.set(String::new());
+                    },
+                    "Save"
+                }
+                button {
+                    class: "btn small",
+                    onclick: move |_| {
+                        session.write().reset_turn_limits();
+                        calls.set(String::new());
+                        rounds.set(String::new());
+                    },
+                    "Reset to default"
+                }
+            }
+        }
+    }
+}
+
 #[component]
 pub fn AboutCard(session: Signal<Session>) -> Element {
     let (server, version) = {

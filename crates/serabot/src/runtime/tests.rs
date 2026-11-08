@@ -1378,8 +1378,8 @@ async fn room_turns_ignore_bot_override() {
 #[tokio::test]
 async fn handoff_reply_keeps_specialist_name_when_a_limit_stops_the_turn() {
     let server = MockServer::start().await;
-    // One more tool call than the per-turn limit stops the specialist turn
-    // before any tool runs.
+    // One more tool call than the owner's per-turn limit stops the specialist
+    // turn before any tool runs.
     let tool_calls: Vec<Value> = (0..13)
         .map(|index| {
             json!({
@@ -1418,11 +1418,27 @@ async fn handoff_reply_keeps_specialist_name_when_a_limit_stops_the_turn() {
                     "finish_reason": "tool_calls"
                 }]
             }),
+            // The final no-tools call after the limit.
+            json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "Limit summary from the specialist."},
+                    "finish_reason": "stop"
+                }]
+            }),
         ]))
         .mount(&server)
         .await;
     let notifier = Arc::new(Capture::default());
     let (runtime, store) = setup_orchestration(&server.uri(), notifier);
+    store
+        .set_user_turn_limits(
+            &admin(&store),
+            crate::turn_limits::TurnLimits {
+                max_tool_calls_per_turn: 12,
+                max_tool_rounds: 60,
+            },
+        )
+        .unwrap();
     runtime
         .submit_text(&admin(&store), "owner", "review notes", None)
         .unwrap();
@@ -1437,8 +1453,9 @@ async fn handoff_reply_keeps_specialist_name_when_a_limit_stops_the_turn() {
         .unwrap();
     let stopped = messages
         .iter()
-        .find(|message| message.content.contains("tool-call limit"))
+        .find(|message| message.content == "Limit summary from the specialist.")
         .expect("limit reply is stored");
+    assert!(stopped.limit_reached);
     assert_eq!(stopped.name.as_deref(), Some("analyst"));
     assert!(store.list_audit(50).unwrap().iter().any(|entry| {
         entry.event == "handoff.completed"
@@ -1449,7 +1466,169 @@ async fn handoff_reply_keeps_specialist_name_when_a_limit_stops_the_turn() {
                 .and_then(Value::as_str)
                 == Some("analyst")
     }));
-    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    // Parent delegation, the specialist's tool round, then the final no-tools call.
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+}
+
+/// A scripted model reply that asks for `count` calls to `skill_list`.
+fn tool_round_reply(prefix: &str, count: usize) -> Value {
+    let calls: Vec<Value> = (0..count)
+        .map(|index| {
+            json!({
+                "id": format!("{prefix}_{index}"),
+                "type": "function",
+                "function": {"name": "skill_list", "arguments": "{}"}
+            })
+        })
+        .collect();
+    json!({
+        "choices": [{
+            "message": {"role": "assistant", "content": null, "tool_calls": calls},
+            "finish_reason": "tool_calls"
+        }]
+    })
+}
+
+fn text_reply(text: &str) -> Value {
+    json!({
+        "choices": [{
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": "stop"
+        }]
+    })
+}
+
+/// Requests the mock received, as parsed JSON bodies.
+async fn received_bodies(server: &MockServer) -> Vec<Value> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn tool_round_limit_ends_with_a_no_tools_answer_and_marks_the_turn() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(Sequence::new(vec![
+            tool_round_reply("round_one", 1),
+            tool_round_reply("round_two", 1),
+            text_reply("Here is what I found so far."),
+        ]))
+        .mount(&server)
+        .await;
+    let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
+    store
+        .set_user_turn_limits(
+            &admin(&store),
+            crate::turn_limits::TurnLimits {
+                max_tool_calls_per_turn: 150,
+                max_tool_rounds: 2,
+            },
+        )
+        .unwrap();
+    runtime
+        .submit_text(&admin(&store), "owner", "read the root folder", None)
+        .unwrap();
+    let task = store.claim_task("worker", 30).unwrap().unwrap();
+    runtime.process_task(task).await.unwrap();
+
+    let bodies = received_bodies(&server).await;
+    assert_eq!(bodies.len(), 3);
+    // The final call offers no tools and carries the limit note last.
+    assert!(bodies[2].get("tools").is_none());
+    let last = bodies[2]["messages"].as_array().unwrap().last().unwrap();
+    assert_eq!(last["role"], "system");
+    assert!(
+        last["content"]
+            .as_str()
+            .unwrap()
+            .contains("You reached this turn's tool limit")
+    );
+    let messages = store
+        .list_visible_messages(&admin(&store), "owner", 20)
+        .unwrap();
+    let reply = messages.last().unwrap();
+    assert_eq!(reply.content, "Here is what I found so far.");
+    assert!(reply.limit_reached);
+    let limited = store
+        .list_audit(50)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.event == "turn.limit_reached")
+        .expect("limit is audited");
+    assert_eq!(
+        limited
+            .details
+            .as_ref()
+            .and_then(|details| details.get("limit"))
+            .and_then(Value::as_str),
+        Some("tool_rounds")
+    );
+}
+
+#[tokio::test]
+async fn failed_limit_answer_falls_back_to_a_summary_of_the_tools_that_ran() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(Sequence::new(vec![
+            // Two calls requested; the limit of one lets none of them run.
+            tool_round_reply("call", 2),
+            // The final call returns no choices, so it fails.
+            json!({"choices": []}),
+        ]))
+        .mount(&server)
+        .await;
+    let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
+    store
+        .set_user_turn_limits(
+            &admin(&store),
+            crate::turn_limits::TurnLimits {
+                max_tool_calls_per_turn: 1,
+                max_tool_rounds: 60,
+            },
+        )
+        .unwrap();
+    runtime
+        .submit_text(&admin(&store), "owner", "read the root folder", None)
+        .unwrap();
+    let task = store.claim_task("worker", 30).unwrap().unwrap();
+    runtime.process_task(task).await.unwrap();
+
+    let messages = store
+        .list_visible_messages(&admin(&store), "owner", 20)
+        .unwrap();
+    let reply = messages.last().unwrap();
+    assert!(reply.limit_reached);
+    assert!(reply.content.contains("tool limit"));
+    assert!(reply.content.contains("skill_list"));
+    assert!(reply.content.contains("Not done: skill_list, skill_list."));
+}
+
+#[tokio::test]
+async fn turn_limits_resolve_owner_override_then_config_default() {
+    let (runtime, store) = setup_orchestration("http://127.0.0.1:9", Arc::new(Capture::default()));
+    let user = admin(&store);
+    let default = runtime.turn_limits_for(&user).unwrap();
+    assert_eq!(default.max_tool_calls_per_turn, 150);
+    assert_eq!(default.max_tool_rounds, 60);
+    store
+        .set_user_turn_limits(
+            &user,
+            crate::turn_limits::TurnLimits {
+                max_tool_calls_per_turn: 40,
+                max_tool_rounds: 20,
+            },
+        )
+        .unwrap();
+    let owner = runtime.turn_limits_for(&user).unwrap();
+    assert_eq!(owner.max_tool_calls_per_turn, 40);
+    assert_eq!(owner.max_tool_rounds, 20);
+    assert!(store.clear_user_turn_limits(&user).unwrap());
+    assert_eq!(runtime.turn_limits_for(&user).unwrap(), default);
 }
 
 #[tokio::test]

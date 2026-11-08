@@ -18,6 +18,7 @@ pub mod events;
 pub mod local_folders;
 pub mod local_fs;
 pub mod local_xfer;
+pub mod media_view;
 pub mod net_policy;
 pub mod oauth;
 pub mod panel;

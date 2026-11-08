@@ -20,6 +20,35 @@ impl Runtime {
         }
     }
 
+    /// Keep a claimed task's lease alive while its turn runs. A tool call can
+    /// take longer than one lease, so the lease is renewed every third of its
+    /// length. The heartbeat stops when the task leaves `running` (finished,
+    /// parked for approval, or reclaimed under a newer fencing token).
+    fn spawn_lease_heartbeat(&self, task: &Task) -> tokio::task::JoinHandle<()> {
+        let store = self.store.clone();
+        let user = task.user_id.clone();
+        let id = task.id.clone();
+        let token = task.fencing_token;
+        let lease_secs = self.config.runtime.task_lease_secs.max(3);
+        tokio::spawn(async move {
+            let mut beat = tokio::time::interval(std::time::Duration::from_secs(lease_secs / 3));
+            // The first tick completes at once; the claim already set a lease.
+            beat.tick().await;
+            loop {
+                beat.tick().await;
+                let until = Utc::now() + chrono::Duration::seconds(lease_secs as i64);
+                match store.renew_task_lease(&user, &id, token, until) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        debug!(task = %id, "lease heartbeat stopped: task is no longer running under this claim");
+                        break;
+                    }
+                    Err(error) => error!(task = %id, %error, "failed to renew task lease"),
+                }
+            }
+        })
+    }
+
     pub async fn run_worker(self) {
         if let Err(error) = self.store.reconcile_dispatching_actions() {
             error!(%error, "failed to reconcile dispatching actions");
@@ -39,9 +68,11 @@ impl Runtime {
                             let runtime = self.clone();
                             tokio::spawn(async move {
                                 let _permit = permit;
+                                let heartbeat = runtime.spawn_lease_heartbeat(&task);
                                 if let Err(error) = runtime.process_task(task).await {
                                     error!(%error, "task processing failed");
                                 }
+                                heartbeat.abort();
                             });
                         }
                         Ok(None) => {

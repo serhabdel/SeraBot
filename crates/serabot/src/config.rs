@@ -2332,7 +2332,7 @@ fn default_prompts_dir() -> String {
     "prompts".into()
 }
 fn default_max_tool_rounds() -> usize {
-    10
+    crate::turn_limits::DEFAULT_TOOL_ROUNDS_PER_TURN
 }
 fn default_max_output_tokens() -> u32 {
     32768
@@ -2479,10 +2479,10 @@ fn default_max_turns() -> usize {
     2
 }
 fn default_max_tool_calls() -> usize {
-    12
+    crate::turn_limits::DEFAULT_TOOL_CALLS_PER_TURN
 }
 fn default_tool_iterations() -> usize {
-    10
+    crate::turn_limits::DEFAULT_TOOL_ROUNDS_PER_TURN
 }
 fn default_lease() -> u64 {
     300

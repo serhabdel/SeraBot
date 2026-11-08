@@ -98,6 +98,54 @@ pub struct ToolOutput {
     pub destination: Option<String>,
 }
 
+/// Reserved key in `ToolOutput::data` that lists artifacts beyond the single
+/// `artifact_hash` (0.24): a tool that makes several files returns them all.
+pub const EXTRA_ARTIFACTS_KEY: &str = "extra_artifacts";
+
+/// One further artifact a tool produced in the same call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtraArtifact {
+    pub hash: String,
+    #[serde(default)]
+    pub filename: String,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+impl ToolOutput {
+    /// The additional artifacts this output lists. A malformed entry is
+    /// skipped; the primary `artifact_hash` is unaffected.
+    pub fn extra_artifacts(&self) -> Vec<ExtraArtifact> {
+        self.data
+            .as_ref()
+            .and_then(|data| data.get(EXTRA_ARTIFACTS_KEY))
+            .and_then(|value| serde_json::from_value::<Vec<ExtraArtifact>>(value.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    /// Attach further artifacts. Stored under `EXTRA_ARTIFACTS_KEY` in `data`.
+    pub fn with_extra_artifacts(mut self, artifacts: Vec<ExtraArtifact>) -> Self {
+        if artifacts.is_empty() {
+            return self;
+        }
+        let mut data = match self.data.take() {
+            Some(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        data.insert(
+            EXTRA_ARTIFACTS_KEY.into(),
+            serde_json::to_value(artifacts).unwrap_or(Value::Null),
+        );
+        self.data = Some(Value::Object(data));
+        self
+    }
+}
+
+/// A lowercase or uppercase 64-digit hex SHA-256, as artifact hashes are.
+fn is_sha256_hex(text: &str) -> bool {
+    text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 #[derive(Debug, Clone)]
 pub struct ApprovalDetails {
     pub summary: String,
@@ -838,6 +886,55 @@ impl Gateway {
                         value.filename.as_deref().unwrap_or_default(),
                         None,
                     )?;
+                }
+                // Further artifacts of the same call (0.24). Each one gets the
+                // same checks as the primary: a well-formed hash, the blocklist
+                // on its filename and title, and one record per hash.
+                if let Some(conversation_id) = context.conversation_id.as_deref() {
+                    let mut seen: HashSet<String> = value.artifact_hash.iter().cloned().collect();
+                    for extra in value.extra_artifacts() {
+                        if !is_sha256_hex(&extra.hash) || !seen.insert(extra.hash.clone()) {
+                            continue;
+                        }
+                        let title = extra.title.as_deref().unwrap_or_default();
+                        if !self.policy.is_allowed(&extra.filename)
+                            || !self.policy.is_allowed(title)
+                        {
+                            self.store.record_audit(
+                                &context.actor,
+                                "policy.blocked_tool_output",
+                                Some(&spec.name),
+                                context.task_id.as_deref(),
+                                None,
+                                None,
+                                Some(self.policy.version()),
+                                None,
+                            )?;
+                            continue;
+                        }
+                        self.store.record_conversation_artifact(
+                            &context.user_id,
+                            conversation_id,
+                            context.turn_id.as_deref(),
+                            &spec.name,
+                            &extra.hash,
+                            &extra.filename,
+                            extra.title.as_deref(),
+                        )?;
+                        self.store.record_audit(
+                            &context.actor,
+                            "artifact.created",
+                            Some(&spec.name),
+                            context.task_id.as_deref(),
+                            None,
+                            None,
+                            Some(self.policy.version()),
+                            Some(&serde_json::json!({
+                                "sha256": extra.hash,
+                                "filename": extra.filename,
+                            })),
+                        )?;
+                    }
                 }
                 self.store.record_audit(
                     &context.actor,
@@ -1634,6 +1731,91 @@ mod tests {
                 .await,
             Err(SeraError::PolicyViolation)
         ));
+    }
+
+    /// One tool call that makes three files: the primary and two extras, plus
+    /// a duplicate, a blocked name and a malformed hash that must not record.
+    struct BatchTool;
+
+    #[async_trait]
+    impl Tool for BatchTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "make_batch".into(),
+                description: "fake batch".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                external_effect: false,
+            }
+        }
+
+        async fn execute(&self, _args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+            Ok(ToolOutput {
+                content: "made three files".into(),
+                artifact_hash: Some("a".repeat(64)),
+                filename: Some("one.txt".into()),
+                ..ToolOutput::default()
+            }
+            .with_extra_artifacts(vec![
+                ExtraArtifact {
+                    hash: "b".repeat(64),
+                    filename: "two.txt".into(),
+                    title: Some("Two".into()),
+                },
+                ExtraArtifact {
+                    hash: "b".repeat(64),
+                    filename: "two-again.txt".into(),
+                    title: None,
+                },
+                ExtraArtifact {
+                    hash: "c".repeat(64),
+                    filename: "TopSecret.txt".into(),
+                    title: None,
+                },
+                ExtraArtifact {
+                    hash: "not-a-hash".into(),
+                    filename: "bad.txt".into(),
+                    title: None,
+                },
+            ]))
+        }
+    }
+
+    #[tokio::test]
+    async fn one_tool_call_records_every_artifact_once() {
+        let store = Store::open_in_memory(384).unwrap();
+        let mut registry = ToolRegistry::default();
+        registry.register(BatchTool).unwrap();
+        let gateway = Gateway::new(
+            store.clone(),
+            Arc::new(Policy::from_text("TopSecret")),
+            registry,
+            1,
+            false,
+        );
+        let admin = gateway.store().admin_user_id().unwrap();
+        let context = ToolContext {
+            user_id: admin.clone(),
+            actor: admin.clone(),
+            bot: "maker".into(),
+            task_id: None,
+            turn_id: None,
+            conversation_id: Some("dir:main".into()),
+            allowed_tools: ["make_batch".to_string()].into_iter().collect(),
+            require_approval: HashSet::new(),
+        };
+        let outcome = gateway
+            .execute("make_batch", serde_json::json!({}), &context)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ToolOutcome::Completed(_)));
+        let mut hashes: Vec<String> = store
+            .list_conversation_artifacts(&admin, "dir:main")
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.hash)
+            .collect();
+        hashes.sort();
+        assert_eq!(hashes, vec!["a".repeat(64), "b".repeat(64)]);
     }
 
     fn in_conversation(context: &ToolContext, conversation: &str) -> ToolContext {
