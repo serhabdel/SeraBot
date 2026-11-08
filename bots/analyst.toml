@@ -5,6 +5,9 @@ trigger = "file"
 system_prompt = "prompts/analyst.txt"
 skills = ["synthesis", "transcript", "xlsx", "docx", "pptx", "timesheets", "ask", "financial-analysis"]
 tools = [
+  "local_read_many",
+  "local_extract",
+  "local_brief",
   "ask_user",
   "skill_list",
   "skill_search",

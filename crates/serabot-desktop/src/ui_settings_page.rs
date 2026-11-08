@@ -6,6 +6,7 @@
 
 use crate::ui::Icon;
 use dioxus::prelude::*;
+use serabot_desktop::local_folders::BotScope;
 use serabot_desktop::session::{Session, SettingsSection, Theme};
 
 /// The list of sections on the left. Admin only shows for admins.
@@ -207,13 +208,22 @@ pub fn LocalFoldersCard(session: Signal<Session>) -> Element {
     use_effect(move || {
         session.write().want_folder_stats();
     });
-    let (folders, notice, running, stats) = {
+    let (folders, notice, running, stats, bots) = {
         let s = session.read();
+        // The owner's enabled bots, by name and title, for the per-folder grant.
+        let bots: Vec<(String, String)> = s
+            .state
+            .listed_bots
+            .iter()
+            .filter(|bot| bot.enabled)
+            .map(|bot| (bot.id.clone(), s.bot_display_name(&bot.id)))
+            .collect();
         (
             s.local_folders.clone(),
             s.local_notice.clone(),
             s.local_agent_running(),
             s.folder_stats.clone(),
+            bots,
         )
     };
     rsx! {
@@ -243,6 +253,12 @@ pub fn LocalFoldersCard(session: Signal<Session>) -> Element {
                                 }
                                 " \u{b7} "
                                 {if folder.mode.as_str() == "read_write" { "bots can read and, with approval, write" } else { "bots can only read" }}
+                            }
+                            BotScopePicker {
+                                session,
+                                folder_id: folder.id.clone(),
+                                scope: folder.bots.clone(),
+                                bots: bots.clone(),
                             }
                         }
                         select {
@@ -298,6 +314,72 @@ pub fn LocalFoldersCard(session: Signal<Session>) -> Element {
             p { class: "tiny",
                 "Writes always ask for your approval. Links, junctions, and files like .env or private keys are never shared. "
                 "If this app is closed, the bots get a clear error instead."
+            }
+        }
+    }
+}
+
+/// One folder's bot grant: every bot, or only the bots ticked here. A new
+/// folder that is switched to "Only these bots" starts with none ticked.
+#[component]
+pub fn BotScopePicker(
+    session: Signal<Session>,
+    folder_id: String,
+    scope: BotScope,
+    bots: Vec<(String, String)>,
+) -> Element {
+    let mut session = session;
+    let scoped = matches!(scope, BotScope::Only { .. });
+    let chosen: Vec<String> = match &scope {
+        BotScope::Only { bots } => bots.clone(),
+        BotScope::All => Vec::new(),
+    };
+    rsx! {
+        div { class: "bot-scope",
+            div { class: "seg", role: "group", "aria-label": "Bots that can use {folder_id}",
+                button {
+                    class: if scoped { "seg-btn" } else { "seg-btn active" },
+                    "aria-pressed": if scoped { "false" } else { "true" },
+                    onclick: {
+                        let id = folder_id.clone();
+                        move |_| session.write().set_local_folder_bots(&id, BotScope::All)
+                    },
+                    "All bots"
+                }
+                button {
+                    class: if scoped { "seg-btn active" } else { "seg-btn" },
+                    "aria-pressed": if scoped { "true" } else { "false" },
+                    onclick: {
+                        let id = folder_id.clone();
+                        move |_| session.write().set_local_folder_bots(&id, BotScope::Only { bots: Vec::new() })
+                    },
+                    "Only these bots"
+                }
+            }
+            if scoped {
+                if bots.is_empty() {
+                    p { class: "tiny", "No enabled bots yet." }
+                }
+                for (name, title) in bots.clone() {
+                    label { key: "{name}", class: "check",
+                        input {
+                            r#type: "checkbox",
+                            checked: chosen.contains(&name),
+                            onchange: {
+                                let (id, name, chosen) = (folder_id.clone(), name.clone(), chosen.clone());
+                                move |event| {
+                                    let mut next = chosen.clone();
+                                    next.retain(|item| item != &name);
+                                    if event.checked() {
+                                        next.push(name.clone());
+                                    }
+                                    session.write().set_local_folder_bots(&id, BotScope::Only { bots: next });
+                                }
+                            },
+                        }
+                        span { "{title}" }
+                    }
+                }
             }
         }
     }

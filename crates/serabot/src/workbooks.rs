@@ -2707,8 +2707,16 @@ impl Tool for XlsxImportTool {
             (Some(path), None) => {
                 let artifacts = self.artifacts.clone();
                 let inbox = self.inbox.clone();
+                let user_id = context.user_id.clone();
                 let (stored, summary) = tokio::task::spawn_blocking(move || {
-                    artifacts.ingest_inbox_file(&inbox, &path, &["xlsx"], MAX_INPUT_BYTES, import)
+                    artifacts.ingest_inbox_file(
+                        &inbox,
+                        &user_id,
+                        &path,
+                        &["xlsx"],
+                        MAX_INPUT_BYTES,
+                        import,
+                    )
                 })
                 .await
                 .map_err(|error| SeraError::Internal(format!("workbook task failed: {error}")))??;
@@ -4061,13 +4069,17 @@ mod tests {
         let artifacts = Arc::new(ArtifactStore::new(dir.path().join("artifacts")).unwrap());
         let store = Store::open_in_memory(384).unwrap();
         let inbox = dir.path().join("inbox");
-        std::fs::create_dir_all(&inbox).unwrap();
+        let owner = inbox.join(crate::store::ADMIN_USER_ID);
+        std::fs::create_dir_all(&owner).unwrap();
         let bytes = build(&spec()).unwrap();
-        std::fs::write(inbox.join("owner.xlsx"), &bytes).unwrap();
+        std::fs::write(owner.join("owner.xlsx"), &bytes).unwrap();
 
         let tool = XlsxImportTool::new(artifacts.clone(), store, &inbox).unwrap();
         let output = tool
-            .execute(json!({"path": "owner.xlsx"}), &context("xlsx_import"))
+            .execute(
+                json!({"path": format!("{}/owner.xlsx", crate::store::ADMIN_USER_ID)}),
+                &context("xlsx_import"),
+            )
             .await
             .unwrap();
         let hash = output.artifact_hash.unwrap();

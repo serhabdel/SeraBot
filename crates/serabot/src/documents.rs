@@ -449,6 +449,15 @@ async fn extract_pages(kind: DocumentKind, bytes: Vec<u8>) -> Result<Vec<PageTex
     }
 }
 
+/// Text of a digital PDF, page by page as `(page number, text)`, for
+/// `local_extract`.
+pub(crate) fn extract_pdf_page_texts(bytes: Vec<u8>) -> Result<Vec<(usize, String)>> {
+    Ok(extract_pdf_pages(bytes)?
+        .into_iter()
+        .map(|page| (page.page, page.text))
+        .collect())
+}
+
 /// Plain text of a digital PDF (all pages joined), for chat attachments.
 pub fn extract_pdf_text(bytes: Vec<u8>) -> Result<String> {
     Ok(extract_pdf_pages(bytes)?

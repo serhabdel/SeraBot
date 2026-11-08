@@ -4,6 +4,6 @@ description = "Monitors the sources you configure, records dated opportunities a
 trigger = "cron"
 system_prompt = "prompts/watcher.txt"
 skills = ["deadlines", "brief", "monitoring-playbook"]
-tools = ["ask_user", "skill_list", "skill_search", "skill_load", "memory_save", "memory_list", "memory_search", "memory_update", "memory_delete", "fetch_url", "watch_now"]
+tools = ["local_list", "local_search", "local_stat", "local_read", "local_read_many", "local_extract", "local_brief", "local_import", "ask_user","skill_list", "skill_search", "skill_load", "memory_save", "memory_list", "memory_search", "memory_update", "memory_delete", "fetch_url", "watch_now"]
 require_approval = []
 enabled = true
