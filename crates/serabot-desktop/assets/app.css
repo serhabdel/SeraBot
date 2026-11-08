@@ -5021,11 +5021,185 @@ html[data-reduce-transparency="true"] .chat-header {
   color: var(--label-2);
 }
 
+.step-file-icon {
+  display: block;
+}
+
 .step-label {
   flex: 1;
   min-width: 0;
   overflow-wrap: anywhere;
 }
+
+/* --- Tasks tab (0.25.0) --- */
+
+.tasks-page .pane-sub {
+  margin: 2px 0 0;
+  color: var(--label-2);
+  font-size: 13px;
+}
+
+.tasks-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.tasks-head-actions .seg {
+  border: 1px solid var(--line-2);
+  background: transparent;
+  color: var(--label-2);
+  border-radius: 8px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.tasks-head-actions .seg.on {
+  background: var(--accent-soft);
+  color: var(--label-1);
+  border-color: var(--accent);
+}
+
+.tasks-notice {
+  margin: 8px 0;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--warn-soft);
+  color: var(--label-1);
+  font-size: 13px;
+}
+
+.tasks-add {
+  display: flex;
+  gap: 8px;
+  margin: 10px 0 14px;
+}
+
+.tasks-add .tasks-due {
+  width: 150px;
+}
+
+.task-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-1);
+  border-radius: 10px;
+  margin-bottom: 6px;
+  background: var(--bg-2);
+}
+
+.task-row .task-title {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.task-row .task-status {
+  border: none;
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 11px;
+  cursor: pointer;
+  text-transform: capitalize;
+}
+
+.task-row .task-status.todo { background: var(--bg-3); color: var(--label-2); }
+.task-row .task-status.doing { background: var(--warn-soft); color: var(--label-1); }
+.task-row .task-status.done { background: var(--ok-soft); color: var(--label-1); text-decoration: line-through; }
+
+.task-row .task-due {
+  font-size: 12px;
+  color: var(--label-2);
+}
+
+.task-row .task-synced {
+  font-size: 12px;
+  color: var(--accent);
+}
+
+.tasks-done {
+  margin-top: 14px;
+  color: var(--label-2);
+  font-size: 13px;
+}
+
+.kanban {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.kanban-col {
+  background: var(--bg-2);
+  border: 1px solid var(--line-1);
+  border-radius: 12px;
+  padding: 10px;
+  min-height: 120px;
+}
+
+.kanban-col h3 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  text-transform: capitalize;
+  color: var(--label-2);
+}
+
+.cal-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 8px 0 10px;
+}
+
+.cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 4px;
+}
+
+.cal-dow {
+  font-size: 11px;
+  color: var(--label-2);
+  text-align: center;
+  padding: 4px 0;
+}
+
+.cal-cell {
+  border: 1px solid var(--line-1);
+  border-radius: 8px;
+  min-height: 64px;
+  padding: 4px 6px;
+  background: var(--bg-2);
+}
+
+.cal-cell.empty {
+  background: transparent;
+  border-color: transparent;
+}
+
+.cal-day {
+  font-size: 11px;
+  color: var(--label-2);
+  margin-bottom: 4px;
+}
+
+.cal-item {
+  font-size: 11px;
+  border-radius: 6px;
+  padding: 1px 6px;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cal-item.task { background: var(--accent-soft); color: var(--label-1); }
+.cal-item.event { background: var(--bg-3); color: var(--label-2); }
 
 .step.running .step-label {
   color: var(--label-1);

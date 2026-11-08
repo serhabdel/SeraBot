@@ -47,6 +47,12 @@ pub struct State {
     pub archived_loaded: bool,
     pub memories: Vec<MemoryEntry>,
     pub memories_loaded: bool,
+    /// Personal tasks of the Tasks tab (0.25.0), owner-scoped.
+    pub tasks: Vec<crate::api::TaskEntry>,
+    pub tasks_loaded: bool,
+    pub task_prefs: Option<crate::api::TaskPrefs>,
+    pub task_sync: Option<crate::api::TaskSyncStatus>,
+    pub task_events: Vec<crate::api::TaskEvent>,
     /// Header counts for the Memory page; `None` until fetched or after a change.
     pub memory_stats: Option<MemoryStatsView>,
     pub providers: Vec<ProviderStatus>,
@@ -153,6 +159,11 @@ impl Default for State {
             archived_loaded: false,
             memories: Vec::new(),
             memories_loaded: false,
+            tasks: Vec::new(),
+            tasks_loaded: false,
+            task_prefs: None,
+            task_sync: None,
+            task_events: Vec::new(),
             memory_stats: None,
             providers: Vec::new(),
             providers_loaded: false,
@@ -235,6 +246,11 @@ impl State {
         let conversations_loaded = self.conversations_loaded;
         let memories = self.memories.clone();
         let memories_loaded = self.memories_loaded;
+        let tasks = self.tasks.clone();
+        let tasks_loaded = self.tasks_loaded;
+        let task_prefs = self.task_prefs.clone();
+        let task_sync = self.task_sync.clone();
+        let task_events = self.task_events.clone();
         let providers = self.providers.clone();
         let providers_loaded = self.providers_loaded;
         let connectors = self.connectors.clone();
@@ -277,6 +293,11 @@ impl State {
             conversations_loaded,
             memories,
             memories_loaded,
+            tasks,
+            tasks_loaded,
+            task_prefs,
+            task_sync,
+            task_events,
             providers,
             providers_loaded,
             connectors,
@@ -311,6 +332,11 @@ impl State {
         self.archived_loaded = false;
         self.memories.clear();
         self.memories_loaded = false;
+        self.tasks.clear();
+        self.tasks_loaded = false;
+        self.task_prefs = None;
+        self.task_sync = None;
+        self.task_events.clear();
         self.providers.clear();
         self.providers_loaded = false;
         self.connectors.clear();
@@ -445,6 +471,33 @@ impl State {
             Reply::Memories(memories) => {
                 self.memories = memories;
                 self.memories_loaded = true;
+            }
+            Reply::Tasks(tasks) => {
+                self.tasks = tasks;
+                self.tasks_loaded = true;
+            }
+            Reply::AddedTask(task) | Reply::UpdatedTask(task) => {
+                if let Some(existing) = self.tasks.iter_mut().find(|t| t.id == task.id) {
+                    *existing = task;
+                } else {
+                    self.tasks.insert(0, task);
+                }
+                self.tasks_loaded = true;
+            }
+            Reply::DeletedTask(id) => {
+                self.tasks.retain(|task| task.id != id);
+            }
+            Reply::TaskPrefs(prefs) => {
+                self.task_prefs = Some(prefs);
+            }
+            Reply::TaskSyncStatus(status) => {
+                self.task_sync = Some(status);
+            }
+            Reply::TaskSyncReport(_report) => {
+                // The next ListTasks picks up whatever the sync changed.
+            }
+            Reply::TaskEvents(events) => {
+                self.task_events = events;
             }
             Reply::AddedMemory(memory) => {
                 if let Some(existing) = self

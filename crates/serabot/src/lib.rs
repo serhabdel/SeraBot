@@ -50,6 +50,7 @@ pub mod openrouter;
 pub mod orchestration;
 pub mod pdf_ops;
 pub mod personal;
+pub mod personal_tasks;
 pub mod plans;
 pub mod policy;
 #[cfg(feature = "pptx")]
@@ -65,6 +66,7 @@ pub mod skills;
 pub mod spreadsheets;
 pub mod store;
 pub mod sysstatus;
+pub mod task_sync;
 pub mod tavily;
 pub mod teams;
 pub mod telegram;

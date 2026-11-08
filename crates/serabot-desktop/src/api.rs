@@ -1156,6 +1156,61 @@ pub struct MemoryEntry {
     pub recall_count: i64,
 }
 
+/// One personal task of the Tasks tab (0.25.0). `status` is the Kanban
+/// column: `todo`, `doing`, `done`.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct TaskEntry {
+    pub id: String,
+    pub title: String,
+    pub notes: String,
+    pub status: String,
+    pub due: Option<String>,
+    pub position: i64,
+    pub remote_provider: Option<String>,
+    pub remote_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// The account's chosen task/calendar sync provider.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct TaskPrefs {
+    pub sync_provider: String,
+    pub updated_at: String,
+}
+
+/// Sync sign-in state per provider family.
+#[derive(Clone, Debug, Deserialize)]
+pub struct TaskSyncStatus {
+    pub prefs: TaskPrefs,
+    pub signed_in: BTreeMap<String, bool>,
+}
+
+/// One calendar event from the chosen calendar provider (read-only).
+#[derive(Clone, Debug, Deserialize)]
+pub struct TaskEvent {
+    pub id: String,
+    pub title: String,
+    pub start: String,
+    pub end: String,
+    pub all_day: bool,
+    pub provider: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct SyncReport {
+    pub imported: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+    pub pushed: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct TaskSyncReport {
+    pub provider: String,
+    pub report: SyncReport,
+}
+
 /// Counts shown in the Memory page header (`GET /v1/memories/stats`).
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct MemoryStatsView {
@@ -3257,6 +3312,279 @@ impl ApiClient {
         Ok(())
     }
 
+    // --- Tasks tab (0.25.0) ---
+
+    /// List the account's personal tasks, optionally filtered by status and a
+    /// due range (the calendar view passes `from`/`to`).
+    pub fn list_tasks(
+        &self,
+        status: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<Vec<TaskEntry>, ApiError> {
+        let mut params: Vec<(&str, &str)> = vec![("limit", "500")];
+        if let Some(status) = status {
+            params.push(("status", status));
+        }
+        if let Some(from) = from {
+            params.push(("from", from));
+        }
+        if let Some(to) = to {
+            params.push(("to", to));
+        }
+        #[derive(Deserialize)]
+        struct Envelope {
+            tasks: Vec<TaskEntry>,
+        }
+        let response: Envelope = self.get(&["v1", "tasks"], &params)?;
+        if response.tasks.len() > 500 {
+            return Err(ApiError::InvalidResponse);
+        }
+        let mut seen = HashSet::with_capacity(response.tasks.len());
+        for task in &response.tasks {
+            if !valid_task_id(&task.id) || !seen.insert(task.id.as_str()) {
+                return Err(ApiError::InvalidResponse);
+            }
+        }
+        Ok(response.tasks)
+    }
+
+    pub fn create_task(&self, title: &str, due: Option<&str>) -> Result<TaskEntry, ApiError> {
+        if title.trim().is_empty()
+            || title.chars().count() > 200
+            || title.chars().any(char::is_control)
+        {
+            return Err(ApiError::Validation(
+                "Task title must be 1–200 characters, without control characters.",
+            ));
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            title: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            due: Option<&'a str>,
+        }
+        #[derive(Deserialize)]
+        struct Envelope {
+            task: TaskEntry,
+        }
+        let response: Envelope = self.request(
+            Method::POST,
+            &["v1", "tasks"],
+            &[],
+            Some(&Body {
+                title,
+                due: due.map(str::trim).filter(|value| !value.is_empty()),
+            }),
+        )?;
+        if !valid_task_id(&response.task.id) {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(response.task)
+    }
+
+    pub fn patch_task_status(&self, id: &str, status: &str) -> Result<TaskEntry, ApiError> {
+        if !valid_task_id(id) {
+            return Err(ApiError::Validation("Invalid task id."));
+        }
+        if !matches!(status, "todo" | "doing" | "done") {
+            return Err(ApiError::Validation("Status must be todo, doing or done."));
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            status: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct Envelope {
+            task: TaskEntry,
+        }
+        let response: Envelope = self.request(
+            Method::PATCH,
+            &["v1", "tasks", id],
+            &[],
+            Some(&Body { status }),
+        )?;
+        if response.task.id != id {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(response.task)
+    }
+
+    pub fn delete_task(&self, id: &str) -> Result<(), ApiError> {
+        if !valid_task_id(id) {
+            return Err(ApiError::Validation("Invalid task id."));
+        }
+        #[derive(Deserialize)]
+        struct Body {
+            deleted: String,
+        }
+        let body: Body =
+            self.request::<Body, ()>(Method::DELETE, &["v1", "tasks", id], &[], None)?;
+        if body.deleted != id {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(())
+    }
+
+    pub fn task_prefs(&self) -> Result<TaskPrefs, ApiError> {
+        #[derive(Deserialize)]
+        struct Envelope {
+            prefs: TaskPrefs,
+        }
+        let response: Envelope = self.get(&["v1", "tasks", "prefs"], &[])?;
+        if !valid_sync_provider(&response.prefs.sync_provider) {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(response.prefs)
+    }
+
+    pub fn put_task_prefs(&self, sync_provider: &str) -> Result<TaskPrefs, ApiError> {
+        if !valid_sync_provider(sync_provider) {
+            return Err(ApiError::Validation("Unknown sync provider."));
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            sync_provider: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct Envelope {
+            prefs: TaskPrefs,
+        }
+        let response: Envelope = self.request(
+            Method::PUT,
+            &["v1", "tasks", "prefs"],
+            &[],
+            Some(&Body { sync_provider }),
+        )?;
+        Ok(response.prefs)
+    }
+
+    pub fn task_sync_status(&self) -> Result<TaskSyncStatus, ApiError> {
+        #[derive(Deserialize)]
+        struct Envelope {
+            prefs: TaskPrefs,
+            signed_in: BTreeMap<String, bool>,
+        }
+        let response: Envelope = self.get(&["v1", "tasks", "sync", "status"], &[])?;
+        Ok(TaskSyncStatus {
+            prefs: response.prefs,
+            signed_in: response.signed_in,
+        })
+    }
+
+    /// Run one sync pass for the stored (or given) provider.
+    pub fn run_task_sync(&self) -> Result<TaskSyncReport, ApiError> {
+        #[derive(Deserialize)]
+        struct Envelope {
+            provider: String,
+            report: SyncReport,
+        }
+        let response: Envelope =
+            self.request::<Envelope, ()>(Method::POST, &["v1", "tasks", "sync", "run"], &[], None)?;
+        Ok(TaskSyncReport {
+            provider: response.provider,
+            report: response.report,
+        })
+    }
+
+    /// Read-only calendar events in `[from, to]` from the chosen provider.
+    pub fn task_calendar_events(&self, from: &str, to: &str) -> Result<Vec<TaskEvent>, ApiError> {
+        #[derive(Deserialize)]
+        struct Envelope {
+            events: Vec<TaskEvent>,
+        }
+        let response: Envelope =
+            self.get(&["v1", "tasks", "calendar"], &[("from", from), ("to", to)])?;
+        if response.events.len() > 250 {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(response.events)
+    }
+
+    /// Begin the per-user Google/Microsoft sign-in for task sync (PKCE). The
+    /// console owns the browser leg and the loopback listener.
+    pub fn task_sync_oauth_start(
+        &self,
+        provider: &str,
+        redirect_uri: &str,
+        challenge: &str,
+        state: &str,
+    ) -> Result<String, ApiError> {
+        if !matches!(provider, "tasks_google" | "tasks_microsoft") {
+            return Err(ApiError::Validation(
+                "provider must be tasks_google or tasks_microsoft.",
+            ));
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            provider: &'a str,
+            redirect_uri: &'a str,
+            challenge: &'a str,
+            state: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct Envelope {
+            url: String,
+        }
+        let response: Envelope = self.request(
+            Method::POST,
+            &["v1", "tasks", "sync", "oauth", "start"],
+            &[],
+            Some(&Body {
+                provider,
+                redirect_uri,
+                challenge,
+                state,
+            }),
+        )?;
+        Ok(response.url)
+    }
+
+    pub fn task_sync_oauth_complete(
+        &self,
+        provider: &str,
+        code: &str,
+        verifier: &str,
+        redirect_uri: &str,
+    ) -> Result<(), ApiError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            provider: &'a str,
+            code: &'a str,
+            verifier: &'a str,
+            redirect_uri: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct Envelope {
+            signed_in: bool,
+        }
+        let response: Envelope = self.request(
+            Method::POST,
+            &["v1", "tasks", "sync", "oauth", "complete"],
+            &[],
+            Some(&Body {
+                provider,
+                code,
+                verifier,
+                redirect_uri,
+            }),
+        )?;
+        if !response.signed_in {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(())
+    }
+
+    pub fn task_sync_oauth_disconnect(&self, provider: &str) -> Result<(), ApiError> {
+        self.request::<serde_json::Value, ()>(
+            Method::DELETE,
+            &["v1", "tasks", "sync", "oauth", provider],
+            &[],
+            None,
+        )?;
+        Ok(())
+    }
+
     pub fn providers(&self) -> Result<Vec<ProviderStatus>, ApiError> {
         let response: ProvidersEnvelope = self.get(&["v1", "providers"], &[])?;
         if response.providers.len() > 64 {
@@ -4390,6 +4718,17 @@ pub fn valid_memory_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+pub fn valid_task_id(id: &str) -> bool {
+    valid_memory_id(id)
+}
+
+pub fn valid_sync_provider(provider: &str) -> bool {
+    matches!(
+        provider,
+        "none" | "google_tasks" | "microsoft_todo" | "google_calendar" | "outlook_calendar"
+    )
 }
 
 pub fn valid_memory_content(content: &str) -> bool {

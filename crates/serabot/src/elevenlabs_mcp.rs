@@ -1,4 +1,5 @@
-//! The "ElevenLabs" connector: the hosted MCP server (`https://api.elevenlabs.io/v1/mcp`).
+//! The "ElevenLabs" connector: the hosted MCP server
+//! (`https://api.us.elevenlabs.io/v1/mcp`, the OAuth token's `resource`).
 //!
 //! Every account signs in with its own ElevenLabs account (CIMD + PKCE, see
 //! `elevenlabs.rs`). The sealed sign-in lives in that account's per-user

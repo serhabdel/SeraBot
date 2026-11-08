@@ -14,7 +14,7 @@ use serabot_desktop::{
     audio_capture::MicRecorder,
     branding,
     chat_cards::{self, CardState, CardView},
-    chat_compose, chat_feed, provider_presets, provider_view,
+    chat_compose, chat_feed, file_icons, provider_presets, provider_view,
     session::{Section, Session, SettingsSection, SignInPhase, Theme, humanize_label},
     teams, ui_highlight,
     working::BotActivity,
@@ -1477,6 +1477,8 @@ fn Shell(session: Signal<Session>) -> Element {
                         Section::Connectors => rsx! { ConnectorsView { session } },
                         Section::Approvals => rsx! { ApprovalsView { session } },
                         Section::Browser => rsx! { BrowserView { session, overlay } },
+
+                        Section::Tasks => rsx! { crate::ui_tasks::TasksView { session } },
                         Section::Vault => rsx! { VaultPage { session } },
                         Section::Usage => rsx! { UsagePage { session } },
                         Section::Settings => rsx! { SettingsView { session } },
@@ -1537,9 +1539,10 @@ fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> 
     let mut session = session;
     let section = session.read().section;
     let pending = session.read().state.approvals.len();
-    let destinations: [(Section, &str, &str); 8] = [
+    let destinations: [(Section, &str, &str); 9] = [
         (Section::Chat, "chat", "Chats"),
         (Section::Browser, "globe", "Browser"),
+        (Section::Tasks, "list", "Tasks"),
         (Section::Approvals, "approvals", "Approvals"),
         (Section::Memory, "memory", "Memory"),
         (Section::Connectors, "connectors", "Connectors"),
@@ -2323,7 +2326,28 @@ fn ActivityRow(mut session: Signal<Session>, step: Step) -> Element {
                     Icon { name: status_icon, size: 13 }
                 }
             }
-            span { class: "step-icon", Icon { name: step_icon(&step.icon), size: 14 } }
+            span { class: "step-icon",
+                // File steps carry the real file-type icon (vscode-icons):
+                // "file:pdf" renders the vendored PDF glyph, anything else
+                // falls back to the console's folder icon.
+                if let Some(group) = step.icon.strip_prefix("file:") {
+                    match file_icons::file_type_image_src(group) {
+                        Some(src) => rsx! {
+                            img {
+                                class: "step-file-icon",
+                                src: "{src}",
+                                width: "14",
+                                height: "14",
+                                draggable: "false",
+                                alt: "",
+                            }
+                        },
+                        None => rsx! { Icon { name: "folder", size: 14 } },
+                    }
+                } else {
+                    Icon { name: step_icon(&step.icon), size: 14 }
+                }
+            }
             if let Some(detail) = step.detail.clone() {
                 // The reasoning text a model returned: collapsed, plain text.
                 details { class: "step-thinking",

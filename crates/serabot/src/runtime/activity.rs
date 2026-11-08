@@ -44,6 +44,33 @@ fn capitalize(word: &str) -> String {
     }
 }
 
+/// A file-type icon (`file:<group>`) for the `path` argument, or `None`.
+/// The extension is mapped through a fixed whitelist of known types, so no
+/// free-form argument text ever reaches an event.
+fn file_icon_of(args: &Value) -> Option<&'static str> {
+    let path = args.get("path").and_then(Value::as_str)?;
+    let file = path.rsplit(['/', '\\']).next()?;
+    let (_, ext) = file.rsplit_once('.')?;
+    if ext.is_empty() || ext.len() > 8 || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(match ext.to_ascii_lowercase().as_str() {
+        "pdf" => "file:pdf",
+        "doc" | "docx" | "odt" | "rtf" => "file:word",
+        "ppt" | "pptx" | "odp" => "file:powerpoint",
+        "xls" | "xlsx" | "xlsm" | "ods" => "file:excel",
+        "md" | "markdown" => "file:markdown",
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" => "file:image",
+        "mp4" | "mov" | "webm" | "mkv" | "avi" => "file:video",
+        "mp3" | "wav" | "ogg" | "m4a" | "flac" => "file:audio",
+        "zip" | "rar" | "7z" | "tar" | "gz" => "file:zip",
+        "json" | "yaml" | "yml" | "toml" | "xml" => "file:json",
+        "csv" | "tsv" => "file:csv",
+        "txt" | "log" => "file:text",
+        _ => return None,
+    })
+}
+
 fn humanize(tool: &str) -> String {
     let words = tool
         .split(['_', '.', '-'])
@@ -88,7 +115,10 @@ pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -
             ("search", "Searching the web".into())
         }
         "rag_search" => ("search", "Searching your documents".into()),
-        "document_index" => ("file", "Reading a document".into()),
+        "document_index" => (
+            file_icon_of(args).unwrap_or("file"),
+            "Reading a document".into(),
+        ),
         "memory_save" | "memory_update" => ("brain", "Saving to memory".into()),
         "memory_list" | "memory_search" | "memory_delete" => ("brain", "Checking memory".into()),
         "plan_update" => ("bolt", "Updating the plan".into()),
@@ -104,19 +134,40 @@ pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -
         "slack_post_message" => ("mail", "Posting to Slack".into()),
         "todoist_list_tasks" => ("bolt", "Checking your tasks".into()),
         "todoist_add_task" | "todoist_complete_task" => ("bolt", "Updating your tasks".into()),
-        "github_get_file" => ("file", "Reading a file on GitHub".into()),
-        "telegram_send_document" | "onedrive_upload" => ("file", "Sending a file".into()),
+        "github_get_file" => (
+            file_icon_of(args).unwrap_or("file"),
+            "Reading a file on GitHub".into(),
+        ),
+        "telegram_send_document" | "onedrive_upload" => (
+            file_icon_of(args).unwrap_or("file"),
+            "Sending a file".into(),
+        ),
         "onedrive_list" => ("file", "Listing files".into()),
         "local_list" => ("file", "Looking at a folder on your PC".into()),
         "local_search" => ("search", "Searching a folder on your PC".into()),
-        "local_stat" => ("file", "Checking a file on your PC".into()),
-        "local_read" => ("file", "Reading a file on your PC".into()),
+        "local_stat" => (
+            file_icon_of(args).unwrap_or("file"),
+            "Checking a file on your PC".into(),
+        ),
+        "local_read" => (
+            file_icon_of(args).unwrap_or("file"),
+            "Reading a file on your PC".into(),
+        ),
         "local_read_many" => ("file", "Reading several files on your PC".into()),
         "local_extract" => ("file", "Reading documents on your PC".into()),
         "local_brief" => ("file", "Surveying a folder on your PC".into()),
-        "local_write" => ("file", "Writing a file on your PC".into()),
-        "local_import" => ("file", "Copying a file from your PC".into()),
-        "local_export" => ("file", "Saving a file to your PC".into()),
+        "local_write" => (
+            file_icon_of(args).unwrap_or("file"),
+            "Writing a file on your PC".into(),
+        ),
+        "local_import" => (
+            file_icon_of(args).unwrap_or("file"),
+            "Copying a file from your PC".into(),
+        ),
+        "local_export" => (
+            file_icon_of(args).unwrap_or("file"),
+            "Saving a file to your PC".into(),
+        ),
         "vault_list" => ("lock", "Checking the vault".into()),
         "analyst" => ("chart", "Analyzing data".into()),
         "delegate" => (
@@ -128,14 +179,14 @@ pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -
         ),
         "team_ask" => ("bot", "Asking the team".into()),
         "team_reply" => ("bot", "Replying to the team".into()),
-        other if other.starts_with("pdf_") => ("file", "Working on a PDF".into()),
-        other if other.starts_with("image_") => ("file", "Working on an image".into()),
-        other if other.starts_with("docx_") => ("file", "Working on a Word document".into()),
+        other if other.starts_with("pdf_") => ("file:pdf", "Working on a PDF".into()),
+        other if other.starts_with("image_") => ("file:image", "Working on an image".into()),
+        other if other.starts_with("docx_") => ("file:word", "Working on a Word document".into()),
         other if other.starts_with("xlsx_") || other == "timesheet_analyze" => {
-            ("chart", "Working on a spreadsheet".into())
+            ("file:excel", "Working on a spreadsheet".into())
         }
         other if other.starts_with("pptx_") || other == "deck_build" => {
-            ("file", "Working on a presentation".into())
+            ("file:powerpoint", "Working on a presentation".into())
         }
         other if other.starts_with("elevenlabs_") || other.starts_with("audio_") => {
             ("mic", "Working with audio".into())
@@ -279,6 +330,36 @@ mod tests {
         assert_eq!(view.label, "Using some new tool");
         let long = "x".repeat(300);
         assert!(describe_step(&long, &json!({}), None).label.chars().count() <= MAX_LABEL_CHARS);
+    }
+
+    #[test]
+    fn file_steps_carry_a_whitelisted_type_icon() {
+        let view = describe_step(
+            "local_read",
+            &json!({"root": "docs", "path": "reports/Q3.PDF"}),
+            None,
+        );
+        assert_eq!(view.icon, "file:pdf");
+        let view = describe_step(
+            "local_write",
+            &json!({"root": "out", "path": "deck\\slides.pptx", "content": "x"}),
+            None,
+        );
+        assert_eq!(view.icon, "file:powerpoint");
+        // No extension, junk extension, or missing path fall back to "file".
+        for args in [
+            json!({"path": "README"}),
+            json!({"path": "a.we!rd"}),
+            json!({"path": "a.toolongextension"}),
+            json!({}),
+            json!({"path": 5}),
+        ] {
+            let view = describe_step("local_read", &args, None);
+            assert_eq!(view.icon, "file", "{args}");
+        }
+        // The icon is a fixed whitelisted word, never argument text.
+        let view = describe_step("local_read", &json!({"path": "evil<script>.pdf"}), None);
+        assert_eq!(view.icon, "file:pdf");
     }
 
     #[test]
