@@ -1,9 +1,12 @@
-//! Native ElevenLabs client and gateway tools (TTS, STT, sound effects, image/video flows).
+//! ElevenLabs REST client and the native `elevenlabs_key_*` gateway tools
+//! (TTS, STT, sound effects, image/video flows) of the "ElevenLabs API key"
+//! connector.
 //!
-//! Outbound calls use the configured HTTPS API base and authenticate with
-//! either the age-stored API key (`xi-api-key` header) or an OAuth bearer
-//! token from an ElevenLabs sign-in. The REST API rejects requests that carry
-//! both headers, so exactly one mode is used per client.
+//! Outbound calls use the configured HTTPS API base and the owner's API key
+//! from the age store (`xi-api-key` header). These tools are registered only
+//! when that connector is enabled. The account sign-in ("ElevenLabs"
+//! connector) does not use this client: it goes through the hosted MCP server
+//! in `elevenlabs_mcp`, and the OAuth sign-in helpers in this module serve it.
 //! Media generation tools require owner approval via the gateway.
 
 use std::path::Path;
@@ -12,7 +15,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::multipart::{Form, Part};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -26,7 +29,7 @@ use crate::gateway::{ApprovalDetails, Tool, ToolContext, ToolOutput, ToolRegistr
 use crate::llm::validate_base_url;
 use crate::maker::{ArtifactMeta, ArtifactStore};
 use crate::policy::Policy;
-use crate::secrets::SharedSecrets;
+use crate::secrets::CredentialWriter;
 use crate::util::truncate_chars;
 
 pub(crate) const MAX_FLOW_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
@@ -356,18 +359,14 @@ async fn token_request(
     })
 }
 
-#[derive(Clone)]
-enum ClientAuth {
-    ApiKey(SecretString),
-    Oauth(Arc<OauthSession>),
-}
-
+/// One account's ElevenLabs sign-in: the access token is renewed from the
+/// refresh token, and a rotated refresh token goes back to the account's own
+/// sealed credential through `writer`.
 pub struct OauthSession {
     tokens: tokio::sync::Mutex<OauthTokens>,
     client_id: String,
     token_url: String,
-    refresh_secret_name: String,
-    secrets: Option<SharedSecrets>,
+    writer: Option<Arc<dyn CredentialWriter>>,
     http: reqwest::Client,
 }
 
@@ -378,9 +377,41 @@ struct OauthTokens {
 }
 
 impl OauthSession {
+    /// A session for one stored sign-in. An empty access token is fine: the
+    /// first use refreshes. `writer` receives rotated refresh tokens.
+    pub(crate) fn new(
+        client_id: impl Into<String>,
+        token_url: &str,
+        access_token: &str,
+        refresh_token: &str,
+        writer: Option<Arc<dyn CredentialWriter>>,
+    ) -> Result<Self> {
+        if refresh_token.trim().is_empty() {
+            return Err(SeraError::Config(
+                "ElevenLabs OAuth refresh token is missing".into(),
+            ));
+        }
+        let token_url = pin_oauth_endpoint(token_url, ELEVENLABS_TOKEN_URL)?.to_string();
+        Ok(Self {
+            tokens: tokio::sync::Mutex::new(OauthTokens {
+                access_token: SecretString::new(access_token.to_owned()),
+                expires_at: None,
+                refresh_token: SecretString::new(refresh_token.to_owned()),
+            }),
+            client_id: client_id.into(),
+            token_url,
+            writer,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|error| SeraError::External(error.to_string()))?,
+        })
+    }
+
     /// Current access token, refreshing first when missing or near expiry
-    /// (30 s skew). A rotated refresh token is persisted to the age store;
-    /// a failed write fails the call so the rotation is never lost.
+    /// (30 s skew). A rotated refresh token is written back through the
+    /// writer; a failed write fails the call so the rotation is never lost.
     pub(crate) async fn current_access_token(&self) -> Result<SecretString> {
         let mut guard = self.tokens.lock().await;
         let stale = match guard.expires_at {
@@ -399,9 +430,9 @@ impl OauthSession {
                 SeraError::External(format!("ElevenLabs token refresh failed: {error}"))
             })?;
             if let Some(refresh) = &pair.refresh_token {
-                if let Some(secrets) = &self.secrets {
-                    secrets
-                        .persist(&[(self.refresh_secret_name.as_str(), refresh.as_str())])
+                if let Some(writer) = &self.writer {
+                    writer
+                        .persist_rotation(refresh, Some(pair.access_token.as_str()))
                         .map_err(|error| {
                             SeraError::External(format!(
                                 "rotated ElevenLabs refresh token was not persisted: {error}"
@@ -423,11 +454,13 @@ impl OauthSession {
     }
 }
 
+/// The API-key connector's REST client (`xi-api-key`). The account sign-in
+/// does not use this client: it goes through the hosted MCP server.
 #[derive(Clone)]
 pub struct ElevenLabsClient {
     http: reqwest::Client,
     base_url: String,
-    auth: ClientAuth,
+    api_key: SecretString,
 }
 
 impl std::fmt::Debug for ElevenLabsClient {
@@ -448,83 +481,6 @@ impl ElevenLabsClient {
         if api_key.trim().is_empty() {
             return Err(SeraError::Config("ElevenLabs credential is missing".into()));
         }
-        Self::with_auth(
-            base_url,
-            ClientAuth::ApiKey(SecretString::new(api_key)),
-            timeout_secs,
-        )
-    }
-
-    /// OAuth mode: the stored access token may already be expired, so the
-    /// first request refreshes it.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_oauth(
-        base_url: impl Into<String>,
-        access_token: impl Into<String>,
-        refresh_token: impl Into<String>,
-        client_id: impl Into<String>,
-        refresh_secret_name: impl Into<String>,
-        secrets: Option<SharedSecrets>,
-        timeout_secs: u64,
-    ) -> Result<Self> {
-        let access_token = access_token.into();
-        let refresh_token = refresh_token.into();
-        if access_token.trim().is_empty() || refresh_token.trim().is_empty() {
-            return Err(SeraError::Config(
-                "ElevenLabs OAuth tokens are missing".into(),
-            ));
-        }
-        Self::new_oauth_at(
-            base_url,
-            access_token,
-            refresh_token,
-            client_id,
-            ELEVENLABS_TOKEN_URL,
-            refresh_secret_name,
-            secrets,
-            timeout_secs,
-        )
-    }
-
-    /// `new_oauth` against an explicit token URL (loopback in tests).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_oauth_at(
-        base_url: impl Into<String>,
-        access_token: impl Into<String>,
-        refresh_token: impl Into<String>,
-        client_id: impl Into<String>,
-        token_url: &str,
-        refresh_secret_name: impl Into<String>,
-        secrets: Option<SharedSecrets>,
-        timeout_secs: u64,
-    ) -> Result<Self> {
-        let access_token = access_token.into();
-        let refresh_token = refresh_token.into();
-        if access_token.trim().is_empty() || refresh_token.trim().is_empty() {
-            return Err(SeraError::Config(
-                "ElevenLabs OAuth tokens are missing".into(),
-            ));
-        }
-        let session = OauthSession {
-            tokens: tokio::sync::Mutex::new(OauthTokens {
-                access_token: SecretString::new(access_token),
-                expires_at: None,
-                refresh_token: SecretString::new(refresh_token),
-            }),
-            client_id: client_id.into(),
-            token_url: token_url.to_owned(),
-            refresh_secret_name: refresh_secret_name.into(),
-            secrets,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(|error| SeraError::External(error.to_string()))?,
-        };
-        Self::with_auth(base_url, ClientAuth::Oauth(Arc::new(session)), timeout_secs)
-    }
-
-    fn with_auth(base_url: impl Into<String>, auth: ClientAuth, timeout_secs: u64) -> Result<Self> {
         let base_url = validate_base_url(&base_url.into())?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs.max(1)))
@@ -534,63 +490,25 @@ impl ElevenLabsClient {
         Ok(Self {
             http,
             base_url,
-            auth,
+            api_key: SecretString::new(api_key),
         })
     }
 
-    /// The OAuth session behind this client, when signed in with OAuth.
-    pub fn oauth_session(&self) -> Option<Arc<OauthSession>> {
-        match &self.auth {
-            ClientAuth::Oauth(session) => Some(session.clone()),
-            ClientAuth::ApiKey(_) => None,
-        }
-    }
-
-    async fn auth_headers(&self) -> Result<HeaderMap> {
-        let mut headers = HeaderMap::new();
-        match &self.auth {
-            ClientAuth::ApiKey(key) => {
-                headers.insert(
-                    "xi-api-key",
-                    HeaderValue::from_str(key.expose_secret())
-                        .map_err(|_| SeraError::Config("invalid ElevenLabs API key".into()))?,
-                );
-            }
-            ClientAuth::Oauth(session) => {
-                let token = session.current_access_token().await?;
-                headers.insert(
-                    AUTHORIZATION,
-                    HeaderValue::from_str(&format!("Bearer {}", token.expose_secret()))
-                        .map_err(|_| SeraError::Config("invalid ElevenLabs access token".into()))?,
-                );
-            }
-        }
-        Ok(headers)
-    }
-
-    /// Send a request with the current credential. On a 401 in OAuth mode the
-    /// access token is refreshed once and the request retried once. The REST
-    /// API rejects requests carrying both auth headers, so only one is set.
+    /// Send a request with the `xi-api-key` header.
     async fn send(
         &self,
-        build: impl Fn(HeaderMap) -> Result<reqwest::RequestBuilder> + Clone,
+        build: impl Fn(HeaderMap) -> Result<reqwest::RequestBuilder>,
     ) -> Result<reqwest::Response> {
-        let response = build(self.auth_headers().await?)?
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "xi-api-key",
+            HeaderValue::from_str(self.api_key.expose_secret())
+                .map_err(|_| SeraError::Config("invalid ElevenLabs API key".into()))?,
+        );
+        build(headers)?
             .send()
             .await
-            .map_err(|error| SeraError::External(format!("ElevenLabs request failed: {error}")))?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED
-            && let ClientAuth::Oauth(session) = &self.auth
-        {
-            session.invalidate().await;
-            return build(self.auth_headers().await?)?
-                .send()
-                .await
-                .map_err(|error| {
-                    SeraError::External(format!("ElevenLabs request failed: {error}"))
-                });
-        }
-        Ok(response)
+            .map_err(|error| SeraError::External(format!("ElevenLabs request failed: {error}")))
     }
 
     pub async fn list_voices(&self, page_size: u32, search: Option<&str>) -> Result<Value> {
@@ -1131,7 +1049,7 @@ struct ElevenLabsListVoicesTool {
 impl Tool for ElevenLabsListVoicesTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "elevenlabs_list_voices".into(),
+            name: "elevenlabs_key_list_voices".into(),
             description:
                 "List ElevenLabs voices available to the workspace (search and pagination). \
                  Returns untrusted metadata only; does not spend generation credits."
@@ -1170,7 +1088,7 @@ struct ElevenLabsTextToSpeechTool {
 impl Tool for ElevenLabsTextToSpeechTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "elevenlabs_text_to_speech".into(),
+            name: "elevenlabs_key_text_to_speech".into(),
             description:
                 "Generate speech audio from text with ElevenLabs and store it as a local artifact."
                     .into(),
@@ -1274,7 +1192,7 @@ struct ElevenLabsSoundEffectTool {
 impl Tool for ElevenLabsSoundEffectTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "elevenlabs_sound_effect".into(),
+            name: "elevenlabs_key_sound_effect".into(),
             description: "Generate a sound effect from a text prompt with ElevenLabs.".into(),
             parameters: json!({
                 "type": "object",
@@ -1354,7 +1272,7 @@ struct ElevenLabsTranscribeTool {
 impl Tool for ElevenLabsTranscribeTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "elevenlabs_transcribe".into(),
+            name: "elevenlabs_key_transcribe".into(),
             description:
                 "Transcribe audio from a local artifact hash or a path relative to the document inbox."
                     .into(),
@@ -1445,7 +1363,7 @@ struct ElevenLabsGenerateImageTool {
 impl Tool for ElevenLabsGenerateImageTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "elevenlabs_generate_image".into(),
+            name: "elevenlabs_key_generate_image".into(),
             description:
                 "Generate an image with ElevenLabs Image & Video flows, poll until complete, and store the result."
                     .into(),
@@ -1556,7 +1474,7 @@ struct ElevenLabsGenerateVideoTool {
 impl Tool for ElevenLabsGenerateVideoTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "elevenlabs_generate_video".into(),
+            name: "elevenlabs_key_generate_video".into(),
             description:
                 "Generate a short video with ElevenLabs Image & Video flows, poll until complete, and store the result."
                     .into(),
@@ -1785,8 +1703,21 @@ mod tests {
         assert!(!text.contains("vvvv"));
     }
 
+    #[derive(Default)]
+    struct RecordingWriter(std::sync::Mutex<Vec<(String, Option<String>)>>);
+
+    impl CredentialWriter for RecordingWriter {
+        fn persist_rotation(&self, refresh: &str, access: Option<&str>) -> Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((refresh.to_owned(), access.map(str::to_owned)));
+            Ok(())
+        }
+    }
+
     #[tokio::test]
-    async fn oauth_client_refreshes_stale_token_and_sends_bearer_only() {
+    async fn oauth_session_refreshes_once_and_writes_back_the_rotation() {
         let as_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/token"))
@@ -1798,26 +1729,33 @@ mod tests {
             })))
             .mount(&as_server)
             .await;
-        let api = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v2/voices"))
-            .and(header("authorization", "Bearer fresh-access"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"voices": []})))
-            .mount(&api)
-            .await;
-        let client = ElevenLabsClient::new_oauth_at(
-            api.uri(),
-            "stale-access",
-            "old-refresh",
+        let writer = Arc::new(RecordingWriter::default());
+        let session = OauthSession::new(
             cimd_client_id(),
             &format!("{}/token", as_server.uri()),
-            "elevenlabs_refresh_token",
-            None,
-            10,
+            "",
+            "old-refresh",
+            Some(writer.clone()),
         )
         .unwrap();
-        let value = client.list_voices(1, None).await.unwrap();
-        assert_eq!(value["voices"], json!([]));
+        let token = session.current_access_token().await.unwrap();
+        assert_eq!(token.expose_secret(), "fresh-access");
+        // The rotated refresh token and the access token it came with.
+        assert_eq!(
+            writer.0.lock().unwrap().as_slice(),
+            [(
+                "rotated-refresh".to_owned(),
+                Some("fresh-access".to_owned())
+            )]
+        );
+        // Still fresh: no second refresh.
+        session.current_access_token().await.unwrap();
+        assert_eq!(as_server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn oauth_session_needs_a_refresh_token() {
+        assert!(OauthSession::new(cimd_client_id(), ELEVENLABS_TOKEN_URL, "a", " ", None).is_err());
     }
 
     #[tokio::test]

@@ -90,7 +90,7 @@ static BRANDS: &[Brand] = &[
         mark: png!("agentmail"),
     },
     Brand {
-        keys: &["elevenlabs"],
+        keys: &["elevenlabs", "elevenlabs-api-key"],
         label: "ElevenLabs",
         mark: png!("elevenlabs"),
     },

@@ -248,6 +248,24 @@ impl SharedSecrets {
         *guard = updated;
         Ok(())
     }
+
+    /// Remove names from the store and write it back. Names that are not
+    /// stored are ignored.
+    pub fn remove(&self, names: &[&str]) -> Result<()> {
+        let mut guard = self.lock();
+        if guard.path.as_os_str().is_empty() || guard.identity_path.as_os_str().is_empty() {
+            return Err(SeraError::Secrets(
+                "cannot persist an in-memory secret store".into(),
+            ));
+        }
+        let mut updated = SecretStore::open_paths(&guard.path, &guard.identity_path)?;
+        for name in names {
+            updated.remove(name);
+        }
+        updated.save()?;
+        *guard = updated;
+        Ok(())
+    }
 }
 
 pub fn ensure_identity(path: &Path) -> Result<()> {

@@ -340,8 +340,6 @@ pub struct ConnectorDraft {
     pub enabled: bool,
     pub values: BTreeMap<String, String>,
     pub saving: bool,
-    /// ElevenLabs only: "api_key" or "oauth" (sent on Save connector).
-    pub auth: Option<String>,
 }
 
 impl Drop for ConnectorDraft {
@@ -2880,6 +2878,7 @@ impl Session {
                             | OperationKind::DefaultRoute
                             | OperationKind::ConnectorTest
                             | OperationKind::OAuthSignIn
+                            | OperationKind::ConnectorSignOut
                             | OperationKind::AdminRestart
                     ) =>
                 {
@@ -3387,6 +3386,12 @@ impl Session {
                             self.admin_notice = None;
                             self.connector_testing = None;
                         }
+                        OperationKind::ConnectorSignOut => {
+                            self.admin_error = None;
+                            self.admin_notice = Some("Signed out for this account.".into());
+                            self.state.connectors_loaded = false;
+                            self.schedule(Operation::Connectors, Duration::ZERO);
+                        }
                         OperationKind::ProviderKey => {
                             for value in self.provider_key_drafts.values_mut() {
                                 value.zeroize();
@@ -3692,31 +3697,16 @@ impl Session {
         self.save_connector(id);
     }
 
-    /// Sign-in connector (ElevenLabs): use the pasted API key instead of the
-    /// account sign-in. Turns the connector on and switches the mode.
-    pub fn use_api_key_instead(&mut self, id: String) {
-        let draft = self.connector_drafts.entry(id.clone()).or_default();
-        draft.enabled = true;
-        draft.auth = Some("api_key".to_owned());
-        self.save_connector(id);
-    }
-
-    /// Sign-in connector: stop using the account sign-in. The server keeps
-    /// whatever it stored; the mode switch is what ends use of it.
+    /// Sign-in connector (ElevenLabs): forget this account's sign-in on the
+    /// server. Tool calls fail until the account signs in again.
     pub fn sign_out_connector(&mut self, id: String) {
-        let enabled = self
-            .state
-            .connectors
-            .iter()
-            .find(|connector| connector.id == id)
-            .map(|connector| connector.enabled);
-        let draft = self.connector_drafts.entry(id.clone()).or_default();
-        if let Some(enabled) = enabled {
-            draft.enabled = enabled;
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
         }
-        draft.auth = Some("api_key".to_owned());
-        draft.values.clear();
-        self.save_connector(id);
+        self.admin_error = None;
+        self.admin_notice = None;
+        self.start_request(Operation::ConnectorSignOut { id });
     }
 
     pub fn can_admin(&self) -> bool {
@@ -3886,7 +3876,6 @@ impl Session {
             return;
         };
         let enabled = draft.enabled;
-        let auth = draft.auth.clone();
         let values = draft
             .values
             .iter()
@@ -3905,17 +3894,8 @@ impl Session {
         }
         self.start_request(Operation::AdminSetConnector {
             id,
-            update: ConnectorUpdate {
-                enabled,
-                values,
-                auth,
-            },
+            update: ConnectorUpdate { enabled, values },
         });
-    }
-
-    pub fn set_connector_auth(&mut self, id: &str, auth: String) {
-        let draft = self.connector_drafts.entry(id.to_owned()).or_default();
-        draft.auth = Some(auth);
     }
 
     /// Browser sign-in for a connector with OAuth support (ElevenLabs).
@@ -4032,9 +4012,6 @@ impl Session {
                 .entry(connector.id.clone())
                 .or_default();
             draft.enabled = connector.enabled;
-            // The server's mode wins: sign-in and sign-out change it outside
-            // the draft, and a stale draft must not hide the real state.
-            draft.auth = connector.auth.clone();
         }
         self.connector_drafts.retain(|id, _| seen.contains(id));
     }

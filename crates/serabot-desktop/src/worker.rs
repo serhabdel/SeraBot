@@ -70,6 +70,7 @@ pub enum OperationKind {
     DefaultRoute,
     ConnectorTest,
     OAuthSignIn,
+    ConnectorSignOut,
     BotSettingsWrite,
     BotLifecycle,
     AdminRestart,
@@ -246,6 +247,10 @@ pub enum Operation {
         id: String,
         callback_uri: String,
     },
+    /// Forget this account's sign-in for a connector (ElevenLabs).
+    ConnectorSignOut {
+        id: String,
+    },
     /// `PUT /v1/bots/{id}`: name, description, instructions, model, profile.
     UpdateBot {
         id: String,
@@ -388,6 +393,7 @@ impl Operation {
             Self::TestConnector { .. } => OperationKind::ConnectorTest,
             Self::OAuthSignIn { .. } => OperationKind::OAuthSignIn,
             Self::ConnectorOAuthSignIn { .. } => OperationKind::OAuthSignIn,
+            Self::ConnectorSignOut { .. } => OperationKind::ConnectorSignOut,
             Self::UpdateBot { .. } => OperationKind::BotSettingsWrite,
             Self::SetBotEnabled { .. } | Self::DeleteBot { .. } => OperationKind::BotLifecycle,
             Self::AdminRestart => OperationKind::AdminRestart,
@@ -679,17 +685,8 @@ fn connector_oauth_sign_in(
         oauth::wait_for_callback(&listener, &pkce.state, std::time::Duration::from_secs(180))
             .map_err(|error| ApiError::Rejected(error.to_string()))?;
     drop(listener);
+    // The server seals the tokens to this account; the card reads it back.
     client.admin_connector_oauth_complete(id, &code, &pkce.verifier, &redirect)?;
-    // The server stores the tokens but keeps its old mode: switch to the
-    // sign-in so the card shows Connected without a second click.
-    client.admin_set_connector(
-        id,
-        &crate::ConnectorUpdate {
-            enabled: true,
-            values: Default::default(),
-            auth: Some("oauth".to_owned()),
-        },
-    )?;
     Ok(Reply::OAuthSignedIn {
         id: id.to_owned(),
         device_code: None,
@@ -886,6 +883,9 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::ConnectorOAuthSignIn { id, callback_uri } => {
             connector_oauth_sign_in(client, id, callback_uri)
         }
+        Operation::ConnectorSignOut { id } => client
+            .admin_connector_oauth_disconnect(id)
+            .map(|_| Reply::AdminSaved),
         Operation::TestConnector { id } => {
             client.admin_test_connector(id).map(Reply::ConnectorTested)
         }

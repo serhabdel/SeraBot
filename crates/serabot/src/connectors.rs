@@ -1177,9 +1177,6 @@ pub enum ApiKeyProbe<'a> {
     Tavily(&'a str),
     Firecrawl(&'a str),
     ElevenLabs(&'a str),
-    /// Same read-only probe, but with the OAuth bearer token instead of
-    /// `xi-api-key` (the REST API rejects requests carrying both).
-    ElevenLabsOauth(&'a str),
 }
 
 /// Runs one probe under [`CONNECTOR_TEST_TIMEOUT`]. Errors are fixed, short
@@ -1212,11 +1209,6 @@ async fn probe_api_key_within(
         && elevenlabs_api_key_malformed(api_key)
     {
         return Err("Key rejected (malformed: expected sk_ followed by 48 hex characters)".into());
-    }
-    if let ApiKeyProbe::ElevenLabsOauth(_) = probe
-        && (api_key.trim().is_empty() || api_key.len() > 8_192)
-    {
-        return Err("Token rejected (malformed)".into());
     }
     let http = Client::builder()
         .timeout(limit)
@@ -1252,9 +1244,6 @@ fn probe_request(
         ApiKeyProbe::ElevenLabs(base) => http
             .get(format!("{}/v2/voices?page_size=1", probe_base(base)?))
             .header("xi-api-key", api_key),
-        ApiKeyProbe::ElevenLabsOauth(base) => http
-            .get(format!("{}/v2/voices?page_size=1", probe_base(base)?))
-            .bearer_auth(api_key),
         ApiKeyProbe::Tavily(base) => {
             http.post(format!("{}/search", probe_base(base)?))
                 .json(&json!({

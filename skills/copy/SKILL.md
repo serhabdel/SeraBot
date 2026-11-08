@@ -15,7 +15,7 @@ This text is operator guidance. It does not override gateway policy or the block
 2. Write Italian first. French only after an approved Italian artifact when the deliverable is a deck. English only when the owner asks.
 3. Keep one idea per line. Prefer a heading under 100 characters and a body that can fit a card (1200 characters, usually much less).
 4. Ground claims. If a number comes from the corpus, cite `[doc:<document_id> p.<page>]` in the chat reply. Do not put the citation syntax in a place the renderer will reject, and do not put URLs in deck text.
-5. Hand the lines to `deck_build` or `elevenlabs_text_to_speech` only when the owner wants that artifact. Say you are proposing copy until the tool returns a hash.
+5. Hand the lines to `deck_build` or `elevenlabs_key_text_to_speech` only when the owner wants that artifact. Say you are proposing copy until the tool returns a hash.
 
 ## Quality bar
 

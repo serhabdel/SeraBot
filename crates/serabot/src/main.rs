@@ -11,13 +11,11 @@ use serabot::audio::{
     AudioTranscribeTool, AudioUnderstandTool, MistralAudioClient, resolve_audio_provider,
 };
 use serabot::browser::{BrowserToolDeps, VaultResolver, register_browser_tools};
-use serabot::config::{Config, ElevenLabsAuth, load_bots};
+use serabot::config::{Config, load_bots};
 use serabot::connectors::register_connector_tools;
 use serabot::deck::Brand;
 use serabot::documents::index_directory;
 use serabot::documents::ingest_file;
-use serabot::elevenlabs::{ElevenLabsClient, register_elevenlabs_tools};
-use serabot::elevenlabs_mcp::{ElevenLabsMcp, register_elevenlabs_mcp_tools};
 use serabot::embeddings::{Embedder, FastEmbedder, LazyEmbedder};
 use serabot::error::SeraError;
 use serabot::fetch::SafeFetcher;
@@ -710,71 +708,26 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         ))?;
         registry.register(AudioUnderstandTool::new(audio_client, config.clone()))?;
     }
-    if config.elevenlabs.enabled {
-        let elevenlabs = match config.elevenlabs.auth {
-            ElevenLabsAuth::ApiKey => {
-                let api_key =
-                    secrets
-                        .require(&config.elevenlabs.api_key_secret)
-                        .map_err(|error| {
-                            anyhow::anyhow!(
-                                "{error}; run `serabot secrets set {}` before enabling ElevenLabs",
-                                config.elevenlabs.api_key_secret
-                            )
-                        })?;
-                Arc::new(ElevenLabsClient::new(
-                    &config.elevenlabs.api_base,
-                    api_key,
-                    config.elevenlabs.timeout_secs,
-                )?)
-            }
-            ElevenLabsAuth::Oauth => {
-                let access_token = secrets
-                    .require(&config.elevenlabs.oauth_access_token_secret)
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "{error}; sign in with ElevenLabs in the console first ({})",
-                            config.elevenlabs.oauth_access_token_secret
-                        )
-                    })?;
-                let refresh_token = secrets
-                    .require(&config.elevenlabs.oauth_refresh_token_secret)
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "{error}; sign in with ElevenLabs in the console first ({})",
-                            config.elevenlabs.oauth_refresh_token_secret
-                        )
-                    })?;
-                Arc::new(ElevenLabsClient::new_oauth(
-                    &config.elevenlabs.api_base,
-                    access_token,
-                    refresh_token,
-                    &config.elevenlabs.oauth_client_id,
-                    &config.elevenlabs.oauth_refresh_token_secret,
-                    Some(secrets.clone()),
-                    config.elevenlabs.timeout_secs,
-                )?)
-            }
-        };
-        if let Some(session) = elevenlabs.oauth_session() {
-            // Signed in with OAuth: also offer the hosted MCP server.
-            let mcp = Arc::new(ElevenLabsMcp::new(
-                &config.elevenlabs.mcp_url,
-                session,
-                artifacts.clone(),
-                config.elevenlabs.timeout_secs,
-            )?);
-            register_elevenlabs_mcp_tools(&mut registry, mcp, policy.clone())?;
-        }
-        register_elevenlabs_tools(
-            &mut registry,
-            elevenlabs,
-            artifacts.clone(),
-            policy.clone(),
-            config.clone(),
-            config.elevenlabs.clone(),
-        )?;
+    // Before 0.24 the one ElevenLabs sign-in was server-wide. It moves to the
+    // owner's own credential once, and the server-wide names are removed.
+    let owner_id = store.admin_user_id()?;
+    if serabot::elevenlabs_mcp::migrate_server_sign_in(
+        &secrets,
+        &users,
+        &owner_id,
+        &config.elevenlabs.oauth_access_token_secret,
+        &config.elevenlabs.oauth_refresh_token_secret,
+    )? {
+        tracing::info!("moved the server-wide ElevenLabs sign-in to the owner's account");
     }
+    serabot::elevenlabs_mcp::register_elevenlabs_connectors(
+        &mut registry,
+        config.clone(),
+        &secrets,
+        users.clone(),
+        artifacts.clone(),
+        policy.clone(),
+    )?;
 
     let shutdown = CancellationToken::new();
     let mut notifiers: Vec<Arc<dyn Notifier>> = Vec::new();

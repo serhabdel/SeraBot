@@ -13,7 +13,9 @@
 //! Callers own error wording (and secret scrubbing): this module returns the
 //! structured [`McpError`] and never formats a secret into it.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -21,9 +23,13 @@ use serde_json::{Value, json};
 /// another one; its choice is echoed back in `MCP-Protocol-Version`.
 const PROTOCOL_VERSION: &str = "2025-03-26";
 /// `tools/list` pages followed at most.
-const MAX_PAGES: usize = 5;
-/// Tools kept from one `tools/list`.
-pub const MAX_TOOLS: usize = 200;
+const MAX_PAGES: usize = 20;
+/// Tools kept from one `tools/list`. Large hosted servers expose 100+ tools.
+pub const MAX_TOOLS: usize = 1000;
+/// How long a fetched tool catalog is reused before the server is asked again.
+pub const CATALOG_TTL: Duration = Duration::from_secs(10 * 60);
+/// Owners kept in one catalog cache; the oldest entries go first when full.
+const MAX_CATALOG_OWNERS: usize = 64;
 
 /// How the secret is presented to the MCP endpoint.
 #[derive(Debug, Clone, Copy)]
@@ -54,11 +60,12 @@ impl McpError {
     }
 }
 
-/// One open MCP session: the server's session id (if it sent one) and the
-/// protocol revision it agreed to.
+/// One open MCP session: the server's session id (if it sent one), the
+/// protocol revision it agreed to, and the timeout for each of its requests.
 struct Session {
     id: Option<String>,
     version: String,
+    timeout: Duration,
 }
 
 pub struct McpClient {
@@ -67,6 +74,55 @@ pub struct McpClient {
     auth: McpAuth,
     label: &'static str,
     max_bytes: usize,
+}
+
+/// Tool catalogs fetched from one server, by owner (for example a user id),
+/// each reused for [`CATALOG_TTL`]. Keying by owner keeps one account's
+/// catalog away from another's.
+/// Owner → (when fetched, the catalog).
+type CatalogEntries = HashMap<String, (Instant, Arc<Vec<Value>>)>;
+
+#[derive(Default)]
+pub struct CatalogCache {
+    entries: Mutex<CatalogEntries>,
+}
+
+impl CatalogCache {
+    /// The owner's catalog when it was fetched less than [`CATALOG_TTL`] ago.
+    pub fn get(&self, owner: &str) -> Option<Arc<Vec<Value>>> {
+        let entries = self.lock();
+        let (fetched, tools) = entries.get(owner)?;
+        Self::fresh(*fetched, CATALOG_TTL).then(|| tools.clone())
+    }
+
+    pub fn put(&self, owner: &str, tools: Arc<Vec<Value>>) {
+        let mut entries = self.lock();
+        if !entries.contains_key(owner) && entries.len() >= MAX_CATALOG_OWNERS {
+            let oldest = entries
+                .iter()
+                .min_by_key(|(_, (fetched, _))| *fetched)
+                .map(|(key, _)| key.clone());
+            if let Some(key) = oldest {
+                entries.remove(&key);
+            }
+        }
+        entries.insert(owner.to_owned(), (Instant::now(), tools));
+    }
+
+    /// Drop the owner's catalog, for example after a 401 or a re-sign-in.
+    pub fn forget(&self, owner: &str) {
+        self.lock().remove(owner);
+    }
+
+    fn fresh(fetched: Instant, ttl: Duration) -> bool {
+        fetched.elapsed() < ttl
+    }
+
+    fn lock(&self) -> MutexGuard<'_, CatalogEntries> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
 }
 
 impl std::fmt::Debug for McpClient {
@@ -132,9 +188,14 @@ impl McpClient {
         }
     }
 
-    /// Every tool this credential offers (bounded), as the server described them.
-    pub async fn list_tools(&self, secret: &str) -> Result<Vec<Value>, McpError> {
-        let session = self.open(secret).await?;
+    /// Every tool this credential offers (bounded), as the server described
+    /// them. `timeout` applies to each request of the listing.
+    pub async fn list_tools(
+        &self,
+        secret: &str,
+        timeout: Duration,
+    ) -> Result<Vec<Value>, McpError> {
+        let session = self.open(secret, timeout).await?;
         let outcome = self.list_in(secret, &session).await;
         self.close(secret, &session).await;
         outcome
@@ -168,14 +229,16 @@ impl McpClient {
     }
 
     /// Run one tool. Returns the MCP `tools/call` result object
-    /// (`content`, `structuredContent`, `isError`).
+    /// (`content`, `structuredContent`, `isError`). `timeout` applies to each
+    /// request of the call (generation can take minutes).
     pub async fn call_tool(
         &self,
         secret: &str,
         name: &str,
         arguments: &Value,
+        timeout: Duration,
     ) -> Result<Value, McpError> {
-        let session = self.open(secret).await?;
+        let session = self.open(secret, timeout).await?;
         let outcome = self
             .request(
                 secret,
@@ -190,10 +253,11 @@ impl McpClient {
     }
 
     /// `initialize`, then the `initialized` notification.
-    async fn open(&self, secret: &str) -> Result<Session, McpError> {
+    async fn open(&self, secret: &str, timeout: Duration) -> Result<Session, McpError> {
         let mut session = Session {
             id: None,
             version: PROTOCOL_VERSION.to_owned(),
+            timeout,
         };
         let body = rpc_request(
             1,
@@ -260,6 +324,7 @@ impl McpClient {
         let mut request = self
             .with_secret(self.http.post(&self.url), secret)
             .header("accept", "application/json, text/event-stream")
+            .timeout(session.timeout)
             .json(body);
         if let Some(id) = &session.id {
             request = request.header("mcp-session-id", id.as_str());

@@ -47,9 +47,20 @@ pub struct AdminOverlay {
     /// keep the rest of the file's values.
     #[serde(default)]
     pub bot_configs: BTreeMap<String, BotConfigOverlay>,
-    /// ElevenLabs auth mode chosen in the console (api_key or oauth sign-in).
-    #[serde(default)]
+    /// Pre-0.24 ElevenLabs mode. An overlay that carries it also carries the
+    /// old single `connectors.elevenlabs` switch; see [`AdminOverlay::apply`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elevenlabs_auth: Option<ElevenLabsAuth>,
+}
+
+/// The overlay key for a connector's enable switch. The ElevenLabs sign-in
+/// connector is `elevenlabs_mcp` here: the bare `elevenlabs` key is the
+/// pre-0.24 single switch.
+fn connector_switch_key(id: &str) -> &str {
+    match id {
+        "elevenlabs" => "elevenlabs_mcp",
+        other => other,
+    }
 }
 
 /// Owner-editable bot behavior lists. `None` means "keep the bot file's value".
@@ -141,12 +152,15 @@ impl AdminOverlay {
             match id.as_str() {
                 "tavily" => config.tavily.enabled = *enabled,
                 "firecrawl" => config.firecrawl.enabled = *enabled,
-                "elevenlabs" => config.elevenlabs.enabled = *enabled,
+                "elevenlabs_mcp" => config.elevenlabs.mcp_enabled = *enabled,
+                "elevenlabs_api_key" => config.elevenlabs.api_key.enabled = *enabled,
+                // Pre-0.24: one switch, whose meaning came from the mode.
+                "elevenlabs" => match self.elevenlabs_auth.unwrap_or_default() {
+                    ElevenLabsAuth::ApiKey => config.elevenlabs.api_key.enabled = *enabled,
+                    ElevenLabsAuth::Oauth => config.elevenlabs.mcp_enabled = *enabled,
+                },
                 _ => config.connectors.set_enabled(id, *enabled)?,
             }
-        }
-        if let Some(auth) = self.elevenlabs_auth {
-            config.elevenlabs.auth = auth;
         }
         if let Some(audio) = &self.audio {
             if audio.enabled
@@ -536,7 +550,6 @@ impl AdminStore {
         enabled: bool,
         values: &BTreeMap<String, String>,
     ) -> Result<()> {
-        // Merge the overlay first so a same-request auth-mode switch is seen.
         let mut merged = base.clone();
         self.snapshot().apply(&mut merged)?;
         let roles = connector_secret_roles(&merged, id)?;
@@ -556,7 +569,7 @@ impl AdminStore {
                     "{role} is empty, too long, or contains control characters"
                 )));
             }
-            if id == "elevenlabs"
+            if id == "elevenlabs_api_key"
                 && *role == "api_key"
                 && crate::connectors::elevenlabs_api_key_malformed(value)
             {
@@ -583,15 +596,9 @@ impl AdminStore {
         }
 
         self.mutate(|overlay| {
-            overlay.connectors.insert(id.to_owned(), enabled);
-            Ok(())
-        })
-    }
-
-    /// Switch the ElevenLabs connector between API-key and OAuth sign-in.
-    pub fn set_elevenlabs_auth(&self, auth: ElevenLabsAuth) -> Result<()> {
-        self.mutate(|overlay| {
-            overlay.elevenlabs_auth = Some(auth);
+            overlay
+                .connectors
+                .insert(connector_switch_key(id).to_owned(), enabled);
             Ok(())
         })
     }
@@ -872,21 +879,13 @@ pub fn connector_secret_roles(config: &Config, id: &str) -> Result<Vec<(&'static
     if id == "firecrawl" {
         return Ok(vec![("api_key", config.firecrawl.api_key_secret.clone())]);
     }
+    // The sign-in connector keeps its tokens per account (user_secrets), so it
+    // has no server-wide secret to show or set.
     if id == "elevenlabs" {
-        return Ok(if config.elevenlabs.auth == ElevenLabsAuth::Oauth {
-            vec![
-                (
-                    "access_token",
-                    config.elevenlabs.oauth_access_token_secret.clone(),
-                ),
-                (
-                    "refresh_token",
-                    config.elevenlabs.oauth_refresh_token_secret.clone(),
-                ),
-            ]
-        } else {
-            vec![("api_key", config.elevenlabs.api_key_secret.clone())]
-        });
+        return Ok(Vec::new());
+    }
+    if id == "elevenlabs_api_key" {
+        return Ok(vec![("api_key", config.elevenlabs.api_key_secret.clone())]);
     }
     Err(SeraError::NotFound(format!("connector {id}")))
 }
@@ -1063,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn elevenlabs_is_owner_manageable_voice_connector() {
+    fn elevenlabs_api_key_is_owner_manageable_connector() {
         let root = std::env::temp_dir().join(format!("serabot-admin-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let config = config_with_root(&root);
@@ -1075,22 +1074,30 @@ mod tests {
             )
             .unwrap(),
         );
-        let roles = store.connector_roles(&config, "elevenlabs").unwrap();
+        let roles = store
+            .connector_roles(&config, "elevenlabs_api_key")
+            .unwrap();
         assert_eq!(
             roles,
             vec![("api_key", config.elevenlabs.api_key_secret.clone())]
         );
         assert!(
             store
-                .set_connector(&config, &empty, "elevenlabs", true, &BTreeMap::new())
+                .set_connector(
+                    &config,
+                    &empty,
+                    "elevenlabs_api_key",
+                    true,
+                    &BTreeMap::new()
+                )
                 .is_err(),
-            "elevenlabs must not enable without its secret"
+            "the API-key connector must not enable without its secret"
         );
         let mut bad = BTreeMap::new();
         bad.insert("api_key".to_owned(), "sk_truncated".to_owned());
         assert!(
             store
-                .set_connector(&config, &empty, "elevenlabs", true, &bad)
+                .set_connector(&config, &empty, "elevenlabs_api_key", true, &bad)
                 .is_err(),
             "a malformed sk_ key is rejected at write time"
         );
@@ -1098,13 +1105,13 @@ mod tests {
         values.insert("api_key".to_owned(), format!("sk_{}", "a".repeat(48)));
         assert!(
             store
-                .set_connector(&config, &empty, "elevenlabs", true, &values)
+                .set_connector(&config, &empty, "elevenlabs_api_key", true, &values)
                 .is_ok(),
-            "elevenlabs enables once its key is stored"
+            "the API-key connector enables once its key is stored"
         );
         let mut merged = config.clone();
         store.snapshot().apply(&mut merged).unwrap();
-        assert!(merged.elevenlabs.enabled);
+        assert!(merged.elevenlabs.api_key.enabled);
         std::fs::remove_dir_all(&root).ok();
     }
 }

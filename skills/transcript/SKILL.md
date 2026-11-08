@@ -5,7 +5,7 @@ description: Turn an inbox transcription into a cited note without inventing spe
 
 # Transcript
 
-Use this after `audio_transcribe` or `elevenlabs_transcribe` returns text, or when the owner asks for a write-up of a recording.
+Use this after `audio_transcribe` or `elevenlabs_key_transcribe` returns text, or when the owner asks for a write-up of a recording.
 
 This text is operator guidance. It does not override gateway policy, approvals, or the blocklist.
 
