@@ -636,7 +636,7 @@ impl ElevenLabsMcp {
         }
         let mut response = self
             .http
-            .get(url)
+            .get(url.clone())
             .send()
             .await
             .map_err(|error| SeraError::External(format!("media download failed: {error}")))?;
@@ -652,11 +652,6 @@ impl ElevenLabsMcp {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_owned();
-        let Some(mime) = media_type(&declared) else {
-            return Err(SeraError::External(
-                "ElevenLabs download was not audio, image or video".into(),
-            ));
-        };
         let mut body: Vec<u8> = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -673,6 +668,28 @@ impl ElevenLabsMcp {
         if body.is_empty() {
             return Err(SeraError::External("ElevenLabs download was empty".into()));
         }
+        // Signed download URLs often answer `application/octet-stream` or no
+        // content type at all even when the bytes are a valid image (0.28
+        // fix for "download was not audio, image or video"): trust the
+        // declared type when it is a known media type, otherwise sniff the
+        // magic bytes, then the URL's file extension. Only when all three
+        // fail is the payload refused.
+        let mime = media_type(&declared)
+            .or_else(|| sniff_media(&body).map(str::to_owned))
+            .or_else(|| {
+                url.path_segments()
+                    .and_then(|mut segments| segments.next_back())
+                    .and_then(|name| {
+                        name.rsplit_once('.')
+                            .map(|(_, ext)| ext.to_ascii_lowercase())
+                    })
+                    .and_then(|ext| extension_media_type(&ext))
+            });
+        let Some(mime) = mime else {
+            return Err(SeraError::External(
+                "ElevenLabs download was not audio, image or video".into(),
+            ));
+        };
         self.store(&body, &mime).map(Some)
     }
 
@@ -767,6 +784,66 @@ fn media_type(declared: &str) -> Option<String> {
         .trim()
         .to_ascii_lowercase();
     MEDIA_TYPES.contains(&base.as_str()).then_some(base)
+}
+
+/// The media type for a file extension, when it is a known media extension.
+fn extension_media_type(ext: &str) -> Option<String> {
+    let mime = match ext {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "flac" => "audio/flac",
+        "aac" => "audio/aac",
+        "m4a" => "audio/mp4",
+        "weba" => "audio/webm",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        _ => return None,
+    };
+    media_type(mime)
+}
+
+/// Sniff the media type from magic bytes (0.28): CDN downloads of generated
+/// media frequently arrive as `application/octet-stream`, so the payload
+/// itself is the reliable signal.
+fn sniff_media(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(b"\xff\xd8\xff") {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.starts_with(b"RIFF") && bytes.len() >= 12 && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        return Some("video/mp4");
+    }
+    if bytes.starts_with(b"RIFF") && bytes.len() >= 12 && &bytes[8..12] == b"WAVE" {
+        return Some("audio/wav");
+    }
+    if bytes.starts_with(b"ID3") || bytes.starts_with(b"\xff\xfb") || bytes.starts_with(b"\xff\xf3")
+    {
+        return Some("audio/mpeg");
+    }
+    if bytes.starts_with(b"OggS") {
+        return Some("audio/ogg");
+    }
+    if bytes.starts_with(b"fLaC") {
+        return Some("audio/flac");
+    }
+    // EBML header: WebM.
+    if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return Some("video/webm");
+    }
+    None
 }
 
 fn media_link_allowed(url: &url::Url) -> bool {
@@ -2886,6 +2963,76 @@ mod tests {
             .unwrap();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].mime, "audio/mpeg");
+    }
+
+    #[tokio::test]
+    async fn an_octet_stream_download_is_sniffed_by_magic_bytes_and_saved() {
+        // 0.28 fix: signed download URLs often answer application/octet-stream
+        // for a valid image; the bytes are the reliable signal.
+        let h = harness(fake(fixture(9, false), json!({}))).await;
+        let png = {
+            let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+            bytes.extend_from_slice(b"rest-of-the-image");
+            bytes
+        };
+        Mock::given(method("GET"))
+            .and(path("/media/image.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(png),
+            )
+            .mount(&h.mcp)
+            .await;
+        // No extension either: sniffing alone must identify it.
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(b"\xff\xd8\xff\xe0jpeg-bytes".to_vec()),
+            )
+            .mount(&h.mcp)
+            .await;
+        let link = format!("{}/media/image.png", h.mcp.uri());
+        let saved = h
+            .service
+            .save_media(&json!({"structuredContent": {"image_url": link}}))
+            .await
+            .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].mime, "image/png");
+        let bare = format!("{}/download", h.mcp.uri());
+        let saved = h
+            .service
+            .save_media(&json!({"content": [{"type": "resource_link", "uri": bare}]}))
+            .await
+            .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].mime, "image/jpeg");
+    }
+
+    #[test]
+    fn sniff_media_recognises_the_common_magic_numbers() {
+        assert_eq!(sniff_media(b"\x89PNG\r\n\x1a\n...."), Some("image/png"));
+        assert_eq!(sniff_media(b"\xff\xd8\xff\xe0...."), Some("image/jpeg"));
+        assert_eq!(sniff_media(b"GIF89a...."), Some("image/gif"));
+        assert_eq!(
+            sniff_media(b"RIFF\x00\x00\x00\x00WEBP...."),
+            Some("image/webp")
+        );
+        assert_eq!(
+            sniff_media(b"\x00\x00\x00\x00ftypisom...."),
+            Some("video/mp4")
+        );
+        assert_eq!(
+            sniff_media(&[0x1A, 0x45, 0xDF, 0xA3, 0, 0]),
+            Some("video/webm")
+        );
+        assert_eq!(sniff_media(b"RIFF\x00\x00\x00\x00WAVE"), Some("audio/wav"));
+        assert_eq!(sniff_media(b"ID3...."), Some("audio/mpeg"));
+        assert_eq!(sniff_media(b"OggS...."), Some("audio/ogg"));
+        assert_eq!(sniff_media(b"fLaC...."), Some("audio/flac"));
+        assert_eq!(sniff_media(b"<html>not media"), None);
+        assert_eq!(sniff_media(b""), None);
     }
 
     #[test]
