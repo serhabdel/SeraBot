@@ -190,6 +190,14 @@ impl BrowserBackend for FakeBackend {
         }
         Ok(())
     }
+    async fn history_step(&self, delta: i64) -> Result<PageInfo> {
+        self.record(format!("history {delta}"));
+        self.info().await
+    }
+    async fn reload(&self) -> Result<PageInfo> {
+        self.record("reload");
+        self.info().await
+    }
     fn pointer(&self) -> Option<Pointer> {
         *self.pointer.lock().unwrap()
     }

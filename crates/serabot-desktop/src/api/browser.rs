@@ -89,6 +89,14 @@ pub struct BrowserPointer {
 
 pub const MAX_BROWSER_TABS: usize = 8;
 
+/// A provider refused sign-in in this browser (`signin_blocked`). The message
+/// is the server's plain sentence for the owner.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SigninBlocked {
+    pub provider: String,
+    pub message: String,
+}
+
 /// One live (or idle) browser: `GET /v1/browser/sessions`. The session id is
 /// the profile id.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -111,7 +119,23 @@ pub struct BrowserSessionInfo {
     /// The conversation of that bot's last turn that used the browser.
     #[serde(default)]
     pub conversation_id: Option<String>,
+    /// Set while the active tab shows a provider's sign-in refusal.
+    #[serde(default)]
+    pub signin_blocked: Option<SigninBlocked>,
+    /// Seconds since the last bot or owner action.
+    #[serde(default)]
+    pub idle_secs: Option<u64>,
     pub updated_at: String,
+}
+
+/// Back, forward or reload on the active tab. Sent through the input route,
+/// so it needs the user in control; the server checks where it lands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum BrowserHistory {
+    Back,
+    Forward,
+    Reload,
 }
 
 impl BrowserSessionInfo {
@@ -140,6 +164,11 @@ struct SessionClosedAck {
 #[derive(Serialize)]
 struct ProfileNameBody<'a> {
     name: &'a str,
+}
+
+#[derive(Serialize)]
+struct TabOpenBody<'a> {
+    url: &'a str,
 }
 
 /// A model choice for one bot. `None` on the update means "use the default".
@@ -273,6 +302,9 @@ fn check_session(session: &BrowserSessionInfo) -> Result<(), ApiError> {
         })
         && session.bot.as_deref().is_none_or(valid_speaker)
         && session.conversation_id.as_deref().is_none_or(valid_id)
+        && session.signin_blocked.as_ref().is_none_or(|block| {
+            plain(&block.provider, 32, false) && plain(&block.message, 400, false)
+        })
         && plain(&session.updated_at, 64, false);
     if ok {
         Ok(())
@@ -426,6 +458,40 @@ impl ApiClient {
             Method::POST,
             &["v1", "browser", "sessions", id, "tabs", tab, action],
             None,
+        )?;
+        check_session(&info)?;
+        Ok(info)
+    }
+
+    /// `POST /v1/browser/sessions/{id}/tabs` `{"url"}`: a new active tab (user
+    /// in control). Public http(s) only; the server checks the address again.
+    pub fn browser_tab_open(&self, id: &str, url: &str) -> Result<BrowserSessionInfo, ApiError> {
+        session_id(id)?;
+        let plain_web = url.starts_with("https://") || url.starts_with("http://");
+        if !plain_web || url.chars().count() > 2048 || url.chars().any(char::is_whitespace) {
+            return Err(ApiError::Validation("That address is not valid."));
+        }
+        let info: BrowserSessionInfo = self.panel_json(
+            Method::POST,
+            &["v1", "browser", "sessions", id, "tabs"],
+            Some(&TabOpenBody { url }),
+        )?;
+        check_session(&info)?;
+        Ok(info)
+    }
+
+    /// Back, forward or reload on the active tab, through the input route
+    /// (user in control).
+    pub fn browser_session_history(
+        &self,
+        id: &str,
+        action: BrowserHistory,
+    ) -> Result<BrowserSessionInfo, ApiError> {
+        session_id(id)?;
+        let info: BrowserSessionInfo = self.panel_json(
+            Method::POST,
+            &["v1", "browser", "sessions", id, "input"],
+            Some(&action),
         )?;
         check_session(&info)?;
         Ok(info)
@@ -660,6 +726,55 @@ mod tests {
         let mut bad = list.sessions[0].clone();
         bad.title = Some("a\nb".into());
         assert!(check_session(&bad).is_err());
+    }
+
+    /// A refused sign-in and the idle time ride along on the session; a
+    /// session without them still parses.
+    #[test]
+    fn signin_refusal_and_idle_time_parse_and_are_checked() {
+        let list: SessionList = serde_json::from_str(
+            r#"{"sessions":[{"id":"default","profile_name":"Default","active":true,
+            "url":"https://accounts.google.com/v3/signin/rejected","controller":"bot",
+            "tabs":[{"id":"t1","url":"https://accounts.google.com/v3/signin/rejected","title":"Sign in","active":true}],
+            "signin_blocked":{"provider":"google","message":"Google refused sign-in."},
+            "idle_secs":185,"updated_at":"2026-11-06T10:00:00Z"}]}"#,
+        )
+        .unwrap();
+        let session = &list.sessions[0];
+        assert!(check_session(session).is_ok());
+        assert_eq!(session.idle_secs, Some(185));
+        assert_eq!(session.signin_blocked.as_ref().unwrap().provider, "google");
+        let mut bad = session.clone();
+        bad.signin_blocked = Some(SigninBlocked {
+            provider: "google".into(),
+            message: "two
+lines"
+                .into(),
+        });
+        assert!(check_session(&bad).is_err());
+        let plain: SessionList = serde_json::from_str(
+            r#"{"sessions":[{"id":"default","profile_name":"Default","active":false,
+            "controller":"bot","updated_at":"2026-11-06T10:00:00Z"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(plain.sessions[0].idle_secs, None);
+        assert!(plain.sessions[0].signin_blocked.is_none());
+    }
+
+    #[test]
+    fn history_bodies_are_the_input_route_shapes() {
+        assert_eq!(
+            serde_json::to_string(&BrowserHistory::Back).unwrap(),
+            r#"{"type":"back"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&BrowserHistory::Forward).unwrap(),
+            r#"{"type":"forward"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&BrowserHistory::Reload).unwrap(),
+            r#"{"type":"reload"}"#
+        );
     }
 
     /// The takeover/handback/input reply is parsed as a session: it must carry

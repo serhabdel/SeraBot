@@ -7,7 +7,8 @@
 //! profile by its id.
 
 use super::*;
-use crate::browser::guard::validate_resolved;
+use crate::browser::guard::{validate_navigation_url, validate_resolved};
+use crate::browser::manager::{BrowserBackend, PageInfo};
 use crate::browser::outline::key_def;
 use crate::browser::{BrowserManager, Controller};
 use crate::browser_profiles::{
@@ -306,11 +307,39 @@ pub(super) async fn session_tab_close(
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub(super) enum BrowserInput {
-    Click { x: f64, y: f64 },
-    Text { text: String },
-    Key { key: String },
-    Scroll { dy: f64 },
-    Navigate { url: String },
+    Click {
+        x: f64,
+        y: f64,
+    },
+    Text {
+        text: String,
+    },
+    Key {
+        key: String,
+    },
+    Scroll {
+        dy: f64,
+    },
+    Navigate {
+        url: String,
+    },
+    /// History of the active tab (the owner's back, forward and reload buttons).
+    Back,
+    Forward,
+    Reload,
+}
+
+/// Back, forward and reload land on a page the guard has not checked at the
+/// top level. A non-public landing is reset to `about:blank`, as bot
+/// navigation does.
+async fn check_landing(backend: &dyn BrowserBackend, landed: PageInfo) -> Result<()> {
+    if validate_navigation_url(&landed.url).is_err() && landed.url != "about:blank" {
+        let _ = backend.navigate("about:blank").await;
+        return Err(SeraError::Validation(
+            "navigation ended on a non-public address and was reset".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn coord(value: f64) -> Result<f64> {
@@ -351,7 +380,10 @@ async fn input_for(
                 return Err(SeraError::Validation("scroll out of range".into()));
             }
         }
-        BrowserInput::Navigate { .. } => {}
+        BrowserInput::Navigate { .. }
+        | BrowserInput::Back
+        | BrowserInput::Forward
+        | BrowserInput::Reload => {}
     }
     let url = match &input {
         BrowserInput::Navigate { url } => Some(validate_resolved(url).await?),
@@ -366,6 +398,18 @@ async fn input_for(
         (BrowserInput::Scroll { dy }, _) => backend.scroll(*dy).await?,
         (BrowserInput::Navigate { .. }, Some(url)) => {
             backend.navigate(url.as_str()).await?;
+        }
+        (BrowserInput::Back, _) => {
+            let landed = backend.history_step(-1).await?;
+            check_landing(backend.as_ref(), landed).await?;
+        }
+        (BrowserInput::Forward, _) => {
+            let landed = backend.history_step(1).await?;
+            check_landing(backend.as_ref(), landed).await?;
+        }
+        (BrowserInput::Reload, _) => {
+            let landed = backend.reload().await?;
+            check_landing(backend.as_ref(), landed).await?;
         }
         _ => {}
     }

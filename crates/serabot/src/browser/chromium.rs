@@ -99,6 +99,35 @@ fn lock_tabs(tabs: &SharedTabs) -> std::sync::MutexGuard<'_, TabSet> {
     tabs.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// What to do with a new page that a tab of ours did not open itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PopupDecision {
+    /// Register it as a tab (it becomes the active one).
+    Adopt,
+    /// Close it; the reason is logged.
+    Close(&'static str),
+}
+
+/// Adopt a new page only when a tab of this browser opened it (its
+/// `openerId` is one of our targets) and the tab limit has room. Anything
+/// else, including a page with no opener, is closed.
+pub fn should_adopt(
+    opener_id: Option<&str>,
+    known_target_ids: &[&str],
+    count: usize,
+) -> PopupDecision {
+    match opener_id {
+        Some(opener) if known_target_ids.contains(&opener) => {
+            if count >= MAX_TABS {
+                PopupDecision::Close("tab limit reached")
+            } else {
+                PopupDecision::Adopt
+            }
+        }
+        _ => PopupDecision::Close("not opened by a tab of this browser"),
+    }
+}
+
 /// Chromium binaries to try, in order, when none is configured.
 pub const CHROMIUM_CANDIDATES: &[&str] = &[
     "chromium",
@@ -249,12 +278,13 @@ impl BrowserLauncher for ChromiumLauncher {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
-        match ChromiumBackend::setup(port, &path, self.timeout).await {
+        let outline: SharedOutline = Arc::default();
+        match ChromiumBackend::setup(port, &path, self.timeout, outline.clone()).await {
             Ok((cdp, tabs, tasks)) => Ok(Arc::new(ChromiumBackend {
                 cdp,
                 tabs,
                 child: Mutex::new(Some(child)),
-                outline: std::sync::Mutex::new(Outline::default()),
+                outline,
                 tasks: std::sync::Mutex::new(tasks),
                 pointer: std::sync::Mutex::new(None),
                 pointer_seq: AtomicU64::new(0),
@@ -267,11 +297,15 @@ impl BrowserLauncher for ChromiumLauncher {
     }
 }
 
+/// Refs of the active page. Shared with the event loop, which clears them
+/// when it makes an adopted popup the active tab.
+type SharedOutline = Arc<std::sync::Mutex<Outline>>;
+
 pub struct ChromiumBackend {
     cdp: Arc<CdpConnection>,
     tabs: SharedTabs,
     child: Mutex<Option<Child>>,
-    outline: std::sync::Mutex<Outline>,
+    outline: SharedOutline,
     tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     pointer: std::sync::Mutex<Option<Pointer>>,
     pointer_seq: AtomicU64,
@@ -282,6 +316,7 @@ impl ChromiumBackend {
         port: u16,
         path: &str,
         timeout: Duration,
+        outline: SharedOutline,
     ) -> Result<(Arc<CdpConnection>, SharedTabs, Vec<JoinHandle<()>>)> {
         let cdp = Arc::new(CdpConnection::connect(port, path, timeout).await?);
         let targets = cdp.call(None, "Target.getTargets", json!({})).await?;
@@ -301,8 +336,22 @@ impl ChromiumBackend {
         };
         let tabs: SharedTabs = Arc::default();
         // Subscribe before enabling Fetch so no paused request is missed.
-        let events = spawn_event_loop(cdp.clone(), tabs.clone());
+        let events = spawn_event_loop(cdp.clone(), tabs.clone(), outline);
         if let Err(error) = Self::attach_tab(&cdp, &tabs, &target_id).await {
+            events.abort();
+            return Err(error);
+        }
+        // From now on every page the browser creates (popups, target=_blank,
+        // open_tab) attaches paused. `adopt_child` guards or closes it before
+        // it runs. Our own tab is attached again here; that copy is dropped.
+        if let Err(error) = cdp
+            .call(
+                None,
+                "Target.setAutoAttach",
+                json!({"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true}),
+            )
+            .await
+        {
             events.abort();
             return Err(error);
         }
@@ -446,8 +495,30 @@ impl ChromiumBackend {
     }
 }
 
+/// Wait (bounded) for the page session's load event.
+async fn wait_for_load(
+    mut events: tokio::sync::broadcast::Receiver<CdpEvent>,
+    session_id: String,
+    limit: Duration,
+) {
+    let wait = async {
+        while let Ok(event) = events.recv().await {
+            if event.method == "Page.loadEventFired"
+                && event.session_id.as_deref() == Some(session_id.as_str())
+            {
+                break;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(limit, wait).await;
+}
+
 /// Handles Fetch pauses (guard), popups and JS dialogs for one page session.
-fn spawn_event_loop(cdp: Arc<CdpConnection>, tabs: SharedTabs) -> JoinHandle<()> {
+fn spawn_event_loop(
+    cdp: Arc<CdpConnection>,
+    tabs: SharedTabs,
+    outline: SharedOutline,
+) -> JoinHandle<()> {
     let mut events = cdp.subscribe();
     let verdicts: Arc<std::sync::Mutex<HashMap<String, (Instant, bool)>>> = Arc::default();
     tokio::spawn(async move {
@@ -457,14 +528,127 @@ fn spawn_event_loop(cdp: Arc<CdpConnection>, tabs: SharedTabs) -> JoinHandle<()>
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
             };
-            handle_event(&cdp, &tabs, &verdicts, event);
+            handle_event(&cdp, &tabs, &outline, &verdicts, event);
         }
     })
+}
+
+/// A page one of our tabs opened (or a page nobody should have opened) has
+/// attached paused. Adopt it as a tab or close it; never leave it paused.
+async fn adopt_child(
+    cdp: &Arc<CdpConnection>,
+    tabs: &SharedTabs,
+    outline: &SharedOutline,
+    child_session: &str,
+    info: &Value,
+    waiting: bool,
+) {
+    let target_id = info["targetId"].as_str().unwrap_or_default().to_owned();
+    // Only a session the browser paused is ours to decide. Anything else is
+    // an attach we made ourselves, which must be left alone.
+    if !waiting || child_session.is_empty() || target_id.is_empty() {
+        return;
+    }
+    // The session of one of our own tabs (the browser reports the attach we
+    // made ourselves): it is not ours to detach.
+    if lock_tabs(tabs).owns_session(child_session) {
+        return;
+    }
+    // Workers and extension pages run as they would without auto-attach, and
+    // a second session to one of our own tabs is not needed: let go of both.
+    if info["type"] != "page" || lock_tabs(tabs).owns_target(&target_id) {
+        let _ = cdp
+            .call(
+                Some(child_session),
+                "Runtime.runIfWaitingForDebugger",
+                json!({}),
+            )
+            .await;
+        let _ = cdp
+            .call(
+                None,
+                "Target.detachFromTarget",
+                json!({"sessionId": child_session}),
+            )
+            .await;
+        return;
+    }
+    // Decide and register under one lock, so the tab limit holds.
+    let adopted = {
+        let mut set = lock_tabs(tabs);
+        let known: Vec<String> = set.tabs.iter().map(|tab| tab.target_id.clone()).collect();
+        let known: Vec<&str> = known.iter().map(String::as_str).collect();
+        let count = set.tabs.len();
+        match should_adopt(info["openerId"].as_str(), &known, count) {
+            PopupDecision::Adopt => Some(set.add(target_id.clone(), child_session.to_owned())),
+            PopupDecision::Close(reason) => {
+                tracing::warn!(reason, "browser: closed a new page");
+                None
+            }
+        }
+    };
+    let Some(label) = adopted else {
+        if info["openerId"].is_string() {
+            // A popup some other page opened: not ours.
+            let _ = cdp
+                .call(None, "Target.closeTarget", json!({"targetId": target_id}))
+                .await;
+        } else {
+            // A page with no opener is not a popup. Our own tabs and the
+            // browser's pages land here; the target-created check closes any
+            // unrelated page, so only let this copy go.
+            let _ = cdp
+                .call(
+                    Some(child_session),
+                    "Runtime.runIfWaitingForDebugger",
+                    json!({}),
+                )
+                .await;
+            let _ = cdp
+                .call(
+                    None,
+                    "Target.detachFromTarget",
+                    json!({"sessionId": child_session}),
+                )
+                .await;
+        }
+        return;
+    };
+    // Fetch (the guard) is on before the page is allowed to run. Requests the
+    // page had already issued are not covered; see docs/browser.md.
+    if ChromiumBackend::configure(cdp, child_session)
+        .await
+        .is_err()
+    {
+        lock_tabs(tabs).remove(&label);
+        let _ = cdp
+            .call(None, "Target.closeTarget", json!({"targetId": target_id}))
+            .await;
+        return;
+    }
+    let _ = cdp
+        .call(
+            Some(child_session),
+            "Runtime.runIfWaitingForDebugger",
+            json!({}),
+        )
+        .await;
+    *outline
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Outline::default();
+    let _ = cdp
+        .call(
+            None,
+            "Target.activateTarget",
+            json!({"targetId": target_id}),
+        )
+        .await;
 }
 
 fn handle_event(
     cdp: &Arc<CdpConnection>,
     tabs: &SharedTabs,
+    outline: &SharedOutline,
     verdicts: &Arc<std::sync::Mutex<HashMap<String, (Instant, bool)>>>,
     event: CdpEvent,
 ) {
@@ -496,13 +680,31 @@ fn handle_event(
                 let _ = cdp.call(Some(&session_id), method, params).await;
             });
         }
+        "Target.attachedToTarget" => {
+            // A page the browser created, attached paused (see `setup`). Adopt
+            // it, or let go of a copy we do not need.
+            let cdp = cdp.clone();
+            let tabs = tabs.clone();
+            let outline = outline.clone();
+            let child = event.params["sessionId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            let info = event.params["targetInfo"].clone();
+            let waiting = event.params["waitingForDebugger"]
+                .as_bool()
+                .unwrap_or(false);
+            tokio::spawn(async move {
+                adopt_child(&cdp, &tabs, &outline, &child, &info, waiting).await;
+            });
+        }
         "Target.targetCreated" => {
             let info = &event.params["targetInfo"];
             if info["type"] == "page"
                 && let Some(id) = info["targetId"].as_str()
             {
-                // Popups and window.open are not guarded by our Fetch session:
-                // close them unless a tab we opened registers the target first.
+                // Safety net for pages nobody adopted: close them unless a tab
+                // of ours registered the target (see `adopt_child`) first.
                 let cdp = cdp.clone();
                 let tabs = tabs.clone();
                 let id = id.to_owned();
@@ -571,22 +773,42 @@ async fn cached_verdict(
 #[async_trait]
 impl BrowserBackend for ChromiumBackend {
     async fn navigate(&self, url: &str) -> Result<PageInfo> {
-        let mut events = self.cdp.subscribe();
+        let events = self.cdp.subscribe();
         let wanted = self.sid();
         let result = self.call("Page.navigate", json!({"url": url})).await?;
         if let Some(error) = result["errorText"].as_str() {
             return Err(browser_error(format!("navigation failed: {error}")));
         }
-        let wait = async {
-            while let Ok(event) = events.recv().await {
-                if event.method == "Page.loadEventFired"
-                    && event.session_id.as_deref() == Some(wanted.as_str())
-                {
-                    break;
-                }
-            }
-        };
-        let _ = tokio::time::timeout(Duration::from_secs(20), wait).await;
+        wait_for_load(events, wanted, Duration::from_secs(20)).await;
+        self.info().await
+    }
+
+    async fn history_step(&self, delta: i64) -> Result<PageInfo> {
+        let history = self.call("Page.getNavigationHistory", json!({})).await?;
+        let current = history["currentIndex"].as_i64().unwrap_or(-1);
+        let entry = usize::try_from(current + delta)
+            .ok()
+            .and_then(|index| history["entries"].as_array()?.get(index).cloned())
+            .ok_or_else(|| SeraError::Validation("there is no page in that direction".into()))?;
+        let entry_id = entry["id"]
+            .as_i64()
+            .ok_or_else(|| browser_error("history entry has no id"))?;
+        let events = self.cdp.subscribe();
+        let wanted = self.sid();
+        self.call("Page.navigateToHistoryEntry", json!({"entryId": entry_id}))
+            .await?;
+        self.reset_outline()?;
+        // A page restored from the back/forward cache fires no load event.
+        wait_for_load(events, wanted, Duration::from_secs(8)).await;
+        self.info().await
+    }
+
+    async fn reload(&self) -> Result<PageInfo> {
+        let events = self.cdp.subscribe();
+        let wanted = self.sid();
+        self.call("Page.reload", json!({})).await?;
+        self.reset_outline()?;
+        wait_for_load(events, wanted, Duration::from_secs(20)).await;
         self.info().await
     }
 
@@ -777,35 +999,27 @@ impl BrowserBackend for ChromiumBackend {
     }
 
     async fn open_tab(&self, url: &str) -> Result<Vec<TabInfo>> {
-        if lock_tabs(&self.tabs).tabs.len() >= MAX_TABS {
+        let before = lock_tabs(&self.tabs).tabs.len();
+        if before >= MAX_TABS {
             return Err(SeraError::Validation(format!(
                 "at most {MAX_TABS} tabs; close one first"
             )));
         }
-        let created = self
-            .cdp
-            .call(None, "Target.createTarget", json!({"url": "about:blank"}))
-            .await?;
-        let target_id = created["targetId"]
-            .as_str()
-            .ok_or_else(|| browser_error("no page target"))?
-            .to_owned();
-        if let Err(error) = Self::attach_tab(&self.cdp, &self.tabs, &target_id).await {
-            let _ = self
-                .cdp
-                .call(None, "Target.closeTarget", json!({"targetId": target_id}))
-                .await;
-            return Err(error);
+        // The active page opens a blank popup. It is a popup like any other:
+        // it attaches paused and `adopt_child` registers it as the active tab.
+        self.call(
+            "Runtime.evaluate",
+            json!({"expression": "window.open('about:blank')", "userGesture": true}),
+        )
+        .await?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock_tabs(&self.tabs).tabs.len() <= before {
+            if Instant::now() >= deadline {
+                return Err(browser_error("the new tab did not open"));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
         self.reset_outline()?;
-        let _ = self
-            .cdp
-            .call(
-                None,
-                "Target.activateTarget",
-                json!({"targetId": target_id}),
-            )
-            .await;
         self.navigate(url).await?;
         self.tabs().await
     }
@@ -907,6 +1121,49 @@ mod tests {
     }
 
     #[test]
+    fn a_popup_from_one_of_our_tabs_is_adopted_while_there_is_room() {
+        let known = ["T1", "T2"];
+        assert_eq!(should_adopt(Some("T2"), &known, 2), PopupDecision::Adopt);
+        assert_eq!(
+            should_adopt(Some("T2"), &known, MAX_TABS - 1),
+            PopupDecision::Adopt
+        );
+    }
+
+    #[test]
+    fn a_full_tab_set_closes_the_popup_it_would_have_adopted() {
+        let known = ["T1"];
+        assert_eq!(
+            should_adopt(Some("T1"), &known, MAX_TABS),
+            PopupDecision::Close("tab limit reached")
+        );
+    }
+
+    #[test]
+    fn pages_without_one_of_our_openers_are_closed() {
+        let known = ["T1"];
+        // No opener at all (a page the browser created itself).
+        assert!(matches!(
+            should_adopt(None, &known, 1),
+            PopupDecision::Close(_)
+        ));
+        // An opener that is not one of our tabs.
+        assert!(matches!(
+            should_adopt(Some("SOMEONE-ELSE"), &known, 1),
+            PopupDecision::Close(_)
+        ));
+        // A tab that was closed since: its id no longer counts.
+        assert!(matches!(
+            should_adopt(Some("T9"), &known, 1),
+            PopupDecision::Close(_)
+        ));
+        assert!(matches!(
+            should_adopt(Some(""), &[], 0),
+            PopupDecision::Close(_)
+        ));
+    }
+
+    #[test]
     fn parses_devtools_active_port() {
         assert_eq!(
             parse_devtools_active_port("40123\n/devtools/browser/abc-def\n"),
@@ -948,6 +1205,124 @@ mod tests {
         let jpeg = backend.screenshot_jpeg().await.unwrap();
         assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
         assert!(jpeg.len() <= MAX_SCREENSHOT_BYTES);
+        backend.shutdown().await;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Needs a real Chromium: `CHROME_PATH=... cargo test -- --ignored live_popup`.
+    #[tokio::test]
+    #[ignore = "requires a local Chromium"]
+    async fn live_popup_opened_by_a_tab_is_adopted_and_active() {
+        let config = BrowserConfig {
+            enabled: true,
+            no_sandbox: true,
+            ..BrowserConfig::default()
+        };
+        let base = std::env::temp_dir().join(format!("serabot-live-{}", uuid::Uuid::new_v4()));
+        let launcher = ChromiumLauncher::new(&config, base.clone()).unwrap();
+        let backend = launcher.launch("live-user", "popup").await.unwrap();
+        backend
+            .navigate("data:text/html,<button style=\"position:fixed;left:0;top:0;width:1280px;height:800px\" onclick=\"var w=window.open('about:blank');w.document.title='popup';w.document.body.textContent='hello';\">Open</button>")
+            .await
+            .unwrap();
+        backend.click_at(10.0, 10.0).await.unwrap();
+        let mut tabs = Vec::new();
+        for _ in 0..50 {
+            tabs = backend.tabs().await.unwrap();
+            if tabs.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(tabs.len(), 2, "{tabs:?}");
+        assert!(tabs[1].active, "{tabs:?}");
+        assert_eq!(backend.info().await.unwrap().title, "popup");
+        // open_tab takes the same path: a popup of the active tab.
+        let opened = backend
+            .open_tab("data:text/html,<title>third</title>")
+            .await
+            .unwrap();
+        assert_eq!(opened.len(), 3, "{opened:?}");
+        assert!(opened[2].active, "{opened:?}");
+        assert_eq!(backend.info().await.unwrap().title, "third");
+        backend.shutdown().await;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Needs a real Chromium: `CHROME_PATH=... cargo test -- --ignored live_popup_first`.
+    /// A popup's first request is guarded: a loopback listener (which the
+    /// guard refuses) must never see a connection, and the popup is adopted.
+    #[tokio::test]
+    #[ignore = "requires a local Chromium"]
+    async fn live_popup_first_request_is_guarded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = BrowserConfig {
+            enabled: true,
+            no_sandbox: true,
+            ..BrowserConfig::default()
+        };
+        let base = std::env::temp_dir().join(format!("serabot-live-{}", uuid::Uuid::new_v4()));
+        let launcher = ChromiumLauncher::new(&config, base.clone()).unwrap();
+        let backend = launcher.launch("live-user", "guard").await.unwrap();
+        backend
+            .navigate(&format!(
+                "data:text/html,<button style=\"position:fixed;left:0;top:0;width:1280px;height:800px\" onclick=\"window.open('http://127.0.0.1:{port}/private')\">Open</button>"
+            ))
+            .await
+            .unwrap();
+        backend.click_at(10.0, 10.0).await.unwrap();
+        // Chromium may open a bare TCP connection (a preconnect) before the
+        // guard sees the request; that is a documented limit. No HTTP request
+        // may reach the refused address.
+        if let Ok(Ok((mut stream, _peer))) =
+            tokio::time::timeout(Duration::from_secs(3), listener.accept()).await
+        {
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; 400];
+            let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+                .await
+                .ok()
+                .and_then(|read| read.ok())
+                .unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(
+                !["GET ", "HEAD ", "POST "]
+                    .iter()
+                    .any(|verb| head.starts_with(verb)),
+                "an HTTP request reached a refused address: {head}"
+            );
+        }
+        let tabs = backend.tabs().await.unwrap();
+        assert_eq!(tabs.len(), 2, "{tabs:?}");
+        backend.shutdown().await;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Needs a real Chromium: `CHROME_PATH=... cargo test -- --ignored live_history`.
+    #[tokio::test]
+    #[ignore = "requires a local Chromium"]
+    async fn live_history_steps_and_reload() {
+        let config = BrowserConfig {
+            enabled: true,
+            no_sandbox: true,
+            ..BrowserConfig::default()
+        };
+        let base = std::env::temp_dir().join(format!("serabot-live-{}", uuid::Uuid::new_v4()));
+        let launcher = ChromiumLauncher::new(&config, base.clone()).unwrap();
+        let backend = launcher.launch("live-user", "history").await.unwrap();
+        backend
+            .navigate("data:text/html,<title>one</title>")
+            .await
+            .unwrap();
+        backend
+            .navigate("data:text/html,<title>two</title>")
+            .await
+            .unwrap();
+        assert_eq!(backend.history_step(-1).await.unwrap().title, "one");
+        assert_eq!(backend.history_step(1).await.unwrap().title, "two");
+        assert_eq!(backend.reload().await.unwrap().title, "two");
+        assert!(backend.history_step(1).await.is_err(), "no forward entry");
         backend.shutdown().await;
         let _ = std::fs::remove_dir_all(base);
     }
