@@ -2,7 +2,7 @@ use crate::{
     ApiError, Approval, AuthUser, BotDetail, BotSummary, Catalog, ConnectorStatus,
     ConnectorTestResult, ConversationSummary, CreatedBot, CreatedConversation, CreatedGroup,
     CreatedSkill, LibraryEntry, MemoryEntry, MemoryStatsView, Message, Onboarding, ProviderStatus,
-    Scope, Selection, SkillSummary, Task, Team, UsageReport,
+    Scope, Selection, ServerHealth, SkillSummary, Task, Team, UsageReport,
     avatars::AvatarImage,
     worker::{OperationKind, Reply},
 };
@@ -91,6 +91,8 @@ pub struct State {
     pub bot_details: BTreeMap<String, BotDetail>,
     /// Latest `GET /v1/usage` report. Owner-scoped like the bot details.
     pub usage: Option<UsageReport>,
+    /// Latest GET /v1/admin/status (admin only). Cleared on disconnect.
+    pub server_health: Option<ServerHealth>,
     pub error: Option<String>,
     pub unknown_outcome: bool,
 }
@@ -161,6 +163,7 @@ impl Default for State {
             bots_loaded: false,
             bot_details: BTreeMap::new(),
             usage: None,
+            server_health: None,
             error: None,
             unknown_outcome: false,
         }
@@ -193,6 +196,7 @@ impl State {
         let bots_loaded = self.bots_loaded;
         let bot_details = self.bot_details.clone();
         let usage = self.usage.clone();
+        let server_health = self.server_health.clone();
         // Directory data is owner-scoped but not conversation-scoped.
         let conversations = self.conversations.clone();
         let conversations_loaded = self.conversations_loaded;
@@ -232,6 +236,7 @@ impl State {
             bots_loaded,
             bot_details,
             usage,
+            server_health,
             conversations,
             conversations_loaded,
             memories,
@@ -260,6 +265,7 @@ impl State {
         self.bots_loaded = false;
         self.bot_details.clear();
         self.usage = None;
+        self.server_health = None;
         self.conversations.clear();
         self.conversations_loaded = false;
         self.archived.clear();
@@ -350,6 +356,9 @@ impl State {
             }
             Reply::Usage(report) => {
                 self.usage = Some(report);
+            }
+            Reply::ServerHealth(status) => {
+                self.server_health = Some(status);
             }
             Reply::Conversations(page) => {
                 self.conversations = page.conversations;

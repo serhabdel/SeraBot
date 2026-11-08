@@ -549,6 +549,10 @@ pub struct Session {
     /// Usage page range in days (7, 30 or 90) and whether a load is running.
     pub usage_days: u32,
     pub usage_loading: bool,
+    /// Owner-only server health card: a load is running, and the calm
+    /// message to show when the last load failed (cleared on success).
+    pub server_health_loading: bool,
+    pub server_health_error: Option<String>,
     /// Pinned bots/conversations shown in the inspector strip. Persisted in
     /// settings.json through [`creds::Settings::pins`].
     pub pins: Vec<String>,
@@ -595,6 +599,8 @@ pub struct Session {
     pending_open: Option<PendingOpen>,
     /// Folders on this PC the bots may use (default empty = off). Device-local.
     pub local_folders: Vec<crate::local_folders::LocalFolder>,
+    /// "This PC" numbers for the Usage page, gathered on a worker thread.
+    pub pc: crate::pc_stats::PcMonitor,
     local_agent: Option<(crate::local_folders::LocalAgent, usize)>,
     /// Message under the Local folders card.
     pub local_notice: Option<String>,
@@ -718,6 +724,8 @@ impl Session {
             pins,
             usage_days: 30,
             usage_loading: false,
+            server_health_loading: false,
+            server_health_error: None,
             section: Section::Chat,
             conversation: "windows-owner".into(),
             composer: String::new(),
@@ -749,6 +757,7 @@ impl Session {
             local_folders: creds::settings_dir()
                 .map(|dir| crate::local_folders::load(&dir))
                 .unwrap_or_default(),
+            pc: crate::pc_stats::PcMonitor::new(),
             local_agent: None,
             local_notice: None,
             folder_pick_rx: None,
@@ -1167,6 +1176,7 @@ impl Session {
         }
         if section == Section::Usage {
             self.load_usage_days(self.usage_days);
+            self.refresh_server_health();
         }
         if section == Section::Settings {
             self.refresh_status();
@@ -1792,6 +1802,50 @@ impl Session {
         self.usage_days = days;
         self.usage_loading = true;
         self.load_usage(days);
+    }
+
+    /// Gather the "This PC" numbers on a worker thread (never blocks the UI).
+    pub fn refresh_pc(&self) {
+        let folders = self
+            .local_folders
+            .iter()
+            .map(|folder| std::path::PathBuf::from(&folder.path))
+            .collect();
+        self.pc.refresh(crate::pc_stats::PcDirs::current(), folders);
+    }
+
+    /// "Clear cache": delete downloaded update files only. They are
+    /// regenerable; settings, the folder list and sign-in stay untouched.
+    pub fn clear_pc_cache(&mut self) {
+        let Some(dir) = crate::updater::downloads_dir() else {
+            self.toast = Some("There is nothing to clear.".into());
+            return;
+        };
+        let freed = crate::updater::clear_downloads(&dir);
+        self.pc.invalidate();
+        self.refresh_pc();
+        self.toast = Some(if freed == 0 {
+            "There was nothing to clear.".to_owned()
+        } else {
+            format!(
+                "Cleared {}. Update files download again if needed.",
+                crate::status_view::format_bytes(freed)
+            )
+        });
+    }
+
+    /// Owner only: load the server health card. A member never sends this
+    /// request, so the server's 403 is a backstop, not the gate.
+    pub fn refresh_server_health(&mut self) {
+        if !self.is_admin() || self.server_health_loading {
+            return;
+        }
+        self.server_health_loading = true;
+        if self.pending.is_some() || !self.ready() {
+            self.schedule(Operation::ServerHealth, Duration::ZERO);
+        } else {
+            self.start_request(Operation::ServerHealth);
+        }
     }
 
     /// Load the token usage report for the last `days` days (1–365).
@@ -2661,6 +2715,24 @@ impl Session {
                 {
                     self.onboarding_failed(completion.kind, error.to_string());
                 }
+                // The health card is optional: a failed load leaves a calm
+                // line on the card, never the global banner, and the next
+                // refresh simply tries again.
+                Err(error) if completion.kind == OperationKind::ServerHealth => {
+                    self.server_health_loading = false;
+                    self.server_health_error = Some(match &error {
+                        ApiError::Http(403) => "Only the owner can see server health.".to_owned(),
+                        ApiError::Http(404) => {
+                            "This server does not report its health yet. Update the server."
+                                .to_owned()
+                        }
+                        _ => "Server health is not available right now. Trying again soon."
+                            .to_owned(),
+                    });
+                    if error == ApiError::Http(403) {
+                        self.state.server_health = None;
+                    }
+                }
                 Err(error) if completion.kind == OperationKind::BotLifecycle => {
                     self.toast = Some(format!("Could not change that bot: {error}"));
                     self.schedule(Operation::ListBots, Duration::ZERO);
@@ -3182,6 +3254,10 @@ impl Session {
                         OperationKind::BotDetail => {}
                         // The usage report is cached in the state.
                         OperationKind::Usage => self.usage_loading = false,
+                        OperationKind::ServerHealth => {
+                            self.server_health_loading = false;
+                            self.server_health_error = None;
+                        }
                         OperationKind::BotConfigWrite => {
                             if let Some((id, update)) = bot_config {
                                 // Optimistic update of the cached detail; the
@@ -4555,6 +4631,27 @@ mod tests {
         assert_eq!(count(true), 9);
         assert_eq!(count(false), 8);
         assert!(!SettingsSection::Admin.visible(false));
+    }
+
+    #[test]
+    fn only_the_admin_asks_for_server_health() {
+        let user = |role: &str| crate::AuthUser {
+            id: "u1".into(),
+            email: "ada@example.test".into(),
+            display_name: "Ada".into(),
+            role: role.into(),
+        };
+        let mut member = Session::new();
+        member.state.user = Some(user("member"));
+        member.refresh_server_health();
+        assert!(!member.server_health_loading, "a member never sends it");
+
+        let mut owner = Session::new();
+        owner.state.user = Some(user("admin"));
+        owner.refresh_server_health();
+        assert!(owner.server_health_loading, "the owner asks once");
+        owner.refresh_server_health();
+        assert!(owner.server_health_loading);
     }
 
     #[test]

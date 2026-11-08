@@ -14,6 +14,7 @@ mod composio_api;
 mod files_api;
 mod personal_api;
 mod profiles_api;
+mod status_api;
 mod vault_http;
 
 /// The bootstrap admin's id â€” the acting user behind the config token
