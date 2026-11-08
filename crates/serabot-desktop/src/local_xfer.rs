@@ -125,12 +125,7 @@ fn hex_sha256(path: &Path) -> Result<String, String> {
 
 /// Receive one chunk of an exported file. The last chunk verifies the whole
 /// file against the approved SHA-256 and moves it into place.
-pub fn put_chunk(
-    root: &Path,
-    rel: &str,
-    content: &str,
-    args: &Value,
-) -> Result<String, String> {
+pub fn put_chunk(root: &Path, rel: &str, content: &str, args: &Value) -> Result<String, String> {
     let path = resolve(root, rel, false)?;
     let name = name_of(&path);
     if sensitive_name(&name) {
@@ -247,7 +242,9 @@ mod tests {
     #[test]
     fn import_reads_a_big_file_in_consistent_chunks() {
         let base = dir();
-        let data: Vec<u8> = (0..(2 * CHUNK_BYTES + 123)).map(|i| (i % 251) as u8).collect();
+        let data: Vec<u8> = (0..(2 * CHUNK_BYTES + 123))
+            .map(|i| (i % 251) as u8)
+            .collect();
         std::fs::write(base.join("big.pdf"), &data).unwrap();
         let mut offset = 0u64;
         let mut got = Vec::new();
@@ -279,7 +276,16 @@ mod tests {
         let huge = std::fs::File::create(base.join("huge.pdf")).unwrap();
         huge.set_len(MAX_TRANSFER_BYTES + 1).unwrap();
         drop(huge);
-        for bad in ["run.exe", ".env", "secret.pem", "empty.docx", "huge.pdf", "../x.pdf", "missing.pdf", "a.pdf:s"] {
+        for bad in [
+            "run.exe",
+            ".env",
+            "secret.pem",
+            "empty.docx",
+            "huge.pdf",
+            "../x.pdf",
+            "missing.pdf",
+            "a.pdf:s",
+        ] {
             assert!(read_chunk(&base, bad, &json!({})).is_err(), "{bad}");
         }
         std::fs::remove_dir_all(&base).ok();
@@ -311,7 +317,11 @@ mod tests {
         assert_eq!(std::fs::read(base.join("out.pdf")).unwrap(), data);
         assert!(!base.join(".out.pdf.serabot-xfer").exists());
         // Existing files need overwrite=true, then are replaced atomically.
-        assert!(export(&base, "out.pdf", b"new", false).unwrap_err().contains("already exists"));
+        assert!(
+            export(&base, "out.pdf", b"new", false)
+                .unwrap_err()
+                .contains("already exists")
+        );
         assert_eq!(std::fs::read(base.join("out.pdf")).unwrap(), data);
         export(&base, "out.pdf", b"new", true).unwrap();
         assert_eq!(std::fs::read(base.join("out.pdf")).unwrap(), b"new");
@@ -331,15 +341,60 @@ mod tests {
         assert!(wrong.contains("did not match"), "{wrong}");
         assert!(!base.join("x.pdf").exists() && !base.join(".x.pdf.serabot-xfer").exists());
         let args = json!({"offset": 0, "total": 4, "sha256": sha(b"data")});
-        for bad in ["../x.pdf", "/x.pdf", "a.exe", ".env", "id_rsa", "ghost/x.pdf", "con.pdf", "x.pdf:s", "."] {
-            assert!(put_chunk(&base, bad, &b64(b"data"), &args).is_err(), "{bad}");
+        for bad in [
+            "../x.pdf",
+            "/x.pdf",
+            "a.exe",
+            ".env",
+            "id_rsa",
+            "ghost/x.pdf",
+            "con.pdf",
+            "x.pdf:s",
+            ".",
+        ] {
+            assert!(
+                put_chunk(&base, bad, &b64(b"data"), &args).is_err(),
+                "{bad}"
+            );
         }
         // Skipping a chunk, oversize totals, bad base64 and missing hash.
-        assert!(put_chunk(&base, "y.pdf", &b64(b"da"), &json!({"offset": 2, "total": 4, "sha256": sha(b"data")})).is_err());
-        assert!(put_chunk(&base, "y.pdf", &b64(b"d"), &json!({"offset": 0, "total": MAX_TRANSFER_BYTES + 1, "sha256": sha(b"d")})).is_err());
+        assert!(
+            put_chunk(
+                &base,
+                "y.pdf",
+                &b64(b"da"),
+                &json!({"offset": 2, "total": 4, "sha256": sha(b"data")})
+            )
+            .is_err()
+        );
+        assert!(
+            put_chunk(
+                &base,
+                "y.pdf",
+                &b64(b"d"),
+                &json!({"offset": 0, "total": MAX_TRANSFER_BYTES + 1, "sha256": sha(b"d")})
+            )
+            .is_err()
+        );
         assert!(put_chunk(&base, "y.pdf", "***", &args).is_err());
-        assert!(put_chunk(&base, "y.pdf", &b64(b"data"), &json!({"offset": 0, "total": 4})).is_err());
-        assert!(put_chunk(&base, "y.pdf", &b64(b"data"), &json!({"offset": 0, "total": 3, "sha256": sha(b"data")})).is_err());
+        assert!(
+            put_chunk(
+                &base,
+                "y.pdf",
+                &b64(b"data"),
+                &json!({"offset": 0, "total": 4})
+            )
+            .is_err()
+        );
+        assert!(
+            put_chunk(
+                &base,
+                "y.pdf",
+                &b64(b"data"),
+                &json!({"offset": 0, "total": 3, "sha256": sha(b"data")})
+            )
+            .is_err()
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -377,7 +432,10 @@ mod tests {
             assert!(put_chunk(&root, "jn/x.pdf", &b64(b"evil"), &args).is_err());
             assert!(!outside.join("x.pdf").exists());
             assert!(read_chunk(&root, "jn/x.pdf", &json!({})).is_err());
-            let _ = std::process::Command::new("cmd").args(["/C", "rmdir"]).arg(root.join("jn")).output();
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "rmdir"])
+                .arg(root.join("jn"))
+                .output();
         }
         std::fs::remove_dir_all(&base).ok();
     }

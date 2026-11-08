@@ -189,7 +189,9 @@ impl Tool for LocalImportTool {
                 || data.is_empty()
                 || data.len() > TRANSFER_CHUNK_BYTES
             {
-                return Err(SeraError::External("the desktop sent an invalid chunk".into()));
+                return Err(SeraError::External(
+                    "the desktop sent an invalid chunk".into(),
+                ));
             }
             if offset == 0 {
                 size = reply_size;
@@ -478,7 +480,10 @@ mod tests {
             task_id: None,
             turn_id: None,
             conversation_id: Some("dir:main".into()),
-            allowed_tools: tools.iter().map(|t| (*t).to_owned()).collect::<HashSet<_>>(),
+            allowed_tools: tools
+                .iter()
+                .map(|t| (*t).to_owned())
+                .collect::<HashSet<_>>(),
             require_approval: HashSet::new(),
         }
     }
@@ -511,7 +516,11 @@ mod tests {
                     "chunk_read" => {
                         let offset = request.args["offset"].as_u64().unwrap() as usize;
                         let end = (offset + TRANSFER_CHUNK_BYTES).min(source.len());
-                        let modified = if mutate_after_first && offset > 0 { 2 } else { 1 };
+                        let modified = if mutate_after_first && offset > 0 {
+                            2
+                        } else {
+                            1
+                        };
                         RelayResult {
                             ok: true,
                             text: Some(
@@ -534,12 +543,28 @@ mod tests {
                         all.extend(part);
                         let done = all.len() as u64 == request.args["total"].as_u64().unwrap();
                         if done && sha256_hex(&*all) != request.args["sha256"].as_str().unwrap() {
-                            RelayResult { ok: false, text: None, error: Some("hash mismatch".into()) }
+                            RelayResult {
+                                ok: false,
+                                text: None,
+                                error: Some("hash mismatch".into()),
+                            }
                         } else {
-                            RelayResult { ok: true, text: Some(if done { "saved".into() } else { "partial".into() }), error: None }
+                            RelayResult {
+                                ok: true,
+                                text: Some(if done {
+                                    "saved".into()
+                                } else {
+                                    "partial".into()
+                                }),
+                                error: None,
+                            }
                         }
                     }
-                    other => RelayResult { ok: false, text: None, error: Some(format!("unexpected {other}")) },
+                    other => RelayResult {
+                        ok: false,
+                        text: None,
+                        error: Some(format!("unexpected {other}")),
+                    },
                 };
                 relay.complete(&user, &request.id, result);
             }
@@ -564,17 +589,33 @@ mod tests {
     #[tokio::test]
     async fn import_copies_a_multi_chunk_file_into_the_users_inbox_and_artifacts() {
         let f = fixture();
-        f.relay.poll(&f.user, roots("read"), Duration::ZERO).await.unwrap();
+        f.relay
+            .poll(&f.user, roots("read"), Duration::ZERO)
+            .await
+            .unwrap();
         let source = pdf_bytes(2 * TRANSFER_CHUNK_BYTES + 99);
-        let desktop = fake_desktop(f.relay.clone(), f.user.clone(), "read", source.clone(), Arc::default(), false);
+        let desktop = fake_desktop(
+            f.relay.clone(),
+            f.user.clone(),
+            "read",
+            source.clone(),
+            Arc::default(),
+            false,
+        );
         let output = import_tool(&f)
-            .execute(json!({"root": "docs", "path": "reports/q3.pdf"}), &context(&f.user, &["local_import"]))
+            .execute(
+                json!({"root": "docs", "path": "reports/q3.pdf"}),
+                &context(&f.user, &["local_import"]),
+            )
             .await
             .unwrap();
         desktop.abort();
         let data = output.data.unwrap();
         let rel = data["inbox_path"].as_str().unwrap();
-        assert!(rel.starts_with(&format!("{}/local/", f.user)) && rel.ends_with("-q3.pdf"), "{rel}");
+        assert!(
+            rel.starts_with(&format!("{}/local/", f.user)) && rel.ends_with("-q3.pdf"),
+            "{rel}"
+        );
         assert_eq!(std::fs::read(f.inbox.join(rel)).unwrap(), source);
         let hash = output.artifact_hash.unwrap();
         assert_eq!(f.artifacts.load(&hash).unwrap().bytes, source);
@@ -603,25 +644,54 @@ mod tests {
             .execute(json!({"root": "docs", "path": "a.pdf"}), &ctx)
             .await
             .unwrap_err();
-        assert!(offline.to_string().contains("Your PC app is closed"), "{offline}");
+        assert!(
+            offline.to_string().contains("Your PC app is closed"),
+            "{offline}"
+        );
         // The file changes between chunks.
-        f.relay.poll(&f.user, roots("read"), Duration::ZERO).await.unwrap();
-        let desktop = fake_desktop(f.relay.clone(), f.user.clone(), "read", pdf_bytes(TRANSFER_CHUNK_BYTES + 10), Arc::default(), true);
+        f.relay
+            .poll(&f.user, roots("read"), Duration::ZERO)
+            .await
+            .unwrap();
+        let desktop = fake_desktop(
+            f.relay.clone(),
+            f.user.clone(),
+            "read",
+            pdf_bytes(TRANSFER_CHUNK_BYTES + 10),
+            Arc::default(),
+            true,
+        );
         let changed = tool
             .execute(json!({"root": "docs", "path": "a.pdf"}), &ctx)
             .await
             .unwrap_err();
         desktop.abort();
-        assert!(changed.to_string().contains("changed on the PC"), "{changed}");
+        assert!(
+            changed.to_string().contains("changed on the PC"),
+            "{changed}"
+        );
         // Content that is not what the extension says.
-        let desktop = fake_desktop(f.relay.clone(), f.user.clone(), "read", b"not a pdf at all".to_vec(), Arc::default(), false);
+        let desktop = fake_desktop(
+            f.relay.clone(),
+            f.user.clone(),
+            "read",
+            b"not a pdf at all".to_vec(),
+            Arc::default(),
+            false,
+        );
         let wrong = tool
             .execute(json!({"root": "docs", "path": "a.pdf"}), &ctx)
             .await
             .unwrap_err();
         desktop.abort();
         assert!(wrong.to_string().contains("does not match"), "{wrong}");
-        assert!(!f.inbox.join(&f.user).join("local").exists() || std::fs::read_dir(f.inbox.join(&f.user).join("local")).unwrap().next().is_none());
+        assert!(
+            !f.inbox.join(&f.user).join("local").exists()
+                || std::fs::read_dir(f.inbox.join(&f.user).join("local"))
+                    .unwrap()
+                    .next()
+                    .is_none()
+        );
         std::fs::remove_dir_all(&f.base).ok();
     }
 
@@ -650,7 +720,15 @@ mod tests {
             )
             .unwrap();
         f.store
-            .record_conversation_artifact(&f.user, "dir:main", None, "pdf_edit", &stored.hash, name, None)
+            .record_conversation_artifact(
+                &f.user,
+                "dir:main",
+                None,
+                "pdf_edit",
+                &stored.hash,
+                name,
+                None,
+            )
             .unwrap();
         stored.hash
     }
@@ -663,9 +741,15 @@ mod tests {
         assert!(tool.requires_approval(&json!({})));
         let base = json!({"root": "docs", "path": "out/merged.pdf", "artifact": hash});
         let details = tool.approval_details(&base).unwrap();
-        assert_eq!(details.destination.as_deref(), Some("local:docs/out/merged.pdf"));
+        assert_eq!(
+            details.destination.as_deref(),
+            Some("local:docs/out/merged.pdf")
+        );
         assert_eq!(details.artifact_hash.as_deref(), Some(hash.as_str()));
-        assert!(details.summary.contains("merged.pdf") && details.summary.contains("fails if it exists"));
+        assert!(
+            details.summary.contains("merged.pdf")
+                && details.summary.contains("fails if it exists")
+        );
         let overwrite = tool
             .approval_details(&json!({"root": "docs", "path": "out/merged.pdf", "artifact": hash, "overwrite": true}))
             .unwrap();
@@ -689,33 +773,69 @@ mod tests {
         let hash = make_artifact(&f, &source, "merged.pdf");
         let mut registry = ToolRegistry::default();
         registry.register(export_tool(&f)).unwrap();
-        let gateway = Gateway::new(f.store.clone(), Arc::new(Policy::from_text("forbiddenterm\n")), registry, 1, false);
+        let gateway = Gateway::new(
+            f.store.clone(),
+            Arc::new(Policy::from_text("forbiddenterm\n")),
+            registry,
+            1,
+            false,
+        );
         let ctx = context(&f.user, &["local_export"]);
         let args = json!({"root": "docs", "path": "out/merged.pdf", "artifact": hash});
-        let ToolOutcome::PendingApproval { approval_id, action_id, .. } =
-            gateway.execute("local_export", args.clone(), &ctx).await.unwrap()
+        let ToolOutcome::PendingApproval {
+            approval_id,
+            action_id,
+            ..
+        } = gateway
+            .execute("local_export", args.clone(), &ctx)
+            .await
+            .unwrap()
         else {
             panic!("export must wait for approval");
         };
         // Nothing went to the desktop before approval.
         assert!(f.relay.roots(&f.user).is_empty());
         let action = f.store.get_action(&f.user, &action_id).unwrap();
-        assert_eq!(action.destination.as_deref(), Some("local:docs/out/merged.pdf"));
+        assert_eq!(
+            action.destination.as_deref(),
+            Some("local:docs/out/merged.pdf")
+        );
         assert_eq!(action.artifact_hash.as_deref(), Some(hash.as_str()));
-        gateway.decide(&f.user, &approval_id, Decision::Once).unwrap();
-        f.relay.poll(&f.user, roots("read_write"), Duration::ZERO).await.unwrap();
+        gateway
+            .decide(&f.user, &approval_id, Decision::Once)
+            .unwrap();
+        f.relay
+            .poll(&f.user, roots("read_write"), Duration::ZERO)
+            .await
+            .unwrap();
         let received: Arc<Mutex<Vec<u8>>> = Arc::default();
-        let desktop = fake_desktop(f.relay.clone(), f.user.clone(), "read_write", Vec::new(), received.clone(), false);
+        let desktop = fake_desktop(
+            f.relay.clone(),
+            f.user.clone(),
+            "read_write",
+            Vec::new(),
+            received.clone(),
+            false,
+        );
         let outcome = gateway.execute_approved(&action_id, &ctx).await.unwrap();
         desktop.abort();
-        let ToolOutcome::Completed(output) = outcome else { panic!("completed") };
-        assert_eq!(output.destination.as_deref(), Some("local:docs/out/merged.pdf"));
+        let ToolOutcome::Completed(output) = outcome else {
+            panic!("completed")
+        };
+        assert_eq!(
+            output.destination.as_deref(),
+            Some("local:docs/out/merged.pdf")
+        );
         assert_eq!(*received.lock().unwrap(), source);
         // The same action cannot be replayed, and different arguments need a
         // fresh approval.
         assert!(gateway.execute_approved(&action_id, &ctx).await.is_err());
         let again = gateway
-            .execute("local_export", json!({"root": "docs", "path": "other/merged.pdf", "artifact": hash}), &ctx)
+            .execute(
+                "local_export",
+                json!({"root": "docs", "path": "other/merged.pdf", "artifact": hash}),
+                &ctx,
+            )
             .await
             .unwrap();
         assert!(matches!(again, ToolOutcome::PendingApproval { .. }));
@@ -733,13 +853,25 @@ mod tests {
             .unwrap()
             .id;
         let args = json!({"root": "docs", "path": "x.pdf", "artifact": hash});
-        let foreign = tool.execute(args.clone(), &context(&other, &["local_export"])).await.unwrap_err();
+        let foreign = tool
+            .execute(args.clone(), &context(&other, &["local_export"]))
+            .await
+            .unwrap_err();
         assert!(matches!(foreign, SeraError::Forbidden(_)), "{foreign}");
-        f.relay.poll(&f.user, roots("read"), Duration::ZERO).await.unwrap();
-        let read_only = tool.execute(args, &context(&f.user, &["local_export"])).await.unwrap_err();
+        f.relay
+            .poll(&f.user, roots("read"), Duration::ZERO)
+            .await
+            .unwrap();
+        let read_only = tool
+            .execute(args, &context(&f.user, &["local_export"]))
+            .await
+            .unwrap_err();
         assert!(matches!(read_only, SeraError::Forbidden(_)), "{read_only}");
         let blocked = tool
-            .execute(json!({"root": "docs", "path": "forbiddenterm.pdf", "artifact": hash}), &context(&f.user, &["local_export"]))
+            .execute(
+                json!({"root": "docs", "path": "forbiddenterm.pdf", "artifact": hash}),
+                &context(&f.user, &["local_export"]),
+            )
             .await
             .unwrap_err();
         assert!(matches!(blocked, SeraError::PolicyViolation), "{blocked}");

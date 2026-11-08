@@ -128,7 +128,9 @@ impl Sources {
         }
         let meta = std::fs::metadata(&candidate)?;
         if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_IMAGE_BYTES as u64 {
-            return Err(invalid("the image is empty, not a file, or larger than 50 MB"));
+            return Err(invalid(
+                "the image is empty, not a file, or larger than 50 MB",
+            ));
         }
         Ok(std::fs::read(candidate)?)
     }
@@ -162,7 +164,12 @@ fn probe(bytes: &[u8]) -> Result<(ImageFormat, u32, u32)> {
         .map_err(|_| invalid("not a readable image"))?;
     let format = reader
         .format()
-        .filter(|format| matches!(format, ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP))
+        .filter(|format| {
+            matches!(
+                format,
+                ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP
+            )
+        })
         .ok_or_else(|| invalid("unsupported image; use PNG, JPEG or WebP"))?;
     let (width, height) = reader
         .into_dimensions()
@@ -214,12 +221,20 @@ struct Tiff<'a> {
 impl Tiff<'_> {
     fn u16(&self, at: usize) -> Option<u16> {
         let b: [u8; 2] = self.data.get(at..at + 2)?.try_into().ok()?;
-        Some(if self.little { u16::from_le_bytes(b) } else { u16::from_be_bytes(b) })
+        Some(if self.little {
+            u16::from_le_bytes(b)
+        } else {
+            u16::from_be_bytes(b)
+        })
     }
 
     fn u32(&self, at: usize) -> Option<u32> {
         let b: [u8; 4] = self.data.get(at..at + 4)?.try_into().ok()?;
-        Some(if self.little { u32::from_le_bytes(b) } else { u32::from_be_bytes(b) })
+        Some(if self.little {
+            u32::from_le_bytes(b)
+        } else {
+            u32::from_be_bytes(b)
+        })
     }
 
     /// `(tag, type, count, value_field_offset)` for every entry of an IFD.
@@ -240,7 +255,11 @@ impl Tiff<'_> {
         if count == 0 || count > 256 {
             return None;
         }
-        let start = if count <= 4 { field } else { self.u32(field)? as usize };
+        let start = if count <= 4 {
+            field
+        } else {
+            self.u32(field)? as usize
+        };
         let raw = self.data.get(start..start + count)?;
         let text = String::from_utf8_lossy(raw);
         let text = text.trim_end_matches('\0').trim();
@@ -263,7 +282,8 @@ impl Tiff<'_> {
 }
 
 fn dms(values: &[f64], negative: bool) -> Option<f64> {
-    let degrees = values.first()? + values.get(1).copied().unwrap_or(0.0) / 60.0
+    let degrees = values.first()?
+        + values.get(1).copied().unwrap_or(0.0) / 60.0
         + values.get(2).copied().unwrap_or(0.0) / 3600.0;
     Some(if negative { -degrees } else { degrees })
 }
@@ -302,7 +322,10 @@ pub fn exif_basics(bytes: &[u8], include_gps: bool) -> Option<ExifBasics> {
         b"MM" => false,
         _ => return None,
     };
-    let tiff = Tiff { data: tiff_bytes, little };
+    let tiff = Tiff {
+        data: tiff_bytes,
+        little,
+    };
     if tiff.u16(2)? != 42 {
         return None;
     }
@@ -404,11 +427,15 @@ pub fn transform(
         if width.is_none() && height.is_none() {
             return Err(invalid("give a width, a height, or both"));
         }
-        if width == Some(0) || height == Some(0) || width > Some(MAX_SIDE) || height > Some(MAX_SIDE)
+        if width == Some(0)
+            || height == Some(0)
+            || width > Some(MAX_SIDE)
+            || height > Some(MAX_SIDE)
         {
             return Err(invalid(format!("width and height must be 1-{MAX_SIDE}")));
         }
-        let scale = (f64::from(box_w) / f64::from(current_w)).min(f64::from(box_h) / f64::from(current_h));
+        let scale =
+            (f64::from(box_w) / f64::from(current_w)).min(f64::from(box_h) / f64::from(current_h));
         let new_w = ((f64::from(current_w) * scale).round() as u32).clamp(1, MAX_SIDE);
         let new_h = ((f64::from(current_h) * scale).round() as u32).clamp(1, MAX_SIDE);
         image = image.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3);
@@ -493,8 +520,7 @@ fn source_properties() -> Value {
 impl Tool for ImageInspectTool {
     fn spec(&self) -> ToolSpec {
         let mut properties = source_properties();
-        properties["include_gps"] =
-            json!({"type": "boolean", "description": "Also report GPS coordinates (withheld by default)"});
+        properties["include_gps"] = json!({"type": "boolean", "description": "Also report GPS coordinates (withheld by default)"});
         ToolSpec {
             name: "image_inspect".into(),
             description: "Inspect a PNG, JPEG or WebP image: format, dimensions, size, and EXIF \
@@ -508,7 +534,10 @@ impl Tool for ImageInspectTool {
 
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
         reject_unknown(&args, &["artifact", "path", "include_gps"])?;
-        let include_gps = args.get("include_gps").and_then(Value::as_bool).unwrap_or(false);
+        let include_gps = args
+            .get("include_gps")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let source = self.sources.resolve(&args, &context.user_id)?;
         let size = source.bytes.len();
         let bytes = source.bytes;
@@ -550,7 +579,8 @@ impl Tool for ImageInspectTool {
                     (true, Some((lat, lon))) => {
                         lines.push(format!("gps: {lat:.5}, {lon:.5}"));
                     }
-                    (true, None) => lines.push("gps: present (withheld; pass include_gps=true to see it)".into()),
+                    (true, None) => lines
+                        .push("gps: present (withheld; pass include_gps=true to see it)".into()),
                     _ => lines.push("gps: none".into()),
                 }
                 data["exif"] = json!({
@@ -578,8 +608,10 @@ impl Tool for ImageTransformTool {
     fn spec(&self) -> ToolSpec {
         let mut properties = source_properties();
         let (description, required): (&str, Vec<&str>) = if self.name == "image_resize" {
-            properties["width"] = json!({"type": "integer", "description": "Maximum width in pixels, 1-8192"});
-            properties["height"] = json!({"type": "integer", "description": "Maximum height in pixels, 1-8192"});
+            properties["width"] =
+                json!({"type": "integer", "description": "Maximum width in pixels, 1-8192"});
+            properties["height"] =
+                json!({"type": "integer", "description": "Maximum height in pixels, 1-8192"});
             properties["format"] = json!({"type": "string", "enum": ["png", "jpg", "webp"], "description": "Output format (default: same as the input)"});
             (
                 "Resize a PNG, JPEG or WebP image to fit inside a width/height box, keeping the \
@@ -594,7 +626,8 @@ impl Tool for ImageTransformTool {
                 vec!["format"],
             )
         };
-        properties["quality"] = json!({"type": "integer", "description": "JPEG quality 1-100 (default 85)"});
+        properties["quality"] =
+            json!({"type": "integer", "description": "JPEG quality 1-100 (default 85)"});
         ToolSpec {
             name: self.name.into(),
             description: description.into(),
@@ -618,7 +651,10 @@ impl Tool for ImageTransformTool {
         )?;
         let source = self.sources.resolve(&args, &context.user_id)?;
         let size = if resize {
-            Some((optional_dimension(&args, "width")?, optional_dimension(&args, "height")?))
+            Some((
+                optional_dimension(&args, "width")?,
+                optional_dimension(&args, "height")?,
+            ))
         } else {
             None
         };
@@ -740,7 +776,9 @@ mod tests {
             .create_user("subject-img", "img@example.example", "Synthetic")
             .unwrap()
             .id;
-        store.create_conversation(&user, "dir:main", "direct", None).unwrap();
+        store
+            .create_conversation(&user, "dir:main", "direct", None)
+            .unwrap();
         Fixture {
             artifacts: Arc::new(ArtifactStore::new(base.join("artifacts")).unwrap()),
             store,
@@ -795,7 +833,15 @@ mod tests {
             )
             .unwrap();
         f.store
-            .record_conversation_artifact(&f.user, "dir:main", None, "local_import", &stored.hash, name, None)
+            .record_conversation_artifact(
+                &f.user,
+                "dir:main",
+                None,
+                "local_import",
+                &stored.hash,
+                name,
+                None,
+            )
             .unwrap();
         stored.hash
     }
@@ -853,7 +899,10 @@ mod tests {
         assert!(hidden.has_gps && hidden.gps.is_none());
         let shown = exif_basics(&jpeg, true).unwrap();
         let (lat, lon) = shown.gps.unwrap();
-        assert!((lat - 48.85).abs() < 1e-6 && (lon - 2.35).abs() < 1e-6, "{lat} {lon}");
+        assert!(
+            (lat - 48.85).abs() < 1e-6 && (lon - 2.35).abs() < 1e-6,
+            "{lat} {lon}"
+        );
         assert!(exif_basics(&sample(2, 2, ImageFormat::Jpeg), true).is_none());
         // Truncated or hostile blocks never panic.
         for cut in 0..jpeg.len().min(200) {
@@ -883,7 +932,11 @@ mod tests {
         assert_eq!((w, h), (3, 4));
         assert!(exif_basics(&rotated, true).is_none());
         assert!(!rotated.windows(4).any(|window| window == b"Exif"));
-        for bad in [Some((Some(0), None)), Some((Some(9000), None)), Some((None, None))] {
+        for bad in [
+            Some((Some(0), None)),
+            Some((Some(9000), None)),
+            Some((None, None)),
+        ] {
             assert!(transform(&png, bad, Output::Png, 85).is_err());
         }
         assert!(transform(b"not an image", None, Output::Png, 85).is_err());
@@ -895,29 +948,65 @@ mod tests {
         let f = fixture();
         let hash = put_artifact(&f, &jpeg_with_exif(4, 3), "photo.jpg");
         let mut registry = ToolRegistry::default();
-        register_image_tools(&mut registry, f.artifacts.clone(), f.store.clone(), f.inbox.clone()).unwrap();
+        register_image_tools(
+            &mut registry,
+            f.artifacts.clone(),
+            f.store.clone(),
+            f.inbox.clone(),
+        )
+        .unwrap();
         for name in ["image_inspect", "image_resize", "image_convert"] {
             assert!(registry.is_registered(name), "{name}");
         }
         let inspect = ImageInspectTool {
-            sources: Sources { artifacts: f.artifacts.clone(), store: f.store.clone(), inbox: f.inbox.clone() },
+            sources: Sources {
+                artifacts: f.artifacts.clone(),
+                store: f.store.clone(),
+                inbox: f.inbox.clone(),
+            },
         };
         let ctx = context(&f.user);
-        let output = inspect.execute(json!({"artifact": hash}), &ctx).await.unwrap();
-        assert!(output.content.contains("format: jpeg") && output.content.contains("size: 4x3 px"), "{}", output.content);
-        assert!(output.content.contains("camera make: TestCam") && output.content.contains("gps: present (withheld"), "{}", output.content);
+        let output = inspect
+            .execute(json!({"artifact": hash}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            output.content.contains("format: jpeg") && output.content.contains("size: 4x3 px"),
+            "{}",
+            output.content
+        );
+        assert!(
+            output.content.contains("camera make: TestCam")
+                && output.content.contains("gps: present (withheld"),
+            "{}",
+            output.content
+        );
         assert!(!output.content.contains("48.85"));
-        let with_gps = inspect.execute(json!({"artifact": hash, "include_gps": true}), &ctx).await.unwrap();
-        assert!(with_gps.content.contains("gps: 48.85000, 2.35000"), "{}", with_gps.content);
+        let with_gps = inspect
+            .execute(json!({"artifact": hash, "include_gps": true}), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            with_gps.content.contains("gps: 48.85000, 2.35000"),
+            "{}",
+            with_gps.content
+        );
 
         let tool = |name| ImageTransformTool {
-            sources: Sources { artifacts: f.artifacts.clone(), store: f.store.clone(), inbox: f.inbox.clone() },
+            sources: Sources {
+                artifacts: f.artifacts.clone(),
+                store: f.store.clone(),
+                inbox: f.inbox.clone(),
+            },
             artifacts: f.artifacts.clone(),
             store: f.store.clone(),
             name,
         };
         let resized = tool("image_resize")
-            .execute(json!({"artifact": hash, "width": 2, "format": "webp"}), &ctx)
+            .execute(
+                json!({"artifact": hash, "width": 2, "format": "webp"}),
+                &ctx,
+            )
             .await
             .unwrap();
         let out_hash = resized.artifact_hash.clone().unwrap();
@@ -930,12 +1019,25 @@ mod tests {
         // The produced artifact is not recorded for the user yet (the gateway
         // does that), so ownership blocks chaining until it is.
         assert!(matches!(converted, Err(SeraError::Forbidden(_))));
-        f.store.record_conversation_artifact(&f.user, "dir:main", None, "image_resize", &out_hash, "photo-resized.webp", None).unwrap();
+        f.store
+            .record_conversation_artifact(
+                &f.user,
+                "dir:main",
+                None,
+                "image_resize",
+                &out_hash,
+                "photo-resized.webp",
+                None,
+            )
+            .unwrap();
         let converted = tool("image_convert")
             .execute(json!({"artifact": out_hash, "format": "png"}), &ctx)
             .await
             .unwrap();
-        assert_eq!(converted.filename.as_deref(), Some("photo-resized-converted.png"));
+        assert_eq!(
+            converted.filename.as_deref(),
+            Some("photo-resized-converted.png")
+        );
         for bad in [
             json!({"artifact": hash}),
             json!({"artifact": hash, "format": "gif"}),
@@ -943,10 +1045,27 @@ mod tests {
             json!({"format": "png"}),
             json!({"artifact": hash, "path": "x/y.png", "format": "png"}),
         ] {
-            assert!(tool("image_convert").execute(bad.clone(), &ctx).await.is_err(), "{bad}");
+            assert!(
+                tool("image_convert")
+                    .execute(bad.clone(), &ctx)
+                    .await
+                    .is_err(),
+                "{bad}"
+            );
         }
-        for bad in [json!({"artifact": hash}), json!({"artifact": hash, "width": 0}), json!({"artifact": hash, "width": 9000}), json!({"artifact": hash, "width": 2, "quality": 0})] {
-            assert!(tool("image_resize").execute(bad.clone(), &ctx).await.is_err(), "{bad}");
+        for bad in [
+            json!({"artifact": hash}),
+            json!({"artifact": hash, "width": 0}),
+            json!({"artifact": hash, "width": 9000}),
+            json!({"artifact": hash, "width": 2, "quality": 0}),
+        ] {
+            assert!(
+                tool("image_resize")
+                    .execute(bad.clone(), &ctx)
+                    .await
+                    .is_err(),
+                "{bad}"
+            );
         }
         std::fs::remove_dir_all(&f.base).ok();
     }
@@ -954,23 +1073,36 @@ mod tests {
     #[tokio::test]
     async fn sources_are_scoped_to_the_acting_user() {
         let f = fixture();
-        let other = f.store.create_user("subject-img2", "img2@example.example", "Other").unwrap().id;
+        let other = f
+            .store
+            .create_user("subject-img2", "img2@example.example", "Other")
+            .unwrap()
+            .id;
         let hash = put_artifact(&f, &sample(2, 2, ImageFormat::Png), "mine.png");
         let own = f.inbox.join(&f.user).join("local");
         std::fs::create_dir_all(&own).unwrap();
         std::fs::write(own.join("abc-pic.png"), sample(3, 3, ImageFormat::Png)).unwrap();
         std::fs::write(f.inbox.join("shared.png"), sample(3, 3, ImageFormat::Png)).unwrap();
         let inspect = ImageInspectTool {
-            sources: Sources { artifacts: f.artifacts.clone(), store: f.store.clone(), inbox: f.inbox.clone() },
+            sources: Sources {
+                artifacts: f.artifacts.clone(),
+                store: f.store.clone(),
+                inbox: f.inbox.clone(),
+            },
         };
         let mine = inspect
-            .execute(json!({"path": format!("{}/local/abc-pic.png", f.user)}), &context(&f.user))
+            .execute(
+                json!({"path": format!("{}/local/abc-pic.png", f.user)}),
+                &context(&f.user),
+            )
             .await
             .unwrap();
         assert!(mine.content.contains("size: 3x3 px"));
         // Another account cannot use my artifact or my inbox path.
         assert!(matches!(
-            inspect.execute(json!({"artifact": hash}), &context(&other)).await,
+            inspect
+                .execute(json!({"artifact": hash}), &context(&other))
+                .await,
             Err(SeraError::Forbidden(_))
         ));
         for path in [
@@ -982,11 +1114,19 @@ mod tests {
             "C:\\x.png".to_owned(),
         ] {
             assert!(
-                inspect.execute(json!({"path": path}), &context(&other)).await.is_err(),
+                inspect
+                    .execute(json!({"path": path}), &context(&other))
+                    .await
+                    .is_err(),
                 "{path}"
             );
         }
-        assert!(inspect.execute(json!({"path": "shared.png"}), &context(&f.user)).await.is_err());
+        assert!(
+            inspect
+                .execute(json!({"path": "shared.png"}), &context(&f.user))
+                .await
+                .is_err()
+        );
         std::fs::remove_dir_all(&f.base).ok();
     }
 

@@ -41,6 +41,12 @@ use std::{
 };
 use zeroize::Zeroize;
 
+/// Results of the background folder counts.
+struct FolderStatsChannel {
+    sender: std::sync::mpsc::Sender<(String, String, crate::local_fs::FolderStats)>,
+    receiver: std::sync::mpsc::Receiver<(String, String, crate::local_fs::FolderStats)>,
+}
+
 pub const REQUEST_GAP: Duration = Duration::from_millis(60);
 pub const POLL_GAP: Duration = Duration::from_millis(750);
 pub const POLL_SAFETY: Duration = Duration::from_secs(4);
@@ -599,6 +605,10 @@ pub struct Session {
     /// Message under the Local folders card.
     pub local_notice: Option<String>,
     folder_pick_rx: Option<std::sync::mpsc::Receiver<Option<(std::path::PathBuf, bool)>>>,
+    /// Size and file counts per allowed folder id, filled in lazily (0.21).
+    pub folder_stats: std::collections::HashMap<String, crate::local_folders::FolderStatus>,
+    folder_stats_wanted: bool,
+    folder_stats_chan: Option<FolderStatsChannel>,
     /// Files already uploaded and attached to the composer draft.
     pub composer_files: Vec<crate::AttachmentInfo>,
     /// Text drafts per conversation, kept while the app runs (0.19).
@@ -752,6 +762,9 @@ impl Session {
             local_agent: None,
             local_notice: None,
             folder_pick_rx: None,
+            folder_stats: std::collections::HashMap::new(),
+            folder_stats_wanted: false,
+            folder_stats_chan: None,
             composer_files: Vec::new(),
             drafts: crate::chat_compose::Drafts::default(),
             attach_notice: None,
@@ -2106,8 +2119,74 @@ impl Session {
         }
     }
 
+    /// The Local folders card is on screen: start counting files and size,
+    /// one folder at a time, off the UI thread. Called again it does nothing.
+    pub fn want_folder_stats(&mut self) {
+        self.folder_stats_wanted = true;
+    }
+
+    /// Count again (a folder may have grown).
+    pub fn recount_folders(&mut self) {
+        self.folder_stats.clear();
+        self.folder_stats_wanted = true;
+    }
+
+    fn poll_folder_stats(&mut self) {
+        let channel = self.folder_stats_chan.get_or_insert_with(|| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            FolderStatsChannel { sender, receiver }
+        });
+        while let Ok((id, path, stats)) = channel.receiver.try_recv() {
+            // Ignore an answer for a folder that was removed or replaced.
+            if self
+                .local_folders
+                .iter()
+                .any(|folder| folder.id == id && folder.path == path)
+            {
+                self.folder_stats
+                    .insert(id, crate::local_folders::FolderStatus::Done(stats));
+            }
+        }
+        self.folder_stats
+            .retain(|id, _| self.local_folders.iter().any(|folder| &folder.id == id));
+        if !self.folder_stats_wanted
+            || self
+                .folder_stats
+                .values()
+                .any(|status| matches!(status, crate::local_folders::FolderStatus::Counting))
+        {
+            return;
+        }
+        let Some(folder) = self
+            .local_folders
+            .iter()
+            .find(|folder| !self.folder_stats.contains_key(&folder.id))
+        else {
+            return;
+        };
+        let (id, path) = (folder.id.clone(), folder.path.clone());
+        let sender = channel.sender.clone();
+        self.folder_stats
+            .insert(id.clone(), crate::local_folders::FolderStatus::Counting);
+        let spawned = std::thread::Builder::new()
+            .name("serabot-folder-stats".into())
+            .spawn({
+                let (id, path) = (id.clone(), path.clone());
+                move || {
+                    let budget = crate::local_fs::Budget::new(std::time::Duration::from_secs(120));
+                    let stats = crate::local_fs::folder_stats(std::path::Path::new(&path), &budget);
+                    let _ = sender.send((id, path, stats));
+                }
+            });
+        if spawned.is_err() {
+            self.folder_stats.remove(&id);
+            self.folder_stats_wanted = false;
+        }
+    }
+
     pub fn remove_local_folder(&mut self, id: &str) {
         self.local_folders.retain(|folder| folder.id != id);
+        self.folder_stats.remove(id);
         self.persist_local_folders();
         self.local_notice = Some("Removed. The bot can no longer see that folder.".into());
     }
@@ -2402,6 +2481,7 @@ impl Session {
         self.poll_attachments();
         self.flush_stop();
         self.poll_folder_pick();
+        self.poll_folder_stats();
         self.sync_local_agent();
         self.poll_launches();
         self.hydrate_bot_settings();

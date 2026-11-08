@@ -103,9 +103,9 @@ pub fn name_addressable(name: &str) -> bool {
     if RESERVED.contains(&stem.as_str()) {
         return false;
     }
-    !name
-        .chars()
-        .any(|c| c.is_control() || matches!(c, '<' | '>' | '"' | '|' | '?' | '*' | ':' | '/' | '\\'))
+    !name.chars().any(|c| {
+        c.is_control() || matches!(c, '<' | '>' | '"' | '|' | '?' | '*' | ':' | '/' | '\\')
+    })
 }
 
 /// Hidden by dot-name everywhere, and by the hidden/system attribute on Windows.
@@ -280,7 +280,8 @@ impl Cursor {
         let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(text)
             .map_err(|_| "invalid cursor".to_string())?;
-        let value: Value = serde_json::from_slice(&raw).map_err(|_| "invalid cursor".to_string())?;
+        let value: Value =
+            serde_json::from_slice(&raw).map_err(|_| "invalid cursor".to_string())?;
         let after: Vec<String> = value
             .get("a")
             .and_then(Value::as_array)
@@ -585,7 +586,6 @@ impl Filter {
         })
     }
 
-
     fn matches(&self, entry: &Entry) -> bool {
         match self.kind {
             Kind::File if entry.is_dir => return false,
@@ -617,12 +617,7 @@ fn describe(entry: &Entry) -> String {
 }
 
 /// `local_list`: one page of a (possibly recursive) listing, or only counts.
-pub fn list(
-    root: &Path,
-    rel: &str,
-    args: &Value,
-    budget: &Budget,
-) -> Result<String, String> {
+pub fn list(root: &Path, rel: &str, args: &Value, budget: &Budget) -> Result<String, String> {
     let root_canon = root
         .canonicalize()
         .map_err(|_| "the allowed folder is no longer available".to_string())?;
@@ -673,7 +668,11 @@ pub fn list(
     let mut lines: Vec<String> = Vec::new();
     let header = format!(
         "{} {}{}",
-        if recursive { "Recursive listing of" } else { "Listing of" },
+        if recursive {
+            "Recursive listing of"
+        } else {
+            "Listing of"
+        },
         rel,
         if recursive {
             format!(" (depth {max_depth})")
@@ -726,7 +725,11 @@ pub fn list(
                 ..Cursor::default()
             });
         }
-        text.push_str(&format!("\n-- {} shown, {} scanned", lines.len(), end.scanned));
+        text.push_str(&format!(
+            "\n-- {} shown, {} scanned",
+            lines.len(),
+            end.scanned
+        ));
         if end.skipped > 0 {
             text.push_str(&format!(", {} not shown (links, odd names)", end.skipped));
         }
@@ -795,13 +798,7 @@ pub fn list(
     if slice.is_empty() {
         text.push_str("(no matching entries)");
     } else {
-        text.push_str(
-            &slice
-                .iter()
-                .map(describe)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
+        text.push_str(&slice.iter().map(describe).collect::<Vec<_>>().join("\n"));
     }
     text.push_str(&format!(
         "\n-- {} shown of {} collected",
@@ -873,7 +870,10 @@ fn list_summary(
         human_size(bytes)
     );
     if end.skipped > 0 {
-        text.push_str(&format!("\n{} entries not counted (links, odd names)", end.skipped));
+        text.push_str(&format!(
+            "\n{} entries not counted (links, odd names)",
+            end.skipped
+        ));
     }
     if end.complete {
         text.push_str("\ncomplete: true");
@@ -901,6 +901,31 @@ pub struct FolderStats {
     pub bytes: u64,
     /// False when the budget ran out: the numbers are lower bounds.
     pub complete: bool,
+}
+
+impl FolderStats {
+    /// `1,234 files, 56 folders, 2.3 GiB`; a lower bound is marked with `+`.
+    pub fn label(&self) -> String {
+        let plus = if self.complete { "" } else { "+" };
+        format!(
+            "{}{plus} files, {}{plus} folders, {}{plus}",
+            group_digits(self.files),
+            group_digits(self.folders),
+            human_size(self.bytes)
+        )
+    }
+}
+
+fn group_digits(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 pub fn folder_stats(root: &Path, budget: &Budget) -> FolderStats {
@@ -946,12 +971,7 @@ fn sniff_file(path: &Path) -> Option<Vec<u8>> {
 }
 
 /// `local_search`: find files by name pattern and optionally by text content.
-pub fn search(
-    root: &Path,
-    rel: &str,
-    args: &Value,
-    budget: &Budget,
-) -> Result<String, String> {
+pub fn search(root: &Path, rel: &str, args: &Value, budget: &Budget) -> Result<String, String> {
     let root_canon = root
         .canonicalize()
         .map_err(|_| "the allowed folder is no longer available".to_string())?;
@@ -1120,7 +1140,11 @@ fn match_lines(path: &Path, needle_lower: &str) -> Vec<String> {
     let mut number = 0usize;
     loop {
         buf.clear();
-        match reader.by_ref().take(MAX_LINE_BYTES as u64).read_until(b'\n', &mut buf) {
+        match reader
+            .by_ref()
+            .take(MAX_LINE_BYTES as u64)
+            .read_until(b'\n', &mut buf)
+        {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
@@ -1173,7 +1197,13 @@ pub fn stat(root: &Path, rel: &str) -> Result<String, String> {
             .unwrap_or_default()
             .to_ascii_lowercase();
         let content = sniff_file(&path)
-            .map(|head| if looks_like_text(&head) { "text" } else { "binary" })
+            .map(|head| {
+                if looks_like_text(&head) {
+                    "text"
+                } else {
+                    "binary"
+                }
+            })
             .unwrap_or("unreadable");
         out.push_str(&format!(
             "type: file\nsize: {} bytes ({})\nmodified: {modified}\nextension: {}\ncontent: {content}\nread_only: {}\n",
@@ -1185,10 +1215,7 @@ pub fn stat(root: &Path, rel: &str) -> Result<String, String> {
     } else {
         return Err("not a regular file or folder".into());
     }
-    out.push_str(&format!(
-        "hidden: {}",
-        is_hidden(name, &meta)
-    ));
+    out.push_str(&format!("hidden: {}", is_hidden(name, &meta)));
     Ok(out)
 }
 
@@ -1239,7 +1266,11 @@ pub fn read(root: &Path, rel: &str, args: &Value, budget: &Budget) -> Result<Str
         .read_to_end(&mut buf)
         .map_err(|_| "could not be read".to_string())?;
     // Start on a character boundary.
-    let skip = buf.iter().take(3).take_while(|b| (**b & 0xC0) == 0x80).count();
+    let skip = buf
+        .iter()
+        .take(3)
+        .take_while(|b| (**b & 0xC0) == 0x80)
+        .count();
     let skip = if offset == 0 { 0 } else { skip };
     let mut chunk = &buf[skip..];
     if chunk.len() > limit {
@@ -1362,7 +1393,11 @@ mod tests {
             let dir = base.join(format!("d{:03}", d / 10)).join(format!("s{d}"));
             std::fs::create_dir_all(&dir).unwrap();
             for i in 0..per_dir.min(files - made) {
-                std::fs::write(dir.join(format!("f{i:03}.txt")), format!("file {made} needle{i}")).unwrap();
+                std::fs::write(
+                    dir.join(format!("f{i:03}.txt")),
+                    format!("file {made} needle{i}"),
+                )
+                .unwrap();
                 made += 1;
             }
             d += 1;
@@ -1390,7 +1425,10 @@ mod tests {
         assert!(glob_match("a*b*c", "aXXbYYc"));
         assert!(!glob_match("a*b*c", "aXXbYY"));
         // A hostile pattern stays fast.
-        assert!(!glob_match(&"a*".repeat(60), &"a".repeat(2000).replace('a', "b")));
+        assert!(!glob_match(
+            &"a*".repeat(60),
+            &"a".repeat(2000).replace('a', "b")
+        ));
         assert_eq!(iso_date(0), "1970-01-01");
         assert_eq!(iso_datetime(1_700_000_000), "2023-11-14T22:13:20Z");
         assert_eq!(human_size(1536), "1.5 KiB");
@@ -1402,12 +1440,21 @@ mod tests {
 
     #[test]
     fn windows_paths_compare_without_case_or_prefix() {
-        assert_eq!(normalize_windows(r"\\?\C:\Users\Me\Docs\"), r"c:\users\me\docs");
+        assert_eq!(
+            normalize_windows(r"\\?\C:\Users\Me\Docs\"),
+            r"c:\users\me\docs"
+        );
         assert_eq!(normalize_windows(r"\\?\UNC\srv\share"), r"\\srv\share");
         #[cfg(windows)]
         {
-            assert!(path_within(Path::new(r"\\?\C:\Docs"), Path::new(r"c:\docs\a\b")));
-            assert!(!path_within(Path::new(r"C:\Docs"), Path::new(r"C:\Docs2\a")));
+            assert!(path_within(
+                Path::new(r"\\?\C:\Docs"),
+                Path::new(r"c:\docs\a\b")
+            ));
+            assert!(!path_within(
+                Path::new(r"C:\Docs"),
+                Path::new(r"C:\Docs2\a")
+            ));
         }
         #[cfg(not(windows))]
         {
@@ -1474,7 +1521,10 @@ mod tests {
             &budget,
         )
         .unwrap();
-        assert_eq!(big.lines().filter(|l| l.contains(".txt (")).count(), MAX_PAGE);
+        assert_eq!(
+            big.lines().filter(|l| l.contains(".txt (")).count(),
+            MAX_PAGE
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -1489,13 +1539,25 @@ mod tests {
             &Budget::new(Duration::from_secs(60)),
         )
         .unwrap();
-        assert!(full.contains("files=600") && full.contains("complete: true"), "{full}");
+        assert!(
+            full.contains("files=600") && full.contains("complete: true"),
+            "{full}"
+        );
         assert!(!full.contains("f000.txt"));
         // An already expired budget yields a partial answer with a cursor, and
         // continuing from it never loses ground.
         let expired = Budget::new(Duration::ZERO);
-        let partial = list(&base, ".", &serde_json::json!({"summary": true, "recursive": true}), &expired).unwrap();
-        assert!(partial.contains("complete: false") && cursor_of(&partial).is_some(), "{partial}");
+        let partial = list(
+            &base,
+            ".",
+            &serde_json::json!({"summary": true, "recursive": true}),
+            &expired,
+        )
+        .unwrap();
+        assert!(
+            partial.contains("complete: false") && cursor_of(&partial).is_some(),
+            "{partial}"
+        );
         // Finish in slices of at most 40 entries via a counting budget trick:
         // resume with a fresh budget from the carried cursor.
         let resumed = list(
@@ -1508,6 +1570,18 @@ mod tests {
         assert!(resumed.contains("files=600"), "{resumed}");
         let stats = folder_stats(&base, &Budget::new(Duration::from_secs(60)));
         assert_eq!((stats.files, stats.complete), (600, true));
+        assert!(
+            stats.label().starts_with("600 files, "),
+            "{}",
+            stats.label()
+        );
+        assert_eq!(group_digits(1_234_567), "1,234,567");
+        let partial = folder_stats(&base, &Budget::new(Duration::ZERO));
+        assert!(
+            !partial.complete && partial.label().contains("+ files"),
+            "{}",
+            partial.label()
+        );
         assert!(stats.bytes > 0 && stats.folders > 0);
         std::fs::remove_dir_all(&base).ok();
     }
@@ -1523,22 +1597,55 @@ mod tests {
         std::fs::write(base.join(".hidden.txt"), "h").unwrap();
         std::fs::write(base.join(".env"), "SECRET=x").unwrap();
         let budget = Budget::new(Duration::from_secs(30));
-        let out = list(&base, ".", &serde_json::json!({"recursive": true, "max_depth": 3, "extensions": ["txt"]}), &budget).unwrap();
-        assert!(out.contains("a/two.txt") && out.contains("a/b/three.txt"), "{out}");
-        assert!(!out.contains("deep.txt") && !out.contains("one.md"), "{out}");
+        let out = list(
+            &base,
+            ".",
+            &serde_json::json!({"recursive": true, "max_depth": 3, "extensions": ["txt"]}),
+            &budget,
+        )
+        .unwrap();
+        assert!(
+            out.contains("a/two.txt") && out.contains("a/b/three.txt"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("deep.txt") && !out.contains("one.md"),
+            "{out}"
+        );
         assert!(!out.contains(".hidden") && !out.contains(".env"), "{out}");
-        let all = list(&base, ".", &serde_json::json!({"recursive": true, "max_depth": 6, "include_hidden": true}), &budget).unwrap();
-        assert!(all.contains(".hidden.txt") && all.contains("deep.txt"), "{all}");
-        assert!(!all.contains(".env"), "credential-like names stay hidden: {all}");
+        let all = list(
+            &base,
+            ".",
+            &serde_json::json!({"recursive": true, "max_depth": 6, "include_hidden": true}),
+            &budget,
+        )
+        .unwrap();
+        assert!(
+            all.contains(".hidden.txt") && all.contains("deep.txt"),
+            "{all}"
+        );
+        assert!(
+            !all.contains(".env"),
+            "credential-like names stay hidden: {all}"
+        );
         let by_size = list(&base, ".", &serde_json::json!({"recursive": true, "max_depth": 6, "kind": "file", "sort": "size", "order": "desc"}), &budget).unwrap();
         let first = by_size.lines().nth(1).unwrap();
         assert!(first.contains("deep.txt"), "{by_size}");
-        let by_pattern = list(&base, ".", &serde_json::json!({"recursive": true, "pattern": "T*E?.txt"}), &budget).unwrap();
+        let by_pattern = list(
+            &base,
+            ".",
+            &serde_json::json!({"recursive": true, "pattern": "T*E?.txt"}),
+            &budget,
+        )
+        .unwrap();
         assert!(by_pattern.contains("three.txt"), "{by_pattern}");
         // Sorted pagination walks the whole set.
         let page1 = list(&base, ".", &serde_json::json!({"recursive": true, "max_depth": 6, "kind": "file", "sort": "size", "page_size": 2}), &budget).unwrap();
         let page2 = list(&base, ".", &serde_json::json!({"recursive": true, "max_depth": 6, "kind": "file", "sort": "size", "page_size": 2, "cursor": cursor_of(&page1).unwrap()}), &budget).unwrap();
-        assert!(page2.contains("more: false") && page2.contains("deep.txt"), "{page2}");
+        assert!(
+            page2.contains("more: false") && page2.contains("deep.txt"),
+            "{page2}"
+        );
         assert!(list(&base, ".", &serde_json::json!({"sort": "bogus"}), &budget).is_err());
         assert!(list(&base, ".", &serde_json::json!({"cursor": "@@"}), &budget).is_err());
         std::fs::remove_dir_all(&base).ok();
@@ -1553,17 +1660,44 @@ mod tests {
         std::fs::write(base.join("big.txt"), "x".repeat(5 * 1024 * 1024)).unwrap();
         let budget = Budget::new(Duration::from_secs(60));
         let by_name = search(&base, ".", &serde_json::json!({"name": "budget"}), &budget).unwrap();
-        assert!(by_name.contains("budget-2024.csv") && by_name.contains("more: false"), "{by_name}");
-        let by_text = search(&base, ".", &serde_json::json!({"text": "uniquemarker"}), &budget).unwrap();
+        assert!(
+            by_name.contains("budget-2024.csv") && by_name.contains("more: false"),
+            "{by_name}"
+        );
+        let by_text = search(
+            &base,
+            ".",
+            &serde_json::json!({"text": "uniquemarker"}),
+            &budget,
+        )
+        .unwrap();
         assert!(by_text.contains("L2: row,UniqueMarker here"), "{by_text}");
         assert!(by_text.contains("skipped 1 binary and 1 over"), "{by_text}");
         // Result cap and resume.
-        let first = search(&base, ".", &serde_json::json!({"name": "f0", "max_results": 40}), &budget).unwrap();
-        assert!(first.contains("40 match") && first.contains("result limit reached"), "{first}");
+        let first = search(
+            &base,
+            ".",
+            &serde_json::json!({"name": "f0", "max_results": 40}),
+            &budget,
+        )
+        .unwrap();
+        assert!(
+            first.contains("40 match") && first.contains("result limit reached"),
+            "{first}"
+        );
         let second = search(&base, ".", &serde_json::json!({"name": "f0", "max_results": 200, "cursor": cursor_of(&first).unwrap()}), &budget).unwrap();
-        assert!(second.contains("260 match") || second.contains("match(es)"), "{second}");
+        assert!(
+            second.contains("260 match") || second.contains("match(es)"),
+            "{second}"
+        );
         assert!(search(&base, ".", &serde_json::json!({}), &budget).is_err());
-        let timed = search(&base, ".", &serde_json::json!({"name": "f"}), &Budget::new(Duration::ZERO)).unwrap();
+        let timed = search(
+            &base,
+            ".",
+            &serde_json::json!({"name": "f"}),
+            &Budget::new(Duration::ZERO),
+        )
+        .unwrap();
         assert!(timed.contains("time budget"), "{timed}");
         std::fs::remove_dir_all(&base).ok();
     }
@@ -1576,7 +1710,10 @@ mod tests {
         std::fs::write(base.join(".env"), "S=1").unwrap();
         std::fs::create_dir(base.join("sub")).unwrap();
         let a = stat(&base, "a.txt").unwrap();
-        assert!(a.contains("type: file") && a.contains("size: 5 bytes") && a.contains("content: text"), "{a}");
+        assert!(
+            a.contains("type: file") && a.contains("size: 5 bytes") && a.contains("content: text"),
+            "{a}"
+        );
         assert!(a.contains("modified: 20"), "{a}");
         assert!(stat(&base, "b.dat").unwrap().contains("content: binary"));
         assert!(stat(&base, "sub").unwrap().contains("type: folder"));
@@ -1597,23 +1734,77 @@ mod tests {
         std::fs::write(base.join("bin.dat"), [0u8, 1]).unwrap();
         let multibyte = "é".repeat(300_000);
         std::fs::write(base.join("m.txt"), &multibyte).unwrap();
-        assert_eq!(read(&base, "small.txt", &serde_json::json!({}), &budget).unwrap(), "tiny");
-        let ranged = read(&base, "l.txt", &serde_json::json!({"offset": 5, "length": 12}), &budget).unwrap();
-        assert!(ranged.starts_with("[bytes 5-17 of ") && ranged.contains("next_offset=17"), "{ranged}");
-        let lines = read(&base, "l.txt", &serde_json::json!({"start_line": 10, "end_line": 12}), &budget).unwrap();
-        assert_eq!(lines, "[lines 10-12; next_line=13]\nline 10\nline 11\nline 12\n");
-        let tail = read(&base, "l.txt", &serde_json::json!({"start_line": 999}), &budget).unwrap();
-        assert!(tail.contains("line 999") && tail.contains("end of file"), "{tail}");
-        let past = read(&base, "l.txt", &serde_json::json!({"start_line": 5000}), &budget).unwrap();
+        assert_eq!(
+            read(&base, "small.txt", &serde_json::json!({}), &budget).unwrap(),
+            "tiny"
+        );
+        let ranged = read(
+            &base,
+            "l.txt",
+            &serde_json::json!({"offset": 5, "length": 12}),
+            &budget,
+        )
+        .unwrap();
+        assert!(
+            ranged.starts_with("[bytes 5-17 of ") && ranged.contains("next_offset=17"),
+            "{ranged}"
+        );
+        let lines = read(
+            &base,
+            "l.txt",
+            &serde_json::json!({"start_line": 10, "end_line": 12}),
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(
+            lines,
+            "[lines 10-12; next_line=13]\nline 10\nline 11\nline 12\n"
+        );
+        let tail = read(
+            &base,
+            "l.txt",
+            &serde_json::json!({"start_line": 999}),
+            &budget,
+        )
+        .unwrap();
+        assert!(
+            tail.contains("line 999") && tail.contains("end of file"),
+            "{tail}"
+        );
+        let past = read(
+            &base,
+            "l.txt",
+            &serde_json::json!({"start_line": 5000}),
+            &budget,
+        )
+        .unwrap();
         assert!(past.contains("the file has 1000 line"), "{past}");
-        assert!(read(&base, "l.txt", &serde_json::json!({"start_line": 5, "end_line": 2}), &budget).is_err());
-        assert!(read(&base, "bin.dat", &serde_json::json!({}), &budget).unwrap_err().contains("binary"));
+        assert!(
+            read(
+                &base,
+                "l.txt",
+                &serde_json::json!({"start_line": 5, "end_line": 2}),
+                &budget
+            )
+            .is_err()
+        );
+        assert!(
+            read(&base, "bin.dat", &serde_json::json!({}), &budget)
+                .unwrap_err()
+                .contains("binary")
+        );
         // Hard cap per call, on a character boundary at both ends, and the
         // whole file is reachable by following next_offset.
         let mut offset = 0u64;
         let mut collected = String::new();
         loop {
-            let out = read(&base, "m.txt", &serde_json::json!({"offset": offset, "length": 100_000_000}), &budget).unwrap();
+            let out = read(
+                &base,
+                "m.txt",
+                &serde_json::json!({"offset": offset, "length": 100_000_000}),
+                &budget,
+            )
+            .unwrap();
             let (head, text) = out.split_once('\n').unwrap();
             assert!(text.len() <= MAX_READ_BYTES, "cap exceeded");
             collected.push_str(text);
@@ -1623,7 +1814,15 @@ mod tests {
             }
         }
         assert_eq!(collected, multibyte);
-        assert!(read(&base, "l.txt", &serde_json::json!({"offset": 999_999_999}), &budget).is_err());
+        assert!(
+            read(
+                &base,
+                "l.txt",
+                &serde_json::json!({"offset": 999_999_999}),
+                &budget
+            )
+            .is_err()
+        );
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -1641,9 +1840,18 @@ mod tests {
         std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("link.txt")).unwrap();
         let budget = Budget::new(Duration::from_secs(30));
         let out = list(&root, ".", &serde_json::json!({"recursive": true}), &budget).unwrap();
-        assert!(out.contains("ok.txt") && !out.contains("secret") && !out.contains("escape") && !out.contains("link.txt"), "{out}");
+        assert!(
+            out.contains("ok.txt")
+                && !out.contains("secret")
+                && !out.contains("escape")
+                && !out.contains("link.txt"),
+            "{out}"
+        );
         let found = search(&root, ".", &serde_json::json!({"text": "outside"}), &budget).unwrap();
-        assert!(!found.contains("secret") && found.contains("nothing found"), "{found}");
+        assert!(
+            !found.contains("secret") && found.contains("nothing found"),
+            "{found}"
+        );
         assert!(read(&root, "link.txt", &serde_json::json!({}), &budget).is_err());
         assert!(read(&root, "escape/secret.txt", &serde_json::json!({}), &budget).is_err());
         assert!(stat(&root, "escape").is_err());
@@ -1673,10 +1881,14 @@ mod tests {
         if made {
             let out = list(&root, ".", &serde_json::json!({"recursive": true}), &budget).unwrap();
             assert!(!out.contains("secret") && !out.contains("jn"), "{out}");
-            let found = search(&root, ".", &serde_json::json!({"text": "outside"}), &budget).unwrap();
+            let found =
+                search(&root, ".", &serde_json::json!({"text": "outside"}), &budget).unwrap();
             assert!(found.contains("nothing found"), "{found}");
             assert_eq!(folder_stats(&root, &budget).files, 1);
-            let _ = std::process::Command::new("cmd").args(["/C", "rmdir"]).arg(root.join("jn")).output();
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "rmdir"])
+                .arg(root.join("jn"))
+                .output();
         }
         // Alternate data streams, reserved names and a different-case path.
         assert!(read(&root, "ok.txt:stream", &serde_json::json!({}), &budget).is_err());
@@ -1685,10 +1897,19 @@ mod tests {
         assert!(list(&root, "..", &serde_json::json!({}), &budget).is_err());
         // Hidden attribute hides a file without a dot name.
         std::fs::write(root.join("quiet.txt"), "q").unwrap();
-        let _ = std::process::Command::new("attrib").arg("+H").arg(root.join("quiet.txt")).output();
+        let _ = std::process::Command::new("attrib")
+            .arg("+H")
+            .arg(root.join("quiet.txt"))
+            .output();
         let out = list(&root, ".", &serde_json::json!({}), &budget).unwrap();
         assert!(!out.contains("quiet.txt"), "{out}");
-        let shown = list(&root, ".", &serde_json::json!({"include_hidden": true}), &budget).unwrap();
+        let shown = list(
+            &root,
+            ".",
+            &serde_json::json!({"include_hidden": true}),
+            &budget,
+        )
+        .unwrap();
         assert!(shown.contains("quiet.txt"), "{shown}");
         std::fs::remove_dir_all(&base).ok();
     }

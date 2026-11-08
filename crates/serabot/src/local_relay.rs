@@ -1001,19 +1001,26 @@ mod tests {
         relay.complete(
             "u1",
             &request.id,
-            RelayResult { ok: true, text: Some("Search in .: 0 match(es)".into()), error: None },
+            RelayResult {
+                ok: true,
+                text: Some("Search in .: 0 match(es)".into()),
+                error: None,
+            },
         );
         let output = caller.await.unwrap().unwrap();
         assert!(output.content.starts_with(UNTRUSTED_BANNER) && output.content.contains("0 match"));
         // Traversal never reaches the queue.
-        for (name, path) in [("local_read", "../x"), ("local_stat", "/etc"), ("local_list", "a/../../b")] {
+        for (name, path) in [
+            ("local_read", "../x"),
+            ("local_stat", "/etc"),
+            ("local_list", "a/../../b"),
+        ] {
             let tool = LocalQueryTool::new(relay.clone(), name);
-            let args = if name == "local_list" {
-                json!({"root": "docs", "path": path})
-            } else {
-                json!({"root": "docs", "path": path})
-            };
-            assert!(tool.execute(args, &ctx("u1")).await.is_err(), "{name} {path}");
+            let args = json!({"root": "docs", "path": path});
+            assert!(
+                tool.execute(args, &ctx("u1")).await.is_err(),
+                "{name} {path}"
+            );
         }
         // Offline and unknown roots fail with the clear messages.
         let tool = LocalQueryTool::new(relay, "local_stat");
@@ -1021,5 +1028,9 @@ mod tests {
             .execute(json!({"root": "docs", "path": "a"}), &ctx("u2"))
             .await
             .unwrap_err();
-        assert!(offline.to_string().contains("Your PC app is closed"), "{offline}");
-    }}
+        assert!(
+            offline.to_string().contains("Your PC app is closed"),
+            "{offline}"
+        );
+    }
+}

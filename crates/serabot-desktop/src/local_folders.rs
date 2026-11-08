@@ -56,6 +56,23 @@ pub struct LocalFolder {
     pub mode: FolderMode,
 }
 
+/// Settings screen: where a folder's lazy size count stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FolderStatus {
+    Counting,
+    Done(crate::local_fs::FolderStats),
+}
+
+impl FolderStatus {
+    /// "Counting\u{2026}" or "1,234 files, 56 folders, 2.3 GiB".
+    pub fn label(&self) -> String {
+        match self {
+            Self::Counting => "Counting\u{2026}".into(),
+            Self::Done(stats) => stats.label(),
+        }
+    }
+}
+
 /// What the server receives with each poll: no path.
 #[derive(Serialize)]
 struct RootView<'a> {
