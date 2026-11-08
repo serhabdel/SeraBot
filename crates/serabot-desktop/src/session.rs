@@ -1944,7 +1944,14 @@ impl Session {
             .listed_bots
             .iter()
             .find(|bot| bot.id == id)
-            .and_then(|bot| bot.display_name.clone())
+            // The server already falls back to the title; this covers an
+            // older or sparse reply before the id is humanized.
+            .and_then(|bot| {
+                bot.display_name
+                    .clone()
+                    .filter(|name| !name.trim().is_empty())
+                    .or_else(|| bot.title.clone())
+            })
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| humanize_label(id))
     }
@@ -3159,6 +3166,16 @@ impl Session {
                         }
                         OperationKind::ListBots => {
                             self.continue_after_bots();
+                        }
+                        // The sheet reads the fresh catalog, then the bot list
+                        // follows so a bot just added reaches the rail and picker.
+                        OperationKind::BotCatalog | OperationKind::BotInstall => {
+                            let next = if completion.kind == OperationKind::BotInstall {
+                                Operation::BotCatalog
+                            } else {
+                                Operation::ListBots
+                            };
+                            self.schedule(next, Duration::ZERO);
                         }
                         OperationKind::Avatar => {
                             self.avatar_op = None;

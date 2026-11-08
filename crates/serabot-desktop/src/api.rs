@@ -820,6 +820,21 @@ pub struct BotSummary {
     pub require_approval: Vec<String>,
 }
 
+/// One shipped template on "Meet your team" (`GET /v1/bots/catalog`).
+/// `installed` says whether the owner already has that bot.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ShippedBot {
+    pub id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub role: String,
+    pub installed: bool,
+    #[serde(default)]
+    pub avatar_version: Option<String>,
+}
+
 /// Full bot record from `GET /v1/bots/{id}`: profile, routing, instructions
 /// and counters. Nullable fields and arrays default so an older server that
 /// omits them still parses.
@@ -2769,6 +2784,65 @@ impl ApiClient {
             }
         }
         Ok(response.bots)
+    }
+
+    /// Every shipped template with whether the owner has it: `GET /v1/bots/catalog`.
+    pub fn bot_catalog(&self) -> Result<Vec<ShippedBot>, ApiError> {
+        #[derive(Deserialize)]
+        struct CatalogEnvelope {
+            bots: Vec<ShippedBot>,
+        }
+        let response: CatalogEnvelope = self.get(&["v1", "bots", "catalog"], &[])?;
+        if response.bots.len() > MAX_BOT_LIST {
+            return Err(ApiError::InvalidResponse);
+        }
+        let mut seen = HashSet::with_capacity(response.bots.len());
+        for bot in &response.bots {
+            if !valid_speaker(&bot.id) || !seen.insert(bot.id.as_str()) {
+                return Err(ApiError::InvalidResponse);
+            }
+            if !valid_speaker(&bot.role)
+                || bot.title.as_deref().is_some_and(|title| {
+                    title.chars().count() > 64 || title.chars().any(char::is_control)
+                })
+                || bot.description.as_deref().is_some_and(|text| {
+                    text.chars().count() > 2_000
+                        || text
+                            .chars()
+                            .any(|c| c != '\n' && c != '\r' && c != '\t' && c.is_control())
+                })
+            {
+                return Err(ApiError::InvalidResponse);
+            }
+        }
+        Ok(response.bots)
+    }
+
+    /// `POST /v1/bots/catalog/{name}/install`: "Add to my team". A write, so an
+    /// unknown outcome is never replayed. A 409 means the owner already has it.
+    pub fn install_shipped_bot(&self, name: &str) -> Result<(), ApiError> {
+        if !valid_speaker(name) {
+            return Err(ApiError::Validation("Bot id is not valid."));
+        }
+        #[derive(Deserialize)]
+        struct InstalledBot {
+            id: String,
+            installed: bool,
+        }
+        #[derive(Deserialize)]
+        struct InstalledEnvelope {
+            bot: InstalledBot,
+        }
+        let response: InstalledEnvelope = self.request::<_, ()>(
+            Method::POST,
+            &["v1", "bots", "catalog", name, "install"],
+            &[],
+            None,
+        )?;
+        if response.bot.id != name || !response.bot.installed {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(())
     }
 
     /// Full record of one bot: `GET /v1/bots/{id}`.
