@@ -25,8 +25,8 @@ or sends something to a third party that cannot be recalled. The list lives in
 
 ## Not destructive (no approval)
 
-- Browser: `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_press`, `browser_screenshot`, `browser_close`. Typing a vault secret into a page whose host is not in the entry's allowed domains still fails closed.
-- Vault: `vault_list`.
+- Browser: `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_press`, `browser_screenshot`, `browser_close`. Typing a vault secret into a page whose host is not in the entry's allowed domains still fails closed. Typing a vault secret always asks for approval bound to the entry name and the page host (see `docs/vault.md`).
+- Vault: `vault_list` and `vault_request_secret` are not destructive; the second one asks the owner for the value in a secure card instead.
 - Memory: `memory_save`, `memory_list`.
 - Research and media: `firecrawl_scrape`, `firecrawl_map`, `firecrawl_search`, `firecrawl_crawl`, `firecrawl_extract`, `tavily_search`, `fetch_url`, `watch_now`, `audio_transcribe`, `audio_understand`, `elevenlabs_list_voices`, `elevenlabs_text_to_speech`, `elevenlabs_sound_effect`, `elevenlabs_transcribe`, `elevenlabs_generate_image`, `elevenlabs_generate_video`.
 - Documents (produce new artifacts): `docx_build`, `docx_import`, `docx_inspect`, `docx_read`, `docx_edit`, `docx_pdf`, `xlsx_build`, `xlsx_import`, `xlsx_inspect`, `xlsx_read`, `xlsx_edit`, `xlsx_analyze`, `timesheet_analyze`, `pptx_import`, `pptx_inspect`, `pptx_edit`, `pptx_pdf`, `pdf_inspect`, `pdf_edit`, `pdf_merge`, `deck_build`, `document_index`, `rag_search`.

@@ -19,11 +19,13 @@ pub(crate) mod testing;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use zeroize::Zeroizing;
 
 use crate::config::Config;
 use crate::error::{Result, SeraError};
 use crate::user_secrets::UserSecrets;
+use crate::vault_providers::Providers;
 
 pub use manager::{BrowserInfo, BrowserManager, Controller, Driver, SecretResolver};
 pub use tools::{BrowserToolDeps, register_browser_tools};
@@ -49,19 +51,27 @@ impl BrowserProvider {
     }
 }
 
-/// Production secret resolver: the acting user's vault, by name and host.
+/// Production secret resolver: the acting user's vault, by name and host. A
+/// reference entry is read through its password manager at fill time.
 pub struct VaultResolver {
     users: Arc<UserSecrets>,
+    providers: Arc<Providers>,
 }
 
 impl VaultResolver {
-    pub fn new(users: Arc<UserSecrets>) -> Self {
-        Self { users }
+    pub fn new(users: Arc<UserSecrets>, providers: Arc<Providers>) -> Self {
+        Self { users, providers }
     }
 }
 
+#[async_trait]
 impl SecretResolver for VaultResolver {
-    fn resolve(
+    fn authorize(&self, user_id: &str, name: &str, field: &str, host: &str) -> Result<()> {
+        let field = crate::vault::VaultField::parse(field)?;
+        crate::vault::authorize_fill(&self.users, user_id, name, host, field).map(|_| ())
+    }
+
+    async fn resolve(
         &self,
         user_id: &str,
         name: &str,
@@ -69,7 +79,15 @@ impl SecretResolver for VaultResolver {
         host: &str,
     ) -> Result<Zeroizing<String>> {
         let field = crate::vault::VaultField::parse(field)?;
-        crate::vault::resolve_field_for_browser(&self.users, user_id, name, host, field)
+        crate::vault_providers::resolve_for_browser(
+            &self.users,
+            &self.providers,
+            user_id,
+            name,
+            host,
+            field,
+        )
+        .await
     }
 }
 
@@ -124,8 +142,8 @@ mod tests {
         assert!(BrowserProvider::parse("lynx").is_err());
     }
 
-    #[test]
-    fn stub_vault_fails_closed_through_the_real_resolver_path() {
+    #[tokio::test]
+    async fn stub_vault_fails_closed_through_the_real_resolver_path() {
         // The vault stub errors; the resolver must surface that, not a value.
         // (Real secret typing is tested with the mocked resolver in tools.rs.)
         let store = crate::store::Store::open(
@@ -135,10 +153,17 @@ mod tests {
         )
         .unwrap();
         let users = Arc::new(UserSecrets::with_master_key(store, [3u8; 32]).unwrap());
-        let resolver = VaultResolver::new(users);
+        let providers = Arc::new(Providers::new(&crate::config::VaultConfig::default()));
+        let resolver = VaultResolver::new(users, providers);
         assert!(
             resolver
                 .resolve("u", "bank", "username", "bank.example")
+                .await
+                .is_err()
+        );
+        assert!(
+            resolver
+                .authorize("u", "bank", "username", "bank.example")
                 .is_err()
         );
     }

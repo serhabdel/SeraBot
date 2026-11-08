@@ -1115,7 +1115,7 @@ const ENTRY: &str = r#"{"name":"portal","kind":"password","username":"me@example
 
 #[test]
 fn vault_routes_validate_and_never_echo_a_value() {
-    use serabot_desktop::{VaultKind, VaultPut};
+    use serabot_desktop::{VaultKind, VaultPut, VaultSource};
     use zeroize::Zeroizing;
     let (client, handle) = server(vec![
         (200, format!(r#"{{"entries":[{ENTRY}]}}"#)),
@@ -1138,6 +1138,8 @@ fn vault_routes_validate_and_never_echo_a_value() {
         value: Zeroizing::new("synthetic-pass".into()),
         domains: vec!["example.test".into()],
         note: Some("  ".into()),
+        source: VaultSource::Local,
+        reference: None,
     };
     assert_eq!(client.vault_put("portal", &put).unwrap().name, "portal");
     client.vault_delete("portal").unwrap();
@@ -1169,6 +1171,7 @@ fn vault_routes_validate_and_never_echo_a_value() {
         body_of(&requests[1]),
         serde_json::json!({
             "kind": "password",
+            "source": "local",
             "username": "me@example.test",
             "value": "synthetic-pass",
             "domains": ["example.test"]
@@ -1188,6 +1191,8 @@ fn vault_writes_are_validated_before_the_network() {
         value: Zeroizing::new(value.into()),
         domains: domains.iter().map(|d| (*d).to_owned()).collect(),
         note: None,
+        source: serabot_desktop::VaultSource::Local,
+        reference: None,
     };
     for (name, input) in [
         ("Bad Name", put("v", &[])),

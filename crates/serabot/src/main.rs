@@ -653,7 +653,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.clone(),
     ))?;
     serabot::tools::register_memory_tools(&mut registry, store.clone())?;
-    serabot::vault::register_vault_tools(&mut registry, users.clone())?;
+    serabot::vault::register_vault_tools(&mut registry, users.clone(), policy.clone())?;
     serabot::cards::register_card_tools(&mut registry, store.clone(), policy.clone())?;
     serabot::tools::register_pdf_tools(
         &mut registry,
@@ -875,11 +875,12 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     let mut browser_manager = None;
     if config.browser.enabled {
         let manager = serabot::browser::build_manager(&config)?;
+        let providers = Arc::new(serabot::vault_providers::Providers::new(&config.vault));
         register_browser_tools(
             &mut registry,
             BrowserToolDeps {
                 manager: manager.clone(),
-                resolver: Arc::new(VaultResolver::new(users.clone())),
+                resolver: Arc::new(VaultResolver::new(users.clone(), providers)),
                 artifacts: Some(artifacts.clone()),
                 store: store.clone(),
             },

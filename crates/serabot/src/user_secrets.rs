@@ -150,6 +150,38 @@ impl UserSecrets {
         self.store.delete_user_credential(user_id, &provider)
     }
 
+    /// Seal a password manager's access token for the acting user. The id is
+    /// one of the vault's own provider ids (`vaultprov:<id>`), so it is never
+    /// reachable through the public credential API.
+    pub(crate) fn set_vault_provider_token(
+        &self,
+        user_id: &str,
+        provider_id: &str,
+        token: &str,
+    ) -> Result<()> {
+        validate_value(token)?;
+        self.seal_and_store(user_id, &vault_provider_token_id(provider_id), token)
+    }
+
+    /// The acting user's access token for a password manager, if one is set.
+    pub(crate) fn vault_provider_token(
+        &self,
+        user_id: &str,
+        provider_id: &str,
+    ) -> Result<Option<SecretString>> {
+        self.get_unchecked(user_id, &vault_provider_token_id(provider_id))
+    }
+
+    /// Delete the acting user's access token for a password manager.
+    pub(crate) fn delete_vault_provider_token(
+        &self,
+        user_id: &str,
+        provider_id: &str,
+    ) -> Result<bool> {
+        self.store
+            .delete_user_credential(user_id, &vault_provider_token_id(provider_id))
+    }
+
     fn seal_and_store(&self, user_id: &str, provider: &str, value: &str) -> Result<()> {
         if self.store.get_user(user_id)?.is_none() {
             return Err(SeraError::NotFound(format!("user {user_id}")));
@@ -254,8 +286,11 @@ impl UserSecrets {
     /// admin grants. Names only — never a value.
     pub fn providers_for(&self, user_id: &str) -> Result<Vec<String>> {
         let mut names = self.store.list_user_credential_providers(user_id)?;
-        // Vault entries are not AI providers; they are listed by the vault.
-        names.retain(|name| !name.starts_with(VAULT_PROVIDER_PREFIX));
+        // Vault entries and password manager tokens are not AI providers.
+        names.retain(|name| {
+            !name.starts_with(VAULT_PROVIDER_PREFIX)
+                && !name.starts_with(VAULT_PROVIDER_TOKEN_PREFIX)
+        });
         for grant in self.store.list_active_grants_for(user_id)? {
             names.push(grant.provider);
         }
@@ -480,6 +515,14 @@ pub(crate) const VAULT_PROVIDER_PREFIX: &str = "vault:";
 pub(crate) fn vault_provider_id(name: &str) -> Result<String> {
     crate::vault::validate_name(name)?;
     Ok(format!("{VAULT_PROVIDER_PREFIX}{name}"))
+}
+
+/// Provider-id prefix under which a password manager's access token is sealed.
+pub(crate) const VAULT_PROVIDER_TOKEN_PREFIX: &str = "vaultprov:";
+
+/// The sealed-credential provider id for a password manager's token.
+fn vault_provider_token_id(provider_id: &str) -> String {
+    format!("{VAULT_PROVIDER_TOKEN_PREFIX}{provider_id}")
 }
 
 /// Provider ids are config keys: letters, digits, `-`, `_`, and `.`.

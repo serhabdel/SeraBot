@@ -66,6 +66,7 @@ const MIGRATION_21: &str = include_str!("../migrations/0021_chat_plans_yolo.sql"
 const MIGRATION_25: &str = include_str!("../migrations/0025_chat_attachments.sql");
 const MIGRATION_26: &str = include_str!("../migrations/0026_memory_v2.sql");
 const MIGRATION_27: &str = include_str!("../migrations/0027_chat_cards.sql");
+const MIGRATION_28: &str = include_str!("../migrations/0028_vault_providers.sql");
 
 /// Fixed admin id written by migration 0008 and mirrored in
 /// `kv['admin_user_id']`. Code resolves the admin through the kv entry (the
@@ -574,6 +575,11 @@ impl Store {
         if version < 27 {
             connection.execute_batch(MIGRATION_27)?;
             connection.pragma_update(None, "user_version", 27)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 28 {
+            connection.execute_batch(MIGRATION_28)?;
+            connection.pragma_update(None, "user_version", 28)?;
         }
         // VACUUM INTO (backups) may renumber rowids; rebuild the external-content
         // FTS index only when its row count no longer matches `memories`.
@@ -4667,7 +4673,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 27);
+        assert_eq!(version, 28);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -4732,7 +4738,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 27);
+        assert_eq!(version, 28);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -4806,7 +4812,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 27);
+        assert_eq!(version, 28);
         let admin = admin(&store);
         let memory = crate::memory::get(&store, &admin, "mem-legacy").unwrap();
         assert_eq!(memory.origin, "explicit");
@@ -4895,7 +4901,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 27);
+        assert_eq!(version, 28);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -5026,7 +5032,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 27);
+        assert_eq!(version, 28);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -5181,7 +5187,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 27);
+        assert_eq!(version, 28);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.

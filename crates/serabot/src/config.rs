@@ -72,6 +72,9 @@ pub struct Config {
     pub skills: SkillsConfig,
     #[serde(default)]
     pub browser: BrowserConfig,
+    /// Password manager CLIs for vault references (see docs/vault.md).
+    #[serde(default)]
+    pub vault: VaultConfig,
     /// Tool approval policy (see docs/approvals.md).
     #[serde(default)]
     pub approvals: ApprovalsConfig,
@@ -122,6 +125,7 @@ impl Default for Config {
             ocr: OcrConfig::default(),
             skills: SkillsConfig::default(),
             browser: BrowserConfig::default(),
+            vault: VaultConfig::default(),
             approvals: ApprovalsConfig::default(),
             connectors: ConnectorsConfig::default(),
             fleet: FleetConfig::default(),
@@ -1261,6 +1265,16 @@ impl Default for FirecrawlConfig {
             crawl_max_wait_secs: default_firecrawl_crawl_max_wait_secs(),
         }
     }
+}
+
+/// `[vault]`: where the password manager CLIs live. Empty means look the
+/// binary up on `PATH` (`op` for 1Password, `pass-cli` for Proton Pass).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VaultConfig {
+    #[serde(default)]
+    pub op_path: String,
+    #[serde(default)]
+    pub pass_cli_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -115,6 +115,53 @@ fn text_output(lease: &Lease, body: String, data: Value) -> ToolOutput {
 }
 
 impl BrowserTool {
+    /// Whether this call types a vault secret.
+    fn types_secret(&self, args: &Value) -> bool {
+        self.kind == Kind::Type && opt_str(args, "secret").is_some()
+    }
+
+    /// The host of the page the bot is on. Reads the session without
+    /// launching one or recording the bot as its driver.
+    async fn page_host(&self, context: &ToolContext) -> Result<String> {
+        let profile = self
+            .deps
+            .store
+            .bot_browser_profile(&context.user_id, &context.bot)?;
+        let lease = self
+            .deps
+            .manager
+            .bot_lease(&context.user_id, profile.as_str(), false, None)
+            .await?;
+        let info = lease.backend().info().await?;
+        host_of(&info.url)
+            .ok_or_else(|| SeraError::Validation("open a page before typing a secret".into()))
+    }
+
+    /// The approval for typing a vault secret into the current page. The
+    /// entry must allow that page's host, and the destination binds the
+    /// entry name and the host: `vault:<name> → <host>`. The gateway
+    /// re-checks the destination before dispatch.
+    async fn secret_details(&self, args: &Value, context: &ToolContext) -> Result<ApprovalDetails> {
+        let reference = truncate_chars(str_arg(args, "ref")?, 16);
+        let secret = str_arg(args, "secret")?;
+        let field = opt_str(args, "field").unwrap_or("password");
+        if !SECRET_FIELDS.contains(&field) {
+            return Err(SeraError::Validation(
+                "field must be password, username or value".into(),
+            ));
+        }
+        let host = self.page_host(context).await?;
+        self.deps
+            .resolver
+            .authorize(&context.user_id, secret, field, &host)?;
+        let name = truncate_chars(secret, 48);
+        Ok(ApprovalDetails {
+            summary: format!("Type vault secret '{name}' ({field}) into {reference} on {host}"),
+            destination: Some(format!("vault:{name} → {host}")),
+            artifact_hash: None,
+        })
+    }
+
     fn name(&self) -> &'static str {
         match self.kind {
             Kind::Navigate => "browser_navigate",
@@ -150,7 +197,7 @@ impl Tool for BrowserTool {
                 true,
             ),
             Kind::Type => (
-                "Type into an element by ref. Give either text, or secret (a vault entry name) with field (password, username or value). The secret value is never shown to you.",
+                "Type into an element by ref. Give either text, or secret (a vault entry name) with field (password, username or value). The secret value is never shown to you. Typing a secret needs the owner's approval for the current page's site.",
                 json!({"type":"object","properties":{
                     "ref":{"type":"string"},
                     "text":{"type":"string","maxLength":MAX_TYPE_CHARS},
@@ -197,6 +244,40 @@ impl Tool for BrowserTool {
         }
     }
 
+    fn requires_approval(&self, args: &Value) -> bool {
+        // Typing a vault secret always needs the owner, even in autonomy mode.
+        self.types_secret(args)
+    }
+
+    async fn approval_details_for(
+        &self,
+        args: &Value,
+        context: &ToolContext,
+    ) -> Result<ApprovalDetails> {
+        if self.types_secret(args) {
+            self.secret_details(args, context).await
+        } else {
+            self.approval_details(args)
+        }
+    }
+
+    async fn live_destination(
+        &self,
+        args: &Value,
+        context: &ToolContext,
+    ) -> Result<Option<String>> {
+        if !self.types_secret(args) {
+            return Ok(None);
+        }
+        Ok(self.secret_details(args, context).await?.destination)
+    }
+
+    async fn auto_approve_allowed(&self, args: &Value, context: &ToolContext) -> bool {
+        // Yolo approves a secret typing only when the page's host is one the
+        // entry names; otherwise the owner decides.
+        !self.types_secret(args) || self.secret_details(args, context).await.is_ok()
+    }
+
     fn approval_details(&self, args: &Value) -> Result<ApprovalDetails> {
         match self.kind {
             Kind::Navigate | Kind::NewTab => {
@@ -240,14 +321,14 @@ impl Tool for BrowserTool {
                                 "field must be password, username or value".into(),
                             ));
                         }
-                        // The page host is only known per user at run time; the
-                        // vault entry's domain list is enforced then, fail closed.
+                        // The page host is known only through the live session, so
+                        // `approval_details_for` supplies the destination.
                         Ok(ApprovalDetails {
                             summary: format!(
                                 "Type vault secret '{}' ({field}) into {reference} on the current page",
                                 truncate_chars(secret, 48)
                             ),
-                            destination: Some(format!("vault:{}", truncate_chars(secret, 48))),
+                            destination: None,
                             artifact_hash: None,
                         })
                     }
@@ -350,7 +431,11 @@ impl Tool for BrowserTool {
                             SeraError::Validation("open a page before typing a secret".into())
                         })?;
                         // Fails closed on unknown name or host outside the entry's domains.
-                        let value = self.deps.resolver.resolve(user, secret, field, &host)?;
+                        let value = self
+                            .deps
+                            .resolver
+                            .resolve(user, secret, field, &host)
+                            .await?;
                         lease.remember_secret(secret, &value);
                         lease
                             .backend()
@@ -737,11 +822,80 @@ mod tests {
             .approval_details(&json!({"ref":"e1","secret":"bank","field":"password"}))
             .unwrap();
         assert!(details.summary.contains("bank"));
-        assert_eq!(details.destination.as_deref(), Some("vault:bank"));
+        // The destination needs the live page host: see `approval_details_for`.
+        assert!(details.destination.is_none());
         let text = tool
             .approval_details(&json!({"ref":"e1","text":"hello"}))
             .unwrap();
         assert!(text.summary.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn typing_a_secret_binds_the_entry_and_the_page_host() {
+        let h = harness();
+        let tool = h.registry.get("browser_type").unwrap();
+        let args = json!({"ref":"e1","secret":"bank","field":"password"});
+        // No page open: nothing to approve.
+        assert!(
+            tool.approval_details_for(&args, &ctx("alice"))
+                .await
+                .is_err()
+        );
+        run(
+            &h,
+            "alice",
+            "browser_navigate",
+            json!({"url": "https://93.184.216.34/"}),
+        )
+        .await
+        .unwrap();
+        // A page outside the entry's sites is refused before any approval is asked.
+        assert!(matches!(
+            tool.approval_details_for(&args, &ctx("alice")).await,
+            Err(SeraError::Forbidden(_))
+        ));
+        let backend = h
+            .manager
+            .bot_lease("alice", "default", false, None)
+            .await
+            .unwrap();
+        backend
+            .backend()
+            .navigate("https://login.bank.example/")
+            .await
+            .unwrap();
+        drop(backend);
+        let details = tool
+            .approval_details_for(&args, &ctx("alice"))
+            .await
+            .unwrap();
+        assert_eq!(
+            details.destination.as_deref(),
+            Some("vault:bank → login.bank.example")
+        );
+        assert!(!details.summary.contains(FAKE_SECRET));
+        assert_eq!(
+            tool.live_destination(&args, &ctx("alice")).await.unwrap(),
+            details.destination
+        );
+        // Typing a secret always asks; yolo may approve it only on a matching page.
+        assert!(tool.requires_approval(&args));
+        assert!(!tool.requires_approval(&json!({"ref":"e1","text":"hi"})));
+        assert!(tool.auto_approve_allowed(&args, &ctx("alice")).await);
+        assert!(
+            tool.live_destination(&json!({"ref":"e1","text":"hi"}), &ctx("alice"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // Another user has no session and no approval to ask for.
+        assert!(tool.approval_details_for(&args, &ctx("bob")).await.is_err());
+        // Unknown entries are refused.
+        assert!(
+            tool.approval_details_for(&json!({"ref":"e1","secret":"nope"}), &ctx("alice"))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

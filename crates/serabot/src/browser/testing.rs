@@ -292,8 +292,27 @@ pub(crate) struct FakeResolver {
     pub requests: std::sync::Mutex<Vec<(String, String, String, String)>>,
 }
 
+impl FakeResolver {
+    fn check(&self, name: &str, host: &str) -> Result<()> {
+        if name != "bank" {
+            return Err(SeraError::NotFound("no such vault entry".into()));
+        }
+        if !(host == "bank.example" || host.ends_with(".bank.example")) {
+            return Err(SeraError::Forbidden(
+                "this vault entry is not allowed on this host".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl SecretResolver for FakeResolver {
-    fn resolve(
+    fn authorize(&self, _user_id: &str, name: &str, _field: &str, host: &str) -> Result<()> {
+        self.check(name, host)
+    }
+
+    async fn resolve(
         &self,
         user_id: &str,
         name: &str,
@@ -306,14 +325,7 @@ impl SecretResolver for FakeResolver {
             field.into(),
             host.into(),
         ));
-        if name != "bank" {
-            return Err(SeraError::NotFound("no such vault entry".into()));
-        }
-        if !(host == "bank.example" || host.ends_with(".bank.example")) {
-            return Err(SeraError::Forbidden(
-                "this vault entry is not allowed on this host".into(),
-            ));
-        }
+        self.check(name, host)?;
         Ok(Zeroizing::new(FAKE_SECRET.to_owned()))
     }
 }

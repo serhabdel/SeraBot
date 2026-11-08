@@ -1195,6 +1195,7 @@ impl Session {
         self.panel.set_page_open(section == Section::Browser);
         if section == Section::Vault {
             self.panel.ask_vault_list();
+            self.panel.ask_password_managers();
         }
         if section == Section::Usage {
             self.load_usage_days(self.usage_days);

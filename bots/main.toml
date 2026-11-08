@@ -69,6 +69,7 @@ tools = [
   "elevenlabs_generate_image",
   "elevenlabs_generate_video",
   "vault_list",
+  "vault_request_secret",
   "browser_navigate",
   "browser_snapshot",
   "browser_click",
