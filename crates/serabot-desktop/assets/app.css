@@ -5022,6 +5022,40 @@ html[data-reduce-transparency="true"] .chat-header {
   gap: 6px;
 }
 
+/* A collapsed "Thinking" step: the model's reasoning text, plain. */
+.step-thinking {
+  flex: 1;
+  min-width: 0;
+}
+
+.step-thinking > summary {
+  cursor: pointer;
+  list-style: none;
+  color: var(--label-2);
+}
+
+.step-thinking > summary::-webkit-details-marker {
+  display: none;
+}
+
+.step-thinking-text {
+  margin: 6px 0 0;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+  font-size: 12px;
+  color: var(--label-2);
+}
+
+/* Thinking-level picker next to the model chip. */
+.thinking-select {
+  width: auto;
+  max-width: 170px;
+  font-size: 12px;
+}
+
 /* Model chip inside the composer. */
 .model-bar.compact {
   flex-wrap: nowrap;

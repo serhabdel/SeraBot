@@ -167,6 +167,9 @@ pub struct BotSettingsUpdate {
     pub model: Option<Option<ModelPick>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub browser_profile: Option<Option<String>>,
+    /// A thinking level, or Some(None) to use the model's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<Option<String>>,
     /// The bot's tool ids (the capability switches).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
@@ -528,6 +531,7 @@ mod tests {
                 model: "gpt-x".into(),
             })),
             browser_profile: Some(Some("work".into())),
+            thinking: Some(Some("high".into())),
             enabled: None,
             tools: Some(vec!["vault_list".into()]),
         };

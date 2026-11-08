@@ -259,6 +259,7 @@ mod tests {
                 name: Some("Mistral Large 3".into()),
                 context_length: Some(131_072),
                 tags: vec!["vision".into(), "tools".into(), "mystery".into()],
+                thinking: Vec::new(),
             },
             CatalogEntry {
                 provider: "default".into(),
@@ -267,6 +268,7 @@ mod tests {
                 name: None,
                 context_length: None,
                 tags: Vec::new(),
+                thinking: Vec::new(),
             },
         ];
         let rows = picker_rows(&entries, |model| model.replace('-', " "));
