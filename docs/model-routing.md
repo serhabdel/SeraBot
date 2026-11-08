@@ -2,8 +2,9 @@
 
 SeraBot talks to OpenAI-compatible chat-completion endpoints. Routing is
 configuration-driven. Builtin kinds supply an OpenAI-compatible base. A live
-model catalog is optional, cached in process memory, and intersected with the
-allowlist. There is no automatic cross-provider fallback and no client-supplied
+model catalog is optional and cached in process memory per user and provider. When it
+loads, it is the list offered and accepted; the allowlist is the fallback. See
+[providers.md](providers.md). There is no automatic cross-provider fallback and no client-supplied
 endpoint.
 
 ## Providers and allowed models
@@ -137,7 +138,7 @@ Model content is not written to the audit log.
 ## Operational notes
 
 - With `catalog_fetch = false`, advertised models are exactly the configured allowlist.
-- With `catalog_fetch = true` and `data_egress_approved = true`, SeraBot caches the provider's model list for `catalog_ttl_secs` (1..=86400, default 1800) and advertises only the allowlist intersection. A failed, malformed, or stale refresh closes the cache: no models are advertised and chat is refused. Unapproved providers are not contacted. The previous list is not kept across a failed refresh.
+- With `catalog_fetch = true` and `data_egress_approved = true`, SeraBot caches the provider's model list for `catalog_ttl_secs` (1..=86400, default 1800) per signed-in user, and advertises and accepts that live chat-capable list. A failed, malformed, or rejected refresh drops that user's cached list and the configured allowlist is used instead; the list is never reused after a failed refresh. Unapproved providers are not contacted.
 - Catalog responses and errors never include endpoints, response bodies, or credentials. Audit event `model.catalog_refreshed` records provider, verified, and model_count only.
 - Official catalogs are host-pinned and parsed strictly (`object` must be `list`, ids come from `data[].id`). A non-chat Mistral card (`capabilities.completion_chat = false`) is ignored. Loopback bases are the fixture exception and append `/models` to that base.
 
@@ -175,7 +176,7 @@ Model content is not written to the audit log.
 
 Keep the in-process allowlist `ModelRouter`. Do not adopt LiteLLM, RouteLLM, or OpenRouter auto-routing.
 
-**Current design.** Each profile lists the models it may call. Auto mode walks a fixed order: the bot `model` override, then `llm.bot_models`, then `[llm].model` on `default`, then the first egress-approved pair in sorted provider id and model id order. Orchestration resolves `routine` and `synthesis` with `ModelRouter::select_class`, which stays on that allowlist and falls back to the same order when the class is missing, empty, or unapproved. A turn pins the provider, model, and configuration fingerprint (endpoint, secret reference, and consent) and re-checks the pin on every call. Live catalogs fail closed: a failed, malformed, or stale refresh advertises no models and refuses chat.
+**Current design.** Each profile lists the models it may call. Auto mode walks a fixed order: the bot `model` override, then `llm.bot_models`, then `[llm].model` on `default`, then the first egress-approved pair in sorted provider id and model id order. Orchestration resolves `routine` and `synthesis` with `ModelRouter::select_class`, which stays on that allowlist and falls back to the same order when the class is missing, empty, or unapproved. A turn pins the provider, model, and configuration fingerprint (endpoint, secret reference, and consent) and re-checks the pin on every call. Live catalogs are authoritative while they load; a failed, malformed, or rejected refresh falls back to the configured allowlist (see [providers.md](providers.md)).
 
 **LiteLLM.** Rejected. It adds a Python process, and its fallback chains can change provider or model after the turn is pinned.
 

@@ -41,6 +41,7 @@ pub mod model_router;
 pub mod ocr;
 pub mod onboarding;
 pub mod onedrive;
+pub mod openrouter;
 pub mod orchestration;
 pub mod pdf_ops;
 pub mod personal;

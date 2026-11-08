@@ -22,6 +22,7 @@ pub mod oauth;
 pub mod panel;
 pub mod pc_stats;
 pub mod provider_presets;
+pub mod provider_view;
 pub mod session;
 pub mod signin;
 pub mod state;

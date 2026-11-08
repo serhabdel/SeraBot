@@ -18,16 +18,21 @@ Each PNG is the vendor's own icon, fetched from the vendor's official domain (or
 | `google-calendar.png` | https://www.gstatic.com/images/branding/product/2x/calendar_2020q4_48dp.png |
 | `google-drive.png` | https://www.gstatic.com/images/branding/product/2x/drive_2020q4_48dp.png |
 | `google-sheets.png` | https://www.gstatic.com/images/branding/product/2x/sheets_2020q4_48dp.png |
+| `gemini.png` | https://www.gstatic.com/lamda/images/gemini_sparkle_4g_512_lt_f94943af3be039176192d.png (Gemini sparkle served by Google) |
 | `groq.png` | https://groq.com/apple-touch-icon.png |
+| `huggingface.png` | https://huggingface.co/favicon.ico |
 | `minimax.png` | https://www.minimaxi.com/favicon.ico |
 | `mistral.png` | https://mistral.ai/favicon.ico |
 | `moonshot.png` | https://www.kimi.com/favicon.ico |
+| `nebius.png` | https://nebius.com/apple-touch-icon.png |
 | `notion.png` | https://www.notion.so/images/logo-ios.png |
 | `ollama.png` | https://ollama.com/public/apple-touch-icon.png |
 | `onedrive.png` | https://onedrive.live.com/favicon.ico |
 | `openai.png` | https://cdn.oaistatic.com/assets/favicon-180x180-od45eci6.webp (icon linked from openai.com / chatgpt.com) |
 | `openrouter.png` | https://openrouter.ai/apple-touch-icon.png |
 | `outlook.png` | https://outlook.live.com/owa/favicon.ico |
+| `perplexity.png` | https://www.perplexity.ai/apple-touch-icon.png |
+| `sambanova.png` | https://sambanova.ai/favicon.ico |
 | `tavily.png` | https://www.tavily.com/apple-icon.png |
 | `together.png` | https://cdn.prod.website-files.com/69654e88dce9154b5f1206dd/69a59cff65ed0f267dd2fbe8_touchicon.png (touch icon linked from together.ai) |
 | `xai.png` | https://x.ai/apple-icon.png |

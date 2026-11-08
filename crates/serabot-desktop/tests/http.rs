@@ -1752,3 +1752,50 @@ fn a_dropped_write_is_never_repeated() {
     let _ = TcpStream::connect(url.trim_start_matches("http://"));
     let _ = handle.join();
 }
+
+#[test]
+fn provider_key_test_default_and_sign_in_calls_use_the_account_routes() {
+    let (client, handle) =
+        server(vec![
+        (200, r#"{"id":"mistral","configured":true}"#.into()),
+        (
+            200,
+            r#"{"id":"mistral","ok":true,"status":"ok","model_source":"live","model_count":12}"#
+                .into(),
+        ),
+        (200, r#"{"selection":{"provider":"mistral","model":"m"}}"#.into()),
+        (200, r#"{"selection":{"provider":"mistral","model":"m"}}"#.into()),
+        (
+            200,
+            r#"{"flow":"pkce","url":"https://openrouter.ai/auth?callback_url=x"}"#.into(),
+        ),
+        (200, r#"{"id":"openrouter","configured":true}"#.into()),
+    ]);
+    client
+        .set_provider_key("mistral", "synthetic-provider-key")
+        .unwrap();
+    let tested = client.test_provider("mistral").unwrap();
+    assert!(tested.ok);
+    assert_eq!((tested.status.as_str(), tested.model_count), ("ok", 12));
+    client.set_default_route("mistral", "m").unwrap();
+    assert_eq!(client.default_route().unwrap().unwrap().model, "m");
+    let start = client
+        .provider_oauth_start("openrouter", &serde_json::json!({"challenge": "c"}))
+        .unwrap();
+    assert!(start.url.starts_with("https://openrouter.ai/auth"));
+    client
+        .provider_oauth_complete("openrouter", "code", "verifier", "http://localhost:1/cb")
+        .unwrap();
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("PUT /v1/providers/mistral/key "));
+    assert!(requests[0].contains("synthetic-provider-key"));
+    assert!(requests[1].starts_with("POST /v1/providers/mistral/test "));
+    assert!(requests[2].starts_with("PUT /v1/providers/default-route "));
+    assert!(requests[3].starts_with("GET /v1/providers/default-route "));
+    assert!(requests[4].starts_with("POST /v1/providers/openrouter/oauth/start "));
+    assert!(requests[5].starts_with("POST /v1/providers/openrouter/oauth/complete "));
+    // Bad ids never reach the network.
+    let (client, _handle) = server(Vec::new());
+    assert!(client.test_provider("bad/id").is_err());
+    assert!(client.set_provider_key("bad id", "k").is_err());
+}

@@ -328,6 +328,16 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/vault/{name}", put(put_vault).delete(delete_vault))
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/{id}/key", put(set_provider_key))
+        .route("/v1/providers/{id}/test", post(test_provider_endpoint))
+        .route("/v1/providers/{id}/oauth/start", post(provider_oauth_start))
+        .route(
+            "/v1/providers/{id}/oauth/complete",
+            post(provider_oauth_complete),
+        )
+        .route(
+            "/v1/providers/default-route",
+            get(get_default_route).put(set_default_route),
+        )
         .route("/v1/providers/{id}", delete(delete_provider_credential))
         .route("/v1/admin/grants", get(list_grants).post(grant_provider))
         .route(

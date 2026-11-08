@@ -51,6 +51,8 @@ pub struct State {
     pub connectors_loaded: bool,
     /// Latest "Test" result per connector id; cleared on disconnect.
     pub connector_tests: std::collections::BTreeMap<String, ConnectorTestResult>,
+    /// Latest provider Test result per provider id.
+    pub provider_tests: std::collections::BTreeMap<String, crate::api::ProviderTest>,
     /// Provider id and device code of the last finished sign-in step.
     pub oauth_result: Option<(String, Option<String>)>,
     /// Team of the open room conversation. Conversation-scoped: it is cleared
@@ -137,6 +139,7 @@ impl Default for State {
             connectors: Vec::new(),
             connectors_loaded: false,
             connector_tests: std::collections::BTreeMap::new(),
+            provider_tests: std::collections::BTreeMap::new(),
             oauth_result: None,
             team: None,
             team_loaded: false,
@@ -207,6 +210,7 @@ impl State {
         let connectors = self.connectors.clone();
         let connectors_loaded = self.connectors_loaded;
         let connector_tests = self.connector_tests.clone();
+        let provider_tests = self.provider_tests.clone();
         *self = Self {
             scope: Scope {
                 epoch,
@@ -246,6 +250,7 @@ impl State {
             connectors,
             connectors_loaded,
             connector_tests,
+            provider_tests,
             ..Self::default()
         };
     }
@@ -277,6 +282,7 @@ impl State {
         self.connectors.clear();
         self.connectors_loaded = false;
         self.connector_tests.clear();
+        self.provider_tests.clear();
     }
 
     pub fn can_send(&self) -> bool {
@@ -469,7 +475,14 @@ impl State {
             Reply::Voice(settings) => {
                 self.voice = Some(settings);
             }
-            Reply::AdminSaved | Reply::BotSettingsSaved | Reply::AdminRestarted => {}
+            Reply::AdminSaved
+            | Reply::BotSettingsSaved
+            | Reply::AdminRestarted
+            | Reply::ProviderKeySaved
+            | Reply::DefaultRouteSaved => {}
+            Reply::ProviderTested { id, result } => {
+                self.provider_tests.insert(id, result);
+            }
             Reply::AvatarImage {
                 target,
                 version,
@@ -908,6 +921,16 @@ mod tests {
                 auth: "api_key".into(),
                 catalog_verified: false,
                 managed: false,
+                status: "ok".into(),
+                model_source: "live".into(),
+                model_count: 1,
+                credential: crate::api::CredentialState {
+                    configured: true,
+                    own: true,
+                    granted: false,
+                },
+                is_default: false,
+                default_model: None,
                 secrets: std::collections::BTreeMap::from([(
                     "api_key".into(),
                     SecretStatus {

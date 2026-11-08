@@ -60,6 +60,12 @@ pub enum OperationKind {
     FetchArtifact,
     Transcribe,
     AdminWrite,
+    /// Save the account's own key for a provider.
+    ProviderKey,
+    /// Ask a provider for its live model list.
+    ProviderTest,
+    /// Choose the account's default provider and model.
+    DefaultRoute,
     ConnectorTest,
     OAuthSignIn,
     BotSettingsWrite,
@@ -190,6 +196,20 @@ pub enum Operation {
         bytes: Vec<u8>,
     },
     AdminSaveProvider(NewProvider),
+    /// PUT /v1/providers/{id}/key: the account's own API key.
+    SaveProviderKey {
+        id: String,
+        key: Zeroizing<String>,
+    },
+    /// POST /v1/providers/{id}/test.
+    TestProvider {
+        id: String,
+    },
+    /// PUT /v1/providers/default-route.
+    SetDefaultRoute {
+        provider: String,
+        model: String,
+    },
     AdminRemoveProvider(String),
     AdminSetConnector {
         id: String,
@@ -327,6 +347,9 @@ impl Operation {
             | Self::AdminRemoveProvider(_)
             | Self::AdminSetConnector { .. }
             | Self::AdminSetAudio(_) => OperationKind::AdminWrite,
+            Self::SaveProviderKey { .. } => OperationKind::ProviderKey,
+            Self::TestProvider { .. } => OperationKind::ProviderTest,
+            Self::SetDefaultRoute { .. } => OperationKind::DefaultRoute,
             Self::VoiceSettings => OperationKind::Health,
             Self::AdminSetVoice(_) => OperationKind::AdminWrite,
             Self::TestConnector { .. } => OperationKind::ConnectorTest,
@@ -399,6 +422,12 @@ pub enum Reply {
     /// Voice/OCR readiness from `GET /v1/settings/voice`.
     Voice(VoiceSettings),
     AdminSaved,
+    ProviderKeySaved,
+    DefaultRouteSaved,
+    ProviderTested {
+        id: String,
+        result: crate::api::ProviderTest,
+    },
     ConnectorTested(ConnectorTestResult),
     /// Sign-in finished (PKCE) or started (device, with the code to enter).
     OAuthSignedIn {
@@ -518,6 +547,30 @@ fn oauth_sign_in(client: &ApiClient, id: &str, kind: &str) -> Result<Reply, ApiE
     let (listener, port) = oauth::bind_loopback()
         .map_err(|_| ApiError::Validation("Could not listen on 127.0.0.1 for the redirect."))?;
     let pkce = oauth::new_pkce();
+    if kind == "openrouter" {
+        // OpenRouter documents localhost callbacks. The key is exchanged by
+        // the server and stored under this account; it never comes back here.
+        let redirect = oauth::redirect_uri(port).replace("127.0.0.1", "localhost");
+        let start = client.provider_oauth_start(
+            id,
+            &serde_json::json!({
+                "challenge": pkce.challenge,
+                "state": pkce.state,
+                "redirect_uri": redirect,
+            }),
+        )?;
+        webbrowser::open(&start.url)
+            .map_err(|_| ApiError::Validation("Could not open the browser for sign-in."))?;
+        let code =
+            oauth::wait_for_callback(&listener, &pkce.state, std::time::Duration::from_secs(180))
+                .map_err(|error| ApiError::Rejected(error.to_string()))?;
+        drop(listener);
+        client.provider_oauth_complete(id, &code, &pkce.verifier, &redirect)?;
+        return Ok(Reply::OAuthSignedIn {
+            id: id.to_owned(),
+            device_code: None,
+        });
+    }
     let redirect = oauth::redirect_uri(port);
     let start = client.admin_oauth_start(
         id,
@@ -713,7 +766,21 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
             .delete_memory(id)
             .map(|_| Reply::DeletedMemory(id.clone())),
         Operation::MemoryStats => client.memory_stats().map(Reply::MemoryStats),
-        Operation::Providers => client.providers().map(Reply::Providers),
+        Operation::Providers => client.providers().map(|mut providers| {
+            // The account's own default route marks one card with a star;
+            // without one, the server default is the starred provider.
+            let chosen = client.default_route().ok().flatten();
+            for provider in &mut providers {
+                provider.is_default = match &chosen {
+                    Some(route) => provider.id == route.provider,
+                    None => provider.id == "default",
+                };
+                if let Some(route) = chosen.as_ref().filter(|_| provider.is_default) {
+                    provider.default_model = Some(route.model.clone());
+                }
+            }
+            Reply::Providers(providers)
+        }),
         Operation::Connectors => client.connectors().map(Reply::Connectors),
         Operation::GetTeam => client.get_team(conversation).map(Reply::Team),
         Operation::SetTeam {
@@ -749,6 +816,20 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::AdminRemoveProvider(id) => {
             client.admin_remove_provider(id).map(|_| Reply::AdminSaved)
         }
+        Operation::SaveProviderKey { id, key } => client
+            .set_provider_key(id, key)
+            .map(|()| Reply::ProviderKeySaved),
+        Operation::TestProvider { id } => {
+            client
+                .test_provider(id)
+                .map(|result| Reply::ProviderTested {
+                    id: id.clone(),
+                    result,
+                })
+        }
+        Operation::SetDefaultRoute { provider, model } => client
+            .set_default_route(provider, model)
+            .map(|()| Reply::DefaultRouteSaved),
         Operation::AdminSetConnector { id, update } => client
             .admin_set_connector(id, update)
             .map(|_| Reply::AdminSaved),

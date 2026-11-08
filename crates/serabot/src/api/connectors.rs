@@ -63,6 +63,9 @@ pub(super) async fn list_providers(
                 "data_egress_approved": provider.data_egress_approved,
                 "catalog_fetch": provider.catalog_fetch,
                 "catalog_verified": provider.catalog_verified,
+                "model_source": provider.model_source,
+                "status": provider.status,
+                "model_count": provider.models.len(),
                 "managed": managed,
                 "secrets": secrets,
                 "credential": credential_view(&state, &user.id, &provider.id)?,
@@ -117,6 +120,9 @@ pub(super) async fn list_providers(
                     "data_egress_approved": profile.data_egress_approved,
                     "catalog_fetch": profile.catalog_fetch,
                     "catalog_verified": false,
+                    "model_source": "fallback",
+                    "status": "unchecked",
+                    "model_count": profile.models.len(),
                     "managed": true,
                     "secrets": secrets,
                     "credential": credential_view(&state, &user.id, &id)?,
@@ -309,6 +315,148 @@ pub(super) fn provider_profile(config: &Config, id: &str) -> Result<ProviderConf
         .ok_or_else(|| SeraError::NotFound(format!("provider {id}")))
 }
 
+/// Ask one provider for its live model list with the acting user's own key.
+///
+/// The reply says how it went in plain terms and never carries a key, a
+/// response body or a provider error text.
+pub(super) async fn test_provider_endpoint(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    validate_provider(&id)?;
+    let report = state.runtime.test_provider(&user.id, &id).await?;
+    let catalog = state.runtime.model_catalog(&user.id)?;
+    let view = catalog.iter().find(|provider| provider.id == id);
+    Ok(Json(json!({
+        "id": id,
+        "ok": report.verified,
+        "status": view.map(|provider| provider.status).unwrap_or("unchecked"),
+        "model_source": view.map(|provider| provider.model_source).unwrap_or("fallback"),
+        "model_count": report.model_count,
+    })))
+}
+
+/// The account's own default route, when it has chosen one.
+pub(super) async fn get_default_route(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    Ok(Json(
+        json!({"selection": state.runtime.default_route(&user.id)?}),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DefaultRouteRequest {
+    provider: String,
+    model: String,
+}
+
+/// Make one provider and model the account's default for new conversations.
+pub(super) async fn set_default_route(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Json(request): Json<DefaultRouteRequest>,
+) -> Result<Json<Value>> {
+    validate_provider(&request.provider)?;
+    state.runtime.refresh_model_catalogs(&user.id).await?;
+    let selection = state.runtime.set_default_route(
+        &user.id,
+        ModelSelection {
+            provider: request.provider,
+            model: request.model,
+        },
+    )?;
+    Ok(Json(json!({"selection": selection})))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProviderOauthStart {
+    challenge: String,
+    state: String,
+    redirect_uri: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ProviderOauthComplete {
+    code: String,
+    verifier: String,
+    /// Sent by the desktop for symmetry with other flows; the exchange does
+    /// not use it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    redirect_uri: String,
+}
+
+/// Providers that offer a documented browser sign-in for a user. Today that
+/// is OpenRouter only; every other provider takes an API key.
+fn user_sign_in_kind(config: &Config, id: &str) -> Result<()> {
+    let profile = provider_profile(config, id)?;
+    if crate::providers::canonical_kind(&profile.kind)? == "openrouter" {
+        Ok(())
+    } else {
+        Err(SeraError::Validation(
+            "this provider has no sign-in; add its API key".into(),
+        ))
+    }
+}
+
+/// Begin "Sign in with OpenRouter": returns the authorization page for the
+/// desktop to open. The code verifier stays on the desktop.
+pub(super) async fn provider_oauth_start(
+    State(state): State<Arc<ApiState>>,
+    Extension(_user): Extension<ActingUser>,
+    Path(id): Path<String>,
+    Json(request): Json<ProviderOauthStart>,
+) -> Result<Json<Value>> {
+    user_sign_in_kind(&state.config, &id)?;
+    let url = crate::openrouter::authorize_url(
+        &request.redirect_uri,
+        &request.challenge,
+        &request.state,
+    )?;
+    Ok(Json(json!({"flow": "pkce", "url": url})))
+}
+
+/// Finish the sign-in: exchange the one-time code for the user's own
+/// OpenRouter key and store it sealed under their account. The key is never
+/// returned.
+pub(super) async fn provider_oauth_complete(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+    Json(request): Json<ProviderOauthComplete>,
+) -> Result<Json<Value>> {
+    user_sign_in_kind(&state.config, &id)?;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| SeraError::External("sign-in could not start".into()))?;
+    let key = crate::openrouter::exchange_code(
+        &http,
+        crate::openrouter::KEYS_URL,
+        &request.code,
+        &request.verifier,
+    )
+    .await?;
+    let credential = ProviderCredential {
+        api_key: key,
+        refresh_token: String::new(),
+    };
+    state.users.set(&user.id, &id, &credential.encode()?)?;
+    state.runtime.invalidate_model_credentials(Some(&user.id));
+    audit_auth(
+        &state,
+        &user.id,
+        "provider.signed_in",
+        json!({"provider": id, "method": "oauth_pkce"}),
+    )?;
+    Ok(Json(json!({"id": id, "configured": true})))
+}
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SetProviderKeyRequest {

@@ -2918,6 +2918,75 @@ async fn bot_tool_edits_keep_tools_whose_service_is_switched_off() {
 }
 
 #[tokio::test]
+async fn providers_report_status_default_route_and_sign_in_only_where_one_exists() {
+    let (app, _, _) = app();
+    let body = read_json(
+        app.clone()
+            .oneshot(request(&app, "GET", "/v1/providers", true, None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let default = body["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == "default")
+        .expect("default provider")
+        .clone();
+    assert!(default["status"].is_string());
+    assert!(default["model_source"].is_string());
+    assert!(default["model_count"].as_u64().unwrap() >= 1);
+
+    // No default chosen yet.
+    let none = read_json(
+        app.clone()
+            .oneshot(request(
+                &app,
+                "GET",
+                "/v1/providers/default-route",
+                true,
+                None,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(none["selection"].is_null());
+    // A model the provider does not list cannot become the default.
+    let refused = app
+        .clone()
+        .oneshot(request(
+            &app,
+            "PUT",
+            "/v1/providers/default-route",
+            true,
+            Some(json!({"provider": "default", "model": "no-such-model"})),
+        ))
+        .await
+        .unwrap();
+    assert!(refused.status().is_client_error());
+
+    // The default provider is not OpenRouter, so it has no sign-in.
+    let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    let start = app
+        .clone()
+        .oneshot(request(
+            &app,
+            "POST",
+            "/v1/providers/default/oauth/start",
+            true,
+            Some(json!({
+                "challenge": challenge,
+                "state": "state_1",
+                "redirect_uri": "http://localhost:51423/callback"
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(start.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+#[tokio::test]
 async fn provider_credentials_are_per_user_and_grants_are_admin_controlled() {
     let (app, _, store) = app();
     let admin = admin(&store);

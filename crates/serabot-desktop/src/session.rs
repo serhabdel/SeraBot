@@ -310,6 +310,8 @@ pub struct ProviderDraft {
     pub secret_name: String,
     pub api_key: String,
     pub catalog_fetch: bool,
+    /// How the chosen preset signs in: "api_key", "oauth" or "none".
+    pub auth: String,
 }
 
 impl Default for ProviderDraft {
@@ -322,6 +324,7 @@ impl Default for ProviderDraft {
             secret_name: String::new(),
             api_key: String::new(),
             catalog_fetch: true,
+            auth: "api_key".into(),
         }
     }
 }
@@ -579,6 +582,10 @@ pub struct Session {
     pub connector_testing: Option<String>,
     /// Provider whose browser sign-in is waiting for the redirect.
     pub oauth_signing_in: Option<String>,
+    /// Keys typed on provider cards, by provider id. Zeroed once saved.
+    pub provider_key_drafts: BTreeMap<String, String>,
+    /// Provider whose Test is running.
+    pub provider_testing: Option<String>,
     pub admin_error: Option<String>,
     pub restart_pending: bool,
     pub restarting: bool,
@@ -749,6 +756,8 @@ impl Session {
             admin_notice: None,
             connector_testing: None,
             oauth_signing_in: None,
+            provider_key_drafts: BTreeMap::new(),
+            provider_testing: None,
             admin_error: None,
             restart_pending: false,
             restarting: false,
@@ -2828,6 +2837,9 @@ impl Session {
                     if matches!(
                         completion.kind,
                         OperationKind::AdminWrite
+                            | OperationKind::ProviderKey
+                            | OperationKind::ProviderTest
+                            | OperationKind::DefaultRoute
                             | OperationKind::ConnectorTest
                             | OperationKind::OAuthSignIn
                             | OperationKind::AdminRestart
@@ -2845,6 +2857,7 @@ impl Session {
                     self.admin_error = Some(message);
                     self.connector_testing = None;
                     self.oauth_signing_in = None;
+                    self.provider_testing = None;
                     self.scheduled = None;
                 }
                 Err(ApiError::Http(429)) if completion.kind.is_background_poll() => {
@@ -3284,6 +3297,20 @@ impl Session {
                                         "Finish in your browser: enter code {code}. Then press Refresh."
                                     ));
                                 }
+                                Some((id, None))
+                                    if self
+                                        .state
+                                        .providers
+                                        .iter()
+                                        .any(|p| p.id == id && p.kind == "openrouter") =>
+                                {
+                                    // OpenRouter's key is stored for this account
+                                    // right away: nothing to restart.
+                                    self.admin_notice = Some(
+                                        "Signed in with OpenRouter. Your key is saved to your account."
+                                            .into(),
+                                    );
+                                }
                                 Some(_) => {
                                     self.admin_notice = Some(
                                         "Signed in. Restart the server to apply the change.".into(),
@@ -3299,6 +3326,31 @@ impl Session {
                             self.admin_error = None;
                             self.admin_notice = None;
                             self.connector_testing = None;
+                        }
+                        OperationKind::ProviderKey => {
+                            for value in self.provider_key_drafts.values_mut() {
+                                value.zeroize();
+                            }
+                            self.provider_key_drafts.clear();
+                            self.admin_error = None;
+                            self.admin_notice = Some(
+                                "Key saved to your account. Checking the model list...".into(),
+                            );
+                            self.state.providers_loaded = false;
+                            self.schedule(Operation::Catalog, Duration::ZERO);
+                        }
+                        OperationKind::ProviderTest => {
+                            self.provider_testing = None;
+                            self.admin_error = None;
+                            self.admin_notice = None;
+                            self.state.providers_loaded = false;
+                            self.schedule(Operation::Catalog, Duration::ZERO);
+                        }
+                        OperationKind::DefaultRoute => {
+                            self.admin_error = None;
+                            self.admin_notice = Some("Default provider updated.".into());
+                            self.state.providers_loaded = false;
+                            self.schedule(Operation::Catalog, Duration::ZERO);
                         }
                         OperationKind::AdminWrite => {
                             self.provider.api_key.zeroize();
@@ -3655,7 +3707,12 @@ impl Session {
         let base_url = self.provider.base_url.trim().to_owned();
         let secret = self.provider.secret_name.trim().to_owned();
         let models = model_csv(&self.provider.models);
-        let api_key = self.provider.api_key.trim().to_owned();
+        let mut api_key = self.provider.api_key.trim().to_owned();
+        if api_key.is_empty() && self.provider.auth == "none" {
+            // A local server needs no key, but the credential store keeps one
+            // per provider; Ollama's own docs use this placeholder.
+            api_key = "ollama".to_owned();
+        }
         let problem = if !valid_provider_id(&id) {
             Some("Provider id must be 1–64 letters, digits, '_' or '-'.")
         } else if kind.is_empty() || kind.len() > 32 {
@@ -3698,6 +3755,59 @@ impl Session {
             api_key: (!api_key.is_empty()).then_some(api_key),
         };
         self.start_request(Operation::AdminSaveProvider(request));
+    }
+
+    /// Save a key typed on a provider card to the signed-in account.
+    pub fn save_provider_key(&mut self, id: String) {
+        let key = self
+            .provider_key_drafts
+            .get(&id)
+            .map(|key| key.trim().to_owned())
+            .unwrap_or_default();
+        if key.is_empty() {
+            self.admin_error = Some("Paste the key first.".into());
+            return;
+        }
+        if !valid_credential(&key) {
+            self.admin_error = Some("The key contains control characters or is too long.".into());
+            return;
+        }
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.admin_error = None;
+        self.admin_notice = None;
+        self.start_request(Operation::SaveProviderKey {
+            id,
+            key: zeroize::Zeroizing::new(key),
+        });
+    }
+
+    /// Ask one provider for its live model list.
+    pub fn test_provider(&mut self, id: String) {
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.admin_error = None;
+        self.admin_notice = None;
+        self.provider_testing = Some(id.clone());
+        self.start_request(Operation::TestProvider { id });
+    }
+
+    /// Make this provider (and its first listed model) the account default.
+    pub fn set_default_provider(&mut self, id: String, model: String) {
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.admin_error = None;
+        self.admin_notice = None;
+        self.start_request(Operation::SetDefaultRoute {
+            provider: id,
+            model,
+        });
     }
 
     pub fn remove_provider(&mut self, id: String) {

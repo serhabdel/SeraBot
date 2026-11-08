@@ -1130,8 +1130,21 @@ pub struct SecretStatus {
     pub configured: bool,
 }
 
+/// Whether the signed-in account can use a provider, from `GET /v1/providers`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct CredentialState {
+    /// The account has a key, or an admin grant, it can use.
+    #[serde(default)]
+    pub configured: bool,
+    /// The key is the account's own (not a grant).
+    #[serde(default)]
+    pub own: bool,
+    #[serde(default)]
+    pub granted: bool,
+}
+
 /// Read-only provider view from `GET /v1/providers`.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct ProviderStatus {
     pub id: String,
     pub kind: String,
@@ -1152,6 +1165,34 @@ pub struct ProviderStatus {
     pub auth: String,
     #[serde(default)]
     pub secrets: BTreeMap<String, SecretStatus>,
+    /// How the last live model fetch went for this account: `ok`,
+    /// `key_rejected`, `unreachable` or `unchecked`.
+    #[serde(default)]
+    pub status: String,
+    /// `live` (the provider's own list) or `fallback` (the allowlist).
+    #[serde(default)]
+    pub model_source: String,
+    #[serde(default)]
+    pub model_count: usize,
+    #[serde(default)]
+    pub credential: CredentialState,
+    /// Set by the console, not the server: this is the account's default
+    /// provider (its chosen route, else the server default).
+    #[serde(skip)]
+    pub is_default: bool,
+    #[serde(skip)]
+    pub default_model: Option<String>,
+}
+
+/// Result of `POST /v1/providers/{id}/test`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct ProviderTest {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub model_count: usize,
 }
 
 /// Read-only connector view from `GET /v1/connectors`.
@@ -1523,6 +1564,14 @@ pub struct CatalogEntry {
     pub model: String,
     #[serde(default)]
     pub data_egress_approved: bool,
+    /// Friendly name, context window and capability tags, when the provider's
+    /// own list gave them.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub context_length: Option<u64>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3449,6 +3498,87 @@ impl ApiClient {
             verifier,
             redirect_uri,
         )
+    }
+
+    /// Save the signed-in account's own key for a provider.
+    pub fn set_provider_key(&self, id: &str, api_key: &str) -> Result<(), ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Provider id is not valid."));
+        }
+        let _: serde_json::Value = self.admin_request(
+            Method::PUT,
+            &["v1", "providers", id, "key"],
+            &serde_json::json!({ "api_key": api_key }),
+        )?;
+        Ok(())
+    }
+
+    /// Ask a provider for its live model list with the account's own key.
+    pub fn test_provider(&self, id: &str) -> Result<ProviderTest, ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Provider id is not valid."));
+        }
+        self.admin_request(
+            Method::POST,
+            &["v1", "providers", id, "test"],
+            &serde_json::json!({}),
+        )
+    }
+
+    /// Make a provider and model the account's default for new chats.
+    pub fn set_default_route(&self, provider: &str, model: &str) -> Result<(), ApiError> {
+        if !valid_id(provider) || !valid_model_id(model) {
+            return Err(ApiError::Validation("Provider or model is not valid."));
+        }
+        let _: serde_json::Value = self.admin_request(
+            Method::PUT,
+            &["v1", "providers", "default-route"],
+            &serde_json::json!({ "provider": provider, "model": model }),
+        )?;
+        Ok(())
+    }
+
+    /// The account's default route, when it chose one.
+    pub fn default_route(&self) -> Result<Option<Selection>, ApiError> {
+        #[derive(Deserialize)]
+        struct Reply {
+            selection: Option<Selection>,
+        }
+        let reply: Reply = self.get(&["v1", "providers", "default-route"], &[])?;
+        Ok(reply.selection)
+    }
+
+    /// First leg of "Sign in with OpenRouter".
+    pub fn provider_oauth_start(
+        &self,
+        id: &str,
+        body: &serde_json::Value,
+    ) -> Result<OAuthStart, ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Provider id is not valid."));
+        }
+        self.checked_oauth_start(&["v1", "providers", id, "oauth", "start"], body)
+    }
+
+    /// Second leg: the server swaps the code for the account's own key and
+    /// stores it. The key never comes back here.
+    pub fn provider_oauth_complete(
+        &self,
+        id: &str,
+        code: &str,
+        verifier: &str,
+        redirect_uri: &str,
+    ) -> Result<(), ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Provider id is not valid."));
+        }
+        self.checked_oauth_complete(
+            &["v1", "providers", id, "oauth", "complete"],
+            code,
+            verifier,
+            redirect_uri,
+        )
+        .map(|_| ())
     }
 
     pub fn admin_connector_oauth_start(

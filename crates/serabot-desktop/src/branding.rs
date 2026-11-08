@@ -180,6 +180,31 @@ static BRANDS: &[Brand] = &[
         label: "Ollama",
         mark: png!("ollama"),
     },
+    Brand {
+        keys: &["gemini"],
+        label: "Google Gemini",
+        mark: png!("gemini"),
+    },
+    Brand {
+        keys: &["perplexity"],
+        label: "Perplexity",
+        mark: png!("perplexity"),
+    },
+    Brand {
+        keys: &["huggingface"],
+        label: "Hugging Face",
+        mark: png!("huggingface"),
+    },
+    Brand {
+        keys: &["nebius"],
+        label: "Nebius",
+        mark: png!("nebius"),
+    },
+    Brand {
+        keys: &["sambanova"],
+        label: "SambaNova",
+        mark: png!("sambanova"),
+    },
     // Generic marks that belong to no vendor
     Brand {
         keys: &["muse-code"],
@@ -264,6 +289,11 @@ mod tests {
         "antigravity",
         "muse-code",
         "ollama",
+        "gemini",
+        "perplexity",
+        "huggingface",
+        "nebius",
+        "sambanova",
         "openai-compatible",
         "custom",
     ];
