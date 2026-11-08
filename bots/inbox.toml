@@ -3,6 +3,7 @@ trigger = "command"
 system_prompt = "prompts/inbox.txt"
 skills = ["email-triage", "messaging-etiquette"]
 tools = [
+  "ask_user",
   "skill_list",
   "skill_search",
   "skill_load",

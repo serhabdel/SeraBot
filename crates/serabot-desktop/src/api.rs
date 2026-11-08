@@ -1797,6 +1797,34 @@ impl Drop for Message {
 #[derive(Deserialize)]
 pub struct History {
     pub messages: Vec<Message>,
+    /// The conversation's chat cards (0.23), oldest first.
+    #[serde(default)]
+    pub cards: Vec<ChatCard>,
+}
+
+/// One chat card (0.23): a question from a bot, or a request for a secret.
+/// Kind, status and payload are checked where they are drawn (`chat_cards`).
+/// A secret request never carries a secret value.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ChatCard {
+    pub id: String,
+    pub conversation_id: String,
+    pub bot: String,
+    pub kind: String,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+    pub status: String,
+    #[serde(default)]
+    pub response: Option<serde_json::Value>,
+    pub created_at: String,
+    #[serde(default)]
+    pub resolved_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CardListing {
+    #[serde(default)]
+    cards: Vec<ChatCard>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -2159,7 +2187,7 @@ impl ApiClient {
     }
     pub fn history(&self, conversation: &str) -> Result<History, ApiError> {
         check_id(conversation)?;
-        let history: History = self.get(
+        let mut history: History = self.get(
             &["v1", "conversations", conversation, "messages"],
             &[("limit", "100")],
         )?;
@@ -2175,7 +2203,17 @@ impl ApiClient {
         }) {
             return Err(ApiError::InvalidResponse);
         }
+        // Cards come with the transcript, so one history load refreshes both.
+        history.cards = self.list_cards(conversation)?;
         Ok(history)
+    }
+
+    /// `GET /v1/conversations/{id}/cards`: the owner's cards, oldest first.
+    pub fn list_cards(&self, conversation: &str) -> Result<Vec<ChatCard>, ApiError> {
+        check_id(conversation)?;
+        let listing: CardListing =
+            self.get(&["v1", "conversations", conversation, "cards"], &[])?;
+        Ok(listing.cards)
     }
     /// `PUT /v1/conversations/{id}/thinking`: set the conversation's thinking
     /// level (`None` goes back to the model's default).
@@ -2456,6 +2494,52 @@ impl ApiClient {
             Some(&Body {
                 decision: decision.as_str(),
             }),
+        )?;
+        Ok(())
+    }
+
+    /// `POST /v1/cards/{id}/answer`: the owner's answer to a question card.
+    /// The server posts it into the conversation, which starts a bot turn.
+    pub fn answer_card(&self, id: &str, answer: &str) -> Result<(), ApiError> {
+        check_id(id)?;
+        #[derive(Serialize)]
+        struct Body<'a> {
+            answer: &'a str,
+        }
+        self.request::<serde_json::Value, Body>(
+            Method::POST,
+            &["v1", "cards", id, "answer"],
+            &[],
+            Some(&Body { answer }),
+        )?;
+        Ok(())
+    }
+
+    /// `POST /v1/cards/{id}/decline`: dismiss a pending card.
+    pub fn decline_card(&self, id: &str) -> Result<(), ApiError> {
+        check_id(id)?;
+        self.request::<serde_json::Value, ()>(
+            Method::POST,
+            &["v1", "cards", id, "decline"],
+            &[],
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// `POST /v1/cards/{id}/secret`: the value for a secret request. The
+    /// server seals it into the owner's vault and replies without it.
+    pub fn submit_secret_card(&self, id: &str, value: &str) -> Result<(), ApiError> {
+        check_id(id)?;
+        #[derive(Serialize)]
+        struct Body<'a> {
+            value: &'a str,
+        }
+        self.request::<serde_json::Value, Body>(
+            Method::POST,
+            &["v1", "cards", id, "secret"],
+            &[],
+            Some(&Body { value }),
         )?;
         Ok(())
     }

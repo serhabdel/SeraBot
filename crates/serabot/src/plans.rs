@@ -81,7 +81,7 @@ impl Plan {
     }
 }
 
-fn clean_text(raw: &str, max_chars: usize) -> String {
+pub(crate) fn clean_text(raw: &str, max_chars: usize) -> String {
     let flat: String = raw
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })

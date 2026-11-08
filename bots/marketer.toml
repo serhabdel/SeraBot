@@ -3,6 +3,7 @@ trigger = "command"
 system_prompt = "prompts/marketer.txt"
 skills = ["campaign-plan", "social-posts", "copy", "write", "onepager"]
 tools = [
+  "ask_user",
   "skill_list",
   "skill_search",
   "skill_load",

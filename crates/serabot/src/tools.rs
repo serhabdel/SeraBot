@@ -867,6 +867,7 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "memory_update",
         "memory_delete",
         "plan_update",
+        "ask_user",
         "vault_list",
         "pdf_inspect",
         "pdf_edit",

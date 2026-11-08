@@ -30,6 +30,8 @@ pub struct State {
     pub catalog: Option<Catalog>,
     pub draft: Selection,
     pub messages: Vec<Message>,
+    /// Chat cards of the open conversation (0.23), oldest first.
+    pub cards: Vec<crate::ChatCard>,
     pub history_loaded: bool,
     pub task: Option<Task>,
     /// Live steps of the latest turn, from the event stream.
@@ -124,6 +126,7 @@ impl Default for State {
             catalog: None,
             draft: Selection::default(),
             messages: Vec::new(),
+            cards: Vec::new(),
             history_loaded: false,
             task: None,
             activity: Default::default(),
@@ -326,6 +329,7 @@ impl State {
             }
             Reply::History(history) => {
                 self.messages = history.messages;
+                self.cards = history.cards;
                 self.history_loaded = true;
                 // Fetching the transcript marks the thread read on the server;
                 // the badge clears locally at the same moment.
@@ -500,7 +504,7 @@ impl State {
                     .insert(target.key(), AvatarImage { version, data_url });
             }
             // The session reacts to these (it owns the drafts they came from).
-            Reply::AvatarSaved(_) | Reply::ToolsSaved => {}
+            Reply::AvatarSaved(_) | Reply::ToolsSaved | Reply::CardWritten => {}
             Reply::CreatedGroup(group) => self.created_group = Some(group),
             Reply::Onboarding(onboarding) => self.onboarding = Some(onboarding),
         }
@@ -528,6 +532,7 @@ impl State {
                 | OperationKind::CreateGroup
                 | OperationKind::OnboardingWrite
                 | OperationKind::ToolsWrite
+                | OperationKind::CardWrite
         );
         if mutation && error.unknown_outcome() {
             self.unknown_outcome = true;
@@ -546,6 +551,7 @@ impl State {
                 OperationKind::CreateGroup => "group create",
                 OperationKind::OnboardingWrite => "interview step",
                 OperationKind::ToolsWrite => "capability change",
+                OperationKind::CardWrite => "card reply",
                 _ => "model change",
             };
             self.error = Some(format!(
@@ -837,6 +843,7 @@ mod tests {
             &scope,
             Reply::History(History {
                 messages: Vec::new(),
+                cards: Vec::new(),
             }),
         );
         let opened = state

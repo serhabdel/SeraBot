@@ -9,6 +9,7 @@ pub mod avatar;
 pub mod brief;
 pub mod browser;
 pub mod browser_profiles;
+pub mod cards;
 pub mod cloud_code;
 pub mod composio;
 pub mod composio_mcp;

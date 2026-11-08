@@ -12,7 +12,9 @@ use serabot_desktop::{
     SPECIALIST_TOOLS, Selection, TaskStatus, Team, TeamMember, TeamMode,
     activity::{Step, StepPhase},
     audio_capture::MicRecorder,
-    branding, chat_compose, chat_feed, provider_presets, provider_view,
+    branding,
+    chat_cards::{self, CardState, CardView},
+    chat_compose, chat_feed, provider_presets, provider_view,
     session::{Section, Session, SettingsSection, SignInPhase, Theme, humanize_label},
     teams, ui_highlight,
     working::BotActivity,
@@ -22,6 +24,7 @@ use std::time::Instant;
 
 use crate::ui_bots::{NewBotSheet, NewGroupSheet, OnboardingView};
 use crate::ui_browser::BrowserView;
+use crate::ui_cards::ChatCardRow;
 use crate::ui_connectors::ConnectorsView;
 use crate::ui_dock::BrowserDock;
 use crate::ui_files::{
@@ -2962,6 +2965,30 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         }
         rows
     };
+    // Chat cards (0.23). A pending card sits at the foot of the feed. A resolved
+    // card keeps its place in the transcript: before the first message made after it.
+    let cards: Vec<CardView> = session
+        .read()
+        .state
+        .cards
+        .iter()
+        .filter_map(CardView::from_card)
+        .collect();
+    let (pending_cards, resolved_cards): (Vec<CardView>, Vec<CardView>) = cards
+        .into_iter()
+        .partition(|card| card.state == CardState::Pending);
+    let message_times: Vec<String> = session
+        .read()
+        .state
+        .messages
+        .iter()
+        .map(|message| message.created_at.clone())
+        .collect();
+    let mut placed: Vec<Vec<CardView>> = vec![Vec::new(); message_times.len() + 1];
+    for card in resolved_cards {
+        let index = chat_cards::insert_index(&message_times, &card.created_at);
+        placed[index].push(card);
+    }
     let task = session
         .read()
         .state
@@ -3334,8 +3361,11 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             }
                         }
                     }
-                    for row in messages.into_iter() {
+                    for (index, row) in messages.into_iter().enumerate() {
                         Fragment { key: "{row.id}",
+                            for card in placed[index].clone() {
+                                ChatCardRow { session, key: "{card.id}", card }
+                            }
                             if let Some(heading) = row.day.clone() {
                                 div { class: "day-sep", role: "separator",
                                     span { "{heading}" }
@@ -3428,8 +3458,16 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             }
                         }
                     }
+                    // Resolved cards that come after the newest message.
+                    for card in placed.last().cloned().unwrap_or_default() {
+                        ChatCardRow { session, key: "{card.id}", card }
+                    }
                     // Files the bots produced in this chat (Open / Save as).
                     MediaCards { session }
+                    // Cards waiting for the owner: questions and secret requests.
+                    for card in pending_cards.clone() {
+                        ChatCardRow { session, key: "{card.id}", card }
+                    }
                     // What the bot is doing right now, in plain words: a
                     // shimmer while it thinks, one row per step, and a small
                     // "N steps" summary once the reply has landed.

@@ -9,6 +9,7 @@ use axum::http::Request;
 use tower::ServiceExt;
 
 mod browser_api;
+mod cards_api;
 mod chat_api;
 mod composio_api;
 mod files_api;

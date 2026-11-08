@@ -79,6 +79,7 @@ fn authenticates_and_routes_every_contract_endpoint() {
         (200, r#"{"ok":true,"version":"test"}"#.into()),
         (200, r#"{"providers":[],"selection":{"provider":"p","model":"m"}}"#.into()),
         (200, r#"{"messages":[{"id":"msg-1","role":"assistant","content":"Synthetic reply","created_at":"test-time"}]}"#.into()),
+        (200, r#"{"cards":[]}"#.into()),
         (200, r#"{"selection":{"provider":"p","model":"m"}}"#.into()),
         (202, task.into()),
         (200, task.into()),
@@ -111,6 +112,7 @@ fn authenticates_and_routes_every_contract_endpoint() {
         "GET /v1/health ",
         "GET /v1/models?conversation_id=owner%3A1 ",
         "GET /v1/conversations/owner:1/messages?limit=100 ",
+        "GET /v1/conversations/owner:1/cards ",
         "PUT /v1/conversations/owner:1/model ",
         "POST /v1/messages ",
         "GET /v1/tasks/task-1 ",
@@ -128,12 +130,35 @@ fn authenticates_and_routes_every_contract_endpoint() {
     let body = |index: usize| -> serde_json::Value {
         serde_json::from_str(requests[index].split("\r\n\r\n").nth(1).unwrap()).unwrap()
     };
-    assert_eq!(body(3), serde_json::json!({"provider":"p","model":"m"}));
+    assert_eq!(body(4), serde_json::json!({"provider":"p","model":"m"}));
     assert_eq!(
-        body(4),
+        body(5),
         serde_json::json!({"conversation_id":"owner:1","text":"Synthetic hello"})
     );
-    assert_eq!(body(7), serde_json::json!({"decision":"once"}));
+    assert_eq!(body(8), serde_json::json!({"decision":"once"}));
+}
+
+#[test]
+fn card_writes_use_their_own_routes_and_bodies() {
+    let (client, handle) = server(vec![
+        (200, r#"{"card":{},"task":{}}"#.into()),
+        (200, r#"{"card":{}}"#.into()),
+        (200, r#"{"card":{}}"#.into()),
+    ]);
+    client.answer_card("card-1", "Blue").unwrap();
+    client.decline_card("card-1").unwrap();
+    client
+        .submit_secret_card("card-1", "Synthetic-value")
+        .unwrap();
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("POST /v1/cards/card-1/answer "));
+    assert!(requests[1].starts_with("POST /v1/cards/card-1/decline "));
+    assert!(requests[2].starts_with("POST /v1/cards/card-1/secret "));
+    let body = |index: usize| -> serde_json::Value {
+        serde_json::from_str(requests[index].split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    };
+    assert_eq!(body(0), serde_json::json!({"answer":"Blue"}));
+    assert_eq!(body(2), serde_json::json!({"value":"Synthetic-value"}));
 }
 
 #[test]
@@ -500,12 +525,20 @@ fn catalog_without_egress_approval_fails_closed() {
 
 #[test]
 fn history_keeps_a_bot_speaker_and_rejects_an_unsafe_name() {
-    let (client, handle) = server(vec![(
-        200,
-        r#"{"messages":[{"id":"m","role":"assistant","content":"Synthetic analyst summary.","created_at":"now","name":"analyst"}]}"#.into(),
-    )]);
+    let (client, handle) = server(vec![
+        (
+            200,
+            r#"{"messages":[{"id":"m","role":"assistant","content":"Synthetic analyst summary.","created_at":"now","name":"analyst"}]}"#.into(),
+        ),
+        (
+            200,
+            r#"{"cards":[{"id":"card-1","conversation_id":"room:review","bot":"analyst","kind":"question","payload":{"question":"Which?","options":["A"],"allow_free_text":false},"status":"pending","created_at":"now"}]}"#.into(),
+        ),
+    ]);
     let history = client.history("room:review").unwrap();
     assert_eq!(history.messages[0].name.as_deref(), Some("analyst"));
+    assert_eq!(history.cards.len(), 1);
+    assert_eq!(history.cards[0].kind, "question");
     handle.join().unwrap();
 
     let (client, handle) = server(vec![(

@@ -6,6 +6,10 @@ use super::*;
 const PLAN_RULES: &str = "- When the owner asks for a multi-step task, first call plan_update with a one-line goal and a short todo list, and call it again whenever an item changes status (pending, doing, done).\n\
 - Once a goal is set, work through the todo list to the end without asking the owner more questions. Ask only when a step is impossible or needs a destructive approval. State your assumptions in the reply instead of asking about them.\n";
 
+/// Guidance for asking the owner: a card instead of a guess, never for secrets in chat.
+const ASK_RULES: &str = "- If the request is ambiguous and a wrong guess would waste work, call ask_user with 2 to 4 concrete options instead of guessing. Do not ask when autonomy is on or the chat has a goal; then choose and state your assumption.\n\
+- Never ask for passwords or API keys in chat text. Use vault_request_secret instead.\n";
+
 /// Honesty rule every bot prompt carries: a bot names only the tools this
 /// turn offers and reports only the calls it actually ran.
 const TOOL_HONESTY_RULE: &str =
@@ -206,6 +210,14 @@ impl Runtime {
         prompt.push_str("- Be concise and explicit about uncertainty.\n");
         prompt.push_str("- When the owner asks you to remember, save, change, or forget a fact or preference, call memory_save, memory_update, or memory_delete if available. Use memory_search to look up older facts.\n");
         prompt.push_str(&self.plan_clause(user_id, conversation_id));
+        if bot
+            .config
+            .tools
+            .iter()
+            .any(|tool| tool == crate::cards::ASK_USER_TOOL)
+        {
+            prompt.push_str(ASK_RULES);
+        }
         if ask_mode {
             prompt.push_str("- Call rag_search before answering. Cite every factual claim as [doc:<document_id> p.<page>] using only returned evidence. If evidence is insufficient, abstain.\n");
         }

@@ -54,6 +54,7 @@ mod admin;
 mod approvals;
 mod bots;
 mod browser;
+mod cards;
 mod composio;
 mod connectors;
 mod conversations;
@@ -73,6 +74,7 @@ use admin::*;
 use approvals::*;
 use bots::*;
 use browser::*;
+use cards::*;
 use composio::*;
 use connectors::*;
 use conversations::*;
@@ -169,6 +171,8 @@ pub struct ApiState {
     local: Arc<crate::local_relay::LocalRelay>,
     /// Host sampler and cached storage scan behind GET /v1/admin/status.
     sys_status: Arc<crate::sysstatus::StatusMonitor>,
+    /// Card ids with an answer or decline in flight (see `cards::CardClaim`).
+    card_claims: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl ApiState {
@@ -226,6 +230,7 @@ impl ApiState {
             onboarding_drafter: None,
             local: crate::local_relay::LocalRelay::new(),
             sys_status: Arc::new(crate::sysstatus::StatusMonitor::new()),
+            card_claims: Arc::default(),
             config,
         })
     }
@@ -412,6 +417,9 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/conversations/{id}/library", get(conversation_library))
         .route("/v1/conversations/{id}/plan", get(get_conversation_plan))
+        .route("/v1/conversations/{id}/cards", get(list_conversation_cards))
+        .route("/v1/cards/{id}/answer", post(answer_card))
+        .route("/v1/cards/{id}/decline", post(decline_card))
         .route("/v1/conversations/{id}/cancel", post(cancel_conversation))
         .route(
             "/v1/conversations/{id}/auto-approve",

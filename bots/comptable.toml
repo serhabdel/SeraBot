@@ -3,6 +3,7 @@ trigger = "file"
 system_prompt = "prompts/comptable.txt"
 skills = ["ma-tax-2026", "pcm-cgnc", "ma-payroll", "financial-analysis", "xlsx"]
 tools = [
+  "ask_user",
   "skill_list",
   "skill_search",
   "skill_load",

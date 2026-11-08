@@ -16,6 +16,7 @@ trigger = "command"
 system_prompt = "prompts/main.txt"
 skills = ["triage", "ask", "firecrawl", "audio", "elevenlabs", "scheduler", "skill-creator"]
 tools = [
+  "ask_user",
   "delegate",
   "skill_list",
   "skill_search",

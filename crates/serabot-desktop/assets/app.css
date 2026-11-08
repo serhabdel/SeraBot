@@ -5211,6 +5211,113 @@ html[data-reduce-transparency="true"] .chat-header {
   }
 }
 
+/* ------------------------------------------------------- chat cards (0.23) ----- */
+/* A question or secret request a bot raised, inline at the foot of the chat.
+   A resolved card shrinks to one quiet line where it happened. */
+
+.chat-card {
+  margin: 10px auto 0;
+  width: min(var(--chat-w), calc(100% - 24px));
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-1);
+  color: var(--label-1);
+}
+
+.chat-card.secret {
+  border-left-color: var(--warn);
+}
+
+.chat-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.chat-card-title {
+  font-size: var(--fs-body-2);
+  font-weight: 600;
+  color: var(--label-2);
+}
+
+.chat-card-question {
+  margin: 0;
+  font-size: var(--fs-body);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chat-card-context,
+.chat-card-reason,
+.chat-card-note,
+.chat-card-facts {
+  margin: 0;
+  font-size: var(--fs-body-2);
+  color: var(--label-2);
+  overflow-wrap: anywhere;
+}
+
+.chat-card-note {
+  color: var(--label-3);
+}
+
+.chat-card-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+}
+
+.chat-card-options,
+.chat-card-domains,
+.chat-card-actions,
+.chat-card-free,
+.chat-card-field {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.chat-card-option {
+  max-width: 100%;
+  white-space: normal;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.chat-card-input {
+  flex: 1 1 180px;
+  min-width: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--label-1);
+  font: inherit;
+}
+
+.chat-card-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.chat-card-resolved {
+  margin: 6px auto 0;
+  width: min(var(--chat-w), calc(100% - 24px));
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--fs-body-2);
+  color: var(--label-3);
+}
+
 /* ------------------------------------------------- chat goal and todo ----- */
 /* Compact plan panel at the top of the chat; collapsed until clicked. */
 

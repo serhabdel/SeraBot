@@ -85,6 +85,8 @@ pub enum OperationKind {
     ToolsWrite,
     /// Upload of one chat attachment from the composer.
     Attach,
+    /// Answer, decline or secret reply on a chat card.
+    CardWrite,
 }
 
 impl OperationKind {
@@ -308,6 +310,20 @@ pub enum Operation {
         id: String,
         tools: Vec<String>,
     },
+    /// `POST /v1/cards/{id}/answer` with the owner's answer.
+    AnswerCard {
+        id: String,
+        answer: String,
+    },
+    /// `POST /v1/cards/{id}/decline`.
+    DeclineCard {
+        id: String,
+    },
+    /// `POST /v1/cards/{id}/secret`. The value is never logged or kept in state.
+    SubmitSecretCard {
+        id: String,
+        value: Zeroizing<String>,
+    },
 }
 
 impl Operation {
@@ -379,6 +395,9 @@ impl Operation {
             | Self::OnboardingReply { .. }
             | Self::OnboardingConfirm { .. } => OperationKind::OnboardingWrite,
             Self::SetBotTools { .. } => OperationKind::ToolsWrite,
+            Self::AnswerCard { .. } | Self::DeclineCard { .. } | Self::SubmitSecretCard { .. } => {
+                OperationKind::CardWrite
+            }
         }
     }
 }
@@ -461,6 +480,8 @@ pub enum Reply {
     CreatedGroup(CreatedGroup),
     Onboarding(Onboarding),
     ToolsSaved,
+    /// An answer, decline or secret was accepted. The transcript reloads next.
+    CardWritten,
 }
 
 pub struct Job {
@@ -935,6 +956,13 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::SetBotTools { id, tools } => {
             client.set_bot_tools(id, tools).map(|_| Reply::ToolsSaved)
         }
+        Operation::AnswerCard { id, answer } => {
+            client.answer_card(id, answer).map(|_| Reply::CardWritten)
+        }
+        Operation::DeclineCard { id } => client.decline_card(id).map(|_| Reply::CardWritten),
+        Operation::SubmitSecretCard { id, value } => client
+            .submit_secret_card(id, value)
+            .map(|_| Reply::CardWritten),
     }
 }
 

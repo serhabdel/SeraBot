@@ -3,6 +3,7 @@ trigger = "command"
 system_prompt = "prompts/whatsapp.txt"
 skills = ["messaging-etiquette"]
 tools = [
+  "ask_user",
   "skill_list",
   "skill_search",
   "skill_load",

@@ -654,6 +654,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     ))?;
     serabot::tools::register_memory_tools(&mut registry, store.clone())?;
     serabot::vault::register_vault_tools(&mut registry, users.clone())?;
+    serabot::cards::register_card_tools(&mut registry, store.clone(), policy.clone())?;
     serabot::tools::register_pdf_tools(
         &mut registry,
         artifacts.clone(),

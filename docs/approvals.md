@@ -34,6 +34,7 @@ or sends something to a third party that cannot be recalled. The list lives in
 - Image tools (image_inspect, image_resize, image_convert): run without approval; results are new artifacts with metadata removed.
 - Read-only connectors: `google_drive_list`, `google_sheets_read`, `google_calendar_list_events`, `gmail_list_messages`, `outlook_list_messages`, `outlook_calendar_list_events`, `notion_query_database`, `agentmail_inboxes_list`, `onedrive_list`, `github_search_repos`, `github_list_issues`, `github_get_issue`, `github_get_file`, `todoist_list_tasks`, `slack_list_channels`, `slack_read_channel`, `exa_search`, `exa_get_contents`.
 - Orchestration: `delegate`, `team_ask`, `team_reply`, `skill_list`, `skill_search`, `skill_load`.
+- Chat cards: `ask_user` (asks the owner a question in the chat; it sends nothing outside SeraBot and returns at once). See [API](api.md#chat-cards-023).
 
 ## Bot `require_approval` lists
 
