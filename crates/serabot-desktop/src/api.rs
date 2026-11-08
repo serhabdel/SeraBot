@@ -803,6 +803,10 @@ pub struct BotSummary {
     pub model: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
+    /// The shipped human title (0.23). The server already falls back to it for
+    /// `display_name`, so the console shows it without this field.
+    #[serde(default)]
+    pub title: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -814,6 +818,21 @@ pub struct BotSummary {
     pub skills: Vec<String>,
     #[serde(default)]
     pub require_approval: Vec<String>,
+}
+
+/// One shipped template on "Meet your team" (`GET /v1/bots/catalog`).
+/// `installed` says whether the owner already has that bot.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ShippedBot {
+    pub id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub role: String,
+    pub installed: bool,
+    #[serde(default)]
+    pub avatar_version: Option<String>,
 }
 
 /// Full bot record from `GET /v1/bots/{id}`: profile, routing, instructions
@@ -1797,6 +1816,34 @@ impl Drop for Message {
 #[derive(Deserialize)]
 pub struct History {
     pub messages: Vec<Message>,
+    /// The conversation's chat cards (0.23), oldest first.
+    #[serde(default)]
+    pub cards: Vec<ChatCard>,
+}
+
+/// One chat card (0.23): a question from a bot, or a request for a secret.
+/// Kind, status and payload are checked where they are drawn (`chat_cards`).
+/// A secret request never carries a secret value.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ChatCard {
+    pub id: String,
+    pub conversation_id: String,
+    pub bot: String,
+    pub kind: String,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+    pub status: String,
+    #[serde(default)]
+    pub response: Option<serde_json::Value>,
+    pub created_at: String,
+    #[serde(default)]
+    pub resolved_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CardListing {
+    #[serde(default)]
+    cards: Vec<ChatCard>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -2159,7 +2206,7 @@ impl ApiClient {
     }
     pub fn history(&self, conversation: &str) -> Result<History, ApiError> {
         check_id(conversation)?;
-        let history: History = self.get(
+        let mut history: History = self.get(
             &["v1", "conversations", conversation, "messages"],
             &[("limit", "100")],
         )?;
@@ -2175,7 +2222,17 @@ impl ApiClient {
         }) {
             return Err(ApiError::InvalidResponse);
         }
+        // Cards come with the transcript, so one history load refreshes both.
+        history.cards = self.list_cards(conversation)?;
         Ok(history)
+    }
+
+    /// `GET /v1/conversations/{id}/cards`: the owner's cards, oldest first.
+    pub fn list_cards(&self, conversation: &str) -> Result<Vec<ChatCard>, ApiError> {
+        check_id(conversation)?;
+        let listing: CardListing =
+            self.get(&["v1", "conversations", conversation, "cards"], &[])?;
+        Ok(listing.cards)
     }
     /// `PUT /v1/conversations/{id}/thinking`: set the conversation's thinking
     /// level (`None` goes back to the model's default).
@@ -2460,6 +2517,52 @@ impl ApiClient {
         Ok(())
     }
 
+    /// `POST /v1/cards/{id}/answer`: the owner's answer to a question card.
+    /// The server posts it into the conversation, which starts a bot turn.
+    pub fn answer_card(&self, id: &str, answer: &str) -> Result<(), ApiError> {
+        check_id(id)?;
+        #[derive(Serialize)]
+        struct Body<'a> {
+            answer: &'a str,
+        }
+        self.request::<serde_json::Value, Body>(
+            Method::POST,
+            &["v1", "cards", id, "answer"],
+            &[],
+            Some(&Body { answer }),
+        )?;
+        Ok(())
+    }
+
+    /// `POST /v1/cards/{id}/decline`: dismiss a pending card.
+    pub fn decline_card(&self, id: &str) -> Result<(), ApiError> {
+        check_id(id)?;
+        self.request::<serde_json::Value, ()>(
+            Method::POST,
+            &["v1", "cards", id, "decline"],
+            &[],
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// `POST /v1/cards/{id}/secret`: the value for a secret request. The
+    /// server seals it into the owner's vault and replies without it.
+    pub fn submit_secret_card(&self, id: &str, value: &str) -> Result<(), ApiError> {
+        check_id(id)?;
+        #[derive(Serialize)]
+        struct Body<'a> {
+            value: &'a str,
+        }
+        self.request::<serde_json::Value, Body>(
+            Method::POST,
+            &["v1", "cards", id, "secret"],
+            &[],
+            Some(&Body { value }),
+        )?;
+        Ok(())
+    }
+
     pub fn create_bot(
         &self,
         id: &str,
@@ -2681,6 +2784,65 @@ impl ApiClient {
             }
         }
         Ok(response.bots)
+    }
+
+    /// Every shipped template with whether the owner has it: `GET /v1/bots/catalog`.
+    pub fn bot_catalog(&self) -> Result<Vec<ShippedBot>, ApiError> {
+        #[derive(Deserialize)]
+        struct CatalogEnvelope {
+            bots: Vec<ShippedBot>,
+        }
+        let response: CatalogEnvelope = self.get(&["v1", "bots", "catalog"], &[])?;
+        if response.bots.len() > MAX_BOT_LIST {
+            return Err(ApiError::InvalidResponse);
+        }
+        let mut seen = HashSet::with_capacity(response.bots.len());
+        for bot in &response.bots {
+            if !valid_speaker(&bot.id) || !seen.insert(bot.id.as_str()) {
+                return Err(ApiError::InvalidResponse);
+            }
+            if !valid_speaker(&bot.role)
+                || bot.title.as_deref().is_some_and(|title| {
+                    title.chars().count() > 64 || title.chars().any(char::is_control)
+                })
+                || bot.description.as_deref().is_some_and(|text| {
+                    text.chars().count() > 2_000
+                        || text
+                            .chars()
+                            .any(|c| c != '\n' && c != '\r' && c != '\t' && c.is_control())
+                })
+            {
+                return Err(ApiError::InvalidResponse);
+            }
+        }
+        Ok(response.bots)
+    }
+
+    /// `POST /v1/bots/catalog/{name}/install`: "Add to my team". A write, so an
+    /// unknown outcome is never replayed. A 409 means the owner already has it.
+    pub fn install_shipped_bot(&self, name: &str) -> Result<(), ApiError> {
+        if !valid_speaker(name) {
+            return Err(ApiError::Validation("Bot id is not valid."));
+        }
+        #[derive(Deserialize)]
+        struct InstalledBot {
+            id: String,
+            installed: bool,
+        }
+        #[derive(Deserialize)]
+        struct InstalledEnvelope {
+            bot: InstalledBot,
+        }
+        let response: InstalledEnvelope = self.request::<_, ()>(
+            Method::POST,
+            &["v1", "bots", "catalog", name, "install"],
+            &[],
+            None,
+        )?;
+        if response.bot.id != name || !response.bot.installed {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(())
     }
 
     /// Full record of one bot: `GET /v1/bots/{id}`.

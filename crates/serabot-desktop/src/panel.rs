@@ -11,12 +11,14 @@
 //! in. Neither touches the network, so both are unit-tested.
 
 use crate::composio_flow::ComposioFlow;
+use crate::vault_import::{self, ImportItem};
 use crate::worker::Credentials;
 use crate::{
-    ApiClient, ApiError, BrowserController, BrowserInfo, BrowserInput, BrowserProfile,
-    BrowserSessionInfo, ConnectorUpdate, DEFAULT_PROFILE, MAX_VAULT_DOMAINS, MAX_VAULT_NOTE_CHARS,
-    MAX_VAULT_USERNAME_CHARS, VaultEntry, VaultKind, VaultPut, normalize_vault_domain,
-    valid_vault_name, validate_vault_put,
+    ApiClient, ApiError, BrowserController, BrowserHistory, BrowserInfo, BrowserInput,
+    BrowserProfile, BrowserSessionInfo, ConnectorUpdate, DEFAULT_PROFILE, MAX_VAULT_DOMAINS,
+    MAX_VAULT_ENTRIES, MAX_VAULT_NOTE_CHARS, MAX_VAULT_USERNAME_CHARS, PasswordManager, VaultEntry,
+    VaultKind, VaultPut, VaultSource, normalize_vault_domain, valid_vault_name,
+    valid_vault_reference, validate_vault_put,
 };
 use crate::{ComposioAccount, ComposioApp};
 use std::{
@@ -67,6 +69,18 @@ pub enum PanelOp {
     VaultDelete {
         name: String,
     },
+    /// Password managers: the status list, then save or clear the token
+    /// (write-only).
+    PasswordManagers,
+    PasswordManagerSave {
+        id: String,
+        token: Zeroizing<String>,
+    },
+    PasswordManagerClear(String),
+    /// List the owner's logins from a password manager on this PC (metadata).
+    ImportList(VaultSource),
+    /// Create the reference entries for the picked logins, as (name, write).
+    VaultImport(Vec<(String, VaultPut)>),
     Status,
     Shot(String),
     Takeover(String),
@@ -75,6 +89,10 @@ pub enum PanelOp {
     Input(String, BrowserInput),
     /// Switch to or close a tab (user in control).
     Tab(String, TabAction),
+    /// Open a new tab at a public address (user in control).
+    TabOpen(String, String),
+    /// Back, forward or reload on the active tab (user in control).
+    History(String, BrowserHistory),
     ProfilesList,
     ProfileCreate(String),
     ProfileRename {
@@ -111,6 +129,11 @@ pub enum PanelKind {
     VaultList,
     VaultPut,
     VaultDelete,
+    PasswordManagers,
+    PasswordManagerSave,
+    PasswordManagerClear,
+    ImportList,
+    VaultImport,
     Status,
     Shot,
     Takeover,
@@ -138,12 +161,19 @@ impl PanelOp {
             Self::VaultList => PanelKind::VaultList,
             Self::VaultPut { .. } => PanelKind::VaultPut,
             Self::VaultDelete { .. } => PanelKind::VaultDelete,
+            Self::PasswordManagers => PanelKind::PasswordManagers,
+            Self::PasswordManagerSave { .. } => PanelKind::PasswordManagerSave,
+            Self::PasswordManagerClear(_) => PanelKind::PasswordManagerClear,
+            Self::ImportList(_) => PanelKind::ImportList,
+            Self::VaultImport(_) => PanelKind::VaultImport,
             Self::Status => PanelKind::Status,
             Self::Shot(_) => PanelKind::Shot,
             Self::Takeover(_) => PanelKind::Takeover,
             Self::Handback(_) => PanelKind::Handback,
             Self::Close(_) => PanelKind::Close,
-            Self::Input(..) | Self::Tab(..) => PanelKind::Input,
+            Self::Input(..) | Self::Tab(..) | Self::TabOpen(..) | Self::History(..) => {
+                PanelKind::Input
+            }
             Self::ProfilesList => PanelKind::ProfilesList,
             Self::ProfileCreate(_) | Self::ProfileRename { .. } | Self::ProfileDelete(_) => {
                 PanelKind::ProfileChange
@@ -167,6 +197,11 @@ pub enum PanelReply {
     VaultList(Vec<VaultEntry>),
     VaultSaved(VaultEntry),
     VaultDeleted(String),
+    PasswordManagers(Vec<PasswordManager>),
+    PasswordManagerSaved(PasswordManager),
+    PasswordManagerCleared(String),
+    ImportList(Vec<ImportItem>),
+    VaultImported(usize),
     Sessions(Vec<BrowserSessionInfo>),
     Shot(String, Vec<u8>),
     Control(BrowserSessionInfo),
@@ -297,6 +332,25 @@ fn execute(job: &PanelJob, cache: &mut Option<ApiClient>) -> Result<PanelReply, 
         PanelOp::VaultDelete { name } => client
             .vault_delete(name)
             .map(|()| PanelReply::VaultDeleted(name.clone())),
+        PanelOp::PasswordManagers => client.password_managers().map(PanelReply::PasswordManagers),
+        PanelOp::PasswordManagerSave { id, token } => client
+            .password_manager_save(id, token)
+            .map(PanelReply::PasswordManagerSaved),
+        PanelOp::PasswordManagerClear(id) => client
+            .password_manager_clear(id)
+            .map(|()| PanelReply::PasswordManagerCleared(id.clone())),
+        // Runs the owner's CLI on this PC: metadata only, nothing is stored.
+        PanelOp::ImportList(source) => {
+            vault_import::list_items(*source).map(PanelReply::ImportList)
+        }
+        PanelOp::VaultImport(batch) => {
+            let mut written = 0;
+            for (name, input) in batch {
+                client.vault_put(name, input)?;
+                written += 1;
+            }
+            Ok(PanelReply::VaultImported(written))
+        }
         PanelOp::Status => client.browser_sessions().map(PanelReply::Sessions),
         PanelOp::Shot(id) => client
             .browser_session_screenshot(id)
@@ -312,6 +366,10 @@ fn execute(job: &PanelJob, cache: &mut Option<ApiClient>) -> Result<PanelReply, 
             TabAction::Close(tab) => client.browser_tab_close(id, tab),
         }
         .map(PanelReply::Input),
+        PanelOp::TabOpen(id, url) => client.browser_tab_open(id, url).map(PanelReply::Input),
+        PanelOp::History(id, action) => client
+            .browser_session_history(id, *action)
+            .map(PanelReply::Input),
         PanelOp::ProfilesList => client.browser_profiles().map(PanelReply::Profiles),
         PanelOp::ProfileCreate(name) => client.browser_profile_create(name).map(|profile| {
             PanelReply::ProfileChanged(format!("Added \u{201c}{}\u{201d}.", profile.name))
@@ -390,6 +448,10 @@ pub struct VaultForm {
     pub replacing: bool,
     pub name: String,
     pub kind: VaultKind,
+    /// Where the value comes from: typed here, or a password manager item.
+    pub source: VaultSource,
+    /// The item pointer, for a password manager source. Not a secret.
+    pub reference: String,
     pub username: String,
     pub value: Zeroizing<String>,
     pub domains: Vec<String>,
@@ -406,6 +468,8 @@ impl VaultForm {
             replacing: false,
             name: String::new(),
             kind: VaultKind::Password,
+            source: VaultSource::Local,
+            reference: String::new(),
             username: String::new(),
             value: Zeroizing::new(String::new()),
             domains: Vec::new(),
@@ -423,6 +487,8 @@ impl VaultForm {
         form.replacing = true;
         form.name = entry.name.clone();
         form.kind = entry.kind;
+        form.source = entry.source;
+        form.reference = entry.reference.clone().unwrap_or_default();
         form.username = entry.username.clone().unwrap_or_default();
         form.domains = entry.domains.clone();
         form.note = entry.note.clone().unwrap_or_default();
@@ -478,18 +544,40 @@ impl VaultForm {
         }
         let username = self.username.trim().to_owned();
         let note = self.note.trim().to_owned();
+        let reference = self.reference.trim().to_owned();
+        let is_reference = self.source.is_reference();
         let input = VaultPut {
             kind: self.kind,
             username: (self.kind == VaultKind::Password && !username.is_empty())
                 .then_some(username),
-            value: Zeroizing::new(self.value.to_string()),
+            // A reference holds no value: the password manager supplies it when typed.
+            value: Zeroizing::new(if is_reference {
+                String::new()
+            } else {
+                self.value.to_string()
+            }),
             domains: self.domains.clone(),
             note: (!note.is_empty()).then_some(note),
+            source: self.source,
+            reference: is_reference.then(|| reference.clone()),
         };
         if self.name.is_empty() {
             return Err("Give the secret a name.".into());
         }
-        if self.value.is_empty() {
+        if is_reference {
+            if self.kind == VaultKind::Note {
+                return Err("A note cannot come from a password manager.".into());
+            }
+            if !valid_vault_reference(self.source, &reference) {
+                return Err(match self.source {
+                    VaultSource::ProtonPass => {
+                        "Use pass://vault/item/field, the Proton Pass item and field to read."
+                            .into()
+                    }
+                    _ => "Use op://vault/item/field, the 1Password item and field to read.".into(),
+                });
+            }
+        } else if self.value.is_empty() {
             return Err(match self.kind {
                 VaultKind::Note => "Write the note text.".into(),
                 _ => "Enter the value. It is stored encrypted and never shown again.".into(),
@@ -518,6 +606,17 @@ impl Drop for VaultForm {
     }
 }
 
+/// The import picker: the logins one password manager listed, and which of
+/// them the owner picked. Metadata only; nothing here holds a value.
+#[derive(Default)]
+pub struct ImportPicker {
+    pub source: VaultSource,
+    pub items: Vec<ImportItem>,
+    pub picked: Vec<bool>,
+    pub saving: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Default)]
 pub struct VaultView {
     pub entries: Vec<VaultEntry>,
@@ -528,6 +627,17 @@ pub struct VaultView {
     /// The entry whose Delete is waiting for its confirm step.
     pub confirm_delete: Option<String>,
     pub deleting: Option<String>,
+    /// Password managers and their token/CLI status, once loaded.
+    pub providers: Vec<PasswordManager>,
+    pub providers_loaded: bool,
+    /// The password manager whose token is being saved or cleared.
+    pub provider_busy: Option<String>,
+    pub provider_error: Option<String>,
+    /// The import listing in flight, and the source it is for.
+    pub import_loading: Option<VaultSource>,
+    pub import_error: Option<String>,
+    /// The logins listed for import, while the picker is open.
+    pub import: Option<ImportPicker>,
     pub notice: Option<String>,
     want_list: bool,
 }
@@ -984,6 +1094,37 @@ impl PanelState {
         self.queue_tab(TabAction::Close(tab.to_owned()));
     }
 
+    /// Open a new tab at the address typed in the address bar. Ignored
+    /// unless the user holds control or the address is not a web address.
+    pub fn open_tab(&mut self, raw_address: &str) -> bool {
+        let Some(url) = address_to_url(raw_address) else {
+            return false;
+        };
+        if !self.user_in_control() {
+            return false;
+        }
+        let Some(id) = self.control_target() else {
+            return false;
+        };
+        if self.queue.len() < MAX_QUEUED_INPUTS {
+            self.queue.push_back(PanelOp::TabOpen(id, url));
+        }
+        true
+    }
+
+    /// Back, forward or reload. Ignored unless the user holds control.
+    pub fn history(&mut self, action: BrowserHistory) {
+        if !self.user_in_control() {
+            return;
+        }
+        let Some(id) = self.control_target() else {
+            return;
+        };
+        if self.queue.len() < MAX_QUEUED_INPUTS {
+            self.queue.push_back(PanelOp::History(id, action));
+        }
+    }
+
     fn queue_tab(&mut self, action: TabAction) {
         if !self.user_in_control() || !crate::valid_tab_id(action.tab()) {
             return;
@@ -1236,6 +1377,102 @@ impl PanelState {
         }
     }
 
+    /// Load the password manager status list.
+    pub fn ask_password_managers(&mut self) {
+        self.queue.push_back(PanelOp::PasswordManagers);
+    }
+
+    /// Save the owner's access token for a password manager (write-only).
+    pub fn save_password_manager(&mut self, id: String, token: Zeroizing<String>) {
+        if self.vault.provider_busy.is_some() {
+            return;
+        }
+        self.vault.provider_busy = Some(id.clone());
+        self.vault.provider_error = None;
+        self.queue
+            .push_back(PanelOp::PasswordManagerSave { id, token });
+    }
+
+    /// Forget the owner's access token for a password manager.
+    pub fn clear_password_manager(&mut self, id: &str) {
+        if self.vault.provider_busy.is_some() {
+            return;
+        }
+        self.vault.provider_busy = Some(id.to_owned());
+        self.vault.provider_error = None;
+        self.queue
+            .push_back(PanelOp::PasswordManagerClear(id.to_owned()));
+    }
+
+    /// List the logins of a password manager on this PC, for the picker.
+    pub fn start_import(&mut self, source: VaultSource) {
+        self.vault.import = None;
+        self.vault.import_error = None;
+        self.vault.import_loading = Some(source);
+        self.queue.push_back(PanelOp::ImportList(source));
+    }
+
+    pub fn toggle_import_item(&mut self, index: usize) {
+        if let Some(picked) = self
+            .vault
+            .import
+            .as_mut()
+            .and_then(|picker| picker.picked.get_mut(index))
+        {
+            *picked = !*picked;
+        }
+    }
+
+    pub fn close_import(&mut self) {
+        self.vault.import = None;
+        self.vault.import_loading = None;
+        self.vault.import_error = None;
+    }
+
+    /// Queue one reference entry per picked login. Each gets a unique name,
+    /// its site from the item's URL, and no value: the password manager
+    /// supplies it when the bot types it.
+    pub fn import_picked(&mut self) {
+        let Some(picker) = self.vault.import.as_mut() else {
+            return;
+        };
+        if picker.saving {
+            return;
+        }
+        let mut taken: Vec<String> = self.vault.entries.iter().map(|e| e.name.clone()).collect();
+        let mut batch = Vec::new();
+        for (item, picked) in picker.items.iter().zip(picker.picked.iter()) {
+            if !picked {
+                continue;
+            }
+            let name = vault_import::unique_name(&item.suggested_name, &taken);
+            taken.push(name.clone());
+            batch.push((
+                name,
+                VaultPut {
+                    kind: VaultKind::Password,
+                    username: item.username.clone(),
+                    value: Zeroizing::new(String::new()),
+                    domains: item.domain.iter().cloned().collect(),
+                    note: None,
+                    source: item.source,
+                    reference: Some(item.reference.clone()),
+                },
+            ));
+        }
+        if batch.is_empty() {
+            picker.error = Some("Pick at least one login to import.".into());
+            return;
+        }
+        if taken.len() > MAX_VAULT_ENTRIES {
+            picker.error = Some("The vault holds at most 64 entries. Delete some first.".into());
+            return;
+        }
+        picker.saving = true;
+        picker.error = None;
+        self.queue.push_back(PanelOp::VaultImport(batch));
+    }
+
     // ---- scheduler ----------------------------------------------------
 
     /// The next request to send, if any is due. Call in a loop until `None`.
@@ -1245,7 +1482,10 @@ impl PanelState {
             return Some(PanelOp::VaultList);
         }
         if let Some(front) = self.queue.front() {
-            let is_input = matches!(front, PanelOp::Input(..) | PanelOp::Tab(..));
+            let is_input = matches!(
+                front,
+                PanelOp::Input(..) | PanelOp::Tab(..) | PanelOp::TabOpen(..) | PanelOp::History(..)
+            );
             if !is_input || self.inputs_inflight < MAX_INPUTS_IN_FLIGHT {
                 let op = self.queue.pop_front()?;
                 if is_input {
@@ -1455,6 +1695,46 @@ impl PanelState {
                 self.vault.entries.retain(|e| e.name != name);
                 self.vault.notice = Some(format!("Deleted \u{201c}{name}\u{201d}."));
             }
+            PanelReply::PasswordManagers(providers) => {
+                self.vault.providers = providers;
+                self.vault.providers_loaded = true;
+                self.vault.provider_error = None;
+            }
+            PanelReply::PasswordManagerSaved(manager) => {
+                self.vault.provider_busy = None;
+                self.vault.notice = Some(format!("{} token saved.", manager.name));
+                match self.vault.providers.iter_mut().find(|p| p.id == manager.id) {
+                    Some(existing) => *existing = manager,
+                    None => self.vault.providers.push(manager),
+                }
+            }
+            PanelReply::PasswordManagerCleared(id) => {
+                self.vault.provider_busy = None;
+                if let Some(manager) = self.vault.providers.iter_mut().find(|p| p.id == id) {
+                    manager.configured = false;
+                }
+                self.vault.notice = Some("Token removed.".into());
+            }
+            PanelReply::ImportList(items) => {
+                let source = self.vault.import_loading.take().unwrap_or_default();
+                let picked = vec![false; items.len()];
+                self.vault.import = Some(ImportPicker {
+                    source,
+                    items,
+                    picked,
+                    saving: false,
+                    error: None,
+                });
+            }
+            PanelReply::VaultImported(count) => {
+                self.vault.import = None;
+                self.vault.notice = Some(format!(
+                    "Imported {count} login{} as references. Add a site to any entry that has none.",
+                    if count == 1 { "" } else { "s" }
+                ));
+                self.vault.want_list = true;
+                self.vault.loading = true;
+            }
         }
     }
 
@@ -1539,6 +1819,26 @@ impl PanelState {
                 self.vault.deleting = None;
                 self.vault.error = Some(message);
             }
+            PanelKind::PasswordManagers => {
+                self.vault.provider_error = Some(message);
+            }
+            PanelKind::PasswordManagerSave | PanelKind::PasswordManagerClear => {
+                self.vault.provider_busy = None;
+                self.vault.provider_error = Some(message);
+            }
+            PanelKind::ImportList => {
+                self.vault.import_loading = None;
+                self.vault.import_error = Some(message);
+            }
+            PanelKind::VaultImport => {
+                if let Some(picker) = self.vault.import.as_mut() {
+                    picker.saving = false;
+                    picker.error = Some(message);
+                } else {
+                    self.vault.error = Some(message);
+                }
+                self.vault.want_list = true;
+            }
         }
     }
 }
@@ -1607,6 +1907,26 @@ pub fn host_label(url: Option<&str>) -> String {
         .unwrap_or_else(|| "No page open".to_owned())
 }
 
+/// "1 tab", "3 tabs": the count a grid card shows.
+pub fn tab_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 tab".to_owned()
+    } else {
+        format!("{count} tabs")
+    }
+}
+
+/// "Idle 42s", "Idle 7m", "Idle 3h": how long since the last bot or owner
+/// action. `None` when the server did not say.
+pub fn idle_label(idle_secs: Option<u64>) -> Option<String> {
+    let secs = idle_secs?;
+    Some(match secs {
+        0..=59 => "Idle under a minute".to_owned(),
+        60..=3599 => format!("Idle {}m", secs / 60),
+        _ => format!("Idle {}h", secs / 3600),
+    })
+}
+
 /// The bots that browse with this profile.
 pub fn profile_users(profile: &BrowserProfile) -> &[String] {
     &profile.bots
@@ -1640,6 +1960,8 @@ mod tests {
             pointer: None,
             bot: Some("main".into()),
             conversation_id: Some("dir:main".into()),
+            signin_blocked: None,
+            idle_secs: None,
             updated_at: "2026-11-06T12:00:00Z".into(),
         }
     }
@@ -1660,6 +1982,8 @@ mod tests {
         VaultEntry {
             name: name.into(),
             kind: VaultKind::ApiKey,
+            source: VaultSource::Local,
+            reference: None,
             username: None,
             domains: vec![],
             note: None,
@@ -1966,6 +2290,61 @@ mod tests {
             state.next_op(t0),
             Some(PanelOp::Tab(_, TabAction::Close(tab))) if tab == "t3"
         ));
+    }
+
+    #[test]
+    fn open_tab_and_history_need_user_control() {
+        let mut state = PanelState::new();
+        let t0 = Instant::now();
+        state.apply(
+            done(
+                &state,
+                PanelKind::Status,
+                Ok(PanelReply::Sessions(vec![info(
+                    true,
+                    BrowserController::Bot,
+                )])),
+            ),
+            t0,
+        );
+        assert!(!state.open_tab("https://example.test/a"), "bot in control");
+        state.history(BrowserHistory::Back);
+        assert!(state.queue.is_empty(), "bot in control: ignored");
+        state.apply(
+            done(
+                &state,
+                PanelKind::Takeover,
+                Ok(PanelReply::Control(info(true, BrowserController::User))),
+            ),
+            t0,
+        );
+        // A blank address is refused here; a bare host becomes https.
+        assert!(!state.open_tab("   "));
+        assert!(state.open_tab("example.test/a"));
+        state.history(BrowserHistory::Reload);
+        match state.next_op(t0) {
+            Some(PanelOp::TabOpen(id, url)) => {
+                assert_eq!(id, "default");
+                assert_eq!(url, "https://example.test/a");
+            }
+            _ => panic!("expected a tab open"),
+        }
+        assert!(matches!(
+            state.next_op(t0),
+            Some(PanelOp::History(_, BrowserHistory::Reload))
+        ));
+    }
+
+    #[test]
+    fn labels_for_tab_count_and_idle_time() {
+        assert_eq!(tab_count_label(1), "1 tab");
+        assert_eq!(tab_count_label(3), "3 tabs");
+        assert_eq!(idle_label(None), None);
+        assert_eq!(idle_label(Some(0)).as_deref(), Some("Idle under a minute"));
+        assert_eq!(idle_label(Some(59)).as_deref(), Some("Idle under a minute"));
+        assert_eq!(idle_label(Some(60)).as_deref(), Some("Idle 1m"));
+        assert_eq!(idle_label(Some(3599)).as_deref(), Some("Idle 59m"));
+        assert_eq!(idle_label(Some(3600)).as_deref(), Some("Idle 1h"));
     }
 
     #[test]

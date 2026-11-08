@@ -54,6 +54,7 @@ mod admin;
 mod approvals;
 mod bots;
 mod browser;
+mod cards;
 mod composio;
 mod connectors;
 mod conversations;
@@ -73,6 +74,7 @@ use admin::*;
 use approvals::*;
 use bots::*;
 use browser::*;
+use cards::*;
 use composio::*;
 use connectors::*;
 use conversations::*;
@@ -169,6 +171,10 @@ pub struct ApiState {
     local: Arc<crate::local_relay::LocalRelay>,
     /// Host sampler and cached storage scan behind GET /v1/admin/status.
     sys_status: Arc<crate::sysstatus::StatusMonitor>,
+    /// Card ids with an answer or decline in flight (see `cards::CardClaim`).
+    card_claims: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Password manager CLIs for vault references (see `vault_providers`).
+    vault_providers: Arc<crate::vault_providers::Providers>,
 }
 
 impl ApiState {
@@ -226,6 +232,8 @@ impl ApiState {
             onboarding_drafter: None,
             local: crate::local_relay::LocalRelay::new(),
             sys_status: Arc::new(crate::sysstatus::StatusMonitor::new()),
+            card_claims: Arc::default(),
+            vault_providers: Arc::new(crate::vault_providers::Providers::new(&config.vault)),
             config,
         })
     }
@@ -301,6 +309,8 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/messages", post(send_message))
         .route("/v1/bots", get(list_bots).post(create_bot))
+        .route("/v1/bots/catalog", get(bot_catalog))
+        .route("/v1/bots/catalog/{name}/install", post(install_catalog_bot))
         .route(
             "/v1/bots/{id}",
             get(bot_detail).put(update_bot).delete(delete_bot),
@@ -325,6 +335,11 @@ pub fn router(state: ApiState) -> Router {
             patch(patch_memory).delete(delete_memory),
         )
         .route("/v1/vault", get(list_vault))
+        .route("/v1/vault/providers", get(list_vault_providers))
+        .route(
+            "/v1/vault/providers/{id}",
+            put(put_vault_provider).delete(delete_vault_provider),
+        )
         .route("/v1/vault/{name}", put(put_vault).delete(delete_vault))
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/{id}/key", put(set_provider_key))
@@ -412,6 +427,16 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/conversations/{id}/library", get(conversation_library))
         .route("/v1/conversations/{id}/plan", get(get_conversation_plan))
+        .route("/v1/conversations/{id}/cards", get(list_conversation_cards))
+        .route("/v1/cards/{id}/answer", post(answer_card))
+        .route("/v1/cards/{id}/decline", post(decline_card))
+        // A secret value is at most 8 KiB; the route reads no more than 16 KiB.
+        .route(
+            "/v1/cards/{id}/secret",
+            post(submit_secret_card).layer(axum::extract::DefaultBodyLimit::max(
+                SECRET_BODY_LIMIT_BYTES,
+            )),
+        )
         .route("/v1/conversations/{id}/cancel", post(cancel_conversation))
         .route(
             "/v1/conversations/{id}/auto-approve",

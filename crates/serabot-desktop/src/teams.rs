@@ -151,6 +151,7 @@ mod tests {
             enabled,
             live: true,
             display_name: Some(id.into()),
+            title: None,
             description: None,
             avatar: None,
             avatar_version: None,

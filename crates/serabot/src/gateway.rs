@@ -26,6 +26,7 @@ use crate::store::Store;
 use crate::user_secrets::UserSecrets;
 use crate::util::{canonical_hash, canonical_json, sha256_hex, truncate_chars};
 use crate::vault::Redactor;
+use crate::vault_providers::ResolvedValues;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -122,11 +123,47 @@ pub trait Tool: Send + Sync {
         Ok(ApprovalDetails::default())
     }
 
+    /// The approval text and destination for this call. Defaults to
+    /// [`Tool::approval_details`]. A tool whose destination is known only at
+    /// run time (the page a browser secret is typed into) overrides it.
+    async fn approval_details_for(
+        &self,
+        args: &Value,
+        _context: &ToolContext,
+    ) -> Result<ApprovalDetails> {
+        self.approval_details(args)
+    }
+
+    /// The destination this call would act on right now. When `Some`, an
+    /// approved action is dispatched only if its approved destination is the
+    /// same; otherwise it is invalidated and needs a new approval. `None`
+    /// (the default) skips the check.
+    async fn live_destination(
+        &self,
+        _args: &Value,
+        _context: &ToolContext,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Whether the conversation's auto-approve switch may approve this call
+    /// without the owner. Defaults to yes.
+    async fn auto_approve_allowed(&self, _args: &Value, _context: &ToolContext) -> bool {
+        true
+    }
+
     /// Whether this call needs approval. Defaults to the central destructive
     /// list by tool name; a tool whose risk depends on its arguments (for
     /// example a Composio slug) overrides it.
     fn requires_approval(&self, _args: &Value) -> bool {
         self.spec().destructive()
+    }
+
+    /// Whether the owner's "always" choice may remember this call. A call that
+    /// is too sensitive for a standing grant (a vault secret typed into a
+    /// page) returns false: "always" then acts as "once" and asks again.
+    fn allow_standing_grant(&self, _args: &Value) -> bool {
+        true
     }
 
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput>;
@@ -221,6 +258,8 @@ pub struct Gateway {
     respect_bot_lists: bool,
     /// Vault redaction source; `None` leaves tool output untouched.
     vault: Option<Arc<UserSecrets>>,
+    /// Values recently read from a password manager, scrubbed with the vault.
+    resolved: Arc<ResolvedValues>,
 }
 
 impl Gateway {
@@ -239,6 +278,7 @@ impl Gateway {
             standing_consent,
             respect_bot_lists: false,
             vault: None,
+            resolved: Arc::default(),
         }
     }
 
@@ -256,6 +296,13 @@ impl Gateway {
         self
     }
 
+    /// The password manager values the redactor also scrubs. Pass the same
+    /// registry the browser fills read through (`Providers::resolved_values`).
+    pub fn with_resolved_values(mut self, resolved: Arc<ResolvedValues>) -> Self {
+        self.resolved = resolved;
+        self
+    }
+
     /// The per-user secret store, when the gateway was built with one. Only
     /// per-user adapters (for example Mem0) read secrets through it, always
     /// under the acting user's id.
@@ -267,7 +314,7 @@ impl Gateway {
     /// the vault cannot be read, the text is not returned.
     pub fn redact_text(&self, user_id: &str, text: &str) -> Result<String> {
         match &self.vault {
-            Some(users) => Ok(Redactor::for_user(users, user_id)?.redact(text)),
+            Some(users) => Ok(Redactor::for_user(users, user_id, &self.resolved)?.redact(text)),
             None => Ok(text.to_owned()),
         }
     }
@@ -283,7 +330,7 @@ impl Gateway {
         let Some(users) = &self.vault else {
             return Ok(messages.to_vec());
         };
-        let redactor = Redactor::for_user(users, user_id)?;
+        let redactor = Redactor::for_user(users, user_id, &self.resolved)?;
         if redactor.is_empty() {
             return Ok(messages.to_vec());
         }
@@ -315,7 +362,7 @@ impl Gateway {
             return output;
         };
         let mut output = output?;
-        let redactor = Redactor::for_user(users, &context.user_id)?;
+        let redactor = Redactor::for_user(users, &context.user_id, &self.resolved)?;
         if redactor.is_empty() {
             return Ok(output);
         }
@@ -372,20 +419,24 @@ impl Gateway {
             .registry
             .get(name)
             .ok_or_else(|| SeraError::NotFound(format!("tool {name}")))?;
-        let spec = tool.spec();
         let canonical = canonical_json(&args)?;
         let hash = canonical_hash(&args)?;
 
         if tool.requires_approval(&args)
             || (self.respect_bot_lists && context.require_approval.contains(name))
         {
-            if let Some(output) = self.check_standing_grant(&spec, &args, &hash, context)? {
+            if let Some(output) = self
+                .check_standing_grant(tool.as_ref(), &args, &hash, context)
+                .await?
+            {
                 return self.dispatch(tool.as_ref(), args, context, output).await;
             }
             let outcome = self
-                .request_approval(tool.as_ref(), args, context, &canonical, &hash)
+                .request_approval(tool.as_ref(), args.clone(), context, &canonical, &hash)
                 .await?;
-            return self.maybe_auto_approve(outcome, &canonical, context).await;
+            return self
+                .maybe_auto_approve(tool.as_ref(), outcome, &args, &canonical, context)
+                .await;
         }
 
         let started = std::time::Instant::now();
@@ -405,7 +456,9 @@ impl Gateway {
     /// never auto-approved; it stays pending for the owner.
     async fn maybe_auto_approve(
         &self,
+        tool: &dyn Tool,
         outcome: ToolOutcome,
+        args: &Value,
         canonical: &str,
         context: &ToolContext,
     ) -> Result<ToolOutcome> {
@@ -422,6 +475,7 @@ impl Gateway {
         };
         if !self.store.yolo_enabled(&context.user_id, conversation_id)
             || !self.policy.is_allowed(canonical)
+            || !tool.auto_approve_allowed(args, context).await
         {
             return Ok(outcome);
         }
@@ -441,18 +495,18 @@ impl Gateway {
         )?;
         self.execute_approved(action_id, context).await
     }
-    fn check_standing_grant(
+    async fn check_standing_grant(
         &self,
-        spec: &ToolSpec,
+        tool: &dyn Tool,
         args: &Value,
         hash: &str,
         context: &ToolContext,
     ) -> Result<Option<ToolOutput>> {
-        let _ = (spec, args, context);
-        let details = match self.registry.get(&spec.name) {
-            Some(tool) => tool.approval_details(args)?,
-            None => ApprovalDetails::default(),
-        };
+        if !tool.allow_standing_grant(args) {
+            return Ok(None);
+        }
+        let spec = tool.spec();
+        let details = tool.approval_details_for(args, context).await?;
         if self.store.matching_grant(
             &context.user_id,
             &spec.name,
@@ -484,7 +538,7 @@ impl Gateway {
         hash: &str,
     ) -> Result<ToolOutcome> {
         let spec = tool.spec();
-        let mut details = tool.approval_details(&args)?;
+        let mut details = tool.approval_details_for(&args, context).await?;
         let preview = truncate_chars(canonical, 600);
         let combined = format!("{}\nPayload: {preview}", details.summary);
         if self.policy.is_allowed(&combined) {
@@ -650,6 +704,39 @@ impl Gateway {
                 "approved tool is no longer allowlisted".into(),
             ));
         }
+        // A destination that moved since approval (a browser page that
+        // navigated, say) needs a new approval, not this one.
+        let live = match tool.live_destination(&args, context).await {
+            Ok(live) => live,
+            Err(error) => {
+                self.store.update_action(
+                    &context.user_id,
+                    action_id,
+                    "failed",
+                    Some(&serde_json::json!({"error": error.to_string()})),
+                )?;
+                return Err(error);
+            }
+        };
+        if let Some(live) = live
+            && action.destination.as_deref() != Some(live.as_str())
+        {
+            self.store
+                .update_action(&context.user_id, action_id, "invalidated", None)?;
+            self.store.record_audit(
+                &context.actor,
+                "approval.destination_changed",
+                Some(&action.tool),
+                context.task_id.as_deref(),
+                None,
+                Some(action_id),
+                Some(self.policy.version()),
+                None,
+            )?;
+            return Err(SeraError::InvalidState(
+                "the destination changed since approval; approve it again".into(),
+            ));
+        }
         let started = std::time::Instant::now();
         let output = self.redact_output(context, tool.execute(args, context).await);
         let succeeded = output.is_ok();
@@ -800,6 +887,16 @@ impl Gateway {
         Ok(())
     }
 
+    /// Whether the action's tool allows a standing grant for its arguments. A
+    /// tool that is no longer registered allows none.
+    fn standing_grant_allowed(&self, action: &Action) -> bool {
+        let Some(tool) = self.registry.get(&action.tool) else {
+            return false;
+        };
+        serde_json::from_str::<Value>(&action.canonical_args)
+            .is_ok_and(|args| tool.allow_standing_grant(&args))
+    }
+
     /// Apply an approval decision for the acting user.
     ///
     /// The decision resolves within the acting user's rows: reads and writes
@@ -833,6 +930,14 @@ impl Gateway {
             )?;
             return Err(SeraError::PolicyViolation);
         }
+        // "Always" remembers the call. The tool may refuse that for this call
+        // (a vault secret typed into a page): the choice then covers this
+        // action only, and the next identical call asks again.
+        let decision = if decision == Decision::Always && !self.standing_grant_allowed(&action) {
+            Decision::Once
+        } else {
+            decision
+        };
         match decision {
             Decision::Deny => {
                 if !self.store.transition_approval(
@@ -1082,6 +1187,219 @@ mod tests {
         );
     }
 
+    /// A tool whose destination is the page it is on, like a browser secret
+    /// fill: the approval binds the destination, and the gateway re-checks it.
+    struct LiveDestTool {
+        calls: Arc<AtomicUsize>,
+        page: Arc<std::sync::Mutex<String>>,
+        auto_ok: bool,
+    }
+
+    #[async_trait]
+    impl Tool for LiveDestTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "onedrive_upload".into(),
+                description: "fake live destination".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                external_effect: true,
+            }
+        }
+
+        fn requires_approval(&self, _args: &Value) -> bool {
+            true
+        }
+
+        async fn approval_details_for(
+            &self,
+            _args: &Value,
+            _context: &ToolContext,
+        ) -> Result<ApprovalDetails> {
+            let page = self.page.lock().unwrap().clone();
+            Ok(ApprovalDetails {
+                summary: format!("type on {page}"),
+                destination: Some(format!("vault:bank → {page}")),
+                artifact_hash: None,
+            })
+        }
+
+        async fn live_destination(
+            &self,
+            _args: &Value,
+            _context: &ToolContext,
+        ) -> Result<Option<String>> {
+            let page = self.page.lock().unwrap().clone();
+            Ok(Some(format!("vault:bank → {page}")))
+        }
+
+        async fn auto_approve_allowed(&self, _args: &Value, _context: &ToolContext) -> bool {
+            self.auto_ok
+        }
+
+        // Like a vault secret fill: "always" never remembers it.
+        fn allow_standing_grant(&self, _args: &Value) -> bool {
+            false
+        }
+
+        async fn execute(&self, _args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutput {
+                content: "typed".into(),
+                ..ToolOutput::default()
+            })
+        }
+    }
+
+    fn live_setup(
+        auto_ok: bool,
+        page: &str,
+    ) -> (
+        Gateway,
+        Arc<AtomicUsize>,
+        Arc<std::sync::Mutex<String>>,
+        ToolContext,
+    ) {
+        let store = Store::open_in_memory(384).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let page = Arc::new(std::sync::Mutex::new(page.to_owned()));
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(LiveDestTool {
+                calls: calls.clone(),
+                page: page.clone(),
+                auto_ok,
+            })
+            .unwrap();
+        let gateway = Gateway::new(store.clone(), Arc::new(Policy::empty()), registry, 1, false);
+        let admin = gateway.store().admin_user_id().unwrap();
+        let task = gateway
+            .store()
+            .enqueue_task(
+                &admin,
+                "turn",
+                "main",
+                &serde_json::json!({}),
+                0,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let context = ToolContext {
+            user_id: admin.clone(),
+            actor: admin,
+            bot: "main".into(),
+            task_id: Some(task.id),
+            turn_id: None,
+            conversation_id: Some("dir:live".into()),
+            allowed_tools: ["onedrive_upload".to_string()].into_iter().collect(),
+            require_approval: HashSet::new(),
+        };
+        (gateway, calls, page, context)
+    }
+
+    #[tokio::test]
+    async fn an_approved_destination_that_moved_is_not_dispatched() {
+        let (gateway, calls, page, context) = live_setup(false, "login.bank.example");
+        let ToolOutcome::PendingApproval {
+            approval_id,
+            action_id,
+            destination,
+            ..
+        } = gateway
+            .execute(
+                "onedrive_upload",
+                serde_json::json!({"field": "password"}),
+                &context,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected approval");
+        };
+        assert_eq!(
+            destination.as_deref(),
+            Some("vault:bank → login.bank.example")
+        );
+        // The page navigates elsewhere while the owner decides.
+        *page.lock().unwrap() = "evil.example".into();
+        gateway
+            .decide(&context.user_id, &approval_id, Decision::Once)
+            .unwrap();
+        assert!(matches!(
+            gateway.execute_approved(&action_id, &context).await,
+            Err(SeraError::InvalidState(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let action = gateway
+            .store()
+            .get_action(&context.user_id, &action_id)
+            .unwrap();
+        assert_eq!(action.status, "invalidated");
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_destination_dispatches_after_approval() {
+        let (gateway, calls, _page, context) = live_setup(false, "login.bank.example");
+        let ToolOutcome::PendingApproval {
+            approval_id,
+            action_id,
+            ..
+        } = gateway
+            .execute(
+                "onedrive_upload",
+                serde_json::json!({"field": "password"}),
+                &context,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected approval");
+        };
+        gateway
+            .decide(&context.user_id, &approval_id, Decision::Once)
+            .unwrap();
+        gateway
+            .execute_approved(&action_id, &context)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn yolo_approves_only_calls_the_tool_allows() {
+        let store_check = |gateway: &Gateway, context: &ToolContext| {
+            gateway
+                .store()
+                .set_yolo(&context.user_id, "dir:live", true)
+                .unwrap();
+        };
+        // The tool refuses: the call stays pending for the owner even with yolo on.
+        let (gateway, calls, _page, context) = live_setup(false, "login.bank.example");
+        store_check(&gateway, &context);
+        let outcome = gateway
+            .execute(
+                "onedrive_upload",
+                serde_json::json!({"field": "password"}),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ToolOutcome::PendingApproval { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // The tool allows it: yolo approves and the call runs.
+        let (gateway, calls, _page, context) = live_setup(true, "login.bank.example");
+        store_check(&gateway, &context);
+        let outcome = gateway
+            .execute(
+                "onedrive_upload",
+                serde_json::json!({"field": "password"}),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ToolOutcome::Completed(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn always_approval_only_matches_exact_arguments() {
         let (gateway, calls, context) = setup();
@@ -1119,6 +1437,72 @@ mod tests {
             .unwrap();
         assert!(matches!(changed, ToolOutcome::PendingApproval { .. }));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn always_is_downgraded_for_a_call_the_tool_will_not_remember() {
+        let (gateway, calls, _page, context) = live_setup(false, "login.bank.example");
+        let args = serde_json::json!({"field": "password"});
+        let ToolOutcome::PendingApproval {
+            approval_id,
+            action_id,
+            ..
+        } = gateway
+            .execute("onedrive_upload", args.clone(), &context)
+            .await
+            .unwrap()
+        else {
+            panic!("expected approval");
+        };
+        // The owner picks "always": the approval is recorded as once only.
+        let decided = gateway
+            .decide(&context.user_id, &approval_id, Decision::Always)
+            .unwrap();
+        assert_eq!(decided.approval.state, ApprovalState::ApprovedOnce.as_str());
+        gateway
+            .execute_approved(&action_id, &context)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // No grant was left behind, so the same call asks again.
+        let again = gateway
+            .execute("onedrive_upload", args.clone(), &context)
+            .await
+            .unwrap();
+        assert!(matches!(again, ToolOutcome::PendingApproval { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_standing_grant_row_is_ignored_for_a_call_the_tool_will_not_remember() {
+        let (gateway, calls, _page, context) = live_setup(false, "login.bank.example");
+        let args = serde_json::json!({"field": "password"});
+        let ToolOutcome::PendingApproval { approval_id, .. } = gateway
+            .execute("onedrive_upload", args.clone(), &context)
+            .await
+            .unwrap()
+        else {
+            panic!("expected approval");
+        };
+        // A grant row that matches this call exactly, as an older build could
+        // have written it. The gateway must not honour it.
+        gateway
+            .store()
+            .insert_grant(
+                &context.user_id,
+                "onedrive_upload",
+                &canonical_hash(&args).unwrap(),
+                Some("vault:bank → login.bank.example"),
+                gateway.policy().version(),
+                &approval_id,
+            )
+            .unwrap();
+        let outcome = gateway
+            .execute("onedrive_upload", args, &context)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ToolOutcome::PendingApproval { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1750,6 +2134,8 @@ mod tests {
                 value: zeroize::Zeroizing::new(value.into()),
                 domains: vec![],
                 note: None,
+                source: crate::vault::VaultSource::Local,
+                reference: None,
             },
         )
         .unwrap();

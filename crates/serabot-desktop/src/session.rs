@@ -1195,6 +1195,7 @@ impl Session {
         self.panel.set_page_open(section == Section::Browser);
         if section == Section::Vault {
             self.panel.ask_vault_list();
+            self.panel.ask_password_managers();
         }
         if section == Section::Usage {
             self.load_usage_days(self.usage_days);
@@ -1943,7 +1944,14 @@ impl Session {
             .listed_bots
             .iter()
             .find(|bot| bot.id == id)
-            .and_then(|bot| bot.display_name.clone())
+            // The server already falls back to the title; this covers an
+            // older or sparse reply before the id is humanized.
+            .and_then(|bot| {
+                bot.display_name
+                    .clone()
+                    .filter(|name| !name.trim().is_empty())
+                    .or_else(|| bot.title.clone())
+            })
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| humanize_label(id))
     }
@@ -2479,6 +2487,24 @@ impl Session {
     pub fn decide(&mut self, id: String, decision: ApprovalDecision) {
         self.state.error = None;
         self.start_request(Operation::Decide { id, decision });
+    }
+
+    /// The owner's answer to a question card. The server posts it as a message.
+    pub fn answer_card(&mut self, id: String, answer: String) {
+        self.state.error = None;
+        self.start_request(Operation::AnswerCard { id, answer });
+    }
+
+    /// Dismiss a pending card (a question or a secret request).
+    pub fn decline_card(&mut self, id: String) {
+        self.state.error = None;
+        self.start_request(Operation::DeclineCard { id });
+    }
+
+    /// Send the value for a secret request. The caller clears its own copy.
+    pub fn submit_secret_card(&mut self, id: String, value: zeroize::Zeroizing<String>) {
+        self.state.error = None;
+        self.start_request(Operation::SubmitSecretCard { id, value });
     }
 
     pub fn refresh_section_data(&mut self, operation: Operation) {
@@ -3121,6 +3147,11 @@ impl Session {
                         OperationKind::Decide => {
                             self.schedule(Operation::Approvals, Duration::ZERO);
                         }
+                        // The answer or decline posted a message: read the transcript
+                        // and the cards together.
+                        OperationKind::CardWrite => {
+                            self.schedule(Operation::History, Duration::ZERO);
+                        }
                         OperationKind::CreateSkill => {
                             self.schedule(Operation::ListSkills, Duration::ZERO);
                         }
@@ -3135,6 +3166,16 @@ impl Session {
                         }
                         OperationKind::ListBots => {
                             self.continue_after_bots();
+                        }
+                        // The sheet reads the fresh catalog, then the bot list
+                        // follows so a bot just added reaches the rail and picker.
+                        OperationKind::BotCatalog | OperationKind::BotInstall => {
+                            let next = if completion.kind == OperationKind::BotInstall {
+                                Operation::BotCatalog
+                            } else {
+                                Operation::ListBots
+                            };
+                            self.schedule(next, Duration::ZERO);
                         }
                         OperationKind::Avatar => {
                             self.avatar_op = None;
@@ -4898,6 +4939,17 @@ mod tests {
             event_refresh("message", "room:review"),
             EventRefresh::History
         );
+    }
+
+    #[test]
+    fn card_events_reload_the_transcript_that_carries_the_cards() {
+        for kind in ["card.created", "card.resolved"] {
+            assert_eq!(
+                event_refresh(kind, "dir:analyst"),
+                EventRefresh::History,
+                "{kind}"
+            );
+        }
     }
 
     #[test]

@@ -1,4 +1,6 @@
 name = "main"
+title = "Main"
+description = "Your front door. Answers directly, routes requests to the right teammate, and searches your documents."
 role = "orchestrator"
 delegates = [
   "analyst",
@@ -16,6 +18,7 @@ trigger = "command"
 system_prompt = "prompts/main.txt"
 skills = ["triage", "ask", "firecrawl", "audio", "elevenlabs", "scheduler", "skill-creator"]
 tools = [
+  "ask_user",
   "delegate",
   "skill_list",
   "skill_search",
@@ -66,6 +69,7 @@ tools = [
   "elevenlabs_generate_image",
   "elevenlabs_generate_video",
   "vault_list",
+  "vault_request_secret",
   "browser_navigate",
   "browser_snapshot",
   "browser_click",

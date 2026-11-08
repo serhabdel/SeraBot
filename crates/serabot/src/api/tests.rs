@@ -9,6 +9,7 @@ use axum::http::Request;
 use tower::ServiceExt;
 
 mod browser_api;
+mod cards_api;
 mod chat_api;
 mod composio_api;
 mod files_api;
@@ -55,6 +56,8 @@ fn app_with_root(
 fn test_bot(name: &str, role: crate::orchestration::BotRole) -> LoadedBot {
     LoadedBot {
         config: BotConfig {
+            title: None,
+            description: None,
             name: name.into(),
             trigger: "command".into(),
             model: None,

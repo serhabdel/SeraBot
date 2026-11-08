@@ -1,8 +1,11 @@
 name = "courier"
+title = "Courier"
+description = "Drafts Telegram messages for you to approve, and sends a file from your artifact store to your own chat after approval."
 trigger = "command"
 system_prompt = "prompts/courier.txt"
 skills = ["messaging-etiquette"]
 tools = [
+  "ask_user",
   "skill_list",
   "skill_search",
   "skill_load",

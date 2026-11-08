@@ -1001,6 +1001,8 @@ mod tests {
         let catalog = SkillCatalog::load(&config).unwrap();
         let bots = vec![LoadedBot {
             config: BotConfig {
+                title: None,
+                description: None,
                 name: "main".into(),
                 trigger: "command".into(),
                 model: None,
@@ -1037,6 +1039,8 @@ mod tests {
         let catalog = Arc::new(SkillCatalog::load(&config).unwrap());
         let bots = vec![LoadedBot {
             config: BotConfig {
+                title: None,
+                description: None,
                 name: "main".into(),
                 trigger: "command".into(),
                 model: None,
@@ -1127,6 +1131,8 @@ mod tests {
                 .load_allowed_body(
                     &LoadedBot {
                         config: BotConfig {
+                            title: None,
+                            description: None,
                             name: "main".into(),
                             trigger: "command".into(),
                             model: None,

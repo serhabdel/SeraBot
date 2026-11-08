@@ -8,6 +8,7 @@ use crate::ui::{Icon, Overlay, avatar_style, group_avatar_style, human_model, hu
 use dioxus::prelude::*;
 use serabot_desktop::capabilities;
 use serabot_desktop::session::{ImageSlot, Section, Session};
+use serabot_desktop::state::{meet_order, shipped_label};
 use serabot_desktop::{AVATAR_FILE_ACCEPT, MAX_AVATAR_UPLOAD_BYTES, MAX_TEAM_MEMBERS, preview_id};
 
 /// Choose an image from disk. The bytes are read off the UI event and handed
@@ -438,6 +439,112 @@ pub fn NewGroupSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Elem
 }
 
 /// The chat that opens right after a bot is created.
+/// "Meet your team": every shipped bot, with "Add to my team" for the ones the
+/// owner does not have yet. Installed ones show a badge instead.
+#[component]
+pub fn MeetTeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
+    let mut overlay = overlay;
+    let (rows, loaded, installing, error) = {
+        let state = session.read();
+        let rows = meet_order(&state.state.shipped_bots)
+            .into_iter()
+            .map(|bot| {
+                let name = shipped_label(bot);
+                let letter = name
+                    .chars()
+                    .next()
+                    .map(|c| c.to_uppercase().to_string())
+                    .unwrap_or_else(|| "B".into());
+                (
+                    bot.id.clone(),
+                    name,
+                    letter,
+                    bot.role.clone(),
+                    bot.description.clone().unwrap_or_default(),
+                    bot.installed,
+                )
+            })
+            .collect::<Vec<_>>();
+        (
+            rows,
+            state.state.shipped_loaded,
+            state.state.shipped_installing.clone(),
+            state.state.shipped_error.clone(),
+        )
+    };
+    rsx! {
+        div { class: "scrim open", onclick: move |_| overlay.set(Overlay::None) }
+        div {
+            class: "sheet open wide",
+            role: "dialog",
+            "aria-label": "Meet your team",
+            onkeydown: move |event: KeyboardEvent| {
+                if event.key() == Key::Escape {
+                    overlay.set(Overlay::None);
+                }
+            },
+            div { class: "sheet-head",
+                h2 { class: "sheet-title", "Meet your team" }
+                button {
+                    class: "icon-btn escape-close",
+                    title: "Close",
+                    "aria-label": "Close",
+                    onclick: move |_| overlay.set(Overlay::None),
+                    Icon { name: "x", size: 16 }
+                }
+            }
+            div { class: "sheet-body",
+                p { class: "hint", "The bots SeraBot ships. Each one you add becomes your own bot." }
+                if let Some(message) = error {
+                    div { class: "banner err", span { "{message}" } }
+                }
+                if !loaded {
+                    div { class: "row",
+                        span { class: "spinner", title: "Loading the team" }
+                        span { class: "hint", "Loading the team…" }
+                    }
+                } else if rows.is_empty() {
+                    p { class: "hint", "No shipped bots are available on this server." }
+                }
+                div { class: "roster",
+                    for (id, name, letter, role, description, installed) in rows {
+                        div { key: "{id}", class: "roster-row",
+                            span { class: "avatar lg bot", style: avatar_style(&id), "{letter}" }
+                            span { class: "meet-copy",
+                                span { class: "thread-title", "{name}" }
+                                span { class: "thread-meta", "{role}" }
+                                if !description.is_empty() {
+                                    span { class: "hint meet-desc", "{description}" }
+                                }
+                            }
+                            if installed {
+                                span { class: "chip ok", "In your team" }
+                            } else {
+                                button {
+                                    class: "btn primary sm",
+                                    disabled: installing.is_some(),
+                                    onclick: {
+                                        let id = id.clone();
+                                        move |_| session.write().install_shipped_bot(id.clone())
+                                    },
+                                    if installing.as_deref() == Some(id.as_str()) {
+                                        "Adding…"
+                                    } else {
+                                        "Add to my team"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            div { class: "sheet-foot",
+                button { class: "btn ghost", onclick: move |_| overlay.set(Overlay::None), "Done" }
+            }
+        }
+    }
+}
+
 #[component]
 pub fn OnboardingView(session: Signal<Session>) -> Element {
     let ui = {

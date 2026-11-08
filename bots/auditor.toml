@@ -1,8 +1,11 @@
 name = "auditor"
+title = "Auditor"
+description = "Plans audits and internal control reviews, runs reconciliation checks, and lists the evidence each test needs."
 trigger = "file"
 system_prompt = "prompts/auditor.txt"
 skills = ["audit-checklist", "bank-reconciliation", "ma-tax-2026", "pcm-cgnc"]
 tools = [
+  "ask_user",
   "skill_list",
   "skill_search",
   "skill_load",

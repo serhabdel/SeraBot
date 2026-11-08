@@ -3,9 +3,12 @@
 //! The grid shows one card per open browser with a live picture (about one
 //! refresh a second, only while this page is on screen and the window has
 //! focus), the profile name, the address, which bot is driving and who holds
-//! control. A click opens the focus view: the browser large on the left, the
-//! conversation of the bot driving it on the right. Below the grid, the
-//! profiles section lists, adds, renames and deletes profiles.
+//! control and how many tabs it has. A click opens the focus view: the browser
+//! large on the left, the conversation of the bot driving it on the right. The
+//! focus view shows every tab; the owner who takes control also gets back,
+//! forward, reload, an address bar and "+" for a new tab. A provider that
+//! refuses sign-in in this browser gets a banner. Below the grid, the profiles
+//! section lists, adds, renames and deletes profiles.
 //!
 //! The pictures, polling and 429 back-off live in `panel.rs`; this file draws
 //! and forwards clicks. Pointer and key capture on the large picture is done
@@ -13,10 +16,13 @@
 
 use crate::ui::{ChatView, Icon, Overlay, avatar_style};
 use dioxus::prelude::*;
-use serabot_desktop::panel::{address_to_url, host_label, profile_users};
-use serabot_desktop::session::Session;
+use serabot_desktop::panel::{
+    address_to_url, host_label, idle_label, profile_users, tab_count_label,
+};
+use serabot_desktop::session::{Section, Session};
 use serabot_desktop::{
-    BrowserController, BrowserInput, BrowserPointer, BrowserSessionInfo, BrowserTab,
+    BrowserController, BrowserHistory, BrowserInput, BrowserPointer, BrowserSessionInfo,
+    BrowserTab, MAX_BROWSER_TABS, SigninBlocked,
 };
 
 /// A grid card: the session, its latest picture, and the bot driving it.
@@ -68,12 +74,20 @@ fn tab_label(tab: &BrowserTab) -> String {
     }
 }
 
-/// The tab strip above the page. Switching and closing need control, like
-/// typing into the page does.
+/// The tab strip above the page: every tab the browser has, the active one
+/// marked. Switching, closing and "+" need control, like typing into the page
+/// does; without control the tabs are shown read-only.
 #[component]
-fn TabStrip(session: Signal<Session>, tabs: Vec<BrowserTab>, in_control: bool) -> Element {
+fn TabStrip(
+    session: Signal<Session>,
+    tabs: Vec<BrowserTab>,
+    in_control: bool,
+    opening: Signal<bool>,
+) -> Element {
     let mut session = session;
+    let mut opening = opening;
     let only = tabs.len() <= 1;
+    let full = tabs.len() >= MAX_BROWSER_TABS;
     rsx! {
         div { class: "tab-strip", role: "tablist", "aria-label": "Browser tabs",
             for tab in tabs {
@@ -88,7 +102,7 @@ fn TabStrip(session: Signal<Session>, tabs: Vec<BrowserTab>, in_control: bool) -
                                 role: "tab",
                                 "aria-selected": if tab.active { "true" } else { "false" },
                                 title: if in_control { "{tab.url}" } else { "Take control to switch tabs" },
-                                disabled: !in_control && !tab.active,
+                                disabled: !in_control,
                                 onclick: move |_| session.write().panel.switch_tab(&switch_id),
                                 "{label}"
                             }
@@ -104,6 +118,40 @@ fn TabStrip(session: Signal<Session>, tabs: Vec<BrowserTab>, in_control: bool) -
                         }
                     }
                 }
+            }
+            if in_control {
+                button {
+                    class: "tab-add",
+                    title: if full { "At most 8 tabs; close one first" } else { "New tab: type an address" },
+                    "aria-label": "New tab",
+                    disabled: full,
+                    onclick: move |_| {
+                        // The address bar takes the next address as a new tab.
+                        opening.set(true);
+                        let _ = dioxus::document::eval(FOCUS_ADDRESS_JS);
+                    },
+                    Icon { name: "plus", size: 14 }
+                }
+            }
+        }
+    }
+}
+
+/// Focus the address field when "+" asks for a new tab.
+const FOCUS_ADDRESS_JS: &str = "document.getElementById('browser-address')?.focus();";
+
+/// The sign-in refusal banner: the page refuses this automated browser. The
+/// button goes to the Connectors page, where the supported route lives.
+#[component]
+fn SigninBanner(session: Signal<Session>, block: SigninBlocked) -> Element {
+    let mut session = session;
+    rsx! {
+        div { class: "signin-banner", role: "alert",
+            p { class: "signin-banner-text", "{block.message}" }
+            button {
+                class: "btn ghost sm",
+                onclick: move |_| session.write().open_section(Section::Connectors),
+                "Open Connectors"
             }
         }
     }
@@ -164,6 +212,10 @@ fn BrowserGrid(session: Signal<Session>) -> Element {
                                 let host = host_label(info.url.as_deref());
                                 let id = info.id.clone();
                                 let title = info.title.clone().unwrap_or_default();
+                                let tabs_text = (!info.tabs.is_empty())
+                                    .then(|| tab_count_label(info.tabs.len()));
+                                let idle = if info.active { idle_label(info.idle_secs) } else { None };
+                                let refused = info.signin_blocked.is_some();
                                 rsx! {
                                     div { key: "{info.id}", class: "browser-card",
                                         button {
@@ -183,6 +235,17 @@ fn BrowserGrid(session: Signal<Session>) -> Element {
                                                     span { class: "{pill}", "{label}" }
                                                 }
                                                 span { class: "browser-host", title: "{title}", "{host}" }
+                                                div { class: "browser-meta",
+                                                    if let Some(text) = tabs_text {
+                                                        span { "{text}" }
+                                                    }
+                                                    if let Some(text) = idle {
+                                                        span { "{text}" }
+                                                    }
+                                                    if refused {
+                                                        span { class: "browser-flag", "Sign-in refused" }
+                                                    }
+                                                }
                                                 if let Some((bot_id, name)) = bot {
                                                     span { class: "browser-bot",
                                                         span { class: "avatar sm bot", style: avatar_style(&bot_id),
@@ -409,6 +472,8 @@ fn FocusView(session: Signal<Session>, overlay: Signal<Overlay>, id: String) -> 
     let mut session = session;
     let mut full = use_signal(|| false);
     let mut editing = use_signal(|| false);
+    // "+" was pressed: the next address typed opens a new tab.
+    let mut opening = use_signal(|| false);
     let mut draft = use_signal(String::new);
     let mut confirm_end = use_signal(|| false);
     let (info, shot, busy, error, bot, in_control) = {
@@ -424,6 +489,7 @@ fn FocusView(session: Signal<Session>, overlay: Signal<Overlay>, id: String) -> 
             s.panel.user_in_control(),
         )
     };
+    let signin = info.as_ref().and_then(|i| i.signin_blocked.clone());
     let active = info.as_ref().is_some_and(|i| i.active);
     let profile_name = info
         .as_ref()
@@ -476,37 +542,84 @@ fn FocusView(session: Signal<Session>, overlay: Signal<Overlay>, id: String) -> 
                         Icon { name: if full() { "minimize" } else { "maximize" }, size: 16 }
                     }
                 }
+                if let Some(block) = signin.clone() {
+                    SigninBanner { session, block }
+                }
                 if in_control {
-                    div { class: "dock-url editable",
-                        Icon { name: "globe", size: 14 }
-                        input {
-                            class: "dock-address",
-                            "aria-label": "Address",
-                            placeholder: "Type an address and press Enter",
-                            value: "{url_shown}",
-                            onfocus: {
-                                let url = url.clone();
-                                move |_| {
-                                    draft.set(url.clone());
-                                    editing.set(true);
-                                }
-                            },
-                            onblur: move |_| editing.set(false),
-                            oninput: move |event| draft.set(event.value()),
-                            onkeydown: move |event: KeyboardEvent| {
-                                event.stop_propagation();
-                                if event.key() == Key::Enter {
-                                    match address_to_url(&draft()) {
-                                        Some(url) => {
-                                            session.write().panel.send_input(BrowserInput::Navigate { url });
-                                            editing.set(false);
+                    div { class: "browser-toolbar", role: "toolbar", "aria-label": "Page controls",
+                        button {
+                            class: "icon-btn",
+                            title: "Back",
+                            "aria-label": "Back",
+                            disabled: !active,
+                            onclick: move |_| session.write().panel.history(BrowserHistory::Back),
+                            Icon { name: "chevron-left", size: 16 }
+                        }
+                        button {
+                            class: "icon-btn",
+                            title: "Forward",
+                            "aria-label": "Forward",
+                            disabled: !active,
+                            onclick: move |_| session.write().panel.history(BrowserHistory::Forward),
+                            Icon { name: "chevron-right", size: 16 }
+                        }
+                        button {
+                            class: "icon-btn",
+                            title: "Reload",
+                            "aria-label": "Reload",
+                            disabled: !active,
+                            onclick: move |_| session.write().panel.history(BrowserHistory::Reload),
+                            Icon { name: "refresh", size: 16 }
+                        }
+                        div { class: "dock-url editable",
+                            Icon { name: "globe", size: 14 }
+                            input {
+                                id: "browser-address",
+                                class: "dock-address",
+                                "aria-label": "Address",
+                                placeholder: if opening() { "New tab: type an address and press Enter" } else { "Type an address and press Enter" },
+                                value: "{url_shown}",
+                                onfocus: {
+                                    let url = url.clone();
+                                    move |_| {
+                                        // A new tab starts from an empty field.
+                                        if opening() {
+                                            draft.set(String::new());
+                                        } else {
+                                            draft.set(url.clone());
                                         }
-                                        None => {
+                                        editing.set(true);
+                                    }
+                                },
+                                onblur: move |_| {
+                                    editing.set(false);
+                                    opening.set(false);
+                                },
+                                oninput: move |event| draft.set(event.value()),
+                                onkeydown: move |event: KeyboardEvent| {
+                                    event.stop_propagation();
+                                    if event.key() == Key::Escape {
+                                        opening.set(false);
+                                    } else if event.key() == Key::Enter && opening() {
+                                        if session.write().panel.open_tab(&draft()) {
+                                            opening.set(false);
+                                            editing.set(false);
+                                        } else {
                                             session.write().panel.browser_error = Some("Enter a web address.".into());
                                         }
+                                    } else if event.key() == Key::Enter {
+                                        match address_to_url(&draft()) {
+                                            Some(url) => {
+                                                session.write().panel.send_input(BrowserInput::Navigate { url });
+                                                editing.set(false);
+                                            }
+                                            None => {
+                                                session.write().panel.browser_error = Some("Enter a web address.".into());
+                                            }
+                                        }
                                     }
-                                }
-                            },
+                                },
+                            }
                         }
                     }
                 } else {
@@ -515,8 +628,8 @@ fn FocusView(session: Signal<Session>, overlay: Signal<Overlay>, id: String) -> 
                         span { class: "dock-url-text", "{url_text}" }
                     }
                 }
-                if active && !tabs.is_empty() {
-                    TabStrip { session, tabs: tabs.clone(), in_control }
+                if !tabs.is_empty() {
+                    TabStrip { session, tabs: tabs.clone(), in_control, opening }
                 }
                 div { class: if active && shot.is_some() { "focus-view has-shot" } else { "focus-view" },
                     if active && shot.is_some() {

@@ -786,3 +786,102 @@ async fn a_bot_joins_the_picked_group_when_onboarding_is_confirmed() {
     .await;
     assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
 }
+
+/// `GET /v1/bots/catalog` lists the shipped templates, and `installed` comes
+/// from the session user's own rows. Installing a removed template restores
+/// only that user's row; the other user's removal stands, and a second install
+/// is a conflict.
+#[tokio::test]
+async fn bot_catalog_lists_templates_and_install_is_per_user() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .unwrap()
+        .to_path_buf();
+    let mut watcher = test_bot("watcher", crate::orchestration::BotRole::Specialist);
+    watcher.config.title = Some("Watcher".into());
+    watcher.config.description = Some("Monitors sources.".into());
+    let main = test_bot("main", crate::orchestration::BotRole::Orchestrator);
+    let (app, _, store) = app_with_fleet(
+        true,
+        crate::policy::Policy::empty(),
+        root,
+        vec![main, watcher],
+    );
+    let owner = member(&store, "catalog-owner");
+    let other = member(&store, "catalog-other");
+    for token in [&owner, &other] {
+        // The first read seeds the user's fleet from the templates.
+        assert_eq!(
+            call(&app, token, "GET", "/v1/bots", None).await.status(),
+            StatusCode::OK
+        );
+        let removed = call(&app, token, "DELETE", "/v1/bots/watcher", None).await;
+        assert_eq!(removed.status(), StatusCode::OK);
+    }
+
+    let entry = |body: &Value, id: &str| {
+        body["bots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|bot| bot["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    let catalog = read_json(call(&app, &owner, "GET", "/v1/bots/catalog", None).await).await;
+    assert_eq!(entry(&catalog, "watcher")["installed"], false);
+    assert_eq!(entry(&catalog, "watcher")["title"], "Watcher");
+    // The bundled picture of a removed shipped bot is still served, so the
+    // catalog can show it; an unknown bot without a default stays a 404.
+    let picture = call(&app, &owner, "GET", "/v1/bots/watcher/avatar", None).await;
+    assert_eq!(picture.status(), StatusCode::OK);
+    let unknown = call(&app, &owner, "GET", "/v1/bots/nobody/avatar", None).await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    assert_eq!(entry(&catalog, "main")["installed"], true);
+
+    let installed = call(
+        &app,
+        &owner,
+        "POST",
+        "/v1/bots/catalog/watcher/install",
+        None,
+    )
+    .await;
+    assert_eq!(installed.status(), StatusCode::OK);
+    let body = read_json(installed).await;
+    assert_eq!(body["bot"]["id"], "watcher");
+    assert_eq!(body["bot"]["installed"], true);
+    assert_eq!(body["bot"]["title"], "Watcher");
+
+    let again = call(
+        &app,
+        &owner,
+        "POST",
+        "/v1/bots/catalog/watcher/install",
+        None,
+    )
+    .await;
+    assert_eq!(again.status(), StatusCode::CONFLICT);
+    let unknown = call(&app, &owner, "POST", "/v1/bots/catalog/ghost/install", None).await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+    // The restored row is listed with its shipped title as the display name.
+    let listed = read_json(call(&app, &owner, "GET", "/v1/bots", None).await).await;
+    let row = entry(&listed, "watcher");
+    assert_eq!(row["display_name"], "Watcher");
+    assert_eq!(row["title"], "Watcher");
+    assert_eq!(row["description"], "Monitors sources.");
+
+    // The other user's catalog still says the bot is removed.
+    let other_catalog = read_json(call(&app, &other, "GET", "/v1/bots/catalog", None).await).await;
+    assert_eq!(entry(&other_catalog, "watcher")["installed"], false);
+    let other_list = read_json(call(&app, &other, "GET", "/v1/bots", None).await).await;
+    assert!(
+        other_list["bots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|bot| bot["id"] != "watcher")
+    );
+}

@@ -42,6 +42,10 @@ struct Tab {
     label: String,
     target_id: String,
     session_id: String,
+    /// False while the page is being configured (its guard is not on yet). A
+    /// tab that is not ready holds a slot toward the limit, but no bot call
+    /// reaches it.
+    ready: bool,
 }
 
 /// The tabs of one browser and which one the tools act on.
@@ -50,29 +54,56 @@ struct TabSet {
     tabs: Vec<Tab>,
     active: String,
     next: u32,
+    /// Pages `open_tab` asked the browser to create and that have not attached yet.
+    expected: Vec<String>,
+    /// `open_tab` calls still waiting for `Target.createTarget` to return.
+    creating: usize,
 }
 
 impl TabSet {
-    fn add(&mut self, target_id: String, session_id: String) -> String {
+    /// Slots in use: tabs (ready or still being set up), created pages not yet
+    /// adopted, and creates in flight.
+    fn occupied(&self) -> usize {
+        self.tabs.len() + self.expected.len() + self.creating
+    }
+
+    /// Reserve a slot for an attached page. It counts toward the limit but is
+    /// not usable until `mark_ready`.
+    fn reserve(&mut self, target_id: String, session_id: String) -> String {
         self.next += 1;
         let label = format!("t{}", self.next);
         self.tabs.push(Tab {
             label: label.clone(),
             target_id,
             session_id,
+            ready: false,
         });
-        self.active = label.clone();
         label
     }
 
+    /// Make a reserved tab the active one. False when it was dropped meanwhile.
+    fn mark_ready(&mut self, label: &str) -> bool {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.label == label) else {
+            return false;
+        };
+        tab.ready = true;
+        self.active = label.to_owned();
+        true
+    }
+
+    fn ready_count(&self) -> usize {
+        self.tabs.iter().filter(|tab| tab.ready).count()
+    }
+
     fn active_tab(&self) -> Option<&Tab> {
-        self.tabs.iter().find(|tab| tab.label == self.active)
+        self.find(&self.active)
     }
 
     fn find(&self, label: &str) -> Option<&Tab> {
-        self.tabs.iter().find(|tab| tab.label == label)
+        self.tabs.iter().find(|tab| tab.ready && tab.label == label)
     }
 
+    /// Reserved tabs count too: their sessions are ours to guard.
     fn owns_session(&self, session_id: &str) -> bool {
         self.tabs.iter().any(|tab| tab.session_id == session_id)
     }
@@ -81,15 +112,45 @@ impl TabSet {
         self.tabs.iter().any(|tab| tab.target_id == target_id)
     }
 
+    fn is_expected(&self, target_id: &str) -> bool {
+        self.expected.iter().any(|id| id == target_id)
+    }
+
+    /// Take a page out of the expected list. True when it was expected.
+    fn take_expected(&mut self, target_id: &str) -> bool {
+        match self.expected.iter().position(|id| id == target_id) {
+            Some(index) => {
+                self.expected.swap_remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn remove(&mut self, label: &str) {
         self.tabs.retain(|tab| tab.label != label);
         if self.active == label {
             self.active = self
                 .tabs
-                .first()
+                .iter()
+                .find(|tab| tab.ready)
                 .map(|tab| tab.label.clone())
                 .unwrap_or_default();
         }
+    }
+
+    /// Drop every tab on a target, and any expectation of it.
+    fn forget_target(&mut self, target_id: &str) {
+        let labels: Vec<String> = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.target_id == target_id)
+            .map(|tab| tab.label.clone())
+            .collect();
+        for label in labels {
+            self.remove(&label);
+        }
+        self.expected.retain(|id| id != target_id);
     }
 }
 
@@ -97,6 +158,40 @@ type SharedTabs = Arc<std::sync::Mutex<TabSet>>;
 
 fn lock_tabs(tabs: &SharedTabs) -> std::sync::MutexGuard<'_, TabSet> {
     tabs.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// What to do with a new page that a tab of ours did not open itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PopupDecision {
+    /// Register it as a tab (it becomes the active one).
+    Adopt,
+    /// Close it; the reason is logged.
+    Close(&'static str),
+}
+
+/// Adopt a page that `open_tab` asked for (`expected`: its slot was counted
+/// when it was requested). Otherwise adopt only a page a tab of this browser
+/// opened (its `openerId` is one of our targets) while the tab limit has room.
+/// Anything else, including a page with no opener, is closed.
+pub fn should_adopt(
+    opener_id: Option<&str>,
+    known_target_ids: &[&str],
+    count: usize,
+    expected: bool,
+) -> PopupDecision {
+    if expected {
+        return PopupDecision::Adopt;
+    }
+    match opener_id {
+        Some(opener) if known_target_ids.contains(&opener) => {
+            if count >= MAX_TABS {
+                PopupDecision::Close("tab limit reached")
+            } else {
+                PopupDecision::Adopt
+            }
+        }
+        _ => PopupDecision::Close("not opened by a tab of this browser"),
+    }
 }
 
 /// Chromium binaries to try, in order, when none is configured.
@@ -175,13 +270,65 @@ pub fn chromium_args(profile: &Path, no_sandbox: bool) -> Vec<String> {
         "--disable-breakpad".to_owned(),
         "--mute-audio".to_owned(),
         "--password-store=basic".to_owned(),
-        "--disable-features=Translate,MediaRouter,OptimizationHints".to_owned(),
+        // No DNS prefetch, preconnect or prefetch. Defence in depth: the guard
+        // is the control, and the profile preference is set too (see
+        // `disable_network_prediction`).
+        "--dns-prefetch-disable".to_owned(),
+        "--disable-features=Translate,MediaRouter,OptimizationHints,NetworkPrediction".to_owned(),
         "about:blank".to_owned(),
     ];
     if no_sandbox {
         args.insert(1, "--no-sandbox".to_owned());
     }
     args
+}
+
+/// Chromium's `net.network_prediction_options` value for "never predict".
+const NETWORK_PREDICTION_NEVER: i64 = 2;
+
+/// The profile's `Default/Preferences` with network prediction set to never,
+/// merged into the existing JSON so other keys are kept. `existing` is the file
+/// as read (`None` when it is missing). Returns `None` when the existing file is
+/// not a JSON object, so the caller leaves it alone.
+pub fn preferences_with_network_prediction_off(existing: Option<&str>) -> Option<String> {
+    let mut root: Value = match existing {
+        Some(text) => serde_json::from_str(text).ok()?,
+        None => json!({}),
+    };
+    let net = root
+        .as_object_mut()?
+        .entry("net")
+        .or_insert_with(|| json!({}));
+    net.as_object_mut()?.insert(
+        "network_prediction_options".to_owned(),
+        json!(NETWORK_PREDICTION_NEVER),
+    );
+    serde_json::to_string(&root).ok()
+}
+
+/// Write the network prediction preference into the profile before launch, so
+/// Chromium starts with preconnect and prefetch off. Failures are logged and do
+/// not stop the launch.
+fn disable_network_prediction(profile: &Path) {
+    let directory = profile.join("Default");
+    let file = directory.join("Preferences");
+    let existing = match std::fs::read_to_string(&file) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            tracing::warn!(%error, "browser: cannot read the profile preferences");
+            return;
+        }
+    };
+    let Some(merged) = preferences_with_network_prediction_off(existing.as_deref()) else {
+        tracing::warn!("browser: profile preferences are not a JSON object; left as they are");
+        return;
+    };
+    if let Err(error) =
+        std::fs::create_dir_all(&directory).and_then(|()| std::fs::write(&file, merged))
+    {
+        tracing::warn!(%error, "browser: cannot write the profile preferences");
+    }
 }
 
 /// Contents of `DevToolsActivePort`: line 1 port, line 2 browser ws path.
@@ -216,6 +363,7 @@ impl BrowserLauncher for ChromiumLauncher {
     async fn launch(&self, user_id: &str, profile_id: &str) -> Result<Arc<dyn BrowserBackend>> {
         let profile = crate::browser_profiles::profile_dir(&self.base_dir, user_id, profile_id)?;
         std::fs::create_dir_all(&profile)?;
+        disable_network_prediction(&profile);
         let port_file = profile.join("DevToolsActivePort");
         let _ = std::fs::remove_file(&port_file);
         let mut child = Command::new(&self.executable)
@@ -249,12 +397,13 @@ impl BrowserLauncher for ChromiumLauncher {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
-        match ChromiumBackend::setup(port, &path, self.timeout).await {
+        let outline: SharedOutline = Arc::default();
+        match ChromiumBackend::setup(port, &path, self.timeout, outline.clone()).await {
             Ok((cdp, tabs, tasks)) => Ok(Arc::new(ChromiumBackend {
                 cdp,
                 tabs,
                 child: Mutex::new(Some(child)),
-                outline: std::sync::Mutex::new(Outline::default()),
+                outline,
                 tasks: std::sync::Mutex::new(tasks),
                 pointer: std::sync::Mutex::new(None),
                 pointer_seq: AtomicU64::new(0),
@@ -267,11 +416,15 @@ impl BrowserLauncher for ChromiumLauncher {
     }
 }
 
+/// Refs of the active page. Shared with the event loop, which clears them
+/// when it makes an adopted popup the active tab.
+type SharedOutline = Arc<std::sync::Mutex<Outline>>;
+
 pub struct ChromiumBackend {
     cdp: Arc<CdpConnection>,
     tabs: SharedTabs,
     child: Mutex<Option<Child>>,
-    outline: std::sync::Mutex<Outline>,
+    outline: SharedOutline,
     tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     pointer: std::sync::Mutex<Option<Pointer>>,
     pointer_seq: AtomicU64,
@@ -282,6 +435,7 @@ impl ChromiumBackend {
         port: u16,
         path: &str,
         timeout: Duration,
+        outline: SharedOutline,
     ) -> Result<(Arc<CdpConnection>, SharedTabs, Vec<JoinHandle<()>>)> {
         let cdp = Arc::new(CdpConnection::connect(port, path, timeout).await?);
         let targets = cdp.call(None, "Target.getTargets", json!({})).await?;
@@ -301,8 +455,22 @@ impl ChromiumBackend {
         };
         let tabs: SharedTabs = Arc::default();
         // Subscribe before enabling Fetch so no paused request is missed.
-        let events = spawn_event_loop(cdp.clone(), tabs.clone());
+        let events = spawn_event_loop(cdp.clone(), tabs.clone(), outline);
         if let Err(error) = Self::attach_tab(&cdp, &tabs, &target_id).await {
+            events.abort();
+            return Err(error);
+        }
+        // From now on every page the browser creates (popups, target=_blank,
+        // open_tab) attaches paused. `adopt_child` guards or closes it before
+        // it runs. Our own tab is attached again here; that copy is dropped.
+        if let Err(error) = cdp
+            .call(
+                None,
+                "Target.setAutoAttach",
+                json!({"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true}),
+            )
+            .await
+        {
             events.abort();
             return Err(error);
         }
@@ -327,16 +495,12 @@ impl ChromiumBackend {
             .as_str()
             .ok_or_else(|| browser_error("attach returned no session"))?
             .to_owned();
-        let previous = lock_tabs(tabs).active.clone();
-        let label = lock_tabs(tabs).add(target_id.to_owned(), session_id.clone());
+        let label = lock_tabs(tabs).reserve(target_id.to_owned(), session_id.clone());
         if let Err(error) = Self::configure(cdp, &session_id).await {
-            let mut set = lock_tabs(tabs);
-            set.remove(&label);
-            if set.tabs.iter().any(|tab| tab.label == previous) {
-                set.active = previous;
-            }
+            lock_tabs(tabs).remove(&label);
             return Err(error);
         }
+        lock_tabs(tabs).mark_ready(&label);
         Ok(label)
     }
 
@@ -446,8 +610,30 @@ impl ChromiumBackend {
     }
 }
 
+/// Wait (bounded) for the page session's load event.
+async fn wait_for_load(
+    mut events: tokio::sync::broadcast::Receiver<CdpEvent>,
+    session_id: String,
+    limit: Duration,
+) {
+    let wait = async {
+        while let Ok(event) = events.recv().await {
+            if event.method == "Page.loadEventFired"
+                && event.session_id.as_deref() == Some(session_id.as_str())
+            {
+                break;
+            }
+        }
+    };
+    let _ = tokio::time::timeout(limit, wait).await;
+}
+
 /// Handles Fetch pauses (guard), popups and JS dialogs for one page session.
-fn spawn_event_loop(cdp: Arc<CdpConnection>, tabs: SharedTabs) -> JoinHandle<()> {
+fn spawn_event_loop(
+    cdp: Arc<CdpConnection>,
+    tabs: SharedTabs,
+    outline: SharedOutline,
+) -> JoinHandle<()> {
     let mut events = cdp.subscribe();
     let verdicts: Arc<std::sync::Mutex<HashMap<String, (Instant, bool)>>> = Arc::default();
     tokio::spawn(async move {
@@ -457,14 +643,139 @@ fn spawn_event_loop(cdp: Arc<CdpConnection>, tabs: SharedTabs) -> JoinHandle<()>
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
             };
-            handle_event(&cdp, &tabs, &verdicts, event);
+            handle_event(&cdp, &tabs, &outline, &verdicts, event);
         }
     })
+}
+
+/// How long a page the browser creates while an `open_tab` call is in flight
+/// may stay paused, waiting for that call to record its id.
+const CREATE_WAIT: Duration = Duration::from_secs(2);
+
+/// Let a paused page or worker run, then let go of its session.
+async fn resume_and_detach(cdp: &Arc<CdpConnection>, session_id: &str) {
+    let _ = cdp
+        .call(
+            Some(session_id),
+            "Runtime.runIfWaitingForDebugger",
+            json!({}),
+        )
+        .await;
+    let _ = cdp
+        .call(
+            None,
+            "Target.detachFromTarget",
+            json!({"sessionId": session_id}),
+        )
+        .await;
+}
+
+/// A page the browser created has attached paused. Adopt it as a tab, or close
+/// it. A page that is not adopted is never resumed: it is closed while still
+/// paused, so none of its code runs.
+async fn adopt_child(
+    cdp: &Arc<CdpConnection>,
+    tabs: &SharedTabs,
+    outline: &SharedOutline,
+    child_session: &str,
+    info: &Value,
+    waiting: bool,
+) {
+    let target_id = info["targetId"].as_str().unwrap_or_default().to_owned();
+    // Only a session the browser paused is ours to decide. Anything else is
+    // an attach we made ourselves, which must be left alone.
+    if !waiting || child_session.is_empty() || target_id.is_empty() {
+        return;
+    }
+    // The session of one of our own tabs (the browser reports the attach we
+    // made ourselves): it is not ours to detach.
+    if lock_tabs(tabs).owns_session(child_session) {
+        return;
+    }
+    // Workers and extension pages run as they would without auto-attach, and
+    // a second session to one of our own tabs is not needed: let go of both.
+    if info["type"] != "page" || lock_tabs(tabs).owns_target(&target_id) {
+        resume_and_detach(cdp, child_session).await;
+        return;
+    }
+    // A page without an opener may be the one `open_tab` is creating, whose id
+    // is not recorded yet. Hold it paused for a short time while a create is in
+    // flight, so the decision below sees the id.
+    let deadline = Instant::now() + CREATE_WAIT;
+    loop {
+        let hold = {
+            let set = lock_tabs(tabs);
+            set.creating > 0 && info["openerId"].as_str().is_none() && !set.is_expected(&target_id)
+        };
+        if !hold || Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // Decide and reserve under one lock, so the tab limit holds.
+    let adopted = {
+        let mut set = lock_tabs(tabs);
+        let expected = set.take_expected(&target_id);
+        let known: Vec<String> = set.tabs.iter().map(|tab| tab.target_id.clone()).collect();
+        let known: Vec<&str> = known.iter().map(String::as_str).collect();
+        match should_adopt(info["openerId"].as_str(), &known, set.occupied(), expected) {
+            PopupDecision::Adopt => Some(set.reserve(target_id.clone(), child_session.to_owned())),
+            PopupDecision::Close(reason) => {
+                tracing::warn!(reason, "browser: closed a new page");
+                None
+            }
+        }
+    };
+    let Some(label) = adopted else {
+        // Not ours. The page is still paused, so its code has not run.
+        let _ = cdp
+            .call(None, "Target.closeTarget", json!({"targetId": target_id}))
+            .await;
+        return;
+    };
+    // Fetch (the guard) is on before the page is allowed to run. Requests the
+    // page had already issued are not covered; see docs/browser.md.
+    if ChromiumBackend::configure(cdp, child_session)
+        .await
+        .is_err()
+    {
+        lock_tabs(tabs).remove(&label);
+        let _ = cdp
+            .call(None, "Target.closeTarget", json!({"targetId": target_id}))
+            .await;
+        return;
+    }
+    // Usable and active only now. If open_tab gave up on the page meanwhile,
+    // the reservation is gone: close the page instead of running it.
+    if !lock_tabs(tabs).mark_ready(&label) {
+        let _ = cdp
+            .call(None, "Target.closeTarget", json!({"targetId": target_id}))
+            .await;
+        return;
+    }
+    let _ = cdp
+        .call(
+            Some(child_session),
+            "Runtime.runIfWaitingForDebugger",
+            json!({}),
+        )
+        .await;
+    *outline
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Outline::default();
+    let _ = cdp
+        .call(
+            None,
+            "Target.activateTarget",
+            json!({"targetId": target_id}),
+        )
+        .await;
 }
 
 fn handle_event(
     cdp: &Arc<CdpConnection>,
     tabs: &SharedTabs,
+    outline: &SharedOutline,
     verdicts: &Arc<std::sync::Mutex<HashMap<String, (Instant, bool)>>>,
     event: CdpEvent,
 ) {
@@ -496,19 +807,42 @@ fn handle_event(
                 let _ = cdp.call(Some(&session_id), method, params).await;
             });
         }
+        "Target.attachedToTarget" => {
+            // A page the browser created, attached paused (see `setup`). Adopt
+            // it, or let go of a copy we do not need.
+            let cdp = cdp.clone();
+            let tabs = tabs.clone();
+            let outline = outline.clone();
+            let child = event.params["sessionId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            let info = event.params["targetInfo"].clone();
+            let waiting = event.params["waitingForDebugger"]
+                .as_bool()
+                .unwrap_or(false);
+            tokio::spawn(async move {
+                adopt_child(&cdp, &tabs, &outline, &child, &info, waiting).await;
+            });
+        }
         "Target.targetCreated" => {
             let info = &event.params["targetInfo"];
             if info["type"] == "page"
                 && let Some(id) = info["targetId"].as_str()
             {
-                // Popups and window.open are not guarded by our Fetch session:
-                // close them unless a tab we opened registers the target first.
+                // Safety net for pages nobody adopted: close them unless a tab
+                // of ours claims the target (see `adopt_child`) first. While an
+                // open_tab call is in flight, its page may not be recorded yet.
                 let cdp = cdp.clone();
                 let tabs = tabs.clone();
                 let id = id.to_owned();
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(600)).await;
-                    if !lock_tabs(&tabs).owns_target(&id) {
+                    let keep = {
+                        let set = lock_tabs(&tabs);
+                        set.owns_target(&id) || set.is_expected(&id) || set.creating > 0
+                    };
+                    if !keep {
                         let _ = cdp
                             .call(None, "Target.closeTarget", json!({"targetId": id}))
                             .await;
@@ -571,22 +905,42 @@ async fn cached_verdict(
 #[async_trait]
 impl BrowserBackend for ChromiumBackend {
     async fn navigate(&self, url: &str) -> Result<PageInfo> {
-        let mut events = self.cdp.subscribe();
+        let events = self.cdp.subscribe();
         let wanted = self.sid();
         let result = self.call("Page.navigate", json!({"url": url})).await?;
         if let Some(error) = result["errorText"].as_str() {
             return Err(browser_error(format!("navigation failed: {error}")));
         }
-        let wait = async {
-            while let Ok(event) = events.recv().await {
-                if event.method == "Page.loadEventFired"
-                    && event.session_id.as_deref() == Some(wanted.as_str())
-                {
-                    break;
-                }
-            }
-        };
-        let _ = tokio::time::timeout(Duration::from_secs(20), wait).await;
+        wait_for_load(events, wanted, Duration::from_secs(20)).await;
+        self.info().await
+    }
+
+    async fn history_step(&self, delta: i64) -> Result<PageInfo> {
+        let history = self.call("Page.getNavigationHistory", json!({})).await?;
+        let current = history["currentIndex"].as_i64().unwrap_or(-1);
+        let entry = usize::try_from(current + delta)
+            .ok()
+            .and_then(|index| history["entries"].as_array()?.get(index).cloned())
+            .ok_or_else(|| SeraError::Validation("there is no page in that direction".into()))?;
+        let entry_id = entry["id"]
+            .as_i64()
+            .ok_or_else(|| browser_error("history entry has no id"))?;
+        let events = self.cdp.subscribe();
+        let wanted = self.sid();
+        self.call("Page.navigateToHistoryEntry", json!({"entryId": entry_id}))
+            .await?;
+        self.reset_outline()?;
+        // A page restored from the back/forward cache fires no load event.
+        wait_for_load(events, wanted, Duration::from_secs(8)).await;
+        self.info().await
+    }
+
+    async fn reload(&self) -> Result<PageInfo> {
+        let events = self.cdp.subscribe();
+        let wanted = self.sid();
+        self.call("Page.reload", json!({})).await?;
+        self.reset_outline()?;
+        wait_for_load(events, wanted, Duration::from_secs(20)).await;
         self.info().await
     }
 
@@ -739,14 +1093,16 @@ impl BrowserBackend for ChromiumBackend {
             .cloned()
             .unwrap_or_default();
         let mut set = lock_tabs(&self.tabs);
-        // Forget tabs the page closed itself.
+        // Forget tabs the page closed itself. A tab still being set up is left
+        // to `adopt_child`, which knows whether it was adopted.
         let gone: Vec<String> = set
             .tabs
             .iter()
             .filter(|tab| {
-                !infos
-                    .iter()
-                    .any(|info| info["targetId"].as_str() == Some(tab.target_id.as_str()))
+                tab.ready
+                    && !infos
+                        .iter()
+                        .any(|info| info["targetId"].as_str() == Some(tab.target_id.as_str()))
             })
             .map(|tab| tab.label.clone())
             .collect();
@@ -756,6 +1112,7 @@ impl BrowserBackend for ChromiumBackend {
         Ok(set
             .tabs
             .iter()
+            .filter(|tab| tab.ready)
             .map(|tab| {
                 let info = infos
                     .iter()
@@ -777,35 +1134,64 @@ impl BrowserBackend for ChromiumBackend {
     }
 
     async fn open_tab(&self, url: &str) -> Result<Vec<TabInfo>> {
-        if lock_tabs(&self.tabs).tabs.len() >= MAX_TABS {
-            return Err(SeraError::Validation(format!(
-                "at most {MAX_TABS} tabs; close one first"
-            )));
+        {
+            let mut set = lock_tabs(&self.tabs);
+            if set.occupied() >= MAX_TABS {
+                return Err(SeraError::Validation(format!(
+                    "at most {MAX_TABS} tabs; close one first"
+                )));
+            }
+            set.creating += 1;
         }
+        // The browser creates a blank page directly. No page script runs in
+        // the active tab, so a site cannot change how the tab opens. The page
+        // attaches paused and `adopt_child` takes it, because its id is expected.
         let created = self
             .cdp
             .call(None, "Target.createTarget", json!({"url": "about:blank"}))
-            .await?;
-        let target_id = created["targetId"]
-            .as_str()
-            .ok_or_else(|| browser_error("no page target"))?
-            .to_owned();
-        if let Err(error) = Self::attach_tab(&self.cdp, &self.tabs, &target_id).await {
-            let _ = self
-                .cdp
-                .call(None, "Target.closeTarget", json!({"targetId": target_id}))
-                .await;
-            return Err(error);
+            .await;
+        let target_id = {
+            let mut set = lock_tabs(&self.tabs);
+            set.creating -= 1;
+            let value = created?;
+            let id = value["targetId"]
+                .as_str()
+                .ok_or_else(|| browser_error("the browser returned no page"))?
+                .to_owned();
+            set.expected.push(id.clone());
+            id
+        };
+        // Wait until the page is adopted: reserved, configured and ready. It
+        // is gone when adoption failed, and dropped when it times out.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (ready, pending) = {
+                let set = lock_tabs(&self.tabs);
+                let ready = set
+                    .tabs
+                    .iter()
+                    .any(|tab| tab.ready && tab.target_id == target_id);
+                let pending = set.is_expected(&target_id)
+                    || set
+                        .tabs
+                        .iter()
+                        .any(|tab| !tab.ready && tab.target_id == target_id);
+                (ready, pending)
+            };
+            if ready {
+                break;
+            }
+            if !pending || Instant::now() >= deadline {
+                lock_tabs(&self.tabs).forget_target(&target_id);
+                let _ = self
+                    .cdp
+                    .call(None, "Target.closeTarget", json!({"targetId": target_id}))
+                    .await;
+                return Err(browser_error("the new tab did not open"));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
         self.reset_outline()?;
-        let _ = self
-            .cdp
-            .call(
-                None,
-                "Target.activateTarget",
-                json!({"targetId": target_id}),
-            )
-            .await;
         self.navigate(url).await?;
         self.tabs().await
     }
@@ -835,7 +1221,7 @@ impl BrowserBackend for ChromiumBackend {
                 .find(tab)
                 .cloned()
                 .ok_or_else(|| SeraError::Validation(format!("no tab {tab}")))?;
-            if set.tabs.len() <= 1 {
+            if set.ready_count() <= 1 {
                 return Err(SeraError::Validation(
                     "that is the last tab; close the browser instead".into(),
                 ));
@@ -907,6 +1293,171 @@ mod tests {
     }
 
     #[test]
+    fn a_popup_from_one_of_our_tabs_is_adopted_while_there_is_room() {
+        let known = ["T1", "T2"];
+        assert_eq!(
+            should_adopt(Some("T2"), &known, 2, false),
+            PopupDecision::Adopt
+        );
+        assert_eq!(
+            should_adopt(Some("T2"), &known, MAX_TABS - 1, false),
+            PopupDecision::Adopt
+        );
+    }
+
+    #[test]
+    fn a_full_tab_set_closes_the_popup_it_would_have_adopted() {
+        let known = ["T1"];
+        assert_eq!(
+            should_adopt(Some("T1"), &known, MAX_TABS, false),
+            PopupDecision::Close("tab limit reached")
+        );
+    }
+
+    #[test]
+    fn pages_without_one_of_our_openers_are_closed() {
+        let known = ["T1"];
+        // No opener at all (a page the browser created itself).
+        assert!(matches!(
+            should_adopt(None, &known, 1, false),
+            PopupDecision::Close(_)
+        ));
+        // An opener that is not one of our tabs.
+        assert!(matches!(
+            should_adopt(Some("SOMEONE-ELSE"), &known, 1, false),
+            PopupDecision::Close(_)
+        ));
+        // A tab that was closed since: its id no longer counts.
+        assert!(matches!(
+            should_adopt(Some("T9"), &known, 1, false),
+            PopupDecision::Close(_)
+        ));
+        assert!(matches!(
+            should_adopt(Some(""), &[], 0, false),
+            PopupDecision::Close(_)
+        ));
+    }
+
+    #[test]
+    fn a_page_open_tab_asked_for_is_adopted_without_an_opener() {
+        // open_tab creates the page itself: no opener, and its slot was counted.
+        let known = ["T1"];
+        assert_eq!(should_adopt(None, &known, 1, true), PopupDecision::Adopt);
+        assert_eq!(
+            should_adopt(None, &known, MAX_TABS, true),
+            PopupDecision::Adopt
+        );
+        // Expectation does not make an unrelated page with an opener adoptable.
+        assert!(matches!(
+            should_adopt(Some("SOMEONE-ELSE"), &known, 1, false),
+            PopupDecision::Close(_)
+        ));
+    }
+
+    #[test]
+    fn a_reserved_tab_is_counted_but_not_usable_until_ready() {
+        let mut set = TabSet::default();
+        let first = set.reserve("T1".into(), "S1".into());
+        assert_eq!(set.occupied(), 1);
+        // Reserved: counts toward the limit, yet no bot call reaches it.
+        assert!(set.active_tab().is_none());
+        assert!(set.find(&first).is_none());
+        assert_eq!(set.ready_count(), 0);
+        assert!(set.owns_session("S1") && set.owns_target("T1"));
+        assert!(set.mark_ready(&first));
+        assert_eq!(set.active_tab().unwrap().target_id, "T1");
+        assert_eq!(set.ready_count(), 1);
+        // Dropped reservations are not revived by a late mark.
+        set.remove(&first);
+        assert!(!set.mark_ready(&first));
+        assert!(set.active_tab().is_none());
+    }
+
+    #[test]
+    fn expected_pages_hold_a_slot_until_adopted_or_forgotten() {
+        let mut set = TabSet {
+            creating: 1,
+            ..TabSet::default()
+        };
+        set.expected.push("T9".into());
+        assert_eq!(set.occupied(), 2);
+        assert!(set.is_expected("T9"));
+        assert!(set.take_expected("T9"));
+        assert!(!set.take_expected("T9"));
+        set.expected.push("T9".into());
+        set.forget_target("T9");
+        assert!(!set.is_expected("T9"));
+        assert_eq!(set.occupied(), 1);
+    }
+
+    #[test]
+    fn chromium_args_turn_off_dns_prefetch_and_network_prediction() {
+        let args = chromium_args(Path::new("/p"), false);
+        assert!(args.contains(&"--dns-prefetch-disable".to_owned()));
+        let features = args
+            .iter()
+            .find(|arg| arg.starts_with("--disable-features="))
+            .unwrap();
+        for kept in [
+            "Translate",
+            "MediaRouter",
+            "OptimizationHints",
+            "NetworkPrediction",
+        ] {
+            assert!(features.contains(kept), "{features}");
+        }
+    }
+
+    #[test]
+    fn the_profile_preferences_file_is_created_and_merged_on_disk() {
+        let profile = std::env::temp_dir().join(format!("serabot-prefs-{}", uuid::Uuid::new_v4()));
+        // No Default/ directory yet: it is created with the one setting.
+        disable_network_prediction(&profile);
+        let created: Value = serde_json::from_str(
+            &std::fs::read_to_string(profile.join("Default").join("Preferences")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(created["net"]["network_prediction_options"], 2);
+
+        // An existing file keeps its other keys.
+        let file = profile.join("Default").join("Preferences");
+        std::fs::write(&file, r#"{"profile":{"name":"Ada"}}"#).unwrap();
+        disable_network_prediction(&profile);
+        let merged: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(merged["net"]["network_prediction_options"], 2);
+        assert_eq!(merged["profile"]["name"], "Ada");
+
+        // Unreadable JSON is left exactly as it was.
+        std::fs::write(&file, "{broken").unwrap();
+        disable_network_prediction(&profile);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "{broken");
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn network_prediction_is_merged_into_existing_preferences() {
+        // Missing file: a fresh object with the one setting.
+        let fresh: Value =
+            serde_json::from_str(&preferences_with_network_prediction_off(None).unwrap()).unwrap();
+        assert_eq!(fresh["net"]["network_prediction_options"], 2);
+
+        // Existing file: other keys, including siblings under "net", survive.
+        let existing =
+            r#"{"profile":{"name":"Ada"},"net":{"proxy":"none","network_prediction_options":0}}"#;
+        let merged: Value =
+            serde_json::from_str(&preferences_with_network_prediction_off(Some(existing)).unwrap())
+                .unwrap();
+        assert_eq!(merged["net"]["network_prediction_options"], 2);
+        assert_eq!(merged["net"]["proxy"], "none");
+        assert_eq!(merged["profile"]["name"], "Ada");
+
+        // Unreadable or non-object JSON is left alone.
+        assert!(preferences_with_network_prediction_off(Some("{not json")).is_none());
+        assert!(preferences_with_network_prediction_off(Some("[1,2]")).is_none());
+        assert!(preferences_with_network_prediction_off(Some(r#"{"net":3}"#)).is_none());
+    }
+
+    #[test]
     fn parses_devtools_active_port() {
         assert_eq!(
             parse_devtools_active_port("40123\n/devtools/browser/abc-def\n"),
@@ -948,6 +1499,124 @@ mod tests {
         let jpeg = backend.screenshot_jpeg().await.unwrap();
         assert_eq!(&jpeg[..2], &[0xff, 0xd8]);
         assert!(jpeg.len() <= MAX_SCREENSHOT_BYTES);
+        backend.shutdown().await;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Needs a real Chromium: `CHROME_PATH=... cargo test -- --ignored live_popup`.
+    #[tokio::test]
+    #[ignore = "requires a local Chromium"]
+    async fn live_popup_opened_by_a_tab_is_adopted_and_active() {
+        let config = BrowserConfig {
+            enabled: true,
+            no_sandbox: true,
+            ..BrowserConfig::default()
+        };
+        let base = std::env::temp_dir().join(format!("serabot-live-{}", uuid::Uuid::new_v4()));
+        let launcher = ChromiumLauncher::new(&config, base.clone()).unwrap();
+        let backend = launcher.launch("live-user", "popup").await.unwrap();
+        backend
+            .navigate("data:text/html,<button style=\"position:fixed;left:0;top:0;width:1280px;height:800px\" onclick=\"var w=window.open('about:blank');w.document.title='popup';w.document.body.textContent='hello';\">Open</button>")
+            .await
+            .unwrap();
+        backend.click_at(10.0, 10.0).await.unwrap();
+        let mut tabs = Vec::new();
+        for _ in 0..50 {
+            tabs = backend.tabs().await.unwrap();
+            if tabs.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(tabs.len(), 2, "{tabs:?}");
+        assert!(tabs[1].active, "{tabs:?}");
+        assert_eq!(backend.info().await.unwrap().title, "popup");
+        // open_tab creates its own page (no popup of the active tab) and adopts it.
+        let opened = backend
+            .open_tab("data:text/html,<title>third</title>")
+            .await
+            .unwrap();
+        assert_eq!(opened.len(), 3, "{opened:?}");
+        assert!(opened[2].active, "{opened:?}");
+        assert_eq!(backend.info().await.unwrap().title, "third");
+        backend.shutdown().await;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Needs a real Chromium: `CHROME_PATH=... cargo test -- --ignored live_popup_first`.
+    /// A popup's first request is guarded: a loopback listener (which the
+    /// guard refuses) must never see a connection, and the popup is adopted.
+    #[tokio::test]
+    #[ignore = "requires a local Chromium"]
+    async fn live_popup_first_request_is_guarded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = BrowserConfig {
+            enabled: true,
+            no_sandbox: true,
+            ..BrowserConfig::default()
+        };
+        let base = std::env::temp_dir().join(format!("serabot-live-{}", uuid::Uuid::new_v4()));
+        let launcher = ChromiumLauncher::new(&config, base.clone()).unwrap();
+        let backend = launcher.launch("live-user", "guard").await.unwrap();
+        backend
+            .navigate(&format!(
+                "data:text/html,<button style=\"position:fixed;left:0;top:0;width:1280px;height:800px\" onclick=\"window.open('http://127.0.0.1:{port}/private')\">Open</button>"
+            ))
+            .await
+            .unwrap();
+        backend.click_at(10.0, 10.0).await.unwrap();
+        // Chromium may open a bare TCP connection (a preconnect) before the
+        // guard sees the request; that is a documented limit. No HTTP request
+        // may reach the refused address.
+        if let Ok(Ok((mut stream, _peer))) =
+            tokio::time::timeout(Duration::from_secs(3), listener.accept()).await
+        {
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; 400];
+            let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+                .await
+                .ok()
+                .and_then(|read| read.ok())
+                .unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(
+                !["GET ", "HEAD ", "POST "]
+                    .iter()
+                    .any(|verb| head.starts_with(verb)),
+                "an HTTP request reached a refused address: {head}"
+            );
+        }
+        let tabs = backend.tabs().await.unwrap();
+        assert_eq!(tabs.len(), 2, "{tabs:?}");
+        backend.shutdown().await;
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Needs a real Chromium: `CHROME_PATH=... cargo test -- --ignored live_history`.
+    #[tokio::test]
+    #[ignore = "requires a local Chromium"]
+    async fn live_history_steps_and_reload() {
+        let config = BrowserConfig {
+            enabled: true,
+            no_sandbox: true,
+            ..BrowserConfig::default()
+        };
+        let base = std::env::temp_dir().join(format!("serabot-live-{}", uuid::Uuid::new_v4()));
+        let launcher = ChromiumLauncher::new(&config, base.clone()).unwrap();
+        let backend = launcher.launch("live-user", "history").await.unwrap();
+        backend
+            .navigate("data:text/html,<title>one</title>")
+            .await
+            .unwrap();
+        backend
+            .navigate("data:text/html,<title>two</title>")
+            .await
+            .unwrap();
+        assert_eq!(backend.history_step(-1).await.unwrap().title, "one");
+        assert_eq!(backend.history_step(1).await.unwrap().title, "two");
+        assert_eq!(backend.reload().await.unwrap().title, "two");
+        assert!(backend.history_step(1).await.is_err(), "no forward entry");
         backend.shutdown().await;
         let _ = std::fs::remove_dir_all(base);
     }

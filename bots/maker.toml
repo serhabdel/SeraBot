@@ -1,8 +1,11 @@
 name = "maker"
+title = "Maker"
+description = "Builds marketing copy, decks, documents and PDFs from structured specs, Italian first, with your brand settings."
 trigger = "command"
 system_prompt = "prompts/maker.txt"
 skills = ["deck", "copy", "write", "design", "onepager", "translate-it-fr", "docx", "pptx", "xlsx", "onedrive", "elevenlabs", "design-brief"]
 tools = [
+  "ask_user",
   "skill_list",
   "skill_search",
   "skill_load",

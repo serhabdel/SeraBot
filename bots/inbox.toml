@@ -1,8 +1,11 @@
 name = "inbox"
+title = "Inbox"
+description = "Triages your Gmail or Outlook, summarises threads, and drafts replies in your voice. It never sends mail."
 trigger = "command"
 system_prompt = "prompts/inbox.txt"
 skills = ["email-triage", "messaging-etiquette"]
 tools = [
+  "ask_user",
   "skill_list",
   "skill_search",
   "skill_load",

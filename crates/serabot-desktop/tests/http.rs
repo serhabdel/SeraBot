@@ -79,6 +79,7 @@ fn authenticates_and_routes_every_contract_endpoint() {
         (200, r#"{"ok":true,"version":"test"}"#.into()),
         (200, r#"{"providers":[],"selection":{"provider":"p","model":"m"}}"#.into()),
         (200, r#"{"messages":[{"id":"msg-1","role":"assistant","content":"Synthetic reply","created_at":"test-time"}]}"#.into()),
+        (200, r#"{"cards":[]}"#.into()),
         (200, r#"{"selection":{"provider":"p","model":"m"}}"#.into()),
         (202, task.into()),
         (200, task.into()),
@@ -111,6 +112,7 @@ fn authenticates_and_routes_every_contract_endpoint() {
         "GET /v1/health ",
         "GET /v1/models?conversation_id=owner%3A1 ",
         "GET /v1/conversations/owner:1/messages?limit=100 ",
+        "GET /v1/conversations/owner:1/cards ",
         "PUT /v1/conversations/owner:1/model ",
         "POST /v1/messages ",
         "GET /v1/tasks/task-1 ",
@@ -128,12 +130,35 @@ fn authenticates_and_routes_every_contract_endpoint() {
     let body = |index: usize| -> serde_json::Value {
         serde_json::from_str(requests[index].split("\r\n\r\n").nth(1).unwrap()).unwrap()
     };
-    assert_eq!(body(3), serde_json::json!({"provider":"p","model":"m"}));
+    assert_eq!(body(4), serde_json::json!({"provider":"p","model":"m"}));
     assert_eq!(
-        body(4),
+        body(5),
         serde_json::json!({"conversation_id":"owner:1","text":"Synthetic hello"})
     );
-    assert_eq!(body(7), serde_json::json!({"decision":"once"}));
+    assert_eq!(body(8), serde_json::json!({"decision":"once"}));
+}
+
+#[test]
+fn card_writes_use_their_own_routes_and_bodies() {
+    let (client, handle) = server(vec![
+        (200, r#"{"card":{},"task":{}}"#.into()),
+        (200, r#"{"card":{}}"#.into()),
+        (200, r#"{"card":{}}"#.into()),
+    ]);
+    client.answer_card("card-1", "Blue").unwrap();
+    client.decline_card("card-1").unwrap();
+    client
+        .submit_secret_card("card-1", "Synthetic-value")
+        .unwrap();
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("POST /v1/cards/card-1/answer "));
+    assert!(requests[1].starts_with("POST /v1/cards/card-1/decline "));
+    assert!(requests[2].starts_with("POST /v1/cards/card-1/secret "));
+    let body = |index: usize| -> serde_json::Value {
+        serde_json::from_str(requests[index].split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    };
+    assert_eq!(body(0), serde_json::json!({"answer":"Blue"}));
+    assert_eq!(body(2), serde_json::json!({"value":"Synthetic-value"}));
 }
 
 #[test]
@@ -500,12 +525,20 @@ fn catalog_without_egress_approval_fails_closed() {
 
 #[test]
 fn history_keeps_a_bot_speaker_and_rejects_an_unsafe_name() {
-    let (client, handle) = server(vec![(
-        200,
-        r#"{"messages":[{"id":"m","role":"assistant","content":"Synthetic analyst summary.","created_at":"now","name":"analyst"}]}"#.into(),
-    )]);
+    let (client, handle) = server(vec![
+        (
+            200,
+            r#"{"messages":[{"id":"m","role":"assistant","content":"Synthetic analyst summary.","created_at":"now","name":"analyst"}]}"#.into(),
+        ),
+        (
+            200,
+            r#"{"cards":[{"id":"card-1","conversation_id":"room:review","bot":"analyst","kind":"question","payload":{"question":"Which?","options":["A"],"allow_free_text":false},"status":"pending","created_at":"now"}]}"#.into(),
+        ),
+    ]);
     let history = client.history("room:review").unwrap();
     assert_eq!(history.messages[0].name.as_deref(), Some("analyst"));
+    assert_eq!(history.cards.len(), 1);
+    assert_eq!(history.cards[0].kind, "question");
     handle.join().unwrap();
 
     let (client, handle) = server(vec![(
@@ -535,6 +568,79 @@ fn list_bots_rejects_secret_shaped_ids() {
         r#"{"bots":[{"id":"../notes","role":"specialist","enabled":false,"live":false,"tools":[],"skills":[]}]}"#.into(),
     )]);
     assert_eq!(client.list_bots().unwrap_err(), ApiError::InvalidResponse);
+    handle.join().unwrap();
+}
+
+#[test]
+fn meet_your_team_reads_the_catalog_and_installs_one_bot() {
+    let (client, handle) = server(vec![(
+        200,
+        r#"{"bots":[{"id":"analyst","title":"Analyst","description":"Reads the numbers.","role":"specialist","installed":false,"avatar_version":"v1"},{"id":"writer","role":"specialist","installed":true,"avatar_version":null}]}"#.into(),
+    )]);
+    let bots = client.bot_catalog().unwrap();
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("GET /v1/bots/catalog "));
+    assert_eq!(bots.len(), 2);
+    assert_eq!(bots[0].id, "analyst");
+    assert_eq!(bots[0].title.as_deref(), Some("Analyst"));
+    assert!(!bots[0].installed);
+    assert!(bots[1].installed);
+    assert!(bots[1].title.is_none());
+
+    let (client, handle) = server(vec![(
+        200,
+        r#"{"bots":[{"id":"analyst","role":"specialist","installed":false},{"id":"analyst","role":"specialist","installed":false}]}"#.into(),
+    )]);
+    assert_eq!(client.bot_catalog().unwrap_err(), ApiError::InvalidResponse);
+    handle.join().unwrap();
+
+    let (client, handle) = server(vec![(
+        200,
+        r#"{"bots":[{"id":"../analyst","role":"specialist","installed":false}]}"#.into(),
+    )]);
+    assert_eq!(client.bot_catalog().unwrap_err(), ApiError::InvalidResponse);
+    handle.join().unwrap();
+
+    let (client, handle) = server(vec![(
+        200,
+        r#"{"bot":{"id":"analyst","title":"Analyst","role":"specialist","enabled":false,"installed":true,"avatar_version":"v1"}}"#.into(),
+    )]);
+    client.install_shipped_bot("analyst").unwrap();
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("POST /v1/bots/catalog/analyst/install "));
+
+    // A bot the owner already has is a conflict, and an unknown template is a
+    // 404; both come back as the status, never as a replayed write.
+    let (client, handle) = server(vec![(409, r#"{"error":"bot already exists"}"#.into())]);
+    assert_eq!(
+        client.install_shipped_bot("analyst").unwrap_err(),
+        ApiError::Http(409)
+    );
+    handle.join().unwrap();
+    let (client, handle) = server(vec![(404, r#"{"error":"not found"}"#.into())]);
+    assert_eq!(
+        client.install_shipped_bot("ghost").unwrap_err(),
+        ApiError::Http(404)
+    );
+    handle.join().unwrap();
+
+    // A reply for some other bot is not what was asked for.
+    let (client, handle) = server(vec![(
+        200,
+        r#"{"bot":{"id":"writer","role":"specialist","enabled":false,"installed":true}}"#.into(),
+    )]);
+    assert_eq!(
+        client.install_shipped_bot("analyst").unwrap_err(),
+        ApiError::InvalidResponse
+    );
+    handle.join().unwrap();
+
+    // Names that are not slugs never leave the process.
+    let (client, handle) = server(vec![]);
+    assert!(matches!(
+        client.install_shipped_bot("../analyst"),
+        Err(ApiError::Validation(_))
+    ));
     handle.join().unwrap();
 }
 
@@ -1082,7 +1188,7 @@ const ENTRY: &str = r#"{"name":"portal","kind":"password","username":"me@example
 
 #[test]
 fn vault_routes_validate_and_never_echo_a_value() {
-    use serabot_desktop::{VaultKind, VaultPut};
+    use serabot_desktop::{VaultKind, VaultPut, VaultSource};
     use zeroize::Zeroizing;
     let (client, handle) = server(vec![
         (200, format!(r#"{{"entries":[{ENTRY}]}}"#)),
@@ -1105,6 +1211,8 @@ fn vault_routes_validate_and_never_echo_a_value() {
         value: Zeroizing::new("synthetic-pass".into()),
         domains: vec!["example.test".into()],
         note: Some("  ".into()),
+        source: VaultSource::Local,
+        reference: None,
     };
     assert_eq!(client.vault_put("portal", &put).unwrap().name, "portal");
     client.vault_delete("portal").unwrap();
@@ -1136,6 +1244,7 @@ fn vault_routes_validate_and_never_echo_a_value() {
         body_of(&requests[1]),
         serde_json::json!({
             "kind": "password",
+            "source": "local",
             "username": "me@example.test",
             "value": "synthetic-pass",
             "domains": ["example.test"]
@@ -1155,6 +1264,8 @@ fn vault_writes_are_validated_before_the_network() {
         value: Zeroizing::new(value.into()),
         domains: domains.iter().map(|d| (*d).to_owned()).collect(),
         note: None,
+        source: serabot_desktop::VaultSource::Local,
+        reference: None,
     };
     for (name, input) in [
         ("Bad Name", put("v", &[])),

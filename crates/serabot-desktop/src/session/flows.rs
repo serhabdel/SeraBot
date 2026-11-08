@@ -142,6 +142,15 @@ impl Session {
             .filter(|bot| bot.avatar_version.is_some())
             .map(|bot| AvatarTarget::Bot(bot.id.clone()).key())
             .chain(
+                // Shipped bots not added yet still wear their bundled picture
+                // in the "Meet your team" sheet.
+                self.state
+                    .shipped_bots
+                    .iter()
+                    .filter(|bot| !bot.installed && bot.avatar_version.is_some())
+                    .map(|bot| AvatarTarget::Bot(bot.id.clone()).key()),
+            )
+            .chain(
                 self.state
                     .conversations
                     .iter()
@@ -165,6 +174,17 @@ impl Session {
                     .clone()
                     .map(|version| (AvatarTarget::Bot(bot.id.clone()), version))
             })
+            .chain(
+                self.state
+                    .shipped_bots
+                    .iter()
+                    .filter(|bot| !bot.installed)
+                    .filter_map(|bot| {
+                        bot.avatar_version
+                            .clone()
+                            .map(|version| (AvatarTarget::Bot(bot.id.clone()), version))
+                    }),
+            )
             .chain(self.state.conversations.iter().filter_map(|conversation| {
                 conversation
                     .avatar_version
@@ -253,6 +273,32 @@ impl Session {
             return;
         }
         self.schedule_next_avatar();
+    }
+
+    /// "Meet your team" opened: read the shipped templates. Scheduled, not
+    /// sent now, so a request already in flight finishes first.
+    pub fn open_meet_team(&mut self) {
+        self.state.shipped_error = None;
+        self.schedule(Operation::BotCatalog, Duration::ZERO);
+    }
+
+    /// "Add to my team" for one shipped bot. One write at a time; a refused
+    /// add is shown in the sheet and the button stays for a retry.
+    pub fn install_shipped_bot(&mut self, name: String) {
+        if self.state.shipped_installing.is_some() {
+            return;
+        }
+        if !self.ready() {
+            self.state.shipped_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.state.shipped_error = None;
+        self.state.shipped_installing = Some(name.clone());
+        self.start_request(Operation::InstallShippedBot { name });
+        if self.pending.is_none() {
+            self.state.shipped_installing = None;
+            self.state.shipped_error = Some("Network worker unavailable. Reconnect.".into());
+        }
     }
 
     // ------------------------------------------------------------- groups --

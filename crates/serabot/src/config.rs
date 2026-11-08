@@ -72,6 +72,9 @@ pub struct Config {
     pub skills: SkillsConfig,
     #[serde(default)]
     pub browser: BrowserConfig,
+    /// Password manager CLIs for vault references (see docs/vault.md).
+    #[serde(default)]
+    pub vault: VaultConfig,
     /// Tool approval policy (see docs/approvals.md).
     #[serde(default)]
     pub approvals: ApprovalsConfig,
@@ -122,6 +125,7 @@ impl Default for Config {
             ocr: OcrConfig::default(),
             skills: SkillsConfig::default(),
             browser: BrowserConfig::default(),
+            vault: VaultConfig::default(),
             approvals: ApprovalsConfig::default(),
             connectors: ConnectorsConfig::default(),
             fleet: FleetConfig::default(),
@@ -1263,6 +1267,21 @@ impl Default for FirecrawlConfig {
     }
 }
 
+/// `[vault]`: where the password manager CLIs live. Empty means look the
+/// binary up on `PATH` (`op` for 1Password, `pass-cli` for Proton Pass).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VaultConfig {
+    #[serde(default)]
+    pub op_path: String,
+    #[serde(default)]
+    pub pass_cli_path: String,
+    /// Read Proton Pass references. Off by default: experimental until the
+    /// `pass-cli` token variable and item flags are checked against the
+    /// installed release (see docs/vault.md).
+    #[serde(default)]
+    pub protonpass_enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TavilyConfig {
     #[serde(default)]
@@ -1706,9 +1725,21 @@ impl Default for OcrConfig {
     }
 }
 
+/// Longest shipped bot title, in characters.
+pub const MAX_BOT_TITLE_CHARS: usize = 40;
+/// Longest shipped bot description, in characters.
+pub const MAX_BOT_TEMPLATE_DESCRIPTION_CHARS: usize = 200;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotConfig {
     pub name: String,
+    /// Human title shown in the console in place of the raw id. Optional, so
+    /// rows stored before 0.23 still parse; the console falls back to the id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// One-line description shown in the console. Optional, like `title`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(default = "default_trigger")]
     pub trigger: String,
     #[serde(default)]
@@ -1732,6 +1763,33 @@ pub struct BotConfig {
     pub role: BotRole,
     #[serde(default)]
     pub delegates: Vec<String>,
+}
+
+impl BotConfig {
+    /// Check the optional `title` and `description` of a shipped template:
+    /// a title is 1 to 40 characters and a description at most 200, with no
+    /// control characters. Absent fields are fine.
+    pub fn validate_metadata(&self) -> Result<()> {
+        if let Some(title) = &self.title {
+            let count = title.trim().chars().count();
+            if count == 0 || count > MAX_BOT_TITLE_CHARS || title.chars().any(char::is_control) {
+                return Err(SeraError::Config(format!(
+                    "bot '{}' title must be 1 to {MAX_BOT_TITLE_CHARS} characters",
+                    self.name
+                )));
+            }
+        }
+        if let Some(description) = &self.description
+            && (description.chars().count() > MAX_BOT_TEMPLATE_DESCRIPTION_CHARS
+                || description.chars().any(char::is_control))
+        {
+            return Err(SeraError::Config(format!(
+                "bot '{}' description must be at most {MAX_BOT_TEMPLATE_DESCRIPTION_CHARS} characters",
+                self.name
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1772,6 +1830,8 @@ pub fn load_bots(config: &Config, dir: impl AsRef<Path>) -> Result<Vec<LoadedBot
                 path.display()
             )));
         }
+        bot.validate_metadata()
+            .map_err(|error| SeraError::Config(format!("{}: {error}", path.display())))?;
         let prompt_path = config.path(&bot.system_prompt);
         let canonical = prompt_path.canonicalize().map_err(|error| {
             SeraError::Config(format!(
@@ -1857,6 +1917,8 @@ pub fn validate_bot_tools(bots: &[LoadedBot], known: &[&str]) -> Result<()> {
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfiguredBot {
     pub id: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
     pub role: String,
     pub enabled: bool,
     pub model: Option<String>,
@@ -2042,6 +2104,9 @@ pub fn build_specialist_bot(
         .collect();
     let config = BotConfig {
         name: id.to_owned(),
+        // A bot the owner names has no shipped title; the id is the fallback.
+        title: None,
+        description: None,
         trigger: "command".into(),
         model: None,
         // The prompt is stored in the row, not read from a file.
@@ -2603,6 +2668,104 @@ mod tests {
         assert!(checked >= 5, "expected the shipped bot files");
     }
 
+    /// A row stored before 0.23 has no title or description and still parses;
+    /// a new template may set both, and an unset field is not written back.
+    #[test]
+    fn bot_config_parses_with_and_without_title() {
+        let legacy: BotConfig =
+            toml::from_str("name = \"legacy\"\nsystem_prompt = \"p\"\n").unwrap();
+        assert!(legacy.title.is_none() && legacy.description.is_none());
+        legacy.validate_metadata().unwrap();
+        let value = serde_json::to_value(&legacy).unwrap();
+        assert!(value.get("title").is_none());
+        assert!(value.get("description").is_none());
+
+        let titled: BotConfig = toml::from_str(
+            "name = \"auditor\"\ntitle = \"Auditor\"\ndescription = \"Runs checks.\"\nsystem_prompt = \"p\"\n",
+        )
+        .unwrap();
+        assert_eq!(titled.title.as_deref(), Some("Auditor"));
+        assert_eq!(titled.description.as_deref(), Some("Runs checks."));
+        titled.validate_metadata().unwrap();
+        let round: BotConfig =
+            serde_json::from_value(serde_json::to_value(&titled).unwrap()).unwrap();
+        assert_eq!(round.title, titled.title);
+        assert_eq!(round.description, titled.description);
+    }
+
+    #[test]
+    fn bot_metadata_lengths_are_checked() {
+        let with = |title: Option<String>, description: Option<String>| BotConfig {
+            name: "synthetic".into(),
+            title,
+            description,
+            trigger: "command".into(),
+            model: None,
+            system_prompt: "prompts/main.txt".into(),
+            skills: Vec::new(),
+            tools: Vec::new(),
+            require_approval: Vec::new(),
+            enabled: true,
+            temperature: None,
+            thinking: None,
+            role: BotRole::default(),
+            delegates: Vec::new(),
+        };
+        let long_title = "t".repeat(MAX_BOT_TITLE_CHARS + 1);
+        let long_description = "d".repeat(MAX_BOT_TEMPLATE_DESCRIPTION_CHARS + 1);
+        with(Some("t".repeat(MAX_BOT_TITLE_CHARS)), None)
+            .validate_metadata()
+            .unwrap();
+        with(None, Some("d".repeat(MAX_BOT_TEMPLATE_DESCRIPTION_CHARS)))
+            .validate_metadata()
+            .unwrap();
+        assert!(with(Some(long_title), None).validate_metadata().is_err());
+        assert!(with(Some("   ".into()), None).validate_metadata().is_err());
+        assert!(
+            with(Some("Bad\u{7}".into()), None)
+                .validate_metadata()
+                .is_err()
+        );
+        assert!(
+            with(None, Some(long_description))
+                .validate_metadata()
+                .is_err()
+        );
+        assert!(
+            with(None, Some("Two\nlines".into()))
+                .validate_metadata()
+                .is_err()
+        );
+    }
+
+    /// Every shipped template has a human title and a one-line description,
+    /// so no bot falls back to its raw id in the console.
+    #[test]
+    fn shipped_bots_have_a_title_and_a_description() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bots");
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(&root).expect("bots directory") {
+            let path = entry.expect("bots entry").path();
+            if path.extension().and_then(|value| value.to_str()) != Some("toml") {
+                continue;
+            }
+            let bot: BotConfig = toml::from_str(&std::fs::read_to_string(&path).expect("bot file"))
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            bot.validate_metadata()
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            let title = bot.title.as_deref().unwrap_or_default();
+            let description = bot.description.as_deref().unwrap_or_default();
+            assert!(!title.trim().is_empty(), "{} needs a title", path.display());
+            assert!(
+                !description.trim().is_empty(),
+                "{} needs a description",
+                path.display()
+            );
+            checked += 1;
+        }
+        assert!(checked >= 12, "expected the twelve shipped bot files");
+    }
+
     fn shipped_bot(name: &str) -> BotConfig {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bots");
         let raw = std::fs::read_to_string(root.join(format!("{name}.toml"))).expect("bot file");
@@ -2688,6 +2851,8 @@ mod tests {
         let bot = LoadedBot {
             config: BotConfig {
                 name: "synthetic".into(),
+                title: None,
+                description: None,
                 trigger: "command".into(),
                 model: None,
                 system_prompt: "prompts/main.txt".into(),

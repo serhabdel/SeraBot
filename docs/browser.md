@@ -42,7 +42,7 @@ when you must run as root.
 | `browser_navigate{url}` | yes | Open a public http(s) URL (starts the browser). |
 | `browser_snapshot{}` | no | Text outline with element refs `e1..eN`. |
 | `browser_click{ref}` | yes | Click a ref from the latest snapshot. |
-| `browser_type{ref, text}` or `{ref, secret, field}` | yes | Type text, or a vault secret by name. The value never reaches tool output; later page text is scrubbed to `[vault:<name>]`. |
+| `browser_type{ref, text}` or `{ref, secret, field}` | yes | Type text, or a vault secret by name. A secret needs the owner's approval for the current page's host, and the entry must list that host. The value never reaches tool output; later page text is scrubbed to `[vault:<name>]`. See `docs/vault.md`. |
 | `browser_press{key}` | yes | Enter, Tab, Escape, arrows, a single letter or digit, ... |
 | `browser_screenshot{}` | no | JPEG stored as an artifact; not returned to the model. |
 | `browser_close{}` | no | Close the session. |
@@ -51,6 +51,10 @@ when you must run as root.
 
 While the owner has taken over (`controller = user`) every bot tool, including
 `browser_close`, fails with "the user is in control of the browser".
+
+Page tool replies carry the URL and title. When the page is a provider's sign-in refusal (see
+below), the reply also carries a plain `note:` telling the model not to retry the login and to
+suggest the connector.
 
 ## Profiles and sessions (0.16)
 
@@ -95,8 +99,27 @@ private, link-local (including 169.254.169.254 metadata), CGNAT 100.64/10, unspe
 multicast, reserved and documentation ranges, and the IPv6 equivalents including
 IPv4-mapped, NAT64 and 6to4 forms. Names are resolved and **every** address must be public.
 The same check runs on every subresource and redirect hop via CDP `Fetch.requestPaused`;
-blocked requests fail with `AccessDenied`. Popups are closed, downloads denied, JavaScript
-dialogs dismissed.
+blocked requests fail with `AccessDenied`. Downloads are denied and JavaScript dialogs dismissed.
+
+Popups: every page the browser creates attaches to us paused (browser-level `Target.setAutoAttach`
+with `waitForDebuggerOnStart`). A page one of our tabs opened (`window.open`, `target=_blank`) is
+configured with the same guard, then runs and is adopted as a tab that becomes the active one
+(`browser/chromium.rs`, `should_adopt`). A popup from any other page, or any popup while the
+browser already has 8 tabs, is closed and logged. A page that is not adopted is closed while it is
+still paused, so its code never runs. The owner's `+` and the bot's `browser_new_tab` create a blank
+page with `Target.createTarget`; no script runs in the active tab, so a site cannot change how the
+new tab opens. The new page is reserved (it counts toward the limit but no bot call reaches it),
+configured with the guard, then made the active tab before the guarded navigation.
+
+Preconnect and DNS prefetch are switched off as defence in depth, not as the control: the
+`--dns-prefetch-disable` switch, `NetworkPrediction` in the disabled features, and
+`net.network_prediction_options = 2` written into the profile's `Default/Preferences` before each
+launch (other keys in that file are kept). Limit, measured against a real Chromium
+(`live_popup_first_request_is_guarded`): when a popup is opened with a URL, Chromium can still open a
+bare TCP connection to that address before the guard sees the request. The test found no HTTP
+request reaching a refused loopback address. The bare connection can still reveal that a port is
+open, so the host firewall must block the service user's egress to private ranges (see above), as
+already advised; OS egress rules remain recommended.
 
 Limits: Chromium resolves names itself, so a DNS-rebinding answer that changes between
 our check and the browser's lookup is not caught (verdicts are cached 30 s per origin);
@@ -110,4 +133,33 @@ for logged-in flows is out of scope for this server browser.
 
 ## Tabs and pointer (0.18)
 
-`GET /v1/browser/sessions` entries (and the takeover, handback, input and tab replies, which also carry `id` and `profile_name`) include `tabs` (`[{id: "t1", url, title, active}]`, at most 8) and `pointer` (`{x, y, action: "click"|"scroll", seq, vw, vh}`, viewport pixels, `seq` grows per action). While the user holds control: `POST /v1/browser/sessions/{id}/tabs {"url"}` opens a tab (public http(s) only), `POST .../tabs/{tab}/switch` and `.../tabs/{tab}/close` switch or close one; the last tab cannot be closed. The desktop Browser page draws a tab strip above the live view and a cursor with a click ripple (static under reduced motion) while the bot drives.
+`GET /v1/browser/sessions` entries (and the takeover, handback, input and tab replies, which also carry `id` and `profile_name`) include `tabs` (`[{id: "t1", url, title, active}]`, at most 8) and `pointer` (`{x, y, action: "click"|"scroll", seq, vw, vh}`, viewport pixels, `seq` grows per action). While the user holds control: `POST /v1/browser/sessions/{id}/tabs {"url"}` opens a tab (public http(s) only), `POST .../tabs/{tab}/switch` and `.../tabs/{tab}/close` switch or close one; the last tab cannot be closed. The tab list is part of every session entry (`GET /v1/browser/sessions`), so there is no separate list route. The desktop Browser page draws a tab strip above the live view and a cursor with a click ripple (static under reduced motion) while the bot drives. Without control the tabs are shown read-only. The grid card shows the tab count.
+
+### Driving controls (0.23)
+
+While the user holds control, `POST /v1/browser/sessions/{id}/input` also takes `{"type":"back"}`,
+`{"type":"forward"}` and `{"type":"reload"}` for the active tab. The landing page gets the same
+public-address check as bot navigation (a private landing is reset to `about:blank`). A
+`{"type":"navigate","url"}` input goes through the same URL guard as `browser_navigate`.
+
+Each session entry also has `idle_secs` (seconds since the last bot or owner action; polling does
+not count) and, when the active tab shows a provider's sign-in refusal, `signin_blocked:
+{"provider","message"}`.
+
+## Sign-in refusals (0.23)
+
+Some providers refuse sign-in in a browser they consider automated. Google answers a sign-in from
+such a browser with `accounts.google.com/.../signin/rejected` ("This browser or app may not be
+secure"). SeraBot does not try to get past that: no user-agent spoofing and no webdriver patching.
+`browser/signin.rs` recognises the refusal pages in a small table (one row per provider, https
+only). When the active tab lands on one, the session reports `signin_blocked`, the desktop shows a
+banner with an "Open Connectors" button, and bot tool replies carry the refusal note. Use the
+Google connector (Connectors → Google) for Gmail, Drive and Calendar, or sign in from a regular
+browser on the owner's PC.
+
+## Hide and idle sessions
+
+Hiding the Browser page or the dock never closes a browser: `Hide` only clears the focus view and
+stops the pictures. A session ends when the owner presses End session, or when it has been idle
+for `idle_timeout_secs` (no bot tool call and no owner input). The grid shows how long it has been
+idle.

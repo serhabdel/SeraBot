@@ -190,6 +190,14 @@ impl BrowserBackend for FakeBackend {
         }
         Ok(())
     }
+    async fn history_step(&self, delta: i64) -> Result<PageInfo> {
+        self.record(format!("history {delta}"));
+        self.info().await
+    }
+    async fn reload(&self) -> Result<PageInfo> {
+        self.record("reload");
+        self.info().await
+    }
     fn pointer(&self) -> Option<Pointer> {
         *self.pointer.lock().unwrap()
     }
@@ -217,6 +225,14 @@ impl FakeLauncher {
     pub fn kill_all(&self) {
         for backend in self.backends.lock().unwrap().iter() {
             backend.alive.store(false, Ordering::SeqCst);
+        }
+    }
+    /// Point every session of `user` at `url`, as a page that navigates by itself.
+    pub fn navigate_user(&self, user: &str, url: &str) {
+        for backend in self.backends.lock().unwrap().iter() {
+            if backend.user == user {
+                backend.set_url(url);
+            }
         }
     }
     pub fn calls_for(&self, user: &str) -> Vec<String> {
@@ -290,10 +306,32 @@ pub(crate) fn manager_with_base(
 #[derive(Default)]
 pub(crate) struct FakeResolver {
     pub requests: std::sync::Mutex<Vec<(String, String, String, String)>>,
+    /// Once set, the next resolve moves the user's pages to the URL after the
+    /// host check: a page that navigates during a slow password manager read.
+    pub moves_page: std::sync::Mutex<Option<(Arc<FakeLauncher>, String)>>,
 }
 
+impl FakeResolver {
+    fn check(&self, name: &str, host: &str) -> Result<()> {
+        if name != "bank" {
+            return Err(SeraError::NotFound("no such vault entry".into()));
+        }
+        if !(host == "bank.example" || host.ends_with(".bank.example")) {
+            return Err(SeraError::Forbidden(
+                "this vault entry is not allowed on this host".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl SecretResolver for FakeResolver {
-    fn resolve(
+    fn authorize(&self, _user_id: &str, name: &str, _field: &str, host: &str) -> Result<()> {
+        self.check(name, host)
+    }
+
+    async fn resolve(
         &self,
         user_id: &str,
         name: &str,
@@ -306,13 +344,10 @@ impl SecretResolver for FakeResolver {
             field.into(),
             host.into(),
         ));
-        if name != "bank" {
-            return Err(SeraError::NotFound("no such vault entry".into()));
-        }
-        if !(host == "bank.example" || host.ends_with(".bank.example")) {
-            return Err(SeraError::Forbidden(
-                "this vault entry is not allowed on this host".into(),
-            ));
+        self.check(name, host)?;
+        let moved = self.moves_page.lock().unwrap().take();
+        if let Some((launcher, url)) = moved {
+            launcher.navigate_user(user_id, &url);
         }
         Ok(Zeroizing::new(FAKE_SECRET.to_owned()))
     }

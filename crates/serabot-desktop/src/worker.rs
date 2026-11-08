@@ -4,8 +4,8 @@ use crate::{
     ConnectorUpdate, ConversationKind, ConversationPage, ConversationSummary, CreatedBot,
     CreatedConversation, CreatedGroup, CreatedSkill, Health, History, LibraryEntry, MemoryEntry,
     MemoryStatsView, NewGroup, NewProvider, Onboarding, ProviderStatus, Scope, Selection,
-    ServerHealth, SkillSummary, Task, Team, TeamMode, Transcription, UsageReport, VoiceSettings,
-    VoiceUpdate, avatars::AvatarTarget,
+    ServerHealth, ShippedBot, SkillSummary, Task, Team, TeamMode, Transcription, UsageReport,
+    VoiceSettings, VoiceUpdate, avatars::AvatarTarget,
 };
 use secrecy::SecretString;
 use std::sync::{
@@ -78,6 +78,10 @@ pub enum OperationKind {
     Usage,
     /// Owner-only server health card (GET /v1/admin/status).
     ServerHealth,
+    /// `GET /v1/bots/catalog`: the shipped templates on "Meet your team".
+    BotCatalog,
+    /// `POST /v1/bots/catalog/{name}/install`: "Add to my team".
+    BotInstall,
     Avatar,
     CreateGroup,
     OnboardingRead,
@@ -85,6 +89,8 @@ pub enum OperationKind {
     ToolsWrite,
     /// Upload of one chat attachment from the composer.
     Attach,
+    /// Answer, decline or secret reply on a chat card.
+    CardWrite,
 }
 
 impl OperationKind {
@@ -266,6 +272,12 @@ pub enum Operation {
     },
     /// `GET /v1/admin/status` (admin only): the owner's server health card.
     ServerHealth,
+    /// `GET /v1/bots/catalog`.
+    BotCatalog,
+    /// `POST /v1/bots/catalog/{name}/install`.
+    InstallShippedBot {
+        name: String,
+    },
     /// `GET /v1/usage?days=&bot=&conversation_id=`.
     Usage {
         days: u32,
@@ -307,6 +319,20 @@ pub enum Operation {
     SetBotTools {
         id: String,
         tools: Vec<String>,
+    },
+    /// `POST /v1/cards/{id}/answer` with the owner's answer.
+    AnswerCard {
+        id: String,
+        answer: String,
+    },
+    /// `POST /v1/cards/{id}/decline`.
+    DeclineCard {
+        id: String,
+    },
+    /// `POST /v1/cards/{id}/secret`. The value is never logged or kept in state.
+    SubmitSecretCard {
+        id: String,
+        value: Zeroizing<String>,
     },
 }
 
@@ -369,6 +395,8 @@ impl Operation {
             Self::UpdateBotConfig { .. } => OperationKind::BotConfigWrite,
             Self::Usage { .. } => OperationKind::Usage,
             Self::ServerHealth => OperationKind::ServerHealth,
+            Self::BotCatalog => OperationKind::BotCatalog,
+            Self::InstallShippedBot { .. } => OperationKind::BotInstall,
             Self::CreateNamedBot { .. } => OperationKind::CreateBot,
             Self::AvatarFetch { .. } | Self::AvatarUpload { .. } | Self::AvatarRemove { .. } => {
                 OperationKind::Avatar
@@ -379,6 +407,9 @@ impl Operation {
             | Self::OnboardingReply { .. }
             | Self::OnboardingConfirm { .. } => OperationKind::OnboardingWrite,
             Self::SetBotTools { .. } => OperationKind::ToolsWrite,
+            Self::AnswerCard { .. } | Self::DeclineCard { .. } | Self::SubmitSecretCard { .. } => {
+                OperationKind::CardWrite
+            }
         }
     }
 }
@@ -451,6 +482,10 @@ pub enum Reply {
     },
     Usage(UsageReport),
     ServerHealth(ServerHealth),
+    /// The shipped templates for "Meet your team".
+    ShippedBots(Vec<ShippedBot>),
+    /// The named shipped bot is now the owner's own.
+    ShippedBotInstalled(String),
     /// A fetched avatar as a `data:` URL; `None` when the bot has no image.
     AvatarImage {
         target: AvatarTarget,
@@ -461,6 +496,8 @@ pub enum Reply {
     CreatedGroup(CreatedGroup),
     Onboarding(Onboarding),
     ToolsSaved,
+    /// An answer, decline or secret was accepted. The transcript reloads next.
+    CardWritten,
 }
 
 pub struct Job {
@@ -888,6 +925,10 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
                 })
         }
         Operation::ServerHealth => client.server_health().map(Reply::ServerHealth),
+        Operation::BotCatalog => client.bot_catalog().map(Reply::ShippedBots),
+        Operation::InstallShippedBot { name } => client
+            .install_shipped_bot(name)
+            .map(|()| Reply::ShippedBotInstalled(name.clone())),
         Operation::Usage {
             days,
             bot,
@@ -935,6 +976,13 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::SetBotTools { id, tools } => {
             client.set_bot_tools(id, tools).map(|_| Reply::ToolsSaved)
         }
+        Operation::AnswerCard { id, answer } => {
+            client.answer_card(id, answer).map(|_| Reply::CardWritten)
+        }
+        Operation::DeclineCard { id } => client.decline_card(id).map(|_| Reply::CardWritten),
+        Operation::SubmitSecretCard { id, value } => client
+            .submit_secret_card(id, value)
+            .map(|_| Reply::CardWritten),
     }
 }
 

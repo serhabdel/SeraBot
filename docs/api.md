@@ -220,6 +220,21 @@ provider must list the model — or `null` for the default model) and
 nothing. The response's `bot` carries `display_name`, `description`, `model`
 (model id or `null`) and `browser_profile`.
 
+Since 0.23 each bot entry also carries `title` (the shipped human title, or
+`null`), and `display_name` falls back to it when the owner has set no name.
+`description` falls back to the shipped one the same way.
+
+`GET /v1/bots/catalog` (0.23, "Meet your team") lists every shipped template as
+`{"id","title","description","role","installed","avatar_version"}`. `installed`
+is true only when the session user has a row with that id. A bot the owner
+removed shows `installed: false`. Only that user's rows are read.
+
+`POST /v1/bots/catalog/{name}/install` puts one shipped template back as the
+session user's own row, with the template's prompt, tools, and enabled flag. It
+never touches another user's rows. An unknown name is `404`; a bot the user
+already has is `409`. The offering is recorded, so later template upgrades reach
+the restored bot. Audited as `bot.installed`.
+
 `PUT /v1/admin/bots/{id}/config` (owner token) updates `tools`, `skills`, and/or
 `require_approval` for an existing bot:
 
@@ -453,6 +468,34 @@ conversation id.
 An assistant message may include `name` when it is a bot id: the orchestrator
 on a room turn, or the specialist after `delegate`. Names that are not bot ids
 are omitted. See [Orchestration](orchestration.md).
+
+## Chat cards (0.23)
+
+A bot that is unsure asks the owner with a question card (`ask_user`) instead
+of guessing. A secret request card is raised by the vault and is resolved only
+through the secret route below. Cards live in the transcript: the desktop reads
+them with the conversation history.
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| `GET` | `/v1/conversations/{id}/cards` | The owner's cards in one conversation, oldest first (newest 100). |
+| `POST` | `/v1/cards/{id}/answer` | Question only. `{"answer": "..."}`. Posts `Answer to “<question>”: <answer>` as the owner's next message, which starts a bot turn, and marks the card `answered`. When free text is off, the answer must be one of the options. |
+| `POST` | `/v1/cards/{id}/decline` | Marks a pending card `declined` and posts a note the bot reads, such as `(The user dismissed the question “…”; proceed with your best judgment.)`. |
+| `POST` | `/v1/cards/{id}/secret` | Secret request only: `{"value": "..."}`. Sealed into the owner's vault. The reply never contains the value. Added by the vault package. |
+
+A card: `{"id", "conversation_id", "bot", "kind", "payload", "status", "response", "created_at", "resolved_at"}`.
+`kind` is `question` or `secret_request`. `status` is `pending`, `answered`, `declined` or `expired`.
+A question payload is `{"question" (≤500), "options" (0 to 6, each ≤80), "allow_free_text", "context"?}`.
+A secret request payload is `{"purpose": "save" | "provide", "name", "kind": "password" | "api_key" | "note", "username"?, "domains", "reason"}`.
+`response` never holds a secret value.
+
+Rules:
+
+- `ask_user` returns `{"asked": false, "autonomy": true}` when the conversation has auto-approve on or a goal plan. The bot then decides and states its assumption.
+- At most one question is pending per conversation. A second `ask_user` returns the pending card. A pending question older than 24 hours expires on the next ask.
+- A card resolves once. A second answer or decline is refused with `422`.
+- Events `card.created` and `card.resolved` carry ids only. The desktop reloads the transcript, which includes the cards.
+- Cards are owner-scoped: another account gets `404`, never the card.
 
 ## Approvals
 

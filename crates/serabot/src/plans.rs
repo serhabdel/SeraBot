@@ -81,9 +81,33 @@ impl Plan {
     }
 }
 
-fn clean_text(raw: &str, max_chars: usize) -> String {
+/// Invisible Unicode format characters (general category Cf) that can hide
+/// text or split a word for a filter: soft hyphen, Arabic and Mongolian marks,
+/// zero-width spaces and joiners, bidi controls, word joiners and the BOM. This
+/// is a small set of the Cf table, covering the ranges that matter here.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+    )
+}
+
+pub(crate) fn clean_text(raw: &str, max_chars: usize) -> String {
+    // Format characters are dropped, not spaced: "sec\u{200B}ret" is one word.
     let flat: String = raw
         .chars()
+        .filter(|c| !is_format_char(*c))
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let collapsed = flat.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -336,6 +360,23 @@ mod tests {
             .unwrap()
             .id;
         (store, admin, other)
+    }
+
+    #[test]
+    fn clean_text_drops_invisible_format_characters() {
+        // Zero-width space, bidi override, BOM and word joiner are removed, so
+        // the text reads the same to the owner and to a filter.
+        assert_eq!(clean_text("sec\u{200B}ret", 50), "secret");
+        assert_eq!(clean_text("\u{202E}olleh\u{202C}", 50), "olleh");
+        assert_eq!(clean_text("\u{FEFF}Ship\u{2060}it", 50), "Shipit");
+        assert_eq!(
+            clean_text("a\u{00AD}b\u{061C}c\u{2066}d\u{2069}", 50),
+            "abcd"
+        );
+        // Ordinary text, including accents and emoji, is untouched.
+        assert_eq!(clean_text("Café 📦 ok", 50), "Café 📦 ok");
+        // Control characters still become spaces.
+        assert_eq!(clean_text("a\u{7}b", 50), "a b");
     }
 
     #[test]

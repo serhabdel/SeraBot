@@ -2,7 +2,7 @@ use crate::{
     ApiError, Approval, AuthUser, BotDetail, BotSummary, Catalog, ConnectorStatus,
     ConnectorTestResult, ConversationSummary, CreatedBot, CreatedConversation, CreatedGroup,
     CreatedSkill, LibraryEntry, MemoryEntry, MemoryStatsView, Message, Onboarding, ProviderStatus,
-    Scope, Selection, ServerHealth, SkillSummary, Task, Team, UsageReport,
+    Scope, Selection, ServerHealth, ShippedBot, SkillSummary, Task, Team, UsageReport,
     avatars::AvatarImage,
     worker::{OperationKind, Reply},
 };
@@ -30,6 +30,8 @@ pub struct State {
     pub catalog: Option<Catalog>,
     pub draft: Selection,
     pub messages: Vec<Message>,
+    /// Chat cards of the open conversation (0.23), oldest first.
+    pub cards: Vec<crate::ChatCard>,
     pub history_loaded: bool,
     pub task: Option<Task>,
     /// Live steps of the latest turn, from the event stream.
@@ -90,6 +92,13 @@ pub struct State {
     pub skills_loaded: bool,
     pub listed_bots: Vec<BotSummary>,
     pub bots_loaded: bool,
+    /// Shipped templates for "Meet your team", owner-scoped like the bot list.
+    pub shipped_bots: Vec<ShippedBot>,
+    pub shipped_loaded: bool,
+    /// The shipped bot being added right now; one write at a time.
+    pub shipped_installing: Option<String>,
+    /// Error text for the "Meet your team" sheet, kept out of the global banner.
+    pub shipped_error: Option<String>,
     /// Cached `GET /v1/bots/{id}` records, keyed by bot id. Owner-scoped:
     /// they survive conversation switches and are cleared on disconnect.
     pub bot_details: BTreeMap<String, BotDetail>,
@@ -124,6 +133,7 @@ impl Default for State {
             catalog: None,
             draft: Selection::default(),
             messages: Vec::new(),
+            cards: Vec::new(),
             history_loaded: false,
             task: None,
             activity: Default::default(),
@@ -167,6 +177,10 @@ impl Default for State {
             skills_loaded: false,
             listed_bots: Vec::new(),
             bots_loaded: false,
+            shipped_bots: Vec::new(),
+            shipped_loaded: false,
+            shipped_installing: None,
+            shipped_error: None,
             bot_details: BTreeMap::new(),
             usage: None,
             server_health: None,
@@ -200,6 +214,8 @@ impl State {
         let skills_loaded = self.skills_loaded;
         let listed_bots = self.listed_bots.clone();
         let bots_loaded = self.bots_loaded;
+        let shipped_bots = self.shipped_bots.clone();
+        let shipped_loaded = self.shipped_loaded;
         let bot_details = self.bot_details.clone();
         let usage = self.usage.clone();
         let server_health = self.server_health.clone();
@@ -241,6 +257,8 @@ impl State {
             skills_loaded,
             listed_bots,
             bots_loaded,
+            shipped_bots,
+            shipped_loaded,
             bot_details,
             usage,
             server_health,
@@ -271,6 +289,8 @@ impl State {
         self.skills_loaded = false;
         self.listed_bots.clear();
         self.bots_loaded = false;
+        self.shipped_bots.clear();
+        self.shipped_loaded = false;
         self.bot_details.clear();
         self.usage = None;
         self.server_health = None;
@@ -326,6 +346,7 @@ impl State {
             }
             Reply::History(history) => {
                 self.messages = history.messages;
+                self.cards = history.cards;
                 self.history_loaded = true;
                 // Fetching the transcript marks the thread read on the server;
                 // the badge clears locally at the same moment.
@@ -359,6 +380,18 @@ impl State {
             Reply::Bots(bots) => {
                 self.listed_bots = bots;
                 self.bots_loaded = true;
+            }
+            Reply::ShippedBots(bots) => {
+                self.shipped_bots = bots;
+                self.shipped_loaded = true;
+                self.shipped_error = None;
+            }
+            Reply::ShippedBotInstalled(name) => {
+                self.shipped_installing = None;
+                self.shipped_error = None;
+                if let Some(bot) = self.shipped_bots.iter_mut().find(|bot| bot.id == name) {
+                    bot.installed = true;
+                }
             }
             Reply::BotDetail(detail) => {
                 self.bot_details.insert(detail.id.clone(), detail);
@@ -500,7 +533,7 @@ impl State {
                     .insert(target.key(), AvatarImage { version, data_url });
             }
             // The session reacts to these (it owns the drafts they came from).
-            Reply::AvatarSaved(_) | Reply::ToolsSaved => {}
+            Reply::AvatarSaved(_) | Reply::ToolsSaved | Reply::CardWritten => {}
             Reply::CreatedGroup(group) => self.created_group = Some(group),
             Reply::Onboarding(onboarding) => self.onboarding = Some(onboarding),
         }
@@ -510,6 +543,12 @@ impl State {
     pub fn fail(&mut self, scope: &Scope, kind: OperationKind, error: ApiError) -> bool {
         if !self.scope.accepts(scope) {
             return false;
+        }
+        // Both belong to the sheet that asked: its error stays in the sheet.
+        if matches!(kind, OperationKind::BotCatalog | OperationKind::BotInstall) {
+            self.shipped_installing = None;
+            self.shipped_error = Some(error.to_string());
+            return true;
         }
         let mutation = matches!(
             kind,
@@ -528,6 +567,7 @@ impl State {
                 | OperationKind::CreateGroup
                 | OperationKind::OnboardingWrite
                 | OperationKind::ToolsWrite
+                | OperationKind::CardWrite
         );
         if mutation && error.unknown_outcome() {
             self.unknown_outcome = true;
@@ -546,6 +586,7 @@ impl State {
                 OperationKind::CreateGroup => "group create",
                 OperationKind::OnboardingWrite => "interview step",
                 OperationKind::ToolsWrite => "capability change",
+                OperationKind::CardWrite => "card reply",
                 _ => "model change",
             };
             self.error = Some(format!(
@@ -561,6 +602,31 @@ impl State {
         }
         true
     }
+}
+
+/// The label a shipped bot wears before the owner has it: its title, or the
+/// humanized id when the template has none.
+pub fn shipped_label(bot: &ShippedBot) -> String {
+    bot.title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::session::humanize_label(&bot.id))
+}
+
+/// "Meet your team" order: the bots the owner does not have yet first, then
+/// by label, so the ones to add are at the top.
+pub fn meet_order(bots: &[ShippedBot]) -> Vec<&ShippedBot> {
+    let mut ordered: Vec<&ShippedBot> = bots.iter().collect();
+    ordered.sort_by_cached_key(|bot| {
+        (
+            bot.installed,
+            shipped_label(bot).to_lowercase(),
+            bot.id.clone(),
+        )
+    });
+    ordered
 }
 
 #[cfg(test)]
@@ -776,6 +842,7 @@ mod tests {
             live: true,
             model: None,
             display_name: Some("Analyst".into()),
+            title: None,
             description: None,
             avatar: Some("A".into()),
             avatar_version: None,
@@ -837,6 +904,7 @@ mod tests {
             &scope,
             Reply::History(History {
                 messages: Vec::new(),
+                cards: Vec::new(),
             }),
         );
         let opened = state
@@ -1089,5 +1157,68 @@ mod tests {
                 .unwrap()
                 .contains("Unknown team update outcome")
         );
+    }
+
+    fn shipped(id: &str, title: Option<&str>, installed: bool) -> ShippedBot {
+        ShippedBot {
+            id: id.into(),
+            title: title.map(str::to_owned),
+            description: None,
+            role: "specialist".into(),
+            installed,
+            avatar_version: None,
+        }
+    }
+
+    #[test]
+    fn meet_order_puts_bots_to_add_first_then_by_title() {
+        let bots = vec![
+            shipped("zeta", Some("Analyst"), false),
+            shipped("alpha", Some("Writer"), true),
+            shipped("beta", Some("builder"), false),
+            shipped("gamma", None, false),
+        ];
+        let order: Vec<&str> = meet_order(&bots)
+            .iter()
+            .map(|bot| bot.id.as_str())
+            .collect();
+        // Not installed first; labels compare case-insensitively ("analyst",
+        // "builder", "gamma"); the id is the tie-break, so the order never
+        // depends on the server's list order.
+        assert_eq!(order, ["zeta", "beta", "gamma", "alpha"]);
+    }
+
+    #[test]
+    fn shipped_label_prefers_the_title_and_falls_back_to_the_id() {
+        assert_eq!(
+            shipped_label(&shipped("marketing-lead", Some("  Marketing lead "), false)),
+            "Marketing lead"
+        );
+        assert_eq!(
+            shipped_label(&shipped("marketing-lead", Some("  "), false)),
+            "Marketing Lead"
+        );
+    }
+
+    #[test]
+    fn installing_a_shipped_bot_flips_its_flag_and_failures_stay_in_the_sheet() {
+        let mut state = State::default();
+        let scope = state.scope.clone();
+        state.receive(
+            &scope,
+            Reply::ShippedBots(vec![shipped("analyst", Some("Analyst"), false)]),
+        );
+        assert!(state.shipped_loaded);
+        state.shipped_installing = Some("analyst".into());
+        state.receive(&scope, Reply::ShippedBotInstalled("analyst".into()));
+        assert!(state.shipped_bots[0].installed);
+        assert!(state.shipped_installing.is_none());
+
+        state.shipped_installing = Some("writer".into());
+        state.fail(&scope, OperationKind::BotInstall, ApiError::Http(409));
+        assert!(state.shipped_installing.is_none());
+        assert!(state.shipped_error.as_ref().unwrap().contains("409"));
+        assert!(state.error.is_none(), "the global banner stays clear");
+        assert!(!state.unknown_outcome);
     }
 }

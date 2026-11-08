@@ -49,12 +49,46 @@ impl VaultKind {
     }
 }
 
+/// Where an entry's value comes from (server `source`). A reference names an
+/// item in the owner's password manager; the value is read when it is typed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VaultSource {
+    #[default]
+    #[serde(rename = "local")]
+    Local,
+    #[serde(rename = "onepassword")]
+    OnePassword,
+    #[serde(rename = "protonpass")]
+    ProtonPass,
+}
+
+impl VaultSource {
+    pub const ALL: [Self; 3] = [Self::Local, Self::OnePassword, Self::ProtonPass];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Local => "Value",
+            Self::OnePassword => "1Password",
+            Self::ProtonPass => "Proton Pass",
+        }
+    }
+
+    pub fn is_reference(self) -> bool {
+        self != Self::Local
+    }
+}
+
 /// One vault entry: metadata only, never the value.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct VaultEntry {
     pub name: String,
     pub kind: VaultKind,
+    #[serde(default)]
+    pub source: VaultSource,
+    /// The password manager item pointer for a reference. A pointer, not a value.
+    #[serde(default)]
+    pub reference: Option<String>,
     #[serde(default)]
     pub username: Option<String>,
     #[serde(default)]
@@ -67,24 +101,78 @@ pub struct VaultEntry {
     pub last_used_at: Option<String>,
 }
 
-/// A vault write. The value is wiped when this is dropped.
+/// A vault write. The value is wiped when this is dropped. A reference
+/// carries an empty value.
 pub struct VaultPut {
     pub kind: VaultKind,
     pub username: Option<String>,
     pub value: Zeroizing<String>,
     pub domains: Vec<String>,
     pub note: Option<String>,
+    pub source: VaultSource,
+    pub reference: Option<String>,
 }
 
 #[derive(Serialize)]
 struct VaultPutBody<'a> {
     kind: VaultKind,
+    source: VaultSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     username: Option<&'a str>,
     value: &'a str,
     domains: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<&'a str>,
+}
+
+/// Longest password manager item pointer the server accepts.
+pub const MAX_VAULT_REFERENCE_CHARS: usize = 512;
+
+/// The shape the server accepts for a reference: `op://vault/item/field`
+/// (or with a section) for 1Password, `pass://vault/item/field` for Proton
+/// Pass. 1Password forbids spaces; Proton Pass titles may contain them. No
+/// control characters either way.
+pub fn valid_vault_reference(source: VaultSource, reference: &str) -> bool {
+    let (prefix, counts, spaces_ok) = match source {
+        VaultSource::Local => return false,
+        VaultSource::OnePassword => ("op://", 3..=4, false),
+        VaultSource::ProtonPass => ("pass://", 3..=3, true),
+    };
+    if reference.chars().count() > MAX_VAULT_REFERENCE_CHARS
+        || reference
+            .chars()
+            .any(|c| c.is_control() || (!spaces_ok && c.is_whitespace()))
+    {
+        return false;
+    }
+    let Some(rest) = reference.strip_prefix(prefix) else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    counts.contains(&parts.len()) && parts.iter().all(|part| !part.is_empty())
+}
+
+/// One password manager as the server reports it. Never a token.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PasswordManager {
+    pub id: String,
+    pub name: String,
+    /// The owner has saved an access token for it.
+    pub configured: bool,
+    /// The CLI is installed on the server.
+    pub cli_found: bool,
+    /// The server reads from this manager (Proton Pass is opt-in).
+    pub enabled: bool,
+    pub install_url: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasswordManagerList {
+    providers: Vec<PasswordManager>,
 }
 
 #[derive(Deserialize)]
@@ -233,7 +321,11 @@ fn check_vault_entry(entry: &VaultEntry) -> Result<(), ApiError> {
         && entry
             .last_used_at
             .as_deref()
-            .is_none_or(|v| bounded_text(v, 64));
+            .is_none_or(|v| bounded_text(v, 64))
+        && entry
+            .reference
+            .as_deref()
+            .is_none_or(|v| bounded_text(v, MAX_VAULT_REFERENCE_CHARS));
     if ok {
         Ok(())
     } else {
@@ -265,18 +357,38 @@ pub fn validate_vault_put(name: &str, input: &VaultPut) -> Result<(), ApiError> 
             "Name: lower-case letters, digits and dashes, 1-48 characters, starting with a letter or digit.",
         ));
     }
-    let value_chars = input.value.chars().count();
-    if value_chars == 0 || value_chars > MAX_VAULT_VALUE_CHARS {
-        return Err(ApiError::Validation("Value must be 1-8192 characters."));
-    }
-    if input
-        .value
-        .chars()
-        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
-    {
-        return Err(ApiError::Validation(
-            "Value must not contain control characters.",
-        ));
+    if input.source.is_reference() {
+        if input.kind == VaultKind::Note {
+            return Err(ApiError::Validation(
+                "A note cannot come from a password manager.",
+            ));
+        }
+        if !input.value.is_empty() {
+            return Err(ApiError::Validation("A reference holds no value."));
+        }
+        if !input
+            .reference
+            .as_deref()
+            .is_some_and(|reference| valid_vault_reference(input.source, reference))
+        {
+            return Err(ApiError::Validation(
+                "Reference: op://vault/item/field for 1Password, pass://vault/item/field for Proton Pass.",
+            ));
+        }
+    } else {
+        let value_chars = input.value.chars().count();
+        if value_chars == 0 || value_chars > MAX_VAULT_VALUE_CHARS {
+            return Err(ApiError::Validation("Value must be 1-8192 characters."));
+        }
+        if input
+            .value
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        {
+            return Err(ApiError::Validation(
+                "Value must not contain control characters.",
+            ));
+        }
     }
     if input.kind == VaultKind::Password
         && input
@@ -423,6 +535,8 @@ impl ApiClient {
         validate_vault_put(name, input)?;
         let body = VaultPutBody {
             kind: input.kind,
+            source: input.source,
+            reference: input.reference.as_deref(),
             username: input
                 .username
                 .as_deref()
@@ -444,6 +558,47 @@ impl ApiClient {
             return Err(ApiError::InvalidResponse);
         }
         Ok(entry)
+    }
+
+    /// `GET /v1/vault/providers`: the password managers, with token and CLI
+    /// status. Never a token.
+    pub fn password_managers(&self) -> Result<Vec<PasswordManager>, ApiError> {
+        let list: PasswordManagerList =
+            self.panel_json::<_, ()>(Method::GET, &["v1", "vault", "providers"], None)?;
+        Ok(list.providers)
+    }
+
+    /// `PUT /v1/vault/providers/{id}`: save the owner's access token (write
+    /// only). The response is the status, never the token.
+    pub fn password_manager_save(
+        &self,
+        id: &str,
+        token: &str,
+    ) -> Result<PasswordManager, ApiError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            token: &'a str,
+        }
+        let manager: PasswordManager = self.panel_json(
+            Method::PUT,
+            &["v1", "vault", "providers", id],
+            Some(&Body { token }),
+        )?;
+        if manager.id != id {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(manager)
+    }
+
+    /// `DELETE /v1/vault/providers/{id}`: forget the owner's token.
+    pub fn password_manager_clear(&self, id: &str) -> Result<(), ApiError> {
+        let ack: DeletedAck =
+            self.panel_json::<_, ()>(Method::DELETE, &["v1", "vault", "providers", id], None)?;
+        if ack.deleted {
+            Ok(())
+        } else {
+            Err(ApiError::InvalidResponse)
+        }
     }
 
     /// `DELETE /v1/vault/{name}`.

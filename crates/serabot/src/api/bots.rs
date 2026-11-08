@@ -194,8 +194,11 @@ pub(super) async fn list_bots(
                 "enabled": bot.enabled,
                 "live": state.runtime.bot_loaded(&user.id, &bot.id),
                 "model": bot.model,
-                "display_name": settings.display_name.clone().or_else(|| profile.as_ref().map(|p| p.display_name.clone()).filter(|name| !name.is_empty())),
-                "description": settings.description.clone().or_else(|| profile.as_ref().map(|p| p.description.clone()).filter(|text| !text.is_empty())),
+                // The owner's own name and text win; the shipped title and
+                // description are the fallback before the console uses the id.
+                "display_name": settings.display_name.clone().or_else(|| profile.as_ref().map(|p| p.display_name.clone()).filter(|name| !name.is_empty())).or_else(|| bot.title.clone()),
+                "title": bot.title,
+                "description": settings.description.clone().or_else(|| profile.as_ref().map(|p| p.description.clone()).filter(|text| !text.is_empty())).or_else(|| bot.description.clone()),
                 "browser_profile": profile_by_bot.get(&id).cloned().unwrap_or_else(|| "default".into()),
                 "avatar": profile.as_ref().map(|p| p.avatar.clone()).filter(|avatar| !avatar.is_empty()),
                 // A bundled default counts as a picture, so the console fetches it.
@@ -209,6 +212,85 @@ pub(super) async fn list_bots(
         })
         .collect::<Vec<_>>();
     let body = json!({ "bots": bots });
+    state
+        .runtime
+        .scan_owner_output(&user.id, &body.to_string())?;
+    Ok(Json(body))
+}
+
+/// `GET /v1/bots/catalog` — the shipped templates, for "Meet your team". Each
+/// entry says whether the session user still has that bot; the installed flag
+/// is read from the user's own rows only.
+pub(super) async fn bot_catalog(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let entries = state.runtime.fleet().template_catalog(&user.id)?;
+    let bots = entries
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "id": entry.name,
+                "title": entry.title,
+                "description": entry.description,
+                "role": entry.role,
+                "installed": entry.installed,
+                "avatar_version": default_avatar_version(&entry.name),
+            })
+        })
+        .collect::<Vec<_>>();
+    let body = json!({ "bots": bots });
+    state
+        .runtime
+        .scan_owner_output(&user.id, &body.to_string())?;
+    Ok(Json(body))
+}
+
+/// `POST /v1/bots/catalog/{name}/install` — "Add to my team": restore one
+/// shipped template as the session user's own row, disabled or enabled as the
+/// template says. Only that user's rows are written. A name that is not a
+/// shipped template is a 404; a bot the user already has is a conflict.
+pub(super) async fn install_catalog_bot(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>> {
+    let fleet = state.runtime.fleet();
+    if !safe_bot_label(&name) || !fleet.has_template(&name) {
+        return Err(SeraError::NotFound(format!("bot {name}")));
+    }
+    if !fleet.install_template(&user.id, &name)? {
+        return Err(SeraError::InvalidState("bot already exists".into()));
+    }
+    fleet.invalidate(&user.id);
+    state.store.record_audit(
+        &user.id,
+        "bot.installed",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({"id": name, "scope": "user"})),
+    )?;
+    let row = fleet
+        .row(&user.id, &name)?
+        .ok_or_else(|| SeraError::NotFound(format!("bot {name}")))?;
+    let template = fleet
+        .templates()
+        .iter()
+        .find(|template| template.config.name == name);
+    let body = json!({
+        "bot": {
+            "id": name,
+            "title": template.and_then(|t| t.config.title.clone()),
+            "description": template.and_then(|t| t.config.description.clone()),
+            "role": template.map(|t| t.config.role.as_str()),
+            "enabled": row.enabled,
+            "installed": true,
+            "avatar_version": default_avatar_version(&name),
+        }
+    });
     state
         .runtime
         .scan_owner_output(&user.id, &body.to_string())?;
@@ -294,6 +376,7 @@ pub(super) async fn bot_detail(
                 .map(|p| p.display_name.clone())
                 .filter(|name| !name.is_empty())
         })
+        .or_else(|| entry.title.clone())
         .unwrap_or_else(|| id.clone());
     let description = settings
         .description
@@ -304,6 +387,7 @@ pub(super) async fn bot_detail(
                 .map(|p| p.description.clone())
                 .filter(|text| !text.is_empty())
         })
+        .or_else(|| entry.description.clone())
         .unwrap_or_default();
     let browser_profile = state.store.bot_browser_profile(&user.id, &id)?;
     let avatar = profile
@@ -354,6 +438,7 @@ pub(super) async fn bot_detail(
     let body = json!({
         "id": entry.id,
         "display_name": display_name,
+        "title": entry.title,
         "role": entry.role,
         "browser_profile": browser_profile,
         "description": description,
