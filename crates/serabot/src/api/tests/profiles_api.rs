@@ -832,6 +832,12 @@ async fn bot_catalog_lists_templates_and_install_is_per_user() {
     let catalog = read_json(call(&app, &owner, "GET", "/v1/bots/catalog", None).await).await;
     assert_eq!(entry(&catalog, "watcher")["installed"], false);
     assert_eq!(entry(&catalog, "watcher")["title"], "Watcher");
+    // The bundled picture of a removed shipped bot is still served, so the
+    // catalog can show it; an unknown bot without a default stays a 404.
+    let picture = call(&app, &owner, "GET", "/v1/bots/watcher/avatar", None).await;
+    assert_eq!(picture.status(), StatusCode::OK);
+    let unknown = call(&app, &owner, "GET", "/v1/bots/nobody/avatar", None).await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
     assert_eq!(entry(&catalog, "main")["installed"], true);
 
     let installed = call(

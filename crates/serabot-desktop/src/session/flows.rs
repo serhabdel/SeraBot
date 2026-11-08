@@ -142,6 +142,15 @@ impl Session {
             .filter(|bot| bot.avatar_version.is_some())
             .map(|bot| AvatarTarget::Bot(bot.id.clone()).key())
             .chain(
+                // Shipped bots not added yet still wear their bundled picture
+                // in the "Meet your team" sheet.
+                self.state
+                    .shipped_bots
+                    .iter()
+                    .filter(|bot| !bot.installed && bot.avatar_version.is_some())
+                    .map(|bot| AvatarTarget::Bot(bot.id.clone()).key()),
+            )
+            .chain(
                 self.state
                     .conversations
                     .iter()
@@ -165,6 +174,17 @@ impl Session {
                     .clone()
                     .map(|version| (AvatarTarget::Bot(bot.id.clone()), version))
             })
+            .chain(
+                self.state
+                    .shipped_bots
+                    .iter()
+                    .filter(|bot| !bot.installed)
+                    .filter_map(|bot| {
+                        bot.avatar_version
+                            .clone()
+                            .map(|version| (AvatarTarget::Bot(bot.id.clone()), version))
+                    }),
+            )
             .chain(self.state.conversations.iter().filter_map(|conversation| {
                 conversation
                     .avatar_version

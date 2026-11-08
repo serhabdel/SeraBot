@@ -194,9 +194,16 @@ pub(super) async fn get_bot_avatar(
     Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
 ) -> Result<Response> {
-    owned_bot(&state, &user, &id)?;
-    if let Some(stored) = state.store.get_bot_avatar(&user.id, &id)? {
-        return Ok(image_response(stored));
+    // A bundled default is shipped data, not the user's: the "Meet your team"
+    // catalog shows it for a template the user has not added yet.
+    match owned_bot(&state, &user, &id) {
+        Ok(_) => {
+            if let Some(stored) = state.store.get_bot_avatar(&user.id, &id)? {
+                return Ok(image_response(stored));
+            }
+        }
+        Err(error) if default_avatar(&id).is_none() => return Err(error),
+        Err(_) => {}
     }
     let data =
         default_avatar(&id).ok_or_else(|| SeraError::NotFound(format!("avatar for bot {id}")))?;
