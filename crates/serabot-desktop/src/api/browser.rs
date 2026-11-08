@@ -223,7 +223,7 @@ pub fn validate_bot_settings(update: &BotSettingsUpdate) -> Result<(), ApiError>
         ));
     }
     if let Some(tools) = &update.tools {
-        validate_tool_list(tools)?;
+        validate_tool_edit(tools)?;
     }
     Ok(())
 }
@@ -532,11 +532,39 @@ mod tests {
             tools: Some(vec!["vault_list".into()]),
         };
         assert!(validate_bot_settings(&ok).is_ok());
+        // The orchestrator keeps `delegate` and other server-owned tools when
+        // its abilities are edited (0.22: "Choose tools from the specialist
+        // list" blocked every Save on Main).
+        let main_tools = BotSettingsUpdate {
+            tools: Some(vec![
+                "delegate".into(),
+                "tavily_search".into(),
+                "local_list".into(),
+            ]),
+            ..BotSettingsUpdate::default()
+        };
+        assert!(validate_bot_settings(&main_tools).is_ok());
         let bad_tools = BotSettingsUpdate {
-            tools: Some(vec!["delegate".into()]),
+            tools: Some(vec!["Bad Tool".into(), "vault_list".into()]),
             ..BotSettingsUpdate::default()
         };
         assert!(validate_bot_settings(&bad_tools).is_err());
+        let doubled = BotSettingsUpdate {
+            tools: Some(vec!["vault_list".into(), "vault_list".into()]),
+            ..BotSettingsUpdate::default()
+        };
+        assert!(validate_bot_settings(&doubled).is_err());
+        // Every ability on at once still fits.
+        let every: Vec<String> = crate::SPECIALIST_TOOLS
+            .iter()
+            .map(|tool| (*tool).to_owned())
+            .chain(["delegate".to_owned()])
+            .collect();
+        let all_on = BotSettingsUpdate {
+            tools: Some(every),
+            ..BotSettingsUpdate::default()
+        };
+        assert!(validate_bot_settings(&all_on).is_ok());
         let bad_name = BotSettingsUpdate {
             display_name: Some("  ".into()),
             ..Default::default()

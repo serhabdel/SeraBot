@@ -263,7 +263,7 @@ impl Session {
             return;
         }
         let tools = crate::capabilities::toggled(capability, &self.bot_settings.draft.tools, on);
-        if let Err(error) = crate::validate_tool_list(&tools) {
+        if let Err(error) = crate::validate_tool_edit(&tools) {
             self.bot_settings.error = Some(error.to_string());
             return;
         }
