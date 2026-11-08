@@ -2103,6 +2103,7 @@ impl Session {
             name: None,
             bot: None,
             attachments: files.clone(),
+            limit_reached: false,
         });
         if files.is_empty() {
             self.start_request(Operation::Submit(zeroize::Zeroizing::new(text)));
@@ -2112,6 +2113,77 @@ impl Session {
                 attachments: files.into_iter().map(|file| file.id).collect(),
             });
         }
+    }
+
+    /// Continue under a reply that a tool limit ended (0.24). Sends the fixed
+    /// Continue text as the owner's next message. The composer draft is left
+    /// as it is, and the same send guards as `submit` apply.
+    pub fn continue_from_limit(&mut self) {
+        if !self.state.can_send()
+            || !self.ready()
+            || self.uploading
+            || !self.upload_queue.is_empty()
+        {
+            return;
+        }
+        self.state.error = None;
+        self.state.activity.clear();
+        self.state.messages.push(Message {
+            id: format!("opt-{}", Instant::now().elapsed().as_nanos()),
+            role: Role::User,
+            content: crate::media_view::CONTINUE_TEXT.into(),
+            created_at: "Just now".into(),
+            name: None,
+            bot: None,
+            attachments: Vec::new(),
+            limit_reached: false,
+        });
+        self.start_request(Operation::Submit(zeroize::Zeroizing::new(
+            crate::media_view::CONTINUE_TEXT.into(),
+        )));
+    }
+
+    /// Read back a video or audio file for an inline player, unless it is
+    /// already here. The bytes come from the artifact route and are turned into
+    /// a data URL off the UI thread.
+    pub fn request_preview(&mut self, hash: String, mime: String) {
+        if self.state.media_previews.contains_key(&hash) {
+            return;
+        }
+        self.schedule(Operation::PreviewArtifact { hash, mime }, Duration::ZERO);
+    }
+
+    /// Read the owner's per-turn work limits (Settings).
+    pub fn load_turn_limits(&mut self) {
+        self.schedule(Operation::TurnLimits, Duration::ZERO);
+    }
+
+    /// Save the Settings form. Both fields must be whole numbers within the
+    /// server ceiling; a bad field is named in `turn_limits_error` and nothing
+    /// is sent.
+    pub fn save_turn_limits(&mut self, calls: &str, rounds: &str) {
+        let ceiling = match self.state.turn_limits.as_ref() {
+            Some(view) => view.ceiling,
+            None => {
+                self.state.turn_limits_error = Some("Wait for the limits to load first.".into());
+                return;
+            }
+        };
+        match crate::media_view::parse_turn_limits(calls, rounds, ceiling) {
+            Ok(limits) => {
+                self.state.turn_limits_error = None;
+                self.start_request(Operation::SaveTurnLimits {
+                    calls: limits.max_tool_calls_per_turn,
+                    rounds: limits.max_tool_rounds,
+                });
+            }
+            Err(message) => self.state.turn_limits_error = Some(message),
+        }
+    }
+
+    /// Go back to the config defaults (Settings).
+    pub fn reset_turn_limits(&mut self) {
+        self.start_request(Operation::ResetTurnLimits);
     }
 
     /// The paperclip: pick files in a native dialog (off the UI thread),
@@ -2969,7 +3041,23 @@ impl Session {
                             self.state.library_error = Some(message.clone());
                             self.state.library_loading = false;
                             self.state.error = None;
+                            self.schedule(Operation::MediaJobs, Duration::ZERO);
+                        }
+                        OperationKind::MediaJobs => {
+                            // The placeholder cards are optional; a failed read
+                            // leaves them out.
+                            self.state.error = None;
                             self.schedule(Operation::ChatPlan, Duration::ZERO);
+                        }
+                        OperationKind::PreviewArtifact => {
+                            self.toast = Some(format!("This file cannot play here: {message}"));
+                        }
+                        OperationKind::TurnLimits => {
+                            self.state.turn_limits_error = Some(message.clone());
+                        }
+                        OperationKind::TurnLimitsWrite => {
+                            self.state.turn_limits_error = Some(message.clone());
+                            self.toast = Some(format!("Work limits were not saved: {message}"));
                         }
                         OperationKind::ChatPlan => {
                             // The plan panel is optional; a failed read leaves
@@ -3345,6 +3433,9 @@ impl Session {
                         }
                         // The plan and auto-approve switch load after the library.
                         OperationKind::Library => {
+                            self.schedule(Operation::MediaJobs, Duration::ZERO);
+                        }
+                        OperationKind::MediaJobs => {
                             self.schedule(Operation::ChatPlan, Duration::ZERO);
                         }
                         OperationKind::OAuthSignIn => {

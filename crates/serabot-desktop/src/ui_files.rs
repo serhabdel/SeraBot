@@ -245,7 +245,7 @@ pub fn ComposerFiles(session: Signal<Session>) -> Element {
 /// Cards for the newest files produced in this conversation.
 #[component]
 pub fn MediaCards(session: Signal<Session>) -> Element {
-    let (entries, downloading) = {
+    let (entries, pending, downloading) = {
         let state = session.read();
         (
             state
@@ -255,14 +255,28 @@ pub fn MediaCards(session: Signal<Session>) -> Element {
                 .take(MAX_CARDS)
                 .cloned()
                 .collect::<Vec<_>>(),
+            serabot_desktop::media_view::pending_jobs(&state.state.media_jobs)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>(),
             state.downloading,
         )
     };
-    if entries.is_empty() {
+    if entries.is_empty() && pending.is_empty() {
         return rsx! {};
     }
     rsx! {
         div { class: "media-cards", role: "list", "aria-label": "Files from this chat",
+            // A background render still running (0.24): a placeholder until its file lands.
+            for job in pending {
+                div { key: "job-{job.id}", class: "media-card pending", role: "listitem",
+                    span { class: "media-card-icon", Icon { name: "refresh", size: 18 } }
+                    div { class: "media-card-copy",
+                        span { class: "media-card-title", "{serabot_desktop::media_view::placeholder_label(&job)}" }
+                        span { class: "media-card-meta", role: "status", "{job.bot}" }
+                    }
+                }
+            }
             for entry in entries {
                 div { key: "{entry.hash}", class: "media-card", role: "listitem",
                     span { class: "media-card-icon",
@@ -276,6 +290,11 @@ pub fn MediaCards(session: Signal<Session>) -> Element {
                             "{entry.title.clone().or(entry.filename.clone()).unwrap_or_else(|| entry.hash.clone())}"
                         }
                         span { class: "media-card-meta", "{humanize_label(&entry.tool)}" }
+                        InlineMedia {
+                            session,
+                            hash: entry.hash.clone(),
+                            mime: entry.mime.clone().unwrap_or_default(),
+                        }
                     }
                     button {
                         class: "btn small",
@@ -298,6 +317,43 @@ pub fn MediaCards(session: Signal<Session>) -> Element {
                 }
             }
         }
+    }
+}
+
+/// An inline player for a video or audio file (0.24). Until its bytes are read
+/// back, a Play button asks the session for them. Other files draw nothing.
+#[component]
+fn InlineMedia(session: Signal<Session>, hash: String, mime: String) -> Element {
+    let Some(player) = serabot_desktop::media_view::inline_player(&mime) else {
+        return rsx! {};
+    };
+    let src = session.read().state.media_previews.get(&hash).cloned();
+    match (src, player) {
+        (Some(src), serabot_desktop::media_view::InlinePlayer::Video) => rsx! {
+            video {
+                class: "media-player",
+                controls: true,
+                preload: "metadata",
+                src: "{src}",
+                "aria-label": "Video",
+            }
+        },
+        (Some(src), serabot_desktop::media_view::InlinePlayer::Audio) => rsx! {
+            audio {
+                class: "media-player",
+                controls: true,
+                preload: "metadata",
+                src: "{src}",
+                "aria-label": "Audio",
+            }
+        },
+        (None, _) => rsx! {
+            button {
+                class: "btn small",
+                onclick: move |_| session.write().request_preview(hash.clone(), mime.clone()),
+                "Play"
+            }
+        },
     }
 }
 

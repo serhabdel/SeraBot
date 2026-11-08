@@ -66,6 +66,7 @@ mod worker;
 
 pub use notifier::{ApprovalNotice, CompositeNotifier, Notifier, NullNotifier};
 pub use rag_tool::RagSearchTool;
+pub(crate) use turn_loop::LIMIT_REACHED_STATUS;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnPayload {

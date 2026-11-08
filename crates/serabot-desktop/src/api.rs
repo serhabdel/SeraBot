@@ -1752,6 +1752,10 @@ pub struct Message {
     /// Files the user attached to this (user) message.
     #[serde(default)]
     pub attachments: Vec<AttachmentInfo>,
+    /// True on the reply of a turn that a tool limit ended (0.24): the chat
+    /// offers Continue under it.
+    #[serde(default)]
+    pub limit_reached: bool,
 }
 
 /// One uploaded chat attachment as the server reports it. No server path.
@@ -1837,6 +1841,53 @@ pub struct ChatCard {
 struct CardListing {
     #[serde(default)]
     cards: Vec<ChatCard>,
+}
+
+/// One background media job (0.24), as the chat shows it. `kind` is `image`,
+/// `video` or `audio`; `status` is `pending`, `done`, `failed` or `expired`.
+/// The provider's error text is never shown; `error` is a short local reason.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct MediaJob {
+    pub id: String,
+    pub bot: String,
+    pub kind: String,
+    pub status: String,
+    #[serde(default)]
+    pub artifact_hash: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Deserialize)]
+struct MediaJobListing {
+    #[serde(default)]
+    media_jobs: Vec<MediaJob>,
+}
+
+/// One pair of per-turn work limits (0.24).
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub struct TurnLimitPair {
+    pub max_tool_calls_per_turn: usize,
+    pub max_tool_rounds: usize,
+}
+
+/// `GET /v1/settings/turn-limits`: what applies now, the config default, the
+/// server ceiling, and whether the owner set an override.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub struct TurnLimitsView {
+    pub max_tool_calls_per_turn: usize,
+    pub max_tool_rounds: usize,
+    pub default: TurnLimitPair,
+    pub ceiling: TurnLimitPair,
+    #[serde(default)]
+    pub overridden: bool,
+}
+
+#[derive(Serialize)]
+struct TurnLimitsBody {
+    max_tool_calls_per_turn: usize,
+    max_tool_rounds: usize,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -2226,6 +2277,49 @@ impl ApiClient {
         let listing: CardListing =
             self.get(&["v1", "conversations", conversation, "cards"], &[])?;
         Ok(listing.cards)
+    }
+
+    /// `GET /v1/conversations/{id}/media-jobs`: the owner's background media
+    /// jobs in this conversation (0.24), oldest first.
+    pub fn media_jobs(&self, conversation: &str) -> Result<Vec<MediaJob>, ApiError> {
+        check_id(conversation)?;
+        let listing: MediaJobListing =
+            self.get(&["v1", "conversations", conversation, "media-jobs"], &[])?;
+        Ok(listing.media_jobs)
+    }
+
+    /// `GET /v1/settings/turn-limits` (0.24).
+    pub fn turn_limits(&self) -> Result<TurnLimitsView, ApiError> {
+        self.request(
+            Method::GET,
+            &["v1", "settings", "turn-limits"],
+            &[],
+            None::<&()>,
+        )
+    }
+
+    /// `PUT /v1/settings/turn-limits` (0.24). The server refuses values
+    /// outside 1 to its ceiling.
+    pub fn set_turn_limits(&self, calls: usize, rounds: usize) -> Result<TurnLimitsView, ApiError> {
+        self.request(
+            Method::PUT,
+            &["v1", "settings", "turn-limits"],
+            &[],
+            Some(&TurnLimitsBody {
+                max_tool_calls_per_turn: calls,
+                max_tool_rounds: rounds,
+            }),
+        )
+    }
+
+    /// `DELETE /v1/settings/turn-limits` (0.24): back to the config defaults.
+    pub fn reset_turn_limits(&self) -> Result<TurnLimitsView, ApiError> {
+        self.request(
+            Method::DELETE,
+            &["v1", "settings", "turn-limits"],
+            &[],
+            None::<&()>,
+        )
     }
     /// `PUT /v1/conversations/{id}/thinking`: set the conversation's thinking
     /// level (`None` goes back to the model's default).

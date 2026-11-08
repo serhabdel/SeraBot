@@ -60,9 +60,11 @@ mod connectors;
 mod conversations;
 mod files;
 mod local;
+mod media;
 mod memories;
 mod messages;
 mod profiles;
+mod settings;
 mod skills;
 mod status;
 #[cfg(test)]
@@ -78,8 +80,10 @@ use cards::*;
 use composio::*;
 use connectors::*;
 use conversations::*;
+use media::*;
 use memories::*;
 use messages::*;
+use settings::*;
 use skills::*;
 use status::*;
 use vault::*;
@@ -431,7 +435,17 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/conversations/{id}/library", get(conversation_library))
         .route("/v1/conversations/{id}/plan", get(get_conversation_plan))
+        .route(
+            "/v1/settings/turn-limits",
+            get(get_turn_limits)
+                .put(put_turn_limits)
+                .delete(reset_turn_limits),
+        )
         .route("/v1/conversations/{id}/cards", get(list_conversation_cards))
+        .route(
+            "/v1/conversations/{id}/media-jobs",
+            get(list_conversation_media_jobs),
+        )
         .route("/v1/cards/{id}/answer", post(answer_card))
         .route("/v1/cards/{id}/decline", post(decline_card))
         // A secret value is at most 8 KiB; the route reads no more than 16 KiB.
