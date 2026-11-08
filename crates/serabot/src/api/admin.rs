@@ -453,8 +453,17 @@ pub(super) async fn admin_connector_oauth_complete(
                 ))
             })?,
     };
-    crate::elevenlabs_mcp::store_sign_in(&state.users, &user.id, &pair.access_token, &refresh)
-        .map_err(admin_error)?;
+    crate::elevenlabs_mcp::store_sign_in(
+        &state.users,
+        &user.id,
+        &pair.access_token,
+        &refresh,
+        pair.expires_in,
+    )
+    .map_err(admin_error)?;
+    if let Some(elevenlabs) = &state.elevenlabs {
+        elevenlabs.forget(&user.id).await;
+    }
     audit_config(
         &state,
         &user.id,
@@ -480,6 +489,9 @@ pub(super) async fn admin_connector_oauth_disconnect(
     }
     let removed =
         crate::elevenlabs_mcp::remove_sign_in(&state.users, &user.id).map_err(admin_error)?;
+    if let Some(elevenlabs) = &state.elevenlabs {
+        elevenlabs.forget(&user.id).await;
+    }
     audit_config(
         &state,
         &user.id,
@@ -907,10 +919,17 @@ pub(super) async fn admin_update_bot_config(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
     Path(id): Path<String>,
-    Json(request): Json<BotConfigRequest>,
+    Json(mut request): Json<BotConfigRequest>,
 ) -> AdminResult<Json<Value>> {
     require_admin(&user).map_err(admin_error)?;
     let admin = admin_store(&state)?;
+    // A console from before a tool rename still sends the old names.
+    if let Some(tools) = request.tools.as_mut() {
+        crate::config::rename_tool_list(tools);
+    }
+    if let Some(approval) = request.require_approval.as_mut() {
+        crate::config::rename_tool_list(approval);
+    }
     let configured = state
         .runtime
         .fleet()

@@ -709,18 +709,28 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         registry.register(AudioUnderstandTool::new(audio_client, config.clone()))?;
     }
     // Before 0.24 the one ElevenLabs sign-in was server-wide. It moves to the
-    // owner's own credential once, and the server-wide names are removed.
-    let owner_id = store.admin_user_id()?;
-    if serabot::elevenlabs_mcp::migrate_server_sign_in(
-        &secrets,
-        &users,
-        &owner_id,
-        &config.elevenlabs.oauth_access_token_secret,
-        &config.elevenlabs.oauth_refresh_token_secret,
-    )? {
-        tracing::info!("moved the server-wide ElevenLabs sign-in to the owner's account");
+    // owner's own credential once, and the server-wide names are removed. A
+    // failure is logged and boot goes on; the names stay for a later start.
+    let migrated = store.admin_user_id().and_then(|owner_id| {
+        serabot::elevenlabs_mcp::migrate_server_sign_in(
+            &secrets,
+            &users,
+            &owner_id,
+            &config.elevenlabs.oauth_access_token_secret,
+            &config.elevenlabs.oauth_refresh_token_secret,
+        )
+    });
+    match migrated {
+        Ok(true) => {
+            tracing::info!("moved the server-wide ElevenLabs sign-in to the owner's account")
+        }
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "could not move the server-wide ElevenLabs sign-in; it stays in place until a later start"
+        ),
     }
-    serabot::elevenlabs_mcp::register_elevenlabs_connectors(
+    let elevenlabs = serabot::elevenlabs_mcp::register_elevenlabs_connectors(
         &mut registry,
         config.clone(),
         &secrets,
@@ -960,6 +970,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         )?
         .with_personal(personal_connectors.clone())
         .with_local_relay(local_relay.clone())
+        .with_elevenlabs(elevenlabs.clone())
         .with_browser(browser_manager.clone());
         if let Some(manager) = &browser_manager {
             // Closes idle sessions, and every session on shutdown.
@@ -1132,6 +1143,7 @@ fn store_admin_provider_login(
     let credential = serabot::user_secrets::ProviderCredential {
         api_key: api_key.to_owned(),
         refresh_token: refresh_token.to_owned(),
+        ..Default::default()
     };
     users.set(&admin, provider, &credential.encode()?)?;
     println!("stored the {provider} credential for the admin account");

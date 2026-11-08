@@ -15,15 +15,16 @@ The hosted server at `https://api.elevenlabs.io/v1/mcp` exposes the whole Eleven
 
 | Tool | Arguments | Approval | What it does |
 |------|-----------|----------|--------------|
-| `elevenlabs_mcp_search_tools` | optional `query`, `category`, `page` (from 1) | no | Compact entries (`name`, `title`, `summary`, `read_only`), 40 per page, plus the categories with counts and `next_page`. Categories come from the name's first word (`agents`, `creative`, `voices`, …). |
-| `elevenlabs_mcp_describe_tool` | `name` (exact) | no | The full description and input schema, bounded to about 16 KiB. Deeply nested schema parts are left out with a note. |
+| `elevenlabs_mcp_search_tools` | optional `query`, `category`, `page` (from 1) | no | Compact entries (`name`, `title`, `summary`, `read_only`), up to 40 per page and at most 24 KiB per reply, plus the categories with counts and `next_page`. Categories come from the name's first word (`agents`, `creative`, `voices`, …); the 20 largest are listed and the rest are counted under `other`. |
+| `elevenlabs_mcp_describe_tool` | `name` (exact) | no | The full description (at most 2,000 characters) and input schema (at most 11 KiB). Deeply nested schema parts are left out with a note. |
 | `elevenlabs_mcp_call` | `tool` (exact name), `arguments` object | yes unless the tool is a read | Runs one tool. The name must be in the account's catalog; anything else is refused with the five closest names. |
 
 Rules the tools enforce, and the guidance the model is given:
 
 - Search the catalog before calling. Only call names returned by search or describe. If a tool is missing, say so; never invent tool names or model ids.
-- The catalog is cached per account for ten minutes. A 401 or a failed fetch drops the cache.
-- Reads (`list_`, `get_`, `search_`, `read_`, `view_`, `find_`, `fetch_`, `check_`, `describe_`, `estimate_`, `retrieve_`, `show_` names with no write word) run directly. Everything else asks the owner first: `create`, `generate`, `design`, `clone`, `transcribe`, `text_to_speech`, `call`, `delete`, and similar.
+- Server-supplied text (names, titles, summaries, descriptions) is marked in every search and describe reply as data, not instructions. Titles and summaries are cut to one plain line.
+- The catalog is cached per account for ten minutes. It is served only while the account is still signed in. A 401, a failed fetch, a sign-in or a sign-out drops the cache.
+- Approval classes. The tool name is split on every character that is not a letter or digit, so `list-voices` and `list.voices` read like `list_voices`. A name **reads** only when it starts with `list_`, `get_`, `search_`, `read_`, `view_`, `find_`, `fetch_`, `check_`, `describe_`, `estimate_`, `retrieve_` or `show_`, and none of its words contains a write word. Write words are matched inside words, so `resettings` counts: `create`, `update`, `delete`, `remove`, `duplicate`, `generate`, `clone`, `send`, `call`, `place`, `publish`, `deploy`, `merge`, `run`, `start`, `edit`, `rename`, `add`, `set`, `upload`, `trigger`, `convert`, `dub`, `compose`, `design`, `synthesize`, `transcribe`, `cancel`, `stop`, `revoke`, `reset`, `import`, `move`, `share`, `invite`, `archive`, `enable`, `disable`, `save`, `write`, `patch`, `submit`, `execute`, `assign`, `attach`, `regenerate`, `train`, `purge`, `clear`, `post`, `transfer`, `buy`, `pay`, `isolate`. Every other name asks the owner first. A name that reads by its spelling but that the server marks `readOnlyHint: false` is never sent: the call is refused, because the owner cannot approve a call that skipped approval.
 - Timeouts: list, search, describe and read requests use `mcp_timeout_secs` (60). Calls that generate, create or spend use `mcp_generate_timeout_secs` (300).
 - Media in a result (inline or signed link, allowlisted types and hosts, at most 4 files) is saved as artifacts. `data.artifacts` lists every saved item with `mime`, `artifact_path`, `artifact_hash`, `filename` and `bytes`.
 - Everything the server returns is untrusted data.
@@ -41,8 +42,11 @@ The authorization request is PKCE S256 with a CIMD client (`[elevenlabs].oauth_c
 ### Storage and per-account rules
 
 - The sign-in is one sealed credential per account, under the provider id `elevenlabs_mcp` in the per-user store (`user_secrets`). Each account's tool calls use its own sign-in only.
-- An access token is renewed from the refresh token on use. A rotated refresh token is written back to the same account's row; if that write fails, the call fails so the rotation is not lost.
-- Before 0.24 the sign-in was server-wide (`elevenlabs_access_token`, `elevenlabs_refresh_token` in the age store). On the first start of 0.24 those tokens move to the **owner's** account credential and the server-wide names are removed. Nothing is kept server-wide.
+- Each account has one shared token session. Concurrent calls share it, so an expired access token is renewed once, not once per call. A 401 renews the token once and retries once, and a renewal that another call already made is reused.
+- The access token's expiry is stored with the sign-in, so a restart does not renew a token that is still valid.
+- Every sign-in gets a new generation. A rotated refresh token is written back only to the sign-in it was issued for, so an older token chain cannot overwrite a newer sign-in. If the write fails, the call fails so the rotation is not lost.
+- A sign-in or a sign-out drops that account's session and cached catalog.
+- Before 0.24 the sign-in was server-wide (`elevenlabs_access_token`, `elevenlabs_refresh_token` in the age store). On the first start of 0.24 those tokens move to the **owner's** account credential and the server-wide names are removed. An access token with no refresh token moves too; it is used until it expires or the server rejects it, then the owner signs in again. The server-wide names are removed only after the owner's credential is written. If the move fails, the server logs a warning and starts anyway; the names stay until a later start. An owner who already has a sign-in keeps it.
 - Members cannot sign in to this connector yet. The consent flow runs only in the owner's console, because the client metadata declares only the loopback redirect. See "Limits" below.
 
 ### Enable
@@ -109,14 +113,20 @@ The old keys are still read, once, and folded into the new switches:
 
 A deprecation warning is logged. The console's old auth-mode toggle is gone, and an old `admin-overrides.json` that carries it still applies.
 
-Bot files and stored bot rows that name the old native tools are renamed on load: `elevenlabs_list_voices` → `elevenlabs_key_list_voices` (and the other four native names), and `elevenlabs_mcp_list_tools` → `elevenlabs_mcp_search_tools`.
+Bot files, stored bot rows, console overrides and tool lists sent by an older console are renamed on load:
+
+- `elevenlabs_list_voices` → `elevenlabs_key_list_voices` (and the other four native names), unless the bot also has MCP tools. A bot with `elevenlabs_mcp_*` tools was in account-sign-in mode, so its old native names are dropped and the MCP tools take their place.
+- `elevenlabs_mcp_list_tools` → `elevenlabs_mcp_search_tools`, and `elevenlabs_mcp_describe_tool` is added beside it.
+- A list that ends up with a name twice keeps the first.
+
+The connector view keeps `auth_modes: ["oauth"]` for one release so an older console still finds its sign-in mode.
 
 ## Limits
 
 - **Members cannot sign in to the ElevenLabs connector.** The sign-in is owner-console only. A member who calls an MCP tool is told to sign in. Member sign-in needs a second redirect on the metadata document or a member-facing consent flow; that is not built.
 - The API-key connector's key is server-wide. It is not a per-user credential. Moving it to the per-user store is a separate change.
 - Enabling or disabling either connector needs a restart; the tool list is built at startup.
-- Some reads (for example `agents_list`) do not match the read prefixes, so they still ask for approval. The classification is deliberately conservative.
+- Some reads (for example `agents_list`) do not match the read prefixes, so they still ask for approval. Words that merely contain a write word (`voice_settings`) ask too. The classification is deliberately conservative.
 - Scopes are product-scoped and the authorization server is per-region. The code pins the global/US endpoints. Verify each tool against a real account before relying on it.
 
 ## Mistral audio
@@ -125,7 +135,7 @@ Bot files and stored bot rows that name the old native tools are renamed on load
 
 ## Tests
 
-Synthetic fixtures only (wiremock for the MCP server, the token endpoint and media hosts). They cover search paging and the byte budget, describe bounds, unknown-name suggestions, catalog paging across three pages with caching, approval classes, per-account sign-in, the one-time migration, connector-dependent registration, and config back-compat.
+Synthetic fixtures only (wiremock for the MCP server, the token endpoint and media hosts). They cover search paging (no entry skipped, the byte budget, 1,000 tools under many categories), category caps, server-text marking, describe bounds, unknown-name suggestions, catalog paging across three pages with caching, approval classes (including `-` and `.` names and the server hint), concurrent calls renewing once, sign-out and re-sign-in, a stale sign-in not overwriting a newer one, access-only sign-ins, the one-time migration with a failed write, connector-dependent registration, and config back-compat.
 
 ```bat
 scripts\cargo-win.bat test -p serabot elevenlabs --locked

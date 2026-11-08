@@ -148,6 +148,9 @@ pub struct ApiState {
     composio: Arc<crate::composio::ComposioService>,
     /// Per-user GitHub, Todoist, Slack and Exa tokens.
     token_connectors: Arc<crate::token_connectors::TokenConnectors>,
+    /// The ElevenLabs MCP service, shared with the tools; `None` while the
+    /// "ElevenLabs" connector is off. Sign-in and sign-out drop its session.
+    elevenlabs: Option<Arc<crate::elevenlabs_mcp::ElevenLabsMcp>>,
     token_hash: String,
     /// Per-user request buckets for the per-minute limit. Keyed by the
     /// acting user id (never a token); public sign-in routes without an
@@ -220,6 +223,7 @@ impl ApiState {
             personal,
             composio,
             token_connectors,
+            elevenlabs: None,
             token_hash: config.api.token_hash.to_ascii_lowercase(),
             rate: Arc::new(Mutex::new(HashMap::new())),
             rate_limit: config.server.rate_limit_per_minute.max(1) as usize,
@@ -249,6 +253,16 @@ impl ApiState {
     /// disconnect also drops the tools' cached access tokens.
     pub fn with_personal(mut self, personal: Arc<PersonalConnectors>) -> Self {
         self.personal = personal;
+        self
+    }
+
+    /// Share the ElevenLabs MCP service the tools use, so a sign-in or
+    /// sign-out drops that account's cached session and catalog.
+    pub fn with_elevenlabs(
+        mut self,
+        elevenlabs: Option<Arc<crate::elevenlabs_mcp::ElevenLabsMcp>>,
+    ) -> Self {
+        self.elevenlabs = elevenlabs;
         self
     }
 

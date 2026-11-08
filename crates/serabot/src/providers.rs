@@ -1177,6 +1177,7 @@ pub fn import_age_provider_credentials(
         let credential = ProviderCredential {
             api_key,
             refresh_token: refresh_token.unwrap_or_default(),
+            ..Default::default()
         };
         if credential.api_key.is_empty() {
             // The refresh flow can mint an access token, but the client needs
@@ -1614,6 +1615,7 @@ mod tests {
         let existing = ProviderCredential {
             api_key: "sk-console".into(),
             refresh_token: String::new(),
+            ..Default::default()
         };
         users
             .set(&admin, "default", &existing.encode().unwrap())
