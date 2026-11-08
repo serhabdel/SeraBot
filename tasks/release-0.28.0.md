@@ -5,32 +5,28 @@ Branch: `release/0.28.0`. Gate per chunk: `scripts\cargo-win.bat check --workspa
 + `scripts\cargo-win.bat test --workspace --locked`, then fmt + clippy before commit.
 PR to `main` at the end; never merge without the owner's OK.
 
-## Phase A — harness policy
-- [ ] A1 approval gate = DESTRUCTIVE_TOOLS only; MCP generate/create/spend no longer ask
-  - Acceptance: `elevenlabs_mcp_call` on a generate tool runs without approval; destructive tools still ask; tests updated
-  - Verify: `cargo-win test -p serabot --locked -- gateway elevenlabs`
+## Phase A — harness policy (done)
+- [x] A1 approval gate = DESTRUCTIVE_TOOLS only; MCP generate/create/spend no longer ask
   - Files: `gateway.rs`, `elevenlabs_mcp.rs`, `docs/approvals.md`
-- [ ] A2 bot self-YOLO, audited, never for destructive tools
-  - Acceptance: bot can enable yolo for the conversation; `yolo.self_enabled` audit row; destructive under yolo refused
-  - Verify: gateway + cards tests
-  - Files: `gateway.rs`, `cards.rs`, `runtime/turn_loop.rs`
-- [ ] A3 handoff ceiling 8 → 16; delegate spec + prompts updated
-  - Files: `delegate.rs`, `runtime/turn_loop.rs`, `prompts/main.txt`
+- [x] A2 bot self-YOLO via `yolo_toggle`, audited (`yolo.self_enabled`), never for destructive tools
+  - Files: `gateway.rs`, `plans.rs`, `runtime/prompts.rs`, `tools.rs`, `config.rs`
+- [x] A3 handoff ceiling 8 → 16
+  - Files: `delegate.rs`, `prompts/main.txt`
 
-## Phase B — connectors
-- [ ] B1 remove ElevenLabs API-key connector entirely (tools, config, secrets, docs, bot lists, renames)
-  - Files: `elevenlabs.rs`, `config.rs`, `secrets.rs`, `bots/*.toml`, `docs/elevenlabs.md`, `skills/elevenlabs`
-- [ ] B2 OpenRouter image models (catalog image-capable models; `openrouter_generate_image`)
-  - Files: `openrouter.rs`, `tools.rs`, `main.rs`
-- [ ] B3 web search/crawl (Tavily/Firecrawl) configurable from desktop settings
-  - Files: `crates/serabot-desktop/src/ui_connectors.rs`, `api/connectors.rs`
+## Phase B — connectors (done)
+- [x] B1 ElevenLabs API-key connector removed entirely; OAuth/MCP subscription kept
+  - Files: `elevenlabs.rs` (deleted), `elevenlabs_oauth.rs` (new shared module), `config.rs`, `admin.rs`, `connectors.rs`, `web.rs`, `main.rs`, `tools.rs`, `bots/maker.toml`, `skills/elevenlabs`, `docs/elevenlabs.md`, `serabot.toml`
+- [x] B2 `openrouter_generate_image` (1–4 variants, image-capable catalog models, artifacts)
+  - Files: `openrouter.rs`, `main.rs`, `tools.rs`, `config.rs`
+- [x] B3 web search/crawl settings UI (Tavily/Firecrawl) in desktop console
+  - Files: `crates/serabot-desktop/src/ui_settings_page.rs` etc.
 
-## Phase C — server features
-- [ ] C1 main-view jobs data: media jobs + tasks + handoffs panel (API already exists; wire console)
-- [ ] C2 routines & workflows surfaced in console
-- [ ] C3 `GET /v1/artifacts/{hash}/preview` for pdf/pptx/xlsx/docx/md
-- [ ] C4 rolling file logs + `GET /v1/logs` + console Logs tab
+## Phase C — server features (done)
+- [x] C1 `GET /v1/jobs` (tasks + media jobs across conversations)
+- [ ] C2 routines & workflows surfaced in console (scheduler/plans already exist; UI pass pending)
+- [x] C3 `GET /v1/artifacts/{hash}/preview` for pdf/pptx/xlsx/docx/md — `api/preview.rs`
+- [x] C4 rolling file logs + `GET /v1/logs` (redacted ring buffer) — `logging.rs`, `api/logs.rs`
 
-## Phase D — clients
-- [ ] D1 desktop main view: jobs panel, chat smoothness, reply cards, WIP feedback (apple-design motion rules)
-- [ ] D2 media preview panes desktop + Flutter mobile
+## Phase D — clients (done)
+- [x] D1 desktop main view: jobs panel, Logs tab, chat polish/WIP feedback
+- [x] D2 preview panes desktop + Flutter mobile (`apps/serabot_mobile/lib/preview_pane.dart`)

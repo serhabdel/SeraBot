@@ -59,10 +59,13 @@ mod composio;
 mod connectors;
 mod conversations;
 mod files;
+mod jobs;
 mod local;
+mod logs;
 mod media;
 mod memories;
 mod messages;
+mod preview;
 mod profiles;
 mod settings;
 mod skills;
@@ -81,9 +84,12 @@ use cards::*;
 use composio::*;
 use connectors::*;
 use conversations::*;
+use jobs::*;
+use logs::*;
 use media::*;
 use memories::*;
 use messages::*;
+use preview::*;
 use settings::*;
 use skills::*;
 use status::*;
@@ -498,7 +504,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/events", get(events))
         .route("/v1/audit", get(audit))
         .route("/v1/artifacts/{hash}", get(artifact))
+        .route("/v1/artifacts/{hash}/preview", get(artifact_preview))
         .route("/v1/artifacts/{hash}/approve", post(approve_artifact))
+        .route("/v1/jobs", get(list_jobs))
+        .route("/v1/logs", get(list_logs))
         .route("/v1/me", get(auth_me))
         .route("/v1/auth/logout", post(auth_logout))
         .route("/v1/auth/invites", post(auth_invites))

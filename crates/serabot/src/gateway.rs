@@ -57,6 +57,9 @@ pub const DESTRUCTIVE_TOOLS: &[&str] = &[
 
 /// Audit reason recorded when the owner's YOLO setting approved a call.
 pub const YOLO_AUDIT_REASON: &str = "auto-approved by user YOLO setting";
+/// Audit reason recorded when a YOLO setting approved a call (0.28: the
+/// setting may also have been enabled by the bot itself via `yolo_toggle`).
+pub const YOLO_SELF_AUDIT_REASON: &str = "auto-approved by YOLO enabled in this conversation";
 
 /// Risk class of a tool by name: true when it needs approval.
 pub fn is_destructive_tool(name: &str) -> bool {
@@ -511,7 +514,10 @@ impl Gateway {
         let Some(conversation_id) = context.conversation_id.as_deref() else {
             return Ok(outcome);
         };
-        if !self.store.yolo_enabled(&context.user_id, conversation_id)
+        // 0.28: YOLO — owner-set or bot self-enabled — never covers a
+        // destructive tool. Those always wait for the owner's own decision.
+        if is_destructive_tool(&tool.spec().name)
+            || !self.store.yolo_enabled(&context.user_id, conversation_id)
             || !self.policy.is_allowed(canonical)
             || !tool.auto_approve_allowed(args, context).await
         {
@@ -1183,12 +1189,48 @@ mod tests {
         }
     }
 
+    /// A non-destructive tool that still asks for approval (a bot-level
+    /// require_approval entry), so YOLO can be tested without touching the
+    /// destructive list.
+    struct FakeApproval {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for FakeApproval {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "fake_approval".into(),
+                description: "fake approval-gated tool".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                external_effect: false,
+            }
+        }
+
+        fn requires_approval(&self, _args: &Value) -> bool {
+            true
+        }
+
+        async fn execute(&self, _args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutput {
+                content: "ran".into(),
+                ..ToolOutput::default()
+            })
+        }
+    }
+
     fn setup() -> (Gateway, Arc<AtomicUsize>, ToolContext) {
         let store = Store::open_in_memory(384).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let mut registry = ToolRegistry::default();
         registry
             .register(FakeExternal {
+                calls: calls.clone(),
+            })
+            .unwrap();
+        registry
+            .register(FakeApproval {
                 calls: calls.clone(),
             })
             .unwrap();
@@ -1221,7 +1263,9 @@ mod tests {
             task_id: Some(task.id),
             turn_id: None,
             conversation_id: None,
-            allowed_tools: ["onedrive_upload".to_string()].into_iter().collect(),
+            allowed_tools: ["onedrive_upload".to_string(), "fake_approval".to_string()]
+                .into_iter()
+                .collect(),
             require_approval: HashSet::new(),
         };
         (gateway, calls, context)
@@ -1289,7 +1333,9 @@ mod tests {
     impl Tool for LiveDestTool {
         fn spec(&self) -> ToolSpec {
             ToolSpec {
-                name: "onedrive_upload".into(),
+                // Non-destructive name: 0.28 YOLO never auto-approves
+                // destructive tools, and this fixture tests auto_approve_allowed.
+                name: "live_dest_tool".into(),
                 description: "fake live destination".into(),
                 parameters: serde_json::json!({"type": "object"}),
                 external_effect: true,
@@ -1380,7 +1426,7 @@ mod tests {
             task_id: Some(task.id),
             turn_id: None,
             conversation_id: Some("dir:live".into()),
-            allowed_tools: ["onedrive_upload".to_string()].into_iter().collect(),
+            allowed_tools: ["live_dest_tool".to_string()].into_iter().collect(),
             require_approval: HashSet::new(),
         };
         (gateway, calls, page, context)
@@ -1396,7 +1442,7 @@ mod tests {
             ..
         } = gateway
             .execute(
-                "onedrive_upload",
+                "live_dest_tool",
                 serde_json::json!({"field": "password"}),
                 &context,
             )
@@ -1435,7 +1481,7 @@ mod tests {
             ..
         } = gateway
             .execute(
-                "onedrive_upload",
+                "live_dest_tool",
                 serde_json::json!({"field": "password"}),
                 &context,
             )
@@ -1467,7 +1513,7 @@ mod tests {
         store_check(&gateway, &context);
         let outcome = gateway
             .execute(
-                "onedrive_upload",
+                "live_dest_tool",
                 serde_json::json!({"field": "password"}),
                 &context,
             )
@@ -1480,7 +1526,7 @@ mod tests {
         store_check(&gateway, &context);
         let outcome = gateway
             .execute(
-                "onedrive_upload",
+                "live_dest_tool",
                 serde_json::json!({"field": "password"}),
                 &context,
             )
@@ -1538,7 +1584,7 @@ mod tests {
             action_id,
             ..
         } = gateway
-            .execute("onedrive_upload", args.clone(), &context)
+            .execute("live_dest_tool", args.clone(), &context)
             .await
             .unwrap()
         else {
@@ -1556,7 +1602,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         // No grant was left behind, so the same call asks again.
         let again = gateway
-            .execute("onedrive_upload", args.clone(), &context)
+            .execute("live_dest_tool", args.clone(), &context)
             .await
             .unwrap();
         assert!(matches!(again, ToolOutcome::PendingApproval { .. }));
@@ -1568,7 +1614,7 @@ mod tests {
         let (gateway, calls, _page, context) = live_setup(false, "login.bank.example");
         let args = serde_json::json!({"field": "password"});
         let ToolOutcome::PendingApproval { approval_id, .. } = gateway
-            .execute("onedrive_upload", args.clone(), &context)
+            .execute("live_dest_tool", args.clone(), &context)
             .await
             .unwrap()
         else {
@@ -1580,7 +1626,7 @@ mod tests {
             .store()
             .insert_grant(
                 &context.user_id,
-                "onedrive_upload",
+                "live_dest_tool",
                 &canonical_hash(&args).unwrap(),
                 Some("vault:bank → login.bank.example"),
                 gateway.policy().version(),
@@ -1588,7 +1634,7 @@ mod tests {
             )
             .unwrap();
         let outcome = gateway
-            .execute("onedrive_upload", args, &context)
+            .execute("live_dest_tool", args, &context)
             .await
             .unwrap();
         assert!(matches!(outcome, ToolOutcome::PendingApproval { .. }));
@@ -1950,11 +1996,7 @@ mod tests {
             .set_yolo(&context.user_id, "dir:main", true)
             .unwrap();
         let outcome = gateway
-            .execute(
-                "onedrive_upload",
-                serde_json::json!({"dest": "folder"}),
-                &context,
-            )
+            .execute("fake_approval", serde_json::json!({}), &context)
             .await
             .unwrap();
         assert!(matches!(outcome, ToolOutcome::Completed(_)));
@@ -1981,6 +2023,24 @@ mod tests {
             .set_yolo(&context.user_id, "dir:main", false)
             .unwrap();
         let again = gateway
+            .execute("fake_approval", serde_json::json!({}), &context)
+            .await
+            .unwrap();
+        assert!(matches!(again, ToolOutcome::PendingApproval { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// 0.28: YOLO — owner-set or bot self-enabled — never auto-approves a
+    /// destructive tool. Those always wait for the owner's own decision.
+    #[tokio::test]
+    async fn yolo_never_covers_destructive_tools() {
+        let (gateway, calls, context) = setup();
+        let context = in_conversation(&context, "dir:main");
+        gateway
+            .store()
+            .set_yolo(&context.user_id, "dir:main", true)
+            .unwrap();
+        let outcome = gateway
             .execute(
                 "onedrive_upload",
                 serde_json::json!({"dest": "folder"}),
@@ -1988,8 +2048,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(again, ToolOutcome::PendingApproval { .. }));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(outcome, ToolOutcome::PendingApproval { .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            !gateway
+                .store()
+                .list_audit_for_user(&context.user_id, 50)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.event == "approval.auto_approved")
+        );
     }
 
     /// One user's YOLO never reaches another conversation or another user,
@@ -2009,23 +2077,23 @@ mod tests {
         member_context.user_id = member.id.clone();
         member_context.actor = member.id.clone();
         member_context.task_id = None;
-        let args = serde_json::json!({"dest": "folder"});
+        let args = serde_json::json!({});
         // Same conversation id, different user: still asks.
         let outcome = gateway
-            .execute("onedrive_upload", args.clone(), &member_context)
+            .execute("fake_approval", args.clone(), &member_context)
             .await
             .unwrap();
         assert!(matches!(outcome, ToolOutcome::PendingApproval { .. }));
         // Same user, different conversation: still asks.
         let other_chat = in_conversation(&admin_context, "dir:other");
         let outcome = gateway
-            .execute("onedrive_upload", args.clone(), &other_chat)
+            .execute("fake_approval", args.clone(), &other_chat)
             .await
             .unwrap();
         assert!(matches!(outcome, ToolOutcome::PendingApproval { .. }));
         // No conversation at all (scheduler, API-less paths): still asks.
         let outcome = gateway
-            .execute("onedrive_upload", args.clone(), &admin_context)
+            .execute("fake_approval", args.clone(), &admin_context)
             .await
             .unwrap();
         assert!(matches!(outcome, ToolOutcome::PendingApproval { .. }));
@@ -2046,7 +2114,7 @@ mod tests {
         );
         let admin_chat = in_conversation(&admin_context, "dir:main");
         let outcome = gateway
-            .execute("onedrive_upload", args, &admin_chat)
+            .execute("fake_approval", args, &admin_chat)
             .await
             .unwrap();
         assert!(matches!(outcome, ToolOutcome::Completed(_)));
@@ -2064,7 +2132,7 @@ mod tests {
             .unwrap();
         let outcome = gateway
             .execute(
-                "onedrive_upload",
+                "fake_approval",
                 serde_json::json!({"dest": "TopSecret"}),
                 &context,
             )

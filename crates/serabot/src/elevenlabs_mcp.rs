@@ -11,11 +11,10 @@
 //! reads one, and `elevenlabs_mcp_call` runs one. A call only runs a name the
 //! account's catalog returned; anything else is refused with the closest names.
 //!
-//! Safety:
-//! * A call needs approval unless the tool name is a pure read (see
-//!   [`tool_is_read`]); anything that creates, edits, deletes, places a call
-//!   or spends credits is approved first. A name that reads but whose
-//!   catalog entry says it changes data is refused, never run unapproved.
+//! Safety (0.28):
+//! * Calls run without an approval prompt — including generation — but a name
+//!   that reads by spelling yet whose catalog entry says it changes data (see
+//!   [`tool_is_read`]) is refused, never run.
 //! * Each account has one shared token session. An expired token is refreshed
 //!   with the stored refresh token, once, however many calls are in flight; a
 //!   401 from the server triggers exactly one renewal and retry. A rotated
@@ -39,10 +38,10 @@ use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 
 use crate::config::Config;
-use crate::elevenlabs::{
-    ELEVENLABS_TOKEN_URL, ElevenLabsClient, MAX_FLOW_DOWNLOAD_BYTES, OauthSession,
-    check_outbound_text, extension_for_mime, plan_error_message, register_elevenlabs_tools,
-    sanitize_provider_error, store_media_artifact, valid_generation_id,
+use crate::elevenlabs_oauth::{
+    ELEVENLABS_TOKEN_URL, MAX_FLOW_DOWNLOAD_BYTES, OauthSession, check_outbound_text,
+    extension_for_mime, plan_error_message, sanitize_provider_error, store_media_artifact,
+    valid_generation_id,
 };
 use crate::error::{Result, SeraError};
 use crate::gateway::{ApprovalDetails, Tool, ToolContext, ToolOutput, ToolRegistry, ToolSpec};
@@ -1383,16 +1382,15 @@ pub fn register_elevenlabs_mcp_tools(
 ///
 /// * "ElevenLabs" (`mcp_enabled`): the three MCP tools. They are registered
 ///   whether or not an account has signed in; a call without a sign-in says so.
-/// * "ElevenLabs API key" (`api_key.enabled`): the native `elevenlabs_key_*`
-///   tools, only when the key is stored. Without a key, they are skipped with
-///   a warning.
+///
+/// 0.28: only the subscription connector exists; the API-key connector and
+/// its `elevenlabs_key_*` tools were removed.
 ///
 /// Returns the MCP service when its tools are registered, so the owner API
 /// can drop an account's cached session when the account signs in or out.
 pub fn register_elevenlabs_connectors(
     registry: &mut ToolRegistry,
     config: Arc<Config>,
-    secrets: &SharedSecrets,
     users: Arc<UserSecrets>,
     artifacts: Arc<ArtifactStore>,
     policy: Arc<Policy>,
@@ -1416,29 +1414,6 @@ pub fn register_elevenlabs_connectors(
         )?;
         register_elevenlabs_mcp_tools(registry, mcp.clone(), policy.clone(), store.clone())?;
         service = Some(mcp);
-    }
-    if settings.api_key.enabled {
-        match secrets.get(&settings.api_key_secret) {
-            Some(api_key) => {
-                let client = Arc::new(ElevenLabsClient::new(
-                    &settings.api_base,
-                    api_key,
-                    settings.timeout_secs,
-                )?);
-                register_elevenlabs_tools(
-                    registry,
-                    client,
-                    artifacts,
-                    policy,
-                    config.clone(),
-                    settings,
-                    store,
-                )?;
-            }
-            None => tracing::warn!(
-                "the ElevenLabs API key connector is enabled but no key is stored; its tools are not registered"
-            ),
-        }
     }
     Ok(service)
 }
@@ -1707,7 +1682,7 @@ impl Tool for CallTool {
                           by search or describe. If a tool is missing, say so; never invent tool \
                           names or model ids. Reads run directly. Anything that generates, \
                           creates, edits, deletes, clones, designs, places calls or spends \
-                          credits needs the user's approval. Generated audio, images and video \
+                          credits runs without an approval prompt (0.28); a name the server marks as changing data is refused. Generated audio, images and video \
                           are saved as artifacts. If a result says status \"generating\" with a \
                           job_id, tell the owner it is being generated and end your turn; it \
                           appears in this chat when ready. Never call the same generation again. \
@@ -1726,12 +1701,12 @@ impl Tool for CallTool {
         }
     }
 
-    fn requires_approval(&self, args: &Value) -> bool {
-        match args.get("tool").and_then(Value::as_str) {
-            Some(name) => !tool_is_read(name, None),
-            // No readable name: the call fails validation, but never skip approval.
-            None => true,
-        }
+    fn requires_approval(&self, _args: &Value) -> bool {
+        // 0.28: only destructive tools ask the owner. ElevenLabs calls —
+        // including generation — run on the bot's judgement. The fail-closed
+        // check in execute() still refuses a name that reads by spelling but
+        // that the server marks as changing data.
+        false
     }
 
     fn approval_details(&self, args: &Value) -> Result<ApprovalDetails> {
@@ -2871,7 +2846,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .ends_with(crate::elevenlabs::PLAN_IMAGE_VIDEO_MESSAGE)
+                .ends_with(crate::elevenlabs_oauth::PLAN_IMAGE_VIDEO_MESSAGE)
         );
     }
 
@@ -2927,21 +2902,15 @@ mod tests {
 
     #[test]
     fn tools_are_registered_per_connector_state() {
-        let registered = |config: Config, key: Option<&str>| -> Vec<String> {
+        let registered = |config: Config| -> Vec<String> {
             let dir = tempfile::tempdir().unwrap();
             let store = Store::open_in_memory(384).unwrap();
             let users = Arc::new(UserSecrets::with_master_key(store.clone(), [4u8; 32]).unwrap());
             let artifacts = Arc::new(ArtifactStore::new(dir.path().join("artifacts")).unwrap());
-            let values: BTreeMap<String, String> = key
-                .map(|value| ("elevenlabs_api_key".to_owned(), value.to_owned()))
-                .into_iter()
-                .collect();
-            let secrets = SharedSecrets::new(crate::secrets::SecretStore::from_map(values));
             let mut registry = ToolRegistry::default();
             register_elevenlabs_connectors(
                 &mut registry,
                 Arc::new(config),
-                &secrets,
                 users,
                 artifacts,
                 Arc::new(Policy::from_text("")),
@@ -2955,17 +2924,9 @@ mod tests {
                 .filter(|name| name.starts_with("elevenlabs"))
                 .collect()
         };
-        let mut both = Config::default();
-        both.elevenlabs.mcp_enabled = true;
-        both.elevenlabs.api_key.enabled = true;
         let mcp_only = {
             let mut config = Config::default();
             config.elevenlabs.mcp_enabled = true;
-            config
-        };
-        let key_only = {
-            let mut config = Config::default();
-            config.elevenlabs.api_key.enabled = true;
             config
         };
         let mcp_names = [
@@ -2973,32 +2934,12 @@ mod tests {
             "elevenlabs_mcp_describe_tool",
             "elevenlabs_mcp_call",
         ];
-        let key_names = [
-            "elevenlabs_key_list_voices",
-            "elevenlabs_key_text_to_speech",
-            "elevenlabs_key_sound_effect",
-            "elevenlabs_key_transcribe",
-            "elevenlabs_key_generate_image",
-            "elevenlabs_key_generate_video",
-        ];
 
-        assert!(registered(Config::default(), None).is_empty());
-        let names = registered(mcp_only.clone(), Some("sk_key_stored"));
+        // 0.28: the API-key connector is gone; only the MCP tools register.
+        assert!(registered(Config::default()).is_empty());
+        let names = registered(mcp_only);
         assert_eq!(names.len(), 3, "{names:?}");
         assert!(mcp_names.iter().all(|name| names.iter().any(|n| n == name)));
-        // The native tools need the key connector and a stored key.
-        let names = registered(key_only.clone(), None);
-        assert!(names.is_empty(), "{names:?}");
-        let names = registered(key_only.clone(), Some("sk_key_stored"));
-        assert_eq!(names.len(), 6, "{names:?}");
-        assert!(key_names.iter().all(|name| names.iter().any(|n| n == name)));
-        let names = registered(both, Some("sk_key_stored"));
-        assert_eq!(names.len(), 9, "{names:?}");
-        assert!(
-            names
-                .iter()
-                .all(|name| !name.starts_with("elevenlabs_mcp_list"))
-        );
     }
 
     #[test]

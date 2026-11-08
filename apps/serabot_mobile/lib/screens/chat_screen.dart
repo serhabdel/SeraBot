@@ -7,6 +7,7 @@ import '../chat_models.dart';
 import '../device.dart';
 import '../markdown.dart';
 import '../models.dart';
+import '../preview_pane.dart';
 import '../widgets.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -77,6 +78,17 @@ class _ChatScreenState extends State<ChatScreen> {
           onOpen: (e) => _download(
             e.label,
             () => widget.app.client.artifactBytes(e.hash),
+          ),
+          // 0.28.0: documents the server can render open in a preview pane;
+          // the share action stays as the fallback.
+          onPreview: (e) => showArtifactPreviewSheet(
+            context,
+            client: widget.app.client,
+            entry: e,
+            onFallback: () {
+              Navigator.pop(context);
+              _download(e.label, () => widget.app.client.artifactBytes(e.hash));
+            },
           ),
         ),
       ),
@@ -601,9 +613,16 @@ class _ModelSheetState extends State<ModelSheet> {
 }
 
 class FilesSheet extends StatelessWidget {
-  const FilesSheet({super.key, required this.entries, required this.onOpen});
+  const FilesSheet({
+    super.key,
+    required this.entries,
+    required this.onOpen,
+    this.onPreview,
+  });
   final List<LibraryEntry> entries;
   final void Function(LibraryEntry) onOpen;
+  /// 0.28.0: opens the server-rendered preview for pdf/pptx/xlsx/docx/md.
+  final void Function(LibraryEntry)? onPreview;
 
   @override
   Widget build(BuildContext context) {
@@ -622,7 +641,23 @@ class FilesSheet extends StatelessWidget {
               leading: const Icon(Icons.insert_drive_file_outlined),
               title: Text(e.label, maxLines: 1, overflow: TextOverflow.ellipsis),
               subtitle: Text(shortTime(e.createdAt)),
-              trailing: const Icon(Icons.share_outlined),
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Preview only for the formats the server can render.
+                  if (onPreview != null && previewKindForName(e.label) != null)
+                    IconButton(
+                      tooltip: 'Preview',
+                      icon: const Icon(Icons.visibility_outlined),
+                      onPressed: () => onPreview!(e),
+                    ),
+                  IconButton(
+                    tooltip: 'Open / share',
+                    icon: const Icon(Icons.share_outlined),
+                    onPressed: () => onOpen(e),
+                  ),
+                ],
+              ),
               onTap: () => onOpen(e),
             ),
         ],

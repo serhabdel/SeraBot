@@ -136,10 +136,12 @@ pub enum Section {
     Usage,
     Tasks,
     Settings,
+    /// The owner-only server logs viewer (0.28.0).
+    Logs,
 }
 
 impl Section {
-    pub const NAV: [Self; 10] = [
+    pub const NAV: [Self; 11] = [
         Self::Chat,
         Self::Conversations,
         Self::Browser,
@@ -150,6 +152,7 @@ impl Section {
         Self::Approvals,
         Self::Vault,
         Self::Usage,
+        Self::Logs,
     ];
 
     pub fn label(self) -> &'static str {
@@ -165,6 +168,7 @@ impl Section {
             Self::Usage => "Usage",
             Self::Tasks => "Tasks",
             Self::Settings => "Settings",
+            Self::Logs => "Logs",
         }
     }
 }
@@ -178,19 +182,22 @@ pub enum SettingsSection {
     Chat,
     Telegram,
     Voice,
+    /// Web search/crawl switches (Tavily, Firecrawl) with API key status (0.28.0).
+    WebSearch,
     LocalFolders,
     Admin,
     About,
 }
 
 impl SettingsSection {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Account,
         Self::Appearance,
         Self::Notifications,
         Self::Chat,
         Self::Telegram,
         Self::Voice,
+        Self::WebSearch,
         Self::LocalFolders,
         Self::Admin,
         Self::About,
@@ -204,6 +211,7 @@ impl SettingsSection {
             Self::Chat => "Chat",
             Self::Telegram => "Telegram",
             Self::Voice => "Voice",
+            Self::WebSearch => "Web search",
             Self::LocalFolders => "Local folders",
             Self::Admin => "Admin",
             Self::About => "About",
@@ -567,6 +575,11 @@ pub struct Session {
     /// settings.json through [`creds::Settings::pins`].
     pub pins: Vec<String>,
     pub section: Section,
+    /// The Logs tab's current filter (0.28.0); applied on every refresh.
+    pub logs_level: Option<String>,
+    pub logs_query: String,
+    /// Artifact hashes with a preview read in flight (one per hash).
+    pub doc_previews_pending: std::collections::BTreeSet<String>,
     pub conversation: String,
     pub composer: String,
     pub fleet: FleetDraft,
@@ -745,6 +758,9 @@ impl Session {
             server_health_loading: false,
             server_health_error: None,
             section: Section::Chat,
+            logs_level: None,
+            logs_query: String::new(),
+            doc_previews_pending: std::collections::BTreeSet::new(),
             conversation: "windows-owner".into(),
             composer: String::new(),
             fleet: FleetDraft::default(),
@@ -1206,7 +1222,53 @@ impl Session {
             self.refresh_status();
             self.refresh_telegram();
         }
+        if section == Section::Logs {
+            self.refresh_logs();
+        }
         self.ensure_section_data();
+    }
+
+    /// Read `GET /v1/logs` with the tab's current filter (0.28.0). A manual
+    /// Refresh calls this again; the section load does too, once per connect.
+    pub fn refresh_logs(&mut self) {
+        if !self.state.connected || self.pending.is_some() {
+            if self.ready() {
+                self.schedule(
+                    Operation::Logs {
+                        level: self.logs_level.clone(),
+                        query: self.logs_query.clone(),
+                    },
+                    Duration::ZERO,
+                );
+            }
+            return;
+        }
+        self.start_request(Operation::Logs {
+            level: self.logs_level.clone(),
+            query: self.logs_query.clone(),
+        });
+    }
+
+    /// Change the Logs tab filter and re-read.
+    pub fn set_logs_filter(&mut self, level: Option<String>, query: String) {
+        self.logs_level = level;
+        self.logs_query = query;
+        self.refresh_logs();
+    }
+
+    /// Ask for one artifact's server-rendered preview (0.28.0). A hash that
+    /// is cached or already being read sends nothing.
+    pub fn request_doc_preview(&mut self, hash: String) {
+        if self.state.doc_previews.contains_key(&hash)
+            || !self.doc_previews_pending.insert(hash.clone())
+        {
+            return;
+        }
+        if self.pending.is_some() {
+            self.schedule(Operation::DocPreview { hash }, Duration::ZERO);
+        } else {
+            self.start_request(Operation::DocPreview { hash });
+        }
     }
 
     /// Read the live sandbox posture from `GET /v1/status`.
@@ -2841,6 +2903,11 @@ impl Session {
             Operation::PreviewArtifact { hash, .. } if !self.state.media_previews.begin(hash) => {
                 return;
             }
+            // One preview read per hash at a time; the session tracks the
+            // in-flight set and clears it when the reply lands.
+            Operation::DocPreview { hash } => {
+                self.doc_previews_pending.insert(hash.clone());
+            }
             _ => {}
         }
         let job = Job {
@@ -3105,6 +3172,16 @@ impl Session {
                             self.downloading = false;
                             self.state.error = None;
                         }
+                        OperationKind::Logs => {
+                            // The tab shows its own message; no global banner.
+                            self.state.logs_loaded = true;
+                            self.state.error = None;
+                        }
+                        OperationKind::DocPreview => {
+                            self.doc_previews_pending.clear();
+                            self.toast = Some(format!("No preview for this file: {message}"));
+                            self.state.error = None;
+                        }
                         _ => {}
                     }
                     if !self.state.connected {
@@ -3172,6 +3249,9 @@ impl Session {
                         Reply::AvatarSaved(target) => Some(target.clone()),
                         _ => None,
                     };
+                    if let Reply::DocPreview { hash, .. } = &reply {
+                        self.doc_previews_pending.remove(hash);
+                    }
                     if !self.state.receive(&completion.scope, reply) {
                         continue;
                     }
@@ -3638,6 +3718,10 @@ impl Session {
                     Some(Operation::ListTasks)
                 }
             }
+            Section::Logs => (!self.state.logs_loaded).then(|| Operation::Logs {
+                level: self.logs_level.clone(),
+                query: self.logs_query.clone(),
+            }),
             Section::Browser | Section::Vault | Section::Usage | Section::Settings => None,
         }
     }
@@ -3847,6 +3931,13 @@ impl Session {
     pub fn toggle_connector(&mut self, id: &str) {
         let draft = self.connector_drafts.entry(id.to_owned()).or_default();
         draft.enabled = !draft.enabled;
+    }
+
+    /// Set a connector's enabled state explicitly (0.28.0 Web search card);
+    /// unlike the toggle this never flips, so a re-render keeps the value.
+    pub fn set_connector_enabled(&mut self, id: &str, enabled: bool) {
+        let draft = self.connector_drafts.entry(id.to_owned()).or_default();
+        draft.enabled = enabled;
     }
 
     pub fn set_connector_value(&mut self, id: &str, role: &str, value: String) {
@@ -5019,8 +5110,8 @@ mod tests {
                 .filter(|section| section.visible(admin))
                 .count()
         };
-        assert_eq!(count(true), 9);
-        assert_eq!(count(false), 8);
+        assert_eq!(count(true), 10);
+        assert_eq!(count(false), 9);
         assert!(!SettingsSection::Admin.visible(false));
     }
 

@@ -1,0 +1,233 @@
+
+/* 0.28.0: Jobs/Activity panel, Logs tab and document preview panes.
+   Tokens only; nothing here hard-codes a colour. */
+
+/* --- Jobs/Activity panel (chat main view) --- */
+.jobs-panel {
+  margin: 4px 0 8px;
+  max-width: min(var(--chat-w), 100%);
+  background: var(--surface-2);
+  border-radius: var(--r-md);
+  font-size: var(--fs-body-2);
+  color: var(--label-2);
+}
+
+.jobs-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+  list-style: none;
+  color: var(--label-2);
+}
+
+.jobs-summary::-webkit-details-marker {
+  display: none;
+}
+
+.jobs-summary svg {
+  transition: transform 160ms ease;
+}
+
+.jobs-panel[open] .jobs-summary svg {
+  transform: rotate(90deg);
+}
+
+.jobs-headline {
+  font-weight: 600;
+  color: var(--label-1);
+}
+
+.jobs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 8px 8px;
+  border-top: 1px solid var(--hairline);
+}
+
+.job {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: var(--r-sm);
+}
+
+.job-mark {
+  flex: 0 0 14px;
+  display: inline-flex;
+  justify-content: center;
+  color: var(--label-2);
+}
+
+.job.running .job-mark,
+.job.finishing .job-mark {
+  color: var(--accent-2);
+}
+
+.job.done .job-mark {
+  color: var(--ok);
+}
+
+.job.failed .job-mark {
+  color: var(--err, #e5534b);
+}
+
+.job.waiting .job-mark {
+  color: var(--warn);
+}
+
+.job-icon {
+  display: inline-flex;
+  color: var(--label-3);
+}
+
+.job-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--label-1);
+}
+
+.job-meta {
+  flex: 0 0 auto;
+  color: var(--label-3);
+  font-size: var(--fs-caption);
+}
+
+.job.done .job-title,
+.job.failed .job-title {
+  color: var(--label-2);
+}
+
+/* --- Logs tab --- */
+.logs-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 0 0 10px;
+}
+
+.logs-search {
+  flex: 1;
+  min-width: 180px;
+}
+
+.logs-body {
+  flex: 1;
+  min-height: 200px;
+  overflow: auto;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  padding: 6px 0;
+  font-family: ui-monospace, monospace;
+  font-size: var(--fs-caption);
+}
+
+.log-row {
+  display: grid;
+  grid-template-columns: 72px 56px minmax(120px, 220px) 1fr;
+  gap: 10px;
+  padding: 3px 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log-row:hover {
+  background: var(--surface-3, var(--surface-2));
+}
+
+.log-time {
+  color: var(--label-3);
+}
+
+.log-level {
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.log-info .log-level {
+  color: var(--accent-2);
+}
+
+.log-warn .log-level {
+  color: var(--warn);
+}
+
+.log-error .log-level {
+  color: var(--err, #e5534b);
+}
+
+.log-trace .log-level {
+  color: var(--label-3);
+}
+
+.log-target {
+  color: var(--label-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.log-message {
+  color: var(--label-1);
+}
+
+/* --- Document preview pane (0.28.0) --- */
+.doc-preview {
+  margin-top: 8px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.doc-preview-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--hairline);
+  font-size: var(--fs-body-2);
+  color: var(--label-2);
+}
+
+.doc-preview-head .grow {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.doc-preview-body {
+  max-height: 320px;
+  overflow: auto;
+  padding: 10px 12px;
+}
+
+.doc-preview-body img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  border-radius: var(--r-sm);
+}
+
+.doc-preview-body pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, monospace;
+  font-size: var(--fs-caption);
+  color: var(--label-1);
+}
+
+/* Reduced motion: the spinner dots and chevron transitions stop. */
+.root[data-motion="reduce"] .jobs-summary svg {
+  transition: none;
+}

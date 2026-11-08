@@ -78,6 +78,16 @@ pub struct State {
     pub library_error: Option<String>,
     /// Background media jobs of the open conversation (0.24), conversation-scoped.
     pub media_jobs: Vec<crate::api::MediaJob>,
+    /// The Logs tab (0.28.0): the latest read of `GET /v1/logs`.
+    pub logs: Vec<crate::logs::LogEntry>,
+    pub logs_loaded: bool,
+    /// False once the server answers 404 on `/v1/logs`: the tab then says the
+    /// route is not available instead of retrying forever.
+    pub logs_supported: bool,
+    /// Server-rendered artifact previews by hash (0.28.0). `None` values mean
+    /// "no preview; use download/open". A hash has at most one read in flight,
+    /// tracked by the session.
+    pub doc_previews: BTreeMap<String, Option<crate::preview::ArtifactPreview>>,
     /// Media files already read back for inline players (capped, 0.24).
     pub media_previews: crate::media_view::PreviewCache,
     /// The owner's per-turn work limits (0.24), once read or saved.
@@ -181,6 +191,10 @@ impl Default for State {
             library_loading: false,
             library_error: None,
             media_jobs: Vec::new(),
+            logs: Vec::new(),
+            logs_loaded: false,
+            logs_supported: true,
+            doc_previews: BTreeMap::new(),
             media_previews: crate::media_view::PreviewCache::default(),
             turn_limits: None,
             turn_limits_error: None,
@@ -547,6 +561,24 @@ impl State {
                 self.library_error = None;
             }
             Reply::MediaJobs(jobs) => self.media_jobs = jobs,
+            Reply::Logs(entries) => {
+                match entries {
+                    Some(entries) => {
+                        self.logs = entries;
+                        self.logs_supported = true;
+                    }
+                    // The server predates the logs route: the tab shows a
+                    // notice instead of an empty list.
+                    None => {
+                        self.logs.clear();
+                        self.logs_supported = false;
+                    }
+                }
+                self.logs_loaded = true;
+            }
+            Reply::DocPreview { hash, preview } => {
+                self.doc_previews.insert(hash, preview);
+            }
             Reply::Preview { hash, data_url } => {
                 self.media_previews.insert(hash, data_url);
             }

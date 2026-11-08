@@ -34,7 +34,7 @@ use crate::ui_files::{
 use crate::ui_settings::SettingsPanel;
 use crate::ui_settings_page::{
     AboutCard, AppearanceCard, ChatPrefsCard, LocalFoldersCard, NotificationsCard, SettingsNav,
-    TurnLimitsCard,
+    TurnLimitsCard, WebSearchCard,
 };
 use crate::ui_usage::UsagePage;
 use crate::ui_vault::VaultPage;
@@ -46,7 +46,8 @@ const SYSTEM_THEME_JS: &str = "const m = window.matchMedia('(prefers-color-schem
 const CSS_PAGES: &str = concat!(
     include_str!("../assets/usage.css"),
     include_str!("../assets/settings.css"),
-    include_str!("../assets/files.css")
+    include_str!("../assets/files.css"),
+    include_str!("../assets/jobs.css")
 );
 
 /// The `data-activity` value the stylesheet keys the avatar ring and the
@@ -744,6 +745,7 @@ pub(crate) fn Icon(name: String, #[props(default = 20)] size: u32) -> Element {
         "fleet" => "M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z",
         "lock" => "M6 11h12v9H6zM8 11V8a4 4 0 0 1 8 0v3",
         "usage" => "M5 20V10M12 20V4M19 20v-7",
+        "logs" => "M6 4h9l3 3v13H6zM9 9h6M9 13h6M9 17h4",
         "globe" => {
             "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"
         }
@@ -1481,6 +1483,7 @@ fn Shell(session: Signal<Session>) -> Element {
                         Section::Tasks => rsx! { crate::ui_tasks::TasksView { session } },
                         Section::Vault => rsx! { VaultPage { session } },
                         Section::Usage => rsx! { UsagePage { session } },
+                        Section::Logs => rsx! { crate::ui_logs::LogsView { session } },
                         Section::Settings => rsx! { SettingsView { session } },
                     }}
                 }
@@ -1539,7 +1542,7 @@ fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> 
     let mut session = session;
     let section = session.read().section;
     let pending = session.read().state.approvals.len();
-    let destinations: [(Section, &str, &str); 9] = [
+    let destinations: [(Section, &str, &str); 10] = [
         (Section::Chat, "chat", "Chats"),
         (Section::Browser, "globe", "Browser"),
         (Section::Tasks, "list", "Tasks"),
@@ -1549,6 +1552,7 @@ fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> 
         (Section::Vault, "lock", "Vault"),
         (Section::Usage, "usage", "Usage"),
         (Section::Providers, "providers", "AI keys"),
+        (Section::Logs, "logs", "Logs"),
     ];
     rsx! {
         nav { class: "rail", "aria-label": "Main navigation",
@@ -3318,6 +3322,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                 if let Some(plan) = chat_plan.clone() {
                     PlanPanel { plan }
                 }
+                // The Jobs/Activity panel (0.28.0): running/queued turns,
+                // media jobs and handoffs, collapsed to one line when idle.
+                crate::ui_jobs::JobsPanel { session }
                 div {
                     class: if group_like { "messages group" } else { "messages" },
                     id: "messages",
@@ -6245,6 +6252,9 @@ fn SettingsView(session: Signal<Session>) -> Element {
         if sel == SettingsSection::Chat {
             ChatPrefsCard { session }
             TurnLimitsCard { session }
+        }
+        if sel == SettingsSection::WebSearch {
+            WebSearchCard { session }
         }
         if sel == SettingsSection::LocalFolders {
             LocalFoldersCard { session }

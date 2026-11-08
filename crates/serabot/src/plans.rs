@@ -29,6 +29,12 @@ const MAX_CONVERSATION_ID_CHARS: usize = 200;
 pub const PLAN_TOOL: &str = "plan_update";
 /// Event kind streamed to the desktop when a plan changes.
 pub const PLAN_EVENT: &str = "plan.updated";
+/// `yolo_toggle`: the bot switches this conversation's auto-approve on or off
+/// itself (0.28). Audited; never applies to destructive tools (the gateway
+/// refuses to auto-approve those even when YOLO is on).
+pub const YOLO_TOOL: &str = "yolo_toggle";
+/// Audit event recorded when a bot flips YOLO for its conversation.
+pub const YOLO_SELF_EVENT: &str = "yolo.self_enabled";
 
 fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
@@ -348,6 +354,82 @@ impl Tool for PlanUpdateTool {
     }
 }
 
+/// `yolo_toggle`: let the bot turn this conversation's auto-approve on or off
+/// from its own judgement (0.28). The switch is per user and per conversation,
+/// every flip is audited, and destructive tools still always ask the owner.
+pub struct YoloToggleTool {
+    store: Store,
+}
+
+impl YoloToggleTool {
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl Tool for YoloToggleTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: YOLO_TOOL.into(),
+            description: "Turn auto-approve (YOLO) on or off for this conversation. \
+                          Use it when the task calls for running without approval prompts; \
+                          destructive actions (sends, uploads, writes, deletes) still always \
+                          ask the owner. Every change is audited."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "enabled": {"type": "boolean", "description": "true to auto-approve non-destructive tool calls in this conversation"}
+                },
+                "required": ["enabled"],
+                "additionalProperties": false
+            }),
+            external_effect: false,
+        }
+    }
+
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
+        let conversation_id = context
+            .conversation_id
+            .as_deref()
+            .ok_or_else(|| SeraError::Validation("yolo_toggle needs a conversation".into()))?;
+        let enabled = args
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| SeraError::Validation("enabled must be a boolean".into()))?;
+        self.store
+            .set_yolo(&context.user_id, conversation_id, enabled)?;
+        self.store.record_audit(
+            &context.actor,
+            YOLO_SELF_EVENT,
+            Some(YOLO_TOOL),
+            context.task_id.as_deref(),
+            None,
+            None,
+            None,
+            Some(&json!({
+                "conversation_id": conversation_id,
+                "bot": context.bot,
+                "enabled": enabled,
+            })),
+        )?;
+        let _ = self.store.append_event(
+            &context.user_id,
+            YOLO_SELF_EVENT,
+            &json!({"conversation_id": conversation_id, "enabled": enabled}),
+        );
+        let state = if enabled { "on" } else { "off" };
+        Ok(ToolOutput {
+            content: format!(
+                "Auto-approve is now {state} for this conversation. Destructive actions still ask the owner."
+            ),
+            data: Some(json!({"conversation_id": conversation_id, "yolo": enabled})),
+            ..ToolOutput::default()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,6 +559,56 @@ mod tests {
         no_conversation.conversation_id = None;
         assert!(
             tool.execute(json!({"goal": "g", "items": []}), &no_conversation)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn yolo_toggle_flips_only_the_acting_users_conversation_and_audits_it() {
+        let (store, admin, other) = store_with_users();
+        let tool = YoloToggleTool::new(store.clone());
+        let context = |user: &str| ToolContext {
+            user_id: user.into(),
+            actor: user.into(),
+            bot: "main".into(),
+            task_id: None,
+            turn_id: None,
+            conversation_id: Some("dir:main".into()),
+            allowed_tools: Default::default(),
+            require_approval: Default::default(),
+        };
+        assert!(!store.yolo_enabled(&admin, "dir:main"));
+        let out = tool
+            .execute(json!({"enabled": true}), &context(&admin))
+            .await
+            .unwrap();
+        assert!(out.data.unwrap()["yolo"] == true);
+        assert!(store.yolo_enabled(&admin, "dir:main"));
+        // Other users and other conversations are untouched.
+        assert!(!store.yolo_enabled(&other, "dir:main"));
+        assert!(!store.yolo_enabled(&admin, "dir:other"));
+        // The flip is audited under the acting user.
+        assert!(
+            store
+                .list_audit_for_user(&admin, 10)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.event == YOLO_SELF_EVENT && entry.actor == admin)
+        );
+        tool.execute(json!({"enabled": false}), &context(&admin))
+            .await
+            .unwrap();
+        assert!(!store.yolo_enabled(&admin, "dir:main"));
+        assert!(
+            tool.execute(json!({"enabled": "yes"}), &context(&admin))
+                .await
+                .is_err()
+        );
+        let mut no_conversation = context(&admin);
+        no_conversation.conversation_id = None;
+        assert!(
+            tool.execute(json!({"enabled": true}), &no_conversation)
                 .await
                 .is_err()
         );

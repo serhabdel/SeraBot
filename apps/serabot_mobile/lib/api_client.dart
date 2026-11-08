@@ -586,6 +586,28 @@ class ApiClient {
     return _fetch(['v1', 'artifacts', hash]);
   }
 
+  /// Server-rendered preview of one artifact (0.28.0):
+  /// `GET /v1/artifacts/{hash}/preview` -> `{content_type, text?, image_b64?}`.
+  /// Null when the server has no preview for it (404) or the route is not
+  /// shipped yet; the caller falls back to [artifactBytes].
+  Future<ArtifactPreview?> artifactPreview(String hash) async {
+    if (!validHash(hash)) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Invalid artifact hash.',
+      );
+    }
+    final response = await _send(
+      'GET',
+      _uri(['v1', 'artifacts', hash, 'preview']),
+    );
+    if (response.statusCode == 404) {
+      return null;
+    }
+    final json = _decode(response);
+    return ArtifactPreview.fromJson(json);
+  }
+
   /// Download one of the user's own attachments.
   Future<List<int>> attachmentBytes(String id) async {
     _checkId(id);

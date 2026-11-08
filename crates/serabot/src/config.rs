@@ -348,23 +348,6 @@ impl Config {
                 ));
             }
         }
-        if self.elevenlabs.api_key.enabled {
-            if self.elevenlabs.api_base.is_empty() {
-                return Err(SeraError::Config(
-                    "elevenlabs.api_base must not be empty when the ElevenLabs API key connector is enabled".into(),
-                ));
-            }
-            if self.elevenlabs.max_tts_chars == 0 {
-                return Err(SeraError::Config(
-                    "elevenlabs.max_tts_chars must be greater than zero".into(),
-                ));
-            }
-            if self.elevenlabs.poll_max_attempts == 0 {
-                return Err(SeraError::Config(
-                    "elevenlabs.poll_max_attempts must be greater than zero".into(),
-                ));
-            }
-        }
         if self.elevenlabs.mcp_enabled {
             if self.elevenlabs.mcp_timeout_secs == 0
                 || self.elevenlabs.mcp_generate_timeout_secs == 0
@@ -1318,45 +1301,15 @@ impl Default for TavilyConfig {
     }
 }
 
-/// The pre-0.24 ElevenLabs mode switch: `api_key` used the account's API key,
-/// `oauth` the sign-in through the hosted MCP server. Read for back-compat
-/// only; see [`ElevenLabsConfig::apply_legacy_settings`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ElevenLabsAuth {
-    #[default]
-    ApiKey,
-    Oauth,
-}
-
-/// The ElevenLabs API-key connector: legacy native tools (`elevenlabs_key_*`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ElevenLabsApiKeyConfig {
-    /// Register the native API-key tools. Needs the key in the age store.
-    #[serde(default)]
-    pub enabled: bool,
-}
-
+/// The ElevenLabs connector: account sign-in through the hosted MCP server,
+/// which exposes the full ElevenLabs catalog. Since 0.28.0 this is the only
+/// ElevenLabs connector; the API-key connector (`elevenlabs_key_*`) is gone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ElevenLabsConfig {
-    /// Pre-0.24 master switch. Input only: folded into `mcp_enabled` and
-    /// `api_key.enabled` at load and never written back.
-    #[serde(rename = "enabled", default, skip_serializing)]
-    pub legacy_enabled: Option<bool>,
-    /// Pre-0.24 mode switch. Input only; see `legacy_enabled`.
-    #[serde(default, skip_serializing)]
-    pub auth: Option<ElevenLabsAuth>,
     /// The "ElevenLabs" connector: account sign-in through the hosted MCP
     /// server, which exposes the full ElevenLabs catalog. Recommended.
     #[serde(default)]
     pub mcp_enabled: bool,
-    /// The "ElevenLabs API key" connector (legacy native tools).
-    #[serde(default)]
-    pub api_key: ElevenLabsApiKeyConfig,
-    #[serde(default = "default_elevenlabs_api_base")]
-    pub api_base: String,
-    #[serde(default = "default_elevenlabs_api_key_secret")]
-    pub api_key_secret: String,
     /// ElevenLabs hosted MCP endpoint (Streamable HTTP, OAuth bearer).
     #[serde(default = "default_elevenlabs_mcp_url")]
     pub mcp_url: String,
@@ -1372,9 +1325,6 @@ pub struct ElevenLabsConfig {
     pub oauth_access_token_secret: String,
     #[serde(default = "default_elevenlabs_oauth_refresh_token_secret")]
     pub oauth_refresh_token_secret: String,
-    /// Timeout for the API-key connector's REST calls.
-    #[serde(default = "default_elevenlabs_timeout_secs")]
-    pub timeout_secs: u64,
     /// Timeout for each MCP request that lists, searches or reads.
     #[serde(default = "default_elevenlabs_mcp_timeout_secs")]
     pub mcp_timeout_secs: u64,
@@ -1402,18 +1352,12 @@ pub struct ElevenLabsConfig {
 impl Default for ElevenLabsConfig {
     fn default() -> Self {
         Self {
-            legacy_enabled: None,
-            auth: None,
             mcp_enabled: false,
-            api_key: ElevenLabsApiKeyConfig::default(),
-            api_base: default_elevenlabs_api_base(),
-            api_key_secret: default_elevenlabs_api_key_secret(),
             mcp_url: default_elevenlabs_mcp_url(),
             oauth_client_id: default_elevenlabs_oauth_client_id(),
             oauth_scope: default_elevenlabs_oauth_scope(),
             oauth_access_token_secret: default_elevenlabs_oauth_access_token_secret(),
             oauth_refresh_token_secret: default_elevenlabs_oauth_refresh_token_secret(),
-            timeout_secs: default_elevenlabs_timeout_secs(),
             mcp_timeout_secs: default_elevenlabs_mcp_timeout_secs(),
             mcp_generate_timeout_secs: default_elevenlabs_mcp_generate_timeout_secs(),
             default_voice_id: default_elevenlabs_voice_id(),
@@ -1429,28 +1373,15 @@ impl Default for ElevenLabsConfig {
 }
 
 impl ElevenLabsConfig {
-    /// Fold the pre-0.24 `enabled` and `auth` pair into the two connector
-    /// switches. `enabled = true` with `auth = "oauth"` turns on the sign-in
-    /// connector; without `auth` (the old default) the API-key connector.
+    /// Upgrade settings written by older builds. Configs written before the
+    /// OAuth resource fix pinned the public MCP host; the token's audience is
+    /// the regional server, so upgrade them. The pre-0.24 `enabled`/`auth`
+    /// pair and the `[elevenlabs.api_key]` section were removed with the
+    /// API-key connector in 0.28.0 and are ignored when read.
     pub fn apply_legacy_settings(&mut self) {
-        // Configs written before the OAuth resource fix pinned the public MCP
-        // host; the token's audience is the regional server, so upgrade them.
-        if self.mcp_url == crate::elevenlabs::ELEVENLABS_MCP_URL_PUBLIC {
-            self.mcp_url = crate::elevenlabs::ELEVENLABS_MCP_URL.to_owned();
+        if self.mcp_url == crate::elevenlabs_oauth::ELEVENLABS_MCP_URL_PUBLIC {
+            self.mcp_url = crate::elevenlabs_oauth::ELEVENLABS_MCP_URL.to_owned();
         }
-        if self.legacy_enabled.is_none() && self.auth.is_none() {
-            return;
-        }
-        let enabled = self.legacy_enabled.unwrap_or(false);
-        match self.auth.take().unwrap_or_default() {
-            ElevenLabsAuth::Oauth => self.mcp_enabled |= enabled,
-            ElevenLabsAuth::ApiKey => self.api_key.enabled |= enabled,
-        }
-        self.legacy_enabled = None;
-        tracing::warn!(
-            "[elevenlabs] `enabled` and `auth` are deprecated: use `mcp_enabled` for the \
-             sign-in connector and `[elevenlabs.api_key] enabled` for the API-key connector"
-        );
     }
 }
 
@@ -1458,16 +1389,32 @@ impl ElevenLabsConfig {
 /// before the rename keep working: each old name maps to its replacement.
 pub fn renamed_tool(name: &str) -> &str {
     match name {
-        "elevenlabs_list_voices" => "elevenlabs_key_list_voices",
-        "elevenlabs_text_to_speech" => "elevenlabs_key_text_to_speech",
-        "elevenlabs_sound_effect" => "elevenlabs_key_sound_effect",
-        "elevenlabs_transcribe" => "elevenlabs_key_transcribe",
-        "elevenlabs_generate_image" => "elevenlabs_key_generate_image",
-        "elevenlabs_generate_video" => "elevenlabs_key_generate_video",
         "elevenlabs_mcp_list_tools" => "elevenlabs_mcp_search_tools",
         other => other,
     }
 }
+
+/// The native `elevenlabs_key_*` tools of the API-key connector, removed in
+/// 0.28.0: subscription (hosted MCP) is the only ElevenLabs connector.
+const REMOVED_ELEVENLABS_KEY_TOOLS: &[&str] = &[
+    "elevenlabs_key_list_voices",
+    "elevenlabs_key_text_to_speech",
+    "elevenlabs_key_sound_effect",
+    "elevenlabs_key_transcribe",
+    "elevenlabs_key_generate_image",
+    "elevenlabs_key_generate_video",
+];
+
+/// Pre-rename native tool names; their `elevenlabs_key_*` replacements are
+/// gone too, so both spellings are dropped from bot lists.
+const LEGACY_NATIVE_ELEVENLABS_TOOLS: &[&str] = &[
+    "elevenlabs_list_voices",
+    "elevenlabs_text_to_speech",
+    "elevenlabs_sound_effect",
+    "elevenlabs_transcribe",
+    "elevenlabs_generate_image",
+    "elevenlabs_generate_video",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderConfig {
@@ -2053,18 +2000,19 @@ pub fn rename_legacy_tools(bot: &mut BotConfig) {
 
 /// Rename the pre-rename tool names in one list, in place.
 ///
-/// A bot that has ElevenLabs MCP tools was in account-sign-in mode, so its
-/// old native names (`elevenlabs_text_to_speech` and the like) are dropped:
-/// the MCP tools replace them. Otherwise they become `elevenlabs_key_*`. A
+/// The ElevenLabs API-key tools are gone (0.28.0), so the old native names
+/// (`elevenlabs_text_to_speech` and the like) and their `elevenlabs_key_*`
+/// spellings are dropped: the MCP tools are the only ElevenLabs connector. A
 /// renamed `elevenlabs_mcp_list_tools` also brings `elevenlabs_mcp_describe_tool`.
 /// Duplicates are removed, keeping the first.
 pub fn rename_tool_list(list: &mut Vec<String>) {
-    let has_mcp = list.iter().any(|tool| tool.starts_with("elevenlabs_mcp_"));
     let mut renamed: Vec<String> = Vec::with_capacity(list.len());
     for tool in list.iter() {
+        if LEGACY_NATIVE_ELEVENLABS_TOOLS.contains(&tool.as_str()) {
+            continue;
+        }
         let new_name = renamed_tool(tool);
-        let native_legacy = new_name != tool.as_str() && new_name.starts_with("elevenlabs_key_");
-        if native_legacy && has_mcp {
+        if REMOVED_ELEVENLABS_KEY_TOOLS.contains(&new_name) {
             continue;
         }
         renamed.push(new_name.to_owned());
@@ -2089,6 +2037,7 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "memory_update",
     "memory_delete",
     "conversation_library",
+    "yolo_toggle",
     "rag_search",
     "xlsx_analyze",
     "timesheet_analyze",
@@ -2102,15 +2051,10 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "firecrawl_search",
     "firecrawl_crawl",
     "firecrawl_extract",
-    "elevenlabs_key_list_voices",
-    "elevenlabs_key_text_to_speech",
-    "elevenlabs_key_sound_effect",
-    "elevenlabs_key_transcribe",
-    "elevenlabs_key_generate_image",
-    "elevenlabs_key_generate_video",
     "elevenlabs_mcp_search_tools",
     "elevenlabs_mcp_describe_tool",
     "elevenlabs_mcp_call",
+    "openrouter_generate_image",
     "deck_build",
     "docx_build",
     "docx_import",
@@ -2694,29 +2638,20 @@ fn default_audio_max_bytes() -> u64 {
 fn default_telegram_audio_max_bytes() -> u64 {
     20_971_520
 }
-fn default_elevenlabs_api_base() -> String {
-    "https://api.elevenlabs.io".into()
-}
 fn default_elevenlabs_mcp_url() -> String {
-    crate::elevenlabs::ELEVENLABS_MCP_URL.into()
-}
-fn default_elevenlabs_api_key_secret() -> String {
-    "elevenlabs_api_key".into()
+    crate::elevenlabs_oauth::ELEVENLABS_MCP_URL.into()
 }
 fn default_elevenlabs_oauth_client_id() -> String {
-    crate::elevenlabs::cimd_client_id()
+    crate::elevenlabs_oauth::cimd_client_id()
 }
 fn default_elevenlabs_oauth_scope() -> String {
-    crate::elevenlabs::DEFAULT_OAUTH_SCOPE.into()
+    crate::elevenlabs_oauth::DEFAULT_OAUTH_SCOPE.into()
 }
 fn default_elevenlabs_oauth_access_token_secret() -> String {
     "elevenlabs_access_token".into()
 }
 fn default_elevenlabs_oauth_refresh_token_secret() -> String {
     "elevenlabs_refresh_token".into()
-}
-fn default_elevenlabs_timeout_secs() -> u64 {
-    120
 }
 fn default_elevenlabs_mcp_timeout_secs() -> u64 {
     60
@@ -2923,11 +2858,11 @@ mod tests {
     #[test]
     fn legacy_public_mcp_url_is_upgraded_to_the_token_resource() {
         let mut config = ElevenLabsConfig {
-            mcp_url: crate::elevenlabs::ELEVENLABS_MCP_URL_PUBLIC.to_owned(),
+            mcp_url: crate::elevenlabs_oauth::ELEVENLABS_MCP_URL_PUBLIC.to_owned(),
             ..ElevenLabsConfig::default()
         };
         config.apply_legacy_settings();
-        assert_eq!(config.mcp_url, crate::elevenlabs::ELEVENLABS_MCP_URL);
+        assert_eq!(config.mcp_url, crate::elevenlabs_oauth::ELEVENLABS_MCP_URL);
         // A custom URL is left alone.
         let mut config = ElevenLabsConfig {
             mcp_url: "https://mcp.example.test".to_owned(),
@@ -2938,23 +2873,15 @@ mod tests {
     }
 
     #[test]
-    fn old_native_elevenlabs_names_become_the_key_tools_without_mcp() {
+    fn removed_elevenlabs_key_tools_and_their_legacy_names_are_dropped() {
         assert_eq!(
             renamed(&[
                 "elevenlabs_text_to_speech",
                 "elevenlabs_list_voices",
+                "elevenlabs_key_transcribe",
                 "memory_save"
             ]),
-            [
-                "elevenlabs_key_text_to_speech",
-                "elevenlabs_key_list_voices",
-                "memory_save"
-            ]
-        );
-        // An old name and its new one together collapse to one entry.
-        assert_eq!(
-            renamed(&["elevenlabs_transcribe", "elevenlabs_key_transcribe"]),
-            ["elevenlabs_key_transcribe"]
+            ["memory_save"]
         );
     }
 

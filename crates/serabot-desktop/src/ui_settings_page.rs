@@ -256,6 +256,90 @@ pub fn TurnLimitsCard(session: Signal<Session>) -> Element {
     }
 }
 
+/// Settings > Web search (0.28.0): the Tavily and Firecrawl switches with
+/// their API key status, read from `GET /v1/connectors` and written through
+/// the existing admin connector route. The key value itself never appears.
+#[component]
+pub fn WebSearchCard(session: Signal<Session>) -> Element {
+    let mut session = session;
+    let can_save = session.read().can_admin();
+    let rows: Vec<(String, String, bool, bool)> = {
+        let s = session.read();
+        ["tavily", "firecrawl"]
+            .iter()
+            .filter_map(|id| {
+                let connector = s.state.connectors.iter().find(|c| c.id == *id)?;
+                let enabled = s
+                    .connector_drafts
+                    .get(*id)
+                    .map(|draft| draft.enabled)
+                    .unwrap_or(connector.enabled);
+                let key_configured = connector
+                    .secrets
+                    .get("api_key")
+                    .is_some_and(|secret| secret.configured);
+                let title = match *id {
+                    "tavily" => "Tavily Search",
+                    _ => "Firecrawl",
+                };
+                Some(((*id).to_owned(), title.to_owned(), enabled, key_configured))
+            })
+            .collect()
+    };
+    rsx! {
+        div { class: "card",
+            div { class: "card-head",
+                h3 { class: "card-title", "Web search & crawl" }
+            }
+            p { class: "tiny",
+                "Let bots search the web and read pages. Each switch needs its API key saved on the Connectors page; the key value is never shown here."
+            }
+            if rows.is_empty() {
+                p { class: "tiny", role: "status", "Loading connectors\u{2026}" }
+            }
+            for (id, title, enabled, key_configured) in rows {
+                div { key: "{id}", class: "kv-row websearch-row",
+                    label { class: "check",
+                        input {
+                            r#type: "checkbox",
+                            checked: enabled,
+                            disabled: !can_save,
+                            "aria-label": "Enable {title}",
+                            onchange: {
+                                let id = id.clone();
+                                move |event| {
+                                    session.write().set_connector_enabled(&id, event.checked());
+                                }
+                            },
+                        }
+                        span { "{title}" }
+                    }
+                    span {
+                        class: if key_configured { "chip mono accent" } else { "chip mono warn" },
+                        if key_configured { "API key saved" } else { "No API key" }
+                    }
+                    span {
+                        class: if enabled { "chip ok" } else { "chip muted" },
+                        if enabled { "on" } else { "off" }
+                    }
+                    button {
+                        class: "btn ghost sm",
+                        disabled: !can_save,
+                        onclick: {
+                            let id = id.clone();
+                            move |_| session.write().save_connector(id.clone())
+                        },
+                        "Save"
+                    }
+                }
+            }
+            p { class: "tiny",
+                "Turning one on makes its tools available to bots (give them in Bots). Connectors also carry a Test button for a read-only key check."
+            }
+        }
+    }
+}
+
 #[component]
 pub fn AboutCard(session: Signal<Session>) -> Element {
     let (server, version) = {

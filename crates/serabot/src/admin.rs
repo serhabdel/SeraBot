@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::audio::resolve_audio_provider;
-use crate::config::{Config, ElevenLabsAuth, OAuthConnectorSettings, ProviderConfig};
+use crate::config::{Config, OAuthConnectorSettings, ProviderConfig};
 use crate::error::{Result, SeraError};
 use crate::providers::{canonical_kind, check_profile};
 use crate::secrets::SharedSecrets;
@@ -47,10 +47,6 @@ pub struct AdminOverlay {
     /// keep the rest of the file's values.
     #[serde(default)]
     pub bot_configs: BTreeMap<String, BotConfigOverlay>,
-    /// Pre-0.24 ElevenLabs mode. An overlay that carries it also carries the
-    /// old single `connectors.elevenlabs` switch; see [`AdminOverlay::apply`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub elevenlabs_auth: Option<ElevenLabsAuth>,
 }
 
 /// The overlay key for a connector's enable switch. The ElevenLabs sign-in
@@ -153,12 +149,16 @@ impl AdminOverlay {
                 "tavily" => config.tavily.enabled = *enabled,
                 "firecrawl" => config.firecrawl.enabled = *enabled,
                 "elevenlabs_mcp" => config.elevenlabs.mcp_enabled = *enabled,
-                "elevenlabs_api_key" => config.elevenlabs.api_key.enabled = *enabled,
-                // Pre-0.24: one switch, whose meaning came from the mode.
-                "elevenlabs" => match self.elevenlabs_auth.unwrap_or_default() {
-                    ElevenLabsAuth::ApiKey => config.elevenlabs.api_key.enabled = *enabled,
-                    ElevenLabsAuth::Oauth => config.elevenlabs.mcp_enabled = *enabled,
-                },
+                // The API-key connector was removed in 0.28.0; a stale switch
+                // for it is ignored so an old overlay still loads.
+                "elevenlabs_api_key" => {
+                    tracing::warn!(
+                        "ignoring the removed ElevenLabs API-key connector switch (0.28.0)"
+                    );
+                }
+                // Pre-0.24: one switch; since 0.28.0 it means the sign-in
+                // connector, the only ElevenLabs connector left.
+                "elevenlabs" => config.elevenlabs.mcp_enabled = *enabled,
                 _ => config.connectors.set_enabled(id, *enabled)?,
             }
         }
@@ -569,15 +569,6 @@ impl AdminStore {
                     "{role} is empty, too long, or contains control characters"
                 )));
             }
-            if id == "elevenlabs_api_key"
-                && *role == "api_key"
-                && crate::connectors::elevenlabs_api_key_malformed(value)
-            {
-                return Err(SeraError::Validation(
-                    "elevenlabs api_key is malformed: expected sk_ followed by 48 hex characters"
-                        .into(),
-                ));
-            }
             if !crate::config::valid_secret_name(name) {
                 return Err(SeraError::Config(format!(
                     "connectors.{id} uses an invalid secret name"
@@ -884,9 +875,6 @@ pub fn connector_secret_roles(config: &Config, id: &str) -> Result<Vec<(&'static
     if id == "elevenlabs" {
         return Ok(Vec::new());
     }
-    if id == "elevenlabs_api_key" {
-        return Ok(vec![("api_key", config.elevenlabs.api_key_secret.clone())]);
-    }
     Err(SeraError::NotFound(format!("connector {id}")))
 }
 
@@ -1062,56 +1050,25 @@ mod tests {
     }
 
     #[test]
-    fn elevenlabs_api_key_is_owner_manageable_connector() {
+    fn the_removed_elevenlabs_api_key_connector_has_no_secrets_or_switch() {
         let root = std::env::temp_dir().join(format!("serabot-admin-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let config = config_with_root(&root);
         let store = AdminStore::open(&config).unwrap();
-        let empty = SharedSecrets::new(
-            crate::secrets::SecretStore::open_paths(
-                root.join("secrets.age"),
-                root.join("identity.txt"),
-            )
-            .unwrap(),
-        );
-        let roles = store
-            .connector_roles(&config, "elevenlabs_api_key")
-            .unwrap();
-        assert_eq!(
-            roles,
-            vec![("api_key", config.elevenlabs.api_key_secret.clone())]
-        );
+        // The API-key connector was removed in 0.28.0: it is an unknown
+        // connector now, and a stale switch in an old overlay is ignored.
         assert!(
             store
-                .set_connector(
-                    &config,
-                    &empty,
-                    "elevenlabs_api_key",
-                    true,
-                    &BTreeMap::new()
-                )
-                .is_err(),
-            "the API-key connector must not enable without its secret"
+                .connector_roles(&config, "elevenlabs_api_key")
+                .is_err()
         );
-        let mut bad = BTreeMap::new();
-        bad.insert("api_key".to_owned(), "sk_truncated".to_owned());
-        assert!(
-            store
-                .set_connector(&config, &empty, "elevenlabs_api_key", true, &bad)
-                .is_err(),
-            "a malformed sk_ key is rejected at write time"
-        );
-        let mut values = BTreeMap::new();
-        values.insert("api_key".to_owned(), format!("sk_{}", "a".repeat(48)));
-        assert!(
-            store
-                .set_connector(&config, &empty, "elevenlabs_api_key", true, &values)
-                .is_ok(),
-            "the API-key connector enables once its key is stored"
-        );
+        let mut overlay = AdminOverlay::default();
+        overlay
+            .connectors
+            .insert("elevenlabs_api_key".to_owned(), true);
         let mut merged = config.clone();
-        store.snapshot().apply(&mut merged).unwrap();
-        assert!(merged.elevenlabs.api_key.enabled);
+        overlay.apply(&mut merged).unwrap();
+        assert!(!merged.elevenlabs.mcp_enabled);
         std::fs::remove_dir_all(&root).ok();
     }
 }

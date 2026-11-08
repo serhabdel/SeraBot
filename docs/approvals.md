@@ -1,7 +1,8 @@
 # Tool approvals
 
-Only destructive tools need owner approval. Every other tool runs on the
-model's judgement.
+Only destructive tools need owner approval (0.28). Every other tool —
+including ElevenLabs MCP generation and OpenRouter image generation — runs on
+the model's judgement without an approval prompt.
 
 A tool is destructive when it deletes or irreversibly overwrites user data,
 or sends something to a third party that cannot be recalled. The list lives in
@@ -28,7 +29,7 @@ or sends something to a third party that cannot be recalled. The list lives in
 - Browser: `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_press`, `browser_screenshot`, `browser_close`. Typing a vault secret into a page whose host is not in the entry's allowed domains still fails closed. Typing a vault secret always asks for approval bound to the entry name and the page host, on an https page only (see `docs/vault.md`). "Always" is never a standing grant for a vault secret: it acts as "once".
 - Vault: `vault_list` and `vault_request_secret` are not destructive; the second one asks the owner for the value in a secure card instead.
 - Memory: `memory_save`, `memory_list`.
-- Research and media: `firecrawl_scrape`, `firecrawl_map`, `firecrawl_search`, `firecrawl_crawl`, `firecrawl_extract`, `tavily_search`, `fetch_url`, `watch_now`, `audio_transcribe`, `audio_understand`, `elevenlabs_key_list_voices`, `elevenlabs_key_text_to_speech`, `elevenlabs_key_sound_effect`, `elevenlabs_key_transcribe`, `elevenlabs_key_generate_image`, `elevenlabs_key_generate_video`.
+- Research and media: `firecrawl_scrape`, `firecrawl_map`, `firecrawl_search`, `firecrawl_crawl`, `firecrawl_extract`, `tavily_search`, `fetch_url`, `watch_now`, `audio_transcribe`, `audio_understand`, `elevenlabs_mcp_search_tools`, `elevenlabs_mcp_describe_tool`, `elevenlabs_mcp_call` (0.28: MCP calls, including generation, run without approval; a name the server marks as changing data is still refused), `openrouter_generate_image`.
 - Documents (produce new artifacts): `docx_build`, `docx_import`, `docx_inspect`, `docx_read`, `docx_edit`, `docx_pdf`, `xlsx_build`, `xlsx_import`, `xlsx_inspect`, `xlsx_read`, `xlsx_edit`, `xlsx_analyze`, `timesheet_analyze`, `pptx_import`, `pptx_inspect`, `pptx_edit`, `pptx_pdf`, `pdf_inspect`, `pdf_edit`, `pdf_merge`, `deck_build`, `document_index`, `rag_search`.
 - Local folders (read only): `local_list`, `local_search`, `local_stat`, `local_read`, `local_import`. They only work while the desktop is online and only inside folders the user allowed.
 - Image tools (image_inspect, image_resize, image_convert): run without approval; results are new artifacts with metadata removed.
@@ -46,3 +47,13 @@ The seed templates list only destructive tools.
 Approvals keep the same binding: user, canonical arguments, destination,
 artifact hash, policy version and expiry. Changing any of them needs a new
 approval.
+
+## YOLO (auto-approve) — 0.28
+
+The per-conversation YOLO switch auto-approves non-destructive calls through
+the full approval chain (action and approval rows are still created and bound,
+and the audit ledger records `approval.auto_approved`). The owner sets it in
+the console, or a bot may set it itself with `yolo_toggle` when its judgement
+says the task should run without prompts; every self-enable is audited as
+`yolo.self_enabled`. **YOLO never covers a destructive tool** — those always
+wait for the owner's own decision, even with YOLO on.

@@ -2345,6 +2345,45 @@ impl ApiClient {
         Ok(listing.media_jobs)
     }
 
+    /// `GET /v1/logs?level=&q=` (0.28.0): the owner-only log ring buffer,
+    /// `{entries:[{ts,level,target,message}]}`. A 404 means the server
+    /// predates the route, reported as `Ok(None)` so the Logs tab can say
+    /// "not available" instead of failing.
+    pub fn logs(
+        &self,
+        level: Option<&str>,
+        query: &str,
+    ) -> Result<Option<Vec<crate::logs::LogEntry>>, ApiError> {
+        let params = crate::logs::logs_query(level, query);
+        match self.get::<serde_json::Value>(&["v1", "logs"], &params) {
+            Ok(value) => crate::logs::parse_entries(&value)
+                .map(Some)
+                .ok_or(ApiError::InvalidResponse),
+            Err(ApiError::Http(404)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// `GET /v1/artifacts/{hash}/preview` (0.28.0): the server-rendered
+    /// preview `{content_type, text?, image_b64?}`. A 404 (route not shipped
+    /// yet, or no preview for this artifact) is `Ok(None)` so the caller
+    /// falls back to the download route.
+    pub fn artifact_preview(
+        &self,
+        hash: &str,
+    ) -> Result<Option<crate::preview::ArtifactPreview>, ApiError> {
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ApiError::Validation("Invalid artifact hash."));
+        }
+        match self.get::<serde_json::Value>(&["v1", "artifacts", hash, "preview"], &[]) {
+            Ok(value) => crate::preview::ArtifactPreview::parse(&value)
+                .map(Some)
+                .ok_or(ApiError::InvalidResponse),
+            Err(ApiError::Http(404)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// `GET /v1/settings/turn-limits` (0.24).
     pub fn turn_limits(&self) -> Result<TurnLimitsView, ApiError> {
         self.request(

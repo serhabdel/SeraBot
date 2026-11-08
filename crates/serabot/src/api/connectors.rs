@@ -190,9 +190,9 @@ pub(super) async fn list_connectors(
         "secrets": {},
         "oauth": {
             "client_id": state.config.elevenlabs.oauth_client_id,
-            "authorize_url": crate::elevenlabs::ELEVENLABS_AUTHORIZE_URL,
-            "cimd_path": crate::elevenlabs::CIMD_PATH,
-            "callback_uri": crate::elevenlabs::oauth_callback_uri(),
+            "authorize_url": crate::elevenlabs_oauth::ELEVENLABS_AUTHORIZE_URL,
+            "cimd_path": crate::elevenlabs_oauth::CIMD_PATH,
+            "callback_uri": crate::elevenlabs_oauth::oauth_callback_uri(),
             "scope": state.config.elevenlabs.oauth_scope,
         },
     }));
@@ -208,12 +208,6 @@ pub(super) async fn list_connectors(
             state.config.firecrawl.enabled,
             state.config.firecrawl.api_base.as_str(),
             state.config.firecrawl.api_key_secret.as_str(),
-        ),
-        (
-            "elevenlabs_api_key",
-            state.config.elevenlabs.api_key.enabled,
-            state.config.elevenlabs.api_base.as_str(),
-            state.config.elevenlabs.api_key_secret.as_str(),
         ),
     ] {
         views.push(json!({
@@ -953,7 +947,6 @@ pub(super) fn api_key_probe<'a>(config: &'a Config, id: &str) -> Option<ApiKeyPr
         )),
         "tavily" => Some(ApiKeyProbe::Tavily(&config.tavily.api_base)),
         "firecrawl" => Some(ApiKeyProbe::Firecrawl(&config.firecrawl.api_base)),
-        "elevenlabs_api_key" => Some(ApiKeyProbe::ElevenLabs(&config.elevenlabs.api_base)),
         _ => None,
     }
 }

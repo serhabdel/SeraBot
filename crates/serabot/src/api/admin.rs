@@ -391,7 +391,7 @@ pub(super) async fn admin_connector_oauth_start(
             "connector {id} does not support OAuth sign-in"
         ))));
     }
-    let url = crate::elevenlabs::authorize_url(
+    let url = crate::elevenlabs_oauth::authorize_url(
         &state.config.elevenlabs.oauth_client_id,
         &request.redirect_uri,
         &state.config.elevenlabs.oauth_scope,
@@ -428,7 +428,7 @@ pub(super) async fn admin_connector_oauth_complete(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| admin_error(SeraError::External(error.to_string())))?;
-    let pair = crate::elevenlabs::exchange_code(
+    let pair = crate::elevenlabs_oauth::exchange_code(
         &http,
         &state.config.elevenlabs.oauth_client_id,
         &request.code,
