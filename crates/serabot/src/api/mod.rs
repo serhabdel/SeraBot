@@ -67,6 +67,7 @@ mod profiles;
 mod settings;
 mod skills;
 mod status;
+mod tasks;
 #[cfg(test)]
 mod tests;
 mod vault;
@@ -86,6 +87,7 @@ use messages::*;
 use settings::*;
 use skills::*;
 use status::*;
+use tasks::*;
 use vault::*;
 
 #[derive(Clone)]
@@ -346,6 +348,18 @@ pub fn router(state: ApiState) -> Router {
             "/v1/conversations/{id}/unarchive",
             post(unarchive_conversation),
         )
+        .route("/v1/tasks", get(list_tasks).post(create_task))
+        .route("/v1/tasks/prefs", get(get_task_prefs).put(put_task_prefs))
+        .route("/v1/tasks/sync/status", get(sync_status))
+        .route("/v1/tasks/sync/run", post(run_sync))
+        .route("/v1/tasks/sync/oauth/start", post(sync_oauth_start))
+        .route("/v1/tasks/sync/oauth/complete", post(sync_oauth_complete))
+        .route(
+            "/v1/tasks/sync/oauth/{provider}",
+            delete(sync_oauth_disconnect),
+        )
+        .route("/v1/tasks/calendar", get(calendar_events))
+        .route("/v1/tasks/{id}", patch(patch_task).delete(delete_task))
         .route("/v1/memories", get(list_memories).post(add_memory))
         .route("/v1/memories/stats", get(memory_stats))
         .route(

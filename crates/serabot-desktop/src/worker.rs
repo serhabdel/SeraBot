@@ -100,6 +100,16 @@ pub enum OperationKind {
     Attach,
     /// Answer, decline or secret reply on a chat card.
     CardWrite,
+    /// Tasks tab (0.25.0): list, write, prefs and sync.
+    ListTasks,
+    AddTask,
+    SetTaskStatus,
+    DeleteTask,
+    TaskPrefs,
+    SetTaskPrefs,
+    TaskSyncStatus,
+    RunTaskSync,
+    TaskCalendar,
 }
 
 impl OperationKind {
@@ -189,6 +199,28 @@ pub enum Operation {
         id: String,
     },
     MemoryStats,
+    ListTasks,
+    AddTask {
+        title: String,
+        due: Option<String>,
+    },
+    SetTaskStatus {
+        id: String,
+        status: String,
+    },
+    DeleteTask {
+        id: String,
+    },
+    TaskPrefs,
+    SetTaskPrefs {
+        provider: String,
+    },
+    TaskSyncStatus,
+    RunTaskSync,
+    TaskCalendar {
+        from: String,
+        to: String,
+    },
     Providers,
     Connectors,
     GetTeam,
@@ -395,6 +427,14 @@ impl Operation {
             Self::SetMemoryStatus { .. } => OperationKind::SetMemoryStatus,
             Self::DeleteMemory { .. } => OperationKind::DeleteMemory,
             Self::MemoryStats => OperationKind::MemoryStats,
+            Self::ListTasks => OperationKind::ListTasks,
+            Self::AddTask { .. } => OperationKind::AddTask,
+            Self::SetTaskStatus { .. } => OperationKind::SetTaskStatus,
+            Self::DeleteTask { .. } => OperationKind::DeleteTask,
+            Self::TaskPrefs | Self::TaskSyncStatus | Self::TaskCalendar { .. } => {
+                OperationKind::TaskPrefs
+            }
+            Self::SetTaskPrefs { .. } | Self::RunTaskSync => OperationKind::SetTaskPrefs,
             Self::Providers => OperationKind::Providers,
             Self::Connectors => OperationKind::Connectors,
             Self::GetTeam => OperationKind::Team,
@@ -473,6 +513,14 @@ pub enum Reply {
     UpdatedMemory(MemoryEntry),
     DeletedMemory(String),
     MemoryStats(MemoryStatsView),
+    Tasks(Vec<crate::api::TaskEntry>),
+    AddedTask(crate::api::TaskEntry),
+    UpdatedTask(crate::api::TaskEntry),
+    DeletedTask(String),
+    TaskPrefs(crate::api::TaskPrefs),
+    TaskSyncStatus(crate::api::TaskSyncStatus),
+    TaskSyncReport(crate::api::TaskSyncReport),
+    TaskEvents(Vec<crate::api::TaskEvent>),
     Providers(Vec<ProviderStatus>),
     Connectors(Vec<ConnectorStatus>),
     Team(Team),
@@ -847,6 +895,25 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
             .delete_memory(id)
             .map(|_| Reply::DeletedMemory(id.clone())),
         Operation::MemoryStats => client.memory_stats().map(Reply::MemoryStats),
+        Operation::ListTasks => client.list_tasks(None, None, None).map(Reply::Tasks),
+        Operation::AddTask { title, due } => client
+            .create_task(title, due.as_deref())
+            .map(Reply::AddedTask),
+        Operation::SetTaskStatus { id, status } => {
+            client.patch_task_status(id, status).map(Reply::UpdatedTask)
+        }
+        Operation::DeleteTask { id } => client
+            .delete_task(id)
+            .map(|_| Reply::DeletedTask(id.clone())),
+        Operation::TaskPrefs => client.task_prefs().map(Reply::TaskPrefs),
+        Operation::SetTaskPrefs { provider } => {
+            client.put_task_prefs(provider).map(Reply::TaskPrefs)
+        }
+        Operation::TaskSyncStatus => client.task_sync_status().map(Reply::TaskSyncStatus),
+        Operation::RunTaskSync => client.run_task_sync().map(Reply::TaskSyncReport),
+        Operation::TaskCalendar { from, to } => client
+            .task_calendar_events(from, to)
+            .map(Reply::TaskEvents),
         Operation::Providers => client.providers().map(|mut providers| {
             // The account's own default route marks one card with a star;
             // without one, the server default is the starred provider.

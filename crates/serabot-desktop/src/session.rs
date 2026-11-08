@@ -134,14 +134,16 @@ pub enum Section {
     Browser,
     Vault,
     Usage,
+    Tasks,
     Settings,
 }
 
 impl Section {
-    pub const NAV: [Self; 9] = [
+    pub const NAV: [Self; 10] = [
         Self::Chat,
         Self::Conversations,
         Self::Browser,
+        Self::Tasks,
         Self::Memory,
         Self::Providers,
         Self::Connectors,
@@ -161,6 +163,7 @@ impl Section {
             Self::Browser => "Browser",
             Self::Vault => "Vault",
             Self::Usage => "Usage",
+            Self::Tasks => "Tasks",
             Self::Settings => "Settings",
         }
     }
@@ -3628,6 +3631,13 @@ impl Session {
             Section::Providers => (!self.state.providers_loaded).then_some(Operation::Providers),
             Section::Connectors => (!self.state.connectors_loaded).then_some(Operation::Connectors),
             Section::Approvals => (!self.state.approvals_loaded).then_some(Operation::Approvals),
+            Section::Tasks => {
+                if self.state.tasks_loaded {
+                    None
+                } else {
+                    Some(Operation::ListTasks)
+                }
+            }
             Section::Browser | Section::Vault | Section::Usage | Section::Settings => None,
         }
     }
@@ -4193,6 +4203,56 @@ impl Session {
     pub fn load_memories(&mut self) {
         let list = self.memory_list_operation();
         self.start_request(list);
+    }
+
+    // --- Tasks tab (0.25.0) ---
+
+    pub fn load_tasks(&mut self) {
+        self.start_request(Operation::ListTasks);
+    }
+
+    pub fn add_task(&mut self, title: String, due: Option<String>) {
+        if title.trim().is_empty() {
+            return;
+        }
+        self.start_request(Operation::AddTask { title, due });
+    }
+
+    /// Cycle a task's Kanban column: todo → doing → done → todo.
+    pub fn cycle_task_status(&mut self, id: String, status: &str) {
+        let next = match status {
+            "todo" => "doing",
+            "doing" => "done",
+            _ => "todo",
+        };
+        self.start_request(Operation::SetTaskStatus {
+            id,
+            status: next.into(),
+        });
+    }
+
+    pub fn delete_task(&mut self, id: String) {
+        self.start_request(Operation::DeleteTask { id });
+    }
+
+    pub fn load_task_prefs(&mut self) {
+        self.start_request(Operation::TaskPrefs);
+        self.start_request(Operation::TaskSyncStatus);
+    }
+
+    pub fn set_task_sync_provider(&mut self, provider: String) {
+        self.start_request(Operation::SetTaskPrefs { provider });
+    }
+
+    pub fn run_task_sync(&mut self) {
+        self.start_request(Operation::RunTaskSync);
+        // Refresh the list and the sign-in state once the pass is applied.
+        self.start_request(Operation::ListTasks);
+        self.start_request(Operation::TaskSyncStatus);
+    }
+
+    pub fn load_task_calendar(&mut self, from: String, to: String) {
+        self.start_request(Operation::TaskCalendar { from, to });
     }
 
     /// The list request for the current search text and filter chip.

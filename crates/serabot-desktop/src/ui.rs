@@ -1477,6 +1477,8 @@ fn Shell(session: Signal<Session>) -> Element {
                         Section::Connectors => rsx! { ConnectorsView { session } },
                         Section::Approvals => rsx! { ApprovalsView { session } },
                         Section::Browser => rsx! { BrowserView { session, overlay } },
+
+                        Section::Tasks => rsx! { crate::ui_tasks::TasksView { session } },
                         Section::Vault => rsx! { VaultPage { session } },
                         Section::Usage => rsx! { UsagePage { session } },
                         Section::Settings => rsx! { SettingsView { session } },
@@ -1537,9 +1539,10 @@ fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> 
     let mut session = session;
     let section = session.read().section;
     let pending = session.read().state.approvals.len();
-    let destinations: [(Section, &str, &str); 8] = [
+    let destinations: [(Section, &str, &str); 9] = [
         (Section::Chat, "chat", "Chats"),
         (Section::Browser, "globe", "Browser"),
+        (Section::Tasks, "list", "Tasks"),
         (Section::Approvals, "approvals", "Approvals"),
         (Section::Memory, "memory", "Memory"),
         (Section::Connectors, "connectors", "Connectors"),
