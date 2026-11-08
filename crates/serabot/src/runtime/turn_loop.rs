@@ -541,7 +541,7 @@ impl Runtime {
                 )
                 .await?;
             if let Some(reasoning) = response.reasoning.as_deref() {
-                self.emit_thinking(&user, task, &turn, reasoning);
+                self.emit_thinking(&user, task, turn, reasoning);
             }
             self.store.record_audit(
                 &user,
