@@ -19,6 +19,7 @@ pub mod net_policy;
 pub mod oauth;
 pub mod panel;
 pub mod provider_presets;
+pub mod provider_view;
 pub mod session;
 pub mod signin;
 pub mod state;

@@ -5854,3 +5854,86 @@ html[data-reduce-transparency="true"] .chat-header {
   color: var(--label-3);
   white-space: nowrap;
 }
+
+/* Providers page: cards, default star, model picker groups. */
+.status-pill.rejected {
+  background: var(--danger-soft);
+  color: var(--danger);
+  border-color: transparent;
+}
+
+.provider-grid {
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+}
+
+.provider-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.provider-card.is-default {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-soft);
+}
+
+.provider-card .card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: auto;
+}
+
+.provider-key-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.provider-key-row .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.default-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.model-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  position: sticky;
+  top: 0;
+  background: var(--card-bg);
+}
+
+.model-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.model-title {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+
+.model-id {
+  font-size: var(--fs-micro);
+  color: var(--label-3);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}

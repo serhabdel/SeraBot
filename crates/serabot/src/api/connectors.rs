@@ -381,10 +381,14 @@ pub(super) struct ProviderOauthStart {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct ProviderOauthComplete {
     code: String,
     verifier: String,
+    /// Sent by the desktop for symmetry with other flows; the exchange does
+    /// not use it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    redirect_uri: String,
 }
 
 /// Providers that offer a documented browser sign-in for a user. Today that

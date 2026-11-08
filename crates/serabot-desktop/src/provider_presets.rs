@@ -344,7 +344,10 @@ const PRESETS: &[ProviderPreset] = &[
         base_url: "https://router.huggingface.co/v1",
         kind: "huggingface",
         default_id: "huggingface",
-        models: &["meta-llama/Llama-3.3-70B-Instruct", "Qwen/Qwen2.5-72B-Instruct"],
+        models: &[
+            "meta-llama/Llama-3.3-70B-Instruct",
+            "Qwen/Qwen2.5-72B-Instruct",
+        ],
         secret_name: "huggingface_api_key",
         catalog_fetch: true,
         auth: "api_key",
