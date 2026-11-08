@@ -171,6 +171,7 @@ impl Runtime {
         if !fleet.contains_key(&bot) {
             return Err(SeraError::NotFound(format!("bot {bot}")));
         }
+        self.heal_conversation_model(user_id, conversation_id, &fleet[&bot])?;
         let selection = self.effective_model_selection(user_id, conversation_id, &bot)?;
         let route = self.router.pin(&selection)?;
         let owner_text = text.clone();

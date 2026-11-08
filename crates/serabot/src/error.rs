@@ -22,6 +22,12 @@ pub enum SeraError {
     InvalidState(String),
     #[error("validation error: {0}")]
     Validation(String),
+    /// A request the server refused with a server-authored, secret-free
+    /// message that is safe to show the caller. `code` is a stable word
+    /// clients match on. Never put user content, secrets or provider bodies
+    /// in `message`.
+    #[error("{message}")]
+    Rejected { code: &'static str, message: String },
     #[error("external service error: {0}")]
     External(String),
     /// A third-party service refused or failed a request made for the user.

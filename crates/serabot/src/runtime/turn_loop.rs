@@ -468,11 +468,27 @@ impl Runtime {
             .map(String::as_str)
             .filter(|name| !self.gateway.registry().is_registered(name))
             .collect();
-        if !unregistered.is_empty() {
+        // A known tool whose connector is simply not connected is expected
+        // (the default bots list every optional connector) and is skipped
+        // quietly. Only a name the server has never heard of is worth a
+        // warning: that is a typo or a stale allowlist.
+        let known = crate::tools::known_tool_names();
+        let unknown: Vec<&str> = unregistered
+            .iter()
+            .copied()
+            .filter(|name| !known.contains(name))
+            .collect();
+        if !unknown.is_empty() {
             warn!(
                 bot = %turn.bot,
+                tools = ?unknown,
+                "bot lists tools the server does not know; they are absent from this turn's tool notice"
+            );
+        } else if !unregistered.is_empty() {
+            debug!(
+                bot = %turn.bot,
                 tools = ?unregistered,
-                "bot lists tools that are not registered (disabled connector or stale allowlist); they are absent from this turn's tool notice"
+                "bot lists tools whose connector is not connected; skipped"
             );
         }
         let tool_specs = self

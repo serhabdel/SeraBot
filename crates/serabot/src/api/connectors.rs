@@ -342,6 +342,7 @@ pub(super) async fn get_default_route(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
 ) -> Result<Json<Value>> {
+    state.runtime.ensure_model_catalogs(&user.id).await;
     Ok(Json(
         json!({"selection": state.runtime.default_route(&user.id)?}),
     ))

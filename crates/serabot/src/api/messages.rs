@@ -17,6 +17,9 @@ pub(super) async fn send_message(
     Json(request): Json<MessageRequest>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&request.conversation_id)?;
+    // After a restart no live model list is loaded yet; load it before the
+    // stored route is validated so a live-only model id is not rejected.
+    state.runtime.ensure_model_catalogs(&user.id).await;
     let task = state.runtime.submit_text_attached(
         &user.id,
         &request.conversation_id,

@@ -2395,3 +2395,156 @@ async fn stop_mark_before_an_approval_pause_does_not_end_the_resumed_turn() {
     );
     assert!(runtime.stop_requests.lock().unwrap().is_empty());
 }
+
+/// A Mistral-style default provider with a live list, as in 0.21.0.
+fn live_catalog_runtime(server: &MockServer) -> (Runtime, Store) {
+    let (runtime, store) = setup(
+        &server.uri(),
+        Arc::new(Capture::default()),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    let mut config = (*runtime.config).clone();
+    config.llm.base_url = format!("{}/v1", server.uri());
+    config.llm.kind = "mistral".into();
+    config.llm.catalog_fetch = true;
+    config.llm.catalog_ttl_secs = 60;
+    let runtime = restart(&runtime, config, vec![bot()]);
+    (runtime, store)
+}
+
+async fn mount_live_list(server: &MockServer, ids: &[&str]) {
+    let data: Vec<Value> = ids
+        .iter()
+        .map(|id| json!({"id": id, "object": "model", "capabilities": {"completion_chat": true}}))
+        .collect();
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"object": "list", "data": data})),
+        )
+        .mount(server)
+        .await;
+}
+
+fn stored_model(store: &Store, conversation: &str) -> String {
+    let value = store
+        .kv_get(&format!("model_selection:{conversation}"))
+        .unwrap()
+        .unwrap();
+    serde_json::from_str::<ModelSelection>(&value)
+        .unwrap()
+        .model
+}
+
+fn notices(store: &Store, user: &str, conversation: &str) -> usize {
+    store
+        .list_messages(user, conversation, 100)
+        .unwrap()
+        .iter()
+        .filter(|message| message.content.contains("is no longer available, using"))
+        .count()
+}
+
+/// 0.21.0 regression: a conversation holding a live-only model id failed every
+/// send with `invalid request` after a restart, because no live list was
+/// loaded and the id was checked against the short allowlist.
+#[tokio::test]
+async fn live_only_stored_model_survives_a_restart_once_the_list_is_loaded() {
+    let server = MockServer::start().await;
+    mount_live_list(&server, &["test", "magistral-medium-latest"]).await;
+    let (runtime, store) = live_catalog_runtime(&server);
+    let user = admin(&store);
+    store
+        .kv_set(
+            "model_selection:owner",
+            r#"{"provider":"default","model":"magistral-medium-latest"}"#,
+        )
+        .unwrap();
+    // Without the list the stored id is not on the allowlist: the send used
+    // to fail here. With the heal path it falls back instead of failing.
+    runtime
+        .submit_text(&user, "owner", "synthetic", None)
+        .unwrap();
+    assert_eq!(stored_model(&store, "owner"), "test");
+    assert_eq!(notices(&store, &user, "owner"), 1);
+
+    // With the list loaded first (what the send handler does) the stored
+    // live-only model is valid and nothing is rewritten.
+    store
+        .kv_set(
+            "model_selection:two",
+            r#"{"provider":"default","model":"magistral-medium-latest"}"#,
+        )
+        .unwrap();
+    runtime.ensure_model_catalogs(&user).await;
+    runtime
+        .submit_text(&user, "two", "synthetic", None)
+        .unwrap();
+    assert_eq!(stored_model(&store, "two"), "magistral-medium-latest");
+    assert_eq!(notices(&store, &user, "two"), 0);
+}
+
+#[tokio::test]
+async fn removed_model_falls_back_and_says_so_once() {
+    let server = MockServer::start().await;
+    mount_live_list(&server, &["test", "other"]).await;
+    let (runtime, store) = live_catalog_runtime(&server);
+    let user = admin(&store);
+    runtime.ensure_model_catalogs(&user).await;
+    store
+        .kv_set(
+            "model_selection:owner",
+            r#"{"provider":"default","model":"retired-model"}"#,
+        )
+        .unwrap();
+    // The picker endpoint answers instead of failing.
+    assert_eq!(
+        runtime
+            .model_selection(&user, "owner", "main")
+            .unwrap()
+            .model,
+        "test"
+    );
+    runtime.submit_text(&user, "owner", "first", None).unwrap();
+    runtime.submit_text(&user, "owner", "second", None).unwrap();
+    assert_eq!(stored_model(&store, "owner"), "test");
+    assert_eq!(notices(&store, &user, "owner"), 1);
+    let history = store.list_messages(&user, "owner", 100).unwrap();
+    assert!(
+        history.iter().any(|message| message.content
+            == "The model retired-model is no longer available, using test")
+    );
+}
+
+#[tokio::test]
+async fn changing_model_loads_the_list_and_explains_a_refusal() {
+    let server = MockServer::start().await;
+    mount_live_list(&server, &["test", "magistral-medium-latest"]).await;
+    let (runtime, store) = live_catalog_runtime(&server);
+    let user = admin(&store);
+    runtime.ensure_model_catalogs(&user).await;
+    let pick = |model: &str| ModelSelection {
+        provider: "default".into(),
+        model: model.into(),
+    };
+    runtime
+        .select_model(&user, "owner", pick("magistral-medium-latest"))
+        .unwrap();
+    runtime
+        .set_default_route(&user, pick("magistral-medium-latest"))
+        .unwrap();
+    let error = runtime
+        .select_model(&user, "owner", pick("not-offered"))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        SeraError::Rejected {
+            code: "model_unavailable",
+            ..
+        }
+    ));
+    assert_eq!(
+        error.to_string(),
+        "That model isn't available for Mistral right now"
+    );
+}
