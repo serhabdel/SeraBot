@@ -7,7 +7,9 @@
 //! it answers, so the model knows what the owner is replying to.
 
 use super::*;
-use crate::cards::{CardKind, CardStatus, MAX_ANSWER_CHARS};
+use crate::cards::{
+    Card, CardKind, CardStatus, MAX_ANSWER_CHARS, QUESTION_TTL_HOURS, question_expired,
+};
 use crate::vault::{VaultInput, VaultKind, VaultSource};
 use zeroize::Zeroizing;
 
@@ -63,8 +65,9 @@ pub(super) async fn list_conversation_cards(
 }
 
 /// `POST /v1/cards/{id}/answer`: `{"answer": "..."}` for a pending question.
-/// The answer is posted as the owner's next message, prefixed with the
-/// question, and the card is marked answered.
+/// The card is marked answered first, so it answers once. The answer is then
+/// posted as the owner's next message, prefixed with the question. If the
+/// message cannot be posted, the card is pending again.
 pub(super) async fn answer_card(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
@@ -80,6 +83,19 @@ pub(super) async fn answer_card(
     }
     if card.status != CardStatus::Pending {
         return Err(SeraError::Validation("card is no longer pending".into()));
+    }
+    let now = Utc::now();
+    if question_expired(&card, now) {
+        // Too old to answer: expire it, so the bot can ask again.
+        state.store.expire_stale_questions(
+            &user.id,
+            &card.conversation_id,
+            now - chrono::Duration::hours(QUESTION_TTL_HOURS),
+        )?;
+        return Err(SeraError::Rejected {
+            code: "question_expired",
+            message: "This question is too old to answer. Ask the bot again.".into(),
+        });
     }
     let answer = answer_text(&request.answer)?;
     let free_text = card.payload["allow_free_text"].as_bool().unwrap_or(true);
@@ -97,18 +113,21 @@ pub(super) async fn answer_card(
     let question = card.payload["question"].as_str().unwrap_or_default();
     let text = format!("Answer to “{question}”: {answer}");
     state.runtime.ensure_model_catalogs(&user.id).await;
-    let task = state.runtime.submit_text_attached(
-        &user.id,
-        &card.conversation_id,
-        &text,
-        Some(&card.bot),
-        &[],
-    )?;
-    let card = state.store.resolve_card(
+    let (card, task) = resolve_then_post(
+        &state.store,
         &user.id,
         &id,
         CardStatus::Answered,
         &json!({"answer": answer}),
+        || {
+            state.runtime.submit_text_attached(
+                &user.id,
+                &card.conversation_id,
+                &text,
+                Some(&card.bot),
+                &[],
+            )
+        },
     )?;
     Ok(Json(json!({"card": card, "task": task_view(&task)})))
 }
@@ -136,16 +155,22 @@ pub(super) async fn decline_card(
         ),
     };
     state.runtime.ensure_model_catalogs(&user.id).await;
-    let task = state.runtime.submit_text_attached(
+    let (card, task) = resolve_then_post(
+        &state.store,
         &user.id,
-        &card.conversation_id,
-        &note,
-        Some(&card.bot),
-        &[],
+        &id,
+        CardStatus::Declined,
+        &json!({}),
+        || {
+            state.runtime.submit_text_attached(
+                &user.id,
+                &card.conversation_id,
+                &note,
+                Some(&card.bot),
+                &[],
+            )
+        },
     )?;
-    let card = state
-        .store
-        .resolve_card(&user.id, &id, CardStatus::Declined, &json!({}))?;
     Ok(Json(json!({"card": card, "task": task_view(&task)})))
 }
 
@@ -247,6 +272,28 @@ pub(super) async fn submit_secret_card(
     Ok(Json(json!({"card": card, "task": task_view(&task)})))
 }
 
+/// Resolve a card before its owner's message is posted, so a card resolves
+/// once. If posting fails, the card is pending again and the error is returned.
+fn resolve_then_post<T>(
+    store: &Store,
+    user_id: &str,
+    id: &str,
+    status: CardStatus,
+    response: &Value,
+    post: impl FnOnce() -> Result<T>,
+) -> Result<(Card, T)> {
+    let card = store.resolve_card(user_id, id, status, response)?;
+    match post() {
+        Ok(posted) => Ok((card, posted)),
+        Err(error) => {
+            if let Err(reopen_error) = store.reopen_card(user_id, id, response) {
+                warn!(error = %reopen_error, "card could not be reopened after a failed post");
+            }
+            Err(error)
+        }
+    }
+}
+
 /// Owner text for an answer: control characters become spaces, the ends are
 /// trimmed, and the length is bounded.
 fn answer_text(raw: &str) -> Result<String> {
@@ -274,6 +321,61 @@ mod tests {
         assert!(answer_text("   ").is_err());
         assert!(answer_text(&"a".repeat(MAX_ANSWER_CHARS + 1)).is_err());
         assert!(answer_text(&"a".repeat(MAX_ANSWER_CHARS)).is_ok());
+    }
+
+    #[test]
+    fn a_failed_post_puts_the_card_back_to_pending() {
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        let payload = json!({"question": "Which?", "options": ["A"], "allow_free_text": true});
+        let card = store
+            .create_card(&admin, "dir:main", "main", CardKind::Question, &payload)
+            .unwrap();
+        let response = json!({"answer": "A"});
+
+        let failed = resolve_then_post(
+            &store,
+            &admin,
+            &card.id,
+            CardStatus::Answered,
+            &response,
+            || Err::<(), _>(SeraError::External("provider down".into())),
+        );
+        assert!(failed.is_err());
+        assert_eq!(
+            store.get_card(&admin, &card.id).unwrap().status,
+            CardStatus::Pending
+        );
+
+        // The owner can answer again once the message posts.
+        let (answered, posted) = resolve_then_post(
+            &store,
+            &admin,
+            &card.id,
+            CardStatus::Answered,
+            &response,
+            || Ok("posted"),
+        )
+        .unwrap();
+        assert_eq!(answered.status, CardStatus::Answered);
+        assert_eq!(answered.response, Some(response));
+        assert_eq!(posted, "posted");
+
+        // A resolved card does not resolve again, and posts nothing.
+        let mut posted_again = false;
+        let second = resolve_then_post(
+            &store,
+            &admin,
+            &card.id,
+            CardStatus::Declined,
+            &json!({}),
+            || {
+                posted_again = true;
+                Ok(())
+            },
+        );
+        assert!(second.is_err());
+        assert!(!posted_again);
     }
 
     #[test]

@@ -12,7 +12,8 @@
 //! refuses to ask and the bot decides. At most one question is pending per
 //! conversation; a second call returns the pending one. Card text is
 //! model-written and untrusted: it is bounded, stripped of control characters,
-//! and checked against the content policy before it is stored.
+//! and checked against the content policy before it is stored. A question that
+//! asks for a secret is refused: secrets go through the vault.
 
 use std::sync::Arc;
 
@@ -47,6 +48,25 @@ pub const QUESTION_TTL_HOURS: i64 = 24;
 pub const MAX_LISTED_CARDS: usize = 100;
 const MAX_PAYLOAD_BYTES: usize = 8 * 1024;
 const MAX_RESPONSE_BYTES: usize = 4 * 1024;
+
+const SECRET_QUESTION_NOTE: &str = "Do not ask for passwords, API keys or other secrets in a question; use vault_request_secret (or ask the owner to add it in the Vault).";
+
+/// Words and phrases that make a question a request for a secret. Matched
+/// case-insensitively, on word boundaries.
+const SECRET_PHRASES: &[&str] = &[
+    "password",
+    "passcode",
+    "api key",
+    "api_key",
+    "apikey",
+    "secret key",
+    "token",
+    "2fa code",
+    "otp",
+    "pin code",
+    "mot de passe",
+    "clé api",
+];
 
 const AUTONOMY_NOTE: &str =
     "Autonomy is on for this chat; decide yourself and state the assumption you made.";
@@ -326,6 +346,49 @@ pub fn parse_question_args(args: &Value) -> Result<Value> {
     Ok(payload)
 }
 
+/// Whether a question is older than the answer window. An unreadable
+/// timestamp counts as expired: a stale question is never answered.
+pub fn question_expired(card: &Card, now: DateTime<Utc>) -> bool {
+    match DateTime::parse_from_rfc3339(&card.created_at) {
+        Ok(created) => created.with_timezone(&Utc) < now - Duration::hours(QUESTION_TTL_HOURS),
+        Err(_) => true,
+    }
+}
+
+/// Whether owner-facing question text asks for a secret. Deliberately broad: a
+/// refused question costs one turn, a secret typed into a chat does not come back.
+fn asks_for_secret(texts: &[&str]) -> bool {
+    texts.iter().any(|text| {
+        let lower = text.to_lowercase();
+        SECRET_PHRASES
+            .iter()
+            .any(|phrase| contains_word(&lower, phrase))
+    })
+}
+
+/// `phrase` occurs in `haystack` with no letter or digit on either side.
+fn contains_word(haystack: &str, phrase: &str) -> bool {
+    haystack.match_indices(phrase).any(|(start, _)| {
+        let before = haystack[..start].chars().next_back();
+        let after = haystack[start + phrase.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
+}
+
+/// Whether a parsed question payload (question, options, context) asks for a secret.
+fn payload_asks_for_secret(payload: &Value) -> bool {
+    let mut texts = vec![payload["question"].as_str().unwrap_or_default()];
+    texts.extend(
+        payload["options"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str),
+    );
+    texts.extend(payload["context"].as_str());
+    asks_for_secret(&texts)
+}
+
 fn read_card(connection: &Connection, user_id: &str, id: &str) -> Result<Option<Card>> {
     let raw = connection
         .query_row(
@@ -532,6 +595,46 @@ impl Store {
         transaction.commit()?;
         Ok(card)
     }
+
+    /// Undo `resolve_card` when the owner's message could not be posted. The
+    /// card is pending again only if it is answered or declined with exactly
+    /// `response`, the response that resolve wrote. Appends `card.created`, so
+    /// the desktop re-reads the card. Returns whether it changed.
+    pub fn reopen_card(&self, user_id: &str, id: &str, response: &Value) -> Result<bool> {
+        let stored_response = serde_json::to_string(response)?;
+        let connection = self.connection()?;
+        let transaction = connection.unchecked_transaction()?;
+        let owner_card: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT conversation_id, kind FROM chat_cards WHERE id = ?1 AND user_id = ?2",
+                params![id, user_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((conversation_id, kind)) = owner_card else {
+            return Err(SeraError::NotFound(format!("card {id}")));
+        };
+        let changed = transaction.execute(
+            "UPDATE chat_cards SET status = 'pending', response = NULL, resolved_at = NULL
+             WHERE id = ?1 AND user_id = ?2
+               AND status IN ('answered', 'declined') AND response = ?3",
+            params![id, user_id, stored_response],
+        )?;
+        if changed == 1 {
+            let at = now_string();
+            let event = serde_json::to_string(&json!({
+                "card_id": id,
+                "conversation_id": conversation_id,
+                "kind": kind,
+            }))?;
+            transaction.execute(
+                "INSERT INTO events(at, kind, payload_json, user_id) VALUES (?1, ?2, ?3, ?4)",
+                params![at, CARD_CREATED_EVENT, event, user_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed == 1)
+    }
 }
 
 /// `ask_user`: put one question to the owner as a card, or decide alone.
@@ -629,6 +732,10 @@ impl Tool for AskUserTool {
             return reply(json!({"asked": false, "autonomy": false, "note": NO_CARD_VIEW_NOTE}));
         }
         let payload = parse_question_args(&args)?;
+        // A secret goes through the vault, never through a question card.
+        if payload_asks_for_secret(&payload) {
+            return reply(json!({"asked": false, "note": SECRET_QUESTION_NOTE}));
+        }
         if !self.policy_allows(&payload) {
             return Err(invalid("question is withheld by content policy"));
         }
@@ -1057,6 +1164,137 @@ mod tests {
         assert_eq!(out["asked"], false);
         assert_eq!(out["autonomy"], false);
         assert!(store.list_cards(&admin, "20").unwrap().is_empty());
+    }
+
+    #[test]
+    fn questions_that_ask_for_secrets_are_detected_on_word_boundaries() {
+        for text in [
+            "What is your Password?",
+            "Enter the PASSCODE",
+            "Which API key should I use",
+            "Use api_key or apikey?",
+            "Your secret key, please",
+            "Paste the token",
+            "Enter the 2FA code",
+            "The OTP sent to you",
+            "Quel est le PIN code",
+            "Votre mot de passe ?",
+            "Quelle est la clé API ?",
+        ] {
+            assert!(asks_for_secret(&[text]), "{text}");
+        }
+        // Whole words only: "otp" inside "footprint" and "token" inside
+        // "tokenizer" do not count, and ordinary questions pass.
+        for text in [
+            "Print the footprint map",
+            "Use the tokenizer",
+            "Which colour?",
+        ] {
+            assert!(!asks_for_secret(&[text]), "{text}");
+        }
+        assert!(asks_for_secret(&["Which colour?", "use a token"]));
+    }
+
+    #[tokio::test]
+    async fn a_question_that_asks_for_a_secret_is_refused_and_not_stored() {
+        let (store, admin, _) = store_with_users();
+        let tool = AskUserTool::new(store.clone(), Arc::new(Policy::empty()));
+        let ctx = context(&admin, "dir:main");
+        let out = tool
+            .execute(
+                json!({"question": "What is the password for the portal?", "options": ["Skip"]}),
+                &ctx,
+            )
+            .await
+            .unwrap()
+            .data
+            .unwrap();
+        assert_eq!(out, json!({"asked": false, "note": SECRET_QUESTION_NOTE}));
+        assert!(store.list_cards(&admin, "dir:main").unwrap().is_empty());
+
+        // A secret hidden in the options is refused too.
+        let out = tool
+            .execute(
+                json!({"question": "Which one?", "options": ["API key", "Skip"]}),
+                &ctx,
+            )
+            .await
+            .unwrap()
+            .data
+            .unwrap();
+        assert_eq!(out["asked"], false);
+        assert!(store.list_cards(&admin, "dir:main").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_question_older_than_the_window_is_expired() {
+        let (store, admin, _) = store_with_users();
+        let card = store
+            .create_card(
+                &admin,
+                "dir:main",
+                "main",
+                CardKind::Question,
+                &question("Old?"),
+            )
+            .unwrap();
+        let now = Utc::now();
+        assert!(!question_expired(&card, now));
+        assert!(question_expired(
+            &card,
+            now + Duration::hours(QUESTION_TTL_HOURS) + Duration::minutes(1)
+        ));
+        let mut unreadable = card.clone();
+        unreadable.created_at = "not a time".into();
+        assert!(question_expired(&unreadable, now));
+    }
+
+    #[test]
+    fn a_resolved_card_can_be_reopened_only_with_the_response_written() {
+        let (store, admin, other) = store_with_users();
+        let card = store
+            .create_card(
+                &admin,
+                "dir:main",
+                "main",
+                CardKind::Question,
+                &question("Reopen?"),
+            )
+            .unwrap();
+        let response = json!({"answer": "Blue"});
+        store
+            .resolve_card(&admin, &card.id, CardStatus::Answered, &response)
+            .unwrap();
+
+        // Another user cannot reopen it, and a different response does not match.
+        assert!(matches!(
+            store.reopen_card(&other, &card.id, &response),
+            Err(SeraError::NotFound(_))
+        ));
+        assert!(
+            !store
+                .reopen_card(&admin, &card.id, &json!({"answer": "Green"}))
+                .unwrap()
+        );
+        assert_eq!(
+            store.get_card(&admin, &card.id).unwrap().status,
+            CardStatus::Answered
+        );
+
+        assert!(store.reopen_card(&admin, &card.id, &response).unwrap());
+        let reopened = store.get_card(&admin, &card.id).unwrap();
+        assert_eq!(reopened.status, CardStatus::Pending);
+        assert!(reopened.response.is_none() && reopened.resolved_at.is_none());
+        assert!(
+            store
+                .pending_question(&admin, "dir:main")
+                .unwrap()
+                .is_some()
+        );
+        // The card can be answered again after a reopen.
+        store
+            .resolve_card(&admin, &card.id, CardStatus::Declined, &json!({}))
+            .unwrap();
     }
 
     #[tokio::test]

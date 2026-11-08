@@ -105,15 +105,21 @@ Popups: every page the browser creates attaches to us paused (browser-level `Tar
 with `waitForDebuggerOnStart`). A page one of our tabs opened (`window.open`, `target=_blank`) is
 configured with the same guard, then runs and is adopted as a tab that becomes the active one
 (`browser/chromium.rs`, `should_adopt`). A popup from any other page, or any popup while the
-browser already has 8 tabs, is closed and logged. The owner's `+` and the bot's `browser_new_tab`
-open their tab the same way (`window.open('about:blank')` in the active tab, then a guarded
-navigation).
+browser already has 8 tabs, is closed and logged. A page that is not adopted is closed while it is
+still paused, so its code never runs. The owner's `+` and the bot's `browser_new_tab` create a blank
+page with `Target.createTarget`; no script runs in the active tab, so a site cannot change how the
+new tab opens. The new page is reserved (it counts toward the limit but no bot call reaches it),
+configured with the guard, then made the active tab before the guarded navigation.
 
-Limit, measured against a real Chromium (`live_popup_first_request_is_guarded`): when a popup is
-opened with a URL, Chromium can open a bare TCP connection to that address (a preconnect) before
-the guard sees the request. The test found no HTTP request reaching a refused loopback address.
-The bare connection can still reveal that a port is open, so the host firewall must block the
-service user's egress to private ranges (see above), as already advised.
+Preconnect and DNS prefetch are switched off as defence in depth, not as the control: the
+`--dns-prefetch-disable` switch, `NetworkPrediction` in the disabled features, and
+`net.network_prediction_options = 2` written into the profile's `Default/Preferences` before each
+launch (other keys in that file are kept). Limit, measured against a real Chromium
+(`live_popup_first_request_is_guarded`): when a popup is opened with a URL, Chromium can still open a
+bare TCP connection to that address before the guard sees the request. The test found no HTTP
+request reaching a refused loopback address. The bare connection can still reveal that a port is
+open, so the host firewall must block the service user's egress to private ranges (see above), as
+already advised; OS egress rules remain recommended.
 
 Limits: Chromium resolves names itself, so a DNS-rebinding answer that changes between
 our check and the browser's lookup is not caught (verdicts are cached 30 s per origin);
