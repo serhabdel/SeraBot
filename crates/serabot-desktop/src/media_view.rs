@@ -134,8 +134,12 @@ pub fn placeholder_label(job: &MediaJob) -> String {
     format!("Generating {} {}\u{2026}", article_for(kind), kind)
 }
 
+/// "an" before a vowel sound ("an image", "an audio"), "a" otherwise ("a video").
 fn article_for(kind: &str) -> &'static str {
-    if kind == "image" { "an" } else { "a" }
+    match kind {
+        "image" | "audio" => "an",
+        _ => "a",
+    }
 }
 
 /// Whether the reply gets a Continue button: an assistant reply that a tool
@@ -227,6 +231,22 @@ mod tests {
             attachments: Vec::new(),
             limit_reached,
         }
+    }
+
+    #[test]
+    fn placeholder_names_each_kind_with_its_article() {
+        assert_eq!(
+            placeholder_label(&job("image", "pending")),
+            "Generating an image\u{2026}"
+        );
+        assert_eq!(
+            placeholder_label(&job("audio", "pending")),
+            "Generating an audio\u{2026}"
+        );
+        assert_eq!(
+            placeholder_label(&job("video", "pending")),
+            "Generating a video\u{2026}"
+        );
     }
 
     #[test]

@@ -737,6 +737,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         users.clone(),
         artifacts.clone(),
         policy.clone(),
+        store.clone(),
     )?;
 
     let shutdown = CancellationToken::new();

@@ -18,10 +18,11 @@
 //!
 //! Unknown-outcome rule: a job is never submitted again. The loop only polls
 //! jobs that already exist, and a job whose provider has no poller waits until
-//! its deadline. A job left `finishing` by a database error is not retried
-//! either, because its message may already be posted. A submission whose
-//! outcome is unknown creates no row, so the caller reports it rather than
-//! retrying it.
+//! its deadline. A job left `finishing` by a crash or a database error is not
+//! retried either, because its message may already be posted. The recovery
+//! sweep marks such a job failed once its claim is older than
+//! [`STALLED_FINISHING_MINUTES`], and posts a note. A submission whose outcome
+//! is unknown creates no row, so the caller reports it rather than retrying it.
 //!
 //! Every store method takes the acting user's id. The loop is the single system
 //! reader: it selects due jobs across users, as the task claim does, and then
@@ -60,6 +61,10 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MAX_MEDIA_BYTES: usize = crate::maker::MAX_ARTIFACT_BYTES;
 /// Longest provider error kept on a job row.
 pub const MAX_JOB_ERROR_CHARS: usize = 500;
+/// A claim older than this is a pass that never finished. The recovery sweep
+/// marks it failed. Each pass finishes its claims before it returns, so a claim
+/// this old cannot belong to a pass still running.
+pub const STALLED_FINISHING_MINUTES: i64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -362,6 +367,25 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Jobs claimed for finishing before `before`, oldest first. This is the
+    /// system reader for the recovery sweep; the sweep acts on each job under
+    /// its own `user_id`.
+    pub fn stalled_finishing_media_jobs(
+        &self,
+        before: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<MediaJob>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {JOB_COLUMNS} FROM media_jobs
+             WHERE status = 'finishing' AND updated_at < ?1
+             ORDER BY updated_at ASC, rowid ASC LIMIT ?2"
+        ))?;
+        let rows =
+            statement.query_map(params![stamp(before), limit.clamp(1, 500) as i64], map_job)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Claim a pending job for finishing: `pending` to `finishing`. Only one
     /// caller wins, so only one pass saves and posts the file. Returns `false`
     /// when the job is no longer pending.
@@ -562,6 +586,45 @@ fn finish_done(
     Ok(())
 }
 
+/// Mark one stalled `finishing` job failed and post the short note. Nothing is
+/// polled, saved or submitted again. Returns `false` when the job had moved on.
+fn finish_stalled(store: &Store, job: &MediaJob) -> Result<bool> {
+    if !store.finish_media_job(
+        &job.user_id,
+        &job.id,
+        MediaJobStatus::Failed,
+        None,
+        Some("the claim was not finished in time"),
+    )? {
+        return Ok(false);
+    }
+    post_job_message(
+        store,
+        job,
+        &format!(
+            "The {} finished but could not be delivered; it may be in your Library.",
+            job.kind.as_str()
+        ),
+    )?;
+    Ok(true)
+}
+
+/// The recovery sweep: fail every job left `finishing` past
+/// [`STALLED_FINISHING_MINUTES`]. A job that errors is logged and skipped, so
+/// one bad row does not hold up the others. Returns how many were failed.
+pub fn sweep_stalled_finishing(store: &Store) -> Result<usize> {
+    let before = Utc::now() - chrono::Duration::minutes(STALLED_FINISHING_MINUTES);
+    let mut failed = 0;
+    for job in store.stalled_finishing_media_jobs(before, POLL_BATCH)? {
+        match finish_stalled(store, &job) {
+            Ok(true) => failed += 1,
+            Ok(false) => {}
+            Err(error) => error!(job = %job.id, %error, "could not fail a stalled media job"),
+        }
+    }
+    Ok(failed)
+}
+
 /// One job's step in a pass. Returns `true` when the job finished. An error
 /// affects only this job; the pass goes on with the next one.
 async fn handle_job(
@@ -627,6 +690,9 @@ async fn poll_media_jobs_with_timeout(
     policy: &Policy,
     poll_timeout: Duration,
 ) -> Result<usize> {
+    if let Err(error) = sweep_stalled_finishing(store) {
+        error!(%error, "media job recovery sweep failed; the pass goes on");
+    }
     let jobs = store.pending_media_jobs(POLL_BATCH)?;
     if jobs.is_empty() {
         return Ok(0);
@@ -1176,6 +1242,76 @@ mod tests {
         assert!(read_capped(refused, 1000).await.is_err());
         let kept = client.get(server.uri()).send().await.unwrap();
         assert_eq!(read_capped(kept, 4000).await.unwrap().len(), 2000);
+    }
+
+    /// Claims a job and backdates the claim, as a pass that never finished leaves it.
+    fn stall_claim(store: &Store, admin: &str, job: &MediaJob, claimed_at: DateTime<Utc>) {
+        assert!(store.claim_media_job(admin, &job.id).unwrap());
+        let connection = store.connection().unwrap();
+        connection
+            .execute(
+                "UPDATE media_jobs SET updated_at = ?1 WHERE id = ?2",
+                params![stamp(claimed_at), job.id],
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stalled_claim_fails_once_and_is_never_polled_again() {
+        let (store, admin) = setup();
+        let provider = provider_name("stalled");
+        let polls = scripted(&provider, vec![Ok(PollResult::Done(video_bytes()))]);
+        let job = create_video_job(&store, &admin, &provider, "ext-15");
+        stall_claim(
+            &store,
+            &admin,
+            &job,
+            Utc::now() - chrono::Duration::minutes(11),
+        );
+
+        let dir = artifact_dir();
+        poll_media_jobs_once(&store, dir.path(), &Policy::empty())
+            .await
+            .unwrap();
+        poll_media_jobs_once(&store, dir.path(), &Policy::empty())
+            .await
+            .unwrap();
+
+        let stored = store.get_media_job(&admin, &job.id).unwrap();
+        assert_eq!(stored.status, MediaJobStatus::Failed);
+        assert!(stored.artifact_hash.is_none());
+        assert_eq!(*polls.lock().unwrap(), 0);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let messages = store.list_visible_messages(&admin, "dir:main", 20).unwrap();
+        let notes = messages
+            .iter()
+            .filter(|m| {
+                m.content
+                    == "The video finished but could not be delivered; it may be in your Library."
+            })
+            .count();
+        assert_eq!(notes, 1);
+    }
+
+    #[tokio::test]
+    async fn a_recent_claim_is_left_to_its_pass() {
+        let (store, admin) = setup();
+        let provider = provider_name("recent");
+        let polls = scripted(&provider, vec![]);
+        let job = create_video_job(&store, &admin, &provider, "ext-16");
+        stall_claim(
+            &store,
+            &admin,
+            &job,
+            Utc::now() - chrono::Duration::minutes(9),
+        );
+
+        assert_eq!(sweep_stalled_finishing(&store).unwrap(), 0);
+        assert_eq!(
+            store.get_media_job(&admin, &job.id).unwrap().status,
+            MediaJobStatus::Finishing
+        );
+        assert_eq!(*polls.lock().unwrap(), 0);
     }
 
     #[test]

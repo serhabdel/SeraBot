@@ -68,8 +68,8 @@ For an owner who prefers a key over the account sign-in. These are the native RE
 | `elevenlabs_key_text_to_speech` | external, approval | `POST /v1/text-to-speech/{voice_id}` → artifact |
 | `elevenlabs_key_sound_effect` | external, approval | `POST /v1/sound-generation` → artifact |
 | `elevenlabs_key_transcribe` | external, approval | `POST /v1/speech-to-text` from an artifact hash or inbox path |
-| `elevenlabs_key_generate_image` | external, approval | `POST/GET /v1/flows/image` with polling → artifact |
-| `elevenlabs_key_generate_video` | external, approval | `POST/GET /v1/flows/video` with polling → artifact |
+| `elevenlabs_key_generate_image` | external, approval | `POST /v1/flows/image`, looked up for up to 20 s in the call → artifact, or a media job (`status: generating`) |
+| `elevenlabs_key_generate_video` | external, approval | `POST /v1/flows/video`, looked up for up to 20 s in the call → artifact, or a media job (`status: generating`) |
 
 ### Enable
 

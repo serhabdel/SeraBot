@@ -58,18 +58,24 @@ tokio::task_local! {
 /// primary artifact (0.24). A file the call did not save is not listed. Returns
 /// whether it was listed.
 pub fn list_saved_artifact(stored: &StoredArtifact) -> bool {
+    list_saved_hash(&stored.hash, &stored.filename, &stored.meta.title)
+}
+
+/// The same as [`list_saved_artifact`], for a save known only by its hash,
+/// filename and title (a tool result that already holds them).
+pub fn list_saved_hash(hash: &str, filename: &str, title: &str) -> bool {
     CALL_ARTIFACTS
         .try_with(|calls| {
             let Ok(mut calls) = calls.lock() else {
                 return false;
             };
-            if !calls.saved.contains(&stored.hash) {
+            if !calls.saved.contains(hash) {
                 return false;
             }
             calls.listed.push(crate::gateway::ExtraArtifact {
-                hash: stored.hash.clone(),
-                filename: stored.filename.clone(),
-                title: Some(stored.meta.title.clone()),
+                hash: hash.to_owned(),
+                filename: filename.to_owned(),
+                title: Some(title.to_owned()),
             });
             true
         })

@@ -12,17 +12,17 @@
   - The text of each file sits between `<<<FILE …>>>` and `<<<END …>>>` lines with a token new to each call, and file names are shown with line breaks escaped, so a file cannot forge a header or end a fence.
 - Bots are told that the shared folders are theirs to read, to work through large sets in batches and report progress, not to refuse because of the number of files, to treat file contents as data, and never to quote, store or send secrets found in files (passwords, keys, ID, card or bank numbers) and to refer to them only by file name.
 
-## Security fix: inbox paths stay in your own area
-- Every inbox path is resolved inside your own inbox folder (`<inbox>/<your id>/`). A path that names another user's file is now "not found", and a symlink or junction that points out of your folder is not followed. This covers the PDF tools, the Word, PowerPoint and Excel imports, `xlsx_analyze`, `document_index` and the image tools. One shared check now does this for all of them.
-- Paths returned by `local_import`, `local_extract` and Telegram uploads already start with your id, so they keep working. Telegram documents and voice notes are now saved under your own folder (`<your id>/`), and the reply names them that way. Voice notes saved by an earlier build in the shared `telegram/` folder are not reachable by the audio tools any more; move them into your folder if you need them.
-- Audio tools (`audio_transcribe`, `audio_understand`, ElevenLabs transcription) resolve paths for the acting user only. Their approval step looks the file up for that user too.
-
 ### Not verified (local folders)
 - Not run against a live PC folder or a live model. Tests use a fake desktop, synthetic files and fixture bytes.
 - Per-bot grants are enforced on the server. The desktop does not see which bot asked, so it cannot re-check the grant on its own.
 - `local_export` asks for approval before it checks the bot grant (the approval step has no bot to check). A bot without the grant is refused when the approved export runs, and nothing is written.
 - The new Local folders controls were compiled but not looked at on screen.
 - PowerPoint extraction is tested on a synthetic three-slide deck with notes; no real customer deck was read.
+
+## Security fix: inbox paths stay in your own area
+- Every inbox path is resolved inside your own inbox folder (`<inbox>/<your id>/`). A path that names another user's file is now "not found", and a symlink or junction that points out of your folder is not followed. This covers the PDF tools, the Word, PowerPoint and Excel imports, `xlsx_analyze`, `document_index` and the image tools. One shared check now does this for all of them.
+- Paths returned by `local_import`, `local_extract` and Telegram uploads already start with your id, so they keep working. Telegram documents and voice notes are now saved under your own folder (`<your id>/`), and the reply names them that way. Voice notes saved by an earlier build in the shared `telegram/` folder are not reachable by the audio tools any more; move them into your folder if you need them.
+- Audio tools (`audio_transcribe`, `audio_understand`, ElevenLabs transcription) resolve paths for the acting user only. Their approval step looks the file up for that user too.
 
 ## ElevenLabs
 
@@ -37,7 +37,10 @@ Changes:
 - The tool catalog is cached per account for ten minutes; a 401 or a failed fetch drops it. Tool lists are paged up to 20 pages and 1000 tools.
 - Search replies are at most 24 KiB, 40 tools a page, never cut mid-JSON; entries that do not fit are dropped whole and counted in `truncated`. Describe replies stay within about 16 KiB, with deeply nested schema left out and noted.
 - Timeouts: 60 s for list, search, describe and read; 300 s (`mcp_generate_timeout_secs`) for calls that generate, create or spend.
-- `elevenlabs_mcp_call` returns every saved media item in `data.artifacts` (`mime`, `artifact_path`, `artifact_hash`, `filename`, `bytes`). Recording all of them as artifacts is left to the media-jobs change.
+- `elevenlabs_mcp_call` returns every saved media item in `data.artifacts` (`mime`, `artifact_path`, `artifact_hash`, `filename`, `bytes`). Each one is recorded in the conversation Library, beside the call's main file.
+- Generations that take a while: image and video generation waits up to 20 seconds in the call. A file ready by then is returned as before. Otherwise a media job takes over (see Long turns and media): the chat shows the placeholder, the file arrives as "Your image is ready.", and the bot ends its turn. A generation is never submitted again.
+  - API-key connector: `elevenlabs_key_generate_image` and `elevenlabs_key_generate_video` use the job. A file delivered in the background keeps the default name (`elevenlabs-image.png`, `elevenlabs-video.mp4`); a `filename` you give applies only when the file is ready in the call.
+  - Hosted connector: a generating `elevenlabs_mcp_call` whose result says `pending` with an id gets a job when the catalog has a status lookup for that generation (a name with `status`, or `get` with a job word such as `generation`, and a single id argument). Otherwise the reply gives the id and says to check later. The poller runs only such a lookup, without approval, and never a generating tool.
 - Config: `[elevenlabs] mcp_enabled` and `[elevenlabs.api_key] enabled`. The old `enabled` and `auth` keys are read once and folded in with a warning. Bot files, stored bot rows and console overrides that name old tools are renamed on load.
 - Console: two connector cards with their own status, connect and disconnect. The mode toggle is removed. Sign-in takes effect without a restart; enabling a connector needs one.
 
@@ -46,9 +49,12 @@ Not done in this release:
 - Members cannot sign in to the ElevenLabs connector (owner console only). Member sign-in needs a second redirect or a member consent flow.
 - The API-key connector's key is still server-wide, not a per-user credential.
 - Enabling or disabling either connector still needs a restart, because tools are registered at startup.
-- Not verified against a live ElevenLabs account.
 
 See `docs/elevenlabs.md`.
+
+### Not verified (ElevenLabs)
+- Not verified against a live ElevenLabs account. Generation jobs, status lookups and the media-link paths are tested with wiremock fixtures and fake pollers only.
+- The hosted server's real status and id field names are unconfirmed. The job path works from the shapes the code accepts (`status`, and an id under `generation_id`, `job_id`, `request_id`, `task_id` or `id`).
 
 ## Long turns and media
 
@@ -68,16 +74,23 @@ See `docs/elevenlabs.md`.
 ### Long tasks keep their lease
 - A running task renews its lease every third of `[runtime] task_lease_secs` (300 s, so every 100 s). Before, a turn that ran past the lease could be requeued while still running, which could repeat external work. The renewal uses the task's fencing token, so a reclaimed task cannot be kept alive by the worker that lost it.
 
+### Turn time limit
+- A turn that runs past `[runtime] turn_max_secs` is stopped. The default is **1800 seconds (30 minutes)**. It is failed, audited (`task.timed_out`) and reported in the conversation with the note that it "is not retried". A stuck provider call therefore cannot hold a worker for good.
+
+### Database migrations
+- Three migrations run at startup, in order and once each: `0029_media_jobs.sql` (the media job table), `0030_user_turn_limits.sql` (the owner's tool-limit overrides behind the Bot work limits card) and `0031_media_job_finishing.sql` (the `finishing` status). Migration 0031 rebuilds `media_jobs` and keeps every existing row.
+
 ### Several files from one tool call
 - A tool can return more than one artifact. Put the extra files under `data.extra_artifacts` as `{hash, filename, title}` (see `EXTRA_ARTIFACTS_KEY` in `gateway.rs`). Each is checked like the primary file (a valid SHA-256 hash, the blocklist on its name) and recorded once in the conversation Library.
 
-### Background media jobs (infrastructure)
-- A provider render that takes minutes can run as a **media job** (`crates/serabot/src/media_jobs.rs`, migration `0029_media_jobs.sql`). A job is created only after the provider accepted the work. The server then polls it every 10 seconds, through the poller registered for its provider name, until it finishes or 20 minutes pass.
+### Background media jobs
+- A provider render that takes minutes runs as a **media job** (`crates/serabot/src/media_jobs.rs`, table `media_jobs`). A job is created only after the provider accepted the work. The server then polls it every 10 seconds, through the poller registered for its provider name, until it finishes or 20 minutes pass.
 - A finished job saves its file to your artifact store, records it in the conversation Library, and posts "Your <kind> is ready." A failed job posts "Your <kind> could not be made."; one that times out posts a note saying so.
 - A job is **never submitted again**. A submission whose outcome is unknown creates no job, so it is reported rather than retried.
+- A job left in `finishing` for more than 10 minutes (a crash, or a database error after the file was claimed) is marked failed by a recovery sweep. The chat says: "The <kind> finished but could not be delivered; it may be in your Library." Nothing is polled, saved or submitted again for it.
+- Two integrations use jobs: the ElevenLabs API-key generation tools and the hosted ElevenLabs catalog (see ElevenLabs above).
 - The chat shows a "Generating a video…" (or image, or audio) placeholder while a job is pending. It refreshes on `media_job.created` and `media_job.updated` events. The owner's jobs come from `GET /v1/conversations/{id}/media-jobs`.
 - Video and audio files play inline in the Library cards. A file is read back only when you press Play, and the player refuses files above 40 MB; those still open and save as before.
-- No ElevenLabs job uses this yet. The ElevenLabs integration can plug in later with `register_media_poller` and `Store::create_media_job`.
 
 ### Not verified (long turns and media)
 - No live provider run. Tests use fake pollers, synthetic artifacts and mocked model responses.

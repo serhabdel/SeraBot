@@ -32,6 +32,15 @@ Before speech, list the voices if the owner did not name one (`elevenlabs_key_li
 3. After a successful call, report the artifact hash from the tool. Do not claim a file exists before that.
 4. Upload elsewhere only with `onedrive_upload` or `telegram_send_document` when those tools are allowlisted, using the returned hash.
 
+## Generations that take a while
+
+Image and video generation can take minutes. A tool waits briefly in the call. If the file is not ready by then, it replies at once with a job, and the file is delivered to this chat later.
+
+- **`status` is `generating` with a `job_id`** (from `elevenlabs_key_generate_image`, `elevenlabs_key_generate_video`, or `elevenlabs_mcp_call`): tell the owner in one sentence that it is being generated and will appear in this chat when ready. Then **end your turn**. Do not wait, poll, or look the generation up yourself.
+- **`status` is `pending` with a `generation_id`** (no job could be recorded): tell the owner the generation is still rendering and give them the id. Check it later only when the owner asks, with the get or status tool the catalog offers for it.
+- **Never submit the same request again**, in this turn or a later one. The provider has already accepted it, so a second submission spends credits twice. A different picture or clip is a new request and needs its own approval.
+- A finished file arrives as "Your image is ready." (or video, or audio) with the file in the Library. If it could not be delivered, the chat says so and the file may still be in the Library.
+
 ## Do not
 
 - Use ElevenLabs for private document questions. That is `rag_search`.
