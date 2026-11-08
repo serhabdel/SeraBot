@@ -61,6 +61,14 @@ impl Runtime {
                     "response delivery has an unknown outcome; not resending automatically".into(),
                 ));
             }
+            // A turn that already stored its final reply is never answered
+            // again, so a retried task cannot post a second reply (0.24).
+            if matches!(
+                existing.status.as_str(),
+                LIMIT_REACHED_STATUS | "completed" | "stopped"
+            ) {
+                return Ok(TurnOutcome::Completed);
+            }
             let state: TurnState = serde_json::from_value(existing.state.clone())
                 .map_err(|_| SeraError::InvalidState("stored turn state is invalid".into()))?;
             self.checked_route(&user, &state.route)?;

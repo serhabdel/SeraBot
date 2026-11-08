@@ -924,6 +924,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     let notifier = Arc::new(CompositeNotifier::new(notifiers));
 
     let startup_policy = policy.clone();
+    let media_policy = policy.clone();
     let gateway = Gateway::new(
         store.clone(),
         policy,
@@ -950,6 +951,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     let media_jobs = tokio::spawn(serabot::media_jobs::run_media_jobs(
         store.clone(),
         config.artifacts_dir(),
+        media_policy,
         shutdown.clone(),
     ));
     let mut services = Vec::new();

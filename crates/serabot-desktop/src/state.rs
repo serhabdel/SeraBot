@@ -72,8 +72,8 @@ pub struct State {
     pub library_error: Option<String>,
     /// Background media jobs of the open conversation (0.24), conversation-scoped.
     pub media_jobs: Vec<crate::api::MediaJob>,
-    /// Media files already read back for inline players, by artifact hash.
-    pub media_previews: std::collections::BTreeMap<String, String>,
+    /// Media files already read back for inline players (capped, 0.24).
+    pub media_previews: crate::media_view::PreviewCache,
     /// The owner's per-turn work limits (0.24), once read or saved.
     pub turn_limits: Option<crate::api::TurnLimitsView>,
     pub turn_limits_error: Option<String>,
@@ -170,7 +170,7 @@ impl Default for State {
             library_loading: false,
             library_error: None,
             media_jobs: Vec::new(),
-            media_previews: std::collections::BTreeMap::new(),
+            media_previews: crate::media_view::PreviewCache::default(),
             turn_limits: None,
             turn_limits_error: None,
             plan: None,

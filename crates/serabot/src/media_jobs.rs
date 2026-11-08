@@ -9,14 +9,19 @@
 //! 2. The background loop ([`run_media_jobs`]) polls every pending job every
 //!    [`POLL_INTERVAL`], through the [`MediaPoller`] registered for the job's
 //!    provider name ([`register_media_poller`]).
-//! 3. A finished job saves its file to the owner's artifact store, records it
-//!    in the conversation, and posts "Your <kind> is ready." A failed job, or
-//!    one still pending at its deadline, posts a short note instead.
+//! 3. A finished job is claimed (`pending` to `finishing`) by one pass, which
+//!    saves its file to the owner's artifact store, records it in the
+//!    conversation, posts "Your <kind> is ready.", and only then moves the job
+//!    to `done`. A failed job, or one still pending at its deadline, posts a
+//!    short note instead. Each step under a claim is taken once, so a second
+//!    pass cannot post the same file again.
 //!
 //! Unknown-outcome rule: a job is never submitted again. The loop only polls
 //! jobs that already exist, and a job whose provider has no poller waits until
-//! its deadline. A submission whose outcome is unknown creates no row, so the
-//! caller reports it rather than retrying it.
+//! its deadline. A job left `finishing` by a database error is not retried
+//! either, because its message may already be posted. A submission whose
+//! outcome is unknown creates no row, so the caller reports it rather than
+//! retrying it.
 //!
 //! Every store method takes the acting user's id. The loop is the single system
 //! reader: it selects due jobs across users, as the task claim does, and then
@@ -39,6 +44,7 @@ use tracing::{error, warn};
 use crate::domain::{Language, Role, new_id};
 use crate::error::{Result, SeraError};
 use crate::maker::{ArtifactMeta, ArtifactStore};
+use crate::policy::Policy;
 use crate::store::Store;
 use crate::util::truncate_chars;
 
@@ -48,6 +54,10 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(10);
 pub const DEFAULT_DEADLINE_MINUTES: i64 = 20;
 /// Most pending jobs one poll pass handles.
 const POLL_BATCH: usize = 50;
+/// Longest one provider poll may take before the pass moves on.
+const POLL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Largest finished file the loop saves: the artifact store's own cap.
+pub const MAX_MEDIA_BYTES: usize = crate::maker::MAX_ARTIFACT_BYTES;
 /// Longest provider error kept on a job row.
 pub const MAX_JOB_ERROR_CHARS: usize = 500;
 
@@ -82,6 +92,8 @@ impl MediaKind {
 #[serde(rename_all = "lowercase")]
 pub enum MediaJobStatus {
     Pending,
+    /// Claimed by one pass, which is saving and posting the finished file.
+    Finishing,
     Done,
     Failed,
     Expired,
@@ -91,6 +103,7 @@ impl MediaJobStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Finishing => "finishing",
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Expired => "expired",
@@ -100,6 +113,7 @@ impl MediaJobStatus {
     pub fn parse(text: &str) -> Option<Self> {
         match text {
             "pending" => Some(Self::Pending),
+            "finishing" => Some(Self::Finishing),
             "done" => Some(Self::Done),
             "failed" => Some(Self::Failed),
             "expired" => Some(Self::Expired),
@@ -142,10 +156,40 @@ pub enum PollResult {
     Failed(String),
 }
 
-/// Looks up a job at its provider. A poller must not submit new work.
+/// Looks up a job at its provider. A poller must not submit new work. A poller
+/// that downloads a finished file reads the body with [`read_capped`], so a file
+/// over [`MAX_MEDIA_BYTES`] is refused while it streams, not after it is held.
 #[async_trait]
 pub trait MediaPoller: Send + Sync {
     async fn poll(&self, user_id: &str, external_id: &str) -> Result<PollResult>;
+}
+
+/// Read a provider download body of at most `max_bytes`. A declared length
+/// over the cap is refused before any byte is read, and a body that grows past
+/// it is refused as it streams.
+pub async fn read_capped(mut response: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > max_bytes as u64)
+    {
+        return Err(SeraError::Validation(
+            "the finished file is too large".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| SeraError::External("the finished file could not be downloaded".into()))?
+    {
+        if bytes.len() + chunk.len() > max_bytes {
+            return Err(SeraError::Validation(
+                "the finished file is too large".into(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 type PollerMap = HashMap<String, Arc<dyn MediaPoller>>;
@@ -318,8 +362,21 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// Move a pending job to its final status. Only a pending job moves, and
-    /// only once, so a second finish returns `false`.
+    /// Claim a pending job for finishing: `pending` to `finishing`. Only one
+    /// caller wins, so only one pass saves and posts the file. Returns `false`
+    /// when the job is no longer pending.
+    pub fn claim_media_job(&self, user_id: &str, id: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE media_jobs SET status = 'finishing', updated_at = ?1
+             WHERE id = ?2 AND user_id = ?3 AND status = 'pending'",
+            params![stamp(Utc::now()), id, user_id],
+        )? == 1;
+        Ok(changed)
+    }
+
+    /// Move an open job (pending, or claimed for finishing) to its final status.
+    /// Only an open job moves, and only once, so a second finish returns `false`.
     pub fn finish_media_job(
         &self,
         user_id: &str,
@@ -328,15 +385,15 @@ impl Store {
         artifact_hash: Option<&str>,
         error: Option<&str>,
     ) -> Result<bool> {
-        if status == MediaJobStatus::Pending {
+        if matches!(status, MediaJobStatus::Pending | MediaJobStatus::Finishing) {
             return Err(SeraError::Validation(
-                "a media job cannot return to pending".into(),
+                "a media job cannot return to an open state".into(),
             ));
         }
         let connection = self.connection()?;
         let changed = connection.execute(
             "UPDATE media_jobs SET status = ?1, artifact_hash = ?2, error = ?3, updated_at = ?4
-             WHERE id = ?5 AND user_id = ?6 AND status = 'pending'",
+             WHERE id = ?5 AND user_id = ?6 AND status IN ('pending', 'finishing')",
             params![
                 status.as_str(),
                 artifact_hash,
@@ -424,9 +481,13 @@ fn finish_failed(store: &Store, job: &MediaJob, error: &str) -> Result<()> {
     Ok(())
 }
 
+/// Save a claimed job's finished file, record it, post the ready line, and
+/// only then mark the job done. The job is `finishing` from the claim until the
+/// last step, so no other pass saves or posts it meanwhile.
 fn finish_done(
     store: &Store,
     artifacts: &ArtifactStore,
+    policy: &Policy,
     job: &MediaJob,
     artifact: MediaArtifact,
 ) -> Result<()> {
@@ -436,6 +497,32 @@ fn finish_done(
         artifact.filename.clone()
     };
     let title = artifact.title.clone().unwrap_or_else(|| filename.clone());
+    // The blocklist covers what is saved and shown: the name and the title.
+    if !policy.is_allowed(&filename) || !policy.is_allowed(&title) {
+        store.record_audit(
+            &job.user_id,
+            "media_job.blocked",
+            None,
+            None,
+            None,
+            None,
+            Some(policy.version()),
+            Some(&json!({"job_id": job.id, "kind": job.kind.as_str()})),
+        )?;
+        return finish_failed(
+            store,
+            job,
+            "the file name or title was blocked by the content policy",
+        );
+    }
+    if artifact.bytes.len() > MAX_MEDIA_BYTES {
+        warn!(job = %job.id, bytes = artifact.bytes.len(), "a finished media file is over the size cap");
+        return finish_failed(
+            store,
+            job,
+            "the finished file is larger than the 100 MiB limit",
+        );
+    }
     let stored = match artifacts.save(
         &artifact.bytes,
         &filename,
@@ -453,15 +540,6 @@ fn finish_done(
             return finish_failed(store, job, "the finished file could not be stored");
         }
     };
-    if !store.finish_media_job(
-        &job.user_id,
-        &job.id,
-        MediaJobStatus::Done,
-        Some(&stored.hash),
-        None,
-    )? {
-        return Ok(());
-    }
     store.record_conversation_artifact(
         &job.user_id,
         &job.conversation_id,
@@ -471,12 +549,84 @@ fn finish_done(
         &stored.filename,
         Some(&title),
     )?;
-    post_job_message(store, job, &format!("Your {} is ready.", job.kind.as_str()))
+    post_job_message(store, job, &format!("Your {} is ready.", job.kind.as_str()))?;
+    if !store.finish_media_job(
+        &job.user_id,
+        &job.id,
+        MediaJobStatus::Done,
+        Some(&stored.hash),
+        None,
+    )? {
+        warn!(job = %job.id, "a finished media job was not open when it was marked done");
+    }
+    Ok(())
+}
+
+/// One job's step in a pass. Returns `true` when the job finished. An error
+/// affects only this job; the pass goes on with the next one.
+async fn handle_job(
+    store: &Store,
+    artifacts: &ArtifactStore,
+    policy: &Policy,
+    job: &MediaJob,
+    poll_timeout: Duration,
+) -> Result<bool> {
+    let Some(poller) = media_poller(&job.provider) else {
+        // No poller for this provider yet: the job waits for one, until its deadline.
+        expire_if_due(store, job)?;
+        return Ok(false);
+    };
+    let polled =
+        match tokio::time::timeout(poll_timeout, poller.poll(&job.user_id, &job.external_id)).await
+        {
+            Ok(polled) => polled,
+            Err(_) => Err(SeraError::External(
+                "the provider did not answer in time".into(),
+            )),
+        };
+    match polled {
+        Ok(PollResult::Pending) => {
+            expire_if_due(store, job)?;
+            Ok(false)
+        }
+        Ok(PollResult::Done(artifact)) => {
+            // The claim is taken before any save or post, so a second pass
+            // that polled the same job cannot finish it too.
+            if !store.claim_media_job(&job.user_id, &job.id)? {
+                return Ok(false);
+            }
+            finish_done(store, artifacts, policy, job, artifact)?;
+            Ok(true)
+        }
+        Ok(PollResult::Failed(error)) => {
+            finish_failed(store, job, &error)?;
+            Ok(true)
+        }
+        Err(error) => {
+            warn!(job = %job.id, provider = %job.provider, %error, "media job poll failed; will retry");
+            expire_if_due(store, job)?;
+            Ok(false)
+        }
+    }
 }
 
 /// One pass over the pending jobs. Returns how many finished. A job that
-/// fails to poll stays pending and is tried again on the next pass.
-pub async fn poll_media_jobs_once(store: &Store, artifacts_dir: &Path) -> Result<usize> {
+/// fails to poll stays pending and is tried again on the next pass; a job
+/// whose step errors is logged and the pass goes on.
+pub async fn poll_media_jobs_once(
+    store: &Store,
+    artifacts_dir: &Path,
+    policy: &Policy,
+) -> Result<usize> {
+    poll_media_jobs_with_timeout(store, artifacts_dir, policy, POLL_TIMEOUT).await
+}
+
+async fn poll_media_jobs_with_timeout(
+    store: &Store,
+    artifacts_dir: &Path,
+    policy: &Policy,
+    poll_timeout: Duration,
+) -> Result<usize> {
     let jobs = store.pending_media_jobs(POLL_BATCH)?;
     if jobs.is_empty() {
         return Ok(0);
@@ -484,26 +634,11 @@ pub async fn poll_media_jobs_once(store: &Store, artifacts_dir: &Path) -> Result
     let artifacts = ArtifactStore::new(artifacts_dir)?;
     let mut finished = 0;
     for job in jobs {
-        let Some(poller) = media_poller(&job.provider) else {
-            // No poller for this provider yet: the job waits for one, until its deadline.
-            expire_if_due(store, &job)?;
-            continue;
-        };
-        match poller.poll(&job.user_id, &job.external_id).await {
-            Ok(PollResult::Pending) => {
-                expire_if_due(store, &job)?;
-            }
-            Ok(PollResult::Done(artifact)) => {
-                finish_done(store, &artifacts, &job, artifact)?;
-                finished += 1;
-            }
-            Ok(PollResult::Failed(error)) => {
-                finish_failed(store, &job, &error)?;
-                finished += 1;
-            }
+        match handle_job(store, &artifacts, policy, &job, poll_timeout).await {
+            Ok(true) => finished += 1,
+            Ok(false) => {}
             Err(error) => {
-                warn!(job = %job.id, provider = %job.provider, %error, "media job poll failed; will retry");
-                expire_if_due(store, &job)?;
+                error!(job = %job.id, %error, "media job step failed; the pass goes on");
             }
         }
     }
@@ -512,13 +647,18 @@ pub async fn poll_media_jobs_once(store: &Store, artifacts_dir: &Path) -> Result
 
 /// The media job loop. Polls pending jobs every [`POLL_INTERVAL`] until
 /// shutdown.
-pub async fn run_media_jobs(store: Store, artifacts_dir: PathBuf, shutdown: CancellationToken) {
+pub async fn run_media_jobs(
+    store: Store,
+    artifacts_dir: PathBuf,
+    policy: Arc<Policy>,
+    shutdown: CancellationToken,
+) {
     let mut tick = tokio::time::interval(POLL_INTERVAL);
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = tick.tick() => {
-                if let Err(failure) = poll_media_jobs_once(&store, &artifacts_dir).await {
+                if let Err(failure) = poll_media_jobs_once(&store, &artifacts_dir, &policy).await {
                     error!(%failure, "media job poll pass failed");
                 }
             }
@@ -678,14 +818,29 @@ mod tests {
             .unwrap();
         let dir = artifact_dir();
 
-        assert_eq!(poll_media_jobs_once(&store, dir.path()).await.unwrap(), 0);
+        assert_eq!(
+            poll_media_jobs_once(&store, dir.path(), &Policy::empty())
+                .await
+                .unwrap(),
+            0
+        );
         assert_eq!(
             store.get_media_job(&admin, &job.id).unwrap().status,
             MediaJobStatus::Pending
         );
-        assert_eq!(poll_media_jobs_once(&store, dir.path()).await.unwrap(), 1);
+        assert_eq!(
+            poll_media_jobs_once(&store, dir.path(), &Policy::empty())
+                .await
+                .unwrap(),
+            1
+        );
         // Once finished, the job is not polled again.
-        assert_eq!(poll_media_jobs_once(&store, dir.path()).await.unwrap(), 0);
+        assert_eq!(
+            poll_media_jobs_once(&store, dir.path(), &Policy::empty())
+                .await
+                .unwrap(),
+            0
+        );
         assert_eq!(*polls.lock().unwrap(), 2);
 
         let stored = store.get_media_job(&admin, &job.id).unwrap();
@@ -722,7 +877,7 @@ mod tests {
                 "ext-4",
             )
             .unwrap();
-        poll_media_jobs_once(&store, artifact_dir().path())
+        poll_media_jobs_once(&store, artifact_dir().path(), &Policy::empty())
             .await
             .unwrap();
         let stored = store.get_media_job(&admin, &job.id).unwrap();
@@ -766,7 +921,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        poll_media_jobs_once(&store, artifact_dir().path())
+        poll_media_jobs_once(&store, artifact_dir().path(), &Policy::empty())
             .await
             .unwrap();
         assert_eq!(*polls.lock().unwrap(), 1);
@@ -804,12 +959,16 @@ mod tests {
             )
             .unwrap();
         let dir = artifact_dir();
-        poll_media_jobs_once(&store, dir.path()).await.unwrap();
+        poll_media_jobs_once(&store, dir.path(), &Policy::empty())
+            .await
+            .unwrap();
         assert_eq!(
             store.get_media_job(&admin, &job.id).unwrap().status,
             MediaJobStatus::Pending
         );
-        poll_media_jobs_once(&store, dir.path()).await.unwrap();
+        poll_media_jobs_once(&store, dir.path(), &Policy::empty())
+            .await
+            .unwrap();
         assert_eq!(
             store.get_media_job(&admin, &job.id).unwrap().status,
             MediaJobStatus::Failed
@@ -832,7 +991,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            poll_media_jobs_once(&store, artifact_dir().path())
+            poll_media_jobs_once(&store, artifact_dir().path(), &Policy::empty())
                 .await
                 .unwrap(),
             0
@@ -841,6 +1000,182 @@ mod tests {
             store.get_media_job(&admin, &job.id).unwrap().status,
             MediaJobStatus::Pending
         );
+    }
+
+    /// Never answers: stands in for a provider that hangs.
+    struct HangingPoller;
+
+    #[async_trait]
+    impl MediaPoller for HangingPoller {
+        async fn poll(&self, _user_id: &str, _external_id: &str) -> Result<PollResult> {
+            std::future::pending::<()>().await;
+            Ok(PollResult::Pending)
+        }
+    }
+
+    fn create_video_job(store: &Store, admin: &str, provider: &str, external: &str) -> MediaJob {
+        store
+            .create_media_job(
+                admin,
+                "dir:main",
+                "maker",
+                provider,
+                MediaKind::Video,
+                external,
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_claimed_job_is_neither_polled_nor_posted_by_another_pass() {
+        let (store, admin) = setup();
+        let provider = provider_name("claimed");
+        let polls = scripted(&provider, vec![Ok(PollResult::Done(video_bytes()))]);
+        let job = create_video_job(&store, &admin, &provider, "ext-8");
+        assert!(store.claim_media_job(&admin, &job.id).unwrap());
+        assert!(!store.claim_media_job(&admin, &job.id).unwrap());
+
+        let dir = artifact_dir();
+        assert_eq!(
+            poll_media_jobs_once(&store, dir.path(), &Policy::empty())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(*polls.lock().unwrap(), 0);
+        assert_eq!(
+            store.get_media_job(&admin, &job.id).unwrap().status,
+            MediaJobStatus::Finishing
+        );
+        let messages = store.list_visible_messages(&admin, "dir:main", 20).unwrap();
+        assert!(messages.iter().all(|m| !m.content.contains("is ready")));
+    }
+
+    #[tokio::test]
+    async fn a_failing_job_does_not_stop_the_others() {
+        let (store, admin) = setup();
+        let failing = provider_name("erring");
+        scripted(
+            &failing,
+            vec![Err(SeraError::External("provider said no".into()))],
+        );
+        let quick = provider_name("quick");
+        scripted(&quick, vec![Ok(PollResult::Done(video_bytes()))]);
+        let first = create_video_job(&store, &admin, &failing, "ext-9");
+        let second = create_video_job(&store, &admin, &quick, "ext-10");
+
+        let dir = artifact_dir();
+        assert_eq!(
+            poll_media_jobs_once(&store, dir.path(), &Policy::empty())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store.get_media_job(&admin, &first.id).unwrap().status,
+            MediaJobStatus::Pending
+        );
+        assert_eq!(
+            store.get_media_job(&admin, &second.id).unwrap().status,
+            MediaJobStatus::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hung_poll_times_out_and_the_pass_goes_on() {
+        let (store, admin) = setup();
+        let hung = provider_name("hung");
+        register_media_poller(&hung, Arc::new(HangingPoller)).unwrap();
+        let quick = provider_name("prompt");
+        scripted(&quick, vec![Ok(PollResult::Done(video_bytes()))]);
+        let slow_job = create_video_job(&store, &admin, &hung, "ext-11");
+        let quick_job = create_video_job(&store, &admin, &quick, "ext-12");
+
+        let dir = artifact_dir();
+        let finished = poll_media_jobs_with_timeout(
+            &store,
+            dir.path(),
+            &Policy::empty(),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+        assert_eq!(finished, 1);
+        assert_eq!(
+            store.get_media_job(&admin, &slow_job.id).unwrap().status,
+            MediaJobStatus::Pending
+        );
+        assert_eq!(
+            store.get_media_job(&admin, &quick_job.id).unwrap().status,
+            MediaJobStatus::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_name_fails_the_job_and_saves_nothing() {
+        let (store, admin) = setup();
+        let provider = provider_name("blocked");
+        scripted(
+            &provider,
+            vec![Ok(PollResult::Done(MediaArtifact {
+                bytes: b"synthetic".to_vec(),
+                filename: "TopSecret.mp4".into(),
+                title: Some("Clip".into()),
+            }))],
+        );
+        let job = create_video_job(&store, &admin, &provider, "ext-13");
+
+        let dir = artifact_dir();
+        poll_media_jobs_once(&store, dir.path(), &Policy::from_text("TopSecret"))
+            .await
+            .unwrap();
+        let stored = store.get_media_job(&admin, &job.id).unwrap();
+        assert_eq!(stored.status, MediaJobStatus::Failed);
+        assert!(stored.artifact_hash.is_none());
+        assert!(
+            store
+                .list_conversation_artifacts(&admin, "dir:main")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_oversize_file_fails_the_job_before_it_is_saved() {
+        let (store, admin) = setup();
+        let provider = provider_name("oversize");
+        scripted(
+            &provider,
+            vec![Ok(PollResult::Done(MediaArtifact {
+                bytes: vec![0u8; MAX_MEDIA_BYTES + 1],
+                filename: "clip.mp4".into(),
+                title: None,
+            }))],
+        );
+        let job = create_video_job(&store, &admin, &provider, "ext-14");
+
+        let dir = artifact_dir();
+        poll_media_jobs_once(&store, dir.path(), &Policy::empty())
+            .await
+            .unwrap();
+        let stored = store.get_media_job(&admin, &job.id).unwrap();
+        assert_eq!(stored.status, MediaJobStatus::Failed);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_provider_download_over_the_cap_is_refused() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(vec![7u8; 2000]))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let refused = client.get(server.uri()).send().await.unwrap();
+        assert!(read_capped(refused, 1000).await.is_err());
+        let kept = client.get(server.uri()).send().await.unwrap();
+        assert_eq!(read_capped(kept, 4000).await.unwrap().len(), 2000);
     }
 
     #[test]

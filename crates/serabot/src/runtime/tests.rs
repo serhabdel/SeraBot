@@ -652,6 +652,60 @@ async fn legacy_unpinned_tasks_fail_closed() {
 }
 
 #[tokio::test]
+async fn a_turn_past_its_time_limit_is_stopped_and_never_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(text_reply("too late"))
+                .set_delay(std::time::Duration::from_secs(10)),
+        )
+        .mount(&server)
+        .await;
+    let notifier = Arc::new(Capture::default());
+    let (runtime, store) = setup_orchestration(&server.uri(), notifier.clone());
+    runtime
+        .submit_text(&admin(&store), "owner", "read the root folder", None)
+        .unwrap();
+    let task = store.claim_task("worker", 30).unwrap().unwrap();
+    let id = task.id.clone();
+    runtime
+        .run_claimed_task(task, std::time::Duration::from_millis(300))
+        .await;
+
+    let stored = store.get_task(&admin(&store), &id).unwrap();
+    assert_eq!(stored.status, "failed");
+    assert!(
+        stored
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("time limit")
+    );
+    // Not queued again, and the late model answer is never posted.
+    assert!(store.claim_task("worker", 30).unwrap().is_none());
+    let messages = store
+        .list_visible_messages(&admin(&store), "owner", 20)
+        .unwrap();
+    assert!(messages.iter().all(|message| message.content != "too late"));
+    assert!(
+        notifier
+            .texts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|text| text.contains("time limit"))
+    );
+    assert!(
+        store
+            .list_audit(50)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.event == "task.timed_out")
+    );
+}
+
+#[tokio::test]
 async fn completes_simple_turn() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1568,6 +1622,48 @@ async fn tool_round_limit_ends_with_a_no_tools_answer_and_marks_the_turn() {
             .and_then(Value::as_str),
         Some("tool_rounds")
     );
+}
+
+#[tokio::test]
+async fn a_retried_task_does_not_answer_a_limited_turn_again() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(Sequence::new(vec![
+            tool_round_reply("round_one", 1),
+            tool_round_reply("round_two", 1),
+            text_reply("Here is what I found so far."),
+        ]))
+        .mount(&server)
+        .await;
+    let (runtime, store) = setup_orchestration(&server.uri(), Arc::new(Capture::default()));
+    store
+        .set_user_turn_limits(
+            &admin(&store),
+            crate::turn_limits::TurnLimits {
+                max_tool_calls_per_turn: 150,
+                max_tool_rounds: 2,
+            },
+        )
+        .unwrap();
+    runtime
+        .submit_text(&admin(&store), "owner", "read the root folder", None)
+        .unwrap();
+    let task = store.claim_task("worker", 30).unwrap().unwrap();
+    runtime.process_task(task.clone()).await.unwrap();
+    let calls = received_bodies(&server).await.len();
+    assert_eq!(calls, 3);
+
+    // The same task run again (a retry after a late failure) finds the turn
+    // already limited: no model call and no second reply.
+    runtime.run_turn(&task).await.unwrap();
+    assert_eq!(received_bodies(&server).await.len(), calls);
+    let replies = store
+        .list_visible_messages(&admin(&store), "owner", 20)
+        .unwrap()
+        .into_iter()
+        .filter(|message| message.content == "Here is what I found so far.")
+        .count();
+    assert_eq!(replies, 1);
 }
 
 #[tokio::test]

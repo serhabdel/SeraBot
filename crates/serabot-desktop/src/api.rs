@@ -21,6 +21,8 @@ pub use panel::*;
 pub use profiles::*;
 
 const MAX_RESPONSE: u64 = 2 * 1024 * 1024;
+/// Server cap for one artifact download (100 MiB).
+const MAX_ARTIFACT_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Seconds from the most recent `Retry-After` header on a 429 (0 = none seen).
 static LAST_RETRY_AFTER_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2513,7 +2515,7 @@ impl ApiClient {
         if !valid_id(id) {
             return Err(ApiError::Validation("Invalid attachment id."));
         }
-        self.fetch_file(&["v1", "attachments", id], id)
+        self.fetch_file(&["v1", "attachments", id], id, MAX_ARTIFACT_BYTES)
     }
 
     pub fn submit(&self, conversation: &str, text: &str) -> Result<Task, ApiError> {
@@ -3615,12 +3617,32 @@ impl ApiClient {
         if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(ApiError::Validation("Invalid artifact hash."));
         }
-        self.fetch_file(&["v1", "artifacts", hash], hash)
+        self.fetch_file(&["v1", "artifacts", hash], hash, MAX_ARTIFACT_BYTES)
     }
 
-    /// Authenticated GET of a file route (artifact or own attachment). Server
-    /// cap 100 MiB; the filename comes from `content-disposition`.
-    fn fetch_file(&self, route: &[&str], fallback: &str) -> Result<(String, Vec<u8>), ApiError> {
+    /// Download one artifact for an inline player (0.24), refused above
+    /// `max_bytes`. A file the server says is larger is refused before its body
+    /// is read; otherwise the read stops at the cap.
+    pub fn artifact_capped(
+        &self,
+        hash: &str,
+        max_bytes: u64,
+    ) -> Result<(String, Vec<u8>), ApiError> {
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ApiError::Validation("Invalid artifact hash."));
+        }
+        self.fetch_file(&["v1", "artifacts", hash], hash, max_bytes)
+    }
+
+    /// Authenticated GET of a file route (artifact or own attachment). The
+    /// filename comes from `content-disposition`. Bodies above `max_bytes` are
+    /// refused.
+    fn fetch_file(
+        &self,
+        route: &[&str],
+        fallback: &str,
+        max_bytes: u64,
+    ) -> Result<(String, Vec<u8>), ApiError> {
         let mut url = self.endpoint.clone();
         url.path_segments_mut()
             .map_err(|_| ApiError::InvalidResponse)?
@@ -3633,6 +3655,9 @@ impl ApiClient {
             .send()
             .map_err(|_| ApiError::Transport)?;
         let status = response.status();
+        if status.is_success() && response.content_length().is_some_and(|len| len > max_bytes) {
+            return Err(ApiError::TooLarge);
+        }
         let filename = response
             .headers()
             .get("content-disposition")
@@ -3642,13 +3667,12 @@ impl ApiClient {
             .map(str::trim)
             .filter(|name| !name.is_empty() && name.chars().count() <= 256)
             .map(str::to_owned);
-        const MAX_ARTIFACT: u64 = 100 * 1024 * 1024;
         let mut bytes = Zeroizing::new(Vec::new());
         response
-            .take(MAX_ARTIFACT + 1)
+            .take(max_bytes + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| ApiError::Transport)?;
-        if bytes.len() as u64 > MAX_ARTIFACT {
+        if bytes.len() as u64 > max_bytes {
             return Err(ApiError::TooLarge);
         }
         if !status.is_success() {
@@ -5232,5 +5256,56 @@ mod tests {
         let mut empty_code = link;
         empty_code.code.clear();
         assert!(check_telegram_link(empty_code).is_err());
+    }
+
+    /// Answers one connection on a loopback port with `response`.
+    fn serve_once(response: Vec<u8>) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(&response);
+            }
+        });
+        port
+    }
+
+    fn client_for(port: u16) -> ApiClient {
+        let endpoint = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        ApiClient::new(endpoint, SecretString::new("t".repeat(40))).unwrap()
+    }
+
+    #[test]
+    fn a_preview_download_is_refused_above_its_cap() {
+        let hash = "a".repeat(64);
+        // The server declares 1000 bytes: refused before the body is read.
+        let declared = client_for(serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n".to_vec(),
+        ));
+        assert!(matches!(
+            declared.artifact_capped(&hash, 100),
+            Err(ApiError::TooLarge)
+        ));
+        // No declared length: the read stops past the cap and is refused.
+        let mut undeclared = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+        undeclared.extend(std::iter::repeat_n(b'x', 200));
+        assert!(matches!(
+            client_for(serve_once(undeclared)).artifact_capped(&hash, 100),
+            Err(ApiError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn a_preview_download_within_its_cap_returns_the_file() {
+        let hash = "b".repeat(64);
+        let response = b"HTTP/1.1 200 OK\r\nContent-Disposition: attachment; filename=\"clip.mp4\"\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_vec();
+        let (filename, bytes) = client_for(serve_once(response))
+            .artifact_capped(&hash, 100)
+            .unwrap();
+        assert_eq!(filename, "clip.mp4");
+        assert_eq!(bytes, b"hello");
     }
 }

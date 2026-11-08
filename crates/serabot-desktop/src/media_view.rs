@@ -4,12 +4,18 @@
 //! form for the per-turn work limits. No UI code here; the components in the
 //! console binary call these and the tests cover them.
 
+use std::collections::BTreeSet;
+
 use crate::ApiError;
 use crate::api::{MediaJob, Message, Role, TurnLimitPair, TurnLimitsView};
 
 /// Largest file read back for an inline player. Larger media stays a card
 /// with Open and Save, so a long video never fills memory.
 pub const MAX_PREVIEW_BYTES: usize = 40 * 1024 * 1024;
+
+/// Most inline previews kept in memory at once (0.24). Past this, the oldest
+/// one is dropped and must be read again if its player is opened.
+pub const MAX_CACHED_PREVIEWS: usize = 3;
 
 /// The owner message that Continue sends. The bot sees it in history with
 /// the turn that stopped.
@@ -50,8 +56,73 @@ pub fn preview_data_url_for(mime: &str, bytes: &[u8]) -> Result<String, ApiError
 }
 
 /// The jobs still rendering, oldest first. Each one gets a placeholder card.
+/// A job being saved and posted (`finishing`) still shows its card.
 pub fn pending_jobs(jobs: &[MediaJob]) -> Vec<&MediaJob> {
-    jobs.iter().filter(|job| job.status == "pending").collect()
+    jobs.iter()
+        .filter(|job| job.status == "pending" || job.status == "finishing")
+        .collect()
+}
+
+/// The inline previews read back so far, keyed by artifact hash, and the reads
+/// still in flight. Entries are capped at [`MAX_CACHED_PREVIEWS`]; the oldest
+/// read is dropped first. A hash has at most one read in flight.
+#[derive(Debug, Default)]
+pub struct PreviewCache {
+    /// Oldest read first.
+    entries: Vec<(String, String)>,
+    in_flight: BTreeSet<String>,
+}
+
+impl PreviewCache {
+    /// The data URL cached for a hash.
+    pub fn get(&self, hash: &str) -> Option<&String> {
+        self.entries
+            .iter()
+            .find(|(key, _)| key == hash)
+            .map(|(_, data_url)| data_url)
+    }
+
+    pub fn contains(&self, hash: &str) -> bool {
+        self.get(hash).is_some()
+    }
+
+    /// Mark a read as started. Returns `false` when the hash is already cached
+    /// or already being read, so the caller must not start another read.
+    pub fn begin(&mut self, hash: &str) -> bool {
+        if self.contains(hash) || self.in_flight.contains(hash) {
+            return false;
+        }
+        self.in_flight.insert(hash.to_owned());
+        true
+    }
+
+    /// Store a finished read and evict the oldest entries past the cap.
+    pub fn insert(&mut self, hash: String, data_url: String) {
+        self.in_flight.remove(&hash);
+        self.entries.retain(|(key, _)| *key != hash);
+        self.entries.push((hash, data_url));
+        while self.entries.len() > MAX_CACHED_PREVIEWS {
+            self.entries.remove(0);
+        }
+    }
+
+    /// A read failed. The failure does not name its hash, so every in-flight
+    /// mark is cleared and the next Play asks again.
+    pub fn fail_in_flight(&mut self) {
+        self.in_flight.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight.len()
+    }
 }
 
 /// The placeholder line for a job: "Generating a video..." while it runs.
@@ -68,8 +139,8 @@ fn article_for(kind: &str) -> &'static str {
 }
 
 /// Whether the reply gets a Continue button: an assistant reply that a tool
-/// limit ended, and only the newest such reply in the transcript, so an
-/// older one does not keep offering it.
+/// limit ended, and only while no later assistant reply exists. Any later
+/// reply, limited or not, means the conversation has moved on.
 pub fn offers_continue(messages: &[Message], index: usize) -> bool {
     let Some(message) = messages.get(index) else {
         return false;
@@ -79,7 +150,7 @@ pub fn offers_continue(messages: &[Message], index: usize) -> bool {
     }
     !messages[index + 1..]
         .iter()
-        .any(|later| later.role == Role::Assistant && later.limit_reached)
+        .any(|later| later.role == Role::Assistant)
 }
 
 /// Parse the Settings form. Both fields must be whole numbers within
@@ -185,9 +256,10 @@ mod tests {
             job("audio", "done"),
             job("image", "failed"),
             job("image", "pending"),
+            job("video", "finishing"),
         ];
         let pending = pending_jobs(&jobs);
-        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.len(), 3);
         assert_eq!(placeholder_label(pending[0]), "Generating a video\u{2026}");
         assert_eq!(placeholder_label(pending[1]), "Generating an image\u{2026}");
         assert_eq!(
@@ -197,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn continue_is_offered_only_on_the_newest_limited_reply() {
+    fn continue_is_offered_only_while_no_later_reply_exists() {
         let transcript = vec![
             message(Role::User, "read the root", false),
             message(Role::Assistant, "first stop", true),
@@ -207,10 +279,60 @@ mod tests {
         ];
         assert!(!offers_continue(&transcript, 0));
         assert!(!offers_continue(&transcript, 1));
-        assert!(offers_continue(&transcript, 3));
+        // A later assistant reply, even a normal one, ends the offer.
+        assert!(!offers_continue(&transcript, 3));
         assert!(!offers_continue(&transcript, 4));
         assert!(!offers_continue(&transcript, 99));
         assert_eq!(CONTINUE_TEXT, "Continue from where you stopped.");
+    }
+
+    #[test]
+    fn continue_is_offered_on_the_last_limited_reply() {
+        let transcript = vec![
+            message(Role::User, "read the root", false),
+            message(Role::Assistant, "stopped", true),
+            message(Role::User, "thanks", false),
+        ];
+        assert!(offers_continue(&transcript, 1));
+    }
+
+    #[test]
+    fn preview_cache_keeps_three_and_drops_the_oldest() {
+        let mut cache = PreviewCache::default();
+        for (hash, url) in [("a", "data:a"), ("b", "data:b"), ("c", "data:c")] {
+            assert!(cache.begin(hash));
+            cache.insert(hash.to_owned(), url.to_owned());
+        }
+        assert_eq!(cache.len(), MAX_CACHED_PREVIEWS);
+        assert!(cache.begin("d"));
+        cache.insert("d".into(), "data:d".into());
+        assert_eq!(cache.len(), MAX_CACHED_PREVIEWS);
+        assert!(!cache.contains("a"), "the oldest read is dropped");
+        assert_eq!(cache.get("d").map(String::as_str), Some("data:d"));
+        assert!(cache.contains("b") && cache.contains("c"));
+    }
+
+    #[test]
+    fn preview_reads_are_deduplicated_while_in_flight() {
+        let mut cache = PreviewCache::default();
+        assert!(cache.begin("video"));
+        assert!(
+            !cache.begin("video"),
+            "a second Play waits for the first read"
+        );
+        assert_eq!(cache.in_flight_count(), 1);
+        cache.insert("video".into(), "data:video".into());
+        assert_eq!(cache.in_flight_count(), 0);
+        assert!(!cache.begin("video"), "a cached file is not read again");
+    }
+
+    #[test]
+    fn a_failed_read_clears_in_flight_marks_so_play_can_retry() {
+        let mut cache = PreviewCache::default();
+        assert!(cache.begin("audio"));
+        cache.fail_in_flight();
+        assert!(cache.is_empty());
+        assert!(cache.begin("audio"));
     }
 
     #[test]

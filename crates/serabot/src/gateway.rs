@@ -11,7 +11,7 @@
 //! semantics do not change.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::Duration;
@@ -98,11 +98,9 @@ pub struct ToolOutput {
     pub destination: Option<String>,
 }
 
-/// Reserved key in `ToolOutput::data` that lists artifacts beyond the single
-/// `artifact_hash` (0.24): a tool that makes several files returns them all.
-pub const EXTRA_ARTIFACTS_KEY: &str = "extra_artifacts";
-
-/// One further artifact a tool produced in the same call.
+/// One further artifact a tool listed for the owner, beside its primary one
+/// (0.24). Built by [`crate::maker::list_saved_artifact`] from a file the call
+/// itself saved; the gateway never reads it from a tool's `data`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtraArtifact {
     pub hash: String,
@@ -112,33 +110,24 @@ pub struct ExtraArtifact {
     pub title: Option<String>,
 }
 
-impl ToolOutput {
-    /// The additional artifacts this output lists. A malformed entry is
-    /// skipped; the primary `artifact_hash` is unaffected.
-    pub fn extra_artifacts(&self) -> Vec<ExtraArtifact> {
-        self.data
-            .as_ref()
-            .and_then(|data| data.get(EXTRA_ARTIFACTS_KEY))
-            .and_then(|value| serde_json::from_value::<Vec<ExtraArtifact>>(value.clone()).ok())
-            .unwrap_or_default()
-    }
-
-    /// Attach further artifacts. Stored under `EXTRA_ARTIFACTS_KEY` in `data`.
-    pub fn with_extra_artifacts(mut self, artifacts: Vec<ExtraArtifact>) -> Self {
-        if artifacts.is_empty() {
-            return self;
-        }
-        let mut data = match self.data.take() {
-            Some(Value::Object(map)) => map,
-            _ => serde_json::Map::new(),
-        };
-        data.insert(
-            EXTRA_ARTIFACTS_KEY.into(),
-            serde_json::to_value(artifacts).unwrap_or(Value::Null),
-        );
-        self.data = Some(Value::Object(data));
-        self
-    }
+/// Run one tool call inside its own artifact record. Returns the output and
+/// the extra artifacts the call listed. Only files the call saved can be
+/// listed, so a hash named in a tool's `data`, an earlier call's file or
+/// another user's file never reaches the conversation library.
+async fn run_tool_call(
+    tool: &dyn Tool,
+    args: Value,
+    context: &ToolContext,
+) -> (Result<ToolOutput>, Vec<ExtraArtifact>) {
+    let calls = Arc::new(Mutex::new(crate::maker::CallArtifacts::default()));
+    let output = crate::maker::CALL_ARTIFACTS
+        .scope(calls.clone(), tool.execute(args, context))
+        .await;
+    let listed = calls
+        .lock()
+        .map(|calls| calls.listed.clone())
+        .unwrap_or_default();
+    (output, listed)
 }
 
 /// A lowercase or uppercase 64-digit hex SHA-256, as artifact hashes are.
@@ -488,8 +477,9 @@ impl Gateway {
         }
 
         let started = std::time::Instant::now();
-        let output = self.redact_output(context, tool.execute(args, context).await);
-        self.finish_tool_call(tool.as_ref(), &output, context, started.elapsed())?;
+        let (output, listed) = run_tool_call(tool.as_ref(), args, context).await;
+        let output = self.redact_output(context, output);
+        self.finish_tool_call(tool.as_ref(), &output, &listed, context, started.elapsed())?;
         output.map(ToolOutcome::Completed)
     }
 
@@ -660,8 +650,9 @@ impl Gateway {
             )?;
         }
         let started = std::time::Instant::now();
-        let output = self.redact_output(context, tool.execute(args, context).await);
-        self.finish_tool_call(tool, &output, context, started.elapsed())?;
+        let (output, listed) = run_tool_call(tool, args, context).await;
+        let output = self.redact_output(context, output);
+        self.finish_tool_call(tool, &output, &listed, context, started.elapsed())?;
         output.map(ToolOutcome::Completed)
     }
 
@@ -786,9 +777,10 @@ impl Gateway {
             ));
         }
         let started = std::time::Instant::now();
-        let output = self.redact_output(context, tool.execute(args, context).await);
+        let (output, listed) = run_tool_call(tool.as_ref(), args, context).await;
+        let output = self.redact_output(context, output);
         let succeeded = output.is_ok();
-        self.finish_tool_call(tool.as_ref(), &output, context, started.elapsed())?;
+        self.finish_tool_call(tool.as_ref(), &output, &listed, context, started.elapsed())?;
         match output {
             Ok(value) => {
                 self.store.update_action(
@@ -835,6 +827,7 @@ impl Gateway {
         &self,
         tool: &dyn Tool,
         output: &Result<ToolOutput>,
+        listed: &[ExtraArtifact],
         context: &ToolContext,
         elapsed: std::time::Duration,
     ) -> Result<()> {
@@ -887,12 +880,12 @@ impl Gateway {
                         None,
                     )?;
                 }
-                // Further artifacts of the same call (0.24). Each one gets the
-                // same checks as the primary: a well-formed hash, the blocklist
-                // on its filename and title, and one record per hash.
+                // Further artifacts the call listed (0.24). Each one gets a
+                // well-formed hash, the blocklist on its filename and title, and
+                // one record per hash.
                 if let Some(conversation_id) = context.conversation_id.as_deref() {
                     let mut seen: HashSet<String> = value.artifact_hash.iter().cloned().collect();
-                    for extra in value.extra_artifacts() {
+                    for extra in listed {
                         if !is_sha256_hex(&extra.hash) || !seen.insert(extra.hash.clone()) {
                             continue;
                         }
@@ -1733,9 +1726,22 @@ mod tests {
         ));
     }
 
-    /// One tool call that makes three files: the primary and two extras, plus
-    /// a duplicate, a blocked name and a malformed hash that must not record.
-    struct BatchTool;
+    fn artifact_meta(filename: &str) -> crate::maker::ArtifactMeta {
+        crate::maker::ArtifactMeta {
+            title: filename.into(),
+            filename: filename.into(),
+            language: crate::domain::Language::En,
+            source_artifact: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// One tool call that saves three files and lists them: the primary and
+    /// two extras. A duplicate, a blocked name and a malformed hash must not
+    /// record.
+    struct BatchTool {
+        artifacts: Arc<crate::maker::ArtifactStore>,
+    }
 
     #[async_trait]
     impl Tool for BatchTool {
@@ -1749,42 +1755,83 @@ mod tests {
         }
 
         async fn execute(&self, _args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+            let one = self
+                .artifacts
+                .save(b"one", "one.txt", artifact_meta("one.txt"))?;
+            let two = self
+                .artifacts
+                .save(b"two", "two.txt", artifact_meta("two.txt"))?;
+            let three =
+                self.artifacts
+                    .save(b"three", "TopSecret.txt", artifact_meta("TopSecret.txt"))?;
+            // A file the call never saved, shaped like a stored one, is refused.
+            let forged = crate::maker::StoredArtifact {
+                hash: "not-a-hash".into(),
+                filename: "bad.txt".into(),
+                bytes: Vec::new(),
+                meta: artifact_meta("bad.txt"),
+            };
+            crate::maker::list_saved_artifact(&two);
+            crate::maker::list_saved_artifact(&two);
+            crate::maker::list_saved_artifact(&three);
+            crate::maker::list_saved_artifact(&forged);
             Ok(ToolOutput {
                 content: "made three files".into(),
-                artifact_hash: Some("a".repeat(64)),
+                artifact_hash: Some(one.hash),
                 filename: Some("one.txt".into()),
                 ..ToolOutput::default()
-            }
-            .with_extra_artifacts(vec![
-                ExtraArtifact {
-                    hash: "b".repeat(64),
-                    filename: "two.txt".into(),
-                    title: Some("Two".into()),
-                },
-                ExtraArtifact {
-                    hash: "b".repeat(64),
-                    filename: "two-again.txt".into(),
-                    title: None,
-                },
-                ExtraArtifact {
-                    hash: "c".repeat(64),
-                    filename: "TopSecret.txt".into(),
-                    title: None,
-                },
-                ExtraArtifact {
-                    hash: "not-a-hash".into(),
-                    filename: "bad.txt".into(),
-                    title: None,
-                },
-            ]))
+            })
         }
     }
 
-    #[tokio::test]
-    async fn one_tool_call_records_every_artifact_once() {
+    /// Returns one fixed output and saves nothing.
+    struct FixedTool {
+        output: ToolOutput,
+    }
+
+    #[async_trait]
+    impl Tool for FixedTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "fixed".into(),
+                description: "fixed output".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                external_effect: false,
+            }
+        }
+
+        async fn execute(&self, _args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+            Ok(self.output.clone())
+        }
+    }
+
+    /// Lists a file that an earlier call saved. The list must refuse it.
+    struct ListForeignTool {
+        stored: crate::maker::StoredArtifact,
+    }
+
+    #[async_trait]
+    impl Tool for ListForeignTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "list_foreign".into(),
+                description: "lists an artifact it did not save".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                external_effect: false,
+            }
+        }
+
+        async fn execute(&self, _args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+            assert!(!crate::maker::list_saved_artifact(&self.stored));
+            Ok(ToolOutput::default())
+        }
+    }
+
+    /// A gateway with one tool and a context in the admin's `dir:main`.
+    fn extra_gateway(tool: impl Tool + 'static) -> (Gateway, ToolContext) {
         let store = Store::open_in_memory(384).unwrap();
         let mut registry = ToolRegistry::default();
-        registry.register(BatchTool).unwrap();
+        registry.register(tool).unwrap();
         let gateway = Gateway::new(
             store.clone(),
             Arc::new(Policy::from_text("TopSecret")),
@@ -1792,30 +1839,98 @@ mod tests {
             1,
             false,
         );
-        let admin = gateway.store().admin_user_id().unwrap();
+        let admin = store.admin_user_id().unwrap();
         let context = ToolContext {
             user_id: admin.clone(),
-            actor: admin.clone(),
+            actor: admin,
             bot: "maker".into(),
             task_id: None,
             turn_id: None,
             conversation_id: Some("dir:main".into()),
-            allowed_tools: ["make_batch".to_string()].into_iter().collect(),
+            allowed_tools: ["fixed", "make_batch", "list_foreign"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             require_approval: HashSet::new(),
         };
+        (gateway, context)
+    }
+
+    #[tokio::test]
+    async fn connector_data_that_names_an_artifact_records_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifacts = crate::maker::ArtifactStore::new(directory.path()).unwrap();
+        // Saved outside any tool call, so no call of this gateway saved it.
+        let existing = artifacts
+            .save(b"not yours", "report.pdf", artifact_meta("report.pdf"))
+            .unwrap();
+        let (gateway, context) = extra_gateway(FixedTool {
+            output: ToolOutput {
+                content: "listed".into(),
+                data: Some(serde_json::json!({
+                    "extra_artifacts": [{"hash": existing.hash, "filename": "report.pdf"}]
+                })),
+                ..ToolOutput::default()
+            },
+        });
+        gateway
+            .execute("fixed", serde_json::json!({}), &context)
+            .await
+            .unwrap();
+        assert!(
+            gateway
+                .store()
+                .list_conversation_artifacts(&context.user_id, "dir:main")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_saved_outside_the_call_cannot_be_listed_by_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifacts = crate::maker::ArtifactStore::new(directory.path()).unwrap();
+        // Saved outside any tool call, like an earlier turn's file.
+        let existing = artifacts
+            .save(b"saved earlier", "report.pdf", artifact_meta("report.pdf"))
+            .unwrap();
+        let (gateway, context) = extra_gateway(ListForeignTool { stored: existing });
+        gateway
+            .execute("list_foreign", serde_json::json!({}), &context)
+            .await
+            .unwrap();
+        assert!(
+            gateway
+                .store()
+                .list_conversation_artifacts(&context.user_id, "dir:main")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn one_tool_call_records_every_artifact_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let artifacts = Arc::new(crate::maker::ArtifactStore::new(directory.path()).unwrap());
+        let (gateway, context) = extra_gateway(BatchTool {
+            artifacts: artifacts.clone(),
+        });
         let outcome = gateway
             .execute("make_batch", serde_json::json!({}), &context)
             .await
             .unwrap();
         assert!(matches!(outcome, ToolOutcome::Completed(_)));
-        let mut hashes: Vec<String> = store
-            .list_conversation_artifacts(&admin, "dir:main")
+        let mut hashes: Vec<String> = gateway
+            .store()
+            .list_conversation_artifacts(&context.user_id, "dir:main")
             .unwrap()
             .into_iter()
             .map(|entry| entry.hash)
             .collect();
         hashes.sort();
-        assert_eq!(hashes, vec!["a".repeat(64), "b".repeat(64)]);
+        let mut expected = vec![sha256_hex(b"one"), sha256_hex(b"two")];
+        expected.sort();
+        assert_eq!(hashes, expected);
     }
 
     fn in_conversation(context: &ToolContext, conversation: &str) -> ToolContext {
