@@ -17,6 +17,7 @@ use serabot::deck::Brand;
 use serabot::documents::index_directory;
 use serabot::documents::ingest_file;
 use serabot::elevenlabs::{ElevenLabsClient, register_elevenlabs_tools};
+use serabot::elevenlabs_mcp::{ElevenLabsMcp, register_elevenlabs_mcp_tools};
 use serabot::embeddings::{Embedder, FastEmbedder, LazyEmbedder};
 use serabot::error::SeraError;
 use serabot::fetch::SafeFetcher;
@@ -754,6 +755,16 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
                 )?)
             }
         };
+        if let Some(session) = elevenlabs.oauth_session() {
+            // Signed in with OAuth: also offer the hosted MCP server.
+            let mcp = Arc::new(ElevenLabsMcp::new(
+                &config.elevenlabs.mcp_url,
+                session,
+                artifacts.clone(),
+                config.elevenlabs.timeout_secs,
+            )?);
+            register_elevenlabs_mcp_tools(&mut registry, mcp, policy.clone())?;
+        }
         register_elevenlabs_tools(
             &mut registry,
             elevenlabs,

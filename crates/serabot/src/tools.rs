@@ -891,6 +891,8 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "elevenlabs_transcribe",
         "elevenlabs_generate_image",
         "elevenlabs_generate_video",
+        "elevenlabs_mcp_list_tools",
+        "elevenlabs_mcp_call",
         "telegram_send_document",
         "firecrawl_scrape",
         "firecrawl_map",
