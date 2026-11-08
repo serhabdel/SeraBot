@@ -8,6 +8,8 @@
 
 use super::*;
 use crate::cards::{CardKind, CardStatus, MAX_ANSWER_CHARS};
+use crate::vault::{VaultInput, VaultKind, VaultSource};
+use zeroize::Zeroizing;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -144,6 +146,104 @@ pub(super) async fn decline_card(
     let card = state
         .store
         .resolve_card(&user.id, &id, CardStatus::Declined, &json!({}))?;
+    Ok(Json(json!({"card": card, "task": task_view(&task)})))
+}
+
+/// The largest body the secret route reads: a value is at most 8 KiB, and the
+/// JSON framing and escapes fit well inside 16 KiB.
+pub(super) const SECRET_BODY_LIMIT_BYTES: usize = 16 * 1024;
+
+/// `{"value": "..."}` for a secret request. Never logged: `Debug` redacts it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SecretRequest {
+    value: String,
+}
+
+impl std::fmt::Debug for SecretRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecretRequest")
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+/// `POST /v1/cards/{id}/secret`: seal the owner's value into the vault under
+/// the card's name, kind, username and sites. The bot is told the entry was
+/// saved (never the value), and the card is marked saved. A value for an
+/// existing name replaces it only when the card asked to save; a card that
+/// asked to provide a login never overwrites one.
+pub(super) async fn submit_secret_card(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+    Json(request): Json<SecretRequest>,
+) -> Result<Json<Value>> {
+    let value = Zeroizing::new(request.value);
+    let _claim = CardClaim::take(&state.card_claims, &id)?;
+    let card = state.store.get_card(&user.id, &id)?;
+    if card.kind != CardKind::SecretRequest {
+        return Err(SeraError::Validation(
+            "only a secret request takes a value".into(),
+        ));
+    }
+    if card.status != CardStatus::Pending {
+        return Err(SeraError::Validation("card is no longer pending".into()));
+    }
+    crate::vault::validate_value(&value)?;
+    let payload = &card.payload;
+    let name = payload["name"].as_str().unwrap_or_default().to_owned();
+    let kind: VaultKind = serde_json::from_value(payload["kind"].clone())
+        .map_err(|_| SeraError::Internal("stored card has an unknown kind".into()))?;
+    let purpose = payload["purpose"].as_str().unwrap_or_default();
+    if purpose != "save" && crate::vault::get(&state.users, &user.id, &name)?.is_some() {
+        return Err(SeraError::InvalidState(
+            "a vault entry with this name already exists".into(),
+        ));
+    }
+    let entry = crate::vault::put(
+        &state.users,
+        &user.id,
+        &name,
+        &VaultInput {
+            kind,
+            username: payload["username"].as_str().map(str::to_owned),
+            value,
+            domains: serde_json::from_value(payload["domains"].clone()).unwrap_or_default(),
+            note: None,
+            source: VaultSource::Local,
+            reference: None,
+        },
+    )?;
+    let sites = entry.domains.join(", ");
+    let text = format!(
+        "Secret “{name}” was saved to the vault for {sites}. Use it with browser_type secret={name}."
+    );
+    state.runtime.ensure_model_catalogs(&user.id).await;
+    let task = state.runtime.submit_text_attached(
+        &user.id,
+        &card.conversation_id,
+        &text,
+        Some(&card.bot),
+        &[],
+    )?;
+    state.store.record_audit(
+        &user.id,
+        "vault.saved_via_card",
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(&json!({"name": name, "card_id": id})),
+    )?;
+    let card = state.store.resolve_card(
+        &user.id,
+        &id,
+        CardStatus::Answered,
+        &json!({"saved": true, "name": name}),
+    )?;
     Ok(Json(json!({"card": card, "task": task_view(&task)})))
 }
 

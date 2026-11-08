@@ -111,9 +111,16 @@ pub trait BrowserLauncher: Send + Sync {
     async fn launch(&self, user_id: &str, profile_id: &str) -> Result<Arc<dyn BrowserBackend>>;
 }
 
-/// Resolves a vault secret for typing. Production: `vault::resolve_for_browser`.
+/// Resolves a vault secret for typing. Production: `vault_providers::resolve_for_browser`.
+#[async_trait]
 pub trait SecretResolver: Send + Sync {
-    fn resolve(
+    /// Whether the entry may be typed into a page on `host`, without reading
+    /// its value. Used to refuse before an approval is asked for.
+    fn authorize(&self, user_id: &str, name: &str, field: &str, host: &str) -> Result<()>;
+
+    /// The value to type. Fails closed on an unknown name or a host outside
+    /// the entry's sites.
+    async fn resolve(
         &self,
         user_id: &str,
         name: &str,

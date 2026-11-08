@@ -31,6 +31,7 @@ pub mod status_view;
 pub mod teams;
 pub mod ui_highlight;
 pub mod updater;
+pub mod vault_import;
 pub mod worker;
 pub mod working;
 pub use api::*;

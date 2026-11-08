@@ -7,8 +7,12 @@ const PLAN_RULES: &str = "- When the owner asks for a multi-step task, first cal
 - Once a goal is set, work through the todo list to the end without asking the owner more questions. Ask only when a step is impossible or needs a destructive approval. State your assumptions in the reply instead of asking about them.\n";
 
 /// Guidance for asking the owner: a card instead of a guess, never for secrets in chat.
-const ASK_RULES: &str = "- If the request is ambiguous and a wrong guess would waste work, call ask_user with 2 to 4 concrete options instead of guessing. Do not ask when autonomy is on or the chat has a goal; then choose and state your assumption.\n\
-- Never ask for passwords or API keys in chat text. Use vault_request_secret instead.\n";
+const ASK_RULES: &str = "- If the request is ambiguous and a wrong guess would waste work, call ask_user with 2 to 4 concrete options instead of guessing. Do not ask when autonomy is on or the chat has a goal; then choose and state your assumption.\n";
+
+/// Guidance for secrets: they never pass through chat. A login the bot needs
+/// is requested in a card, and used by name through the browser.
+const VAULT_RULES: &str = "- Never ask for passwords, API keys or other secrets in chat text, and never repeat one the owner typed. Call vault_request_secret: the owner enters the value in a secure card, and you never see it. End your turn and wait.\n\
+- To log in or use a saved credential, call browser_type with secret=<name> and the field (password, username or value). Look up names with vault_list first. The owner approves each typing for that site.\n";
 
 /// Honesty rule every bot prompt carries: a bot names only the tools this
 /// turn offers and reports only the calls it actually ran.
@@ -217,6 +221,14 @@ impl Runtime {
             .any(|tool| tool == crate::cards::ASK_USER_TOOL)
         {
             prompt.push_str(ASK_RULES);
+        }
+        if bot
+            .config
+            .tools
+            .iter()
+            .any(|tool| tool == crate::vault::REQUEST_SECRET_TOOL)
+        {
+            prompt.push_str(VAULT_RULES);
         }
         if ask_mode {
             prompt.push_str("- Call rag_search before answering. Cite every factual claim as [doc:<document_id> p.<page>] using only returned evidence. If evidence is insufficient, abstain.\n");

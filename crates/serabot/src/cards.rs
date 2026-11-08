@@ -440,6 +440,29 @@ impl Store {
         raw.map(into_card).transpose()
     }
 
+    /// The acting user's pending secret request in one conversation, if any.
+    /// A conversation holds at most one at a time.
+    pub fn pending_secret_request(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<Card>> {
+        let connection = self.connection()?;
+        let raw = connection
+            .query_row(
+                &format!(
+                    "SELECT {CARD_COLUMNS} FROM chat_cards
+                     WHERE user_id = ?1 AND conversation_id = ?2
+                       AND kind = 'secret_request' AND status = 'pending'
+                     ORDER BY created_at DESC, id DESC LIMIT 1"
+                ),
+                params![user_id, conversation_id],
+                raw_card,
+            )
+            .optional()?;
+        raw.map(into_card).transpose()
+    }
+
     /// Expire the acting user's pending questions in one conversation that
     /// were created before `before`. Returns how many changed.
     pub fn expire_stale_questions(

@@ -42,7 +42,7 @@ when you must run as root.
 | `browser_navigate{url}` | yes | Open a public http(s) URL (starts the browser). |
 | `browser_snapshot{}` | no | Text outline with element refs `e1..eN`. |
 | `browser_click{ref}` | yes | Click a ref from the latest snapshot. |
-| `browser_type{ref, text}` or `{ref, secret, field}` | yes | Type text, or a vault secret by name. The value never reaches tool output; later page text is scrubbed to `[vault:<name>]`. |
+| `browser_type{ref, text}` or `{ref, secret, field}` | yes | Type text, or a vault secret by name. A secret needs the owner's approval for the current page's host, and the entry must list that host. The value never reaches tool output; later page text is scrubbed to `[vault:<name>]`. See `docs/vault.md`. |
 | `browser_press{key}` | yes | Enter, Tab, Escape, arrows, a single letter or digit, ... |
 | `browser_screenshot{}` | no | JPEG stored as an artifact; not returned to the model. |
 | `browser_close{}` | no | Close the session. |

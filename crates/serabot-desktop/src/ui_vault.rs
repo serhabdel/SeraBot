@@ -9,8 +9,8 @@ use crate::ui::Icon;
 use dioxus::prelude::*;
 use serabot_desktop::panel::last_used_label;
 use serabot_desktop::session::Session;
-use serabot_desktop::{VaultEntry, VaultKind};
-use zeroize::Zeroize;
+use serabot_desktop::{PasswordManager, VaultEntry, VaultKind, VaultSource};
+use zeroize::{Zeroize, Zeroizing};
 
 fn kind_icon(kind: VaultKind) -> &'static str {
     match kind {
@@ -80,6 +80,7 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
                                 span { "{message}" }
                             }
                         }
+                        PasswordManagersPanel { session }
                         if loading && !loaded {
                             div { class: "vault-list", "aria-busy": "true",
                                 div { class: "skeleton row", " " }
@@ -132,6 +133,9 @@ fn VaultRow(session: Signal<Session>, entry: VaultEntry) -> Element {
         )
     };
     let mut meta = vec![entry.kind.label().to_owned()];
+    if entry.source.is_reference() {
+        meta.push(entry.source.label().to_owned());
+    }
     if let Some(user) = entry.username.as_deref().filter(|u| !u.is_empty()) {
         meta.push(user.to_owned());
     }
@@ -232,6 +236,13 @@ fn VaultFormView(session: Signal<Session>) -> Element {
             form.name_hint(),
         )
     };
+    let (source, reference) = {
+        let s = session.read();
+        match s.panel.vault.form.as_ref() {
+            Some(form) => (form.source, form.reference.clone()),
+            None => (VaultSource::Local, String::new()),
+        }
+    };
     let value_label = match kind {
         VaultKind::Password => "Password",
         VaultKind::ApiKey => "API key",
@@ -272,6 +283,26 @@ fn VaultFormView(session: Signal<Session>) -> Element {
                     }
                 }
                 div { class: "field",
+                    span { class: "field-label", "Value comes from" }
+                    div { class: "seg", role: "radiogroup", "aria-label": "Value comes from",
+                        for option in VaultSource::ALL {
+                            button {
+                                key: "{option.label()}",
+                                r#type: "button",
+                                role: "radio",
+                                class: if option == source { "seg-btn active" } else { "seg-btn" },
+                                "aria-checked": if option == source { "true" } else { "false" },
+                                onclick: move |_| {
+                                    if let Some(form) = session.write().panel.vault.form.as_mut() {
+                                        form.source = option;
+                                    }
+                                },
+                                "{option.label()}"
+                            }
+                        }
+                    }
+                }
+                div { class: "field",
                     span { class: "field-label", "Type" }
                     div { class: "seg", role: "radiogroup", "aria-label": "Type",
                         for option in VaultKind::ALL {
@@ -308,6 +339,27 @@ fn VaultFormView(session: Signal<Session>) -> Element {
                         }
                     }
                 }
+                if source.is_reference() {
+                    div { class: "field",
+                        label { class: "field-label", r#for: "vault-reference", "Item reference" }
+                        input {
+                            id: "vault-reference",
+                            class: "input mono",
+                            value: "{reference}",
+                            autocomplete: "off",
+                            spellcheck: false,
+                            placeholder: if source == VaultSource::ProtonPass { "pass://Vault/Item/password" } else { "op://Vault/Item/password" },
+                            oninput: move |event| {
+                                if let Some(form) = session.write().panel.vault.form.as_mut() {
+                                    form.reference = event.value();
+                                }
+                            },
+                        }
+                        span { class: "tiny vault-hint",
+                            "The password is read from {source.label()} each time a bot types it. Nothing is copied here."
+                        }
+                    }
+                } else {
                 div { class: "field",
                     label { class: "field-label", r#for: "vault-value", "{value_label}" }
                     input {
@@ -333,8 +385,9 @@ fn VaultFormView(session: Signal<Session>) -> Element {
                         }
                     }
                 }
+                }
                 div { class: "field",
-                    label { class: "field-label", r#for: "vault-domains", "Websites it works on (optional)" }
+                    label { class: "field-label", r#for: "vault-domains", "Websites" }
                     div { class: "vault-chips editable",
                         for domain in domains.iter() {
                             span { key: "{domain}", class: "chip mono removable",
@@ -389,7 +442,7 @@ fn VaultFormView(session: Signal<Session>) -> Element {
                         span { class: "error-text tiny", "{message}" }
                     } else {
                         span { class: "tiny vault-hint",
-                            "Leave empty to allow any site. example.com also covers its subdomains."
+                            "Required: the sites this login may be typed into. example.com also covers its subdomains."
                         }
                     }
                 }
@@ -422,6 +475,220 @@ fn VaultFormView(session: Signal<Session>) -> Element {
                 }
                 button { r#type: "submit", class: "btn primary", disabled: saving,
                     if saving { "Saving\u{2026}" } else { "Save" }
+                }
+            }
+        }
+    }
+}
+
+/// The source a password manager's id stands for, for its import button.
+fn source_of(id: &str) -> Option<VaultSource> {
+    match id {
+        "onepassword" => Some(VaultSource::OnePassword),
+        "protonpass" => Some(VaultSource::ProtonPass),
+        _ => None,
+    }
+}
+
+/// Password managers (0.23): each one's token and CLI status, and an import
+/// from this PC. A token is write-only, like a vault value: it is sent and
+/// never shown again. Requests run on the panel worker.
+#[component]
+fn PasswordManagersPanel(session: Signal<Session>) -> Element {
+    let (loaded, providers, error, importing, import_error, picker_open) = {
+        let s = session.read();
+        let v = &s.panel.vault;
+        (
+            v.providers_loaded,
+            v.providers.clone(),
+            v.provider_error.clone(),
+            v.import_loading,
+            v.import_error.clone(),
+            v.import.is_some(),
+        )
+    };
+    rsx! {
+        section { class: "vault-providers", "aria-label": "Password managers",
+            h2 { class: "vault-section-title", "Password managers" }
+            p { class: "tiny vault-hint",
+                "Use a login from 1Password or Proton Pass without copying it. The password stays in your manager and is read only when a bot types it."
+            }
+            if let Some(message) = error {
+                div { class: "error-text tiny", role: "alert", "{message}" }
+            }
+            if !loaded {
+                span { class: "caption", "Checking password managers\u{2026}" }
+            }
+            for manager in providers {
+                ProviderRow { key: "{manager.id}", session, manager }
+            }
+            if let Some(source) = importing {
+                span { class: "caption", "Reading the logins from {source.label()}\u{2026}" }
+            }
+            if let Some(message) = import_error {
+                div { class: "error-text tiny", role: "alert", "{message}" }
+            }
+            if picker_open {
+                ImportPickerView { session }
+            }
+        }
+    }
+}
+
+#[component]
+fn ProviderRow(session: Signal<Session>, manager: PasswordManager) -> Element {
+    let mut session = session;
+    let mut token = use_signal(String::new);
+    let busy = session.read().panel.vault.provider_busy.as_deref() == Some(manager.id.as_str());
+    let filled = !token.read().is_empty();
+    let token_line = if manager.configured {
+        "Access token saved on this server"
+    } else {
+        "No access token saved"
+    };
+    let cli_line = if manager.cli_found {
+        "CLI found on this server".to_owned()
+    } else {
+        format!(
+            "CLI not installed on this server. Install it from {}",
+            manager.install_url
+        )
+    };
+    let save_id = manager.id.clone();
+    let clear_id = manager.id.clone();
+    let source = source_of(&manager.id);
+    let input_label = format!("{} access token", manager.name);
+    rsx! {
+        div { class: "vault-provider-row",
+            div { class: "vault-row-main",
+                strong { class: "vault-name", "{manager.name}" }
+                span { class: "caption", "{token_line}" }
+                span { class: "tiny vault-hint", "{cli_line}" }
+            }
+            div { class: "vault-provider-token",
+                input {
+                    class: "input",
+                    r#type: "password",
+                    autocomplete: "off",
+                    spellcheck: false,
+                    "aria-label": "{input_label}",
+                    placeholder: "Access token",
+                    value: "{token}",
+                    oninput: move |event| token.set(event.value()),
+                }
+                button {
+                    class: "btn primary sm",
+                    disabled: busy || !filled,
+                    onclick: move |_| {
+                        // Move the token out of the signal: nothing is left behind.
+                        let secret = Zeroizing::new(std::mem::take(&mut *token.write()));
+                        if !secret.is_empty() {
+                            session.write().panel.save_password_manager(save_id.clone(), secret);
+                        }
+                    },
+                    "Save token"
+                }
+                if manager.configured {
+                    button {
+                        class: "btn ghost sm",
+                        disabled: busy,
+                        onclick: move |_| session.write().panel.clear_password_manager(&clear_id),
+                        "Remove"
+                    }
+                }
+            }
+            if let Some(source) = source {
+                button {
+                    class: "btn sm",
+                    onclick: move |_| session.write().panel.start_import(source),
+                    "Import from this PC"
+                }
+            }
+        }
+    }
+}
+
+/// The import picker: the logins listed on this PC, with their titles,
+/// usernames and sites. Picking one creates a reference, never a copy.
+#[component]
+fn ImportPickerView(session: Signal<Session>) -> Element {
+    let mut session = session;
+    let (source, items, picked, saving, error) = {
+        let s = session.read();
+        match s.panel.vault.import.as_ref() {
+            Some(picker) => (
+                picker.source,
+                picker.items.clone(),
+                picker.picked.clone(),
+                picker.saving,
+                picker.error.clone(),
+            ),
+            None => return rsx! {},
+        }
+    };
+    let count = picked.iter().filter(|chosen| **chosen).count();
+    let label = source.label();
+    let action = if saving {
+        "Importing\u{2026}".to_owned()
+    } else {
+        format!("Import {count}")
+    };
+    rsx! {
+        section { class: "vault-import", "aria-label": "Import from {label}",
+            h3 { class: "vault-form-title", "Import from {label}" }
+            p { class: "tiny vault-hint",
+                "Each login becomes a reference: the password stays in {label} and is read only when a bot types it."
+            }
+            if items.is_empty() {
+                p { class: "caption", "No logins were listed." }
+            }
+            ul { class: "vault-list", role: "list",
+                for (index, item) in items.iter().enumerate() {
+                    li { key: "{item.reference}", class: "vault-row",
+                        label { class: "vault-import-pick",
+                            input {
+                                r#type: "checkbox",
+                                checked: picked.get(index).copied().unwrap_or(false),
+                                onchange: move |_| session.write().panel.toggle_import_item(index),
+                            }
+                            div { class: "vault-row-main",
+                                strong { class: "vault-name", "{item.title}" }
+                                span { class: "vault-meta caption",
+                                    {
+                                        [item.username.clone(), Some(item.vault.clone()).filter(|v| !v.is_empty())]
+                                            .into_iter()
+                                            .flatten()
+                                            .collect::<Vec<_>>()
+                                            .join(" \u{b7} ")
+                                    }
+                                }
+                                if let Some(domain) = item.domain.clone() {
+                                    span { class: "chip mono", "{domain}" }
+                                } else {
+                                    span { class: "tiny vault-hint", "No site in this item. Add one after importing." }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(message) = error {
+                div { class: "error-text", role: "alert", "{message}" }
+            }
+            div { class: "vault-form-foot",
+                button {
+                    r#type: "button",
+                    class: "btn ghost",
+                    disabled: saving,
+                    onclick: move |_| session.write().panel.close_import(),
+                    "Cancel"
+                }
+                button {
+                    r#type: "button",
+                    class: "btn primary",
+                    disabled: saving || count == 0,
+                    onclick: move |_| session.write().panel.import_picked(),
+                    "{action}"
                 }
             }
         }
