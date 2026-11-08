@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import 'chat_models.dart';
 import 'models.dart';
 import 'validation.dart';
 
@@ -44,6 +45,10 @@ class ApiException implements Exception {
         return detail ?? 'Invalid input.';
       case ApiErrorKind.http:
         final c = statusCode ?? 0;
+        final d = detail;
+        if (d != null && d.isNotEmpty && c != 401 && c != 403 && c != 429) {
+          return d;
+        }
         if (c == 401) {
           return 'Your session has expired. Sign in again.';
         }
@@ -68,6 +73,27 @@ class ApiException implements Exception {
 
   @override
   String toString() => messageForUser();
+}
+
+/// The server's own `{"error": "..."}` sentence for client errors that are
+/// safe to show (bounded, no control characters). Null for anything else.
+String? serverErrorText(int status, List<int> body) {
+  if (!const {400, 404, 409, 413, 422, 503}.contains(status) ||
+      body.length > 8192) {
+    return null;
+  }
+  try {
+    final v = jsonDecode(utf8.decode(body));
+    if (v is Map<String, dynamic> && v['error'] is String) {
+      final s = (v['error'] as String).trim();
+      if (s.isNotEmpty &&
+          s.runes.length <= 512 &&
+          !s.runes.any((r) => r <= 0x1f || (r >= 0x7f && r <= 0x9f))) {
+        return s;
+      }
+    }
+  } catch (_) {}
+  return null;
 }
 
 /// Owner API client. Token is held in memory only; never logged.
@@ -111,6 +137,34 @@ class ApiClient {
     return uri;
   }
 
+  /// One authenticated request. Redirects are never followed: the bearer
+  /// token must not travel to another URL.
+  Future<http.Response> _send(
+    String method,
+    Uri uri, {
+    List<int>? bodyBytes,
+    Map<String, String>? extraHeaders,
+    String accept = 'application/json',
+    Duration timeout = const Duration(seconds: 20),
+  }) async {
+    try {
+      final req = http.Request(method, uri)
+        ..followRedirects = false
+        ..headers.addAll({
+          'Authorization': 'Bearer $_token',
+          'Accept': accept,
+          ...?extraHeaders,
+        });
+      if (bodyBytes != null) {
+        req.bodyBytes = bodyBytes;
+      }
+      final streamed = await _http.send(req).timeout(timeout);
+      return await http.Response.fromStream(streamed).timeout(timeout);
+    } catch (_) {
+      throw ApiException(ApiErrorKind.transport);
+    }
+  }
+
   Future<Map<String, dynamic>> _request(
     String method,
     List<String> segments, {
@@ -118,35 +172,12 @@ class ApiClient {
     Map<String, dynamic>? body,
   }) async {
     final uri = _uri(segments, query);
-    late final http.Response response;
-    try {
-      final headers = {
-        'Authorization': 'Bearer $_token',
-        'Accept': 'application/json',
-        if (body != null) 'Content-Type': 'application/json',
-      };
-      switch (method) {
-        case 'GET':
-          response = await _http
-              .get(uri, headers: headers)
-              .timeout(const Duration(seconds: 20));
-        case 'POST':
-          response = await _http
-              .post(uri, headers: headers, body: jsonEncode(body))
-              .timeout(const Duration(seconds: 20));
-        case 'PUT':
-          response = await _http
-              .put(uri, headers: headers, body: jsonEncode(body))
-              .timeout(const Duration(seconds: 20));
-        default:
-          throw ApiException(ApiErrorKind.transport);
-      }
-    } on ApiException {
-      rethrow;
-    } catch (_) {
-      throw ApiException(ApiErrorKind.transport);
-    }
-
+    final response = await _send(
+      method,
+      uri,
+      bodyBytes: body == null ? null : utf8.encode(jsonEncode(body)),
+      extraHeaders: {if (body != null) 'Content-Type': 'application/json'},
+    );
     if (response.statusCode == 401) {
       _onUnauthorized?.call();
       throw ApiException(ApiErrorKind.http, statusCode: 401);
@@ -155,12 +186,19 @@ class ApiClient {
       throw ApiException(ApiErrorKind.http, statusCode: response.statusCode);
     }
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw ApiException(ApiErrorKind.http, statusCode: response.statusCode);
+      throw ApiException(
+        ApiErrorKind.http,
+        statusCode: response.statusCode,
+        detail: serverErrorText(response.statusCode, response.bodyBytes),
+      );
     }
 
     final bytes = response.bodyBytes;
     if (bytes.length > _maxResponseBytes) {
       throw ApiException(ApiErrorKind.tooLarge);
+    }
+    if (bytes.isEmpty) {
+      return <String, dynamic>{};
     }
 
     try {
@@ -311,9 +349,21 @@ class ApiClient {
     return Selection.fromJson(json['selection'] as Map<String, dynamic>);
   }
 
-  Future<TaskInfo> submit(String conversationId, String text) async {
+  Future<TaskInfo> submit(
+    String conversationId,
+    String text, {
+    List<String> attachments = const [],
+  }) async {
     _checkId(conversationId);
-    if (!validText(text)) {
+    if (attachments.length > maxAttachments || !attachments.every(validId)) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Attach at most 6 files.',
+      );
+    }
+    final textOk =
+        validText(text) || (attachments.isNotEmpty && text.trim().isEmpty);
+    if (!textOk) {
       throw ApiException(
         ApiErrorKind.validation,
         detail: 'Enter 1–8,000 characters of message text.',
@@ -322,13 +372,470 @@ class ApiClient {
     final json = await _request(
       'POST',
       ['v1', 'messages'],
-      body: {'conversation_id': conversationId, 'text': text},
+      body: {
+        'conversation_id': conversationId,
+        'text': text,
+        if (attachments.isNotEmpty) 'attachments': attachments,
+      },
     );
     return _checkTask(
       TaskInfo.fromJson(json['task'] as Map<String, dynamic>),
     );
   }
 
+  /// All of this user's conversations, in the server's order (the same
+  /// `GET /v1/conversations` the desktop rail reads), following the cursor.
+  Future<List<ConversationSummary>> conversations({
+    bool includeArchived = false,
+    int pageSize = 100,
+    int maxPages = 10,
+  }) async {
+    final out = <ConversationSummary>[];
+    String? cursor;
+    for (var page = 0; page < maxPages; page++) {
+      final json = await _request(
+        'GET',
+        ['v1', 'conversations'],
+        query: {
+          'limit': '$pageSize',
+          'include_archived': includeArchived ? 'true' : 'false',
+          'cursor': ?cursor,
+        },
+      );
+      final ConversationPage parsed;
+      try {
+        parsed = ConversationPage.fromJson(json, pageSize);
+      } catch (_) {
+        throw ApiException(ApiErrorKind.invalidResponse);
+      }
+      for (final c in parsed.conversations) {
+        if (!validId(c.id)) {
+          throw ApiException(ApiErrorKind.invalidResponse);
+        }
+      }
+      out.addAll(parsed.conversations);
+      cursor = parsed.nextCursor;
+      if (cursor == null || cursor.isEmpty) {
+        break;
+      }
+    }
+    return out;
+  }
+
+  /// A new node in the tree. [kind] direct/room sit under a section or group.
+  Future<ConversationSummary> createChat({
+    required ConversationKind kind,
+    required String slug,
+    String? parentId,
+    String? title,
+  }) async {
+    if (!validSlug(slug)) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Slug must be a lowercase slug of at most 32 characters.',
+      );
+    }
+    final t = title?.trim();
+    if (t != null && t.isNotEmpty && (t.runes.length > 120)) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Names must be 1-120 characters.',
+      );
+    }
+    final json = await _request(
+      'POST',
+      ['v1', 'conversations'],
+      body: {
+        'kind': kind.apiValue,
+        'slug': slug,
+        'parent_id': ?parentId,
+        if (t != null && t.isNotEmpty) 'title': t,
+      },
+    );
+    return ConversationSummary.fromJson(
+      json['conversation'] as Map<String, dynamic>,
+    );
+  }
+
+  /// `POST /v1/groups`: a group chat with its members in one step.
+  Future<ConversationSummary> createGroupChat(
+    String name,
+    List<String> members,
+  ) async {
+    final n = name.trim();
+    if (n.isEmpty || n.runes.length > 60) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Give the group a name of 1 to 60 characters.',
+      );
+    }
+    final json = await _request(
+      'POST',
+      ['v1', 'groups'],
+      body: {'name': n, 'members': members},
+    );
+    return ConversationSummary.fromJson(json['group'] as Map<String, dynamic>);
+  }
+
+  Future<void> renameConversation(String id, String title) async {
+    _checkId(id);
+    final t = title.trim();
+    if (t.isEmpty || t.runes.length > 120) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Title must be 1-120 characters.',
+      );
+    }
+    await _request('PATCH', ['v1', 'conversations', id], body: {'title': t});
+  }
+
+  Future<void> archiveConversation(String id) async {
+    _checkId(id);
+    await _request('DELETE', ['v1', 'conversations', id]);
+  }
+
+  /// Stop the running turn of one conversation.
+  Future<void> cancelTurn(String id) async {
+    _checkId(id);
+    await _request(
+      'POST',
+      ['v1', 'conversations', id, 'cancel'],
+      body: const {},
+    );
+  }
+
+  Future<List<LibraryEntry>> library(String conversationId) async {
+    _checkId(conversationId);
+    final json = await _request(
+      'GET',
+      ['v1', 'conversations', conversationId, 'library'],
+    );
+    final list = json['artifacts'];
+    if (list is! List || list.length > 100) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+    try {
+      final items = list
+          .map((e) => LibraryEntry.fromJson(e as Map<String, dynamic>))
+          .toList();
+      if (items.any((e) => !validHash(e.hash))) {
+        throw ApiException(ApiErrorKind.invalidResponse);
+      }
+      return items;
+    } on ApiException {
+      rethrow;
+    } catch (_) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+  }
+
+  /// Upload one chat attachment (raw bytes, `X-Filename`), same route as the
+  /// desktop. Returns the attachment to reference in the next message.
+  Future<AttachmentInfo> uploadAttachment(
+    String conversationId,
+    String filename,
+    List<int> bytes,
+  ) async {
+    _checkId(conversationId);
+    if (bytes.isEmpty) {
+      throw ApiException(ApiErrorKind.validation, detail: 'That file is empty.');
+    }
+    if (bytes.length > maxAttachmentBytes) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Files must be 25 MB or smaller.',
+      );
+    }
+    if (!validAttachmentName(filename)) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail:
+            'That file type is not supported. Use images, PDF, Office, text, markdown or CSV files.',
+      );
+    }
+    final response = await _send(
+      'POST',
+      _uri(['v1', 'conversations', conversationId, 'attachments']),
+      bodyBytes: bytes,
+      extraHeaders: {
+        'X-Filename': filename.trim(),
+        'Content-Type': 'application/octet-stream',
+      },
+      timeout: const Duration(minutes: 2),
+    );
+    final json = _decode(response);
+    final raw = json['attachment'];
+    if (raw is! Map<String, dynamic>) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+    final info = AttachmentInfo.fromJson(raw);
+    if (!validId(info.id)) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+    return info;
+  }
+
+  /// Download a produced file by content hash (cap 100 MiB).
+  Future<List<int>> artifactBytes(String hash) async {
+    if (!validHash(hash)) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Invalid artifact hash.',
+      );
+    }
+    return _fetch(['v1', 'artifacts', hash]);
+  }
+
+  /// Download one of the user's own attachments.
+  Future<List<int>> attachmentBytes(String id) async {
+    _checkId(id);
+    return _fetch(['v1', 'attachments', id]);
+  }
+
+  Future<List<int>> _fetch(List<String> segments) async {
+    final response = await _send(
+      'GET',
+      _uri(segments),
+      accept: '*/*',
+      timeout: const Duration(minutes: 2),
+    );
+    _checkStatus(response);
+    if (response.bodyBytes.length > 100 * 1024 * 1024) {
+      throw ApiException(ApiErrorKind.tooLarge);
+    }
+    return response.bodyBytes;
+  }
+
+  /// Bot or group picture; null when none is set or the image is not a PNG.
+  Future<List<int>?> avatarBytes(String kind, String id) async {
+    _checkId(id);
+    final response = await _send(
+      'GET',
+      _uri(['v1', kind, id, 'avatar']),
+      accept: 'image/*',
+    );
+    if (response.statusCode == 404) {
+      return null;
+    }
+    _checkStatus(response);
+    final b = response.bodyBytes;
+    if (b.length > 2 * 1024 * 1024 || b.length < 8) {
+      return null;
+    }
+    const png = [0x89, 0x50, 0x4e, 0x47];
+    for (var i = 0; i < 4; i++) {
+      if (b[i] != png[i]) {
+        return null;
+      }
+    }
+    return b;
+  }
+
+  Future<void> setBotAvatar(String id, List<int> png) async {
+    _checkId(id);
+    if (png.isEmpty || png.length > 2 * 1024 * 1024) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Pictures must be a PNG of at most 2 MB.',
+      );
+    }
+    final response = await _send(
+      'PUT',
+      _uri(['v1', 'bots', id, 'avatar']),
+      bodyBytes: png,
+      extraHeaders: {'Content-Type': 'application/octet-stream'},
+      timeout: const Duration(seconds: 60),
+    );
+    _checkStatus(response);
+  }
+
+  /// Speech to text for the composer mic button. The transcript is model
+  /// output: the user reviews it before sending.
+  Future<String> transcribe(String filename, List<int> audio) async {
+    if (audio.isEmpty) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'The recording is empty.',
+      );
+    }
+    if (audio.length > maxAudioBytes) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'The recording is larger than the 20 MiB limit.',
+      );
+    }
+    final response = await _send(
+      'POST',
+      _uri(['v1', 'audio', 'transcribe']),
+      bodyBytes: audio,
+      extraHeaders: {
+        'X-Audio-Filename': filename,
+        'Content-Type': 'application/octet-stream',
+      },
+      timeout: const Duration(minutes: 2),
+    );
+    return Transcription.fromJson(_decode(response)).text;
+  }
+
+  Future<List<BotSummary>> bots() async {
+    final json = await _request('GET', ['v1', 'bots']);
+    final list = json['bots'];
+    if (list is! List || list.length > 200) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+    try {
+      return list
+          .map((e) => BotSummary.fromJson(e as Map<String, dynamic>))
+          .toList();
+    } catch (_) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+  }
+
+  Future<BotDetail> botDetail(String id) async {
+    _checkId(id);
+    final json = await _request('GET', ['v1', 'bots', id]);
+    try {
+      final d = BotDetail.fromJson(json);
+      if (d.id != id) {
+        throw ApiException(ApiErrorKind.invalidResponse);
+      }
+      return d;
+    } on ApiException {
+      rethrow;
+    } catch (_) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+  }
+
+  /// `PUT /v1/bots/{id}`: name, description, instructions, model, abilities.
+  Future<void> updateBot(String id, Map<String, dynamic> body) async {
+    _checkId(id);
+    if (body.isEmpty) {
+      return;
+    }
+    await _request('PUT', ['v1', 'bots', id], body: body);
+  }
+
+  /// `POST /v1/bots` with a name; the server derives the id.
+  Future<String> createNamedBot(String name) async {
+    final n = name.trim();
+    if (n.isEmpty || n.runes.length > 60) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Give the bot a name of 1 to 60 characters.',
+      );
+    }
+    final json = await _request('POST', ['v1', 'bots'], body: {'name': n});
+    final bot = json['bot'];
+    final id = bot is Map<String, dynamic> ? bot['id'] : null;
+    if (id is! String || !validId(id)) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+    return id;
+  }
+
+  Future<UsageReport> usage({int days = 30}) async {
+    final json = await _request(
+      'GET',
+      ['v1', 'usage'],
+      query: {'days': '$days'},
+    );
+    return UsageReport.fromJson(json);
+  }
+
+  Future<List<ConnectorStatus>> connectors() async {
+    final json = await _request('GET', ['v1', 'connectors']);
+    final list = json['connectors'];
+    if (list is! List || list.length > 64) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+    try {
+      return list
+          .map((e) => ConnectorStatus.fromJson(e as Map<String, dynamic>))
+          .toList();
+    } catch (_) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
+  }
+
+  /// Server events after [after] (`GET /v1/events`, Server-Sent Events). The
+  /// stream ends when the connection drops; the caller reconnects from the
+  /// last id it saw. A 401 signs the session out like any other call.
+  Stream<ServerEvent> events({int after = 0}) async* {
+    final req = http.Request(
+      'GET',
+      _uri(
+        ['v1', 'events'],
+        {if (after > 0) 'after': '$after', 'limit': '100'},
+      ),
+    )
+      ..followRedirects = false
+      ..headers.addAll({
+        'Authorization': 'Bearer $_token',
+        'Accept': 'text/event-stream',
+      });
+    final http.StreamedResponse res;
+    try {
+      res = await _http.send(req).timeout(const Duration(seconds: 20));
+    } catch (_) {
+      throw ApiException(ApiErrorKind.transport);
+    }
+    if (res.statusCode == 401) {
+      _onUnauthorized?.call();
+      throw ApiException(ApiErrorKind.http, statusCode: 401);
+    }
+    if (res.statusCode != 200) {
+      throw ApiException(ApiErrorKind.http, statusCode: res.statusCode);
+    }
+    final parser = SseParser();
+    try {
+      await for (final chunk in res.stream.transform(utf8.decoder)) {
+        for (final frame in parser.feed(chunk)) {
+          final e = ServerEvent.fromFrame(frame);
+          if (e != null) {
+            yield e;
+          }
+        }
+      }
+    } on http.ClientException {
+      throw ApiException(ApiErrorKind.transport);
+    }
+  }
+
+  void _checkStatus(http.Response response) {
+    if (response.statusCode == 401) {
+      _onUnauthorized?.call();
+      throw ApiException(ApiErrorKind.http, statusCode: 401);
+    }
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw ApiException(
+        ApiErrorKind.http,
+        statusCode: response.statusCode,
+        detail: serverErrorText(response.statusCode, response.bodyBytes),
+      );
+    }
+  }
+
+  Map<String, dynamic> _decode(http.Response response) {
+    _checkStatus(response);
+    final bytes = response.bodyBytes;
+    if (bytes.length > _maxResponseBytes) {
+      throw ApiException(ApiErrorKind.tooLarge);
+    }
+    if (bytes.isEmpty) {
+      return <String, dynamic>{};
+    }
+    try {
+      final v = jsonDecode(utf8.decode(bytes));
+      if (v is Map<String, dynamic>) {
+        return v;
+      }
+    } catch (_) {}
+    throw ApiException(ApiErrorKind.invalidResponse);
+  }
+
+  Future<List<ApprovalItem>> approvalsPlaceholder() async => approvals();
   Future<TaskInfo> task(String id) async {
     _checkId(id);
     final json = await _request('GET', ['v1', 'tasks', id]);
