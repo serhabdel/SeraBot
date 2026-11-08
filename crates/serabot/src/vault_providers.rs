@@ -246,6 +246,9 @@ const HOME_VARS: &[&str] = &[
     "XDG_DATA_HOME",
     "APPDATA",
     "LOCALAPPDATA",
+    "USERPROFILE",
+    "TEMP",
+    "TMP",
 ];
 
 /// The environment a password manager CLI runs in. Nothing is inherited but
@@ -1095,6 +1098,9 @@ mod tests {
             "XDG_DATA_HOME",
             "APPDATA",
             "LOCALAPPDATA",
+            "USERPROFILE",
+            "TEMP",
+            "TMP",
             "OP_SERVICE_ACCOUNT_TOKEN",
         ];
         for (key, _) in &env {
