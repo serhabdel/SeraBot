@@ -110,6 +110,8 @@ pub enum PanelOp {
         token: Zeroizing<String>,
     },
     ConnectorDisconnect(String),
+    /// Admin: remove a connector's saved server-wide secrets (age store).
+    ConnectorRemoveSecrets(String),
     /// Composio: save the user's own key (write-only).
     ComposioKey(Zeroizing<String>),
     ComposioKeyRemove,
@@ -147,6 +149,7 @@ pub enum PanelKind {
     ConnectorStart,
     ConnectorToken,
     ConnectorDisconnect,
+    ConnectorRemoveSecrets,
     ComposioKey,
     ComposioKeyRemove,
     ComposioLoad,
@@ -183,6 +186,7 @@ impl PanelOp {
             Self::ConnectorStart(_) => PanelKind::ConnectorStart,
             Self::ConnectorToken { .. } => PanelKind::ConnectorToken,
             Self::ConnectorDisconnect(_) => PanelKind::ConnectorDisconnect,
+            Self::ConnectorRemoveSecrets(_) => PanelKind::ConnectorRemoveSecrets,
             Self::ComposioKey(_) => PanelKind::ComposioKey,
             Self::ComposioKeyRemove => PanelKind::ComposioKeyRemove,
             Self::ComposioLoad(_) => PanelKind::ComposioLoad,
@@ -394,6 +398,9 @@ fn execute(job: &PanelJob, cache: &mut Option<ApiClient>) -> Result<PanelReply, 
             .map(|()| PanelReply::ConnectorChanged),
         PanelOp::ConnectorDisconnect(id) => client
             .connector_disconnect(id)
+            .map(|()| PanelReply::ConnectorChanged),
+        PanelOp::ConnectorRemoveSecrets(id) => client
+            .admin_remove_connector_secrets(id)
             .map(|()| PanelReply::ConnectorChanged),
         PanelOp::ComposioKey(key) => client
             .composio_set_key(key)
@@ -1249,6 +1256,19 @@ impl PanelState {
             .push_back(PanelOp::ConnectorDisconnect(id.to_owned()));
     }
 
+    /// Admin: remove the connector's saved server-side credentials (for
+    /// example the stored ElevenLabs API key). Per-account sign-ins use
+    /// `disconnect_connector` instead.
+    pub fn remove_connector_secrets(&mut self, id: &str) {
+        if self.connectors.busy.is_some() {
+            return;
+        }
+        self.connectors.busy = Some(id.to_owned());
+        self.connectors.errors.remove(id);
+        self.queue
+            .push_back(PanelOp::ConnectorRemoveSecrets(id.to_owned()));
+    }
+
     /// Composio: save the user's own key. The value is wiped after sending.
     pub fn composio_save_key(&mut self, key: &str) {
         let key = key.trim();
@@ -1785,7 +1805,8 @@ impl PanelState {
             }
             PanelKind::ConnectorStart
             | PanelKind::ConnectorToken
-            | PanelKind::ConnectorDisconnect => {
+            | PanelKind::ConnectorDisconnect
+            | PanelKind::ConnectorRemoveSecrets => {
                 if let Some(id) = self.connectors.busy.take() {
                     self.connectors
                         .errors

@@ -674,7 +674,16 @@ pub(super) async fn update_bot(
     };
     let require_approval = match &request.require_approval {
         Some(list) => validate_require_approval_list(list, &tools)?,
-        None => validate_require_approval_list(&config.require_approval, &tools)?,
+        None => {
+            // The tools were replaced without a new approval list: drop the
+            // entries the new list no longer covers instead of refusing the
+            // whole save (0.26.0 — capability toggles used to break Save).
+            let mut kept_list = config.require_approval.clone();
+            if request.tools.is_some() {
+                kept_list.retain(|item| tools.iter().any(|tool| tool == item));
+            }
+            validate_require_approval_list(&kept_list, &tools)?
+        }
     };
     let enabled = request.enabled.unwrap_or(row.enabled);
     if !enabled && config.role == BotRole::Orchestrator {

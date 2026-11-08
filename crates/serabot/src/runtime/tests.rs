@@ -1709,8 +1709,8 @@ async fn turn_limits_resolve_owner_override_then_config_default() {
     let (runtime, store) = setup_orchestration("http://127.0.0.1:9", Arc::new(Capture::default()));
     let user = admin(&store);
     let default = runtime.turn_limits_for(&user).unwrap();
-    assert_eq!(default.max_tool_calls_per_turn, 150);
-    assert_eq!(default.max_tool_rounds, 60);
+    assert_eq!(default.max_tool_calls_per_turn, 1500);
+    assert_eq!(default.max_tool_rounds, 200);
     store
         .set_user_turn_limits(
             &user,

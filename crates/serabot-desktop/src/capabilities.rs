@@ -362,19 +362,28 @@ pub fn is_on(capability: &Capability, tools: &[String]) -> bool {
         .any(|tool| tools.iter().any(|have| have == tool))
 }
 
-/// The tool list after switching `capability` on or off.
-pub fn toggled(capability: &Capability, tools: &[String], on: bool) -> Vec<String> {
+/// The tool list after switching `capability` on or off. `allow_delegate`
+/// is true only for the orchestrator (the server refuses it for anyone else);
+/// every other tool of the capability is granted (0.26.0: the orchestrator
+/// gets the full capability, not just the specialist subset).
+pub fn toggled(
+    capability: &Capability,
+    tools: &[String],
+    on: bool,
+    allow_delegate: bool,
+) -> Vec<String> {
     let mut next: Vec<String> = tools
         .iter()
         .filter(|tool| !capability.tools.contains(&tool.as_str()))
         .cloned()
         .collect();
     if on {
-        // Keep the order of the allowlist so the saved list is stable.
+        // Keep the order of the capability so the saved list is stable.
         for tool in capability.tools {
-            if crate::SPECIALIST_TOOLS.contains(tool) {
-                next.push((*tool).to_owned());
+            if *tool == "delegate" && !allow_delegate {
+                continue;
             }
+            next.push((*tool).to_owned());
         }
     }
     next
@@ -421,7 +430,12 @@ mod tests {
         }
         for capability in CAPABILITIES {
             for tool in capability.tools {
-                assert!(SPECIALIST_TOOLS.contains(tool), "{tool} is not allowlisted");
+                // Every capability tool is either allowlisted or delegate,
+                // which only the orchestrator may hold (enforced on toggle).
+                assert!(
+                    SPECIALIST_TOOLS.contains(tool) || *tool == "delegate",
+                    "{tool} is not allowlisted"
+                );
             }
         }
     }
@@ -430,14 +444,25 @@ mod tests {
     fn toggling_adds_or_removes_only_that_capability() {
         let browser = &CAPABILITIES[0];
         let start = vec!["vault_list".to_owned(), "mystery_tool".to_owned()];
-        let on = toggled(browser, &start, true);
+        let on = toggled(browser, &start, true, true);
         assert!(is_on(browser, &on));
         assert!(on.contains(&"vault_list".to_owned()));
         assert!(on.contains(&"mystery_tool".to_owned()));
-        let off = toggled(browser, &on, false);
+        let off = toggled(browser, &on, false, true);
         assert_eq!(off, start);
-        let clean = toggled(browser, &["vault_list".to_owned()], true);
-        assert!(crate::validate_tool_list(&clean).is_ok());
+        // Delegate is only ever added for the orchestrator.
+        let delegate_cap = Capability {
+            group: "Test",
+            label: "Delegate",
+            hint: "",
+            needs: Needs::Nothing,
+            tools: &["delegate", "memory_save"],
+        };
+        let specialist = toggled(&delegate_cap, &[], true, false);
+        assert!(!specialist.contains(&"delegate".to_owned()));
+        assert!(specialist.contains(&"memory_save".to_owned()));
+        let orchestrator = toggled(&delegate_cap, &[], true, true);
+        assert!(orchestrator.contains(&"delegate".to_owned()));
     }
 
     fn connector(id: &str, state: Option<&str>) -> crate::ConnectorStatus {

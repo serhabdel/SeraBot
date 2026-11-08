@@ -4310,6 +4310,21 @@ impl ApiClient {
         )
     }
 
+    /// `DELETE /v1/admin/connectors/{id}/secrets`: remove the connector's
+    /// saved server-wide credentials (e.g. the ElevenLabs API key). The
+    /// server returns only the removed secret names, never values.
+    pub fn admin_remove_connector_secrets(&self, id: &str) -> Result<(), ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Connector id is not valid."));
+        }
+        self.admin_request::<serde_json::Value, _>(
+            Method::DELETE,
+            &["v1", "admin", "connectors", id, "secrets"],
+            &serde_json::json!({}),
+        )?;
+        Ok(())
+    }
+
     pub fn admin_test_connector(&self, id: &str) -> Result<ConnectorTestResult, ApiError> {
         if !valid_id(id) {
             return Err(ApiError::Validation("Connector id is not valid."));

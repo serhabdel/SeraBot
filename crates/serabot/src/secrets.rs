@@ -265,13 +265,15 @@ impl SharedSecrets {
     }
 
     /// Remove names from the store and write it back. Names that are not
-    /// stored are ignored.
+    /// stored are ignored. An in-memory store (tests) just drops them from
+    /// memory.
     pub fn remove(&self, names: &[&str]) -> Result<()> {
         let mut guard = self.lock();
         if guard.path.as_os_str().is_empty() || guard.identity_path.as_os_str().is_empty() {
-            return Err(SeraError::Secrets(
-                "cannot persist an in-memory secret store".into(),
-            ));
+            for name in names {
+                guard.remove(name);
+            }
+            return Ok(());
         }
         let mut updated = SecretStore::open_paths(&guard.path, &guard.identity_path)?;
         for name in names {

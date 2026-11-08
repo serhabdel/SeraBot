@@ -426,6 +426,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/admin/connectors/{id}", put(admin_set_connector))
         .route("/v1/admin/connectors/{id}/test", post(admin_test_connector))
         .route(
+            "/v1/admin/connectors/{id}/secrets",
+            delete(admin_remove_connector_secrets),
+        )
+        .route(
             "/v1/admin/connectors/{id}/oauth/start",
             post(admin_connector_oauth_start),
         )
