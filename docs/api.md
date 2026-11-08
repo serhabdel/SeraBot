@@ -430,7 +430,7 @@ changes configuration:
 | `agentmail` | `GET {api_base}/inboxes?limit=1` |
 | `tavily` | `POST {api_base}/search` with `max_results: 1` (this consumes one search credit) |
 | `firecrawl` | `GET {api_base}/v2/team/credit-usage` |
-| `elevenlabs` | `GET {api_base}/v2/voices?page_size=1` with `xi-api-key`, or with `Authorization: Bearer` when `auth = "oauth"` (requires auth either way, so it validates the credential) |
+| `elevenlabs_api_key` | `GET {api_base}/v2/voices?page_size=1` with `xi-api-key` (validates the key). `elevenlabs` (the account sign-in) reports whether this account is signed in; it makes no provider call |
 
 OAuth connectors (`google_drive`, `google_sheets`, `google_calendar`, `gmail`,
 `outlook`, `outlook_calendar`, `notion`) do not contact the provider. They

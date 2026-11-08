@@ -401,6 +401,10 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/connectors/{id}/oauth/complete",
             post(admin_connector_oauth_complete),
         )
+        .route(
+            "/v1/admin/connectors/{id}/oauth",
+            delete(admin_connector_oauth_disconnect),
+        )
         .route("/v1/admin/audio", put(admin_set_audio))
         .route(
             "/v1/settings/voice",

@@ -333,12 +333,15 @@ fn capability_label(tool: &str) -> Option<&'static str> {
         "fetch_url" | "watch_now" | "firecrawl_scrape" | "firecrawl_map" | "firecrawl_search"
         | "firecrawl_crawl" | "exa_search" | "exa_get_contents" => Some("Web research"),
         "audio_transcribe" | "audio_understand" => Some("Audio notes"),
-        "elevenlabs_text_to_speech"
-        | "elevenlabs_sound_effect"
-        | "elevenlabs_transcribe"
-        | "elevenlabs_generate_image"
-        | "elevenlabs_generate_video" => Some("Voice and media"),
-        "elevenlabs_mcp_list_tools" | "elevenlabs_mcp_call" => Some("ElevenLabs tools"),
+        "elevenlabs_key_list_voices"
+        | "elevenlabs_key_text_to_speech"
+        | "elevenlabs_key_sound_effect"
+        | "elevenlabs_key_transcribe"
+        | "elevenlabs_key_generate_image"
+        | "elevenlabs_key_generate_video" => Some("Voice and media"),
+        "elevenlabs_mcp_search_tools" | "elevenlabs_mcp_describe_tool" | "elevenlabs_mcp_call" => {
+            Some("ElevenLabs tools")
+        }
         "onedrive_upload" | "onedrive_list" => Some("OneDrive files"),
         "github_search_repos"
         | "github_list_issues"

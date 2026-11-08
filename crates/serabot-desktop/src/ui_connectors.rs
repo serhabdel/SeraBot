@@ -16,7 +16,6 @@ use serabot_desktop::connector_card::{
     CardState, DEFAULT_ADMIN_HINT, GOOGLE_CONSOLE_URL, GOOGLE_SETUP_STEPS, NOTION_SHARE_HINT,
     connector_card_state, editable_roles, google_is_set_up, google_redirect_uri,
     google_setup_offered, is_internal_role, legacy_connected, supports_sign_in, token_help,
-    uses_api_key,
 };
 use serabot_desktop::session::{Session, humanize_label};
 
@@ -146,6 +145,7 @@ fn connector_title(id: &str) -> String {
         "tavily" => "Tavily Search",
         "firecrawl" => "Firecrawl",
         "elevenlabs" => "ElevenLabs",
+        "elevenlabs_api_key" => "ElevenLabs API key",
         other => return humanize_label(other),
     }
     .to_owned()
@@ -169,8 +169,9 @@ fn connector_blurb(id: &str) -> &'static str {
         "agentmail" => "A mailbox for your bots.",
         "tavily" | "firecrawl" | "exa" => "Let bots search and read the web.",
         "elevenlabs" => {
-            "Sign in with ElevenLabs gives access to voice, music, sound, images and video your plan includes."
+            "Sign in with your ElevenLabs account: voices, music, sound, images, video and agents your plan includes."
         }
+        "elevenlabs_api_key" => "Voice, sound and images with the owner's ElevenLabs API key.",
         _ => "",
     }
 }
@@ -238,7 +239,7 @@ pub(crate) fn ConnectorsView(session: Signal<Session>) -> Element {
                     ("Code and tasks", &["github", "todoist"][..]),
                     ("Messages", &["slack"][..]),
                     ("Web search", &["tavily", "firecrawl", "exa"][..]),
-                    ("Voice", &["elevenlabs"][..]),
+                    ("Voice", &["elevenlabs", "elevenlabs_api_key"][..]),
                     ("Apps and tools", &["composio"][..]),
                 ] {
                     {
@@ -576,16 +577,8 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
         .unwrap_or(connector.enabled);
     let testing = session.read().connector_testing.as_deref() == Some(id.as_str());
     let signing_in = session.read().oauth_signing_in.as_deref() == Some(id.as_str());
-    let auth_mode = session
-        .read()
-        .connector_drafts
-        .get(&id)
-        .and_then(|draft| draft.auth.clone())
-        .or_else(|| connector.auth.clone())
-        .unwrap_or_default();
-    let connected = legacy_connected(&connector, &auth_mode);
-    let signed_in_with_account = supports_sign_in(&connector) && connected && auth_mode == "oauth";
-    let on_api_key = uses_api_key(&connector, &auth_mode);
+    let connected = legacy_connected(&connector);
+    let signed_in_with_account = supports_sign_in(&connector) && connected;
     let test_result = session.read().state.connector_tests.get(&id).cloned();
     let needs_attention = test_result.as_ref().is_some_and(|result| !result.ok);
     let values = session
@@ -615,7 +608,6 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
             )
         );
     let has_values = values.values().any(|value| !value.trim().is_empty());
-    let api_key_value = values.get("api_key").cloned().unwrap_or_default();
     rsx! {
         div { class: "card connector-card",
             div { class: "card-head",
@@ -641,9 +633,6 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
             }
             if signed_in_with_account {
                 p { class: "tiny", role: "status", "Signed in with your {title} account." }
-            }
-            if on_api_key {
-                p { class: "tiny", role: "status", "Connected with an API key." }
             }
             if key_inputs {
                 div { class: "form-grid",
@@ -798,33 +787,6 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                         if let Some(uri) = connector.redirect_uri.clone() {
                             code { class: "tiny", "{uri}" }
                         }
-                        if supports_sign_in(&connector) && connector.secrets.contains_key("api_key") {
-                            div { class: "field",
-                                label { class: "field-label", "Use an API key instead" }
-                                input {
-                                    class: "input",
-                                    "type": "password",
-                                    autocomplete: "off",
-                                    value: "{api_key_value}",
-                                    placeholder: if on_api_key { "Paste a new key to replace it" } else { "Paste your API key" },
-                                    oninput: {
-                                        let id = id.clone();
-                                        move |event| session.write().set_connector_value(&id, "api_key", event.value())
-                                    },
-                                }
-                            }
-                            div { class: "card-actions",
-                                button {
-                                    class: "btn ghost sm",
-                                    disabled: !can_save || api_key_value.trim().is_empty(),
-                                    onclick: {
-                                        let id = id.clone();
-                                        move |_| session.write().use_api_key_instead(id.clone())
-                                    },
-                                    "Save key"
-                                }
-                            }
-                        }
                         if id != "onedrive" {
                             p { class: "tiny",
                                 "Turning a connector on makes it available. Give its tools to a bot in Bots. Reading and sending still ask you first."
@@ -953,9 +915,8 @@ mod tests {
     }
 
     #[test]
-    fn a_sign_in_connector_always_leads_with_sign_in_and_hides_tokens() {
+    fn a_sign_in_connector_always_leads_with_sign_in_and_has_no_key_field() {
         let mut voice = connector("elevenlabs");
-        voice.auth_modes = vec!["api_key".into(), "oauth".into()];
         voice.oauth = Some(serabot_desktop::ConnectorOauth {
             client_id: "https://example.example/client.json".into(),
             authorize_url: None,
@@ -963,16 +924,6 @@ mod tests {
             callback_uri: Some("http://127.0.0.1:1/cb".into()),
             scope: None,
         });
-        for role in ["api_key", "access_token", "refresh_token"] {
-            voice.secrets.insert(
-                role.to_owned(),
-                serabot_desktop::SecretStatus {
-                    name: Some(format!("secret_{role}")),
-                    configured: false,
-                },
-            );
-        }
-        // Whatever mode the server reports, signing in leads and no key sits beside it.
         assert_eq!(
             connector_action(&voice, false),
             Some(ConnectorAction::SignIn)
@@ -981,7 +932,10 @@ mod tests {
             connector_action(&voice, true),
             Some(ConnectorAction::SignIn)
         );
-        assert_eq!(editable_roles(&voice), vec!["api_key".to_owned()]);
+        // The account sign-in never takes a pasted key; that is its own connector.
+        assert!(editable_roles(&voice).is_empty());
+        let key = connector("elevenlabs_api_key");
+        assert!(!supports_sign_in(&key));
     }
 
     #[test]

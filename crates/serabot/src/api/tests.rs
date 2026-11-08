@@ -1062,7 +1062,7 @@ async fn new_conversation_routes_validate_identity_and_require_authentication() 
 }
 
 #[tokio::test]
-async fn connector_catalog_lists_elevenlabs_in_voice_group() {
+async fn connector_catalog_lists_both_elevenlabs_connectors_in_voice_group() {
     let (app, _, _) = app();
     let response = app
         .clone()
@@ -1071,17 +1071,29 @@ async fn connector_catalog_lists_elevenlabs_in_voice_group() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = read_json(response).await;
-    let entry = body["connectors"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|connector| connector["id"] == "elevenlabs")
-        .expect("elevenlabs listed");
-    assert_eq!(entry["kind"], "api_key");
-    assert_eq!(entry["enabled"], false);
-    assert_eq!(entry["group"], "Voice & Media");
-    assert_eq!(entry["secrets"]["api_key"]["name"], "elevenlabs_api_key");
-    assert_eq!(entry["secrets"]["api_key"]["configured"], false);
+    let find = |id: &str| {
+        body["connectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|connector| connector["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("{id} listed"))
+    };
+    // The account sign-in: per-account state, no server-wide secrets.
+    let signin = find("elevenlabs");
+    assert_eq!(signin["kind"], "oauth");
+    assert_eq!(signin["enabled"], false);
+    assert_eq!(signin["connected"], false);
+    assert_eq!(signin["group"], "Voice & Media");
+    assert!(signin.get("auth").is_none() && signin.get("auth_modes").is_none());
+    // The API-key connector: its own key, its own switch.
+    let key = find("elevenlabs_api_key");
+    assert_eq!(key["kind"], "api_key");
+    assert_eq!(key["enabled"], false);
+    assert_eq!(key["group"], "Voice & Media");
+    assert_eq!(key["secrets"]["api_key"]["name"], "elevenlabs_api_key");
+    assert_eq!(key["secrets"]["api_key"]["configured"], false);
 }
 
 #[tokio::test]
@@ -1113,7 +1125,13 @@ async fn connector_test_is_owner_only_and_reports_missing_secrets_without_networ
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-    for id in ["elevenlabs", "tavily", "firecrawl", "agentmail", "gmail"] {
+    for id in [
+        "elevenlabs_api_key",
+        "tavily",
+        "firecrawl",
+        "agentmail",
+        "gmail",
+    ] {
         let response = app
             .clone()
             .oneshot(request(
@@ -2847,7 +2865,7 @@ async fn providers_and_connectors_report_status_without_secret_values() {
     )
     .await;
     let list = connectors["connectors"].as_array().unwrap();
-    assert_eq!(list.len(), 16);
+    assert_eq!(list.len(), 17);
     let gmail = list
         .iter()
         .find(|connector| connector["id"] == "gmail")

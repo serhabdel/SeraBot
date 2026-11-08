@@ -174,7 +174,7 @@ Telegram, about five minutes. The service is on `27b1018`:
 2. **`/providers`** — models grouped by provider. Catalogs fail closed when refresh fails.
 3. **`/model auto`**, then **`/model <provider> <model>`** — selection pins for this conversation ([model-routing.md](model-routing.md)).
 4. **`/help`** — `/brief`, `/watch`, schedules, approvals, deck flows.
-5. Firecrawl, audio, and ElevenLabs only after the secret rows above. `elevenlabs_list_voices` is the read-only probe; generation stays Once / Always / Deny.
+5. Firecrawl, audio, and ElevenLabs only after the secret rows above. `elevenlabs_key_list_voices` is the read-only probe; generation stays Once / Always / Deny.
 
 Optional writes create files on the host the API is using. Skip them on OVH
 unless you want those files there. Ids are synthetic. Bot and skill

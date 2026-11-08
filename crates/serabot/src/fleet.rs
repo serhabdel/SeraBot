@@ -26,7 +26,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::config::{BotConfig, Config, ConfiguredBot, LoadedBot, apply_bot_config_override};
+use crate::config::{
+    BotConfig, Config, ConfiguredBot, LoadedBot, apply_bot_config_override, rename_legacy_tools,
+};
 use crate::error::{Result, SeraError};
 use crate::orchestration::{BotFleetMember, safe_bot_label, validate_bot_fleet};
 use crate::skills::SkillCatalog;
@@ -572,6 +574,8 @@ impl FleetRegistry {
             })?;
             config.name = row.name.clone();
             config.enabled = row.enabled;
+            // Rows saved before a tool rename keep working under the new name.
+            rename_legacy_tools(&mut config);
             // The console overlay is the admin's alone. Seed templates are
             // raw, so members never inherit it.
             if user_id == self.admin_user_id {

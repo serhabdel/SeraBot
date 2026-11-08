@@ -21,6 +21,7 @@ const KEY_HEADER: &str = "x-consumer-api-key";
 
 pub struct McpClient {
     inner: mcp_client::McpClient,
+    timeout: Duration,
 }
 
 impl std::fmt::Debug for McpClient {
@@ -48,7 +49,7 @@ impl McpClient {
             max_bytes,
         )
         .map_err(|error| SeraError::Internal(format!("Composio MCP client: {error:?}")))?;
-        Ok(Self { inner })
+        Ok(Self { inner, timeout })
     }
 
     pub fn url(&self) -> &str {
@@ -58,7 +59,7 @@ impl McpClient {
     /// Every tool this key offers (bounded), as the server described them.
     pub async fn list_tools(&self, key: &str) -> Result<Vec<Value>> {
         self.inner
-            .list_tools(key)
+            .list_tools(key, self.timeout)
             .await
             .map_err(|error| failure(error, key))
     }
@@ -67,7 +68,7 @@ impl McpClient {
     /// (`content`, `structuredContent`, `isError`).
     pub async fn call_tool(&self, key: &str, name: &str, arguments: &Value) -> Result<Value> {
         self.inner
-            .call_tool(key, name, arguments)
+            .call_tool(key, name, arguments, self.timeout)
             .await
             .map_err(|error| failure(error, key))
     }

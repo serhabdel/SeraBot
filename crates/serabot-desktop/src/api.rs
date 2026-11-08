@@ -294,13 +294,14 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
     "firecrawl_search",
     "firecrawl_crawl",
     "firecrawl_extract",
-    "elevenlabs_list_voices",
-    "elevenlabs_text_to_speech",
-    "elevenlabs_sound_effect",
-    "elevenlabs_transcribe",
-    "elevenlabs_generate_image",
-    "elevenlabs_generate_video",
-    "elevenlabs_mcp_list_tools",
+    "elevenlabs_key_list_voices",
+    "elevenlabs_key_text_to_speech",
+    "elevenlabs_key_sound_effect",
+    "elevenlabs_key_transcribe",
+    "elevenlabs_key_generate_image",
+    "elevenlabs_key_generate_video",
+    "elevenlabs_mcp_search_tools",
+    "elevenlabs_mcp_describe_tool",
     "elevenlabs_mcp_call",
     "deck_build",
     "docx_build",
@@ -1255,11 +1256,6 @@ pub struct ConnectorStatus {
     pub default_inbox_id: Option<String>,
     #[serde(default)]
     pub secrets: BTreeMap<String, SecretStatus>,
-    /// Current auth mode ("api_key" / "oauth"), when the connector has one.
-    #[serde(default)]
-    pub auth: Option<String>,
-    #[serde(default)]
-    pub auth_modes: Vec<String>,
     /// OAuth sign-in details when the server offers them.
     #[serde(default)]
     pub oauth: Option<ConnectorOauth>,
@@ -1331,9 +1327,6 @@ pub struct ConnectorUpdate {
     pub enabled: bool,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub values: BTreeMap<String, String>,
-    /// ElevenLabs only: "api_key" or "oauth".
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -3856,6 +3849,18 @@ impl ApiClient {
             code,
             verifier,
             redirect_uri,
+        )
+    }
+
+    /// Forget the acting account's sign-in for a connector (ElevenLabs).
+    pub fn admin_connector_oauth_disconnect(&self, id: &str) -> Result<AdminAck, ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Connector id is not valid."));
+        }
+        self.admin_request(
+            Method::DELETE,
+            &["v1", "admin", "connectors", id, "oauth"],
+            &serde_json::json!({}),
         )
     }
 

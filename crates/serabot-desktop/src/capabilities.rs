@@ -246,16 +246,7 @@ pub const CAPABILITIES: &[Capability] = &[
         needs: Needs::Nothing,
         label: "Work with voice and audio",
         hint: "Transcribe recordings and speak replies.",
-        tools: &[
-            "audio_transcribe",
-            "audio_understand",
-            "elevenlabs_list_voices",
-            "elevenlabs_text_to_speech",
-            "elevenlabs_sound_effect",
-            "elevenlabs_transcribe",
-            "elevenlabs_generate_image",
-            "elevenlabs_generate_video",
-        ],
+        tools: &["audio_transcribe", "audio_understand"],
     },
     Capability {
         group: "Media",
@@ -264,8 +255,29 @@ pub const CAPABILITIES: &[Capability] = &[
             ids: &["elevenlabs"],
         },
         label: "Use your ElevenLabs tools",
-        hint: "Voice, music, sound, images and video your ElevenLabs plan includes. Anything that spends credits asks you first.",
-        tools: &["elevenlabs_mcp_list_tools", "elevenlabs_mcp_call"],
+        hint: "Voice, music, sound, images, video and agents your ElevenLabs plan includes. Anything that spends credits asks you first.",
+        tools: &[
+            "elevenlabs_mcp_search_tools",
+            "elevenlabs_mcp_describe_tool",
+            "elevenlabs_mcp_call",
+        ],
+    },
+    Capability {
+        group: "Media",
+        needs: Needs::Connector {
+            name: "ElevenLabs API key",
+            ids: &["elevenlabs_api_key"],
+        },
+        label: "Use your ElevenLabs API key tools",
+        hint: "Voice, sound, transcripts and images with the owner's ElevenLabs key. Generating asks you first.",
+        tools: &[
+            "elevenlabs_key_list_voices",
+            "elevenlabs_key_text_to_speech",
+            "elevenlabs_key_sound_effect",
+            "elevenlabs_key_transcribe",
+            "elevenlabs_key_generate_image",
+            "elevenlabs_key_generate_video",
+        ],
     },
     // ---- Memory
     Capability {

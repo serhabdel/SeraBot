@@ -142,6 +142,7 @@ impl Config {
         let raw = std::fs::read_to_string(path)?;
         let mut config: Self = toml::from_str(&raw)
             .map_err(|error| SeraError::Config(format!("{}: {error}", path.display())))?;
+        config.elevenlabs.apply_legacy_settings();
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -347,10 +348,10 @@ impl Config {
                 ));
             }
         }
-        if self.elevenlabs.enabled {
+        if self.elevenlabs.api_key.enabled {
             if self.elevenlabs.api_base.is_empty() {
                 return Err(SeraError::Config(
-                    "elevenlabs.api_base must not be empty when elevenlabs is enabled".into(),
+                    "elevenlabs.api_base must not be empty when the ElevenLabs API key connector is enabled".into(),
                 ));
             }
             if self.elevenlabs.max_tts_chars == 0 {
@@ -363,38 +364,44 @@ impl Config {
                     "elevenlabs.poll_max_attempts must be greater than zero".into(),
                 ));
             }
-            if self.elevenlabs.auth == ElevenLabsAuth::Oauth {
-                if crate::mcp_client::parse_url(&self.elevenlabs.mcp_url).is_none() {
+        }
+        if self.elevenlabs.mcp_enabled {
+            if self.elevenlabs.mcp_timeout_secs == 0
+                || self.elevenlabs.mcp_generate_timeout_secs == 0
+            {
+                return Err(SeraError::Config(
+                    "elevenlabs MCP timeouts must be greater than zero".into(),
+                ));
+            }
+            if crate::mcp_client::parse_url(&self.elevenlabs.mcp_url).is_none() {
+                return Err(SeraError::Config(
+                    "elevenlabs.mcp_url must be an http(s) URL without credentials".into(),
+                ));
+            }
+            let client_id = self.elevenlabs.oauth_client_id.trim();
+            match reqwest::Url::parse(client_id) {
+                Ok(url)
+                    if url.scheme() == "https"
+                        && url.host_str().is_some()
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.query().is_none()
+                        && url.fragment().is_none() => {}
+                _ => {
                     return Err(SeraError::Config(
-                        "elevenlabs.mcp_url must be an http(s) URL without credentials".into(),
-                    ));
-                }
-                let client_id = self.elevenlabs.oauth_client_id.trim();
-                match reqwest::Url::parse(client_id) {
-                    Ok(url)
-                        if url.scheme() == "https"
-                            && url.host_str().is_some()
-                            && url.username().is_empty()
-                            && url.password().is_none()
-                            && url.query().is_none()
-                            && url.fragment().is_none() => {}
-                    _ => {
-                        return Err(SeraError::Config(
                             "elevenlabs.oauth_client_id must be a credential-less https URL (CIMD client_id)"
                                 .into(),
                         ));
-                    }
                 }
-                for name in [
-                    &self.elevenlabs.oauth_access_token_secret,
-                    &self.elevenlabs.oauth_refresh_token_secret,
-                ] {
-                    if !valid_secret_name(name) {
-                        return Err(SeraError::Config(
-                            "elevenlabs OAuth token secret names must be secret-store key names"
-                                .into(),
-                        ));
-                    }
+            }
+            for name in [
+                &self.elevenlabs.oauth_access_token_secret,
+                &self.elevenlabs.oauth_refresh_token_secret,
+            ] {
+                if !valid_secret_name(name) {
+                    return Err(SeraError::Config(
+                        "elevenlabs OAuth token secret names must be secret-store key names".into(),
+                    ));
                 }
             }
         }
@@ -1311,9 +1318,9 @@ impl Default for TavilyConfig {
     }
 }
 
-/// How the ElevenLabs connector authenticates. `api_key` sends the
-/// `xi-api-key` header; `oauth` sends `Authorization: Bearer` from an
-/// ElevenLabs OAuth sign-in (the REST API rejects requests that carry both).
+/// The pre-0.24 ElevenLabs mode switch: `api_key` used the account's API key,
+/// `oauth` the sign-in through the hosted MCP server. Read for back-compat
+/// only; see [`ElevenLabsConfig::apply_legacy_settings`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ElevenLabsAuth {
@@ -1322,18 +1329,35 @@ pub enum ElevenLabsAuth {
     Oauth,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ElevenLabsConfig {
+/// The ElevenLabs API-key connector: legacy native tools (`elevenlabs_key_*`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ElevenLabsApiKeyConfig {
+    /// Register the native API-key tools. Needs the key in the age store.
     #[serde(default)]
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElevenLabsConfig {
+    /// Pre-0.24 master switch. Input only: folded into `mcp_enabled` and
+    /// `api_key.enabled` at load and never written back.
+    #[serde(rename = "enabled", default, skip_serializing)]
+    pub legacy_enabled: Option<bool>,
+    /// Pre-0.24 mode switch. Input only; see `legacy_enabled`.
+    #[serde(default, skip_serializing)]
+    pub auth: Option<ElevenLabsAuth>,
+    /// The "ElevenLabs" connector: account sign-in through the hosted MCP
+    /// server, which exposes the full ElevenLabs catalog. Recommended.
+    #[serde(default)]
+    pub mcp_enabled: bool,
+    /// The "ElevenLabs API key" connector (legacy native tools).
+    #[serde(default)]
+    pub api_key: ElevenLabsApiKeyConfig,
     #[serde(default = "default_elevenlabs_api_base")]
     pub api_base: String,
     #[serde(default = "default_elevenlabs_api_key_secret")]
     pub api_key_secret: String,
-    #[serde(default)]
-    pub auth: ElevenLabsAuth,
-    /// ElevenLabs hosted MCP endpoint (Streamable HTTP, OAuth bearer). Used
-    /// only with OAuth sign-in.
+    /// ElevenLabs hosted MCP endpoint (Streamable HTTP, OAuth bearer).
     #[serde(default = "default_elevenlabs_mcp_url")]
     pub mcp_url: String,
     /// CIMD client_id: the https URL of the client metadata document this
@@ -1342,12 +1366,21 @@ pub struct ElevenLabsConfig {
     pub oauth_client_id: String,
     #[serde(default = "default_elevenlabs_oauth_scope")]
     pub oauth_scope: String,
+    /// Pre-0.24 server-wide token names. Read once, to move a stored sign-in
+    /// to the owner's per-user credential store. Never written.
     #[serde(default = "default_elevenlabs_oauth_access_token_secret")]
     pub oauth_access_token_secret: String,
     #[serde(default = "default_elevenlabs_oauth_refresh_token_secret")]
     pub oauth_refresh_token_secret: String,
+    /// Timeout for the API-key connector's REST calls.
     #[serde(default = "default_elevenlabs_timeout_secs")]
     pub timeout_secs: u64,
+    /// Timeout for each MCP request that lists, searches or reads.
+    #[serde(default = "default_elevenlabs_mcp_timeout_secs")]
+    pub mcp_timeout_secs: u64,
+    /// Timeout for each MCP request that generates, creates or spends.
+    #[serde(default = "default_elevenlabs_mcp_generate_timeout_secs")]
+    pub mcp_generate_timeout_secs: u64,
     #[serde(default = "default_elevenlabs_voice_id")]
     pub default_voice_id: String,
     #[serde(default = "default_elevenlabs_tts_model")]
@@ -1369,16 +1402,20 @@ pub struct ElevenLabsConfig {
 impl Default for ElevenLabsConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            legacy_enabled: None,
+            auth: None,
+            mcp_enabled: false,
+            api_key: ElevenLabsApiKeyConfig::default(),
             api_base: default_elevenlabs_api_base(),
             api_key_secret: default_elevenlabs_api_key_secret(),
-            auth: ElevenLabsAuth::default(),
             mcp_url: default_elevenlabs_mcp_url(),
             oauth_client_id: default_elevenlabs_oauth_client_id(),
             oauth_scope: default_elevenlabs_oauth_scope(),
             oauth_access_token_secret: default_elevenlabs_oauth_access_token_secret(),
             oauth_refresh_token_secret: default_elevenlabs_oauth_refresh_token_secret(),
             timeout_secs: default_elevenlabs_timeout_secs(),
+            mcp_timeout_secs: default_elevenlabs_mcp_timeout_secs(),
+            mcp_generate_timeout_secs: default_elevenlabs_mcp_generate_timeout_secs(),
             default_voice_id: default_elevenlabs_voice_id(),
             tts_model: default_elevenlabs_tts_model(),
             stt_model: default_elevenlabs_stt_model(),
@@ -1388,6 +1425,42 @@ impl Default for ElevenLabsConfig {
             poll_interval_ms: default_elevenlabs_poll_interval_ms(),
             poll_max_attempts: default_elevenlabs_poll_max_attempts(),
         }
+    }
+}
+
+impl ElevenLabsConfig {
+    /// Fold the pre-0.24 `enabled` and `auth` pair into the two connector
+    /// switches. `enabled = true` with `auth = "oauth"` turns on the sign-in
+    /// connector; without `auth` (the old default) the API-key connector.
+    pub fn apply_legacy_settings(&mut self) {
+        if self.legacy_enabled.is_none() && self.auth.is_none() {
+            return;
+        }
+        let enabled = self.legacy_enabled.unwrap_or(false);
+        match self.auth.take().unwrap_or_default() {
+            ElevenLabsAuth::Oauth => self.mcp_enabled |= enabled,
+            ElevenLabsAuth::ApiKey => self.api_key.enabled |= enabled,
+        }
+        self.legacy_enabled = None;
+        tracing::warn!(
+            "[elevenlabs] `enabled` and `auth` are deprecated: use `mcp_enabled` for the \
+             sign-in connector and `[elevenlabs.api_key] enabled` for the API-key connector"
+        );
+    }
+}
+
+/// Tool names that were renamed. Bot files and console overrides written
+/// before the rename keep working: each old name maps to its replacement.
+pub fn renamed_tool(name: &str) -> &str {
+    match name {
+        "elevenlabs_list_voices" => "elevenlabs_key_list_voices",
+        "elevenlabs_text_to_speech" => "elevenlabs_key_text_to_speech",
+        "elevenlabs_sound_effect" => "elevenlabs_key_sound_effect",
+        "elevenlabs_transcribe" => "elevenlabs_key_transcribe",
+        "elevenlabs_generate_image" => "elevenlabs_key_generate_image",
+        "elevenlabs_generate_video" => "elevenlabs_key_generate_video",
+        "elevenlabs_mcp_list_tools" => "elevenlabs_mcp_search_tools",
+        other => other,
     }
 }
 
@@ -1810,8 +1883,9 @@ pub fn load_bots(config: &Config, dir: impl AsRef<Path>) -> Result<Vec<LoadedBot
     let mut bots = Vec::new();
     for path in paths {
         let raw = std::fs::read_to_string(&path)?;
-        let bot: BotConfig = toml::from_str(&raw)
+        let mut bot: BotConfig = toml::from_str(&raw)
             .map_err(|error| SeraError::Config(format!("{}: {error}", path.display())))?;
+        rename_legacy_tools(&mut bot);
         if bot.name.is_empty() || bot.name.len() > 64 {
             return Err(SeraError::Config(format!(
                 "{}: invalid bot name",
@@ -1942,6 +2016,18 @@ pub fn apply_bot_config_override(config: &Config, bot: &mut BotConfig) {
             bot.require_approval = require_approval.clone();
         }
     }
+    rename_legacy_tools(bot);
+}
+
+/// Map pre-rename tool names in a bot's tool and approval lists (see
+/// [`renamed_tool`]). Applied to bot files, stored bot rows and overrides.
+pub fn rename_legacy_tools(bot: &mut BotConfig) {
+    for tool in bot.tools.iter_mut().chain(bot.require_approval.iter_mut()) {
+        let renamed = renamed_tool(tool.as_str()).to_owned();
+        if renamed != *tool {
+            *tool = renamed;
+        }
+    }
 }
 
 /// Specialist tools the owner API may write into a scaffolded bot file.
@@ -1968,13 +2054,14 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "firecrawl_search",
     "firecrawl_crawl",
     "firecrawl_extract",
-    "elevenlabs_list_voices",
-    "elevenlabs_text_to_speech",
-    "elevenlabs_sound_effect",
-    "elevenlabs_transcribe",
-    "elevenlabs_generate_image",
-    "elevenlabs_generate_video",
-    "elevenlabs_mcp_list_tools",
+    "elevenlabs_key_list_voices",
+    "elevenlabs_key_text_to_speech",
+    "elevenlabs_key_sound_effect",
+    "elevenlabs_key_transcribe",
+    "elevenlabs_key_generate_image",
+    "elevenlabs_key_generate_video",
+    "elevenlabs_mcp_search_tools",
+    "elevenlabs_mcp_describe_tool",
     "elevenlabs_mcp_call",
     "deck_build",
     "docx_build",
@@ -2576,6 +2663,12 @@ fn default_elevenlabs_oauth_refresh_token_secret() -> String {
 }
 fn default_elevenlabs_timeout_secs() -> u64 {
     120
+}
+fn default_elevenlabs_mcp_timeout_secs() -> u64 {
+    60
+}
+fn default_elevenlabs_mcp_generate_timeout_secs() -> u64 {
+    300
 }
 fn default_elevenlabs_voice_id() -> String {
     String::new()
