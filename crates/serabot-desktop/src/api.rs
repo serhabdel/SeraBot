@@ -300,6 +300,8 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
     "elevenlabs_transcribe",
     "elevenlabs_generate_image",
     "elevenlabs_generate_video",
+    "elevenlabs_mcp_list_tools",
+    "elevenlabs_mcp_call",
     "deck_build",
     "docx_build",
     "docx_import",

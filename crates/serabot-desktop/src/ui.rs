@@ -15,8 +15,10 @@ use serabot_desktop::{
     branding, chat_compose, chat_feed, provider_presets, provider_view,
     session::{Section, Session, SettingsSection, SignInPhase, Theme, humanize_label},
     teams, ui_highlight,
+    working::BotActivity,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Instant;
 
 use crate::ui_bots::{NewBotSheet, NewGroupSheet, OnboardingView};
 use crate::ui_browser::BrowserView;
@@ -42,6 +44,17 @@ const CSS_PAGES: &str = concat!(
     include_str!("../assets/settings.css"),
     include_str!("../assets/files.css")
 );
+
+/// The `data-activity` value the stylesheet keys the avatar ring and the
+/// "Working..." label on: `working` (animated ring), `waiting` (static dot)
+/// or `idle`.
+fn activity_attr(activity: Option<&BotActivity>) -> &'static str {
+    match activity {
+        Some(BotActivity::Working(_)) => "working",
+        Some(BotActivity::WaitingApproval) => "waiting",
+        None => "idle",
+    }
+}
 
 /// A chat row: id, owner flag, speaker, avatar, bot, time, body, peer flag.
 /// One prepared transcript row: what the message draws, the day heading
@@ -320,6 +333,7 @@ fn capability_label(tool: &str) -> Option<&'static str> {
         | "elevenlabs_transcribe"
         | "elevenlabs_generate_image"
         | "elevenlabs_generate_video" => Some("Voice and media"),
+        "elevenlabs_mcp_list_tools" | "elevenlabs_mcp_call" => Some("ElevenLabs tools"),
         "onedrive_upload" | "onedrive_list" => Some("OneDrive files"),
         "github_search_repos"
         | "github_list_issues"
@@ -2008,8 +2022,10 @@ fn Sidebar(
                         RailItem::Bot { id, label, role, avatar, active, enabled, live, unread, pinned } => {
                             let pin_id = id.strip_prefix("dir:").unwrap_or(&id).to_owned();
                             let removable = serabot_desktop::can_remove_bot(&pin_id, &role);
+                            let act = session.read().state.working.activity_of(&pin_id, Instant::now());
+                            let act_label = act.as_ref().map(BotActivity::label).unwrap_or_default();
                             rsx! {
-                                div { key: "{id}", class: if active { "thread active" } else { "thread" },
+                                div { key: "{id}", class: if active { "thread active" } else { "thread" }, "data-activity": activity_attr(act.as_ref()),
                                     button {
                                         class: "thread-main thread-bot",
                                         onclick: {
@@ -2019,9 +2035,14 @@ fn Sidebar(
                                                 session.write().open_bot_chat(bot);
                                             }
                                         },
-                                        span { class: "avatar bot", style: conversation_avatar_style(&id), "{avatar}" }
+                                        span { class: "avatar-wrap", "data-activity": activity_attr(act.as_ref()),
+                                            span { class: "avatar bot", style: conversation_avatar_style(&id), "{avatar}" }
+                                        }
                                         div { class: "thread-copy",
                                             span { class: "thread-title", "{label}" }
+                                            if act.is_some() {
+                                                span { class: "thread-meta working-label", role: "status", "{act_label}" }
+                                            }
                                             span { class: "thread-meta", if enabled { "{role}" } else { "{role} · disabled" } }
                                         }
                                         if unread > 0 {
@@ -2086,10 +2107,18 @@ fn Sidebar(
                         },
                         RailItem::Thread { id, label, subtitle, depth, active, unread, archived, pinned } => {
                             let editing = renaming().as_ref().map(|(edit, _)| edit == &id).unwrap_or(false);
+                            let act = session
+                                .read()
+                                .state
+                                .working
+                                .conversation_working(&id, Instant::now())
+                                .then_some(BotActivity::Working(None));
+                            let act_label = act.as_ref().map(BotActivity::label).unwrap_or_default();
                             rsx! {
                                 div {
                                     key: "{id}",
                                     class: if active { "thread active" } else { "thread" },
+                                    "data-activity": activity_attr(act.as_ref()),
                                     style: format!("--depth: {depth};"),
                                     if editing {
                                         div { class: "thread-rename",
@@ -2151,9 +2180,14 @@ fn Sidebar(
                                                 let id = id.clone();
                                                 move |_| session.write().open_conversation(id.clone())
                                             },
-                                            span { class: "avatar bot", style: conversation_avatar_style(&id), "{initial_of(&label)}" }
+                                            span { class: "avatar-wrap", "data-activity": activity_attr(act.as_ref()),
+                                                span { class: "avatar bot", style: conversation_avatar_style(&id), "{initial_of(&label)}" }
+                                            }
                                             div { class: "thread-copy",
                                                 span { class: "thread-title", "{label}" }
+                                                if act.is_some() {
+                                                    span { class: "thread-meta working-label", role: "status", "{act_label}" }
+                                                }
                                                 span { class: "thread-meta", "{subtitle}" }
                                             }
                                             if !archived && unread > 0 {
@@ -2540,6 +2574,32 @@ fn Topbar(
             .map(|id| (id.clone(), state.bot_avatar(&id)))
             .collect::<Vec<_>>()
     };
+    // Who is working: the chat bot, or each room member. A queued or running
+    // task covers the moment before the first step event arrives.
+    let (header_act, team_acts) = {
+        let state = session.read();
+        let now = Instant::now();
+        let busy = matches!(task_status, Some(TaskStatus::Running | TaskStatus::Queued));
+        let header = match &active_bot {
+            Some(bot) => state
+                .state
+                .working
+                .activity_of(bot, now)
+                .or_else(|| busy.then_some(BotActivity::Working(None))),
+            None => (busy
+                || state
+                    .state
+                    .working
+                    .conversation_working(&state.conversation, now))
+            .then_some(BotActivity::Working(None)),
+        };
+        let members = team
+            .iter()
+            .map(|(id, _)| (id.clone(), state.state.working.activity_of(id, now)))
+            .collect::<HashMap<_, _>>();
+        (header, members)
+    };
+    let header_label = header_act.as_ref().map(BotActivity::label);
     rsx! {
         header { class: "topbar chat-header",
             button {
@@ -2549,14 +2609,20 @@ fn Topbar(
                 onclick: move |_| drawer_open.set(true),
                 Icon { name: "list", size: 16 }
             }
-            span {
-                class: "avatar bot",
-                style: active_bot.as_deref().map(avatar_style).unwrap_or_else(|| avatar_style(&title)),
-                "{avatar}"
+            span { class: "avatar-wrap", "data-activity": activity_attr(header_act.as_ref()),
+                span {
+                    class: "avatar bot",
+                    style: active_bot.as_deref().map(avatar_style).unwrap_or_else(|| avatar_style(&title)),
+                    "{avatar}"
+                }
             }
             div { class: "chat-header-copy",
                 strong { "{title}" }
-                span { "{subtitle}" }
+                if let Some(text) = header_label {
+                    span { class: "working-label", role: "status", "{text}" }
+                } else {
+                    span { "{subtitle}" }
+                }
             }
             span { class: "{pill_class}", role: "status",
                 if pill_label == "working" {
@@ -2574,7 +2640,13 @@ fn Topbar(
                         overlay.set(Overlay::Team);
                     },
                     for (id, avatar) in team {
-                        span { key: "{id}", class: "avatar sm bot", style: avatar_style(&id), "{avatar}" }
+                        span {
+                            key: "{id}",
+                            class: "avatar-wrap sm",
+                            "data-activity": activity_attr(team_acts.get(&id).and_then(|a| a.as_ref())),
+                            title: team_acts.get(&id).and_then(|a| a.as_ref()).map(BotActivity::label).unwrap_or_default(),
+                            span { class: "avatar sm bot", style: avatar_style(&id), "{avatar}" }
+                        }
                     }
                 }
                 button {
@@ -2994,6 +3066,14 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                 )
             })
             .collect::<Vec<_>>()
+    };
+    let member_acts: HashMap<String, Option<BotActivity>> = {
+        let state = session.read();
+        let now = Instant::now();
+        talking_to
+            .iter()
+            .map(|(id, _, _)| (id.clone(), state.state.working.activity_of(id, now)))
+            .collect()
     };
     // The team row is collapsed by default: routing state changes rarely, so it
     // sits behind one caption chip instead of a permanent row of pills.
@@ -3557,9 +3637,19 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     }
                                     if !team_collapsed() {
                                         for (bot_id, bot_name, bot_avatar) in talking_to.iter() {
-                                            span { key: "{bot_id}", class: "team-chip",
-                                                span { class: "avatar sm bot", style: avatar_style(bot_id), "{bot_avatar}" }
+                                            span {
+                                                key: "{bot_id}",
+                                                class: "team-chip",
+                                                "data-activity": activity_attr(member_acts.get(bot_id).and_then(|a| a.as_ref())),
+                                                span {
+                                                    class: "avatar-wrap sm",
+                                                    "data-activity": activity_attr(member_acts.get(bot_id).and_then(|a| a.as_ref())),
+                                                    span { class: "avatar sm bot", style: avatar_style(bot_id), "{bot_avatar}" }
+                                                }
                                                 "{bot_name}"
+                                                if let Some(text) = member_acts.get(bot_id).and_then(|a| a.as_ref()).map(BotActivity::label) {
+                                                    span { class: "working-label", role: "status", "{text}" }
+                                                }
                                             }
                                         }
                                     }

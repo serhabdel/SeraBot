@@ -34,6 +34,8 @@ pub struct State {
     pub task: Option<Task>,
     /// Live steps of the latest turn, from the event stream.
     pub activity: crate::activity::Activity,
+    /// Which bots are working now (rail, header and room rings).
+    pub working: crate::working::WorkingBots,
     pub approvals: Vec<Approval>,
     pub approvals_loaded: bool,
     pub conversations: Vec<ConversationSummary>,
@@ -125,6 +127,7 @@ impl Default for State {
             history_loaded: false,
             task: None,
             activity: Default::default(),
+            working: Default::default(),
             approvals: Vec::new(),
             approvals_loaded: false,
             conversations: Vec::new(),

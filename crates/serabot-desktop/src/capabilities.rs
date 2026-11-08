@@ -257,6 +257,16 @@ pub const CAPABILITIES: &[Capability] = &[
             "elevenlabs_generate_video",
         ],
     },
+    Capability {
+        group: "Media",
+        needs: Needs::Connector {
+            name: "ElevenLabs",
+            ids: &["elevenlabs"],
+        },
+        label: "Use your ElevenLabs tools",
+        hint: "Voice, music, sound, images and video your ElevenLabs plan includes. Anything that spends credits asks you first.",
+        tools: &["elevenlabs_mcp_list_tools", "elevenlabs_mcp_call"],
+    },
     // ---- Memory
     Capability {
         group: "Memory",

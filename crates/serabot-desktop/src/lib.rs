@@ -31,6 +31,7 @@ pub mod teams;
 pub mod ui_highlight;
 pub mod updater;
 pub mod worker;
+pub mod working;
 pub use api::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -196,6 +196,7 @@ impl Runtime {
             "task_id": task.id,
             "turn_id": turn.id,
             "conversation_id": turn.conversation_id,
+            "bot": turn.bot,
             "call_id": truncate_chars(&call.id, 64),
             "step": ordinal,
             "phase": phase.as_str(),
