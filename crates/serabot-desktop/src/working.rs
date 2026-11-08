@@ -146,7 +146,7 @@ impl WorkingBots {
             .retain(|entry| now.saturating_duration_since(entry.seen) < STALE_AFTER);
     }
 
-    fn live<'a>(&'a self, now: Instant) -> impl Iterator<Item = &'a Entry> {
+    fn live(&self, now: Instant) -> impl Iterator<Item = &Entry> {
         self.entries
             .iter()
             .filter(move |entry| now.saturating_duration_since(entry.seen) < STALE_AFTER)
@@ -234,8 +234,16 @@ mod tests {
     fn between_steps_the_bot_keeps_working_without_a_stale_label() {
         let now = Instant::now();
         let mut w = WorkingBots::default();
-        w.apply("turn.step", &step("t1", "a", "dir:a", "running", "Reading"), now);
-        w.apply("turn.step", &step("t1", "a", "dir:a", "done", "Reading"), now);
+        w.apply(
+            "turn.step",
+            &step("t1", "a", "dir:a", "running", "Reading"),
+            now,
+        );
+        w.apply(
+            "turn.step",
+            &step("t1", "a", "dir:a", "done", "Reading"),
+            now,
+        );
         assert_eq!(w.activity_of("a", now), Some(BotActivity::Working(None)));
         assert_eq!(w.activity_of("a", now).unwrap().label(), WORKING_LABEL);
     }
@@ -244,7 +252,11 @@ mod tests {
     fn waiting_for_approval_is_not_animated() {
         let now = Instant::now();
         let mut w = WorkingBots::default();
-        w.apply("turn.step", &step("t1", "a", "dir:a", "waiting_approval", "Send"), now);
+        w.apply(
+            "turn.step",
+            &step("t1", "a", "dir:a", "waiting_approval", "Send"),
+            now,
+        );
         let activity = w.activity_of("a", now).unwrap();
         assert_eq!(activity, BotActivity::WaitingApproval);
         assert!(!activity.animates());
@@ -256,8 +268,16 @@ mod tests {
     fn room_members_are_tracked_one_by_one() {
         let now = Instant::now();
         let mut w = WorkingBots::default();
-        w.apply("turn.step", &step("t1", "writer", "room:r", "running", "Writing"), now);
-        w.apply("turn.step", &step("t2", "editor", "room:r", "running", "Checking"), now);
+        w.apply(
+            "turn.step",
+            &step("t1", "writer", "room:r", "running", "Writing"),
+            now,
+        );
+        w.apply(
+            "turn.step",
+            &step("t2", "editor", "room:r", "running", "Checking"),
+            now,
+        );
         assert_eq!(w.working_bots(now), vec!["editor", "writer"]);
         assert!(w.conversation_working("room:r", now));
         assert!(!w.conversation_working("room:other", now));
@@ -269,7 +289,11 @@ mod tests {
     fn a_quiet_stream_expires_instead_of_spinning_forever() {
         let start = Instant::now();
         let mut w = WorkingBots::default();
-        w.apply("turn.step", &step("t1", "a", "dir:a", "running", "x"), start);
+        w.apply(
+            "turn.step",
+            &step("t1", "a", "dir:a", "running", "x"),
+            start,
+        );
         let later = start + STALE_AFTER + Duration::from_secs(1);
         assert!(w.working_bots(later).is_empty());
         assert_eq!(w.activity_of("a", later), None);
@@ -281,12 +305,12 @@ mod tests {
     fn steps_without_a_bot_or_with_junk_are_ignored() {
         let now = Instant::now();
         let mut w = WorkingBots::default();
-        assert!(!w.apply("turn.step", &json!({"task_id": "t", "phase": "running"}), now));
         assert!(!w.apply(
             "turn.step",
-            &step("t", "a", "c", "exploding", "x"),
+            &json!({"task_id": "t", "phase": "running"}),
             now
         ));
+        assert!(!w.apply("turn.step", &step("t", "a", "c", "exploding", "x"), now));
         assert!(!w.apply("task.queued", &json!({"task_id": "t"}), now));
         let long = "x".repeat(500);
         w.apply("turn.step", &step("t", "a", "c", "running", &long), now);

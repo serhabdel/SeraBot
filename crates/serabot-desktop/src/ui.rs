@@ -2578,8 +2578,12 @@ fn Topbar(
                 .working
                 .activity_of(bot, now)
                 .or_else(|| busy.then_some(BotActivity::Working(None))),
-            None => (busy || state.state.working.conversation_working(&state.conversation, now))
-                .then_some(BotActivity::Working(None)),
+            None => (busy
+                || state
+                    .state
+                    .working
+                    .conversation_working(&state.conversation, now))
+            .then_some(BotActivity::Working(None)),
         };
         let members = team
             .iter()
