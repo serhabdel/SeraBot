@@ -853,6 +853,12 @@ pub struct BotDetail {
     /// The browser profile this bot uses; `None` means the default profile.
     #[serde(default)]
     pub browser_profile: Option<String>,
+    /// The bot's thinking level; `None` means the model's default.
+    #[serde(default)]
+    pub thinking: Option<String>,
+    /// Levels the bot's model accepts; empty when it has no thinking control.
+    #[serde(default)]
+    pub thinking_levels: Vec<String>,
 }
 
 /// Body of `PUT /v1/admin/bots/{id}/config`. Every field is optional; the
@@ -1592,6 +1598,34 @@ pub struct CatalogEntry {
     pub context_length: Option<u64>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Thinking levels the model accepts, weakest first; empty when it has
+    /// no thinking control.
+    #[serde(default)]
+    pub thinking: Vec<String>,
+}
+
+/// The open conversation's thinking level and the levels its model accepts.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct ThinkingInfo {
+    /// The level the owner picked, or `None` for the model's default.
+    #[serde(default)]
+    pub level: Option<String>,
+    #[serde(default)]
+    pub levels: Vec<String>,
+}
+
+/// A plain label for a thinking level.
+pub fn thinking_label(level: &str) -> &'static str {
+    match level {
+        "off" => "Off",
+        "minimal" => "Minimal",
+        "low" => "Low",
+        "medium" => "Medium",
+        "high" => "High",
+        "xhigh" => "Extra high",
+        "max" => "Max",
+        _ => "Default",
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1602,6 +1636,8 @@ pub struct Catalog {
     pub selection: Selection,
     #[serde(default)]
     pub effective_selection: Option<Selection>,
+    #[serde(default)]
+    pub thinking: ThinkingInfo,
 }
 
 impl Catalog {
@@ -2140,6 +2176,37 @@ impl ApiClient {
             return Err(ApiError::InvalidResponse);
         }
         Ok(history)
+    }
+    /// `PUT /v1/conversations/{id}/thinking`: set the conversation's thinking
+    /// level (`None` goes back to the model's default).
+    pub fn set_thinking(
+        &self,
+        conversation: &str,
+        level: Option<&str>,
+    ) -> Result<Option<String>, ApiError> {
+        check_id(conversation)?;
+        if level
+            .is_some_and(|level| level.len() > 16 || level.chars().any(|c| !c.is_ascii_lowercase()))
+        {
+            return Err(ApiError::Validation(
+                "Choose a thinking level from the list.",
+            ));
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            level: Option<&'a str>,
+        }
+        #[derive(Deserialize)]
+        struct Reply {
+            thinking: ThinkingInfo,
+        }
+        let reply: Reply = self.request(
+            Method::PUT,
+            &["v1", "conversations", conversation, "thinking"],
+            &[],
+            Some(&Body { level }),
+        )?;
+        Ok(reply.thinking.level)
     }
     pub fn select(&self, conversation: &str, selection: &Selection) -> Result<Selection, ApiError> {
         check_id(conversation)?;
@@ -4352,6 +4419,25 @@ mod tests {
             last_message: None,
             avatar_version: None,
         }
+    }
+
+    #[test]
+    fn catalog_reads_thinking_levels_and_older_servers_omit_them() {
+        let catalog: Catalog = serde_json::from_str(
+            r#"{"providers":[],"entries":[{"provider":"default","model":"m","thinking":["off","high"]}],
+               "selection":{"provider":"default","model":"m"},
+               "thinking":{"level":"high","levels":["off","high"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(catalog.thinking.level.as_deref(), Some("high"));
+        assert_eq!(catalog.thinking.levels, ["off", "high"]);
+        assert_eq!(catalog.entries[0].thinking, ["off", "high"]);
+        let old: Catalog =
+            serde_json::from_str(r#"{"providers":[],"selection":{"provider":"auto","model":""}}"#)
+                .unwrap();
+        assert!(old.thinking.levels.is_empty() && old.thinking.level.is_none());
+        assert_eq!(thinking_label("xhigh"), "Extra high");
+        assert_eq!(thinking_label("bogus"), "Default");
     }
 
     #[test]

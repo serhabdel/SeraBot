@@ -513,6 +513,7 @@ mod tests {
                 require_approval: vec![],
                 enabled,
                 temperature: None,
+                thinking: None,
                 role,
                 delegates,
             },

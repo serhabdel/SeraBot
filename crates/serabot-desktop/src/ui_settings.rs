@@ -171,6 +171,7 @@ fn BotForm(session: Signal<Session>, id: String) -> Element {
         )
     };
     let groups = model_groups(&session.read());
+    let thinking_levels = session.read().bot_thinking_levels();
     let profiles = session.read().panel.profiles.clone();
     let name_error = draft.name_error();
     let description_error = draft.description_error();
@@ -316,6 +317,33 @@ fn BotForm(session: Signal<Session>, id: String) -> Element {
                         }
                     }
                     span { class: "hint", "Default uses the model picked for the chat." }
+                }
+                if !thinking_levels.is_empty() {
+                    div { class: "field",
+                        label { class: "field-label", r#for: "bot-thinking", "Thinking" }
+                        select {
+                            id: "bot-thinking",
+                            class: "select",
+                            value: "{draft.thinking}",
+                            disabled: !hydrated,
+                            onchange: move |event| {
+                                let mut s = session.write();
+                                s.bot_settings.draft.thinking = event.value();
+                                s.bot_settings.error = None;
+                                s.bot_settings.notice = None;
+                            },
+                            option { value: "", selected: draft.thinking.is_empty(), "Default" }
+                            for level in thinking_levels.clone() {
+                                option {
+                                    key: "{level}",
+                                    value: "{level}",
+                                    selected: level == draft.thinking,
+                                    "{serabot_desktop::thinking_label(&level)}"
+                                }
+                            }
+                        }
+                        span { class: "hint", "Only applies when the model supports it." }
+                    }
                 }
                 div { class: "field",
                     label { class: "field-label", r#for: "bot-profile", "Browser profile" }

@@ -2266,7 +2266,15 @@ fn ActivityRow(mut session: Signal<Session>, step: Step) -> Element {
                 }
             }
             span { class: "step-icon", Icon { name: step_icon(&step.icon), size: 14 } }
-            span { class: "step-label", "{step.label}" }
+            if let Some(detail) = step.detail.clone() {
+                // The reasoning text a model returned: collapsed, plain text.
+                details { class: "step-thinking",
+                    summary { class: "step-label", "{step.label}" }
+                    pre { class: "step-thinking-text", "{detail}" }
+                }
+            } else {
+                span { class: "step-label", "{step.label}" }
+            }
             if let Some(id) = approval {
                 span { class: "step-actions",
                     button {
@@ -3808,6 +3816,7 @@ fn ModelBar(session: Signal<Session>, #[props(default = false)] compact: bool) -
                                 name: None,
                                 context_length: None,
                                 tags: Vec::new(),
+                                thinking: Vec::new(),
                             })
                     })
                     .collect();
@@ -3850,6 +3859,22 @@ fn ModelBar(session: Signal<Session>, #[props(default = false)] compact: bool) -
         .find(|(item_value, _)| *item_value == value)
         .map(|(_, label)| label.clone())
         .unwrap_or_else(|| "Auto · approved route".to_owned());
+    // Thinking levels the saved model accepts, and the one in force. The
+    // picker is absent for a model with no thinking control.
+    let (thinking_levels, thinking_now) = {
+        let session = session.read();
+        session
+            .state
+            .catalog
+            .as_ref()
+            .map(|catalog| {
+                (
+                    catalog.thinking.levels.clone(),
+                    catalog.thinking.level.clone().unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default()
+    };
     let mut open = use_signal(|| false);
     let mut query = use_signal(String::new);
     let mut active_idx = use_signal(|| 0usize);
@@ -4029,6 +4054,29 @@ fn ModelBar(session: Signal<Session>, #[props(default = false)] compact: bool) -
                                 }
                             }
                             }
+                        }
+                    }
+                }
+            }
+            if !thinking_levels.is_empty() && !changed {
+                select {
+                    class: "select thinking-select",
+                    title: "How hard the model thinks before it answers",
+                    "aria-label": "Thinking level",
+                    value: "{thinking_now}",
+                    onchange: move |event| {
+                        let picked = event.value();
+                        session
+                            .write()
+                            .set_thinking((!picked.is_empty()).then_some(picked));
+                    },
+                    option { value: "", selected: thinking_now.is_empty(), "Thinking: default" }
+                    for level in thinking_levels.clone() {
+                        option {
+                            key: "{level}",
+                            value: "{level}",
+                            selected: level == thinking_now,
+                            "Thinking: {serabot_desktop::thinking_label(&level)}"
                         }
                     }
                 }

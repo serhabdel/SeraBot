@@ -2946,6 +2946,13 @@ impl Session {
                             self.state.error = None;
                             self.schedule(Operation::ChatPlan, Duration::ZERO);
                         }
+                        OperationKind::Thinking => {
+                            // The picker shows the server's value, never a guess:
+                            // read it back and tell the owner.
+                            self.toast = Some(format!("Thinking level was not changed: {message}"));
+                            self.state.error = None;
+                            self.schedule(Operation::Catalog, Duration::ZERO);
+                        }
                         OperationKind::StopTurn => {
                             // The reply keeps running; Stop can be pressed again.
                             self.toast = Some(format!("Could not stop the reply: {message}"));
@@ -4302,6 +4309,12 @@ impl Session {
             self.state.auto_approve = false;
         }
         self.start_request(Operation::SetAutoApprove { enabled });
+    }
+
+    /// Pick the open conversation's thinking level (None for the model's
+    /// default). The server stores it only when the model accepts it.
+    pub fn set_thinking(&mut self, level: Option<String>) {
+        self.start_request(Operation::SetThinking { level });
     }
 
     pub fn unarchive_conversation(&mut self, id: String) {

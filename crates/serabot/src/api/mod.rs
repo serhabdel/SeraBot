@@ -401,6 +401,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/connectors", get(list_connectors))
         .route("/v1/models", get(models))
         .route("/v1/conversations/{id}/model", put(select_model))
+        .route("/v1/conversations/{id}/thinking", put(set_thinking))
         .route(
             "/v1/conversations/{id}/messages",
             get(conversation_messages),
@@ -768,6 +769,36 @@ impl IntoResponse for SeraError {
             )
                 .into_response();
         }
+        if let SeraError::Rejected { code, message } = &self {
+            warn!(code, reason = %message, "api request rejected");
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ApiErrorBody {
+                    error: message.clone(),
+                    code,
+                }),
+            )
+                .into_response();
+        }
+        if let SeraError::Validation(text) = &self {
+            // Only server-authored static text is shown; any other
+            // validation message may carry user content and stays generic.
+            // The reason is logged only for the audited static texts.
+            match safe_validation_text(text) {
+                Some(safe) => {
+                    warn!(reason = safe, "api request failed validation");
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(ApiErrorBody {
+                            error: safe.to_owned(),
+                            code: "validation",
+                        }),
+                    )
+                        .into_response();
+                }
+                None => warn!("api request failed validation (reason withheld)"),
+            }
+        }
         let (status, code, message) = match &self {
             SeraError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found", "not found"),
             SeraError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden", "forbidden"),
@@ -806,6 +837,64 @@ impl IntoResponse for SeraError {
     }
 }
 
+/// Validation messages that are fixed server-authored text (no user content,
+/// no secrets) and so safe to show. Anything not listed stays generic.
+const SAFE_VALIDATION_TEXTS: &[&str] = &[
+    "message is empty",
+    "message is too long",
+    "too many attachments",
+    "duplicate attachment",
+    "pick a provider and model for the default route",
+    "unknown model provider",
+    "model is not allowed for this provider",
+];
+
+fn safe_validation_text(text: &str) -> Option<&'static str> {
+    SAFE_VALIDATION_TEXTS
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == text)
+}
+
 pub fn sanitize_for_event(value: &str) -> String {
     truncate_chars(value, 2000)
+}
+
+#[cfg(test)]
+mod error_text_tests {
+    use super::*;
+
+    async fn body_of(error: SeraError) -> (StatusCode, Value) {
+        let response = error.into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn rejected_errors_carry_their_code_and_message() {
+        let (status, body) = body_of(SeraError::Rejected {
+            code: "model_unavailable",
+            message: "That model isn't available for Mistral right now".into(),
+        })
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["code"], "model_unavailable");
+        assert_eq!(
+            body["error"],
+            "That model isn't available for Mistral right now"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_audited_static_validation_text_is_shown() {
+        let (_, body) = body_of(SeraError::Validation("message is empty".into())).await;
+        assert_eq!(body["error"], "message is empty");
+        assert_eq!(body["code"], "validation");
+        // Anything else may carry user content and stays generic.
+        let (_, body) = body_of(SeraError::Validation("unknown bot secret-name".into())).await;
+        assert_eq!(body["error"], "invalid request");
+    }
 }
