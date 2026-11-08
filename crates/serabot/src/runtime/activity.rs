@@ -12,6 +12,8 @@ use super::*;
 const MAX_LABEL_CHARS: usize = 80;
 /// Longest host shown in a label.
 const MAX_HOST_CHARS: usize = 48;
+/// Longest reasoning text one Thinking step carries.
+const THINKING_EVENT_CHARS: usize = 4000;
 
 /// What the desktop renders for one step.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +205,29 @@ impl Runtime {
         if let Some(id) = approval_id {
             payload["approval_id"] = json!(id);
         }
+        let _ = self.store.append_event(user_id, "turn.step", &payload);
+    }
+
+    /// Best-effort collapsed "Thinking" step carrying the reasoning text a
+    /// model returned. The text is untrusted display data: it passes the
+    /// blocklist like any outgoing text, is bounded, and is dropped (the step
+    /// is not emitted) when it does not.
+    pub(super) fn emit_thinking(&self, user_id: &str, task: &Task, turn: &Turn, reasoning: &str) {
+        let text = truncate_chars(reasoning.trim(), THINKING_EVENT_CHARS);
+        if text.is_empty() || self.gateway.scan_egress(user_id, &text).is_err() {
+            return;
+        }
+        let payload = json!({
+            "task_id": task.id,
+            "turn_id": turn.id,
+            "conversation_id": turn.conversation_id,
+            "call_id": format!("thinking-{}", new_id()),
+            "step": 0,
+            "phase": "done",
+            "icon": "brain",
+            "label": "Thinking",
+            "detail": text,
+        });
         let _ = self.store.append_event(user_id, "turn.step", &payload);
     }
 }

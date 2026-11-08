@@ -136,6 +136,89 @@ impl Runtime {
         Ok(())
     }
 
+    fn thinking_key(conversation_id: &str) -> String {
+        format!("thinking:{conversation_id}")
+    }
+
+    /// The conversation's own thinking level, when the owner picked one.
+    pub fn conversation_thinking(&self, conversation_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .store
+            .kv_get(&Self::thinking_key(conversation_id))?
+            .filter(|level| crate::thinking::is_known_level(level)))
+    }
+
+    /// The thinking levels the conversation's current model accepts.
+    pub fn conversation_thinking_levels(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        bot: &str,
+    ) -> Result<Vec<&'static str>> {
+        let selection = self.effective_model_selection(user_id, conversation_id, bot)?;
+        Ok(self.router.thinking_levels(user_id, &selection))
+    }
+
+    /// Set (or with `None`, clear) the conversation's thinking level. The
+    /// level must be one the current model accepts; a later model change that
+    /// does not accept it simply stops applying it.
+    pub fn set_conversation_thinking(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        bot: &str,
+        level: Option<&str>,
+    ) -> Result<Option<String>> {
+        validate_conversation_id(conversation_id)?;
+        self.guard_conversation_scope(user_id, conversation_id)?;
+        let key = Self::thinking_key(conversation_id);
+        let Some(level) = level else {
+            self.store.kv_set(&key, "")?;
+            return Ok(None);
+        };
+        let levels = self.conversation_thinking_levels(user_id, conversation_id, bot)?;
+        if !levels.contains(&level) {
+            return Err(SeraError::Rejected {
+                code: "thinking_unavailable",
+                message: if levels.is_empty() {
+                    "This model has no thinking levels".into()
+                } else {
+                    "That thinking level isn't available for this model".into()
+                },
+            });
+        }
+        self.store.kv_set(&key, level)?;
+        self.store.record_audit(
+            user_id,
+            "model.thinking_set",
+            None,
+            None,
+            None,
+            None,
+            Some(self.gateway.policy().version()),
+            Some(&json!({"level": level})),
+        )?;
+        Ok(Some(level.to_owned()))
+    }
+
+    /// The level a turn applies: the conversation's, else the bot's. The
+    /// router ignores it when the model does not support it.
+    pub(super) fn turn_thinking(
+        &self,
+        conversation_id: &str,
+        bot: &crate::config::LoadedBot,
+    ) -> Option<String> {
+        self.conversation_thinking(conversation_id)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                bot.config
+                    .thinking
+                    .clone()
+                    .filter(|level| crate::thinking::is_known_level(level))
+            })
+    }
+
     /// The acting user's routable provider catalog. A provider they hold no
     /// credential for is absent, never shown with another account's status.
     pub fn model_catalog(&self, user_id: &str) -> Result<Vec<ProviderView>> {

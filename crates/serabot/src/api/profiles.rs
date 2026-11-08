@@ -652,6 +652,7 @@ pub(super) async fn onboarding_confirm(
         display_name: None,
         description: None,
         model: None,
+        thinking: None,
         browser_profile: None,
     };
     let _saved = update_bot(

@@ -2104,6 +2104,7 @@ mod tests {
                 require_approval: vec![],
                 enabled: true,
                 temperature: None,
+                thinking: None,
                 role: crate::orchestration::BotRole::Orchestrator,
                 delegates: vec![],
             },

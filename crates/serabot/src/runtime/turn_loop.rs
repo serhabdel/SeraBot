@@ -528,10 +528,21 @@ impl Runtime {
                 .scan_egress(&user, &serde_json::to_string(&tool_specs)?)?;
             // Vault values never reach a model: redact a copy of the request.
             let outgoing = self.gateway.redact_messages(&user, &state.messages)?;
+            let thinking = self.turn_thinking(conversation_id, &bot);
             let response = self
                 .router
-                .complete(&user, route, &outgoing, &tool_specs, temperature)
+                .complete_with_thinking(
+                    &user,
+                    route,
+                    &outgoing,
+                    &tool_specs,
+                    temperature,
+                    thinking.as_deref(),
+                )
                 .await?;
+            if let Some(reasoning) = response.reasoning.as_deref() {
+                self.emit_thinking(&user, task, &turn, reasoning);
+            }
             self.store.record_audit(
                 &user,
                 "model.used",

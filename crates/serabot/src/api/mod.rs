@@ -401,6 +401,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/connectors", get(list_connectors))
         .route("/v1/models", get(models))
         .route("/v1/conversations/{id}/model", put(select_model))
+        .route("/v1/conversations/{id}/thinking", put(set_thinking))
         .route(
             "/v1/conversations/{id}/messages",
             get(conversation_messages),

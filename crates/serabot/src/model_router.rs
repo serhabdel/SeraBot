@@ -91,6 +91,10 @@ pub struct CatalogEntry {
     pub context_length: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Thinking levels the model accepts, weakest first; absent when it has
+    /// no thinking control.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub thinking: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -403,6 +407,11 @@ impl ModelRouter {
                             .unwrap_or_default();
                         CatalogEntry {
                             provider: provider.id.clone(),
+                            thinking: crate::thinking::levels_for(
+                                &provider.kind,
+                                &model,
+                                &meta.tags,
+                            ),
                             model,
                             data_egress_approved: provider.data_egress_approved,
                             catalog_verified: verified,
@@ -865,6 +874,31 @@ impl ModelRouter {
         tools: &[ToolSpec],
         temperature: Option<f32>,
     ) -> Result<LlmResponse> {
+        self.complete_with_thinking(user_id, route, messages, tools, temperature, None)
+            .await
+    }
+
+    /// The thinking levels the acting user's account can pick for `selection`
+    /// (empty when the model has no thinking control). Detection reads the
+    /// live catalog's capability tags when the account has a list.
+    pub fn thinking_levels(&self, user_id: &str, selection: &ModelSelection) -> Vec<&'static str> {
+        self.providers
+            .get(&selection.provider)
+            .map(|provider| provider.thinking_levels(user_id, &selection.model))
+            .unwrap_or_default()
+    }
+
+    /// Like [`Self::complete`], applying a thinking `level` when the model
+    /// supports it. An unsupported level is ignored, never sent.
+    pub(crate) async fn complete_with_thinking(
+        &self,
+        user_id: &str,
+        route: &PinnedRoute,
+        messages: &[LlmMessage],
+        tools: &[ToolSpec],
+        temperature: Option<f32>,
+        thinking: Option<&str>,
+    ) -> Result<LlmResponse> {
         self.validate_pinned(route)?;
         let provider = &self.providers[&route.selection.provider];
         if !provider.available(user_id) {
@@ -877,9 +911,23 @@ impl ModelRouter {
                 return Err(model_unavailable_error(provider, &route.selection.model));
             }
         }
+        let extra = thinking.and_then(|level| {
+            crate::thinking::wire_fields(
+                &provider.kind,
+                &route.selection.model,
+                &provider.model_tags(user_id, &route.selection.model),
+                level,
+            )
+        });
         provider
             .client_for(&route.selection.provider, user_id)?
-            .complete(messages, tools, Some(&route.selection.model), temperature)
+            .complete_with(
+                messages,
+                tools,
+                Some(&route.selection.model),
+                temperature,
+                extra.as_ref(),
+            )
             .await
     }
 }
@@ -990,6 +1038,18 @@ impl Provider {
             .snapshots
             .get(user_id)
             .map(|snapshot| snapshot.models.clone())
+    }
+
+    /// Capability tags the account's live list gives `model` (empty without a
+    /// list).
+    fn model_tags(&self, user_id: &str, model: &str) -> Vec<String> {
+        self.live_models(user_id)
+            .and_then(|catalog| catalog.get(model).map(|meta| meta.tags.clone()))
+            .unwrap_or_default()
+    }
+
+    fn thinking_levels(&self, user_id: &str, model: &str) -> Vec<&'static str> {
+        crate::thinking::levels_for(&self.kind, model, &self.model_tags(user_id, model))
     }
 
     fn failed_recently(&self, user_id: &str) -> bool {

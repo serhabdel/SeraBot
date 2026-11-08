@@ -52,12 +52,50 @@ pub(super) async fn models(
         state
             .runtime
             .effective_model_selection(&user.id, &query.conversation_id, bot)?;
+    let levels =
+        state
+            .runtime
+            .conversation_thinking_levels(&user.id, &query.conversation_id, bot)?;
     Ok(Json(json!({
         "providers": state.runtime.model_catalog(&user.id)?,
         "entries": state.runtime.model_catalog_entries(&user.id)?,
         "selection": selection,
         "effective_selection": effective_selection,
+        "thinking": {
+            "level": state.runtime.conversation_thinking(&query.conversation_id)?,
+            "levels": levels,
+        },
     })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ThinkingRequest {
+    /// `off`, `low`, ... or `null` to go back to the model's default.
+    #[serde(default)]
+    level: Option<String>,
+    #[serde(default)]
+    bot: Option<String>,
+}
+
+/// `PUT /v1/conversations/{id}/thinking` - set the conversation's thinking
+/// level. Only a level the current model accepts is stored.
+pub(super) async fn set_thinking(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+    Json(request): Json<ThinkingRequest>,
+) -> Result<Json<Value>> {
+    validate_conversation_id(&id)?;
+    state.runtime.ensure_model_catalogs(&user.id).await;
+    let bot = request.bot.as_deref().unwrap_or("main");
+    let level = state.runtime.set_conversation_thinking(
+        &user.id,
+        &id,
+        bot,
+        request.level.as_deref().filter(|level| !level.is_empty()),
+    )?;
+    Ok(Json(json!({"thinking": {"level": level}})))
 }
 
 #[derive(Deserialize)]

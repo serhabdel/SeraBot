@@ -202,6 +202,7 @@ fn bot() -> LoadedBot {
             require_approval: vec![],
             enabled: true,
             temperature: None,
+            thinking: None,
             role: crate::orchestration::BotRole::Orchestrator,
             delegates: vec![],
         },
@@ -1098,6 +1099,7 @@ fn orchestrator_bots() -> Vec<LoadedBot> {
                 require_approval: vec![],
                 enabled: true,
                 temperature: None,
+                thinking: None,
                 role: crate::orchestration::BotRole::Orchestrator,
                 delegates: vec!["analyst".into()],
             },
@@ -1114,6 +1116,7 @@ fn orchestrator_bots() -> Vec<LoadedBot> {
                 require_approval: vec![],
                 enabled: true,
                 temperature: None,
+                thinking: None,
                 role: crate::orchestration::BotRole::Specialist,
                 delegates: vec![],
             },
@@ -1130,6 +1133,7 @@ fn orchestrator_bots() -> Vec<LoadedBot> {
                 require_approval: vec![],
                 enabled: true,
                 temperature: None,
+                thinking: None,
                 role: crate::orchestration::BotRole::Specialist,
                 delegates: vec![],
             },
@@ -2546,5 +2550,144 @@ async fn changing_model_loads_the_list_and_explains_a_refusal() {
     assert_eq!(
         error.to_string(),
         "That model isn't available for Mistral right now"
+    );
+}
+
+/// A Mistral Small 4 default provider (`reasoning_effort` capable) with its
+/// model on the live list.
+async fn sent_chat_body(server: &MockServer, index: usize) -> Value {
+    let requests = server.received_requests().await.unwrap();
+    let chats: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/v1/chat/completions")
+        .collect();
+    serde_json::from_slice::<Value>(&chats[index].body).unwrap()
+}
+
+async fn thinking_runtime(server: &MockServer) -> (Runtime, Store, Arc<Capture>) {
+    mount_live_list(server, &["mistral-small-2603", "mistral-large-latest"]).await;
+    let notifier = Arc::new(Capture::default());
+    let (runtime, store) = setup(
+        &server.uri(),
+        notifier.clone(),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    let mut config = (*runtime.config).clone();
+    config.llm.base_url = format!("{}/v1", server.uri());
+    config.llm.kind = "mistral".into();
+    config.llm.model = "mistral-small-2603".into();
+    config.llm.catalog_fetch = true;
+    let runtime = restart(&runtime, config, vec![bot()]);
+    runtime.ensure_model_catalogs(&admin(&store)).await;
+    (runtime, store, notifier)
+}
+
+#[tokio::test]
+async fn thinking_level_is_applied_and_the_reasoning_shows_as_a_step() {
+    let server = MockServer::start().await;
+    let (runtime, store, notifier) = thinking_runtime(&server).await;
+    let user = admin(&store);
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": [{"type": "text", "text": "weighing options"}]},
+                {"type": "text", "text": "Done."}
+            ]}, "finish_reason": "stop"}]
+        })))
+        .mount(&server)
+        .await;
+    // The model offers off/high; a level it lacks is refused with a reason.
+    assert_eq!(
+        runtime
+            .conversation_thinking_levels(&user, "owner", "main")
+            .unwrap(),
+        vec!["off", "high"]
+    );
+    let error = runtime
+        .set_conversation_thinking(&user, "owner", "main", Some("medium"))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        SeraError::Rejected {
+            code: "thinking_unavailable",
+            ..
+        }
+    ));
+    runtime
+        .set_conversation_thinking(&user, "owner", "main", Some("high"))
+        .unwrap();
+    runtime
+        .submit_text(&user, "owner", "think about it", None)
+        .unwrap();
+    let task = store.claim_task("test", 30).unwrap().unwrap();
+    runtime.process_task(task).await.unwrap();
+    assert_eq!(notifier.texts.lock().unwrap().as_slice(), ["Done."]);
+    let requests = server.received_requests().await.unwrap();
+    let chat = requests
+        .iter()
+        .find(|request| request.url.path() == "/v1/chat/completions")
+        .unwrap();
+    let body: Value = serde_json::from_slice(&chat.body).unwrap();
+    assert_eq!(body["reasoning_effort"], "high");
+    let events = store.events_after(&user, 0, 200).unwrap();
+    let step = events
+        .iter()
+        .find(|event| event.kind == "turn.step" && event.payload["label"] == "Thinking")
+        .expect("a Thinking step");
+    assert_eq!(step.payload["detail"], "weighing options");
+    assert_eq!(step.payload["phase"], "done");
+}
+
+#[tokio::test]
+async fn bot_thinking_applies_unless_the_conversation_overrides_and_unsupported_is_dropped() {
+    let server = MockServer::start().await;
+    let (runtime, store, _notifier) = thinking_runtime(&server).await;
+    let user = admin(&store);
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
+        })))
+        .mount(&server)
+        .await;
+    let mut thoughtful = bot();
+    thoughtful.config.thinking = Some("high".into());
+    let mut config = (*runtime.config).clone();
+    config.llm.model = "mistral-small-2603".into();
+    let runtime = restart(&runtime, config, vec![thoughtful]);
+    runtime.ensure_model_catalogs(&user).await;
+    // Bot level applies by default.
+    runtime.submit_text(&user, "a", "hi", None).unwrap();
+    let task = store.claim_task("test", 30).unwrap().unwrap();
+    runtime.process_task(task).await.unwrap();
+    assert_eq!(sent_chat_body(&server, 0).await["reasoning_effort"], "high");
+    // The conversation's own level wins.
+    runtime
+        .set_conversation_thinking(&user, "b", "main", Some("off"))
+        .unwrap();
+    runtime.submit_text(&user, "b", "hi", None).unwrap();
+    let task = store.claim_task("test", 30).unwrap().unwrap();
+    runtime.process_task(task).await.unwrap();
+    assert_eq!(sent_chat_body(&server, 1).await["reasoning_effort"], "none");
+    // A model without thinking control gets no parameter at all.
+    runtime
+        .select_model(
+            &user,
+            "c",
+            ModelSelection {
+                provider: "default".into(),
+                model: "mistral-large-latest".into(),
+            },
+        )
+        .unwrap();
+    runtime.submit_text(&user, "c", "hi", None).unwrap();
+    let task = store.claim_task("test", 30).unwrap().unwrap();
+    runtime.process_task(task).await.unwrap();
+    assert!(
+        sent_chat_body(&server, 2)
+            .await
+            .get("reasoning_effort")
+            .is_none()
     );
 }

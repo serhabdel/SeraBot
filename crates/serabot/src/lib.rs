@@ -63,6 +63,7 @@ pub mod sysstatus;
 pub mod tavily;
 pub mod teams;
 pub mod telegram;
+pub mod thinking;
 pub mod token_cli;
 pub mod token_connectors;
 pub mod tools;

@@ -1714,6 +1714,10 @@ pub struct BotConfig {
     pub enabled: bool,
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// Thinking level for models that support one (off, low, medium,
+    /// high, ...). Ignored when the chosen model has no such level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
     #[serde(default)]
     pub role: BotRole,
     #[serde(default)]
@@ -2035,6 +2039,7 @@ pub fn build_specialist_bot(
         require_approval: require_approval.clone(),
         enabled: false,
         temperature: None,
+        thinking: None,
         role: BotRole::Specialist,
         delegates: Vec::new(),
     };
@@ -2676,6 +2681,7 @@ mod tests {
                 require_approval: Vec::new(),
                 enabled: true,
                 temperature: None,
+                thinking: None,
                 role: BotRole::default(),
                 delegates: Vec::new(),
             },

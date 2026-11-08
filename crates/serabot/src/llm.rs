@@ -33,6 +33,9 @@ pub struct LlmResponse {
     pub message: LlmMessage,
     pub usage: Usage,
     pub finish_reason: Option<String>,
+    /// Reasoning text the provider returned with the answer, when it did.
+    /// Untrusted display data; never fed back as instructions.
+    pub reasoning: Option<String>,
 }
 
 struct RefreshPersistence {
@@ -190,6 +193,20 @@ impl LlmClient {
         model_override: Option<&str>,
         temperature: Option<f32>,
     ) -> Result<LlmResponse> {
+        self.complete_with(messages, tools, model_override, temperature, None)
+            .await
+    }
+
+    /// Like [`Self::complete`], merging `extra` (thinking-level fields built
+    /// by `thinking::wire_fields`) into the request body.
+    pub async fn complete_with(
+        &self,
+        messages: &[LlmMessage],
+        tools: &[ToolSpec],
+        model_override: Option<&str>,
+        temperature: Option<f32>,
+        extra: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<LlmResponse> {
         let model = model_override.unwrap_or(&self.model).to_owned();
         if model.is_empty() {
             return Err(SeraError::Config("LLM model is not configured".into()));
@@ -224,6 +241,11 @@ impl LlmClient {
         }
         if let Some(temperature) = temperature {
             body["temperature"] = json!(temperature.clamp(0.0, 2.0));
+        }
+        if let Some(extra) = extra {
+            for (key, value) in extra {
+                body[key.as_str()] = value.clone();
+            }
         }
 
         let url = format!("{}/chat/completions", self.base_url);
@@ -727,6 +749,7 @@ fn cloud_completion(parsed: CloudCodeCompletion) -> Result<LlmResponse> {
                 .saturating_add(parsed.completion_tokens),
         },
         finish_reason: parsed.finish_reason,
+        reasoning: None,
     })
 }
 
@@ -820,10 +843,7 @@ fn parse_response(bytes: &[u8]) -> Result<LlmResponse> {
     let message = choice
         .get("message")
         .ok_or_else(|| SeraError::External("LLM response has no message".into()))?;
-    let content = message
-        .get("content")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    let (content, reasoning) = crate::thinking::split_message(message);
     let mut tool_calls = Vec::new();
     if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
         for call in calls {
@@ -884,6 +904,7 @@ fn parse_response(bytes: &[u8]) -> Result<LlmResponse> {
         },
         usage,
         finish_reason,
+        reasoning,
     })
 }
 
