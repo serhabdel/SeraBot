@@ -320,6 +320,7 @@ fn capability_label(tool: &str) -> Option<&'static str> {
         | "elevenlabs_transcribe"
         | "elevenlabs_generate_image"
         | "elevenlabs_generate_video" => Some("Voice and media"),
+        "elevenlabs_mcp_list_tools" | "elevenlabs_mcp_call" => Some("ElevenLabs tools"),
         "onedrive_upload" | "onedrive_list" => Some("OneDrive files"),
         "github_search_repos"
         | "github_list_issues"
