@@ -546,9 +546,7 @@ pub fn valid_bot_description(text: &str) -> bool {
 /// the server checks role and registry and stays authoritative.
 pub fn validate_tool_edit(tools: &[String]) -> Result<(), ApiError> {
     if tools.len() > MAX_BOT_CONFIG_ITEMS {
-        return Err(ApiError::Validation(
-            "A bot can hold at most 128 tools.",
-        ));
+        return Err(ApiError::Validation("A bot can hold at most 128 tools."));
     }
     let mut seen = HashSet::with_capacity(tools.len());
     for tool in tools {
