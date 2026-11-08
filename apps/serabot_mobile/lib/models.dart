@@ -1,3 +1,5 @@
+import 'chat_models.dart';
+
 class Selection {
   const Selection({required this.provider, required this.model});
   final String provider;
@@ -129,14 +131,26 @@ class ChatMessage {
     required this.role,
     required this.content,
     required this.createdAt,
+    this.name,
+    this.bot,
+    this.attachments = const [],
   });
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) {
+    final att = json['attachments'];
     return ChatMessage(
       id: json['id'] as String,
       role: parseRole(json['role'] as String),
       content: json['content'] as String,
       createdAt: json['created_at'] as String,
+      name: json['name'] as String?,
+      bot: json['bot'] as String?,
+      attachments: att is List
+          ? att
+              .whereType<Map<String, dynamic>>()
+              .map(AttachmentInfo.fromJson)
+              .toList()
+          : const [],
     );
   }
 
@@ -144,6 +158,16 @@ class ChatMessage {
   final MessageRole role;
   final String content;
   final String createdAt;
+
+  /// Bot id on a room or handoff reply; null on ordinary assistant text.
+  final String? name;
+
+  /// Bot that produced this assistant message.
+  final String? bot;
+  final List<AttachmentInfo> attachments;
+
+  /// Who spoke, for the bubble header: the room speaker, else the bot.
+  String? get speaker => name ?? bot;
 }
 
 enum TaskStatus {
