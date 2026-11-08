@@ -25,8 +25,9 @@ accounts and a vault of passwords and keys. Nobody can see anyone else's data.
 ## Highlights
 
 - **Bots that work together.** A main bot hands tasks to specialists
-  (analyst, maker, watcher) and you can create your own, with a picture, a
-  model and a short interview that sets their role.
+  (analyst, maker, watcher, accountant, auditor, marketer, markets, courier,
+  inbox, WhatsApp) and you can create your own, with a picture, a model and a
+  short interview that sets their role.
 - **A real browser on the server.** Bots open public websites, read, click
   and type. You watch live and can take control at any time.
 - **Vault.** Store logins and API keys once. Bots use them by name and never

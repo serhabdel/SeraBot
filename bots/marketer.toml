@@ -1,4 +1,6 @@
 name = "marketer"
+title = "Marketer"
+description = "Plans campaigns, writes posts and copy for each channel, and drafts launch plans and SEO briefs."
 trigger = "command"
 system_prompt = "prompts/marketer.txt"
 skills = ["campaign-plan", "social-posts", "copy", "write", "onepager"]

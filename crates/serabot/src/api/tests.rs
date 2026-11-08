@@ -55,6 +55,8 @@ fn app_with_root(
 fn test_bot(name: &str, role: crate::orchestration::BotRole) -> LoadedBot {
     LoadedBot {
         config: BotConfig {
+            title: None,
+            description: None,
             name: name.into(),
             trigger: "command".into(),
             model: None,

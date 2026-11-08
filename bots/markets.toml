@@ -1,4 +1,6 @@
 name = "markets"
+title = "Markets"
+description = "Read-only stock and sector research, portfolio exposure, and simple valuation sketches with every assumption written out."
 trigger = "command"
 system_prompt = "prompts/markets.txt"
 skills = ["equity-research", "financial-analysis"]

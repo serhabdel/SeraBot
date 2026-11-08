@@ -220,6 +220,21 @@ provider must list the model — or `null` for the default model) and
 nothing. The response's `bot` carries `display_name`, `description`, `model`
 (model id or `null`) and `browser_profile`.
 
+Since 0.23 each bot entry also carries `title` (the shipped human title, or
+`null`), and `display_name` falls back to it when the owner has set no name.
+`description` falls back to the shipped one the same way.
+
+`GET /v1/bots/catalog` (0.23, "Meet your team") lists every shipped template as
+`{"id","title","description","role","installed","avatar_version"}`. `installed`
+is true only when the session user has a row with that id. A bot the owner
+removed shows `installed: false`. Only that user's rows are read.
+
+`POST /v1/bots/catalog/{name}/install` puts one shipped template back as the
+session user's own row, with the template's prompt, tools, and enabled flag. It
+never touches another user's rows. An unknown name is `404`; a bot the user
+already has is `409`. The offering is recorded, so later template upgrades reach
+the restored bot. Audited as `bot.installed`.
+
 `PUT /v1/admin/bots/{id}/config` (owner token) updates `tools`, `skills`, and/or
 `require_approval` for an existing bot:
 
