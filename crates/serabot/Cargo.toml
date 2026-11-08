@@ -99,12 +99,14 @@ zeroize = "1"
 # anything, plus the post-export link check. Same version and features
 # deckcraft-pptx already resolves, so this adds no new crate.
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+# Private per-call home for a password manager CLI (vault_providers): removed
+# when the call returns. Already in the lock file as a dev-dependency.
+tempfile = "3"
 
 [dev-dependencies]
 # Signs synthetic provider id_tokens in the wiremock OIDC tests. Never used
 # outside tests: production verifies id_tokens with the openidconnect crate.
 jsonwebtoken = "9"
 http-body-util = "0.1"
-tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"

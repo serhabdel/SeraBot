@@ -381,3 +381,112 @@ async fn a_provide_card_never_overwrites_and_only_secret_cards_take_values() {
     .await;
     assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+#[tokio::test]
+async fn a_save_card_replaces_an_entry_only_when_it_says_so_and_never_a_password_manager_entry() {
+    let (app, _, store) = app();
+    let owner = store
+        .create_user("subject-secret-d", "sd@example.example", "Synthetic SD")
+        .unwrap();
+    let token = mint_for(&store, &owner.id, "secret-d");
+    store
+        .ensure_conversation_accepts_turns(&owner.id, "dir:replace")
+        .unwrap();
+    let existing = call(
+        &app,
+        &token,
+        "PUT",
+        "/v1/vault/vendor-portal",
+        Some(json!({"kind": "password", "value": "synthetic-existing", "domains": ["vendor.example"]})),
+    )
+    .await;
+    assert_eq!(existing.status(), StatusCode::OK);
+    let external = call(
+        &app,
+        &token,
+        "PUT",
+        "/v1/vault/bank-login",
+        Some(json!({
+            "kind": "password",
+            "value": "",
+            "domains": ["bank.example"],
+            "source": "onepassword",
+            "reference": "op://Vault/Bank/password"
+        })),
+    )
+    .await;
+    assert_eq!(external.status(), StatusCode::OK);
+    let raise = |name: &str, replaces: Option<bool>| {
+        let mut payload = secret_payload();
+        payload["name"] = json!(name);
+        if let Some(replaces) = replaces {
+            payload["replaces"] = json!(replaces);
+        }
+        store
+            .create_card(
+                &owner.id,
+                "dir:replace",
+                "main",
+                CardKind::SecretRequest,
+                &payload,
+            )
+            .unwrap()
+    };
+
+    // A save over an existing name is refused unless the card says it replaces it.
+    let plain = raise("vendor-portal", None);
+    let refused = call(
+        &app,
+        &token,
+        "POST",
+        &format!("/v1/cards/{}/secret", plain.id),
+        Some(json!({"value": "synthetic-plain-value"})),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        store.get_card(&owner.id, &plain.id).unwrap().status,
+        CardStatus::Pending
+    );
+
+    // A card raised for that name replaces it.
+    let replacing = raise("vendor-portal", Some(true));
+    let saved = call(
+        &app,
+        &token,
+        "POST",
+        &format!("/v1/cards/{}/secret", replacing.id),
+        Some(json!({"value": "synthetic-replaced-value"})),
+    )
+    .await;
+    assert_eq!(saved.status(), StatusCode::OK);
+    assert_eq!(
+        store.get_card(&owner.id, &replacing.id).unwrap().status,
+        CardStatus::Answered
+    );
+
+    // A password manager entry is never replaced, even by a card that says so.
+    let over_external = raise("bank-login", Some(true));
+    let refused = call(
+        &app,
+        &token,
+        "POST",
+        &format!("/v1/cards/{}/secret", over_external.id),
+        Some(json!({"value": "synthetic-external-value"})),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        store.get_card(&owner.id, &over_external.id).unwrap().status,
+        CardStatus::Pending
+    );
+    let listed = read_json(call(&app, &token, "GET", "/v1/vault", None).await).await;
+    let bank = listed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "bank-login")
+        .unwrap();
+    assert_eq!(bank["source"], "onepassword");
+    assert!(!listed.to_string().contains("synthetic-external-value"));
+}

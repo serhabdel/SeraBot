@@ -227,6 +227,14 @@ impl FakeLauncher {
             backend.alive.store(false, Ordering::SeqCst);
         }
     }
+    /// Point every session of `user` at `url`, as a page that navigates by itself.
+    pub fn navigate_user(&self, user: &str, url: &str) {
+        for backend in self.backends.lock().unwrap().iter() {
+            if backend.user == user {
+                backend.set_url(url);
+            }
+        }
+    }
     pub fn calls_for(&self, user: &str) -> Vec<String> {
         self.backends
             .lock()
@@ -298,6 +306,9 @@ pub(crate) fn manager_with_base(
 #[derive(Default)]
 pub(crate) struct FakeResolver {
     pub requests: std::sync::Mutex<Vec<(String, String, String, String)>>,
+    /// Once set, the next resolve moves the user's pages to the URL after the
+    /// host check: a page that navigates during a slow password manager read.
+    pub moves_page: std::sync::Mutex<Option<(Arc<FakeLauncher>, String)>>,
 }
 
 impl FakeResolver {
@@ -334,6 +345,10 @@ impl SecretResolver for FakeResolver {
             host.into(),
         ));
         self.check(name, host)?;
+        let moved = self.moves_page.lock().unwrap().take();
+        if let Some((launcher, url)) = moved {
+            launcher.navigate_user(user_id, &url);
+        }
         Ok(Zeroizing::new(FAKE_SECRET.to_owned()))
     }
 }

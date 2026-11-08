@@ -872,15 +872,17 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         store.clone(),
         config.path(&config.documents.watch_dir),
     )?;
+    // One provider set for the browser fills and the gateway's redactor, so a
+    // value a fill reads is scrubbed from what the model sees.
+    let providers = Arc::new(serabot::vault_providers::Providers::new(&config.vault));
     let mut browser_manager = None;
     if config.browser.enabled {
         let manager = serabot::browser::build_manager(&config)?;
-        let providers = Arc::new(serabot::vault_providers::Providers::new(&config.vault));
         register_browser_tools(
             &mut registry,
             BrowserToolDeps {
                 manager: manager.clone(),
-                resolver: Arc::new(VaultResolver::new(users.clone(), providers)),
+                resolver: Arc::new(VaultResolver::new(users.clone(), providers.clone())),
                 artifacts: Some(artifacts.clone()),
                 store: store.clone(),
             },
@@ -977,7 +979,8 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.runtime.owner_standing_consent,
     )
     .with_respect_bot_lists(config.approvals.respect_bot_lists)
-    .with_vault(users.clone());
+    .with_vault(users.clone())
+    .with_resolved_values(providers.resolved_values());
 
     let runtime = Runtime::with_fleet(
         config.clone(),

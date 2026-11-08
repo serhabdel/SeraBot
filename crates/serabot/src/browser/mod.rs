@@ -70,7 +70,15 @@ impl VaultResolver {
 impl SecretResolver for VaultResolver {
     fn authorize(&self, user_id: &str, name: &str, field: &str, host: &str) -> Result<()> {
         let field = crate::vault::VaultField::parse(field)?;
-        crate::vault::authorize_fill(&self.users, user_id, name, host, field).map(|_| ())
+        crate::vault_providers::authorize_for_browser(
+            &self.users,
+            &self.providers,
+            user_id,
+            name,
+            host,
+            field,
+        )
+        .map(|_| ())
     }
 
     async fn resolve(

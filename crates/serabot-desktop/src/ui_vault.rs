@@ -546,7 +546,10 @@ fn ProviderRow(session: Signal<Session>, manager: PasswordManager) -> Element {
     } else {
         "No access token saved"
     };
-    let cli_line = if manager.cli_found {
+    let cli_line = if !manager.enabled {
+        "Off on this server (experimental): the server admin sets protonpass_enabled in [vault]."
+            .to_owned()
+    } else if manager.cli_found {
         "CLI found on this server".to_owned()
     } else {
         format!(
