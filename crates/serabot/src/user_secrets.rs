@@ -76,6 +76,9 @@ pub struct UserSecrets {
     master_key: Zeroizing<[u8; KEY_BYTES]>,
     /// The bootstrap admin id: the only account allowed to grant a provider.
     admin_id: String,
+    /// Serializes writes, so a read-merge-write (a token rotation) and a
+    /// plain write (a new sign-in) cannot interleave and lose one another.
+    writes: std::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for UserSecrets {
@@ -109,6 +112,7 @@ impl UserSecrets {
             store,
             master_key: Zeroizing::new(master_key),
             admin_id,
+            writes: std::sync::Mutex::new(()),
         })
     }
 
@@ -119,7 +123,32 @@ impl UserSecrets {
     pub fn set(&self, user_id: &str, provider: &str, value: &str) -> Result<()> {
         validate_provider(provider)?;
         validate_value(value)?;
+        let _write = self.lock_writes();
         self.seal_and_store(user_id, provider, value)
+    }
+
+    /// Read, change and write back one JSON provider credential under the
+    /// write lock. `change` returns an error to leave the row as it is.
+    pub(crate) fn update_provider(
+        &self,
+        user_id: &str,
+        provider: &str,
+        change: impl FnOnce(&mut ProviderCredential) -> Result<()>,
+    ) -> Result<()> {
+        validate_provider(provider)?;
+        let _write = self.lock_writes();
+        let secret = self
+            .get_unchecked(user_id, provider)?
+            .ok_or_else(|| SeraError::Secrets("rotated credential was not persisted".into()))?;
+        let mut credential = ProviderCredential::parse(&secret)?;
+        change(&mut credential)?;
+        self.seal_and_store(user_id, provider, &credential.encode()?)
+    }
+
+    fn lock_writes(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.writes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The store behind this credential vault, for the vault's metadata rows.
@@ -356,6 +385,14 @@ pub struct ProviderCredential {
     pub api_key: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub refresh_token: String,
+    /// OAuth only: when the access token stops being usable (Unix seconds).
+    /// Unset means unknown, so the next use renews it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    /// OAuth only: identifies one sign-in. A new sign-in gets a new value, and
+    /// a rotation written for an older sign-in is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
 }
 
 impl std::fmt::Debug for ProviderCredential {
@@ -445,6 +482,9 @@ pub struct UserCredentialWriter {
     user_id: String,
     provider: String,
     format: CredentialFormat,
+    /// The sign-in generation this writer was issued for. When set, a write
+    /// is refused unless the stored credential still carries it.
+    generation: Option<String>,
 }
 
 impl UserCredentialWriter {
@@ -459,7 +499,15 @@ impl UserCredentialWriter {
             user_id: user_id.into(),
             provider: provider.into(),
             format: CredentialFormat::Provider,
+            generation: None,
         }
+    }
+
+    /// Only write while the stored sign-in still has `generation`, so an older
+    /// token chain cannot overwrite a newer sign-in.
+    pub fn expecting(mut self, generation: Option<String>) -> Self {
+        self.generation = generation;
+        self
     }
 
     /// Replace a plain token value (the OneDrive refresh token).
@@ -473,6 +521,7 @@ impl UserCredentialWriter {
             user_id: user_id.into(),
             provider: provider.into(),
             format: CredentialFormat::Plain,
+            generation: None,
         }
     }
 }
@@ -488,22 +537,53 @@ impl std::fmt::Debug for UserCredentialWriter {
     }
 }
 
+impl UserCredentialWriter {
+    /// Apply `change` to the stored JSON credential, unless the sign-in it was
+    /// issued for has been replaced.
+    fn update(&self, change: impl FnOnce(&mut ProviderCredential) -> Result<()>) -> Result<()> {
+        self.users
+            .update_provider(&self.user_id, &self.provider, |credential| {
+                if let Some(expected) = &self.generation
+                    && credential.generation.as_ref() != Some(expected)
+                {
+                    return Err(SeraError::Secrets(
+                        "the ElevenLabs sign-in changed; this refresh was not saved".into(),
+                    ));
+                }
+                change(credential)
+            })
+    }
+}
+
 impl CredentialWriter for UserCredentialWriter {
     fn persist_rotation(&self, refresh: &str, access: Option<&str>) -> Result<()> {
         match self.format {
             CredentialFormat::Plain => self.users.set(&self.user_id, &self.provider, refresh),
             CredentialFormat::Provider => {
-                let secret = self
-                    .users
-                    .get(&self.user_id, &self.provider)?
-                    .ok_or_else(|| {
-                        SeraError::Secrets("rotated credential was not persisted".into())
-                    })?;
-                let mut credential = ProviderCredential::parse(&secret)?;
-                credential.merge_rotation(refresh, access)?;
-                self.users
-                    .set(&self.user_id, &self.provider, &credential.encode()?)
+                self.update(|credential| credential.merge_rotation(refresh, access))
             }
+        }
+    }
+
+    fn persist_refresh(
+        &self,
+        refresh: Option<&str>,
+        access: &str,
+        expires_at: Option<i64>,
+    ) -> Result<()> {
+        match (self.format, refresh) {
+            (CredentialFormat::Plain, Some(refresh)) => {
+                self.users.set(&self.user_id, &self.provider, refresh)
+            }
+            (CredentialFormat::Plain, None) => Ok(()),
+            (CredentialFormat::Provider, refresh) => self.update(|credential| {
+                match refresh {
+                    Some(refresh) => credential.merge_rotation(refresh, Some(access))?,
+                    None => credential.api_key = access.to_owned(),
+                }
+                credential.expires_at = expires_at;
+                Ok(())
+            }),
         }
     }
 }
@@ -978,6 +1058,7 @@ mod tests {
         let credential = ProviderCredential {
             api_key: "sk-debug-marker".into(),
             refresh_token: "refresh-debug-marker".into(),
+            ..Default::default()
         };
         let debug = format!("{credential:?}");
         assert!(!debug.contains("sk-debug-marker"));
@@ -992,6 +1073,7 @@ mod tests {
         let credential = ProviderCredential {
             api_key: "access-one".into(),
             refresh_token: "refresh-one".into(),
+            ..Default::default()
         };
         let encoded = credential.encode().unwrap();
         let parsed = ProviderCredential::parse(&SecretString::new(encoded)).unwrap();
@@ -1024,6 +1106,7 @@ mod tests {
         let credential = ProviderCredential {
             api_key: "access-one".into(),
             refresh_token: "refresh-one".into(),
+            ..Default::default()
         };
         secrets
             .set(&admin, "antigravity", &credential.encode().unwrap())

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::Utc;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::multipart::{Form, Part};
 use secrecy::{ExposeSecret, SecretString};
@@ -372,18 +372,21 @@ pub struct OauthSession {
 
 struct OauthTokens {
     access_token: SecretString,
-    expires_at: Option<chrono::DateTime<Utc>>,
+    /// Unix seconds; `None` means unknown, so the next use renews.
+    expires_at: Option<i64>,
     refresh_token: SecretString,
 }
 
 impl OauthSession {
-    /// A session for one stored sign-in. An empty access token is fine: the
-    /// first use refreshes. `writer` receives rotated refresh tokens.
+    /// A session for one stored sign-in. An empty access token or an unknown
+    /// expiry is fine: the first use refreshes. `writer` receives refreshed
+    /// tokens and their expiry.
     pub(crate) fn new(
         client_id: impl Into<String>,
         token_url: &str,
         access_token: &str,
         refresh_token: &str,
+        expires_at: Option<i64>,
         writer: Option<Arc<dyn CredentialWriter>>,
     ) -> Result<Self> {
         if refresh_token.trim().is_empty() {
@@ -395,7 +398,7 @@ impl OauthSession {
         Ok(Self {
             tokens: tokio::sync::Mutex::new(OauthTokens {
                 access_token: SecretString::new(access_token.to_owned()),
-                expires_at: None,
+                expires_at,
                 refresh_token: SecretString::new(refresh_token.to_owned()),
             }),
             client_id: client_id.into(),
@@ -410,13 +413,25 @@ impl OauthSession {
     }
 
     /// Current access token, refreshing first when missing or near expiry
-    /// (30 s skew). A rotated refresh token is written back through the
+    /// (30 s skew). The refresh holds the session lock, so concurrent callers
+    /// share one refresh. A rotated refresh token is written back through the
     /// writer; a failed write fails the call so the rotation is never lost.
     pub(crate) async fn current_access_token(&self) -> Result<SecretString> {
+        self.access(None).await
+    }
+
+    /// The server rejected `rejected`: renew it, unless another caller already
+    /// replaced it while this one waited, in which case the new token is used.
+    pub(crate) async fn renew_after_rejection(&self, rejected: &str) -> Result<SecretString> {
+        self.access(Some(rejected)).await
+    }
+
+    async fn access(&self, rejected: Option<&str>) -> Result<SecretString> {
         let mut guard = self.tokens.lock().await;
-        let stale = match guard.expires_at {
-            Some(at) => at <= Utc::now() + ChronoDuration::seconds(30),
-            None => true,
+        let stale = match (rejected, guard.expires_at) {
+            (Some(rejected), _) => guard.access_token.expose_secret() == rejected,
+            (None, Some(at)) => at <= Utc::now().timestamp() + 30,
+            (None, None) => true,
         };
         if stale {
             let pair = refresh_grant_at(
@@ -429,28 +444,29 @@ impl OauthSession {
             .map_err(|error| {
                 SeraError::External(format!("ElevenLabs token refresh failed: {error}"))
             })?;
-            if let Some(refresh) = &pair.refresh_token {
-                if let Some(writer) = &self.writer {
-                    writer
-                        .persist_rotation(refresh, Some(pair.access_token.as_str()))
-                        .map_err(|error| {
-                            SeraError::External(format!(
-                                "rotated ElevenLabs refresh token was not persisted: {error}"
-                            ))
-                        })?;
-                }
-                guard.refresh_token = SecretString::new(refresh.clone());
+            let expires_at = pair
+                .expires_in
+                .map(|seconds| Utc::now().timestamp() + seconds.min(86_400 * 7) as i64);
+            if let Some(writer) = &self.writer {
+                writer
+                    .persist_refresh(
+                        pair.refresh_token.as_deref(),
+                        pair.access_token.as_str(),
+                        expires_at,
+                    )
+                    .map_err(|error| {
+                        SeraError::External(format!(
+                            "refreshed ElevenLabs token was not persisted: {error}"
+                        ))
+                    })?;
             }
-            guard.expires_at = pair.expires_in.map(|seconds| {
-                Utc::now() + ChronoDuration::seconds(seconds.min(86_400 * 7) as i64)
-            });
+            if let Some(refresh) = pair.refresh_token {
+                guard.refresh_token = SecretString::new(refresh);
+            }
+            guard.expires_at = expires_at;
             guard.access_token = SecretString::new(pair.access_token);
         }
         Ok(guard.access_token.clone())
-    }
-
-    pub(crate) async fn invalidate(&self) {
-        self.tokens.lock().await.expires_at = None;
     }
 }
 
@@ -1736,6 +1752,7 @@ mod tests {
             &format!("{}/token", as_server.uri()),
             "",
             "old-refresh",
+            None,
             Some(writer.clone()),
         )
         .unwrap();
@@ -1756,7 +1773,49 @@ mod tests {
 
     #[test]
     fn oauth_session_needs_a_refresh_token() {
-        assert!(OauthSession::new(cimd_client_id(), ELEVENLABS_TOKEN_URL, "a", " ", None).is_err());
+        assert!(
+            OauthSession::new(cimd_client_id(), ELEVENLABS_TOKEN_URL, "a", " ", None, None)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_session_seeded_with_a_fresh_token_does_not_refresh() {
+        let as_server = MockServer::start().await;
+        let future = Utc::now().timestamp() + 3_600;
+        let session = OauthSession::new(
+            cimd_client_id(),
+            &format!("{}/token", as_server.uri()),
+            "stored-access",
+            "stored-refresh",
+            Some(future),
+            None,
+        )
+        .unwrap();
+        let token = session.current_access_token().await.unwrap();
+        assert_eq!(token.expose_secret(), "stored-access");
+        assert!(as_server.received_requests().await.unwrap().is_empty());
+        // A rejection of a token that is still current renews it, once.
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "renewed-access",
+                "expires_in": 3600,
+            })))
+            .mount(&as_server)
+            .await;
+        let renewed = session
+            .renew_after_rejection("stored-access")
+            .await
+            .unwrap();
+        assert_eq!(renewed.expose_secret(), "renewed-access");
+        // A second rejection of the old token finds the renewed one: no refresh.
+        let again = session
+            .renew_after_rejection("stored-access")
+            .await
+            .unwrap();
+        assert_eq!(again.expose_secret(), "renewed-access");
+        assert_eq!(as_server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

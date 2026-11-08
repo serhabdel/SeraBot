@@ -70,6 +70,8 @@ const UNTRUSTED_SOURCE_PREFIXES: &[&str] = &[
     "notion_",
     "onedrive_",
     "google_",
+    "elevenlabs_mcp_",
+    "elevenlabs_key_transcribe",
 ];
 
 const EXTRACTION_SYSTEM: &str = "You extract durable facts about the owner from one exchange, for the owner's private memory. \
@@ -627,6 +629,10 @@ mod tests {
             "pdf_inspect",
             "docx_read",
             "xlsx_read",
+            "elevenlabs_mcp_search_tools",
+            "elevenlabs_mcp_describe_tool",
+            "elevenlabs_mcp_call",
+            "elevenlabs_key_transcribe",
         ] {
             assert!(is_untrusted_source_tool(name), "{name}");
         }

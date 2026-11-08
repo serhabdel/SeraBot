@@ -1086,7 +1086,8 @@ async fn connector_catalog_lists_both_elevenlabs_connectors_in_voice_group() {
     assert_eq!(signin["enabled"], false);
     assert_eq!(signin["connected"], false);
     assert_eq!(signin["group"], "Voice & Media");
-    assert!(signin.get("auth").is_none() && signin.get("auth_modes").is_none());
+    assert!(signin.get("auth").is_none());
+    assert_eq!(signin["auth_modes"], json!(["oauth"]));
     // The API-key connector: its own key, its own switch.
     let key = find("elevenlabs_api_key");
     assert_eq!(key["kind"], "api_key");

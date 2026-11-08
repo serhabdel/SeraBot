@@ -7,7 +7,7 @@
 //! the admin console's `bot_config_overrides` are applied only when the
 //! admin's own fleet is loaded, never to the templates.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -2022,12 +2022,34 @@ pub fn apply_bot_config_override(config: &Config, bot: &mut BotConfig) {
 /// Map pre-rename tool names in a bot's tool and approval lists (see
 /// [`renamed_tool`]). Applied to bot files, stored bot rows and overrides.
 pub fn rename_legacy_tools(bot: &mut BotConfig) {
-    for tool in bot.tools.iter_mut().chain(bot.require_approval.iter_mut()) {
-        let renamed = renamed_tool(tool.as_str()).to_owned();
-        if renamed != *tool {
-            *tool = renamed;
+    rename_tool_list(&mut bot.tools);
+    rename_tool_list(&mut bot.require_approval);
+}
+
+/// Rename the pre-rename tool names in one list, in place.
+///
+/// A bot that has ElevenLabs MCP tools was in account-sign-in mode, so its
+/// old native names (`elevenlabs_text_to_speech` and the like) are dropped:
+/// the MCP tools replace them. Otherwise they become `elevenlabs_key_*`. A
+/// renamed `elevenlabs_mcp_list_tools` also brings `elevenlabs_mcp_describe_tool`.
+/// Duplicates are removed, keeping the first.
+pub fn rename_tool_list(list: &mut Vec<String>) {
+    let has_mcp = list.iter().any(|tool| tool.starts_with("elevenlabs_mcp_"));
+    let mut renamed: Vec<String> = Vec::with_capacity(list.len());
+    for tool in list.iter() {
+        let new_name = renamed_tool(tool);
+        let native_legacy = new_name != tool.as_str() && new_name.starts_with("elevenlabs_key_");
+        if native_legacy && has_mcp {
+            continue;
+        }
+        renamed.push(new_name.to_owned());
+        if tool == "elevenlabs_mcp_list_tools" {
+            renamed.push("elevenlabs_mcp_describe_tool".to_owned());
         }
     }
+    let mut seen: HashSet<String> = HashSet::with_capacity(renamed.len());
+    renamed.retain(|tool| seen.insert(tool.clone()));
+    *list = renamed;
 }
 
 /// Specialist tools the owner API may write into a scaffolded bot file.
@@ -2860,6 +2882,77 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 12, "expected the twelve shipped bot files");
+    }
+
+    fn renamed(names: &[&str]) -> Vec<String> {
+        let mut list: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+        rename_tool_list(&mut list);
+        list
+    }
+
+    #[test]
+    fn old_native_elevenlabs_names_become_the_key_tools_without_mcp() {
+        assert_eq!(
+            renamed(&[
+                "elevenlabs_text_to_speech",
+                "elevenlabs_list_voices",
+                "memory_save"
+            ]),
+            [
+                "elevenlabs_key_text_to_speech",
+                "elevenlabs_key_list_voices",
+                "memory_save"
+            ]
+        );
+        // An old name and its new one together collapse to one entry.
+        assert_eq!(
+            renamed(&["elevenlabs_transcribe", "elevenlabs_key_transcribe"]),
+            ["elevenlabs_key_transcribe"]
+        );
+    }
+
+    #[test]
+    fn a_bot_with_mcp_tools_drops_the_old_native_names() {
+        assert_eq!(
+            renamed(&[
+                "elevenlabs_mcp_list_tools",
+                "elevenlabs_mcp_call",
+                "elevenlabs_text_to_speech",
+                "elevenlabs_generate_image",
+            ]),
+            [
+                "elevenlabs_mcp_search_tools",
+                "elevenlabs_mcp_describe_tool",
+                "elevenlabs_mcp_call",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_renamed_list_tools_adds_describe_once_and_keeps_an_existing_one() {
+        assert_eq!(
+            renamed(&["elevenlabs_mcp_list_tools", "elevenlabs_mcp_describe_tool"]),
+            [
+                "elevenlabs_mcp_search_tools",
+                "elevenlabs_mcp_describe_tool",
+            ]
+        );
+        assert_eq!(
+            renamed(&[
+                "elevenlabs_mcp_list_tools",
+                "elevenlabs_mcp_call",
+                "elevenlabs_mcp_list_tools"
+            ]),
+            [
+                "elevenlabs_mcp_search_tools",
+                "elevenlabs_mcp_describe_tool",
+                "elevenlabs_mcp_call",
+            ]
+        );
+        // Renaming twice changes nothing more.
+        let once = renamed(&["elevenlabs_mcp_list_tools"]);
+        let twice = renamed(&once.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(once, twice);
     }
 
     fn shipped_bot(name: &str) -> BotConfig {

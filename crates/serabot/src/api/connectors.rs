@@ -185,6 +185,8 @@ pub(super) async fn list_connectors(
         "enabled": state.config.elevenlabs.mcp_enabled,
         "redirect_uri": Value::Null,
         "connected": crate::elevenlabs_mcp::is_signed_in(&state.users, &user.id)?,
+        // Kept for one release so an older console still finds its OAuth mode.
+        "auth_modes": ["oauth"],
         "secrets": {},
         "oauth": {
             "client_id": state.config.elevenlabs.oauth_client_id,
@@ -441,6 +443,7 @@ pub(super) async fn provider_oauth_complete(
     let credential = ProviderCredential {
         api_key: key,
         refresh_token: String::new(),
+        ..Default::default()
     };
     state.users.set(&user.id, &id, &credential.encode()?)?;
     state.runtime.invalidate_model_credentials(Some(&user.id));
@@ -474,6 +477,7 @@ pub(super) async fn set_provider_key(
     let credential = ProviderCredential {
         api_key: request.api_key.trim().to_owned(),
         refresh_token: String::new(),
+        ..Default::default()
     };
     state.users.set(&user.id, &id, &credential.encode()?)?;
     state.runtime.invalidate_model_credentials(Some(&user.id));
