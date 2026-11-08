@@ -3,7 +3,8 @@
 SeraBot talks to OpenAI-compatible chat-completion endpoints. Routing is
 configuration-driven. Builtin kinds supply an OpenAI-compatible base. A live
 model catalog is optional and cached in process memory per user and provider. When it
-loads, it is the list offered and accepted; the allowlist is the fallback. See\n[providers.md](providers.md). There is no automatic cross-provider fallback and no client-supplied
+loads, it is the list offered and accepted; the allowlist is the fallback. See
+[providers.md](providers.md). There is no automatic cross-provider fallback and no client-supplied
 endpoint.
 
 ## Providers and allowed models
