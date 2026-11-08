@@ -11,7 +11,7 @@ The two never share a credential and never run on the same request.
 
 ## ElevenLabs: account sign-in (hosted MCP)
 
-The hosted server at `https://api.elevenlabs.io/v1/mcp` exposes the whole ElevenLabs catalog the account's plan allows: voices, speech, music, sound, image and video generation, agents, knowledge bases, phone numbers, flows, and more. It is 120+ tools, so the model does not get them all at once. It works through three tools:
+The hosted server at `https://api.us.elevenlabs.io/v1/mcp` (the `resource` named by ElevenLabs' protected-resource document; `https://api.elevenlabs.io/v1/mcp` is the public fallback) exposes the whole ElevenLabs catalog the account's plan allows: voices, speech, music, sound, image and video generation, agents, knowledge bases, phone numbers, flows, and more. It is 120+ tools, so the model does not get them all at once. It works through three tools:
 
 | Tool | Arguments | Approval | What it does |
 |------|-----------|----------|--------------|
@@ -37,7 +37,7 @@ Rules the tools enforce, and the guidance the model is given:
 
 API equivalents (owner only): `POST /v1/admin/connectors/elevenlabs/oauth/start` returns the consent URL; `POST /v1/admin/connectors/elevenlabs/oauth/complete` takes `{code, verifier, redirect_uri}`; `DELETE /v1/admin/connectors/elevenlabs/oauth` disconnects.
 
-The authorization request is PKCE S256 with a CIMD client (`[elevenlabs].oauth_client_id`, the https URL of the metadata document this server publishes at `/.well-known/serabot-oauth-client.json`). The redirect is the fixed loopback `http://127.0.0.1:51122/oauth-callback`. The authorize and token endpoints are pinned in code. Scope: `[elevenlabs].oauth_scope`.
+The authorization request is PKCE S256 with a CIMD client (`[elevenlabs].oauth_client_id`, the https URL of the metadata document this server publishes at `/.well-known/serabot-oauth-client.json`). The redirect is the fixed loopback `http://127.0.0.1:51122/oauth-callback`. The authorize and token endpoints are pinned in code. Scope: `[elevenlabs].oauth_scope`. The authorize, token and refresh requests all carry the RFC 8707 `resource` (`https://api.us.elevenlabs.io/v1/mcp`), because the token is minted for the MCP server, not the REST API; without it MCP calls are rejected.
 
 ### Storage and per-account rules
 
@@ -92,9 +92,9 @@ Prompts and text are checked against the blocklist before they leave the host. T
 mcp_enabled = false                 # the account sign-in connector
 mcp_timeout_secs = 60               # list, search, describe, read
 mcp_generate_timeout_secs = 300     # generate, create, spend
-mcp_url = "https://api.elevenlabs.io/v1/mcp"
+mcp_url = "https://api.us.elevenlabs.io/v1/mcp"
 oauth_client_id = "https://bot.seradyx.tech/.well-known/serabot-oauth-client.json"
-oauth_scope = "text_to_speech speech_history_read flows image_video_generation voice_generation convai_read"
+oauth_scope = "convai_read convai_write text_to_speech speech_history_read flows image_video_generation voice_generation"
 
 [elevenlabs.api_key]
 enabled = false                     # the API-key connector

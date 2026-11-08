@@ -51,7 +51,16 @@ pub const KEY_MEDIA_PROVIDER: &str = "elevenlabs_key";
 // (global/US region). Loopback URLs are accepted only in tests.
 pub const ELEVENLABS_AUTHORIZE_URL: &str = "https://elevenlabs.io/app/oauth/authorize";
 /// ElevenLabs hosted MCP server (Streamable HTTP; OAuth bearer, no API key).
-pub const ELEVENLABS_MCP_URL: &str = "https://api.elevenlabs.io/v1/mcp";
+/// The protected-resource document names the `api.us.elevenlabs.io` server as
+/// the resource, so OAuth tokens are minted for — and spent against — this
+/// endpoint first (the public host is the fallback).
+pub const ELEVENLABS_MCP_URL: &str = "https://api.us.elevenlabs.io/v1/mcp";
+/// Public fallback endpoint, tried when the regional one is unreachable.
+pub const ELEVENLABS_MCP_URL_PUBLIC: &str = "https://api.elevenlabs.io/v1/mcp";
+/// RFC 8707 `resource` sent on authorize, token and refresh requests: the
+/// MCP server the token is for. Without it the token is not audience-scoped
+/// for the MCP server and every MCP call is rejected.
+pub const ELEVENLABS_MCP_RESOURCE: &str = ELEVENLABS_MCP_URL;
 pub const ELEVENLABS_TOKEN_URL: &str = "https://api.us.elevenlabs.io/v1/oauth/token";
 /// Public host that serves this server's client metadata document.
 pub const PUBLIC_HOST: &str = "bot.seradyx.tech";
@@ -59,9 +68,9 @@ pub const CIMD_PATH: &str = "/.well-known/serabot-oauth-client.json";
 /// Fixed loopback port so the CIMD document can declare exactly one redirect.
 pub const OAUTH_CALLBACK_PORT: u16 = 51122;
 pub const OAUTH_CALLBACK_PATH: &str = "/oauth-callback";
-/// Product-scoped scopes covering the connector's tools.
-pub const DEFAULT_OAUTH_SCOPE: &str =
-    "text_to_speech speech_history_read flows image_video_generation voice_generation convai_read";
+/// Product-scoped scopes covering the connector's tools: every scope the
+/// authorization server advertises for this resource.
+pub const DEFAULT_OAUTH_SCOPE: &str = "convai_read convai_write text_to_speech speech_history_read flows image_video_generation voice_generation";
 const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// The CIMD client_id: the https URL of the metadata document served publicly.
@@ -176,6 +185,8 @@ pub fn authorize_url(
         query.append_pair("code_challenge", challenge);
         query.append_pair("code_challenge_method", "S256");
         query.append_pair("state", state);
+        // RFC 8707: bind the token to the MCP server resource.
+        query.append_pair("resource", ELEVENLABS_MCP_RESOURCE);
     }
     // Defense in depth: the final URL must stay on the documented authorize
     // endpoint (host/path; the query is the PKCE material we just added).
@@ -248,6 +259,8 @@ pub async fn exchange_code_at(
             ("code", code),
             ("redirect_uri", redirect_uri),
             ("code_verifier", verifier),
+            // RFC 8707: the token is for the MCP server, not the REST API.
+            ("resource", ELEVENLABS_MCP_RESOURCE),
         ],
     )
     .await
@@ -281,6 +294,8 @@ pub async fn refresh_grant_at(
             ("grant_type", "refresh_token"),
             ("client_id", client_id.trim()),
             ("refresh_token", refresh_token),
+            // Keep the refreshed token bound to the same MCP resource.
+            ("resource", ELEVENLABS_MCP_RESOURCE),
         ],
     )
     .await
@@ -1810,6 +1825,9 @@ mod tests {
         assert_eq!(query["code_challenge"], challenge);
         assert_eq!(query["redirect_uri"], oauth_callback_uri());
         assert_eq!(query["client_id"], cimd_client_id());
+        // RFC 8707: the token is requested for the MCP server resource.
+        assert_eq!(query["resource"], ELEVENLABS_MCP_RESOURCE);
+        assert_eq!(ELEVENLABS_MCP_RESOURCE, ELEVENLABS_MCP_URL);
         // Only the fixed loopback callback declared in the CIMD document is accepted.
         assert!(
             authorize_url(
@@ -1841,6 +1859,7 @@ mod tests {
             .and(path("/token"))
             .and(body_string_contains("grant_type=authorization_code"))
             .and(body_string_contains("code_verifier="))
+            .and(body_string_contains("resource="))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "access_token": "access-secret-value",
                 "refresh_token": "refresh-secret-value",
@@ -1905,6 +1924,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/token"))
             .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("resource="))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "access_token": "fresh-access",
                 "refresh_token": "rotated-refresh",

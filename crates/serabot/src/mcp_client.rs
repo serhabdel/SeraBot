@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 
 /// The MCP protocol revision this client asks for. The server may answer with
 /// another one; its choice is echoed back in `MCP-Protocol-Version`.
-const PROTOCOL_VERSION: &str = "2025-03-26";
+const PROTOCOL_VERSION: &str = "2025-06-18";
 /// `tools/list` pages followed at most.
 const MAX_PAGES: usize = 20;
 /// Tools kept from one `tools/list`. Large hosted servers expose 100+ tools.

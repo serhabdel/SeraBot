@@ -1433,6 +1433,11 @@ impl ElevenLabsConfig {
     /// switches. `enabled = true` with `auth = "oauth"` turns on the sign-in
     /// connector; without `auth` (the old default) the API-key connector.
     pub fn apply_legacy_settings(&mut self) {
+        // Configs written before the OAuth resource fix pinned the public MCP
+        // host; the token's audience is the regional server, so upgrade them.
+        if self.mcp_url == crate::elevenlabs::ELEVENLABS_MCP_URL_PUBLIC {
+            self.mcp_url = crate::elevenlabs::ELEVENLABS_MCP_URL.to_owned();
+        }
         if self.legacy_enabled.is_none() && self.auth.is_none() {
             return;
         }
@@ -2896,6 +2901,23 @@ mod tests {
         let mut list: Vec<String> = names.iter().map(|name| name.to_string()).collect();
         rename_tool_list(&mut list);
         list
+    }
+
+    #[test]
+    fn legacy_public_mcp_url_is_upgraded_to_the_token_resource() {
+        let mut config = ElevenLabsConfig {
+            mcp_url: crate::elevenlabs::ELEVENLABS_MCP_URL_PUBLIC.to_owned(),
+            ..ElevenLabsConfig::default()
+        };
+        config.apply_legacy_settings();
+        assert_eq!(config.mcp_url, crate::elevenlabs::ELEVENLABS_MCP_URL);
+        // A custom URL is left alone.
+        let mut config = ElevenLabsConfig {
+            mcp_url: "https://mcp.example.test".to_owned(),
+            ..ElevenLabsConfig::default()
+        };
+        config.apply_legacy_settings();
+        assert_eq!(config.mcp_url, "https://mcp.example.test");
     }
 
     #[test]
