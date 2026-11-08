@@ -871,6 +871,9 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "pdf_inspect",
         "pdf_edit",
         "pdf_merge",
+        "image_inspect",
+        "image_resize",
+        "image_convert",
         "fetch_url",
         "watch_now",
         "skill_list",
@@ -933,8 +936,12 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "onedrive_upload",
         "onedrive_list",
         "local_list",
+        "local_search",
+        "local_stat",
         "local_read",
         "local_write",
+        "local_import",
+        "local_export",
     ];
     #[cfg(feature = "docx")]
     names.extend([

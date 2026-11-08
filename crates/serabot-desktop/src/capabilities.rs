@@ -122,6 +122,13 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         group: "Files",
+        needs: Needs::Nothing,
+        label: "Inspect, resize and convert images",
+        hint: "PNG, JPEG and WebP: sizes and camera info, smaller copies, format changes.",
+        tools: &["image_inspect", "image_resize", "image_convert"],
+    },
+    Capability {
+        group: "Files",
         needs: Needs::Connector {
             name: "a cloud account",
             ids: &["onedrive", "google_drive", "google_sheets", "notion"],
@@ -140,8 +147,16 @@ pub const CAPABILITIES: &[Capability] = &[
         group: "Files",
         needs: Needs::Nothing,
         label: "Work with folders on this PC",
-        hint: "Read, and with your approval write, folders you allow in Settings. Works only while the SeraBot app is open on this PC.",
-        tools: &["local_list", "local_read", "local_write"],
+        hint: "Browse and search big folders you allow in Settings, read files, bring Word, Excel, PowerPoint, PDF and image files in to work on, and with your approval save results back. Works only while the SeraBot app is open on this PC.",
+        tools: &[
+            "local_list",
+            "local_search",
+            "local_stat",
+            "local_read",
+            "local_write",
+            "local_import",
+            "local_export",
+        ],
     },
     // ---- Messages
     Capability {

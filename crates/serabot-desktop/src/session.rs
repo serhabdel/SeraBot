@@ -41,6 +41,12 @@ use std::{
 };
 use zeroize::Zeroize;
 
+/// Results of the background folder counts.
+struct FolderStatsChannel {
+    sender: std::sync::mpsc::Sender<(String, String, crate::local_fs::FolderStats)>,
+    receiver: std::sync::mpsc::Receiver<(String, String, crate::local_fs::FolderStats)>,
+}
+
 pub const REQUEST_GAP: Duration = Duration::from_millis(60);
 pub const POLL_GAP: Duration = Duration::from_millis(750);
 pub const POLL_SAFETY: Duration = Duration::from_secs(4);
@@ -304,6 +310,8 @@ pub struct ProviderDraft {
     pub secret_name: String,
     pub api_key: String,
     pub catalog_fetch: bool,
+    /// How the chosen preset signs in: "api_key", "oauth" or "none".
+    pub auth: String,
 }
 
 impl Default for ProviderDraft {
@@ -316,6 +324,7 @@ impl Default for ProviderDraft {
             secret_name: String::new(),
             api_key: String::new(),
             catalog_fetch: true,
+            auth: "api_key".into(),
         }
     }
 }
@@ -549,6 +558,10 @@ pub struct Session {
     /// Usage page range in days (7, 30 or 90) and whether a load is running.
     pub usage_days: u32,
     pub usage_loading: bool,
+    /// Owner-only server health card: a load is running, and the calm
+    /// message to show when the last load failed (cleared on success).
+    pub server_health_loading: bool,
+    pub server_health_error: Option<String>,
     /// Pinned bots/conversations shown in the inspector strip. Persisted in
     /// settings.json through [`creds::Settings::pins`].
     pub pins: Vec<String>,
@@ -569,6 +582,10 @@ pub struct Session {
     pub connector_testing: Option<String>,
     /// Provider whose browser sign-in is waiting for the redirect.
     pub oauth_signing_in: Option<String>,
+    /// Keys typed on provider cards, by provider id. Zeroed once saved.
+    pub provider_key_drafts: BTreeMap<String, String>,
+    /// Provider whose Test is running.
+    pub provider_testing: Option<String>,
     pub admin_error: Option<String>,
     pub restart_pending: bool,
     pub restarting: bool,
@@ -595,10 +612,16 @@ pub struct Session {
     pending_open: Option<PendingOpen>,
     /// Folders on this PC the bots may use (default empty = off). Device-local.
     pub local_folders: Vec<crate::local_folders::LocalFolder>,
+    /// "This PC" numbers for the Usage page, gathered on a worker thread.
+    pub pc: crate::pc_stats::PcMonitor,
     local_agent: Option<(crate::local_folders::LocalAgent, usize)>,
     /// Message under the Local folders card.
     pub local_notice: Option<String>,
     folder_pick_rx: Option<std::sync::mpsc::Receiver<Option<(std::path::PathBuf, bool)>>>,
+    /// Size and file counts per allowed folder id, filled in lazily (0.21).
+    pub folder_stats: std::collections::HashMap<String, crate::local_folders::FolderStatus>,
+    folder_stats_wanted: bool,
+    folder_stats_chan: Option<FolderStatsChannel>,
     /// Files already uploaded and attached to the composer draft.
     pub composer_files: Vec<crate::AttachmentInfo>,
     /// Text drafts per conversation, kept while the app runs (0.19).
@@ -718,6 +741,8 @@ impl Session {
             pins,
             usage_days: 30,
             usage_loading: false,
+            server_health_loading: false,
+            server_health_error: None,
             section: Section::Chat,
             conversation: "windows-owner".into(),
             composer: String::new(),
@@ -731,6 +756,8 @@ impl Session {
             admin_notice: None,
             connector_testing: None,
             oauth_signing_in: None,
+            provider_key_drafts: BTreeMap::new(),
+            provider_testing: None,
             admin_error: None,
             restart_pending: false,
             restarting: false,
@@ -749,9 +776,13 @@ impl Session {
             local_folders: creds::settings_dir()
                 .map(|dir| crate::local_folders::load(&dir))
                 .unwrap_or_default(),
+            pc: crate::pc_stats::PcMonitor::new(),
             local_agent: None,
             local_notice: None,
             folder_pick_rx: None,
+            folder_stats: std::collections::HashMap::new(),
+            folder_stats_wanted: false,
+            folder_stats_chan: None,
             composer_files: Vec::new(),
             drafts: crate::chat_compose::Drafts::default(),
             attach_notice: None,
@@ -1167,6 +1198,7 @@ impl Session {
         }
         if section == Section::Usage {
             self.load_usage_days(self.usage_days);
+            self.refresh_server_health();
         }
         if section == Section::Settings {
             self.refresh_status();
@@ -1794,6 +1826,50 @@ impl Session {
         self.load_usage(days);
     }
 
+    /// Gather the "This PC" numbers on a worker thread (never blocks the UI).
+    pub fn refresh_pc(&self) {
+        let folders = self
+            .local_folders
+            .iter()
+            .map(|folder| std::path::PathBuf::from(&folder.path))
+            .collect();
+        self.pc.refresh(crate::pc_stats::PcDirs::current(), folders);
+    }
+
+    /// "Clear cache": delete downloaded update files only. They are
+    /// regenerable; settings, the folder list and sign-in stay untouched.
+    pub fn clear_pc_cache(&mut self) {
+        let Some(dir) = crate::updater::downloads_dir() else {
+            self.toast = Some("There is nothing to clear.".into());
+            return;
+        };
+        let freed = crate::updater::clear_downloads(&dir);
+        self.pc.invalidate();
+        self.refresh_pc();
+        self.toast = Some(if freed == 0 {
+            "There was nothing to clear.".to_owned()
+        } else {
+            format!(
+                "Cleared {}. Update files download again if needed.",
+                crate::status_view::format_bytes(freed)
+            )
+        });
+    }
+
+    /// Owner only: load the server health card. A member never sends this
+    /// request, so the server's 403 is a backstop, not the gate.
+    pub fn refresh_server_health(&mut self) {
+        if !self.is_admin() || self.server_health_loading {
+            return;
+        }
+        self.server_health_loading = true;
+        if self.pending.is_some() || !self.ready() {
+            self.schedule(Operation::ServerHealth, Duration::ZERO);
+        } else {
+            self.start_request(Operation::ServerHealth);
+        }
+    }
+
     /// Load the token usage report for the last `days` days (1–365).
     pub fn load_usage(&mut self, days: u32) {
         self.load_usage_scoped(days, None, None);
@@ -2106,8 +2182,74 @@ impl Session {
         }
     }
 
+    /// The Local folders card is on screen: start counting files and size,
+    /// one folder at a time, off the UI thread. Called again it does nothing.
+    pub fn want_folder_stats(&mut self) {
+        self.folder_stats_wanted = true;
+    }
+
+    /// Count again (a folder may have grown).
+    pub fn recount_folders(&mut self) {
+        self.folder_stats.clear();
+        self.folder_stats_wanted = true;
+    }
+
+    fn poll_folder_stats(&mut self) {
+        let channel = self.folder_stats_chan.get_or_insert_with(|| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            FolderStatsChannel { sender, receiver }
+        });
+        while let Ok((id, path, stats)) = channel.receiver.try_recv() {
+            // Ignore an answer for a folder that was removed or replaced.
+            if self
+                .local_folders
+                .iter()
+                .any(|folder| folder.id == id && folder.path == path)
+            {
+                self.folder_stats
+                    .insert(id, crate::local_folders::FolderStatus::Done(stats));
+            }
+        }
+        self.folder_stats
+            .retain(|id, _| self.local_folders.iter().any(|folder| &folder.id == id));
+        if !self.folder_stats_wanted
+            || self
+                .folder_stats
+                .values()
+                .any(|status| matches!(status, crate::local_folders::FolderStatus::Counting))
+        {
+            return;
+        }
+        let Some(folder) = self
+            .local_folders
+            .iter()
+            .find(|folder| !self.folder_stats.contains_key(&folder.id))
+        else {
+            return;
+        };
+        let (id, path) = (folder.id.clone(), folder.path.clone());
+        let sender = channel.sender.clone();
+        self.folder_stats
+            .insert(id.clone(), crate::local_folders::FolderStatus::Counting);
+        let spawned = std::thread::Builder::new()
+            .name("serabot-folder-stats".into())
+            .spawn({
+                let (id, path) = (id.clone(), path.clone());
+                move || {
+                    let budget = crate::local_fs::Budget::new(std::time::Duration::from_secs(120));
+                    let stats = crate::local_fs::folder_stats(std::path::Path::new(&path), &budget);
+                    let _ = sender.send((id, path, stats));
+                }
+            });
+        if spawned.is_err() {
+            self.folder_stats.remove(&id);
+            self.folder_stats_wanted = false;
+        }
+    }
+
     pub fn remove_local_folder(&mut self, id: &str) {
         self.local_folders.retain(|folder| folder.id != id);
+        self.folder_stats.remove(id);
         self.persist_local_folders();
         self.local_notice = Some("Removed. The bot can no longer see that folder.".into());
     }
@@ -2402,6 +2544,7 @@ impl Session {
         self.poll_attachments();
         self.flush_stop();
         self.poll_folder_pick();
+        self.poll_folder_stats();
         self.sync_local_agent();
         self.poll_launches();
         self.hydrate_bot_settings();
@@ -2661,6 +2804,24 @@ impl Session {
                 {
                     self.onboarding_failed(completion.kind, error.to_string());
                 }
+                // The health card is optional: a failed load leaves a calm
+                // line on the card, never the global banner, and the next
+                // refresh simply tries again.
+                Err(error) if completion.kind == OperationKind::ServerHealth => {
+                    self.server_health_loading = false;
+                    self.server_health_error = Some(match &error {
+                        ApiError::Http(403) => "Only the owner can see server health.".to_owned(),
+                        ApiError::Http(404) => {
+                            "This server does not report its health yet. Update the server."
+                                .to_owned()
+                        }
+                        _ => "Server health is not available right now. Trying again soon."
+                            .to_owned(),
+                    });
+                    if error == ApiError::Http(403) {
+                        self.state.server_health = None;
+                    }
+                }
                 Err(error) if completion.kind == OperationKind::BotLifecycle => {
                     self.toast = Some(format!("Could not change that bot: {error}"));
                     self.schedule(Operation::ListBots, Duration::ZERO);
@@ -2676,6 +2837,9 @@ impl Session {
                     if matches!(
                         completion.kind,
                         OperationKind::AdminWrite
+                            | OperationKind::ProviderKey
+                            | OperationKind::ProviderTest
+                            | OperationKind::DefaultRoute
                             | OperationKind::ConnectorTest
                             | OperationKind::OAuthSignIn
                             | OperationKind::AdminRestart
@@ -2693,6 +2857,7 @@ impl Session {
                     self.admin_error = Some(message);
                     self.connector_testing = None;
                     self.oauth_signing_in = None;
+                    self.provider_testing = None;
                     self.scheduled = None;
                 }
                 Err(ApiError::Http(429)) if completion.kind.is_background_poll() => {
@@ -3132,6 +3297,20 @@ impl Session {
                                         "Finish in your browser: enter code {code}. Then press Refresh."
                                     ));
                                 }
+                                Some((id, None))
+                                    if self
+                                        .state
+                                        .providers
+                                        .iter()
+                                        .any(|p| p.id == id && p.kind == "openrouter") =>
+                                {
+                                    // OpenRouter's key is stored for this account
+                                    // right away: nothing to restart.
+                                    self.admin_notice = Some(
+                                        "Signed in with OpenRouter. Your key is saved to your account."
+                                            .into(),
+                                    );
+                                }
                                 Some(_) => {
                                     self.admin_notice = Some(
                                         "Signed in. Restart the server to apply the change.".into(),
@@ -3147,6 +3326,31 @@ impl Session {
                             self.admin_error = None;
                             self.admin_notice = None;
                             self.connector_testing = None;
+                        }
+                        OperationKind::ProviderKey => {
+                            for value in self.provider_key_drafts.values_mut() {
+                                value.zeroize();
+                            }
+                            self.provider_key_drafts.clear();
+                            self.admin_error = None;
+                            self.admin_notice = Some(
+                                "Key saved to your account. Checking the model list...".into(),
+                            );
+                            self.state.providers_loaded = false;
+                            self.schedule(Operation::Catalog, Duration::ZERO);
+                        }
+                        OperationKind::ProviderTest => {
+                            self.provider_testing = None;
+                            self.admin_error = None;
+                            self.admin_notice = None;
+                            self.state.providers_loaded = false;
+                            self.schedule(Operation::Catalog, Duration::ZERO);
+                        }
+                        OperationKind::DefaultRoute => {
+                            self.admin_error = None;
+                            self.admin_notice = Some("Default provider updated.".into());
+                            self.state.providers_loaded = false;
+                            self.schedule(Operation::Catalog, Duration::ZERO);
                         }
                         OperationKind::AdminWrite => {
                             self.provider.api_key.zeroize();
@@ -3182,6 +3386,10 @@ impl Session {
                         OperationKind::BotDetail => {}
                         // The usage report is cached in the state.
                         OperationKind::Usage => self.usage_loading = false,
+                        OperationKind::ServerHealth => {
+                            self.server_health_loading = false;
+                            self.server_health_error = None;
+                        }
                         OperationKind::BotConfigWrite => {
                             if let Some((id, update)) = bot_config {
                                 // Optimistic update of the cached detail; the
@@ -3499,7 +3707,12 @@ impl Session {
         let base_url = self.provider.base_url.trim().to_owned();
         let secret = self.provider.secret_name.trim().to_owned();
         let models = model_csv(&self.provider.models);
-        let api_key = self.provider.api_key.trim().to_owned();
+        let mut api_key = self.provider.api_key.trim().to_owned();
+        if api_key.is_empty() && self.provider.auth == "none" {
+            // A local server needs no key, but the credential store keeps one
+            // per provider; Ollama's own docs use this placeholder.
+            api_key = "ollama".to_owned();
+        }
         let problem = if !valid_provider_id(&id) {
             Some("Provider id must be 1–64 letters, digits, '_' or '-'.")
         } else if kind.is_empty() || kind.len() > 32 {
@@ -3542,6 +3755,59 @@ impl Session {
             api_key: (!api_key.is_empty()).then_some(api_key),
         };
         self.start_request(Operation::AdminSaveProvider(request));
+    }
+
+    /// Save a key typed on a provider card to the signed-in account.
+    pub fn save_provider_key(&mut self, id: String) {
+        let key = self
+            .provider_key_drafts
+            .get(&id)
+            .map(|key| key.trim().to_owned())
+            .unwrap_or_default();
+        if key.is_empty() {
+            self.admin_error = Some("Paste the key first.".into());
+            return;
+        }
+        if !valid_credential(&key) {
+            self.admin_error = Some("The key contains control characters or is too long.".into());
+            return;
+        }
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.admin_error = None;
+        self.admin_notice = None;
+        self.start_request(Operation::SaveProviderKey {
+            id,
+            key: zeroize::Zeroizing::new(key),
+        });
+    }
+
+    /// Ask one provider for its live model list.
+    pub fn test_provider(&mut self, id: String) {
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.admin_error = None;
+        self.admin_notice = None;
+        self.provider_testing = Some(id.clone());
+        self.start_request(Operation::TestProvider { id });
+    }
+
+    /// Make this provider (and its first listed model) the account default.
+    pub fn set_default_provider(&mut self, id: String, model: String) {
+        if !self.can_admin() {
+            self.admin_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.admin_error = None;
+        self.admin_notice = None;
+        self.start_request(Operation::SetDefaultRoute {
+            provider: id,
+            model,
+        });
     }
 
     pub fn remove_provider(&mut self, id: String) {
@@ -4555,6 +4821,27 @@ mod tests {
         assert_eq!(count(true), 9);
         assert_eq!(count(false), 8);
         assert!(!SettingsSection::Admin.visible(false));
+    }
+
+    #[test]
+    fn only_the_admin_asks_for_server_health() {
+        let user = |role: &str| crate::AuthUser {
+            id: "u1".into(),
+            email: "ada@example.test".into(),
+            display_name: "Ada".into(),
+            role: role.into(),
+        };
+        let mut member = Session::new();
+        member.state.user = Some(user("member"));
+        member.refresh_server_health();
+        assert!(!member.server_health_loading, "a member never sends it");
+
+        let mut owner = Session::new();
+        owner.state.user = Some(user("admin"));
+        owner.refresh_server_health();
+        assert!(owner.server_health_loading, "the owner asks once");
+        owner.refresh_server_health();
+        assert!(owner.server_health_loading);
     }
 
     #[test]

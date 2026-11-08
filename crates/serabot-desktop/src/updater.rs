@@ -596,7 +596,7 @@ fn part_path(destination: &Path) -> PathBuf {
 }
 
 /// `%LOCALAPPDATA%\SeraBot\updates` (or the XDG data fallback off Windows).
-fn downloads_dir() -> Option<PathBuf> {
+pub fn downloads_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         std::env::var_os("LOCALAPPDATA")
@@ -607,6 +607,35 @@ fn downloads_dir() -> Option<PathBuf> {
         std::env::var_os("HOME")
             .map(|home| PathBuf::from(home).join(".local/share/SeraBot/updates"))
     }
+}
+
+/// Delete downloaded installers, abandoned partial downloads and the
+/// update-check cache from dir; all of it downloads again. The updater's log
+/// and anything else in the folder stay. Returns the bytes freed.
+pub fn clear_downloads(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut freed = 0;
+    for entry in entries.flatten() {
+        let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let ours = (name.starts_with("serabot-desktop-")
+            && (name.ends_with(".exe") || name.ends_with(".exe.part")))
+            || name == CACHE_FILE;
+        if ours && fs::remove_file(entry.path()).is_ok() {
+            freed += metadata.len();
+        }
+    }
+    freed
 }
 
 /// Batch helper run after this process exits: wait for the PID, replace the
@@ -840,6 +869,24 @@ mod tests {
         verify_file(&path, &digest).unwrap();
         assert_eq!(sha256_file(&path).unwrap(), digest);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clear_downloads_removes_only_regenerable_files() {
+        let dir = temp_dir("clear");
+        fs::write(dir.join("serabot-desktop-1.2.3.exe"), vec![0u8; 100]).unwrap();
+        fs::write(dir.join("serabot-desktop-1.2.4.exe.part"), vec![0u8; 50]).unwrap();
+        fs::write(dir.join(CACHE_FILE), b"{}").unwrap();
+        fs::write(dir.join("update.log"), b"keep me").unwrap();
+        fs::write(dir.join("notes.txt"), b"keep me too").unwrap();
+        let freed = clear_downloads(&dir);
+        assert_eq!(freed, 152);
+        assert!(dir.join("update.log").exists());
+        assert!(dir.join("notes.txt").exists());
+        assert!(!dir.join("serabot-desktop-1.2.3.exe").exists());
+        assert!(!dir.join(CACHE_FILE).exists());
+        assert_eq!(clear_downloads(&dir.join("missing")), 0);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

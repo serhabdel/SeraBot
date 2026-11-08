@@ -106,8 +106,12 @@ pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -
         "telegram_send_document" | "onedrive_upload" => ("file", "Sending a file".into()),
         "onedrive_list" => ("file", "Listing files".into()),
         "local_list" => ("file", "Looking at a folder on your PC".into()),
+        "local_search" => ("search", "Searching a folder on your PC".into()),
+        "local_stat" => ("file", "Checking a file on your PC".into()),
         "local_read" => ("file", "Reading a file on your PC".into()),
         "local_write" => ("file", "Writing a file on your PC".into()),
+        "local_import" => ("file", "Copying a file from your PC".into()),
+        "local_export" => ("file", "Saving a file to your PC".into()),
         "vault_list" => ("lock", "Checking the vault".into()),
         "analyst" => ("chart", "Analyzing data".into()),
         "delegate" => (
@@ -120,6 +124,7 @@ pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -
         "team_ask" => ("bot", "Asking the team".into()),
         "team_reply" => ("bot", "Replying to the team".into()),
         other if other.starts_with("pdf_") => ("file", "Working on a PDF".into()),
+        other if other.starts_with("image_") => ("file", "Working on an image".into()),
         other if other.starts_with("docx_") => ("file", "Working on a Word document".into()),
         other if other.starts_with("xlsx_") || other == "timesheet_analyze" => {
             ("chart", "Working on a spreadsheet".into())

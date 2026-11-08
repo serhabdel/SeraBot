@@ -319,6 +319,9 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
     "pdf_inspect",
     "pdf_edit",
     "pdf_merge",
+    "image_inspect",
+    "image_resize",
+    "image_convert",
     "telegram_send_document",
     "onedrive_upload",
     "onedrive_list",
@@ -361,8 +364,12 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
     "memory_update",
     "memory_delete",
     "local_list",
+    "local_search",
+    "local_stat",
     "local_read",
     "local_write",
+    "local_import",
+    "local_export",
 ];
 
 pub const DEFAULT_SPECIALIST_TOOLS: &[&str] = &["skill_list", "skill_search", "skill_load"];
@@ -914,6 +921,111 @@ pub struct UsageReport {
     pub tools: Vec<UsageTool>,
 }
 
+/// Process numbers of `GET /v1/admin/status`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct HealthProcess {
+    #[serde(default)]
+    pub memory_bytes: u64,
+    #[serde(default)]
+    pub cpu_percent: f32,
+}
+
+/// Host numbers of `GET /v1/admin/status`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct HealthHost {
+    #[serde(default)]
+    pub memory_total_bytes: u64,
+    #[serde(default)]
+    pub memory_used_bytes: u64,
+    #[serde(default)]
+    pub cpu_percent: f32,
+    #[serde(default)]
+    pub cpu_cores: u32,
+}
+
+/// The disk that holds the server's data.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct HealthDisk {
+    #[serde(default)]
+    pub total_bytes: u64,
+    #[serde(default)]
+    pub used_bytes: u64,
+    #[serde(default)]
+    pub free_bytes: u64,
+}
+
+/// One storage category (database, documents, ...).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct HealthCategory {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub files: u64,
+}
+
+/// Storage breakdown of the server's data folder.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct HealthStorage {
+    #[serde(default)]
+    pub total_bytes: u64,
+    #[serde(default)]
+    pub total_files: u64,
+    /// True when the count was cut short, so the numbers are a minimum.
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub categories: Vec<HealthCategory>,
+}
+
+/// One member's totals: counts and sizes, never content.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct HealthUser {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub conversations: i64,
+    #[serde(default)]
+    pub messages: i64,
+    #[serde(default)]
+    pub documents: i64,
+    #[serde(default)]
+    pub memories: i64,
+    #[serde(default)]
+    pub artifacts: i64,
+    #[serde(default)]
+    pub file_bytes: u64,
+}
+
+/// `GET /v1/admin/status` (admin only): server health at a glance.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct ServerHealth {
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub uptime_secs: u64,
+    #[serde(default)]
+    pub process: HealthProcess,
+    #[serde(default)]
+    pub host: HealthHost,
+    #[serde(default)]
+    pub disk: Option<HealthDisk>,
+    #[serde(default)]
+    pub storage: HealthStorage,
+    #[serde(default)]
+    pub users: Vec<HealthUser>,
+}
 /// One conversation row from `GET /v1/conversations`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct ConversationSummary {
@@ -1018,8 +1130,21 @@ pub struct SecretStatus {
     pub configured: bool,
 }
 
+/// Whether the signed-in account can use a provider, from `GET /v1/providers`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct CredentialState {
+    /// The account has a key, or an admin grant, it can use.
+    #[serde(default)]
+    pub configured: bool,
+    /// The key is the account's own (not a grant).
+    #[serde(default)]
+    pub own: bool,
+    #[serde(default)]
+    pub granted: bool,
+}
+
 /// Read-only provider view from `GET /v1/providers`.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct ProviderStatus {
     pub id: String,
     pub kind: String,
@@ -1040,6 +1165,34 @@ pub struct ProviderStatus {
     pub auth: String,
     #[serde(default)]
     pub secrets: BTreeMap<String, SecretStatus>,
+    /// How the last live model fetch went for this account: `ok`,
+    /// `key_rejected`, `unreachable` or `unchecked`.
+    #[serde(default)]
+    pub status: String,
+    /// `live` (the provider's own list) or `fallback` (the allowlist).
+    #[serde(default)]
+    pub model_source: String,
+    #[serde(default)]
+    pub model_count: usize,
+    #[serde(default)]
+    pub credential: CredentialState,
+    /// Set by the console, not the server: this is the account's default
+    /// provider (its chosen route, else the server default).
+    #[serde(skip)]
+    pub is_default: bool,
+    #[serde(skip)]
+    pub default_model: Option<String>,
+}
+
+/// Result of `POST /v1/providers/{id}/test`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct ProviderTest {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub model_count: usize,
 }
 
 /// Read-only connector view from `GET /v1/connectors`.
@@ -1411,6 +1564,14 @@ pub struct CatalogEntry {
     pub model: String,
     #[serde(default)]
     pub data_egress_approved: bool,
+    /// Friendly name, context window and capability tags, when the provider's
+    /// own list gave them.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub context_length: Option<u64>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2492,6 +2653,15 @@ impl ApiClient {
         check_usage_report(report)
     }
 
+    /// Server health for the owner: `GET /v1/admin/status` (admin only; a
+    /// member gets a 403). Numbers only, bounded in size.
+    pub fn server_health(&self) -> Result<ServerHealth, ApiError> {
+        let status: ServerHealth = self.get(&["v1", "admin", "status"], &[])?;
+        if status.users.len() > 1000 || status.storage.categories.len() > 64 {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(status)
+    }
     /// One page of conversation metadata. `cursor` is opaque and must come
     /// from a previous `next_cursor`; it is never guessed from UI state.
     pub fn list_conversations(
@@ -3328,6 +3498,87 @@ impl ApiClient {
             verifier,
             redirect_uri,
         )
+    }
+
+    /// Save the signed-in account's own key for a provider.
+    pub fn set_provider_key(&self, id: &str, api_key: &str) -> Result<(), ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Provider id is not valid."));
+        }
+        let _: serde_json::Value = self.admin_request(
+            Method::PUT,
+            &["v1", "providers", id, "key"],
+            &serde_json::json!({ "api_key": api_key }),
+        )?;
+        Ok(())
+    }
+
+    /// Ask a provider for its live model list with the account's own key.
+    pub fn test_provider(&self, id: &str) -> Result<ProviderTest, ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Provider id is not valid."));
+        }
+        self.admin_request(
+            Method::POST,
+            &["v1", "providers", id, "test"],
+            &serde_json::json!({}),
+        )
+    }
+
+    /// Make a provider and model the account's default for new chats.
+    pub fn set_default_route(&self, provider: &str, model: &str) -> Result<(), ApiError> {
+        if !valid_id(provider) || !valid_model_id(model) {
+            return Err(ApiError::Validation("Provider or model is not valid."));
+        }
+        let _: serde_json::Value = self.admin_request(
+            Method::PUT,
+            &["v1", "providers", "default-route"],
+            &serde_json::json!({ "provider": provider, "model": model }),
+        )?;
+        Ok(())
+    }
+
+    /// The account's default route, when it chose one.
+    pub fn default_route(&self) -> Result<Option<Selection>, ApiError> {
+        #[derive(Deserialize)]
+        struct Reply {
+            selection: Option<Selection>,
+        }
+        let reply: Reply = self.get(&["v1", "providers", "default-route"], &[])?;
+        Ok(reply.selection)
+    }
+
+    /// First leg of "Sign in with OpenRouter".
+    pub fn provider_oauth_start(
+        &self,
+        id: &str,
+        body: &serde_json::Value,
+    ) -> Result<OAuthStart, ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Provider id is not valid."));
+        }
+        self.checked_oauth_start(&["v1", "providers", id, "oauth", "start"], body)
+    }
+
+    /// Second leg: the server swaps the code for the account's own key and
+    /// stores it. The key never comes back here.
+    pub fn provider_oauth_complete(
+        &self,
+        id: &str,
+        code: &str,
+        verifier: &str,
+        redirect_uri: &str,
+    ) -> Result<(), ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::Validation("Provider id is not valid."));
+        }
+        self.checked_oauth_complete(
+            &["v1", "providers", id, "oauth", "complete"],
+            code,
+            verifier,
+            redirect_uri,
+        )
+        .map(|_| ())
     }
 
     pub fn admin_connector_oauth_start(
@@ -4372,6 +4623,29 @@ mod tests {
             ..BotConfigUpdate::default()
         };
         assert!(validate_bot_config_update(&outside).is_err());
+    }
+
+    #[test]
+    fn server_health_reads_the_server_shape_and_tolerates_missing_parts() {
+        let status: ServerHealth = serde_json::from_str(
+            r#"{"ok":true,"version":"0.21.0","uptime_secs":90,
+                "process":{"memory_bytes":1000,"cpu_percent":1.5},
+                "host":{"memory_total_bytes":8000,"memory_used_bytes":4000,"cpu_percent":10.0,"cpu_cores":4},
+                "disk":{"total_bytes":100,"used_bytes":40,"free_bytes":60},
+                "storage":{"total_bytes":7,"total_files":2,"truncated":false,
+                  "categories":[{"id":"database","label":"Database","bytes":5,"files":1}]},
+                "users":[{"id":"u1","display_name":"Ana","email":"a@x.example","role":"admin",
+                  "status":"active","conversations":1,"messages":2,"documents":3,"memories":4,
+                  "artifacts":5,"file_bytes":6}]}"#,
+        )
+        .unwrap();
+        assert_eq!(status.version, "0.21.0");
+        assert_eq!(status.host.cpu_cores, 4);
+        assert_eq!(status.disk.as_ref().unwrap().free_bytes, 60);
+        assert_eq!(status.storage.categories[0].id, "database");
+        assert_eq!(status.users[0].file_bytes, 6);
+        let sparse: ServerHealth = serde_json::from_str("{}").unwrap();
+        assert!(sparse.disk.is_none() && sparse.users.is_empty());
     }
 
     #[test]

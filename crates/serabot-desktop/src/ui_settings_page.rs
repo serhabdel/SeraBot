@@ -203,12 +203,17 @@ pub fn AboutCard(session: Signal<Session>) -> Element {
 #[component]
 pub fn LocalFoldersCard(session: Signal<Session>) -> Element {
     let mut session = session;
-    let (folders, notice, running) = {
+    // Counting files and size is lazy: it starts when this card is shown.
+    use_effect(move || {
+        session.write().want_folder_stats();
+    });
+    let (folders, notice, running, stats) = {
         let s = session.read();
         (
             s.local_folders.clone(),
             s.local_notice.clone(),
             s.local_agent_running(),
+            s.folder_stats.clone(),
         )
     };
     rsx! {
@@ -217,18 +222,28 @@ pub fn LocalFoldersCard(session: Signal<Session>) -> Element {
                 h3 { class: "card-title", "Local folders" }
             }
             p { class: "tiny",
-                "Let your bots read, and with your approval write, text files in folders on this PC. "
+                "Let your bots browse, search and read big folders on this PC, bring Word, Excel, PowerPoint, PDF and image files in to work on, and with your approval save results back. "
                 "It is off until you add a folder. Only this app can see the folder paths; the bots get a short name."
             }
             if folders.is_empty() {
                 p { class: "hint", "No folders allowed. The bots cannot see anything on this PC." }
             }
             div { class: "roster",
-                for folder in folders {
+                for folder in folders.clone() {
                     div { key: "{folder.id}", class: "roster-row",
                         div { class: "thread-copy",
                             span { class: "thread-title", "{folder.id}" }
                             span { class: "thread-meta", "{folder.path}" }
+                            span { class: "thread-meta",
+                                {
+                                    stats
+                                        .get(&folder.id)
+                                        .map(|status| status.label())
+                                        .unwrap_or_else(|| "Counting\u{2026}".to_string())
+                                }
+                                " \u{b7} "
+                                {if folder.mode.as_str() == "read_write" { "bots can read and, with approval, write" } else { "bots can only read" }}
+                            }
                         }
                         select {
                             "aria-label": "Access for {folder.id}",
@@ -265,6 +280,13 @@ pub fn LocalFoldersCard(session: Signal<Session>) -> Element {
                     class: "btn",
                     onclick: move |_| session.write().pick_local_folder(),
                     "Add folder\u{2026}"
+                }
+                if !folders.is_empty() {
+                    button {
+                        class: "btn",
+                        onclick: move |_| session.write().recount_folders(),
+                        "Recount"
+                    }
                 }
                 if running {
                     span { class: "chip ok", "Connected to your bots" }

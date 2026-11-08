@@ -17,12 +17,11 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::local_fs::Budget;
 use crate::{ApiClient, ApiError};
 
-/// Read and write ceiling per request.
+/// Write ceiling per request, and read ceiling per call.
 pub const MAX_FILE_BYTES: u64 = 256 * 1024;
-/// Entries per listing.
-pub const MAX_LIST_ENTRIES: usize = 200;
 /// Folders a user can allow.
 pub const MAX_FOLDERS: usize = 16;
 
@@ -57,6 +56,23 @@ pub struct LocalFolder {
     pub mode: FolderMode,
 }
 
+/// Settings screen: where a folder's lazy size count stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FolderStatus {
+    Counting,
+    Done(crate::local_fs::FolderStats),
+}
+
+impl FolderStatus {
+    /// "Counting\u{2026}" or "1,234 files, 56 folders, 2.3 GiB".
+    pub fn label(&self) -> String {
+        match self {
+            Self::Counting => "Counting\u{2026}".into(),
+            Self::Done(stats) => stats.label(),
+        }
+    }
+}
+
 /// What the server receives with each poll: no path.
 #[derive(Serialize)]
 struct RootView<'a> {
@@ -74,6 +90,9 @@ pub struct LocalRequest {
     pub path: String,
     #[serde(default)]
     pub content: Option<String>,
+    /// Operation parameters (ranges, filters, cursors). Clamped here again.
+    #[serde(default)]
+    pub args: serde_json::Value,
 }
 
 const FILE_NAME: &str = "local_folders.json";
@@ -213,7 +232,7 @@ fn reserved_device(component: &str) -> bool {
 }
 
 /// Symlink, junction or any other reparse point.
-fn is_link(meta: &std::fs::Metadata) -> bool {
+pub(crate) fn is_link(meta: &std::fs::Metadata) -> bool {
     if meta.file_type().is_symlink() {
         return true;
     }
@@ -265,7 +284,7 @@ fn components(rel: &str) -> Result<Vec<String>, String> {
 /// exists is checked to not be a link; the canonical result must start with
 /// the canonical root. `must_exist = false` allows a missing final component
 /// (a file about to be created).
-fn resolve(root: &Path, rel: &str, must_exist: bool) -> Result<PathBuf, String> {
+pub(crate) fn resolve(root: &Path, rel: &str, must_exist: bool) -> Result<PathBuf, String> {
     let root = root
         .canonicalize()
         .map_err(|_| "the allowed folder is no longer available".to_string())?;
@@ -303,7 +322,7 @@ fn resolve(root: &Path, rel: &str, must_exist: bool) -> Result<PathBuf, String> 
             .canonicalize()
             .map_err(|_| "could not be opened".to_string())?
     };
-    if !check.starts_with(&root) {
+    if !crate::local_fs::path_within(&root, &check) {
         return Err("the path leaves the allowed folder".into());
     }
     Ok(current)
@@ -316,16 +335,46 @@ fn file_name_of(path: &Path) -> String {
         .to_owned()
 }
 
+/// Time one relayed request may run before the agent answers without it.
+const REQUEST_LIMIT: Duration = Duration::from_secs(22);
+
 /// Run one relayed request against the local allowlist.
 pub fn handle(folders: &[LocalFolder], request: &LocalRequest) -> Result<String, String> {
+    handle_with(folders, request, &Budget::new(crate::local_fs::WALK_BUDGET))
+}
+
+pub fn handle_with(
+    folders: &[LocalFolder],
+    request: &LocalRequest,
+    budget: &Budget,
+) -> Result<String, String> {
     let folder = folders
         .iter()
         .find(|folder| folder.id == request.root)
         .ok_or_else(|| "that folder is not on the allowed list".to_string())?;
     let root = Path::new(&folder.path);
+    let args = if request.args.is_object() {
+        request.args.clone()
+    } else {
+        serde_json::json!({})
+    };
     match request.op.as_str() {
-        "list" => list(root, &request.path),
-        "read" => read(root, &request.path),
+        "list" => crate::local_fs::list(root, &request.path, &args, budget),
+        "search" => crate::local_fs::search(root, &request.path, &args, budget),
+        "stat" => crate::local_fs::stat(root, &request.path),
+        "read" => crate::local_fs::read(root, &request.path, &args, budget),
+        "chunk_read" => crate::local_xfer::read_chunk(root, &request.path, &args),
+        "put_chunk" => {
+            if folder.mode != FolderMode::ReadWrite {
+                return Err("that folder is read-only".into());
+            }
+            crate::local_xfer::put_chunk(
+                root,
+                &request.path,
+                request.content.as_deref().unwrap_or_default(),
+                &args,
+            )
+        }
         "write" => {
             if folder.mode != FolderMode::ReadWrite {
                 return Err("that folder is read-only".into());
@@ -340,66 +389,27 @@ pub fn handle(folders: &[LocalFolder], request: &LocalRequest) -> Result<String,
     }
 }
 
-fn list(root: &Path, rel: &str) -> Result<String, String> {
-    let dir = if rel == "." {
-        root.canonicalize()
-            .map_err(|_| "the allowed folder is no longer available".to_string())?
-    } else {
-        resolve(root, rel, true)?
-    };
-    let meta = std::fs::symlink_metadata(&dir).map_err(|_| "could not be opened".to_string())?;
-    if !meta.is_dir() || is_link(&meta) {
-        return Err("not a folder".into());
-    }
-    let mut entries = Vec::new();
-    for entry in std::fs::read_dir(&dir).map_err(|_| "could not be listed".to_string())? {
-        let Ok(entry) = entry else { continue };
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
-            continue;
-        };
-        // Links and credential-like names do not even show up.
-        if is_link(&meta) || sensitive_name(&name) {
-            continue;
+/// Run a request on a worker thread so a slow disk or a huge tree can never
+/// stall the long-poll loop. Past [`REQUEST_LIMIT`] the walk is cancelled and
+/// the agent answers with an error.
+fn handle_in_worker(folders: Vec<LocalFolder>, request: LocalRequest) -> Result<String, String> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let budget = Budget::with_cancel(crate::local_fs::WALK_BUDGET, cancel.clone());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("serabot-local-worker".into())
+        .spawn(move || {
+            let _ = sender.send(handle_with(&folders, &request, &budget));
+        })
+        .map_err(|_| "could not start a worker".to_string())?;
+    match receiver.recv_timeout(REQUEST_LIMIT) {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            cancel.store(true, Ordering::SeqCst);
+            Err("the folder took too long to read; try a smaller path or add filters".into())
         }
-        entries.push(if meta.is_dir() {
-            format!("{name}/")
-        } else {
-            format!("{name} ({} bytes)", meta.len())
-        });
     }
-    entries.sort();
-    let truncated = entries.len() > MAX_LIST_ENTRIES;
-    entries.truncate(MAX_LIST_ENTRIES);
-    let mut text = entries.join("\n");
-    if text.is_empty() {
-        text = "(empty)".into();
-    }
-    if truncated {
-        text.push_str("\n(list truncated)");
-    }
-    Ok(text)
 }
-
-fn read(root: &Path, rel: &str) -> Result<String, String> {
-    let path = resolve(root, rel, true)?;
-    if sensitive_name(&file_name_of(&path)) {
-        return Err("credential-like files are never shared".into());
-    }
-    let meta = std::fs::symlink_metadata(&path).map_err(|_| "could not be opened".to_string())?;
-    if !meta.is_file() || is_link(&meta) {
-        return Err("not a regular file".into());
-    }
-    if meta.len() > MAX_FILE_BYTES {
-        return Err("file is larger than 256 KiB".into());
-    }
-    let bytes = std::fs::read(&path).map_err(|_| "could not be read".to_string())?;
-    if bytes.contains(&0) {
-        return Err("binary files are not shared".into());
-    }
-    String::from_utf8(bytes).map_err(|_| "only UTF-8 text files are shared".to_string())
-}
-
 fn write(root: &Path, rel: &str, content: &str) -> Result<String, String> {
     if content.len() as u64 > MAX_FILE_BYTES {
         return Err("content is larger than 256 KiB".into());
@@ -497,7 +507,7 @@ impl LocalAgent {
                             let outcome = if flag.load(Ordering::SeqCst) || live.is_empty() {
                                 Err("local folders are switched off on this PC".to_string())
                             } else {
-                                handle(&live, &request)
+                                handle_in_worker(live, request.clone())
                             };
                             let _ = client.local_result(&request.id, outcome);
                         }
@@ -566,6 +576,7 @@ mod tests {
             root: root.into(),
             path: path.into(),
             content: content.map(str::to_owned),
+            args: serde_json::Value::Null,
         }
     }
 
@@ -573,7 +584,7 @@ mod tests {
     fn lists_reads_and_writes_inside_the_root() {
         let (base, folders) = fixture();
         let listing = handle(&folders, &request("list", "docs", ".", None)).unwrap();
-        assert!(listing.contains("a.txt (5 bytes)") && listing.contains("sub/"));
+        assert!(listing.contains("a.txt (5 bytes") && listing.contains("sub/"));
         // Credential-like files are not even listed.
         assert!(!listing.contains(".env"));
         assert_eq!(

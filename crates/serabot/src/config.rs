@@ -1917,6 +1917,9 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "pdf_inspect",
     "pdf_edit",
     "pdf_merge",
+    "image_inspect",
+    "image_resize",
+    "image_convert",
     "telegram_send_document",
     "onedrive_upload",
     "onedrive_list",
@@ -1953,8 +1956,12 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "exa_search",
     "exa_get_contents",
     "local_list",
+    "local_search",
+    "local_stat",
     "local_read",
     "local_write",
+    "local_import",
+    "local_export",
 ];
 
 const DEFAULT_SPECIALIST_TOOLS: &[&str] = &["skill_list", "skill_search", "skill_load"];

@@ -94,3 +94,116 @@ pub(super) async fn usage(
         .scan_owner_output(&user.id, &body.to_string())?;
     Ok(Json(body))
 }
+
+/// `GET /v1/admin/status` (admin only): server health for the owner's Usage
+/// tab. Numbers only: uptime, memory, CPU, disk, a storage breakdown of the
+/// data directory and per-member counts and sizes. It never returns message
+/// text, file names, documents or credentials. The directory walk is bounded
+/// and cached (see `sysstatus`). Views are audited at most every 15 minutes
+/// (the card polls); a refused member is always audited.
+pub(super) async fn admin_status(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    if let Err(error) = require_admin(&user) {
+        let _ = state.store.record_audit(
+            &user.id,
+            "admin.status.denied",
+            None,
+            None,
+            None,
+            None,
+            Some(state.runtime.policy_version()),
+            None,
+        );
+        return Err(error);
+    }
+    if state.sys_status.should_audit() {
+        state.store.record_audit(
+            &user.id,
+            "admin.status.viewed",
+            None,
+            None,
+            None,
+            None,
+            Some(state.runtime.policy_version()),
+            None,
+        )?;
+    }
+    let data_dir = state
+        .store
+        .path()
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .filter(|path| path.is_dir());
+    let work = {
+        let state = state.clone();
+        move || -> Result<Value> {
+            use crate::sysstatus::{Category, Rules};
+            let mut users = crate::sysstatus::user_totals(&state.store)?;
+            let ids: std::collections::HashSet<String> =
+                users.iter().map(|u| u.id.clone()).collect();
+            let host = state
+                .sys_status
+                .host_snapshot(data_dir.as_deref().unwrap_or(std::path::Path::new(".")));
+            let storage = match &data_dir {
+                Some(root) => {
+                    let root = root.canonicalize().unwrap_or_else(|_| root.clone());
+                    let canon = |path: std::path::PathBuf| path.canonicalize().unwrap_or(path);
+                    let rules = Rules::new(
+                        &root,
+                        &canon(state.store.path().to_path_buf()),
+                        &canon(state.config.path(&state.config.documents.watch_dir)),
+                        &canon(state.config.artifacts_dir()),
+                    );
+                    state.sys_status.storage(&root, &rules, &ids)
+                }
+                None => Default::default(),
+            };
+            for member in &mut users {
+                member.file_bytes = storage.user_bytes.get(&member.id).copied().unwrap_or(0);
+            }
+            let categories: Vec<Value> = Category::ALL
+                .iter()
+                .map(|category| {
+                    let (bytes, files) =
+                        storage.categories.get(category).copied().unwrap_or((0, 0));
+                    json!({
+                        "id": category.id(),
+                        "label": category.label(),
+                        "bytes": bytes,
+                        "files": files,
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "ok": true,
+                "version": env!("CARGO_PKG_VERSION"),
+                "uptime_secs": state.sys_status.uptime_secs(),
+                "process": {
+                    "memory_bytes": host.process_rss_bytes,
+                    "cpu_percent": host.process_cpu_percent,
+                },
+                "host": {
+                    "memory_total_bytes": host.host_memory_total_bytes,
+                    "memory_used_bytes": host.host_memory_used_bytes,
+                    "cpu_percent": host.host_cpu_percent,
+                    "cpu_cores": host.cpu_cores,
+                },
+                "disk": host.disk,
+                "storage": {
+                    "total_bytes": storage.total_bytes,
+                    "total_files": storage.total_files,
+                    "truncated": storage.truncated,
+                    "scanned_at": storage.scanned_at,
+                    "categories": categories,
+                },
+                "users": users,
+            }))
+        }
+    };
+    let body = tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| SeraError::Internal(format!("status task failed: {error}")))??;
+    Ok(Json(body))
+}

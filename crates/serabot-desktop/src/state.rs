@@ -2,7 +2,7 @@ use crate::{
     ApiError, Approval, AuthUser, BotDetail, BotSummary, Catalog, ConnectorStatus,
     ConnectorTestResult, ConversationSummary, CreatedBot, CreatedConversation, CreatedGroup,
     CreatedSkill, LibraryEntry, MemoryEntry, MemoryStatsView, Message, Onboarding, ProviderStatus,
-    Scope, Selection, SkillSummary, Task, Team, UsageReport,
+    Scope, Selection, ServerHealth, SkillSummary, Task, Team, UsageReport,
     avatars::AvatarImage,
     worker::{OperationKind, Reply},
 };
@@ -51,6 +51,8 @@ pub struct State {
     pub connectors_loaded: bool,
     /// Latest "Test" result per connector id; cleared on disconnect.
     pub connector_tests: std::collections::BTreeMap<String, ConnectorTestResult>,
+    /// Latest provider Test result per provider id.
+    pub provider_tests: std::collections::BTreeMap<String, crate::api::ProviderTest>,
     /// Provider id and device code of the last finished sign-in step.
     pub oauth_result: Option<(String, Option<String>)>,
     /// Team of the open room conversation. Conversation-scoped: it is cleared
@@ -91,6 +93,8 @@ pub struct State {
     pub bot_details: BTreeMap<String, BotDetail>,
     /// Latest `GET /v1/usage` report. Owner-scoped like the bot details.
     pub usage: Option<UsageReport>,
+    /// Latest GET /v1/admin/status (admin only). Cleared on disconnect.
+    pub server_health: Option<ServerHealth>,
     pub error: Option<String>,
     pub unknown_outcome: bool,
 }
@@ -135,6 +139,7 @@ impl Default for State {
             connectors: Vec::new(),
             connectors_loaded: false,
             connector_tests: std::collections::BTreeMap::new(),
+            provider_tests: std::collections::BTreeMap::new(),
             oauth_result: None,
             team: None,
             team_loaded: false,
@@ -161,6 +166,7 @@ impl Default for State {
             bots_loaded: false,
             bot_details: BTreeMap::new(),
             usage: None,
+            server_health: None,
             error: None,
             unknown_outcome: false,
         }
@@ -193,6 +199,7 @@ impl State {
         let bots_loaded = self.bots_loaded;
         let bot_details = self.bot_details.clone();
         let usage = self.usage.clone();
+        let server_health = self.server_health.clone();
         // Directory data is owner-scoped but not conversation-scoped.
         let conversations = self.conversations.clone();
         let conversations_loaded = self.conversations_loaded;
@@ -203,6 +210,7 @@ impl State {
         let connectors = self.connectors.clone();
         let connectors_loaded = self.connectors_loaded;
         let connector_tests = self.connector_tests.clone();
+        let provider_tests = self.provider_tests.clone();
         *self = Self {
             scope: Scope {
                 epoch,
@@ -232,6 +240,7 @@ impl State {
             bots_loaded,
             bot_details,
             usage,
+            server_health,
             conversations,
             conversations_loaded,
             memories,
@@ -241,6 +250,7 @@ impl State {
             connectors,
             connectors_loaded,
             connector_tests,
+            provider_tests,
             ..Self::default()
         };
     }
@@ -260,6 +270,7 @@ impl State {
         self.bots_loaded = false;
         self.bot_details.clear();
         self.usage = None;
+        self.server_health = None;
         self.conversations.clear();
         self.conversations_loaded = false;
         self.archived.clear();
@@ -271,6 +282,7 @@ impl State {
         self.connectors.clear();
         self.connectors_loaded = false;
         self.connector_tests.clear();
+        self.provider_tests.clear();
     }
 
     pub fn can_send(&self) -> bool {
@@ -350,6 +362,9 @@ impl State {
             }
             Reply::Usage(report) => {
                 self.usage = Some(report);
+            }
+            Reply::ServerHealth(status) => {
+                self.server_health = Some(status);
             }
             Reply::Conversations(page) => {
                 self.conversations = page.conversations;
@@ -460,7 +475,14 @@ impl State {
             Reply::Voice(settings) => {
                 self.voice = Some(settings);
             }
-            Reply::AdminSaved | Reply::BotSettingsSaved | Reply::AdminRestarted => {}
+            Reply::AdminSaved
+            | Reply::BotSettingsSaved
+            | Reply::AdminRestarted
+            | Reply::ProviderKeySaved
+            | Reply::DefaultRouteSaved => {}
+            Reply::ProviderTested { id, result } => {
+                self.provider_tests.insert(id, result);
+            }
             Reply::AvatarImage {
                 target,
                 version,
@@ -899,6 +921,16 @@ mod tests {
                 auth: "api_key".into(),
                 catalog_verified: false,
                 managed: false,
+                status: "ok".into(),
+                model_source: "live".into(),
+                model_count: 1,
+                credential: crate::api::CredentialState {
+                    configured: true,
+                    own: true,
+                    granted: false,
+                },
+                is_default: false,
+                default_model: None,
                 secrets: std::collections::BTreeMap::from([(
                     "api_key".into(),
                     SecretStatus {

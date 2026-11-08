@@ -45,6 +45,93 @@ impl Runtime {
         Ok(entries)
     }
 
+    fn default_route_key(user_id: &str) -> String {
+        format!("default_route:{user_id}")
+    }
+
+    /// The route used for a conversation that has not picked one: the
+    /// account's own default when set and still valid, else the bot's hint or
+    /// the server default.
+    fn user_default_selection(&self, user_id: &str, bot_hint: Option<&str>) -> ModelSelection {
+        if bot_hint.is_none()
+            && let Ok(Some(chosen)) = self.default_route(user_id)
+        {
+            return chosen;
+        }
+        self.router.default_selection(user_id, bot_hint)
+    }
+
+    /// The account's chosen default route, if it is still routable for them.
+    pub fn default_route(&self, user_id: &str) -> Result<Option<ModelSelection>> {
+        let Some(value) = self.store.kv_get(&Self::default_route_key(user_id))? else {
+            return Ok(None);
+        };
+        let Ok(stored) = serde_json::from_str::<ModelSelection>(&value) else {
+            return Ok(None);
+        };
+        Ok(self
+            .router
+            .validate_selection(user_id, &stored)
+            .ok()
+            .map(|_| stored))
+    }
+
+    /// Make `selection` the account's default route. Same gates as picking a
+    /// model for one conversation.
+    pub fn set_default_route(
+        &self,
+        user_id: &str,
+        selection: ModelSelection,
+    ) -> Result<ModelSelection> {
+        if selection.is_auto_mode() {
+            return Err(SeraError::Validation(
+                "pick a provider and model for the default route".into(),
+            ));
+        }
+        self.router.pin(&selection)?;
+        self.router.catalog_gate(user_id, &selection)?;
+        self.router.validate_selection(user_id, &selection)?;
+        let value = serde_json::to_string(&selection)?;
+        self.gateway.scan_egress(user_id, &value)?;
+        self.store.record_audit(
+            user_id,
+            "model.default_set",
+            None,
+            None,
+            None,
+            None,
+            Some(self.gateway.policy().version()),
+            Some(&serde_json::to_value(&selection)?),
+        )?;
+        self.store
+            .kv_set(&Self::default_route_key(user_id), &value)?;
+        Ok(selection)
+    }
+
+    /// Ask one provider for its live model list with the account's own key.
+    pub async fn test_provider(
+        &self,
+        user_id: &str,
+        provider: &str,
+    ) -> Result<crate::model_router::CatalogRefresh> {
+        let report = self.router.test_provider(user_id, provider).await?;
+        self.store.record_audit(
+            user_id,
+            "model.provider_tested",
+            None,
+            None,
+            None,
+            None,
+            Some(self.gateway.policy().version()),
+            Some(&json!({
+                "provider": report.provider,
+                "verified": report.verified,
+                "model_count": report.model_count,
+            })),
+        )?;
+        Ok(report)
+    }
+
     /// Drop cached per-user provider clients after a credential or grant
     /// change. `None` clears every account (an admin credential or grant can
     /// affect more than one user).
@@ -109,9 +196,7 @@ impl Runtime {
             .ok_or_else(|| SeraError::NotFound("bot not found".into()))?;
         let selection = match self.stored_model_selection(conversation_id)? {
             Some(stored) => stored,
-            None => self
-                .router
-                .default_selection(user_id, self.bot_model_hint(bot).as_deref()),
+            None => self.user_default_selection(user_id, self.bot_model_hint(bot).as_deref()),
         };
         if selection.is_auto_mode() {
             self.gateway
@@ -138,9 +223,7 @@ impl Runtime {
             .ok_or_else(|| SeraError::NotFound("bot not found".into()))?;
         let stored = match self.stored_model_selection(conversation_id)? {
             Some(stored) => stored,
-            None => self
-                .router
-                .default_selection(user_id, self.bot_model_hint(bot).as_deref()),
+            None => self.user_default_selection(user_id, self.bot_model_hint(bot).as_deref()),
         };
         let resolved = self.router.resolve_selection(
             user_id,

@@ -47,26 +47,39 @@ const OFFICIAL_CATALOGS: &[OfficialCatalog] = &[
         kind: "mistral",
         host: "api.mistral.ai",
         path: "/v1/models",
+        strict: true,
     },
     OfficialCatalog {
         kind: "deepseek",
         host: "api.deepseek.com",
         path: "/models",
+        strict: true,
     },
     OfficialCatalog {
         kind: "minimax",
         host: "api.minimax.io",
         path: "/v1/models",
+        strict: true,
     },
     OfficialCatalog {
         kind: "minimax-cn",
         host: "api.minimaxi.com",
         path: "/v1/models",
+        strict: true,
     },
     OfficialCatalog {
         kind: "muse-code",
         host: "api.meta.ai",
         path: "/v1/models",
+        strict: true,
+    },
+    // Perplexity chats on the host root but lists models under /v1; its list
+    // shape is not pinned, so the looser parser applies.
+    OfficialCatalog {
+        kind: "perplexity",
+        host: "api.perplexity.ai",
+        path: "/v1/models",
+        strict: false,
     },
 ];
 
@@ -74,6 +87,8 @@ struct OfficialCatalog {
     kind: &'static str,
     host: &'static str,
     path: &'static str,
+    /// Whether the list shape is pinned (`{object:"list", data:[...]}`).
+    strict: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +177,36 @@ const BUILTINS: &[BuiltinProvider] = &[
         base_url: Some("https://api.moonshot.ai/v1"),
         auth: "api_key",
         summary: "Moonshot OpenAI-compatible chat",
+    },
+    BuiltinProvider {
+        kind: "gemini",
+        base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai"),
+        auth: "api_key",
+        summary: "Google Gemini API, OpenAI-compatible endpoint; catalog GET {base}/models",
+    },
+    BuiltinProvider {
+        kind: "perplexity",
+        base_url: Some("https://api.perplexity.ai"),
+        auth: "api_key",
+        summary: "Perplexity Sonar chat; catalog GET https://api.perplexity.ai/v1/models",
+    },
+    BuiltinProvider {
+        kind: "huggingface",
+        base_url: Some("https://router.huggingface.co/v1"),
+        auth: "api_key",
+        summary: "Hugging Face Inference Providers router; catalog GET {base}/models",
+    },
+    BuiltinProvider {
+        kind: "nebius",
+        base_url: Some("https://api.tokenfactory.nebius.com/v1"),
+        auth: "api_key",
+        summary: "Nebius Token Factory; catalog GET {base}/models",
+    },
+    BuiltinProvider {
+        kind: "sambanova",
+        base_url: Some("https://api.sambanova.ai/v1"),
+        auth: "api_key",
+        summary: "SambaNova Cloud; catalog GET {base}/models",
     },
     BuiltinProvider {
         kind: "muse-code",
@@ -355,7 +400,7 @@ pub fn resolve_catalog(kind: &str, base_url: &str) -> Result<ResolvedCatalog> {
         if is_exact_loopback(&parsed) {
             return Ok(ResolvedCatalog {
                 url: validate_base_url(&format!("{base}/models"))?,
-                strict: true,
+                strict: spec.strict,
             });
         }
         let host = parsed.host_str().unwrap_or("");
@@ -366,7 +411,7 @@ pub fn resolve_catalog(kind: &str, base_url: &str) -> Result<ResolvedCatalog> {
         }
         return Ok(ResolvedCatalog {
             url: validate_base_url(&format!("https://{}{}", spec.host, spec.path))?,
-            strict: true,
+            strict: spec.strict,
         });
     }
     Ok(ResolvedCatalog {
@@ -411,87 +456,205 @@ pub fn valid_model_id(model: &str) -> bool {
         && !model.chars().any(char::is_control)
 }
 
-pub fn parse_model_ids(bytes: &[u8]) -> Result<BTreeSet<String>> {
-    if bytes.len() > 1_048_576 {
+/// What a provider's own model list says about one model. Everything is
+/// optional: only fields the API actually returned are filled in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ModelMeta {
+    /// Friendly name when the API gives one that differs from the id.
+    pub name: Option<String>,
+    /// Context window in tokens.
+    pub context_length: Option<u64>,
+    /// Capability tags from the API: `vision`, `tools`, `reasoning`, `free`,
+    /// `cheap`.
+    pub tags: Vec<String>,
+}
+
+/// A provider's live chat-capable model list, keyed by model id.
+pub type ModelCatalog = std::collections::BTreeMap<String, ModelMeta>;
+
+/// Catalog shape check shared by the loose and strict parsers.
+const CATALOG_MAX_BYTES: usize = 1_048_576;
+const CATALOG_MAX_ENTRIES: usize = 4_000;
+
+/// Parse a provider's model list into ids plus metadata, keeping only models
+/// that can chat. Accepts `{data:[...]}`, `{models:[...]}` or a bare array and
+/// strips Gemini's `models/` prefix. `strict` is for providers whose list shape
+/// is pinned (`{object:"list", data:[{id, object:"model"}]}`): any other shape
+/// fails closed. Ids and bodies are never copied into errors.
+pub fn parse_model_catalog(bytes: &[u8], strict: bool) -> Result<ModelCatalog> {
+    if bytes.len() > CATALOG_MAX_BYTES {
         return Err(SeraError::External("model catalog is too large".into()));
     }
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|_| SeraError::External("malformed model catalog".into()))?;
-    let entries = value
-        .get("data")
-        .and_then(Value::as_array)
-        .or_else(|| value.get("models").and_then(Value::as_array))
-        .or_else(|| value.as_array())
-        .ok_or_else(|| SeraError::External("model catalog has no model list".into()))?;
-    if entries.len() > 4_000 {
+    if strict && value.get("object").and_then(Value::as_str) != Some("list") {
+        return Err(SeraError::External("model catalog was not a list".into()));
+    }
+    let entries = if strict {
+        value.get("data").and_then(Value::as_array)
+    } else {
+        value
+            .get("data")
+            .and_then(Value::as_array)
+            .or_else(|| value.get("models").and_then(Value::as_array))
+            .or_else(|| value.as_array())
+    }
+    .ok_or_else(|| SeraError::External("model catalog has no model list".into()))?;
+    if entries.len() > CATALOG_MAX_ENTRIES {
         return Err(SeraError::External("model catalog is too large".into()));
     }
-    let mut ids = BTreeSet::new();
+    let mut catalog = ModelCatalog::new();
     for entry in entries {
-        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+        if strict
+            && entry
+                .get("object")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind != "model")
+        {
+            continue;
+        }
+        let Some(raw) = entry.get("id").and_then(Value::as_str) else {
             continue;
         };
-        if valid_model_id(id) {
-            ids.insert(id.to_owned());
+        let id = raw.strip_prefix("models/").unwrap_or(raw);
+        let id_ok = if strict {
+            official_model_id(id)
+        } else {
+            valid_model_id(id)
+        };
+        if !id_ok || !chat_capable(id, entry) {
+            continue;
         }
+        catalog.insert(id.to_owned(), model_meta(id, entry));
     }
-    if ids.is_empty() {
+    if catalog.is_empty() {
         return Err(SeraError::External(
             "model catalog contained no usable model ids".into(),
         ));
     }
-    Ok(ids)
+    Ok(catalog)
+}
+
+/// Ids only, for callers that do not need metadata.
+pub fn parse_model_ids(bytes: &[u8]) -> Result<BTreeSet<String>> {
+    parse_model_catalog(bytes, false).map(|catalog| catalog.into_keys().collect())
 }
 
 /// Official Mistral, DeepSeek, and MiniMax lists are `{object:list, data:[{id, object:model}]}`.
 /// Unexpected shapes fail closed. Ids and response bodies are never copied into errors.
 pub fn parse_official_catalog(bytes: &[u8]) -> Result<BTreeSet<String>> {
-    if bytes.len() > 1_048_576 {
-        return Err(SeraError::External("model catalog is too large".into()));
-    }
-    let value: Value = serde_json::from_slice(bytes)
-        .map_err(|_| SeraError::External("malformed model catalog".into()))?;
-    if value.get("object").and_then(Value::as_str) != Some("list") {
-        return Err(SeraError::External("model catalog was not a list".into()));
-    }
-    let entries = value
-        .get("data")
-        .and_then(Value::as_array)
-        .ok_or_else(|| SeraError::External("model catalog has no model list".into()))?;
-    if entries.len() > 4_000 {
-        return Err(SeraError::External("model catalog is too large".into()));
-    }
-    let mut ids = BTreeSet::new();
-    for entry in entries {
-        if entry
-            .get("object")
-            .and_then(Value::as_str)
-            .is_some_and(|kind| kind != "model")
-        {
-            continue;
-        }
-        if entry
-            .pointer("/capabilities/completion_chat")
-            .and_then(Value::as_bool)
-            == Some(false)
-        {
-            continue;
-        }
-        let Some(id) = entry.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        if official_model_id(id) {
-            ids.insert(id.to_owned());
-        }
-    }
-    if ids.is_empty() {
-        return Err(SeraError::External(
-            "model catalog contained no usable model ids".into(),
-        ));
-    }
-    Ok(ids)
+    parse_model_catalog(bytes, true).map(|catalog| catalog.into_keys().collect())
 }
 
+/// Ids that are never chat models, used only when the API says nothing about
+/// capabilities.
+const NON_CHAT_ID_HINTS: [&str; 10] = [
+    "embed",
+    "moderation",
+    "whisper",
+    "tts",
+    "dall-e",
+    "gpt-image",
+    "transcribe",
+    "rerank",
+    "sora",
+    "realtime",
+];
+
+fn chat_capable(id: &str, entry: &Value) -> bool {
+    if let Some(chat) = entry
+        .pointer("/capabilities/completion_chat")
+        .and_then(Value::as_bool)
+    {
+        return chat;
+    }
+    if entry.get("supports_chat").and_then(Value::as_bool) == Some(false) {
+        return false;
+    }
+    if let Some(kind) = entry
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+    {
+        return !matches!(
+            kind.as_str(),
+            "image" | "embedding" | "embeddings" | "moderation" | "rerank" | "audio" | "video"
+        ) && !kind.contains("transcri");
+    }
+    if let Some(outputs) = entry
+        .pointer("/architecture/output_modalities")
+        .and_then(Value::as_array)
+    {
+        return outputs.iter().any(|item| item.as_str() == Some("text"));
+    }
+    let lowered = id.to_ascii_lowercase();
+    !NON_CHAT_ID_HINTS.iter().any(|hint| lowered.contains(hint))
+}
+
+fn model_meta(id: &str, entry: &Value) -> ModelMeta {
+    let name = ["name", "display_name", "displayName"]
+        .iter()
+        .find_map(|key| entry.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && name.len() <= 120 && *name != id)
+        .filter(|name| !name.chars().any(char::is_control))
+        .map(str::to_owned);
+    let context_length = [
+        "/max_context_length",
+        "/context_length",
+        "/context_window",
+        "/max_model_len",
+        "/inputTokenLimit",
+        "/top_provider/context_length",
+    ]
+    .iter()
+    .find_map(|pointer| entry.pointer(pointer).and_then(Value::as_u64))
+    .filter(|tokens| *tokens > 0);
+    let has_item = |pointer: &str, wanted: &str| {
+        entry
+            .pointer(pointer)
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(wanted)))
+    };
+    let flag = |pointer: &str| entry.pointer(pointer).and_then(Value::as_bool) == Some(true);
+    let mut tags = Vec::new();
+    if flag("/capabilities/vision")
+        || flag("/supports_image_input")
+        || has_item("/architecture/input_modalities", "image")
+    {
+        tags.push("vision".to_owned());
+    }
+    if flag("/capabilities/function_calling")
+        || flag("/supports_tools")
+        || has_item("/supported_parameters", "tools")
+    {
+        tags.push("tools".to_owned());
+    }
+    if flag("/capabilities/reasoning")
+        || has_item("/supported_parameters", "reasoning")
+        || has_item("/supported_parameters", "include_reasoning")
+    {
+        tags.push("reasoning".to_owned());
+    }
+    // Prices are USD per token, as decimal strings (OpenRouter).
+    if let Some(price) = entry
+        .pointer("/pricing/prompt")
+        .and_then(Value::as_str)
+        .and_then(|text| text.parse::<f64>().ok())
+        .filter(|price| price.is_finite() && *price >= 0.0)
+    {
+        if price == 0.0 {
+            tags.push("free".to_owned());
+        } else if price <= 0.000_000_3 {
+            tags.push("cheap".to_owned());
+        }
+    }
+    ModelMeta {
+        name,
+        context_length,
+        tags,
+    }
+}
 fn official_model_id(model: &str) -> bool {
     valid_model_id(model)
         && model
@@ -813,7 +976,7 @@ fn is_cloud_code_host(host: &str) -> bool {
 /// Provider *endpoints and model catalogs* stay admin-defined in config; the
 /// *credential* comes from the acting user's envelope-encrypted row (or an
 /// active admin grant). Building a client for a user with no credential is an
-/// explicit error — never a fallback to another account's key.
+/// explicit error â€” never a fallback to another account's key.
 pub struct UserProviderCredentials {
     users: Arc<UserSecrets>,
     server_secrets: SharedSecrets,
@@ -893,7 +1056,7 @@ pub struct CredentialOwner<'a> {
 ///
 /// `credential.api_key` is the bearer (an API key, or the access token for an
 /// OAuth provider); `credential.refresh_token` enables the refresh flow. The
-/// OAuth *app* client id/secret stay server-level in the age store — they are
+/// OAuth *app* client id/secret stay server-level in the age store â€” they are
 /// the registration, not the user's secret.
 pub fn open_provider_client(
     profile: &ProviderConfig,
@@ -1051,6 +1214,11 @@ mod tests {
             "groq",
             "openrouter",
             "google-antigravity",
+            "gemini",
+            "perplexity",
+            "huggingface",
+            "nebius",
+            "sambanova",
         ] {
             assert!(kinds.contains(&kind), "{kind}");
         }
@@ -1082,6 +1250,54 @@ mod tests {
             enforce_oauth_target(OAuthStyle::MuseMint, "https://evil.example/muse-code/key")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn new_provider_kinds_resolve_documented_bases_and_catalog_urls() {
+        for (kind, base, catalog, strict) in [
+            (
+                "gemini",
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+                "https://generativelanguage.googleapis.com/v1beta/openai/models",
+                false,
+            ),
+            (
+                "huggingface",
+                "https://router.huggingface.co/v1",
+                "https://router.huggingface.co/v1/models",
+                false,
+            ),
+            (
+                "nebius",
+                "https://api.tokenfactory.nebius.com/v1",
+                "https://api.tokenfactory.nebius.com/v1/models",
+                false,
+            ),
+            (
+                "sambanova",
+                "https://api.sambanova.ai/v1",
+                "https://api.sambanova.ai/v1/models",
+                false,
+            ),
+            (
+                "perplexity",
+                "https://api.perplexity.ai",
+                "https://api.perplexity.ai/v1/models",
+                false,
+            ),
+        ] {
+            assert_eq!(resolve_base_url(kind, "").unwrap(), base, "{kind}");
+            let resolved = resolve_catalog(kind, base).unwrap();
+            assert_eq!(resolved.url, catalog, "{kind}");
+            assert_eq!(resolved.strict, strict, "{kind}");
+            assert!(matches!(auth_plan(kind, "").unwrap(), AuthPlan::ApiKey));
+        }
+        // Perplexity only contacts its own host for the list.
+        assert!(resolve_catalog("perplexity", "https://evil.example").is_err());
+        // An Ollama-style server is a custom OpenAI-compatible endpoint on
+        // exact loopback; any other plain-http host is refused.
+        assert!(resolve_base_url("openai-compatible", "http://127.0.0.1:11434/v1").is_ok());
+        assert!(resolve_base_url("openai-compatible", "http://192.168.1.5:11434/v1").is_err());
     }
 
     #[test]
@@ -1482,5 +1698,131 @@ mod tests {
         users.grant(&admin, &member, "default").unwrap();
         assert!(credentials.available(&member, "default"));
         assert!(credentials.client(&member, "default", &profile).is_ok());
+    }
+
+    fn catalog_of(value: serde_json::Value, strict: bool) -> ModelCatalog {
+        parse_model_catalog(&serde_json::to_vec(&value).unwrap(), strict).unwrap()
+    }
+
+    #[test]
+    fn mistral_catalog_keeps_chat_models_with_context_and_capability_tags() {
+        let catalog = catalog_of(
+            json!({"object": "list", "data": [
+                {"id": "mistral-large-latest", "object": "model", "name": "mistral-large-latest",
+                 "max_context_length": 131072,
+                 "capabilities": {"completion_chat": true, "function_calling": true, "vision": true}},
+                {"id": "mistral-embed", "object": "model",
+                 "capabilities": {"completion_chat": false}},
+                {"id": "magistral-medium-latest", "object": "model", "name": "Magistral Medium",
+                 "max_context_length": 40000,
+                 "capabilities": {"completion_chat": true, "function_calling": false, "vision": false}}
+            ]}),
+            true,
+        );
+        assert_eq!(
+            catalog.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["magistral-medium-latest", "mistral-large-latest"]
+        );
+        let large = &catalog["mistral-large-latest"];
+        assert_eq!(large.name, None, "a name equal to the id is not a name");
+        assert_eq!(large.context_length, Some(131_072));
+        assert_eq!(large.tags, vec!["vision", "tools"]);
+        let magistral = &catalog["magistral-medium-latest"];
+        assert_eq!(magistral.name.as_deref(), Some("Magistral Medium"));
+        assert!(magistral.tags.is_empty());
+    }
+
+    #[test]
+    fn openrouter_catalog_reads_modalities_parameters_and_pricing() {
+        let catalog = catalog_of(
+            json!({"data": [
+                {"id": "vendor/cheap-vision", "name": "Vendor: Cheap Vision", "context_length": 200000,
+                 "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["text"]},
+                 "supported_parameters": ["tools", "reasoning", "temperature"],
+                 "pricing": {"prompt": "0.0000001", "completion": "0.0000004"}},
+                {"id": "vendor/free:free", "name": "Free One", "context_length": 8192,
+                 "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+                 "pricing": {"prompt": "0", "completion": "0"}},
+                {"id": "vendor/image-only", "name": "Painter",
+                 "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}}
+            ]}),
+            false,
+        );
+        assert_eq!(catalog.len(), 2);
+        let cheap = &catalog["vendor/cheap-vision"];
+        assert_eq!(cheap.context_length, Some(200_000));
+        assert_eq!(cheap.tags, vec!["vision", "tools", "reasoning", "cheap"]);
+        assert_eq!(catalog["vendor/free:free"].tags, vec!["free"]);
+    }
+
+    #[test]
+    fn openai_style_lists_drop_non_chat_ids_and_gemini_prefixes_are_stripped() {
+        let openai = catalog_of(
+            json!({"object": "list", "data": [
+                {"id": "gpt-5", "object": "model"}, {"id": "text-embedding-3-small", "object": "model"},
+                {"id": "whisper-1", "object": "model"}, {"id": "omni-moderation-latest", "object": "model"},
+                {"id": "gpt-image-1", "object": "model"}, {"id": "gpt-4o-mini", "object": "model"}
+            ]}),
+            false,
+        );
+        assert_eq!(
+            openai.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["gpt-4o-mini", "gpt-5"]
+        );
+        let gemini = catalog_of(
+            json!({"data": [
+                {"id": "models/gemini-2.5-flash", "object": "model"},
+                {"id": "models/text-embedding-004", "object": "model"}
+            ]}),
+            false,
+        );
+        assert_eq!(
+            gemini.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["gemini-2.5-flash"]
+        );
+    }
+
+    #[test]
+    fn together_and_fireworks_shapes_use_their_own_type_and_support_flags() {
+        let together = catalog_of(
+            json!([
+                {"id": "meta/chat-70b", "type": "chat", "display_name": "Chat 70B", "context_length": 131072},
+                {"id": "meta/embedder", "type": "embedding"},
+                {"id": "meta/painter", "type": "image"}
+            ]),
+            false,
+        );
+        assert_eq!(together.len(), 1);
+        assert_eq!(together["meta/chat-70b"].name.as_deref(), Some("Chat 70B"));
+        let fireworks = catalog_of(
+            json!({"data": [
+                {"id": "accounts/fireworks/models/a", "supports_chat": true, "supports_tools": true,
+                 "supports_image_input": true, "context_length": 65536},
+                {"id": "accounts/fireworks/models/b", "supports_chat": false}
+            ]}),
+            false,
+        );
+        assert_eq!(fireworks.len(), 1);
+        assert_eq!(
+            fireworks["accounts/fireworks/models/a"].tags,
+            vec!["vision", "tools"]
+        );
+    }
+
+    #[test]
+    fn strict_catalogs_fail_closed_and_never_echo_the_body() {
+        for body in [
+            json!({"models": [{"id": "ok-id"}]}),
+            json!({"object": "list", "data": [{"object": "model"}], "note": "synthetic-body-secret"}),
+            json!({"object": "list", "data": [{"id": "not/an id"}]}),
+        ] {
+            let error = parse_model_catalog(&serde_json::to_vec(&body).unwrap(), true)
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("synthetic-body-secret"), "{error}");
+            assert!(!error.contains("not/an id"), "{error}");
+        }
+        assert!(parse_model_catalog(b"not json", false).is_err());
+        assert!(parse_model_catalog(&vec![b' '; 1_048_577], false).is_err());
     }
 }

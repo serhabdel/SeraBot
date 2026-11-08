@@ -80,7 +80,7 @@ fn allowed_extension(filename: &str) -> Result<String> {
 
 /// The content must look like what the extension claims. This is a sanity
 /// check against mislabelled uploads, not malware scanning.
-fn sniff_matches(extension: &str, bytes: &[u8]) -> bool {
+pub(crate) fn sniff_matches(extension: &str, bytes: &[u8]) -> bool {
     match extension {
         "pdf" => bytes.starts_with(b"%PDF-"),
         "png" => bytes.starts_with(&[0x89, b'P', b'N', b'G']),

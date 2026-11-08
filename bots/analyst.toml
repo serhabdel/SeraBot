@@ -42,8 +42,14 @@ tools = [
   "firecrawl_crawl",
   "firecrawl_extract",
   "tavily_search",
+  "image_inspect",
+  "image_resize",
+  "image_convert",
   "local_list",
+  "local_search",
+  "local_stat",
   "local_read",
+  "local_import",
 ]
 require_approval = []
 enabled = true
