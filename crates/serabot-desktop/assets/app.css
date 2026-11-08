@@ -5021,6 +5021,10 @@ html[data-reduce-transparency="true"] .chat-header {
   color: var(--label-2);
 }
 
+.step-file-icon {
+  display: block;
+}
+
 .step-label {
   flex: 1;
   min-width: 0;
