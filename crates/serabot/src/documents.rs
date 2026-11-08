@@ -451,11 +451,23 @@ async fn extract_pages(kind: DocumentKind, bytes: Vec<u8>) -> Result<Vec<PageTex
 
 /// Text of a digital PDF, page by page as `(page number, text)`, for
 /// `local_extract`.
-pub(crate) fn extract_pdf_page_texts(bytes: Vec<u8>) -> Result<Vec<(usize, String)>> {
-    Ok(extract_pdf_pages(bytes)?
-        .into_iter()
-        .map(|page| (page.page, page.text))
-        .collect())
+/// Page texts of a digital PDF in page order, for a bounded read. At most
+/// `max_pages` pages are extracted, and the walk stops as soon as `enough`
+/// returns true for a page's text. The flag says whether pages were left
+/// unread.
+pub(crate) fn extract_pdf_page_texts_bounded(
+    bytes: &[u8],
+    max_pages: usize,
+    enough: impl FnMut(&str) -> bool,
+) -> Result<(Vec<(usize, String)>, bool)> {
+    let (pages, more) = extract_pdf_pages_bounded(bytes, max_pages, enough)?;
+    Ok((
+        pages
+            .into_iter()
+            .map(|page| (page.page, page.text))
+            .collect(),
+        more,
+    ))
 }
 
 /// Plain text of a digital PDF (all pages joined), for chat attachments.
@@ -468,7 +480,17 @@ pub fn extract_pdf_text(bytes: Vec<u8>) -> Result<String> {
 }
 
 fn extract_pdf_pages(bytes: Vec<u8>) -> Result<Vec<PageText>> {
-    let document = catch_unwind(AssertUnwindSafe(|| lopdf::Document::load_mem(&bytes)))
+    Ok(extract_pdf_pages_bounded(&bytes, usize::MAX, |_| false)?.0)
+}
+
+/// [`extract_pdf_pages`] with a page cap and an early stop; see
+/// [`extract_pdf_page_texts_bounded`]. The flag says whether pages were unread.
+fn extract_pdf_pages_bounded(
+    bytes: &[u8],
+    max_pages: usize,
+    mut enough: impl FnMut(&str) -> bool,
+) -> Result<(Vec<PageText>, bool)> {
+    let document = catch_unwind(AssertUnwindSafe(|| lopdf::Document::load_mem(bytes)))
         .map_err(|_| {
             SeraError::Validation(
                 "malformed PDF: the parser aborted; the file is not a safe digital PDF".into(),
@@ -496,8 +518,9 @@ fn extract_pdf_pages(bytes: Vec<u8>) -> Result<Vec<PageText>> {
         ));
     }
 
-    let mut pages = Vec::with_capacity(page_numbers.len());
-    for page_number in page_numbers {
+    let total = page_numbers.len();
+    let mut pages = Vec::with_capacity(total.min(max_pages));
+    for page_number in page_numbers.into_iter().take(max_pages) {
         let text = catch_unwind(AssertUnwindSafe(|| document.extract_text(&[page_number])))
             .map_err(|_| {
                 SeraError::Validation(format!(
@@ -507,11 +530,16 @@ fn extract_pdf_pages(bytes: Vec<u8>) -> Result<Vec<PageText>> {
             .map_err(|error| {
                 SeraError::Validation(format!("PDF page {page_number} could not be read: {error}"))
             })?;
+        let stop = enough(&text);
         pages.push(PageText {
             page: page_number as usize,
             text,
         });
+        if stop {
+            break;
+        }
     }
+    let more = pages.len() < total;
 
     if pages.iter().all(|page| page.text.trim().is_empty()) {
         return Err(SeraError::Validation(
@@ -519,7 +547,7 @@ fn extract_pdf_pages(bytes: Vec<u8>) -> Result<Vec<PageText>> {
                 .into(),
         ));
     }
-    Ok(pages)
+    Ok((pages, more))
 }
 
 fn plan_chunks(pages: Vec<PageText>, chunk_chars: usize, overlap: usize) -> Vec<PlannedChunk> {

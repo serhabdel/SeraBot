@@ -510,41 +510,18 @@ impl MistralAudioClient {
     }
 }
 
-pub fn resolve_inbox_audio(config: &Config, relative: &str) -> Result<PathBuf> {
+/// Resolve an inbox audio path for `user_id`. The path names a file in the
+/// user's own inbox directory (`<user_id>/…`), checked by
+/// [`crate::user_inbox::resolve`]; another user's file is not found.
+pub fn resolve_inbox_audio(config: &Config, user_id: &str, relative: &str) -> Result<PathBuf> {
     if relative.is_empty() || relative.len() > 512 {
         return Err(SeraError::Validation("invalid audio path".into()));
-    }
-    let raw = Path::new(relative);
-    if raw.is_absolute() {
-        return Err(SeraError::Forbidden(
-            "audio paths must be relative to the configured inbox".into(),
-        ));
-    }
-    if raw.components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::ParentDir
-                | std::path::Component::RootDir
-                | std::path::Component::Prefix(_)
-        )
-    }) {
-        return Err(SeraError::Forbidden(
-            "audio path must stay within the inbox".into(),
-        ));
     }
     let root = config
         .path(&config.documents.watch_dir)
         .canonicalize()
         .map_err(|_| SeraError::NotFound("document inbox is unavailable".into()))?;
-    let candidate = root
-        .join(raw)
-        .canonicalize()
-        .map_err(|_| SeraError::NotFound("audio file not found".into()))?;
-    if !candidate.starts_with(&root) {
-        return Err(SeraError::Forbidden(
-            "audio path escapes the configured inbox".into(),
-        ));
-    }
+    let candidate = crate::user_inbox::resolve(&root, user_id, relative)?;
     let extension = candidate
         .extension()
         .and_then(|value| value.to_str())
@@ -680,8 +657,8 @@ impl AudioTranscribeTool {
         Self { client, config }
     }
 
-    fn resolve(&self, path: &str) -> Result<PathBuf> {
-        let path = resolve_inbox_audio(&self.config, path)?;
+    fn resolve(&self, user_id: &str, path: &str) -> Result<PathBuf> {
+        let path = resolve_inbox_audio(&self.config, user_id, path)?;
         let size = std::fs::metadata(&path)?.len();
         if size > self.client.max_bytes() {
             return Err(SeraError::Validation(format!(
@@ -716,12 +693,22 @@ impl Tool for AudioTranscribeTool {
         }
     }
 
-    fn approval_details(&self, args: &Value) -> Result<ApprovalDetails> {
+    fn approval_details(&self, _args: &Value) -> Result<ApprovalDetails> {
+        Err(SeraError::Validation(
+            "audio approval needs the acting user".into(),
+        ))
+    }
+
+    async fn approval_details_for(
+        &self,
+        args: &Value,
+        context: &ToolContext,
+    ) -> Result<ApprovalDetails> {
         let path = args
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| SeraError::Validation("path is required".into()))?;
-        let resolved = self.resolve(path)?;
+        let resolved = self.resolve(&context.user_id, path)?;
         let bytes = std::fs::read(&resolved)?;
         Ok(ApprovalDetails {
             summary: format!(
@@ -734,13 +721,13 @@ impl Tool for AudioTranscribeTool {
         })
     }
 
-    async fn execute(&self, args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
         let path = args
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| SeraError::Validation("path is required".into()))?;
         let language = args.get("language").and_then(Value::as_str);
-        let resolved = self.resolve(path)?;
+        let resolved = self.resolve(&context.user_id, path)?;
         let text = self.client.transcribe_file(&resolved, language).await?;
         Ok(ToolOutput {
             content: text.clone(),
@@ -765,8 +752,8 @@ impl AudioUnderstandTool {
         Self { client, config }
     }
 
-    fn resolve(&self, path: &str) -> Result<PathBuf> {
-        let path = resolve_inbox_audio(&self.config, path)?;
+    fn resolve(&self, user_id: &str, path: &str) -> Result<PathBuf> {
+        let path = resolve_inbox_audio(&self.config, user_id, path)?;
         let size = std::fs::metadata(&path)?.len();
         if size > self.client.max_bytes() {
             return Err(SeraError::Validation(format!(
@@ -801,7 +788,17 @@ impl Tool for AudioUnderstandTool {
         }
     }
 
-    fn approval_details(&self, args: &Value) -> Result<ApprovalDetails> {
+    fn approval_details(&self, _args: &Value) -> Result<ApprovalDetails> {
+        Err(SeraError::Validation(
+            "audio approval needs the acting user".into(),
+        ))
+    }
+
+    async fn approval_details_for(
+        &self,
+        args: &Value,
+        context: &ToolContext,
+    ) -> Result<ApprovalDetails> {
         let path = args
             .get("path")
             .and_then(Value::as_str)
@@ -810,7 +807,7 @@ impl Tool for AudioUnderstandTool {
             .get("instruction")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let resolved = self.resolve(path)?;
+        let resolved = self.resolve(&context.user_id, path)?;
         let bytes = std::fs::read(&resolved)?;
         Ok(ApprovalDetails {
             summary: format!(
@@ -824,7 +821,7 @@ impl Tool for AudioUnderstandTool {
         })
     }
 
-    async fn execute(&self, args: Value, _context: &ToolContext) -> Result<ToolOutput> {
+    async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
         let path = args
             .get("path")
             .and_then(Value::as_str)
@@ -833,7 +830,7 @@ impl Tool for AudioUnderstandTool {
             .get("instruction")
             .and_then(Value::as_str)
             .ok_or_else(|| SeraError::Validation("instruction is required".into()))?;
-        let resolved = self.resolve(path)?;
+        let resolved = self.resolve(&context.user_id, path)?;
         let text = self.client.understand_file(&resolved, instruction).await?;
         Ok(ToolOutput {
             content: text.clone(),
@@ -856,9 +853,12 @@ pub struct TelegramAudioSaveReport {
     pub sha256: String,
 }
 
-/// Persist a Telegram voice/audio attachment under `telegram/` in the inbox.
+/// Persist a Telegram voice/audio attachment under `<user_id>/telegram/` in the
+/// inbox. The report's path starts with the user's id, so the inbox tools
+/// accept it for that user only.
 pub fn save_telegram_audio_bytes(
     config: &Config,
+    user_id: &str,
     message_id: i64,
     extension: &str,
     bytes: &[u8],
@@ -878,13 +878,28 @@ pub fn save_telegram_audio_bytes(
             "unsupported Telegram audio extension '.{extension}'"
         )));
     }
+    if !crate::user_inbox::safe_user_segment(user_id) {
+        return Err(SeraError::Validation(
+            "the account id is not a safe inbox directory name".into(),
+        ));
+    }
     let root = config.path(&config.documents.watch_dir);
-    std::fs::create_dir_all(root.join("telegram"))?;
+    std::fs::create_dir_all(root.join(user_id).join("telegram"))?;
     let root = root
         .canonicalize()
         .map_err(|_| SeraError::NotFound("document inbox is unavailable".into()))?;
-    let filename = format!("telegram/{message_id}.{extension}");
-    let target = root.join(&filename);
+    let directory = root
+        .join(user_id)
+        .join("telegram")
+        .canonicalize()
+        .map_err(|_| SeraError::NotFound("document inbox is unavailable".into()))?;
+    if !directory.starts_with(&root) {
+        return Err(SeraError::Forbidden(
+            "audio path escapes the configured inbox".into(),
+        ));
+    }
+    let filename = format!("{user_id}/telegram/{message_id}.{extension}");
+    let target = directory.join(format!("{message_id}.{extension}"));
     if target.exists() {
         return Err(SeraError::Validation(
             "Telegram audio for this message was already saved".into(),
@@ -944,7 +959,72 @@ mod tests {
     fn rejects_path_traversal() {
         let dir = TempDir::new().unwrap();
         let config = sample_config(dir.path());
-        assert!(resolve_inbox_audio(&config, "../secret.wav").is_err());
+        assert!(resolve_inbox_audio(&config, "alice", "../secret.wav").is_err());
+        assert!(resolve_inbox_audio(&config, "alice", "alice/../../secret.wav").is_err());
+    }
+
+    #[test]
+    fn inbox_audio_resolves_only_inside_the_users_own_directory() {
+        let dir = TempDir::new().unwrap();
+        let config = sample_config(dir.path());
+        std::fs::create_dir_all(dir.path().join("alice").join("telegram")).unwrap();
+        std::fs::create_dir_all(dir.path().join("bob")).unwrap();
+        std::fs::write(dir.path().join("alice/telegram/1.ogg"), b"ogg").unwrap();
+        std::fs::write(dir.path().join("bob/note.wav"), b"RIFF").unwrap();
+        std::fs::write(dir.path().join("shared.wav"), b"RIFF").unwrap();
+
+        let own = resolve_inbox_audio(&config, "alice", "alice/telegram/1.ogg").unwrap();
+        assert!(own.ends_with("1.ogg") && own.is_file());
+        // Another user's file is not found, by its prefix or a traversal.
+        for path in ["alice/telegram/1.ogg", "bob/../alice/telegram/1.ogg"] {
+            let error = resolve_inbox_audio(&config, "bob", path).unwrap_err();
+            assert!(
+                matches!(error, SeraError::NotFound(_) | SeraError::Forbidden(_)),
+                "{path}: {error}"
+            );
+        }
+        // A file at the shared inbox root has no owner and is not reachable.
+        assert!(resolve_inbox_audio(&config, "alice", "shared.wav").is_err());
+        assert!(resolve_inbox_audio(&config, "bob", "shared.wav").is_err());
+    }
+
+    #[tokio::test]
+    async fn audio_approval_resolves_the_path_for_the_acting_user_only() {
+        let server = MockServer::start().await;
+        let client =
+            MistralAudioClient::new(server.uri(), "secret", 10, &AudioConfig::default(), true)
+                .unwrap();
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("alice").join("telegram")).unwrap();
+        std::fs::write(dir.path().join("alice/telegram/1.ogg"), b"OggS").unwrap();
+        let tool = AudioTranscribeTool::new(Arc::new(client), sample_config(dir.path()));
+        let args = json!({"path": "alice/telegram/1.ogg"});
+        let context = |user: &str| ToolContext {
+            user_id: user.into(),
+            actor: user.into(),
+            bot: "main".into(),
+            task_id: None,
+            turn_id: None,
+            conversation_id: None,
+            allowed_tools: Default::default(),
+            require_approval: Default::default(),
+        };
+        let details = tool
+            .approval_details_for(&args, &context("alice"))
+            .await
+            .unwrap();
+        assert_eq!(
+            details.artifact_hash.as_deref(),
+            Some(sha256_hex(b"OggS").as_str())
+        );
+        // Bob's approval cannot reach Alice's recording.
+        assert!(
+            tool.approval_details_for(&args, &context("bob"))
+                .await
+                .is_err()
+        );
+        // The bare approval hook has no user, so it refuses.
+        assert!(tool.approval_details(&args).is_err());
     }
 
     #[tokio::test]
@@ -1004,12 +1084,20 @@ mod tests {
     }
 
     #[test]
-    fn saves_telegram_audio_under_inbox() {
+    fn saves_telegram_audio_under_the_users_inbox() {
         let dir = TempDir::new().unwrap();
         let config = sample_config(dir.path());
-        let report = save_telegram_audio_bytes(&config, 42, "ogg", b"fake-ogg", 1024).unwrap();
-        assert_eq!(report.relative_path, "telegram/42.ogg");
-        assert!(dir.path().join("telegram/42.ogg").is_file());
+        let report =
+            save_telegram_audio_bytes(&config, "alice", 42, "ogg", b"fake-ogg", 1024).unwrap();
+        // The path names the user's own directory, and the inbox tools accept it.
+        assert_eq!(report.relative_path, "alice/telegram/42.ogg");
+        assert!(dir.path().join("alice/telegram/42.ogg").is_file());
+        assert!(!dir.path().join("telegram").exists());
+        let resolved = resolve_inbox_audio(&config, "alice", &report.relative_path).unwrap();
+        assert!(resolved.is_file());
+        assert!(resolve_inbox_audio(&config, "bob", &report.relative_path).is_err());
+        // The same message is not saved twice.
+        assert!(save_telegram_audio_bytes(&config, "alice", 42, "ogg", b"again", 1024).is_err());
     }
 
     #[tokio::test]
