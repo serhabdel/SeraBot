@@ -5,6 +5,14 @@ trigger = "file"
 system_prompt = "prompts/auditor.txt"
 skills = ["audit-checklist", "bank-reconciliation", "ma-tax-2026", "pcm-cgnc"]
 tools = [
+  "local_list",
+  "local_search",
+  "local_stat",
+  "local_read",
+  "local_read_many",
+  "local_extract",
+  "local_brief",
+  "local_import",
   "ask_user",
   "skill_list",
   "skill_search",

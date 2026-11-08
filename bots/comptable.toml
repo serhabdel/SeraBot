@@ -5,6 +5,14 @@ trigger = "file"
 system_prompt = "prompts/comptable.txt"
 skills = ["ma-tax-2026", "pcm-cgnc", "ma-payroll", "financial-analysis", "xlsx"]
 tools = [
+  "local_list",
+  "local_search",
+  "local_stat",
+  "local_read",
+  "local_read_many",
+  "local_extract",
+  "local_brief",
+  "local_import",
   "ask_user",
   "skill_list",
   "skill_search",

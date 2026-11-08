@@ -47,6 +47,30 @@ impl FolderMode {
     }
 }
 
+/// Which of the owner's bots may use a folder. Stored on this device and sent
+/// with each registration as `{"mode":"all"}` or `{"mode":"only","bots":[...]}`.
+/// The server enforces it on every request; a folder saved before per-bot
+/// grants has no `bots` key and stays open to every bot.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum BotScope {
+    #[default]
+    All,
+    Only {
+        bots: Vec<String>,
+    },
+}
+
+impl BotScope {
+    /// Whether `bot` (a bot name, not its title) is in the grant.
+    pub fn allows(&self, bot: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only { bots } => bots.iter().any(|name| name == bot),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalFolder {
     /// Short slug the model sees. Never the path.
@@ -54,6 +78,9 @@ pub struct LocalFolder {
     /// Absolute, canonical path. Stays on this device.
     pub path: String,
     pub mode: FolderMode,
+    /// The bots allowed to use this folder (every bot when absent).
+    #[serde(default)]
+    pub bots: BotScope,
 }
 
 /// Settings screen: where a folder's lazy size count stands.
@@ -79,6 +106,7 @@ struct RootView<'a> {
     id: &'a str,
     label: &'a str,
     mode: &'a str,
+    bots: &'a BotScope,
 }
 
 /// A request relayed by the server.
@@ -188,6 +216,7 @@ pub fn add_folder(
         id: id.clone(),
         path: text,
         mode,
+        bots: BotScope::All,
     });
     Ok(id)
 }
@@ -483,7 +512,7 @@ impl LocalAgent {
                 let mut backoff = Duration::from_secs(2);
                 while !flag.load(Ordering::SeqCst) {
                     let current = list.read().map(|guard| guard.clone()).unwrap_or_default();
-                    let views: Vec<(String, String, &'static str)> = current
+                    let views: Vec<(String, String, &'static str, BotScope)> = current
                         .iter()
                         .map(|folder| {
                             let label = Path::new(&folder.path)
@@ -491,12 +520,22 @@ impl LocalAgent {
                                 .and_then(|name| name.to_str())
                                 .unwrap_or("folder")
                                 .to_owned();
-                            (folder.id.clone(), label, folder.mode.as_str())
+                            (
+                                folder.id.clone(),
+                                label,
+                                folder.mode.as_str(),
+                                folder.bots.clone(),
+                            )
                         })
                         .collect();
                     let roots: Vec<RootView<'_>> = views
                         .iter()
-                        .map(|(id, label, mode)| RootView { id, label, mode })
+                        .map(|(id, label, mode, bots)| RootView {
+                            id,
+                            label,
+                            mode,
+                            bots,
+                        })
                         .collect();
                     match client.local_poll(&roots_json(&roots), 12) {
                         Ok(Some(request)) => {
@@ -559,11 +598,15 @@ mod tests {
                 id: "docs".into(),
                 path: root.canonicalize().unwrap().to_string_lossy().into_owned(),
                 mode: FolderMode::ReadWrite,
+                bots: BotScope::All,
             },
             LocalFolder {
                 id: "ro".into(),
                 path: root.canonicalize().unwrap().to_string_lossy().into_owned(),
                 mode: FolderMode::Read,
+                bots: BotScope::Only {
+                    bots: vec!["main".into()],
+                },
             },
         ];
         (base, folders)
@@ -742,6 +785,44 @@ mod tests {
         save(&base, &folders).unwrap();
         assert_eq!(load(&base), folders);
         std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn folders_saved_before_bot_grants_load_open_to_every_bot() {
+        let base = std::env::temp_dir().join(format!("serabot-lf-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join(FILE_NAME),
+            r#"[{"id":"docs","path":"C:\\Docs","mode":"read"}]"#,
+        )
+        .unwrap();
+        let loaded = load(&base);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].bots, BotScope::All);
+        assert!(loaded[0].bots.allows("analyst"));
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn bot_scope_wire_shape_and_grant_check() {
+        let only = BotScope::Only {
+            bots: vec!["main".into(), "maker".into()],
+        };
+        assert_eq!(
+            serde_json::to_value(&only).unwrap(),
+            serde_json::json!({"mode": "only", "bots": ["main", "maker"]})
+        );
+        assert_eq!(
+            serde_json::to_value(BotScope::All).unwrap(),
+            serde_json::json!({"mode": "all"})
+        );
+        let back: BotScope =
+            serde_json::from_value(serde_json::json!({"mode": "only", "bots": ["analyst"]}))
+                .unwrap();
+        assert!(back.allows("analyst") && !back.allows("main"));
+        let none = BotScope::Only { bots: Vec::new() };
+        assert!(!none.allows("main"));
+        assert!(BotScope::All.allows("anyone"));
     }
 
     #[test]

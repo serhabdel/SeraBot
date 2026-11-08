@@ -2269,6 +2269,14 @@ impl Session {
         self.persist_local_folders();
     }
 
+    /// Which bots may use a folder. The server applies it on the next poll.
+    pub fn set_local_folder_bots(&mut self, id: &str, bots: crate::local_folders::BotScope) {
+        if let Some(folder) = self.local_folders.iter_mut().find(|folder| folder.id == id) {
+            folder.bots = bots;
+        }
+        self.persist_local_folders();
+    }
+
     fn persist_local_folders(&mut self) {
         if let Some(dir) = creds::settings_dir()
             && let Err(error) = crate::local_folders::save(&dir, &self.local_folders)

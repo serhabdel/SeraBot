@@ -1,4 +1,4 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -146,54 +146,26 @@ impl ArtifactStore {
         Ok(store.kv_get(&format!("deck_approved:{hash}"))?.as_deref() == Some("1"))
     }
 
-    /// Copy one owner-supplied file from a configured inbox into the store.
+    /// Copy one file from the acting user's inbox area into the store.
     ///
-    /// This is the single, format-agnostic inbox → artifact path. It enforces
-    /// the inbox boundary (the path must be relative, must canonicalise inside
-    /// `inbox`, and must not be a directory), the caller's extension allowlist,
-    /// and the caller's size cap. `inspect` runs on the bytes before anything is
-    /// written, so a caller can reject a file without leaving an artifact
-    /// behind; only then are the bytes hashed into the store. The artifact
-    /// records English because ingest does not infer a language.
+    /// This is the single, format-agnostic inbox → artifact path. The path is
+    /// resolved inside `<inbox>/<user_id>/` by [`crate::user_inbox::resolve`]
+    /// (another user's file is not found), then the caller's extension
+    /// allowlist and size cap apply, and it must be a regular file. `inspect`
+    /// runs on the bytes before anything is written, so a caller can reject a
+    /// file without leaving an artifact behind; only then are the bytes hashed
+    /// into the store. The artifact records English because ingest does not
+    /// infer a language.
     pub fn ingest_inbox_file<T>(
         &self,
         inbox: &Path,
+        user_id: &str,
         relative: &str,
         extensions: &[&str],
         max_bytes: usize,
         inspect: impl FnOnce(&[u8]) -> Result<T>,
     ) -> Result<(StoredArtifact, T)> {
-        if relative.is_empty() || relative.len() > 512 {
-            return Err(SeraError::Validation("invalid inbox path".into()));
-        }
-        let raw = Path::new(relative);
-        // Reject absolute paths, Windows drive-relative paths (`C:file`), and
-        // any `..` component before touching the filesystem. The canonicalised
-        // prefix check below is the second line of defence.
-        if raw.is_absolute()
-            || raw.components().any(|component| {
-                matches!(
-                    component,
-                    Component::Prefix(_) | Component::RootDir | Component::ParentDir
-                )
-            })
-        {
-            return Err(SeraError::Forbidden(
-                "inbox paths must be relative to the configured inbox".into(),
-            ));
-        }
-        let root = inbox
-            .canonicalize()
-            .map_err(|_| SeraError::NotFound("the configured inbox is unavailable".into()))?;
-        let candidate = root
-            .join(raw)
-            .canonicalize()
-            .map_err(|_| SeraError::NotFound("file not found in the configured inbox".into()))?;
-        if !candidate.starts_with(&root) {
-            return Err(SeraError::Forbidden(
-                "path escapes the configured inbox".into(),
-            ));
-        }
+        let candidate = crate::user_inbox::resolve(inbox, user_id, relative)?;
         let extension = candidate
             .extension()
             .and_then(|value| value.to_str())
@@ -889,44 +861,63 @@ mod tests {
     fn ingest_inbox_file_enforces_the_boundary() {
         let dir = tempfile::tempdir().unwrap();
         let inbox = dir.path().join("inbox");
-        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::create_dir_all(inbox.join("u1")).unwrap();
+        std::fs::create_dir_all(inbox.join("u2")).unwrap();
         let artifacts = ArtifactStore::new(dir.path().join("artifacts")).unwrap();
-        std::fs::write(inbox.join("note.txt"), b"hello").unwrap();
+        std::fs::write(inbox.join("u1").join("note.txt"), b"hello").unwrap();
         std::fs::write(dir.path().join("outside.txt"), b"hello").unwrap();
 
         let (stored, seen) = artifacts
-            .ingest_inbox_file(&inbox, "note.txt", &["txt"], 16, |bytes| Ok(bytes.len()))
+            .ingest_inbox_file(&inbox, "u1", "u1/note.txt", &["txt"], 16, |bytes| {
+                Ok(bytes.len())
+            })
             .unwrap();
         assert_eq!(seen, 5);
         assert_eq!(stored.bytes, b"hello");
         assert_eq!(stored.filename, "note.txt");
 
-        let absolute = inbox.join("note.txt").to_string_lossy().to_string();
+        let absolute = inbox
+            .join("u1")
+            .join("note.txt")
+            .to_string_lossy()
+            .to_string();
         for path in [
-            "../outside.txt",
-            "missing.txt",
-            "note.md",
+            "u1/../outside.txt",
+            "u1/missing.txt",
+            "u1/note.md",
             absolute.as_str(),
         ] {
             assert!(
                 artifacts
-                    .ingest_inbox_file(&inbox, path, &["txt"], 16, |_| Ok(()))
+                    .ingest_inbox_file(&inbox, "u1", path, &["txt"], 16, |_| Ok(()))
                     .is_err(),
                 "accepted {path}"
             );
         }
+        // Another user's file, named by its prefix, is not found.
+        assert!(matches!(
+            artifacts
+                .ingest_inbox_file(&inbox, "u2", "u1/note.txt", &["txt"], 16, |_| Ok(()))
+                .unwrap_err(),
+            SeraError::NotFound(_)
+        ));
         // The size cap is enforced before the bytes are read.
         assert!(
             artifacts
-                .ingest_inbox_file(&inbox, "note.txt", &["txt"], 4, |_| Ok(()))
+                .ingest_inbox_file(&inbox, "u1", "u1/note.txt", &["txt"], 4, |_| Ok(()))
                 .is_err()
         );
         // A rejected inspection stores nothing.
         assert!(
             artifacts
-                .ingest_inbox_file(&inbox, "note.txt", &["txt"], 16, |_| -> Result<()> {
-                    Err(SeraError::Validation("rejected".into()))
-                })
+                .ingest_inbox_file(
+                    &inbox,
+                    "u1",
+                    "u1/note.txt",
+                    &["txt"],
+                    16,
+                    |_| -> Result<()> { Err(SeraError::Validation("rejected".into())) }
+                )
                 .is_err()
         );
         let stored_artifacts = std::fs::read_dir(dir.path().join("artifacts"))

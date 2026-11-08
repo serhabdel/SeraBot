@@ -1143,6 +1143,76 @@ mod tests {
         );
     }
 
+    /// Every shipped bot reaches an existing user with the local folder tools:
+    /// the upgrade adds what the template gained and keeps the owner's prompt.
+    #[test]
+    fn shipped_bots_gain_the_local_read_tools_on_upgrade() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("repository root")
+            .to_path_buf();
+        let config = Config {
+            base_dir: root.canonicalize().unwrap(),
+            ..Config::default()
+        };
+        let templates =
+            crate::config::load_bots(&config, &config.fleet.bots_dir).expect("seed templates");
+        let expected: Vec<(String, Vec<String>)> = templates
+            .iter()
+            .map(|bot| {
+                let local = bot
+                    .config
+                    .tools
+                    .iter()
+                    .filter(|tool| tool.starts_with("local_"))
+                    .cloned()
+                    .collect();
+                (bot.config.name.clone(), local)
+            })
+            .collect();
+        assert!(
+            expected
+                .iter()
+                .any(|(name, tools)| name == "analyst" && tools.len() >= 5),
+            "analyst ships the local folder tools"
+        );
+        let store = Store::open_in_memory(384).unwrap();
+        let admin = store.admin_user_id().unwrap();
+        for bot in &templates {
+            // An existing row from before 0.24: no local folder tools at all.
+            let mut old = bot.config.clone();
+            old.tools.retain(|tool| !tool.starts_with("local_"));
+            store
+                .upsert_bot(
+                    &admin,
+                    &bot.config.name,
+                    &serde_json::to_value(&old).unwrap(),
+                    "the owner's own prompt",
+                    true,
+                )
+                .unwrap();
+        }
+        let catalog = Arc::new(SkillCatalog::load(&config).unwrap());
+        let registry =
+            FleetRegistry::new(Arc::new(config), store.clone(), templates, catalog).unwrap();
+        registry.seed(&admin).unwrap();
+        for (name, local) in &expected {
+            let tools = config_of(&store, &admin, name).tools;
+            for tool in local {
+                assert!(tools.contains(tool), "{name} lacks {tool}");
+            }
+            assert_eq!(
+                store.get_bot(&admin, name).unwrap().unwrap().prompt,
+                "the owner's own prompt",
+                "{name}"
+            );
+        }
+        let analyst = config_of(&store, &admin, "analyst").tools;
+        assert!(analyst.iter().any(|tool| tool == "local_read_many"));
+        assert!(!analyst.iter().any(|tool| tool == "local_write"));
+    }
+
     /// A template bot added to `main.delegates` reaches an existing user: the
     /// bot row is inserted and `main` gains the delegate.
     #[test]

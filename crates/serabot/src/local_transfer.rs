@@ -28,7 +28,7 @@ use crate::domain::{Language, new_id};
 use crate::error::{Result, SeraError};
 use crate::gateway::{ApprovalDetails, Tool, ToolContext, ToolOutput, ToolRegistry, ToolSpec};
 use crate::local_relay::{LocalRelay, TRANSFER_CHUNK_BYTES, valid_root_id, validate_relative_path};
-use crate::maker::{ArtifactMeta, ArtifactStore};
+use crate::maker::{ArtifactMeta, ArtifactStore, StoredArtifact};
 use crate::policy::Policy;
 use crate::store::Store;
 use crate::util::sha256_hex;
@@ -66,12 +66,7 @@ fn text_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 }
 
 fn safe_user_segment(user_id: &str) -> Result<()> {
-    let valid = !user_id.is_empty()
-        && user_id.len() <= 128
-        && user_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
-    if valid {
+    if crate::user_inbox::safe_user_segment(user_id) {
         Ok(())
     } else {
         Err(SeraError::Validation(
@@ -91,6 +86,108 @@ fn dir_size(path: &Path) -> u64 {
                 .sum()
         })
         .unwrap_or(0)
+}
+
+/// Pull one whole file from the calling bot's shared folder, chunk by chunk.
+/// Each chunk must describe the same file (size and modified time), so a file
+/// that changes mid-copy is refused. The caller checks the type and content.
+pub(crate) async fn fetch_file(
+    relay: &LocalRelay,
+    context: &ToolContext,
+    root: &str,
+    path: &str,
+) -> Result<Vec<u8>> {
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut size = 0u64;
+    let mut modified = 0u64;
+    loop {
+        let offset = bytes.len() as u64;
+        let reply = relay
+            .call_with(
+                context,
+                "chunk_read",
+                root,
+                path,
+                None,
+                json!({"offset": offset, "length": TRANSFER_CHUNK_BYTES}),
+            )
+            .await?;
+        let chunk: Value = serde_json::from_str(&reply)
+            .map_err(|_| SeraError::External("the desktop sent an invalid chunk".into()))?;
+        let reply_size = chunk.get("size").and_then(Value::as_u64).unwrap_or(0);
+        let reply_modified = chunk.get("modified").and_then(Value::as_u64).unwrap_or(0);
+        let reply_offset = chunk.get("offset").and_then(Value::as_u64);
+        let data = chunk
+            .get("data")
+            .and_then(Value::as_str)
+            .and_then(|text| base64::engine::general_purpose::STANDARD.decode(text).ok())
+            .ok_or_else(|| SeraError::External("the desktop sent an invalid chunk".into()))?;
+        if reply_size == 0
+            || reply_size > MAX_TRANSFER_BYTES
+            || reply_offset != Some(offset)
+            || data.is_empty()
+            || data.len() > TRANSFER_CHUNK_BYTES
+        {
+            return Err(SeraError::External(
+                "the desktop sent an invalid chunk".into(),
+            ));
+        }
+        if offset == 0 {
+            size = reply_size;
+            modified = reply_modified;
+        } else if reply_size != size || reply_modified != modified {
+            return Err(SeraError::External(
+                "the file changed on the PC while it was copied; try again".into(),
+            ));
+        }
+        bytes.extend_from_slice(&data);
+        if bytes.len() as u64 > size {
+            return Err(SeraError::External("the desktop sent too much data".into()));
+        }
+        if bytes.len() as u64 == size {
+            return Ok(bytes);
+        }
+    }
+}
+
+/// Keep an imported file: a copy under `<inbox>/<user>/local/` for the
+/// path-based tools, and an artifact for the hash-based ones. The per-user cap
+/// counts the inbox copy. Returns the inbox path and the stored artifact.
+pub(crate) fn store_import(
+    inbox: &Path,
+    artifacts: &ArtifactStore,
+    user_id: &str,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<(String, StoredArtifact)> {
+    safe_user_segment(user_id)?;
+    let directory = inbox.join(user_id).join("local");
+    std::fs::create_dir_all(&directory)?;
+    if dir_size(&directory) + bytes.len() as u64 > MAX_USER_IMPORT_BYTES {
+        return Err(SeraError::Validation(
+            "your imported files take too much server space; ask the owner to clear them".into(),
+        ));
+    }
+    let id = new_id();
+    let stored_name = format!(
+        "{}-{}",
+        &id[..8.min(id.len())],
+        crate::telegram::safe_upload_name(filename)
+    );
+    std::fs::write(directory.join(&stored_name), bytes)?;
+    let rel_path = format!("{user_id}/local/{stored_name}");
+    let stored = artifacts.save(
+        bytes,
+        filename,
+        ArtifactMeta {
+            title: filename.to_owned(),
+            filename: filename.to_owned(),
+            language: Language::En,
+            source_artifact: None,
+            created_at: Utc::now(),
+        },
+    )?;
+    Ok((rel_path, stored))
 }
 
 fn root_property() -> Value {
@@ -155,60 +252,7 @@ impl Tool for LocalImportTool {
         }
         safe_user_segment(&context.user_id)?;
 
-        // Pull the file chunk by chunk, checking the desktop keeps describing
-        // the same file.
-        let mut bytes: Vec<u8> = Vec::new();
-        let mut size = 0u64;
-        let mut modified = 0u64;
-        loop {
-            let offset = bytes.len() as u64;
-            let reply = self
-                .relay
-                .call_with(
-                    &context.user_id,
-                    "chunk_read",
-                    root,
-                    path,
-                    None,
-                    json!({"offset": offset, "length": TRANSFER_CHUNK_BYTES}),
-                )
-                .await?;
-            let chunk: Value = serde_json::from_str(&reply)
-                .map_err(|_| SeraError::External("the desktop sent an invalid chunk".into()))?;
-            let reply_size = chunk.get("size").and_then(Value::as_u64).unwrap_or(0);
-            let reply_modified = chunk.get("modified").and_then(Value::as_u64).unwrap_or(0);
-            let reply_offset = chunk.get("offset").and_then(Value::as_u64);
-            let data = chunk
-                .get("data")
-                .and_then(Value::as_str)
-                .and_then(|text| base64::engine::general_purpose::STANDARD.decode(text).ok())
-                .ok_or_else(|| SeraError::External("the desktop sent an invalid chunk".into()))?;
-            if reply_size == 0
-                || reply_size > MAX_TRANSFER_BYTES
-                || reply_offset != Some(offset)
-                || data.is_empty()
-                || data.len() > TRANSFER_CHUNK_BYTES
-            {
-                return Err(SeraError::External(
-                    "the desktop sent an invalid chunk".into(),
-                ));
-            }
-            if offset == 0 {
-                size = reply_size;
-                modified = reply_modified;
-            } else if reply_size != size || reply_modified != modified {
-                return Err(SeraError::External(
-                    "the file changed on the PC while it was copied; try again".into(),
-                ));
-            }
-            bytes.extend_from_slice(&data);
-            if bytes.len() as u64 > size {
-                return Err(SeraError::External("the desktop sent too much data".into()));
-            }
-            if bytes.len() as u64 == size {
-                break;
-            }
-        }
+        let bytes = fetch_file(&self.relay, context, root, path).await?;
         let filename = path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned();
         if !self.policy.is_allowed(&filename) {
             return Err(SeraError::PolicyViolation);
@@ -219,34 +263,12 @@ impl Tool for LocalImportTool {
             ));
         }
 
-        // Inbox copy for the path-based tools, scoped to this user.
-        let directory = self.inbox.join(&context.user_id).join("local");
-        std::fs::create_dir_all(&directory)?;
-        if dir_size(&directory) + bytes.len() as u64 > MAX_USER_IMPORT_BYTES {
-            return Err(SeraError::Validation(
-                "your imported files take too much server space; ask the owner to clear them"
-                    .into(),
-            ));
-        }
-        let id = new_id();
-        let stored_name = format!(
-            "{}-{}",
-            &id[..8.min(id.len())],
-            crate::telegram::safe_upload_name(&filename)
-        );
-        std::fs::write(directory.join(&stored_name), &bytes)?;
-        let rel_path = format!("{}/local/{stored_name}", context.user_id);
-        // Artifact copy so hash-based tools and a later export can use it.
-        let stored = self.artifacts.save(
-            &bytes,
+        let (rel_path, stored) = store_import(
+            &self.inbox,
+            &self.artifacts,
+            &context.user_id,
             &filename,
-            ArtifactMeta {
-                title: filename.clone(),
-                filename: filename.clone(),
-                language: Language::En,
-                source_artifact: None,
-                created_at: Utc::now(),
-            },
+            &bytes,
         )?;
         let hint = match extension.as_str() {
             "docx" => "docx_read / docx_inspect / docx_edit",
@@ -377,7 +399,7 @@ impl Tool for LocalExportTool {
             last = self
                 .relay
                 .call_with(
-                    &context.user_id,
+                    context,
                     "put_chunk",
                     &root,
                     &path,
@@ -413,15 +435,15 @@ pub fn register_transfer_tools(
         relay: relay.clone(),
         policy: policy.clone(),
         artifacts: artifacts.clone(),
-        inbox,
+        inbox: inbox.clone(),
     })?;
     registry.register(LocalExportTool {
-        relay,
-        policy,
-        artifacts,
+        relay: relay.clone(),
+        policy: policy.clone(),
+        artifacts: artifacts.clone(),
         store,
     })?;
-    Ok(())
+    crate::local_bulk::register_bulk_tools(registry, relay, policy, artifacts, inbox)
 }
 
 #[cfg(test)]
@@ -469,6 +491,7 @@ mod tests {
             id: "docs".into(),
             label: "Docs".into(),
             mode: mode.into(),
+            bots: Default::default(),
         }]
     }
 

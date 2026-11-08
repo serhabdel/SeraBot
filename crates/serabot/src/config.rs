@@ -2040,6 +2040,9 @@ const SPECIALIST_TOOL_ALLOWLIST: &[&str] = &[
     "local_write",
     "local_import",
     "local_export",
+    "local_read_many",
+    "local_extract",
+    "local_brief",
 ];
 
 const DEFAULT_SPECIALIST_TOOLS: &[&str] = &["skill_list", "skill_search", "skill_load"];
@@ -2843,6 +2846,52 @@ mod tests {
                 !bot.tools.iter().any(|granted| granted == "local_write"),
                 "{name} must not write to the PC"
             );
+        }
+    }
+
+    /// Every shipped bot can use the PC folder read tools; the owner's grants
+    /// decide which folders each one sees. Only `main` keeps the write tools.
+    #[test]
+    fn every_shipped_bot_can_read_local_folders() {
+        const READ_TOOLS: [&str; 8] = [
+            "local_list",
+            "local_search",
+            "local_stat",
+            "local_read",
+            "local_read_many",
+            "local_extract",
+            "local_brief",
+            "local_import",
+        ];
+        for name in [
+            "analyst",
+            "auditor",
+            "comptable",
+            "courier",
+            "inbox",
+            "legal",
+            "main",
+            "maker",
+            "marketer",
+            "markets",
+            "watcher",
+            "whatsapp",
+        ] {
+            let bot = shipped_bot(name);
+            for tool in READ_TOOLS {
+                assert!(
+                    bot.tools.iter().any(|granted| granted == tool),
+                    "{name} lacks {tool}"
+                );
+            }
+            if name != "main" {
+                assert!(
+                    !bot.tools
+                        .iter()
+                        .any(|granted| granted == "local_write" || granted == "local_export"),
+                    "{name} must not write to the PC"
+                );
+            }
         }
     }
 

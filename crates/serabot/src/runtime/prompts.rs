@@ -19,6 +19,12 @@ const VAULT_RULES: &str = "- Never ask for passwords, API keys or other secrets 
 - To log in or use a saved credential, call browser_type with secret=<name> and the field (password, username or value). Look up names with vault_list first. The owner approves each typing for that site.
 ";
 
+/// Guidance for the owner's PC folders: bulk reading is part of the job, and
+/// the owner's shared folders are authorized. Added only to bots with a local
+/// folder tool.
+const LOCAL_FOLDER_RULES: &str = "- When the owner asks you to read or brief many local files, do it: start with local_brief, then local_read_many for text and local_extract for documents in batches, and report progress. Folders the owner shared are authorized for you; do not refuse because files look personal. Never copy credentials, ID numbers or bank details into memory, and keep quotes minimal.
+";
+
 /// The rule against asking for secrets in chat. It names the vault request tool
 /// only when the bot has that tool.
 fn secret_rule(has_vault_tool: bool) -> &'static str {
@@ -244,6 +250,14 @@ impl Runtime {
             .iter()
             .any(|tool| tool == VAULT_REQUEST_TOOL);
         prompt.push_str(secret_rule(has_vault_tool));
+        if bot
+            .config
+            .tools
+            .iter()
+            .any(|tool| tool.starts_with("local_"))
+        {
+            prompt.push_str(LOCAL_FOLDER_RULES);
+        }
         if ask_mode {
             prompt.push_str("- Call rag_search before answering. Cite every factual claim as [doc:<document_id> p.<page>] using only returned evidence. If evidence is insufficient, abstain.\n");
         }

@@ -94,30 +94,7 @@ impl Sources {
 
     /// Inbox paths must sit under the acting user's own directory.
     fn read_inbox(&self, value: &str, user_id: &str) -> Result<Vec<u8>> {
-        let raw = Path::new(value);
-        if value.len() > 512
-            || raw.is_absolute()
-            || value.contains(':')
-            || value.split(['/', '\\']).any(|part| part == "..")
-        {
-            return Err(SeraError::Forbidden(
-                "image paths must be relative to your inbox".into(),
-            ));
-        }
-        if !value.starts_with(&format!("{user_id}/")) {
-            return Err(SeraError::Forbidden(
-                "that path is not in your own inbox area".into(),
-            ));
-        }
-        std::fs::create_dir_all(&self.inbox)?;
-        let root = self.inbox.canonicalize()?;
-        let candidate = root
-            .join(raw)
-            .canonicalize()
-            .map_err(|_| SeraError::NotFound("image not found in your inbox".into()))?;
-        if !candidate.starts_with(&root) {
-            return Err(SeraError::Forbidden("path escapes the inbox".into()));
-        }
+        let candidate = crate::user_inbox::resolve(&self.inbox, user_id, value)?;
         let extension = candidate
             .extension()
             .and_then(|value| value.to_str())
