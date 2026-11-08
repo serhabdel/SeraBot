@@ -28,6 +28,8 @@ tools = [
   "xlsx_analyze",
   "xlsx_read",
   "xlsx_build",
+  "conversation_library",
+  "telegram_send_document",
 ]
 require_approval = []
 enabled = true

@@ -40,6 +40,7 @@ tools = [
   "pdf_merge",
   "document_index",
   "telegram_send_document",
+  "conversation_library",
   "onedrive_list",
   "onedrive_upload",
   "elevenlabs_key_list_voices",

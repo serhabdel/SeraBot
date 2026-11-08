@@ -49,7 +49,10 @@ overrides.
 
 Bots that send or delete anything through an external account keep approval
 on: `telegram_send_document`, `composio_execute` (for the messaging bots), and
-`onedrive_upload`. Only `main` has the `delegate` tool.
+`onedrive_upload`. Every bot gets `conversation_library` (find artifact hashes,
+media results and local files itself) and `telegram_send_document` (0.27).
+Only `main` has the `delegate` tool, and it may fan out up to 8 handoffs in one
+turn to run parallel subagents.
 
 Related sources of truth:
 

@@ -16,7 +16,8 @@ classes (`routine`, `synthesis`) to models already listed in configuration; it
 does not replace the allowlist or consent gates.
 
 **Orchestrator:** `main` is the only bot with `role = "orchestrator"`. It routes
-owner traffic and may queue one audited handoff per turn to a specialist. It does
+owner traffic and may queue up to 8 audited handoffs per turn — several `delegate`
+calls in one round fan out to parallel specialist subagents (0.27). It does
 not receive specialist-only tools (maker, analyst, watcher pipelines stay on
 those bots). Specialists cannot delegate.
 

@@ -489,6 +489,8 @@ impl Tool for DeckBuildTool {
     }
 }
 
+pub const TELEGRAM_SEND_DOCUMENT_TOOL: &str = "telegram_send_document";
+
 pub struct TelegramDocumentTool {
     client: Arc<TelegramClient>,
     artifacts: Arc<ArtifactStore>,
@@ -513,7 +515,7 @@ impl TelegramDocumentTool {
 impl Tool for TelegramDocumentTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "telegram_send_document".into(),
+            name: TELEGRAM_SEND_DOCUMENT_TOOL.into(),
             description:
                 "Deliver an existing rendered artifact to the owner's private Telegram chat.".into(),
             parameters: json!({

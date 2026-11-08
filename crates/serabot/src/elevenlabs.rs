@@ -1173,7 +1173,7 @@ impl MediaPoller for ElevenLabsKeyPoller {
         Ok(match self.client.flow_state(kind, generation_id).await? {
             FlowState::Pending => PollResult::Pending,
             FlowState::Failed(message) => PollResult::Failed(message),
-            FlowState::Completed(done) => PollResult::Done(MediaArtifact {
+            FlowState::Completed(done) => PollResult::Done(vec![MediaArtifact {
                 filename: format!(
                     "elevenlabs-{}.{}",
                     kind.label(),
@@ -1181,7 +1181,7 @@ impl MediaPoller for ElevenLabsKeyPoller {
                 ),
                 title: Some(kind.title().to_owned()),
                 bytes: done.bytes,
-            }),
+            }]),
         })
     }
 }
@@ -2413,10 +2413,11 @@ mod tests {
             PollResult::Pending
         ));
         match poller.poll("owner", "video:gen-p1").await.unwrap() {
-            PollResult::Done(artifact) => {
-                assert_eq!(artifact.bytes, b"MP4");
-                assert_eq!(artifact.filename, "elevenlabs-video.mp4");
-                assert_eq!(artifact.title.as_deref(), Some("ElevenLabs video"));
+            PollResult::Done(files) => {
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].bytes, b"MP4");
+                assert_eq!(files[0].filename, "elevenlabs-video.mp4");
+                assert_eq!(files[0].title.as_deref(), Some("ElevenLabs video"));
             }
             other => panic!("expected a finished video, got {other:?}"),
         }

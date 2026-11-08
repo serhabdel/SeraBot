@@ -2519,6 +2519,63 @@ impl Store {
         Ok(artifacts)
     }
 
+    /// Artifacts recorded directly in the acting user's conversation, with
+    /// the filename and title the bot needs to name the file (0.27). Scoped
+    /// to the acting user, newest first.
+    pub fn list_conversation_library(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<ConversationLibraryArtifact>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT hash, tool, filename, title, created_at
+              FROM conversation_artifacts
+              WHERE conversation_id = ?1 AND user_id = ?2
+              ORDER BY created_at DESC, rowid DESC
+              LIMIT 100",
+        )?;
+        let rows = statement.query_map(params![conversation_id, user_id], |row| {
+            Ok(ConversationLibraryArtifact {
+                hash: row.get(0)?,
+                tool: row.get(1)?,
+                filename: row.get(2)?,
+                title: row.get(3)?,
+                created_at: parse_datetime(&row.get::<_, String>(4)?),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Destinations on the owner's PC that tools wrote to in the acting
+    /// user's conversation (`local:<root>/<path>`), newest first (0.27). A
+    /// PC write is not an artifact-store file, so the library tool reports the
+    /// destination instead of a hash.
+    pub fn list_local_file_destinations(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<LocalFileDestination>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT a.tool, a.destination, a.created_at
+              FROM actions a
+              JOIN turns t ON t.id = a.turn_id
+              WHERE t.conversation_id = ?1 AND t.user_id = ?2
+                AND a.destination LIKE 'local:%'
+              ORDER BY a.created_at DESC, a.rowid DESC
+              LIMIT 100",
+        )?;
+        let rows = statement.query_map(params![conversation_id, user_id], |row| {
+            Ok(LocalFileDestination {
+                tool: row.get(0)?,
+                destination: row.get(1)?,
+                created_at: parse_datetime(&row.get::<_, String>(2)?),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn list_visible_messages(
         &self,
         user_id: &str,
@@ -3782,6 +3839,26 @@ pub struct StoredConversationArtifact {
     pub tool: String,
     pub created_at: DateTime<Utc>,
     pub hash: String,
+}
+
+/// One artifact recorded in a conversation, with the filename and title
+/// (0.27 conversation library tool).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConversationLibraryArtifact {
+    pub hash: String,
+    pub tool: String,
+    pub filename: String,
+    pub title: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// One `local:<root>/<path>` destination a tool wrote to on the owner's PC
+/// (0.27 conversation library tool).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LocalFileDestination {
+    pub tool: String,
+    pub destination: String,
+    pub created_at: DateTime<Utc>,
 }
 
 fn map_conversation_write(error: rusqlite::Error) -> SeraError {

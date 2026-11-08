@@ -23,6 +23,8 @@ tools = [
   "composio_search_tools",
   "composio_connect",
   "composio_execute",
+  "conversation_library",
+  "telegram_send_document",
 ]
 require_approval = ["composio_execute"]
 enabled = true
