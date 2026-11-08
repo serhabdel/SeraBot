@@ -567,8 +567,10 @@ fn clip_to_block(text: &str) -> (String, bool) {
 pub fn plain_text(bytes: &[u8], max_chars: usize) -> Result<String> {
     let document = load(bytes)?;
     let mut out = String::new();
+    // Characters written so far, counted once per block rather than per check.
+    let mut written = 0usize;
     for block in &document.body {
-        if out.chars().count() >= max_chars {
+        if written >= max_chars {
             break;
         }
         let text = match block.as_ref() {
@@ -578,6 +580,7 @@ pub fn plain_text(bytes: &[u8], max_chars: usize) -> Result<String> {
         if text.trim().is_empty() {
             continue;
         }
+        written += text.chars().count() + 1;
         out.push_str(&text);
         out.push('\n');
     }

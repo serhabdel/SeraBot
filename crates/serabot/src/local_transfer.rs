@@ -16,15 +16,16 @@
 //! Bytes move in 1 MiB base64 chunks over the existing relay. The desktop
 //! applies its own allowlist, link and name rules to every chunk.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use base64::Engine as _;
 use chrono::Utc;
 use serde_json::{Value, json};
 
-use crate::domain::{Language, new_id};
+use crate::domain::Language;
 use crate::error::{Result, SeraError};
 use crate::gateway::{ApprovalDetails, Tool, ToolContext, ToolOutput, ToolRegistry, ToolSpec};
 use crate::local_relay::{LocalRelay, TRANSFER_CHUNK_BYTES, valid_root_id, validate_relative_path};
@@ -36,7 +37,7 @@ use crate::util::sha256_hex;
 /// Largest file imported or exported.
 pub const MAX_TRANSFER_BYTES: u64 = 50 * 1024 * 1024;
 /// Imported files kept per user in the server inbox.
-const MAX_USER_IMPORT_BYTES: u64 = 1024 * 1024 * 1024;
+pub(crate) const MAX_USER_IMPORT_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Types a local import accepts (the document and image tools' inputs).
 pub const IMPORT_EXTENSIONS: [&str; 11] = [
@@ -150,6 +151,44 @@ pub(crate) async fn fetch_file(
     }
 }
 
+/// Hex characters of the SHA-256 that name an inbox copy.
+const HASH_PREFIX: usize = 16;
+
+/// Bytes in one user's `local/` folder, held in memory. The first import scans
+/// the folder; every later write adds to the count. The mutex is the user's
+/// import lock: the cap check and the write happen under it.
+type UsageCell = Arc<Mutex<Option<u64>>>;
+
+/// One usage cell per user and inbox, so tests with separate inboxes do not
+/// share a count.
+static IMPORT_USAGE: OnceLock<Mutex<HashMap<String, UsageCell>>> = OnceLock::new();
+
+fn import_usage(inbox: &Path, user_id: &str) -> UsageCell {
+    let key = format!("{}\u{0}{user_id}", inbox.display());
+    let map = IMPORT_USAGE.get_or_init(Default::default);
+    let mut map = map.lock().unwrap_or_else(|error| error.into_inner());
+    map.entry(key).or_default().clone()
+}
+
+/// The name of a file in `directory` with exactly these bytes, if one exists.
+/// Only files named with this content's hash prefix are read.
+fn same_content_in(directory: &Path, hash: &str, bytes: &[u8]) -> Option<String> {
+    let prefix = format!("{}-", &hash[..HASH_PREFIX]);
+    for entry in std::fs::read_dir(directory).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let same_size = entry
+            .metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.len() == bytes.len() as u64);
+        if name.starts_with(&prefix)
+            && same_size
+            && std::fs::read(entry.path()).is_ok_and(|old| old == bytes)
+        {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// Keep an imported file: a copy under `<inbox>/<user>/local/` for the
 /// path-based tools, and an artifact for the hash-based ones. The per-user cap
 /// counts the inbox copy. Returns the inbox path and the stored artifact.
@@ -160,22 +199,57 @@ pub(crate) fn store_import(
     filename: &str,
     bytes: &[u8],
 ) -> Result<(String, StoredArtifact)> {
+    store_import_capped(
+        inbox,
+        artifacts,
+        user_id,
+        filename,
+        bytes,
+        MAX_USER_IMPORT_BYTES,
+    )
+}
+
+/// [`store_import`] with the per-user cap given.
+///
+/// The inbox copy is named `<sha256 prefix>-<name>`. Same bytes already in the
+/// user's `local/` folder (under any name) are reused, not copied again, and
+/// the artifact store already dedupes by hash.
+pub(crate) fn store_import_capped(
+    inbox: &Path,
+    artifacts: &ArtifactStore,
+    user_id: &str,
+    filename: &str,
+    bytes: &[u8],
+    cap: u64,
+) -> Result<(String, StoredArtifact)> {
     safe_user_segment(user_id)?;
+    let hash = sha256_hex(bytes);
     let directory = inbox.join(user_id).join("local");
     std::fs::create_dir_all(&directory)?;
-    if dir_size(&directory) + bytes.len() as u64 > MAX_USER_IMPORT_BYTES {
-        return Err(SeraError::Validation(
-            "your imported files take too much server space; ask the owner to clear them".into(),
-        ));
-    }
-    let id = new_id();
-    let stored_name = format!(
-        "{}-{}",
-        &id[..8.min(id.len())],
-        crate::telegram::safe_upload_name(filename)
-    );
-    std::fs::write(directory.join(&stored_name), bytes)?;
-    let rel_path = format!("{user_id}/local/{stored_name}");
+    let rel_path = {
+        let usage = import_usage(inbox, user_id);
+        let mut used = usage.lock().unwrap_or_else(|error| error.into_inner());
+        let total = *used.get_or_insert_with(|| dir_size(&directory));
+        match same_content_in(&directory, &hash, bytes) {
+            Some(existing) => format!("{user_id}/local/{existing}"),
+            None => {
+                if total + bytes.len() as u64 > cap {
+                    return Err(SeraError::Validation(
+                        "your imported files take too much server space; ask the owner to clear them"
+                            .into(),
+                    ));
+                }
+                let stored_name = format!(
+                    "{}-{}",
+                    &hash[..HASH_PREFIX],
+                    crate::telegram::safe_upload_name(filename)
+                );
+                std::fs::write(directory.join(&stored_name), bytes)?;
+                *used = Some(total + bytes.len() as u64);
+                format!("{user_id}/local/{stored_name}")
+            }
+        }
+    };
     let stored = artifacts.save(
         bytes,
         filename,
@@ -453,6 +527,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::domain::new_id;
     use crate::gateway::{Decision, Gateway, ToolOutcome};
     use crate::local_relay::{LocalRoot, RelayResult};
 
@@ -715,6 +790,44 @@ mod tests {
                     .next()
                     .is_none()
         );
+        std::fs::remove_dir_all(&f.base).ok();
+    }
+
+    #[test]
+    fn same_bytes_are_reused_and_the_cap_is_checked_before_any_write() {
+        let f = fixture();
+        let (first, _) =
+            store_import_capped(&f.inbox, &f.artifacts, &f.user, "a.txt", b"hello", 100).unwrap();
+        // The same bytes under another name reuse the copy already there.
+        let (again, _) =
+            store_import_capped(&f.inbox, &f.artifacts, &f.user, "copy.txt", b"hello", 100)
+                .unwrap();
+        assert_eq!(first, again);
+        // A new file that would pass the cap is refused, and nothing is written.
+        let refused = store_import_capped(
+            &f.inbox,
+            &f.artifacts,
+            &f.user,
+            "big.txt",
+            &[b'x'; 200],
+            100,
+        )
+        .unwrap_err();
+        assert!(
+            refused.to_string().contains("too much server space"),
+            "{refused}"
+        );
+        let entries = std::fs::read_dir(f.inbox.join(&f.user).join("local"))
+            .unwrap()
+            .count();
+        assert_eq!(entries, 1);
+        // Another user's folder is counted separately: 60 bytes fit for them.
+        let other = f
+            .store
+            .create_user("subject-cap", "cap@example.example", "Cap")
+            .unwrap()
+            .id;
+        store_import_capped(&f.inbox, &f.artifacts, &other, "mine.txt", &[b'y'; 60], 100).unwrap();
         std::fs::remove_dir_all(&f.base).ok();
     }
 

@@ -1317,7 +1317,8 @@ impl Tool for ElevenLabsTranscribeTool {
                 let artifact = self.deps.artifacts.load(hash)?;
                 (artifact.bytes, artifact.filename)
             } else if let Some(path) = args.get("path").and_then(Value::as_str) {
-                let resolved = resolve_inbox_audio(self.deps.app_config.as_ref(), path)?;
+                let resolved =
+                    resolve_inbox_audio(self.deps.app_config.as_ref(), &_context.user_id, path)?;
                 let bytes = std::fs::read(&resolved)?;
                 let filename = resolved
                     .file_name()

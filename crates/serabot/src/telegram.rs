@@ -646,7 +646,14 @@ impl TelegramClient {
                 .unwrap_or("mpeg")
                 .to_ascii_lowercase()
         };
-        match save_telegram_audio_bytes(config, message.message_id, &extension, &bytes, max_bytes) {
+        match save_telegram_audio_bytes(
+            config,
+            user_id,
+            message.message_id,
+            &extension,
+            &bytes,
+            max_bytes,
+        ) {
             Ok(report) => {
                 store.record_audit(
                     user_id,
@@ -765,11 +772,13 @@ impl TelegramClient {
         let safe = safe_upload_name(name);
         let target = unique_inbox_path(&inbox, &safe, message.message_id);
         std::fs::write(&target, &bytes)?;
-        let relative = target
+        // The reply names the file the way the inbox tools take it: under the
+        // owner's own directory.
+        let name = target
             .file_name()
             .and_then(|value| value.to_str())
-            .unwrap_or(&safe)
-            .to_owned();
+            .unwrap_or(&safe);
+        let relative = format!("{user_id}/{name}");
         store.record_audit(
             user_id,
             "document.telegram_intake",
@@ -2757,6 +2766,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let config = audio_test_config(&dir, &provider.uri(), Some(AUDIO_TEST_KEY));
         let (runtime, store) = runtime_with_config(config);
+        let admin = store.admin_user_id().unwrap();
         let client = TelegramClient::new("123:abc", 10, 20)
             .unwrap()
             .with_base_url(telegram.uri());
@@ -2780,12 +2790,77 @@ mod tests {
         assert_eq!(task.payload["text"], json!("buongiorno"));
         assert_eq!(task.payload["conversation_id"], json!("20"));
         assert_eq!(task.payload["source"], json!("owner"));
-        // The original recording is still stored in the inbox.
+        // The original recording is still stored in the owner's inbox directory.
         assert!(
             dir.path()
                 .join("inbox")
+                .join(&admin)
                 .join("telegram")
                 .join("9.ogg")
+                .is_file()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_uploaded_document_is_named_under_the_owners_folder() {
+        let telegram = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:abc/getFile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "result": {"file_path": "docs/report.docx", "file_size": 8}
+            })))
+            .mount(&telegram)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/file/bot123:abc/docs/report.docx"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PK\x03\x04fake".to_vec()))
+            .mount(&telegram)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/bot123:abc/sendMessage"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": {}})),
+            )
+            .mount(&telegram)
+            .await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = default_test_config();
+        config.base_dir = dir.path().to_path_buf();
+        config.documents.watch_dir = dir.path().join("inbox").to_string_lossy().into_owned();
+        let (runtime, store) = runtime_with_config(config);
+        let admin = store.admin_user_id().unwrap();
+        let client = TelegramClient::new("123:abc", 10, 20)
+            .unwrap()
+            .with_base_url(telegram.uri());
+        client.bootstrap_admin_binding(&store).unwrap();
+        let update: Update = serde_json::from_value(json!({
+            "update_id": 601,
+            "message": {
+                "message_id": 11,
+                "chat": {"id": 20, "type": "private"},
+                "from": {"id": 10},
+                "document": {"file_id": "doc-1", "file_name": "report.docx", "file_size": 8}
+            }
+        }))
+        .unwrap();
+        client
+            .handle_update(&runtime, &store, None, update)
+            .await
+            .unwrap();
+        // The reply names the file the way the inbox tools take it: under the
+        // owner's own folder, and the file is there.
+        let messages = sent_messages(&telegram).await;
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].contains(&format!("{admin}/report.docx")),
+            "{messages:?}"
+        );
+        assert!(
+            dir.path()
+                .join("inbox")
+                .join(&admin)
+                .join("report.docx")
                 .is_file()
         );
     }

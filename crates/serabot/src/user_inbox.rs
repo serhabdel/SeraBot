@@ -65,8 +65,15 @@ pub fn resolve(inbox: &Path, user_id: &str, value: &str) -> Result<PathBuf> {
     let root = inbox
         .canonicalize()
         .map_err(|_| SeraError::NotFound("the inbox is unavailable".into()))?;
-    let user_dir = root.join(user_id).canonicalize().map_err(|_| not_found())?;
-    if !user_dir.starts_with(&root) {
+    // The user's own directory must be a real directory, not a link (symlink
+    // or Windows junction) that points elsewhere, even inside the inbox.
+    let user_link = root.join(user_id);
+    let link = std::fs::symlink_metadata(&user_link).map_err(|_| not_found())?;
+    if is_link(&link) {
+        return Err(not_found());
+    }
+    let user_dir = user_link.canonicalize().map_err(|_| not_found())?;
+    if user_dir != user_link || !user_dir.starts_with(&root) {
         return Err(not_found());
     }
     let mut candidate = user_dir.clone();
@@ -78,6 +85,24 @@ pub fn resolve(inbox: &Path, user_id: &str, value: &str) -> Result<PathBuf> {
         return Err(not_found());
     }
     Ok(candidate)
+}
+
+/// Whether `metadata` (taken without following links) is a symlink, a junction
+/// or another reparse point.
+fn is_link(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -168,6 +193,36 @@ mod tests {
     #[cfg(windows)]
     fn create_file_link(target: &Path, link: &Path) -> bool {
         std::os::windows::fs::symlink_file(target, link).is_ok()
+    }
+
+    /// A folder link: a symlink where the host allows it, else a junction.
+    fn create_dir_link(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(target, link).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(target, link).is_ok()
+            || std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .is_ok_and(|out| out.status.success());
+        linked
+    }
+
+    #[test]
+    fn a_user_directory_that_is_a_link_is_refused() {
+        let (_dir, inbox) = inbox_with_two_users();
+        // Carol's directory is a link to Alice's: the path looks like Carol's,
+        // but the files are Alice's.
+        if !create_dir_link(&inbox.join("alice"), &inbox.join("carol")) {
+            // Links are not available on this host; nothing to check.
+            return;
+        }
+        let error = resolve(&inbox, "carol", "carol/local/secret.pdf").unwrap_err();
+        assert!(matches!(error, SeraError::NotFound(_)), "{error}");
+        // A real directory of the same shape still resolves.
+        assert!(resolve(&inbox, "alice", "alice/local/secret.pdf").is_ok());
     }
 
     #[test]

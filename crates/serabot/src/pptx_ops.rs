@@ -496,8 +496,10 @@ fn summarize(bytes: &[u8]) -> Result<PptxInfo> {
 pub fn slide_plain_text(bytes: &[u8], max_chars: usize) -> Result<String> {
     let presentation = open(bytes)?;
     let mut out = String::new();
+    // Characters written so far, counted once per slide rather than per check.
+    let mut written = 0usize;
     for (index, slide) in presentation.slides.iter().enumerate() {
-        if out.chars().count() >= max_chars {
+        if written >= max_chars {
             out.push_str("[more slides not shown: text limit reached]\n");
             break;
         }
@@ -511,11 +513,13 @@ pub fn slide_plain_text(bytes: &[u8], max_chars: usize) -> Result<String> {
                 }
             }
         });
-        out.push_str(&format!("--- slide {} ---\n{body}", index + 1));
+        let mut section = format!("--- slide {} ---\n{body}", index + 1);
         let notes = slide.notes.text();
         if !notes.trim().is_empty() {
-            out.push_str(&format!("speaker notes:\n{}\n", notes.trim()));
+            section.push_str(&format!("speaker notes:\n{}\n", notes.trim()));
         }
+        written += section.chars().count();
+        out.push_str(&section);
     }
     Ok(out)
 }

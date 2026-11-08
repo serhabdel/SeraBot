@@ -47,18 +47,34 @@ impl FolderMode {
     }
 }
 
+/// The bots that may use a folder with no grant: the bots that had local folder
+/// tools before 0.24. The server uses the same list.
+pub const DEFAULT_GRANT_BOTS: [&str; 3] = ["main", "analyst", "maker"];
+
 /// Which of the owner's bots may use a folder. Stored on this device and sent
 /// with each registration as `{"mode":"all"}` or `{"mode":"only","bots":[...]}`.
-/// The server enforces it on every request; a folder saved before per-bot
-/// grants has no `bots` key and stays open to every bot.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The server enforces it on every request. A folder saved before per-bot
+/// grants has no `bots` key and gets [`DEFAULT_GRANT_BOTS`], not every bot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum BotScope {
-    #[default]
+    /// Every bot. Chosen by the owner in the picker.
     All,
     Only {
         bots: Vec<String>,
     },
+}
+
+impl Default for BotScope {
+    /// The grant for a new folder, and for one saved without a grant.
+    fn default() -> Self {
+        Self::Only {
+            bots: DEFAULT_GRANT_BOTS
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
+        }
+    }
 }
 
 impl BotScope {
@@ -78,7 +94,7 @@ pub struct LocalFolder {
     /// Absolute, canonical path. Stays on this device.
     pub path: String,
     pub mode: FolderMode,
-    /// The bots allowed to use this folder (every bot when absent).
+    /// The bots allowed to use this folder ([`DEFAULT_GRANT_BOTS`] when absent).
     #[serde(default)]
     pub bots: BotScope,
 }
@@ -216,7 +232,7 @@ pub fn add_folder(
         id: id.clone(),
         path: text,
         mode,
-        bots: BotScope::All,
+        bots: BotScope::default(),
     });
     Ok(id)
 }
@@ -776,6 +792,10 @@ mod tests {
             add_folder(&mut list, &other, FolderMode::ReadWrite, None).unwrap(),
             "docs-2"
         );
+        // A new folder starts with the default bots; the owner picks All.
+        assert_eq!(list[0].bots, BotScope::default());
+        assert_eq!(list[1].bots, BotScope::default());
+        assert!(list[0].bots.allows("analyst") && !list[0].bots.allows("inbox"));
         std::fs::remove_dir_all(base).ok();
     }
 
@@ -788,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn folders_saved_before_bot_grants_load_open_to_every_bot() {
+    fn folders_saved_before_bot_grants_load_with_the_default_bots() {
         let base = std::env::temp_dir().join(format!("serabot-lf-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(
@@ -798,8 +818,16 @@ mod tests {
         .unwrap();
         let loaded = load(&base);
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].bots, BotScope::All);
-        assert!(loaded[0].bots.allows("analyst"));
+        assert_eq!(loaded[0].bots, BotScope::default());
+        for bot in DEFAULT_GRANT_BOTS {
+            assert!(loaded[0].bots.allows(bot), "{bot}");
+        }
+        assert!(!loaded[0].bots.allows("inbox"));
+        // The wire form the server receives is the explicit list.
+        assert_eq!(
+            serde_json::to_value(&loaded[0].bots).unwrap(),
+            serde_json::json!({"mode": "only", "bots": ["main", "analyst", "maker"]})
+        );
         std::fs::remove_dir_all(base).ok();
     }
 

@@ -839,18 +839,28 @@ pub fn import(bytes: &[u8]) -> Result<Workbook> {
 pub fn plain_text(bytes: &[u8], max_chars: usize) -> Result<String> {
     let (workbook, _) = load(bytes)?;
     let mut out = String::new();
+    // Characters written and cells visited so far. A sparse sheet visits only
+    // its stored cells, and the cell budget bounds that work too.
+    let mut written = 0usize;
+    let mut visited = 0usize;
+    let mut cut = false;
     for sheet in &workbook.sheets {
-        if out.chars().count() >= max_chars {
+        if written >= max_chars || visited >= PLAIN_TEXT_MAX_CELLS {
+            cut = true;
             break;
         }
         let Some(used) = sheet.cells.used_range() else {
             continue;
         };
-        out.push_str(&format!("# {}\n", sheet.name));
+        let header = format!("# {}\n", sheet.name);
+        written += header.chars().count();
+        out.push_str(&header);
         for (cell_ref, cell) in sheet.cells.iter_range(used) {
-            if out.chars().count() >= max_chars {
+            if written >= max_chars || visited >= PLAIN_TEXT_MAX_CELLS {
+                cut = true;
                 break;
             }
+            visited += 1;
             let record = cell_record(&workbook, sheet, cell_ref, cell);
             let value = match (&record.formula, &record.cached, &record.value) {
                 (Some(formula), cached, _) => match cached {
@@ -863,11 +873,19 @@ pub fn plain_text(bytes: &[u8], max_chars: usize) -> Result<String> {
             if value.trim().is_empty() {
                 continue;
             }
-            out.push_str(&format!("{}!{}: {value}\n", sheet.name, cell_ref.a1()));
+            let line = format!("{}!{}: {value}\n", sheet.name, cell_ref.a1());
+            written += line.chars().count();
+            out.push_str(&line);
         }
+    }
+    if cut {
+        out.push_str("[more cells not shown: text limit reached]\n");
     }
     Ok(out)
 }
+
+/// Cells one [`plain_text`] pass visits, empty ones included.
+const PLAIN_TEXT_MAX_CELLS: usize = 200_000;
 
 /// Read the values of one worksheet range, so a caller can see what is in a cell before editing
 /// it. Read-only: nothing is written and no artifact is produced.
