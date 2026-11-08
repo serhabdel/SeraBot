@@ -319,6 +319,9 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
     "pdf_inspect",
     "pdf_edit",
     "pdf_merge",
+    "image_inspect",
+    "image_resize",
+    "image_convert",
     "telegram_send_document",
     "onedrive_upload",
     "onedrive_list",
@@ -361,8 +364,12 @@ pub const SPECIALIST_TOOLS: &[&str] = &[
     "memory_update",
     "memory_delete",
     "local_list",
+    "local_search",
+    "local_stat",
     "local_read",
     "local_write",
+    "local_import",
+    "local_export",
 ];
 
 pub const DEFAULT_SPECIALIST_TOOLS: &[&str] = &["skill_list", "skill_search", "skill_load"];

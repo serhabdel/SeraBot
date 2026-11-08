@@ -76,9 +76,16 @@ tools = [
   "browser_tabs",
   "browser_new_tab",
   "telegram_send_document",
+  "image_inspect",
+  "image_resize",
+  "image_convert",
   "local_list",
+  "local_search",
+  "local_stat",
   "local_read",
   "local_write",
+  "local_import",
+  "local_export",
 ]
 require_approval = []
 enabled = true
