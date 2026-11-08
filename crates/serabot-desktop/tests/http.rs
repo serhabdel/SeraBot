@@ -572,6 +572,79 @@ fn list_bots_rejects_secret_shaped_ids() {
 }
 
 #[test]
+fn meet_your_team_reads_the_catalog_and_installs_one_bot() {
+    let (client, handle) = server(vec![(
+        200,
+        r#"{"bots":[{"id":"analyst","title":"Analyst","description":"Reads the numbers.","role":"specialist","installed":false,"avatar_version":"v1"},{"id":"writer","role":"specialist","installed":true,"avatar_version":null}]}"#.into(),
+    )]);
+    let bots = client.bot_catalog().unwrap();
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("GET /v1/bots/catalog "));
+    assert_eq!(bots.len(), 2);
+    assert_eq!(bots[0].id, "analyst");
+    assert_eq!(bots[0].title.as_deref(), Some("Analyst"));
+    assert!(!bots[0].installed);
+    assert!(bots[1].installed);
+    assert!(bots[1].title.is_none());
+
+    let (client, handle) = server(vec![(
+        200,
+        r#"{"bots":[{"id":"analyst","role":"specialist","installed":false},{"id":"analyst","role":"specialist","installed":false}]}"#.into(),
+    )]);
+    assert_eq!(client.bot_catalog().unwrap_err(), ApiError::InvalidResponse);
+    handle.join().unwrap();
+
+    let (client, handle) = server(vec![(
+        200,
+        r#"{"bots":[{"id":"../analyst","role":"specialist","installed":false}]}"#.into(),
+    )]);
+    assert_eq!(client.bot_catalog().unwrap_err(), ApiError::InvalidResponse);
+    handle.join().unwrap();
+
+    let (client, handle) = server(vec![(
+        200,
+        r#"{"bot":{"id":"analyst","title":"Analyst","role":"specialist","enabled":false,"installed":true,"avatar_version":"v1"}}"#.into(),
+    )]);
+    client.install_shipped_bot("analyst").unwrap();
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("POST /v1/bots/catalog/analyst/install "));
+
+    // A bot the owner already has is a conflict, and an unknown template is a
+    // 404; both come back as the status, never as a replayed write.
+    let (client, handle) = server(vec![(409, r#"{"error":"bot already exists"}"#.into())]);
+    assert_eq!(
+        client.install_shipped_bot("analyst").unwrap_err(),
+        ApiError::Http(409)
+    );
+    handle.join().unwrap();
+    let (client, handle) = server(vec![(404, r#"{"error":"not found"}"#.into())]);
+    assert_eq!(
+        client.install_shipped_bot("ghost").unwrap_err(),
+        ApiError::Http(404)
+    );
+    handle.join().unwrap();
+
+    // A reply for some other bot is not what was asked for.
+    let (client, handle) = server(vec![(
+        200,
+        r#"{"bot":{"id":"writer","role":"specialist","enabled":false,"installed":true}}"#.into(),
+    )]);
+    assert_eq!(
+        client.install_shipped_bot("analyst").unwrap_err(),
+        ApiError::InvalidResponse
+    );
+    handle.join().unwrap();
+
+    // Names that are not slugs never leave the process.
+    let (client, handle) = server(vec![]);
+    assert!(matches!(
+        client.install_shipped_bot("../analyst"),
+        Err(ApiError::Validation(_))
+    ));
+    handle.join().unwrap();
+}
+
+#[test]
 fn unexpected_roles_and_overlong_history_are_rejected() {
     for body in [r#"{"messages":[{"id":"m","role":"tool","content":"untrusted internal details","created_at":"now"}]}"#.to_string(),
         serde_json::json!({"messages": (0..101).map(|_| serde_json::json!({"id":"m","role":"user","content":"fixture","created_at":"now"})).collect::<Vec<_>>()}).to_string()] {

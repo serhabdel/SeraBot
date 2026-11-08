@@ -22,7 +22,7 @@ use serabot_desktop::{
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
-use crate::ui_bots::{NewBotSheet, NewGroupSheet, OnboardingView};
+use crate::ui_bots::{MeetTeamSheet, NewBotSheet, NewGroupSheet, OnboardingView};
 use crate::ui_browser::BrowserView;
 use crate::ui_cards::ChatCardRow;
 use crate::ui_connectors::ConnectorsView;
@@ -253,6 +253,8 @@ pub(crate) enum Overlay {
     /// The guided "Add provider" sheet.
     AddProvider,
     Team,
+    /// "Meet your team": the shipped bots the owner can add.
+    MeetTeam,
 }
 
 fn avatar_hue(id: &str) -> u16 {
@@ -1500,6 +1502,9 @@ fn Shell(session: Signal<Session>) -> Element {
                 Overlay::Team => rsx! {
                     TeamSheet { session, overlay }
                 },
+                Overlay::MeetTeam => rsx! {
+                    MeetTeamSheet { session, overlay }
+                },
                 Overlay::None => rsx! {},
             }}
             if let Some((message, failed)) = toast() {
@@ -1692,6 +1697,16 @@ fn NewMenu(
                     },
                     Icon { name: "robot", size: 16 }
                     "New bot"
+                }
+                button {
+                    class: "menu-item",
+                    onclick: move |_| {
+                        open.set(false);
+                        session.write().open_meet_team();
+                        overlay.set(Overlay::MeetTeam);
+                    },
+                    Icon { name: "users", size: 16 }
+                    "Meet your team"
                 }
             }
         }

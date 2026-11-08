@@ -255,6 +255,32 @@ impl Session {
         self.schedule_next_avatar();
     }
 
+    /// "Meet your team" opened: read the shipped templates. Scheduled, not
+    /// sent now, so a request already in flight finishes first.
+    pub fn open_meet_team(&mut self) {
+        self.state.shipped_error = None;
+        self.schedule(Operation::BotCatalog, Duration::ZERO);
+    }
+
+    /// "Add to my team" for one shipped bot. One write at a time; a refused
+    /// add is shown in the sheet and the button stays for a retry.
+    pub fn install_shipped_bot(&mut self, name: String) {
+        if self.state.shipped_installing.is_some() {
+            return;
+        }
+        if !self.ready() {
+            self.state.shipped_error = Some("Wait for the current request, then retry.".into());
+            return;
+        }
+        self.state.shipped_error = None;
+        self.state.shipped_installing = Some(name.clone());
+        self.start_request(Operation::InstallShippedBot { name });
+        if self.pending.is_none() {
+            self.state.shipped_installing = None;
+            self.state.shipped_error = Some("Network worker unavailable. Reconnect.".into());
+        }
+    }
+
     // ------------------------------------------------------------- groups --
 
     /// Validate the create-group sheet and send it.

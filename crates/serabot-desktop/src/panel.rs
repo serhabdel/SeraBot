@@ -16,8 +16,8 @@ use crate::worker::Credentials;
 use crate::{
     ApiClient, ApiError, BrowserController, BrowserHistory, BrowserInfo, BrowserInput,
     BrowserProfile, BrowserSessionInfo, ConnectorUpdate, DEFAULT_PROFILE, MAX_VAULT_DOMAINS,
-    MAX_VAULT_ENTRIES, MAX_VAULT_NOTE_CHARS, MAX_VAULT_USERNAME_CHARS, PasswordManager,
-    VaultEntry, VaultKind, VaultPut, VaultSource, normalize_vault_domain, valid_vault_name,
+    MAX_VAULT_ENTRIES, MAX_VAULT_NOTE_CHARS, MAX_VAULT_USERNAME_CHARS, PasswordManager, VaultEntry,
+    VaultKind, VaultPut, VaultSource, normalize_vault_domain, valid_vault_name,
     valid_vault_reference, validate_vault_put,
 };
 use crate::{ComposioAccount, ComposioApp};

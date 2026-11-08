@@ -1542,6 +1542,20 @@ body {
   flex: 1;
 }
 
+/* "Meet your team": name, role and the shipped description in one column. */
+.meet-copy {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.meet-desc {
+  margin: 0;
+  white-space: normal;
+}
+
 /* ------------------------------------------- pins, picker, kv, skills --- */
 
 .pins {
