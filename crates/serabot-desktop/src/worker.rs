@@ -911,9 +911,9 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         }
         Operation::TaskSyncStatus => client.task_sync_status().map(Reply::TaskSyncStatus),
         Operation::RunTaskSync => client.run_task_sync().map(Reply::TaskSyncReport),
-        Operation::TaskCalendar { from, to } => client
-            .task_calendar_events(from, to)
-            .map(Reply::TaskEvents),
+        Operation::TaskCalendar { from, to } => {
+            client.task_calendar_events(from, to).map(Reply::TaskEvents)
+        }
         Operation::Providers => client.providers().map(|mut providers| {
             // The account's own default route marks one card with a star;
             // without one, the server default is the starred provider.
