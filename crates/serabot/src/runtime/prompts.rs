@@ -6,9 +6,21 @@ use super::*;
 const PLAN_RULES: &str = "- When the owner asks for a multi-step task, first call plan_update with a one-line goal and a short todo list, and call it again whenever an item changes status (pending, doing, done).\n\
 - Once a goal is set, work through the todo list to the end without asking the owner more questions. Ask only when a step is impossible or needs a destructive approval. State your assumptions in the reply instead of asking about them.\n";
 
-/// Guidance for asking the owner: a card instead of a guess, never for secrets in chat.
-const ASK_RULES: &str = "- If the request is ambiguous and a wrong guess would waste work, call ask_user with 2 to 4 concrete options instead of guessing. Do not ask when autonomy is on or the chat has a goal; then choose and state your assumption.\n\
-- Never ask for passwords or API keys in chat text. Use vault_request_secret instead.\n";
+/// Guidance for asking the owner: a card instead of a guess.
+const ASK_RULES: &str = "- If the request is ambiguous and a wrong guess would waste work, call ask_user with 2 to 4 concrete options instead of guessing. Do not ask when autonomy is on or the chat has a goal; then choose and state your assumption.\n";
+
+/// The bot's tool that asks the vault for a secret.
+const VAULT_REQUEST_TOOL: &str = "vault_request_secret";
+
+/// The rule against asking for secrets in chat. It names the vault request tool
+/// only when the bot has that tool.
+fn secret_rule(has_vault_tool: bool) -> &'static str {
+    if has_vault_tool {
+        "- Never ask for passwords or API keys in chat text. Use vault_request_secret instead.\n"
+    } else {
+        "- Never ask for passwords or API keys in chat; tell the owner to add them in the Vault.\n"
+    }
+}
 
 /// Honesty rule every bot prompt carries: a bot names only the tools this
 /// turn offers and reports only the calls it actually ran.
@@ -218,6 +230,12 @@ impl Runtime {
         {
             prompt.push_str(ASK_RULES);
         }
+        let has_vault_tool = bot
+            .config
+            .tools
+            .iter()
+            .any(|tool| tool == VAULT_REQUEST_TOOL);
+        prompt.push_str(secret_rule(has_vault_tool));
         if ask_mode {
             prompt.push_str("- Call rag_search before answering. Cite every factual claim as [doc:<document_id> p.<page>] using only returned evidence. If evidence is insufficient, abstain.\n");
         }
@@ -280,5 +298,24 @@ impl Runtime {
             }
         }
         self.gateway.scan_egress(user_id, &combined)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_rule_names_the_vault_tool_only_when_the_bot_has_it() {
+        let with_vault = secret_rule(true);
+        assert!(with_vault.contains("Use vault_request_secret instead."));
+        assert!(!with_vault.contains("Vault"));
+
+        let without_vault = secret_rule(false);
+        assert!(!without_vault.contains("vault_request_secret"));
+        assert_eq!(
+            without_vault,
+            "- Never ask for passwords or API keys in chat; tell the owner to add them in the Vault.\n"
+        );
     }
 }

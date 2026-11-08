@@ -42,6 +42,10 @@ struct Tab {
     label: String,
     target_id: String,
     session_id: String,
+    /// False while the page is being configured (its guard is not on yet). A
+    /// tab that is not ready holds a slot toward the limit, but no bot call
+    /// reaches it.
+    ready: bool,
 }
 
 /// The tabs of one browser and which one the tools act on.
@@ -50,29 +54,56 @@ struct TabSet {
     tabs: Vec<Tab>,
     active: String,
     next: u32,
+    /// Pages `open_tab` asked the browser to create and that have not attached yet.
+    expected: Vec<String>,
+    /// `open_tab` calls still waiting for `Target.createTarget` to return.
+    creating: usize,
 }
 
 impl TabSet {
-    fn add(&mut self, target_id: String, session_id: String) -> String {
+    /// Slots in use: tabs (ready or still being set up), created pages not yet
+    /// adopted, and creates in flight.
+    fn occupied(&self) -> usize {
+        self.tabs.len() + self.expected.len() + self.creating
+    }
+
+    /// Reserve a slot for an attached page. It counts toward the limit but is
+    /// not usable until `mark_ready`.
+    fn reserve(&mut self, target_id: String, session_id: String) -> String {
         self.next += 1;
         let label = format!("t{}", self.next);
         self.tabs.push(Tab {
             label: label.clone(),
             target_id,
             session_id,
+            ready: false,
         });
-        self.active = label.clone();
         label
     }
 
+    /// Make a reserved tab the active one. False when it was dropped meanwhile.
+    fn mark_ready(&mut self, label: &str) -> bool {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.label == label) else {
+            return false;
+        };
+        tab.ready = true;
+        self.active = label.to_owned();
+        true
+    }
+
+    fn ready_count(&self) -> usize {
+        self.tabs.iter().filter(|tab| tab.ready).count()
+    }
+
     fn active_tab(&self) -> Option<&Tab> {
-        self.tabs.iter().find(|tab| tab.label == self.active)
+        self.find(&self.active)
     }
 
     fn find(&self, label: &str) -> Option<&Tab> {
-        self.tabs.iter().find(|tab| tab.label == label)
+        self.tabs.iter().find(|tab| tab.ready && tab.label == label)
     }
 
+    /// Reserved tabs count too: their sessions are ours to guard.
     fn owns_session(&self, session_id: &str) -> bool {
         self.tabs.iter().any(|tab| tab.session_id == session_id)
     }
@@ -81,15 +112,45 @@ impl TabSet {
         self.tabs.iter().any(|tab| tab.target_id == target_id)
     }
 
+    fn is_expected(&self, target_id: &str) -> bool {
+        self.expected.iter().any(|id| id == target_id)
+    }
+
+    /// Take a page out of the expected list. True when it was expected.
+    fn take_expected(&mut self, target_id: &str) -> bool {
+        match self.expected.iter().position(|id| id == target_id) {
+            Some(index) => {
+                self.expected.swap_remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn remove(&mut self, label: &str) {
         self.tabs.retain(|tab| tab.label != label);
         if self.active == label {
             self.active = self
                 .tabs
-                .first()
+                .iter()
+                .find(|tab| tab.ready)
                 .map(|tab| tab.label.clone())
                 .unwrap_or_default();
         }
+    }
+
+    /// Drop every tab on a target, and any expectation of it.
+    fn forget_target(&mut self, target_id: &str) {
+        let labels: Vec<String> = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.target_id == target_id)
+            .map(|tab| tab.label.clone())
+            .collect();
+        for label in labels {
+            self.remove(&label);
+        }
+        self.expected.retain(|id| id != target_id);
     }
 }
 
@@ -108,14 +169,19 @@ pub enum PopupDecision {
     Close(&'static str),
 }
 
-/// Adopt a new page only when a tab of this browser opened it (its
-/// `openerId` is one of our targets) and the tab limit has room. Anything
-/// else, including a page with no opener, is closed.
+/// Adopt a page that `open_tab` asked for (`expected`: its slot was counted
+/// when it was requested). Otherwise adopt only a page a tab of this browser
+/// opened (its `openerId` is one of our targets) while the tab limit has room.
+/// Anything else, including a page with no opener, is closed.
 pub fn should_adopt(
     opener_id: Option<&str>,
     known_target_ids: &[&str],
     count: usize,
+    expected: bool,
 ) -> PopupDecision {
+    if expected {
+        return PopupDecision::Adopt;
+    }
     match opener_id {
         Some(opener) if known_target_ids.contains(&opener) => {
             if count >= MAX_TABS {
@@ -204,13 +270,65 @@ pub fn chromium_args(profile: &Path, no_sandbox: bool) -> Vec<String> {
         "--disable-breakpad".to_owned(),
         "--mute-audio".to_owned(),
         "--password-store=basic".to_owned(),
-        "--disable-features=Translate,MediaRouter,OptimizationHints".to_owned(),
+        // No DNS prefetch, preconnect or prefetch. Defence in depth: the guard
+        // is the control, and the profile preference is set too (see
+        // `disable_network_prediction`).
+        "--dns-prefetch-disable".to_owned(),
+        "--disable-features=Translate,MediaRouter,OptimizationHints,NetworkPrediction".to_owned(),
         "about:blank".to_owned(),
     ];
     if no_sandbox {
         args.insert(1, "--no-sandbox".to_owned());
     }
     args
+}
+
+/// Chromium's `net.network_prediction_options` value for "never predict".
+const NETWORK_PREDICTION_NEVER: i64 = 2;
+
+/// The profile's `Default/Preferences` with network prediction set to never,
+/// merged into the existing JSON so other keys are kept. `existing` is the file
+/// as read (`None` when it is missing). Returns `None` when the existing file is
+/// not a JSON object, so the caller leaves it alone.
+pub fn preferences_with_network_prediction_off(existing: Option<&str>) -> Option<String> {
+    let mut root: Value = match existing {
+        Some(text) => serde_json::from_str(text).ok()?,
+        None => json!({}),
+    };
+    let net = root
+        .as_object_mut()?
+        .entry("net")
+        .or_insert_with(|| json!({}));
+    net.as_object_mut()?.insert(
+        "network_prediction_options".to_owned(),
+        json!(NETWORK_PREDICTION_NEVER),
+    );
+    serde_json::to_string(&root).ok()
+}
+
+/// Write the network prediction preference into the profile before launch, so
+/// Chromium starts with preconnect and prefetch off. Failures are logged and do
+/// not stop the launch.
+fn disable_network_prediction(profile: &Path) {
+    let directory = profile.join("Default");
+    let file = directory.join("Preferences");
+    let existing = match std::fs::read_to_string(&file) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            tracing::warn!(%error, "browser: cannot read the profile preferences");
+            return;
+        }
+    };
+    let Some(merged) = preferences_with_network_prediction_off(existing.as_deref()) else {
+        tracing::warn!("browser: profile preferences are not a JSON object; left as they are");
+        return;
+    };
+    if let Err(error) =
+        std::fs::create_dir_all(&directory).and_then(|()| std::fs::write(&file, merged))
+    {
+        tracing::warn!(%error, "browser: cannot write the profile preferences");
+    }
 }
 
 /// Contents of `DevToolsActivePort`: line 1 port, line 2 browser ws path.
@@ -245,6 +363,7 @@ impl BrowserLauncher for ChromiumLauncher {
     async fn launch(&self, user_id: &str, profile_id: &str) -> Result<Arc<dyn BrowserBackend>> {
         let profile = crate::browser_profiles::profile_dir(&self.base_dir, user_id, profile_id)?;
         std::fs::create_dir_all(&profile)?;
+        disable_network_prediction(&profile);
         let port_file = profile.join("DevToolsActivePort");
         let _ = std::fs::remove_file(&port_file);
         let mut child = Command::new(&self.executable)
@@ -376,16 +495,12 @@ impl ChromiumBackend {
             .as_str()
             .ok_or_else(|| browser_error("attach returned no session"))?
             .to_owned();
-        let previous = lock_tabs(tabs).active.clone();
-        let label = lock_tabs(tabs).add(target_id.to_owned(), session_id.clone());
+        let label = lock_tabs(tabs).reserve(target_id.to_owned(), session_id.clone());
         if let Err(error) = Self::configure(cdp, &session_id).await {
-            let mut set = lock_tabs(tabs);
-            set.remove(&label);
-            if set.tabs.iter().any(|tab| tab.label == previous) {
-                set.active = previous;
-            }
+            lock_tabs(tabs).remove(&label);
             return Err(error);
         }
+        lock_tabs(tabs).mark_ready(&label);
         Ok(label)
     }
 
@@ -533,8 +648,31 @@ fn spawn_event_loop(
     })
 }
 
-/// A page one of our tabs opened (or a page nobody should have opened) has
-/// attached paused. Adopt it as a tab or close it; never leave it paused.
+/// How long a page the browser creates while an `open_tab` call is in flight
+/// may stay paused, waiting for that call to record its id.
+const CREATE_WAIT: Duration = Duration::from_secs(2);
+
+/// Let a paused page or worker run, then let go of its session.
+async fn resume_and_detach(cdp: &Arc<CdpConnection>, session_id: &str) {
+    let _ = cdp
+        .call(
+            Some(session_id),
+            "Runtime.runIfWaitingForDebugger",
+            json!({}),
+        )
+        .await;
+    let _ = cdp
+        .call(
+            None,
+            "Target.detachFromTarget",
+            json!({"sessionId": session_id}),
+        )
+        .await;
+}
+
+/// A page the browser created has attached paused. Adopt it as a tab, or close
+/// it. A page that is not adopted is never resumed: it is closed while still
+/// paused, so none of its code runs.
 async fn adopt_child(
     cdp: &Arc<CdpConnection>,
     tabs: &SharedTabs,
@@ -557,30 +695,31 @@ async fn adopt_child(
     // Workers and extension pages run as they would without auto-attach, and
     // a second session to one of our own tabs is not needed: let go of both.
     if info["type"] != "page" || lock_tabs(tabs).owns_target(&target_id) {
-        let _ = cdp
-            .call(
-                Some(child_session),
-                "Runtime.runIfWaitingForDebugger",
-                json!({}),
-            )
-            .await;
-        let _ = cdp
-            .call(
-                None,
-                "Target.detachFromTarget",
-                json!({"sessionId": child_session}),
-            )
-            .await;
+        resume_and_detach(cdp, child_session).await;
         return;
     }
-    // Decide and register under one lock, so the tab limit holds.
+    // A page without an opener may be the one `open_tab` is creating, whose id
+    // is not recorded yet. Hold it paused for a short time while a create is in
+    // flight, so the decision below sees the id.
+    let deadline = Instant::now() + CREATE_WAIT;
+    loop {
+        let hold = {
+            let set = lock_tabs(tabs);
+            set.creating > 0 && info["openerId"].as_str().is_none() && !set.is_expected(&target_id)
+        };
+        if !hold || Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // Decide and reserve under one lock, so the tab limit holds.
     let adopted = {
         let mut set = lock_tabs(tabs);
+        let expected = set.take_expected(&target_id);
         let known: Vec<String> = set.tabs.iter().map(|tab| tab.target_id.clone()).collect();
         let known: Vec<&str> = known.iter().map(String::as_str).collect();
-        let count = set.tabs.len();
-        match should_adopt(info["openerId"].as_str(), &known, count) {
-            PopupDecision::Adopt => Some(set.add(target_id.clone(), child_session.to_owned())),
+        match should_adopt(info["openerId"].as_str(), &known, set.occupied(), expected) {
+            PopupDecision::Adopt => Some(set.reserve(target_id.clone(), child_session.to_owned())),
             PopupDecision::Close(reason) => {
                 tracing::warn!(reason, "browser: closed a new page");
                 None
@@ -588,30 +727,10 @@ async fn adopt_child(
         }
     };
     let Some(label) = adopted else {
-        if info["openerId"].is_string() {
-            // A popup some other page opened: not ours.
-            let _ = cdp
-                .call(None, "Target.closeTarget", json!({"targetId": target_id}))
-                .await;
-        } else {
-            // A page with no opener is not a popup. Our own tabs and the
-            // browser's pages land here; the target-created check closes any
-            // unrelated page, so only let this copy go.
-            let _ = cdp
-                .call(
-                    Some(child_session),
-                    "Runtime.runIfWaitingForDebugger",
-                    json!({}),
-                )
-                .await;
-            let _ = cdp
-                .call(
-                    None,
-                    "Target.detachFromTarget",
-                    json!({"sessionId": child_session}),
-                )
-                .await;
-        }
+        // Not ours. The page is still paused, so its code has not run.
+        let _ = cdp
+            .call(None, "Target.closeTarget", json!({"targetId": target_id}))
+            .await;
         return;
     };
     // Fetch (the guard) is on before the page is allowed to run. Requests the
@@ -621,6 +740,14 @@ async fn adopt_child(
         .is_err()
     {
         lock_tabs(tabs).remove(&label);
+        let _ = cdp
+            .call(None, "Target.closeTarget", json!({"targetId": target_id}))
+            .await;
+        return;
+    }
+    // Usable and active only now. If open_tab gave up on the page meanwhile,
+    // the reservation is gone: close the page instead of running it.
+    if !lock_tabs(tabs).mark_ready(&label) {
         let _ = cdp
             .call(None, "Target.closeTarget", json!({"targetId": target_id}))
             .await;
@@ -704,13 +831,18 @@ fn handle_event(
                 && let Some(id) = info["targetId"].as_str()
             {
                 // Safety net for pages nobody adopted: close them unless a tab
-                // of ours registered the target (see `adopt_child`) first.
+                // of ours claims the target (see `adopt_child`) first. While an
+                // open_tab call is in flight, its page may not be recorded yet.
                 let cdp = cdp.clone();
                 let tabs = tabs.clone();
                 let id = id.to_owned();
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(600)).await;
-                    if !lock_tabs(&tabs).owns_target(&id) {
+                    let keep = {
+                        let set = lock_tabs(&tabs);
+                        set.owns_target(&id) || set.is_expected(&id) || set.creating > 0
+                    };
+                    if !keep {
                         let _ = cdp
                             .call(None, "Target.closeTarget", json!({"targetId": id}))
                             .await;
@@ -961,14 +1093,16 @@ impl BrowserBackend for ChromiumBackend {
             .cloned()
             .unwrap_or_default();
         let mut set = lock_tabs(&self.tabs);
-        // Forget tabs the page closed itself.
+        // Forget tabs the page closed itself. A tab still being set up is left
+        // to `adopt_child`, which knows whether it was adopted.
         let gone: Vec<String> = set
             .tabs
             .iter()
             .filter(|tab| {
-                !infos
-                    .iter()
-                    .any(|info| info["targetId"].as_str() == Some(tab.target_id.as_str()))
+                tab.ready
+                    && !infos
+                        .iter()
+                        .any(|info| info["targetId"].as_str() == Some(tab.target_id.as_str()))
             })
             .map(|tab| tab.label.clone())
             .collect();
@@ -978,6 +1112,7 @@ impl BrowserBackend for ChromiumBackend {
         Ok(set
             .tabs
             .iter()
+            .filter(|tab| tab.ready)
             .map(|tab| {
                 let info = infos
                     .iter()
@@ -999,22 +1134,59 @@ impl BrowserBackend for ChromiumBackend {
     }
 
     async fn open_tab(&self, url: &str) -> Result<Vec<TabInfo>> {
-        let before = lock_tabs(&self.tabs).tabs.len();
-        if before >= MAX_TABS {
-            return Err(SeraError::Validation(format!(
-                "at most {MAX_TABS} tabs; close one first"
-            )));
+        {
+            let mut set = lock_tabs(&self.tabs);
+            if set.occupied() >= MAX_TABS {
+                return Err(SeraError::Validation(format!(
+                    "at most {MAX_TABS} tabs; close one first"
+                )));
+            }
+            set.creating += 1;
         }
-        // The active page opens a blank popup. It is a popup like any other:
-        // it attaches paused and `adopt_child` registers it as the active tab.
-        self.call(
-            "Runtime.evaluate",
-            json!({"expression": "window.open('about:blank')", "userGesture": true}),
-        )
-        .await?;
+        // The browser creates a blank page directly. No page script runs in
+        // the active tab, so a site cannot change how the tab opens. The page
+        // attaches paused and `adopt_child` takes it, because its id is expected.
+        let created = self
+            .cdp
+            .call(None, "Target.createTarget", json!({"url": "about:blank"}))
+            .await;
+        let target_id = {
+            let mut set = lock_tabs(&self.tabs);
+            set.creating -= 1;
+            let value = created?;
+            let id = value["targetId"]
+                .as_str()
+                .ok_or_else(|| browser_error("the browser returned no page"))?
+                .to_owned();
+            set.expected.push(id.clone());
+            id
+        };
+        // Wait until the page is adopted: reserved, configured and ready. It
+        // is gone when adoption failed, and dropped when it times out.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while lock_tabs(&self.tabs).tabs.len() <= before {
-            if Instant::now() >= deadline {
+        loop {
+            let (ready, pending) = {
+                let set = lock_tabs(&self.tabs);
+                let ready = set
+                    .tabs
+                    .iter()
+                    .any(|tab| tab.ready && tab.target_id == target_id);
+                let pending = set.is_expected(&target_id)
+                    || set
+                        .tabs
+                        .iter()
+                        .any(|tab| !tab.ready && tab.target_id == target_id);
+                (ready, pending)
+            };
+            if ready {
+                break;
+            }
+            if !pending || Instant::now() >= deadline {
+                lock_tabs(&self.tabs).forget_target(&target_id);
+                let _ = self
+                    .cdp
+                    .call(None, "Target.closeTarget", json!({"targetId": target_id}))
+                    .await;
                 return Err(browser_error("the new tab did not open"));
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1049,7 +1221,7 @@ impl BrowserBackend for ChromiumBackend {
                 .find(tab)
                 .cloned()
                 .ok_or_else(|| SeraError::Validation(format!("no tab {tab}")))?;
-            if set.tabs.len() <= 1 {
+            if set.ready_count() <= 1 {
                 return Err(SeraError::Validation(
                     "that is the last tab; close the browser instead".into(),
                 ));
@@ -1123,9 +1295,12 @@ mod tests {
     #[test]
     fn a_popup_from_one_of_our_tabs_is_adopted_while_there_is_room() {
         let known = ["T1", "T2"];
-        assert_eq!(should_adopt(Some("T2"), &known, 2), PopupDecision::Adopt);
         assert_eq!(
-            should_adopt(Some("T2"), &known, MAX_TABS - 1),
+            should_adopt(Some("T2"), &known, 2, false),
+            PopupDecision::Adopt
+        );
+        assert_eq!(
+            should_adopt(Some("T2"), &known, MAX_TABS - 1, false),
             PopupDecision::Adopt
         );
     }
@@ -1134,7 +1309,7 @@ mod tests {
     fn a_full_tab_set_closes_the_popup_it_would_have_adopted() {
         let known = ["T1"];
         assert_eq!(
-            should_adopt(Some("T1"), &known, MAX_TABS),
+            should_adopt(Some("T1"), &known, MAX_TABS, false),
             PopupDecision::Close("tab limit reached")
         );
     }
@@ -1144,23 +1319,142 @@ mod tests {
         let known = ["T1"];
         // No opener at all (a page the browser created itself).
         assert!(matches!(
-            should_adopt(None, &known, 1),
+            should_adopt(None, &known, 1, false),
             PopupDecision::Close(_)
         ));
         // An opener that is not one of our tabs.
         assert!(matches!(
-            should_adopt(Some("SOMEONE-ELSE"), &known, 1),
+            should_adopt(Some("SOMEONE-ELSE"), &known, 1, false),
             PopupDecision::Close(_)
         ));
         // A tab that was closed since: its id no longer counts.
         assert!(matches!(
-            should_adopt(Some("T9"), &known, 1),
+            should_adopt(Some("T9"), &known, 1, false),
             PopupDecision::Close(_)
         ));
         assert!(matches!(
-            should_adopt(Some(""), &[], 0),
+            should_adopt(Some(""), &[], 0, false),
             PopupDecision::Close(_)
         ));
+    }
+
+    #[test]
+    fn a_page_open_tab_asked_for_is_adopted_without_an_opener() {
+        // open_tab creates the page itself: no opener, and its slot was counted.
+        let known = ["T1"];
+        assert_eq!(should_adopt(None, &known, 1, true), PopupDecision::Adopt);
+        assert_eq!(
+            should_adopt(None, &known, MAX_TABS, true),
+            PopupDecision::Adopt
+        );
+        // Expectation does not make an unrelated page with an opener adoptable.
+        assert!(matches!(
+            should_adopt(Some("SOMEONE-ELSE"), &known, 1, false),
+            PopupDecision::Close(_)
+        ));
+    }
+
+    #[test]
+    fn a_reserved_tab_is_counted_but_not_usable_until_ready() {
+        let mut set = TabSet::default();
+        let first = set.reserve("T1".into(), "S1".into());
+        assert_eq!(set.occupied(), 1);
+        // Reserved: counts toward the limit, yet no bot call reaches it.
+        assert!(set.active_tab().is_none());
+        assert!(set.find(&first).is_none());
+        assert_eq!(set.ready_count(), 0);
+        assert!(set.owns_session("S1") && set.owns_target("T1"));
+        assert!(set.mark_ready(&first));
+        assert_eq!(set.active_tab().unwrap().target_id, "T1");
+        assert_eq!(set.ready_count(), 1);
+        // Dropped reservations are not revived by a late mark.
+        set.remove(&first);
+        assert!(!set.mark_ready(&first));
+        assert!(set.active_tab().is_none());
+    }
+
+    #[test]
+    fn expected_pages_hold_a_slot_until_adopted_or_forgotten() {
+        let mut set = TabSet {
+            creating: 1,
+            ..TabSet::default()
+        };
+        set.expected.push("T9".into());
+        assert_eq!(set.occupied(), 2);
+        assert!(set.is_expected("T9"));
+        assert!(set.take_expected("T9"));
+        assert!(!set.take_expected("T9"));
+        set.expected.push("T9".into());
+        set.forget_target("T9");
+        assert!(!set.is_expected("T9"));
+        assert_eq!(set.occupied(), 1);
+    }
+
+    #[test]
+    fn chromium_args_turn_off_dns_prefetch_and_network_prediction() {
+        let args = chromium_args(Path::new("/p"), false);
+        assert!(args.contains(&"--dns-prefetch-disable".to_owned()));
+        let features = args
+            .iter()
+            .find(|arg| arg.starts_with("--disable-features="))
+            .unwrap();
+        for kept in [
+            "Translate",
+            "MediaRouter",
+            "OptimizationHints",
+            "NetworkPrediction",
+        ] {
+            assert!(features.contains(kept), "{features}");
+        }
+    }
+
+    #[test]
+    fn the_profile_preferences_file_is_created_and_merged_on_disk() {
+        let profile = std::env::temp_dir().join(format!("serabot-prefs-{}", uuid::Uuid::new_v4()));
+        // No Default/ directory yet: it is created with the one setting.
+        disable_network_prediction(&profile);
+        let created: Value = serde_json::from_str(
+            &std::fs::read_to_string(profile.join("Default").join("Preferences")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(created["net"]["network_prediction_options"], 2);
+
+        // An existing file keeps its other keys.
+        let file = profile.join("Default").join("Preferences");
+        std::fs::write(&file, r#"{"profile":{"name":"Ada"}}"#).unwrap();
+        disable_network_prediction(&profile);
+        let merged: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(merged["net"]["network_prediction_options"], 2);
+        assert_eq!(merged["profile"]["name"], "Ada");
+
+        // Unreadable JSON is left exactly as it was.
+        std::fs::write(&file, "{broken").unwrap();
+        disable_network_prediction(&profile);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "{broken");
+        let _ = std::fs::remove_dir_all(profile);
+    }
+
+    #[test]
+    fn network_prediction_is_merged_into_existing_preferences() {
+        // Missing file: a fresh object with the one setting.
+        let fresh: Value =
+            serde_json::from_str(&preferences_with_network_prediction_off(None).unwrap()).unwrap();
+        assert_eq!(fresh["net"]["network_prediction_options"], 2);
+
+        // Existing file: other keys, including siblings under "net", survive.
+        let existing =
+            r#"{"profile":{"name":"Ada"},"net":{"proxy":"none","network_prediction_options":0}}"#;
+        let merged: Value =
+            serde_json::from_str(&preferences_with_network_prediction_off(Some(existing)).unwrap())
+                .unwrap();
+        assert_eq!(merged["net"]["network_prediction_options"], 2);
+        assert_eq!(merged["net"]["proxy"], "none");
+        assert_eq!(merged["profile"]["name"], "Ada");
+
+        // Unreadable or non-object JSON is left alone.
+        assert!(preferences_with_network_prediction_off(Some("{not json")).is_none());
+        assert!(preferences_with_network_prediction_off(Some("[1,2]")).is_none());
+        assert!(preferences_with_network_prediction_off(Some(r#"{"net":3}"#)).is_none());
     }
 
     #[test]
@@ -1237,7 +1531,7 @@ mod tests {
         assert_eq!(tabs.len(), 2, "{tabs:?}");
         assert!(tabs[1].active, "{tabs:?}");
         assert_eq!(backend.info().await.unwrap().title, "popup");
-        // open_tab takes the same path: a popup of the active tab.
+        // open_tab creates its own page (no popup of the active tab) and adopts it.
         let opened = backend
             .open_tab("data:text/html,<title>third</title>")
             .await
