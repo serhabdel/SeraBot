@@ -15,10 +15,7 @@ fn sanitize_source_error(raw: Option<&str>) -> Option<String> {
     if lower.contains("<html") || lower.contains("<!doctype") {
         return Some("run failed (response withheld)".into());
     }
-    let flat: String = text
-        .chars()
-        .filter(|ch| !ch.is_control())
-        .collect();
+    let flat: String = text.chars().filter(|ch| !ch.is_control()).collect();
     if flat.contains('<') {
         return Some("run failed (response withheld)".into());
     }

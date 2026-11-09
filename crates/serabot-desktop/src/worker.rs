@@ -1006,9 +1006,7 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         }
         Operation::MediaJobs => client.media_jobs(conversation).map(Reply::MediaJobs),
         Operation::Logs { level, query } => client.logs(level.as_deref(), query).map(Reply::Logs),
-        Operation::Workflows => client
-            .workflows_snapshot()
-            .map(Reply::Workflows),
+        Operation::Workflows => client.workflows_snapshot().map(Reply::Workflows),
         Operation::DocPreview { hash } => {
             client
                 .artifact_preview(hash)

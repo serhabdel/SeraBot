@@ -5,9 +5,7 @@
 use crate::ui::Icon;
 use dioxus::prelude::*;
 use serabot_desktop::session::Session;
-use serabot_desktop::workflows::{
-    self, ActiveWorkflow, MonitoringSource, Routine,
-};
+use serabot_desktop::workflows::{self, ActiveWorkflow, MonitoringSource, Routine};
 
 #[component]
 fn RoutineRow(routine: Routine) -> Element {
@@ -34,10 +32,7 @@ fn RoutineRow(routine: Routine) -> Element {
 fn SourceRow(source: MonitoringSource) -> Element {
     let status = match &source.last_run {
         Some(run) if run.ok => format!("OK · {} items", run.items_seen.max(0)),
-        Some(run) => run
-            .error
-            .clone()
-            .unwrap_or_else(|| "Error".into()),
+        Some(run) => run.error.clone().unwrap_or_else(|| "Error".into()),
         None => "No run yet".into(),
     };
     let status_class = match source.last_run.as_ref().map(|r| r.ok) {
