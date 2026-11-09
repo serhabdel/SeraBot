@@ -4609,6 +4609,44 @@ html[data-reduce-transparency="true"] .chat-header {
   color: var(--danger);
 }
 
+.browser-console-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-top: 8px;
+}
+
+.browser-signin-helpers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.browser-profile-picker {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.browser-profile-picker .input {
+  max-width: 220px;
+}
+
+.focus-host-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 0 4px 8px;
+}
+
+.browser-last-nav {
+  color: var(--text-2);
+}
+
 /* Browser page: a grid of live cards. */
 .browser-grid {
   display: grid;

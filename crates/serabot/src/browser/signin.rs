@@ -38,6 +38,28 @@ const RULES: &[Rule] = &[Rule {
     bot_note: "Google refused the sign-in from this automated browser (\"This browser or app may not be secure\"). Do not retry the login or look for another way past it. Tell the owner to use the Google connector (Connectors → Google) for Gmail, Drive and Calendar instead.",
 }];
 
+/// Status the owner console shows for each sign-in refusal helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SigninHelperStatus {
+    pub provider: &'static str,
+    pub host: &'static str,
+    pub status: &'static str,
+}
+
+const HELPER_STATUS: &str = "Watching for automated sign-in refusal pages";
+
+/// One row per monitored provider (owner console, not model-facing).
+pub fn signin_helper_statuses() -> Vec<SigninHelperStatus> {
+    RULES
+        .iter()
+        .map(|rule| SigninHelperStatus {
+            provider: rule.provider,
+            host: rule.host,
+            status: HELPER_STATUS,
+        })
+        .collect()
+}
+
 /// The refusal a page URL shows, if it is one of the known refusal pages.
 pub fn signin_block_hint(url: &str) -> Option<SigninBlock> {
     let parsed = Url::parse(url).ok()?;
@@ -95,5 +117,13 @@ mod tests {
         assert_eq!(value.as_object().unwrap().len(), 2);
         assert_eq!(value["provider"], "google");
         assert_eq!(value["message"], block.message);
+    }
+
+    #[test]
+    fn helper_status_lists_monitored_providers() {
+        let helpers = signin_helper_statuses();
+        assert_eq!(helpers.len(), RULES.len());
+        assert!(helpers.iter().any(|row| row.provider == "google"));
+        assert_eq!(helpers[0].status, HELPER_STATUS);
     }
 }

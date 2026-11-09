@@ -406,6 +406,7 @@ impl Tool for BrowserTool {
                         "navigation ended on a non-public address and was reset".into(),
                     ));
                 }
+                lease.note_navigation(&info.url);
                 Ok(text_output(
                     &lease,
                     format!("navigated\n{}", page_lines(&info)),
@@ -580,6 +581,9 @@ impl Tool for BrowserTool {
                     return Err(SeraError::Validation(
                         "navigation ended on a non-public address and the tab was closed".into(),
                     ));
+                }
+                if let Some(active) = active {
+                    lease.note_navigation(&active.url);
                 }
                 let note = active.map(|tab| signin_note(&tab.url)).unwrap_or_default();
                 Ok(text_output(

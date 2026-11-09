@@ -97,6 +97,14 @@ pub struct SigninBlocked {
     pub message: String,
 }
 
+/// One monitored sign-in refusal helper (`GET /v1/browser/sessions` envelope).
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SigninHelperStatus {
+    pub provider: String,
+    pub host: String,
+    pub status: String,
+}
+
 /// One live (or idle) browser: `GET /v1/browser/sessions`. The session id is
 /// the profile id.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -125,6 +133,9 @@ pub struct BrowserSessionInfo {
     /// Seconds since the last bot or owner action.
     #[serde(default)]
     pub idle_secs: Option<u64>,
+    /// Host of the last explicit navigation on this session.
+    #[serde(default)]
+    pub last_nav_host: Option<String>,
     pub updated_at: String,
 }
 
@@ -154,6 +165,18 @@ impl BrowserSessionInfo {
 #[derive(Deserialize)]
 struct SessionList {
     sessions: Vec<BrowserSessionInfo>,
+    #[serde(default)]
+    idle_timeout_secs: Option<u64>,
+    #[serde(default)]
+    signin_helpers: Vec<SigninHelperStatus>,
+}
+
+/// `GET /v1/browser/sessions` body.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BrowserSessionsList {
+    pub sessions: Vec<BrowserSessionInfo>,
+    pub idle_timeout_secs: Option<u64>,
+    pub signin_helpers: Vec<SigninHelperStatus>,
 }
 
 #[derive(Deserialize)]
@@ -305,6 +328,10 @@ fn check_session(session: &BrowserSessionInfo) -> Result<(), ApiError> {
         && session.signin_blocked.as_ref().is_none_or(|block| {
             plain(&block.provider, 32, false) && plain(&block.message, 400, false)
         })
+        && session
+            .last_nav_host
+            .as_deref()
+            .is_none_or(|host| plain(host, 253, false))
         && plain(&session.updated_at, 64, false);
     if ok {
         Ok(())
@@ -396,14 +423,31 @@ impl ApiClient {
     }
 
     /// `GET /v1/browser/sessions`.
-    pub fn browser_sessions(&self) -> Result<Vec<BrowserSessionInfo>, ApiError> {
+    pub fn browser_sessions(&self) -> Result<BrowserSessionsList, ApiError> {
         let list: SessionList =
             self.panel_json::<_, ()>(Method::GET, &["v1", "browser", "sessions"], None)?;
         if list.sessions.len() > MAX_BROWSER_SESSIONS {
             return Err(ApiError::InvalidResponse);
         }
         list.sessions.iter().try_for_each(check_session)?;
-        Ok(list.sessions)
+        if let Some(secs) = list.idle_timeout_secs
+            && !(30..=86_400).contains(&secs)
+        {
+            return Err(ApiError::InvalidResponse);
+        }
+        for helper in &list.signin_helpers {
+            if !plain(&helper.provider, 32, false)
+                || !plain(&helper.host, 253, false)
+                || !plain(&helper.status, 200, false)
+            {
+                return Err(ApiError::InvalidResponse);
+            }
+        }
+        Ok(BrowserSessionsList {
+            sessions: list.sessions,
+            idle_timeout_secs: list.idle_timeout_secs,
+            signin_helpers: list.signin_helpers,
+        })
     }
 
     /// `GET /v1/browser/sessions/{id}/screenshot`: JPEG, same caps as the
@@ -730,6 +774,17 @@ mod tests {
 
     /// A refused sign-in and the idle time ride along on the session; a
     /// session without them still parses.
+    #[test]
+    fn sessions_envelope_parses_console_fields() {
+        let list: SessionList = serde_json::from_str(
+            r#"{"sessions":[],"idle_timeout_secs":600,
+            "signin_helpers":[{"provider":"google","host":"accounts.google.com","status":"Watching"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(list.idle_timeout_secs, Some(600));
+        assert_eq!(list.signin_helpers.len(), 1);
+    }
+
     #[test]
     fn signin_refusal_and_idle_time_parse_and_are_checked() {
         let list: SessionList = serde_json::from_str(

@@ -19,6 +19,7 @@ use zeroize::Zeroizing;
 use super::outline::Outline;
 use super::signin::{SigninBlock, signin_block_hint};
 use crate::error::{Result, SeraError};
+use url::Url;
 
 pub const MAX_SECRETS_TRACKED: usize = 16;
 
@@ -163,6 +164,9 @@ pub struct BrowserInfo {
     /// Set while the active tab shows a sign-in refusal from a provider.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signin_blocked: Option<SigninBlock>,
+    /// Host of the last explicit navigation (bot tool or owner input).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_nav_host: Option<String>,
 }
 
 /// Which bot (and conversation) is driving a session.
@@ -192,6 +196,7 @@ impl BrowserInfo {
             conversation_id: None,
             idle_secs: None,
             signin_blocked: None,
+            last_nav_host: None,
         }
     }
 
@@ -207,6 +212,19 @@ struct SessionState {
     secrets: Vec<(String, Zeroizing<String>)>,
     bot: Option<String>,
     conversation_id: Option<String>,
+    last_nav_host: Option<String>,
+}
+
+/// The registrable host of a public http(s) navigation, without a `www.` prefix.
+pub fn navigation_host(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        _ => return None,
+    }
+    parsed
+        .host_str()
+        .map(|host| host.trim_start_matches("www.").to_owned())
 }
 
 pub struct Session {
@@ -227,8 +245,15 @@ impl Session {
                 secrets: Vec::new(),
                 bot: None,
                 conversation_id: None,
+                last_nav_host: None,
             }),
             op: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn note_navigation(&self, url: &str) {
+        if let Some(host) = navigation_host(url) {
+            self.with_state(|state| state.last_nav_host = Some(host));
         }
     }
 
@@ -261,6 +286,11 @@ pub struct Lease {
 impl Lease {
     pub fn backend(&self) -> &Arc<dyn BrowserBackend> {
         &self.session.backend
+    }
+
+    /// Remember the host of an explicit navigation for the owner console.
+    pub fn note_navigation(&self, url: &str) {
+        self.session.note_navigation(url);
     }
 
     /// Remember a typed secret so it is scrubbed from later page text.
@@ -454,15 +484,17 @@ impl BrowserManager {
 
     async fn info_of(session: &Arc<Session>) -> BrowserInfo {
         let page = session.backend.info().await.unwrap_or_default();
-        let (controller, updated_at, bot, conversation_id, idle) = session.with_state(|state| {
-            (
-                state.controller,
-                state.updated_at,
-                state.bot.clone(),
-                state.conversation_id.clone(),
-                state.last_used.elapsed().as_secs(),
-            )
-        });
+        let (controller, updated_at, bot, conversation_id, idle, last_nav_host) =
+            session.with_state(|state| {
+                (
+                    state.controller,
+                    state.updated_at,
+                    state.bot.clone(),
+                    state.conversation_id.clone(),
+                    state.last_used.elapsed().as_secs(),
+                    state.last_nav_host.clone(),
+                )
+            });
         BrowserInfo {
             active: true,
             signin_blocked: signin_block_hint(&page.url),
@@ -475,7 +507,12 @@ impl BrowserManager {
             bot,
             conversation_id,
             idle_secs: Some(idle),
+            last_nav_host,
         }
+    }
+
+    pub fn idle_timeout_secs(&self) -> u64 {
+        self.idle_timeout.as_secs()
     }
 
     pub async fn info(&self, user_id: &str, profile_id: &str) -> BrowserInfo {
@@ -667,6 +704,34 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(manager.reap_idle().await, 1);
         assert_eq!(manager.session_count().await, 0);
+    }
+
+    #[test]
+    fn navigation_host_strips_www_and_refuses_non_http() {
+        assert_eq!(
+            navigation_host("https://www.example.com/path"),
+            Some("example.com".into())
+        );
+        assert_eq!(navigation_host("about:blank"), None);
+        assert_eq!(navigation_host("not a url"), None);
+    }
+
+    #[tokio::test]
+    async fn navigation_host_is_recorded_on_bot_navigate() {
+        let (manager, _) = manager_with(4, Duration::from_secs(600));
+        let lease = manager
+            .bot_lease("alice", D, true, None)
+            .await
+            .unwrap();
+        lease
+            .backend()
+            .navigate("https://shop.example/items")
+            .await
+            .unwrap();
+        lease.note_navigation("https://shop.example/items");
+        drop(lease);
+        let info = manager.info("alice", D).await;
+        assert_eq!(info.last_nav_host.as_deref(), Some("shop.example"));
     }
 
     #[tokio::test]

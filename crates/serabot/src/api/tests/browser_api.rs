@@ -524,6 +524,10 @@ async fn sessions_list_and_per_profile_routes_are_isolated() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let sessions = list["sessions"].as_array().unwrap();
+    assert!(list["idle_timeout_secs"].as_u64().is_some());
+    let helpers = list["signin_helpers"].as_array().unwrap();
+    assert!(!helpers.is_empty());
+    assert_eq!(helpers[0]["provider"], "google");
     assert_eq!(sessions.len(), 2);
     assert_eq!(sessions[0]["id"], "default");
     assert_eq!(sessions[0]["profile_name"], "Default");

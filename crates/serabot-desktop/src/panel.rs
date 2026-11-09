@@ -15,10 +15,10 @@ use crate::vault_import::{self, ImportItem};
 use crate::worker::Credentials;
 use crate::{
     ApiClient, ApiError, BrowserController, BrowserHistory, BrowserInfo, BrowserInput,
-    BrowserProfile, BrowserSessionInfo, ConnectorUpdate, DEFAULT_PROFILE, MAX_VAULT_DOMAINS,
-    MAX_VAULT_ENTRIES, MAX_VAULT_NOTE_CHARS, MAX_VAULT_USERNAME_CHARS, PasswordManager,
-    PasswordManagerProbe, VaultEntry, VaultKind, VaultPut, VaultSource, normalize_vault_domain,
-    valid_vault_name, valid_vault_reference, validate_vault_put,
+    BrowserProfile, BrowserSessionInfo, BrowserSessionsList, ConnectorUpdate, DEFAULT_PROFILE,
+    MAX_VAULT_DOMAINS, MAX_VAULT_ENTRIES, MAX_VAULT_NOTE_CHARS, MAX_VAULT_USERNAME_CHARS,
+    PasswordManager, PasswordManagerProbe, SigninHelperStatus, VaultEntry, VaultKind, VaultPut,
+    VaultSource, normalize_vault_domain, valid_vault_name, valid_vault_reference, validate_vault_put,
 };
 use crate::{ComposioAccount, ComposioApp};
 use std::{
@@ -213,7 +213,7 @@ pub enum PanelReply {
     },
     ImportList(Vec<ImportItem>),
     VaultImported(usize),
-    Sessions(Vec<BrowserSessionInfo>),
+    Sessions(BrowserSessionsList),
     Shot(String, Vec<u8>),
     Control(BrowserSessionInfo),
     Closed,
@@ -801,6 +801,9 @@ pub struct PanelState {
     /// Every browser the server reports, one per profile.
     pub sessions: Vec<BrowserSessionInfo>,
     pub sessions_loaded: bool,
+    /// From the latest `GET /v1/browser/sessions` envelope.
+    pub idle_timeout_secs: Option<u64>,
+    pub signin_helpers: Vec<SigninHelperStatus>,
     /// The profile (= session id) the dock watches.
     pub dock_profile: String,
     /// `data:` URI of the latest screenshot per session id.
@@ -851,6 +854,8 @@ impl PanelState {
             info: None,
             sessions: Vec::new(),
             sessions_loaded: false,
+            idle_timeout_secs: None,
+            signin_helpers: Vec::new(),
             dock_profile: DEFAULT_PROFILE.to_owned(),
             shots: HashMap::new(),
             page_open: false,
@@ -1642,9 +1647,11 @@ impl PanelState {
 
     fn apply_reply(&mut self, reply: PanelReply, now: Instant) {
         match reply {
-            PanelReply::Sessions(sessions) => {
+            PanelReply::Sessions(list) => {
                 self.browser_error = None;
-                self.set_sessions(sessions);
+                self.idle_timeout_secs = list.idle_timeout_secs;
+                self.signin_helpers = list.signin_helpers;
+                self.set_sessions(list.sessions);
             }
             PanelReply::Control(session) | PanelReply::Input(session) => {
                 self.browser_error = None;
@@ -1990,6 +1997,15 @@ pub fn idle_label(idle_secs: Option<u64>) -> Option<String> {
     })
 }
 
+/// Plain sentence for the configured session idle close time.
+pub fn idle_timeout_label(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("Sessions close after {secs}s idle"),
+        60..=3599 => format!("Sessions close after {}m idle", secs / 60),
+        _ => format!("Sessions close after {}h idle", secs / 3600),
+    }
+}
+
 /// The bots that browse with this profile.
 pub fn profile_users(profile: &BrowserProfile) -> &[String] {
     &profile.bots
@@ -2025,6 +2041,7 @@ mod tests {
             conversation_id: Some("dir:main".into()),
             signin_blocked: None,
             idle_secs: None,
+            last_nav_host: None,
             updated_at: "2026-11-06T12:00:00Z".into(),
         }
     }
@@ -2083,10 +2100,11 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Sessions(vec![info(
+                Ok(PanelReply::Sessions(BrowserSessionsList {
+                    sessions: vec![info(
                     false,
                     BrowserController::Bot,
-                )])),
+                )], ..Default::default() })),
             ),
             t0,
         );
@@ -2099,10 +2117,11 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Sessions(vec![info(
+                Ok(PanelReply::Sessions(BrowserSessionsList {
+                    sessions: vec![info(
                     false,
                     BrowserController::Bot,
-                )])),
+                )], ..Default::default() })),
             ),
             t0,
         );
@@ -2116,10 +2135,11 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Sessions(vec![info(
+                Ok(PanelReply::Sessions(BrowserSessionsList {
+                    sessions: vec![info(
                     false,
                     BrowserController::Bot,
-                )])),
+                )], ..Default::default() })),
             ),
             t0,
         );
@@ -2132,10 +2152,11 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Sessions(vec![info(
+                Ok(PanelReply::Sessions(BrowserSessionsList {
+                    sessions: vec![info(
                     false,
                     BrowserController::Bot,
-                )])),
+                )], ..Default::default() })),
             ),
             t0,
         );
@@ -2155,10 +2176,11 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Sessions(vec![info(
+                Ok(PanelReply::Sessions(BrowserSessionsList {
+                    sessions: vec![info(
                     false,
                     BrowserController::Bot,
-                )])),
+                )], ..Default::default() })),
             ),
             t0,
         );
@@ -2168,10 +2190,11 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Sessions(vec![info(
+                Ok(PanelReply::Sessions(BrowserSessionsList {
+                    sessions: vec![info(
                     true,
                     BrowserController::Bot,
-                )])),
+                )], ..Default::default() })),
             ),
             t0,
         );
@@ -2251,10 +2274,11 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Sessions(vec![info(
+                Ok(PanelReply::Sessions(BrowserSessionsList {
+                    sessions: vec![info(
                     true,
                     BrowserController::Bot,
-                )])),
+                )], ..Default::default() })),
             ),
             t0,
         );
@@ -2278,10 +2302,11 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Sessions(vec![info(
+                Ok(PanelReply::Sessions(BrowserSessionsList {
+                    sessions: vec![info(
                     true,
                     BrowserController::Bot,
-                )])),
+                )], ..Default::default() })),
             ),
             t0,
         );
@@ -2290,10 +2315,11 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Sessions(vec![info(
+                Ok(PanelReply::Sessions(BrowserSessionsList {
+                    sessions: vec![info(
                     false,
                     BrowserController::Bot,
-                )])),
+                )], ..Default::default() })),
             ),
             t0,
         );
@@ -2301,10 +2327,11 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Sessions(vec![info(
+                Ok(PanelReply::Sessions(BrowserSessionsList {
+                    sessions: vec![info(
                     true,
                     BrowserController::Bot,
-                )])),
+                )], ..Default::default() })),
             ),
             t0,
         );
@@ -2320,10 +2347,11 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Sessions(vec![info(
+                Ok(PanelReply::Sessions(BrowserSessionsList {
+                    sessions: vec![info(
                     true,
                     BrowserController::Bot,
-                )])),
+                )], ..Default::default() })),
             ),
             t0,
         );
@@ -2363,10 +2391,11 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Sessions(vec![info(
+                Ok(PanelReply::Sessions(BrowserSessionsList {
+                    sessions: vec![info(
                     true,
                     BrowserController::Bot,
-                )])),
+                )], ..Default::default() })),
             ),
             t0,
         );
@@ -2402,6 +2431,7 @@ mod tests {
     fn labels_for_tab_count_and_idle_time() {
         assert_eq!(tab_count_label(1), "1 tab");
         assert_eq!(tab_count_label(3), "3 tabs");
+        assert_eq!(idle_timeout_label(600), "Sessions close after 10m idle");
         assert_eq!(idle_label(None), None);
         assert_eq!(idle_label(Some(0)).as_deref(), Some("Idle under a minute"));
         assert_eq!(idle_label(Some(59)).as_deref(), Some("Idle under a minute"));
@@ -2418,10 +2448,11 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Sessions(vec![info(
+                Ok(PanelReply::Sessions(BrowserSessionsList {
+                    sessions: vec![info(
                     true,
                     BrowserController::Bot,
-                )])),
+                )], ..Default::default() })),
             ),
             t0,
         );
@@ -2484,10 +2515,10 @@ mod tests {
         let mut old = done(
             &state,
             PanelKind::Status,
-            Ok(PanelReply::Sessions(vec![info(
-                true,
-                BrowserController::Bot,
-            )])),
+            Ok(PanelReply::Sessions(BrowserSessionsList {
+                sessions: vec![info(true, BrowserController::Bot)],
+                ..Default::default()
+            })),
         );
         state.reset();
         old.epoch = 0;
@@ -2508,10 +2539,11 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Sessions(vec![info(
+                Ok(PanelReply::Sessions(BrowserSessionsList {
+                    sessions: vec![info(
                     true,
                     BrowserController::Bot,
-                )])),
+                )], ..Default::default() })),
             ),
             t0,
         );
@@ -2683,10 +2715,11 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Sessions(vec![info(
+                Ok(PanelReply::Sessions(BrowserSessionsList {
+                    sessions: vec![info(
                     true,
                     BrowserController::Bot,
-                )])),
+                )], ..Default::default() })),
             ),
             t0,
         );
@@ -2710,10 +2743,11 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Sessions(vec![info(
+                Ok(PanelReply::Sessions(BrowserSessionsList {
+                    sessions: vec![info(
                     false,
                     BrowserController::Bot,
-                )])),
+                )], ..Default::default() })),
             ),
             later,
         );
@@ -2721,10 +2755,11 @@ mod tests {
             done(
                 &state,
                 PanelKind::Status,
-                Ok(PanelReply::Sessions(vec![info(
+                Ok(PanelReply::Sessions(BrowserSessionsList {
+                    sessions: vec![info(
                     true,
                     BrowserController::Bot,
-                )])),
+                )], ..Default::default() })),
             ),
             later,
         );
@@ -2801,7 +2836,10 @@ mod tests {
     // ---- 0.16: sessions, profiles, the Browser page -----------------------
 
     fn sessions(list: Vec<BrowserSessionInfo>) -> Result<PanelReply, ApiError> {
-        Ok(PanelReply::Sessions(list))
+        Ok(PanelReply::Sessions(BrowserSessionsList {
+            sessions: list,
+            ..Default::default()
+        }))
     }
 
     fn feed(
