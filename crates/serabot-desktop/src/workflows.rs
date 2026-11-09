@@ -240,7 +240,7 @@ mod tests {
             }]
         }))
         .unwrap();
-        assert_eq!(sources[0].last_run.as_ref().unwrap().ok, false);
+        assert!(!sources[0].last_run.as_ref().unwrap().ok);
 
         let active = parse_active_workflows(&json!({
             "workflows": [{
