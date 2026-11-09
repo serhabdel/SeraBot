@@ -11,8 +11,9 @@ owner's OK**.
 
 - **Wave A shipped** — merged to `main` via [PR #37](https://github.com/serhabdel/SeraBot/pull/37)
   (`origin/main` @ `a8157b4`, includes release tip `3208a1a`).
-- **Wave B integration branch** — `recover/wave-b-wip` rebased onto `origin/main`
-  (`fb0ca48` = B1/B2 + scheduler hook fix on `8e33d66`); force-with-lease pushed.
+- **Wave B integration branch** — `recover/wave-b-wip` rebased onto post-0.29
+  `origin/main` (`a8157b42`); B1/B2 integration rebased @ `41c198d` (remote tip
+  advancing, draft PR #39). Clippy hygiene on recover tracked locally.
 - **Wave B slices** — `feat/big-wave-b3b4` @ `be67c20` (rebased on `8e33d66`,
   one commit behind `fb0ca48` — rebase onto `origin/recover/wave-b-wip` before
   merge); `feat/big-wave-b5-b6` @ `726c711` (same); local only until gated.
@@ -86,7 +87,7 @@ vault probe.
 
 ## Wave B — Reliable circle (0.30.0)
 
-_Base: `recover/wave-b-wip` @ `8e33d66` (rebased 2026-11-09)._
+_Base: `recover/wave-b-wip` @ `fb0ca48` (rebased 2026-11-09)._
 
 - [ ] **B1** Per-user routine CRUD — enable/disable/schedule for self; enqueue
       to member default conversation (not hardcoded `"owner"`).

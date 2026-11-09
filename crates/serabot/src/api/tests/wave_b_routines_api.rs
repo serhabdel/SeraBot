@@ -42,7 +42,7 @@ async fn put_routine_updates_only_the_acting_users_row() {
     assert_eq!(denied.status(), StatusCode::NOT_FOUND);
 
     let alice_rows = store.list_routines(&alice.id).unwrap();
-    assert_eq!(alice_rows[0].enabled, true);
+    assert!(alice_rows[0].enabled);
     assert_eq!(alice_rows[0].config["time"], "06:15");
     assert!(store.list_routines(&bob.id).unwrap().is_empty());
 }
