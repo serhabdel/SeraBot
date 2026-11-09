@@ -190,7 +190,9 @@ impl WorkingBots {
         for entry in &self.entries {
             entry.task_id.hash(h);
             entry.bot.hash(h);
+            entry.conversation.hash(h);
             entry.activity.hash(h);
+            entry.activity.label().hash(h);
         }
     }
 

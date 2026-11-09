@@ -19,11 +19,7 @@ pub fn merge_transcript(current: &[Message], incoming: Vec<Message>) -> Vec<Mess
 
     for inc in incoming {
         if let Some(cur) = current.iter().find(|row| row.id == inc.id) {
-            merged.push(if transcript_row_equal(cur, &inc) {
-                cur.clone()
-            } else {
-                inc.clone()
-            });
+            merged.push(merge_transcript_row(cur, &inc));
             continue;
         }
         if let Some((idx, _cur)) = current.iter().enumerate().find(|(i, row)| {
@@ -64,6 +60,35 @@ fn pairs_optimistic(local: &Message, server: &Message) -> bool {
         && local.role == Role::User
         && local.content == server.content
         && local.attachments.len() == server.attachments.len()
+}
+
+/// Combine one server row with what is already on screen. Assistant rows keep
+/// the longer body when a stale history response would shorten streaming text.
+fn merge_transcript_row(cur: &Message, inc: &Message) -> Message {
+    if transcript_row_equal(cur, inc) {
+        return cur.clone();
+    }
+    let mut row = if assistant_content_regressed(cur, inc) {
+        let mut kept = inc.clone();
+        kept.content = cur.content.clone();
+        kept
+    } else {
+        inc.clone()
+    };
+    if inc.limit_reached {
+        row.limit_reached = true;
+    }
+    if inc.attachments.len() > row.attachments.len() {
+        row.attachments = inc.attachments.clone();
+    }
+    row
+}
+
+fn assistant_content_regressed(cur: &Message, inc: &Message) -> bool {
+    cur.id == inc.id
+        && cur.role == inc.role
+        && cur.role == Role::Assistant
+        && cur.content.chars().count() > inc.content.chars().count()
 }
 
 pub struct State {
@@ -976,6 +1001,33 @@ mod tests {
         let again = merge_transcript(&merged, merged.clone());
         assert_eq!(again[1].content, merged[1].content);
         assert_eq!(again[1].id, merged[1].id);
+    }
+
+    #[test]
+    fn merge_transcript_keeps_longer_assistant_on_stale_history() {
+        let live = Message {
+            id: "m-bot".into(),
+            role: Role::Assistant,
+            content: "Hello, this is still growing on screen".into(),
+            created_at: "2026-11-09T12:00:02Z".into(),
+            name: None,
+            bot: Some("main".into()),
+            attachments: Vec::new(),
+            limit_reached: false,
+        };
+        let current = vec![live.clone()];
+        let mut stale = live.clone();
+        stale.content = "Hello".into();
+        let merged = merge_transcript(&current, vec![stale]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].content, live.content);
+        let mut done = live.clone();
+        done.content = "Hello, this is still growing on screen, done".into();
+        let fresher = merge_transcript(&merged, vec![done]);
+        assert_eq!(
+            fresher[0].content,
+            "Hello, this is still growing on screen, done"
+        );
     }
 
     #[test]

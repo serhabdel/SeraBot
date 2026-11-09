@@ -49,6 +49,40 @@ if (!window.__serabotPasteBridge) {
 /// Keeps the message list pinned to the bottom while content grows (streaming
 /// tokens, activity rows) without fighting a scroll-up. `data-stick` tracks
 /// whether the owner is near the bottom; ResizeObserver pins only then.
+/// Remembers the composer caret across streaming repaints.
+pub const COMPOSER_CARET_SETUP_JS: &str = r#"
+(function () {
+  if (window.__serabotComposerCaret) return;
+  window.__serabotComposerCaret = true;
+  const remember = () => {
+    const el = document.getElementById('composer-input');
+    if (!el || el !== document.activeElement) return;
+    const start = el.selectionStart;
+    const end = el.selectionEnd;
+    if (start == null || end == null) return;
+    window.__serabotComposerSel = [start, end];
+  };
+  document.addEventListener('selectionchange', remember);
+  document.addEventListener('input', remember, true);
+})();
+"#;
+
+/// After a streaming repaint, put the caret back when the composer still has focus.
+pub const COMPOSER_CARET_BRIDGE_JS: &str = r#"
+(function () {
+  const sel = window.__serabotComposerSel;
+  if (!Array.isArray(sel) || sel.length !== 2) return;
+  const el = document.getElementById('composer-input');
+  if (!el || el !== document.activeElement) return;
+  requestAnimationFrame(() => {
+    if (document.activeElement !== el) return;
+    try {
+      el.setSelectionRange(sel[0], sel[1]);
+    } catch (_) {}
+  });
+})();
+"#;
+
 pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
 (function () {
   if (window.__serabotChatScroll) return;
