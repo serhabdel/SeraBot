@@ -21,12 +21,7 @@ async fn routines_are_scoped_to_the_acting_user() {
 
     let alice_body = read_json(
         app.clone()
-            .oneshot(request_with_token(
-                "GET",
-                "/v1/routines",
-                &alice_token,
-                None,
-            ))
+            .oneshot(request_with_token("GET", "/v1/routines", &alice_token, None))
             .await
             .unwrap(),
     )
@@ -44,7 +39,10 @@ async fn routines_are_scoped_to_the_acting_user() {
     )
     .await;
     assert_eq!(bob_body["routines"].as_array().unwrap().len(), 1);
-    assert_eq!(bob_body["routines"][0]["config"]["time"], "08:00");
+    assert_eq!(
+        bob_body["routines"][0]["config"]["time"],
+        "08:00"
+    );
 }
 
 #[tokio::test]

@@ -1,7 +1,7 @@
-//! Monitoring source health (0.29.0, Wave A2): configured watcher sources plus
-//! the acting user's latest `source_runs` row for each.
+//! Monitoring source health (0.29.0, Wave A2) and manual watch enqueue (0.30.0 B2).
 
 use super::*;
+use crate::runtime::ScheduledPayload;
 
 const MAX_SOURCE_ERROR_CHARS: usize = 240;
 
@@ -15,7 +15,10 @@ fn sanitize_source_error(raw: Option<&str>) -> Option<String> {
     if lower.contains("<html") || lower.contains("<!doctype") {
         return Some("run failed (response withheld)".into());
     }
-    let flat: String = text.chars().filter(|ch| !ch.is_control()).collect();
+    let flat: String = text
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .collect();
     if flat.contains('<') {
         return Some("run failed (response withheld)".into());
     }
@@ -53,4 +56,36 @@ pub(super) async fn list_monitoring_sources(
         })
         .collect::<Vec<_>>();
     Ok(Json(json!({"sources": sources})))
+}
+
+/// `POST /v1/monitoring/run`: enqueue one `watch` task for the acting user
+/// (same effect as `/watch` in chat).
+pub(super) async fn run_all_sources(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let conversation_id = state.store.default_scheduled_conversation_id(&user.id)?;
+    let task = state.store.enqueue_task_with_quota(
+        &user.id,
+        "watch",
+        "watcher",
+        &serde_json::to_value(ScheduledPayload {
+            conversation_id: conversation_id.clone(),
+            user_id: user.id.clone(),
+        })?,
+        5,
+        chrono::Utc::now(),
+        state.config.users.tasks_per_user_per_day,
+    )?;
+    state.store.record_audit(
+        &user.id,
+        "watch.manual_enqueue",
+        None,
+        Some(&task.id),
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({"conversation_id": conversation_id})),
+    )?;
+    Ok(Json(json!({"task_id": task.id, "kind": "watch"})))
 }

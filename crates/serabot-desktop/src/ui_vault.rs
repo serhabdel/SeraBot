@@ -491,10 +491,7 @@ fn source_of(id: &str) -> Option<VaultSource> {
 }
 
 fn entry_count_for(source: VaultSource, entries: &[VaultEntry]) -> usize {
-    entries
-        .iter()
-        .filter(|entry| entry.source == source)
-        .count()
+    entries.iter().filter(|entry| entry.source == source).count()
 }
 
 /// Short connection status for the Connected vaults summary. Never a token.
@@ -525,17 +522,7 @@ fn entries_label(count: usize) -> String {
 /// never shown again. Requests run on the panel worker.
 #[component]
 fn PasswordManagersPanel(session: Signal<Session>) -> Element {
-    let (
-        loaded,
-        vault_loaded,
-        entries,
-        providers,
-        tests,
-        error,
-        importing,
-        import_error,
-        picker_open,
-    ) = {
+    let (loaded, vault_loaded, entries, providers, tests, error, importing, import_error, picker_open) = {
         let s = session.read();
         let v = &s.panel.vault;
         (
@@ -660,7 +647,13 @@ fn ProviderRow(session: Signal<Session>, manager: PasswordManager) -> Element {
     let id = manager.id.clone();
     let busy = session.read().panel.vault.provider_busy.as_deref() == Some(id.as_str());
     let testing = session.read().panel.vault.provider_testing.as_deref() == Some(id.as_str());
-    let probe = session.read().panel.vault.provider_tests.get(&id).cloned();
+    let probe = session
+        .read()
+        .panel
+        .vault
+        .provider_tests
+        .get(&id)
+        .cloned();
     let filled = !token.read().is_empty();
     let token_line = if manager.configured {
         "Access token saved on this server"

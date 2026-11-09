@@ -17,8 +17,9 @@ use crate::{
     ApiClient, ApiError, BrowserController, BrowserHistory, BrowserInfo, BrowserInput,
     BrowserProfile, BrowserSessionInfo, ConnectorUpdate, DEFAULT_PROFILE, MAX_VAULT_DOMAINS,
     MAX_VAULT_ENTRIES, MAX_VAULT_NOTE_CHARS, MAX_VAULT_USERNAME_CHARS, PasswordManager,
-    PasswordManagerProbe, VaultEntry, VaultKind, VaultPut, VaultSource, normalize_vault_domain,
-    valid_vault_name, valid_vault_reference, validate_vault_put,
+    PasswordManagerProbe, VaultEntry,
+    VaultKind, VaultPut, VaultSource, normalize_vault_domain, valid_vault_name,
+    valid_vault_reference, validate_vault_put,
 };
 use crate::{ComposioAccount, ComposioApp};
 use std::{
@@ -350,14 +351,12 @@ fn execute(job: &PanelJob, cache: &mut Option<ApiClient>) -> Result<PanelReply, 
         PanelOp::PasswordManagerClear(id) => client
             .password_manager_clear(id)
             .map(|()| PanelReply::PasswordManagerCleared(id.clone())),
-        PanelOp::PasswordManagerTest(id) => {
-            client
-                .password_manager_test(id)
-                .map(|probe| PanelReply::PasswordManagerTested {
-                    id: id.clone(),
-                    probe,
-                })
-        }
+        PanelOp::PasswordManagerTest(id) => client
+            .password_manager_test(id)
+            .map(|probe| PanelReply::PasswordManagerTested {
+                id: id.clone(),
+                probe,
+            }),
         // Runs the owner's CLI on this PC: metadata only, nothing is stored.
         PanelOp::ImportList(source) => {
             vault_import::list_items(*source).map(PanelReply::ImportList)

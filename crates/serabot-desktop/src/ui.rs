@@ -868,8 +868,7 @@ fn markdown_content_hash(content: &str) -> u64 {
 fn parse_markdown_cached(message_id: &str, content: &str) -> Vec<MdBlock> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type MdCache = HashMap<(String, u64), Vec<MdBlock>>;
-    static CACHE: OnceLock<Mutex<MdCache>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<(String, u64), Vec<MdBlock>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = (message_id.to_owned(), markdown_content_hash(content));
     let mut guard = cache.lock().expect("markdown cache");

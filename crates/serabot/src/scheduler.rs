@@ -47,6 +47,29 @@ pub struct DueRoutine {
 /// Repeated calls keep `last_run_for` and, unless the configured time or
 /// timezone changed, preserve `next_run_at`. Preserving a past `next_run_at`
 /// is what allows a missed occurrence to be caught up after downtime.
+/// Enable or disable the acting user's routine without changing its schedule.
+pub fn set_routine_enabled(
+    store: &Store,
+    user_id: &str,
+    name: &str,
+    enabled: bool,
+) -> Result<()> {
+    let connection = store.connection()?;
+    let changed = connection.execute(
+        "UPDATE routines SET enabled = ?1, updated_at = ?2 WHERE name = ?3 AND user_id = ?4",
+        params![
+            enabled as i64,
+            utc_string(Utc::now()),
+            name,
+            user_id
+        ],
+    )?;
+    if changed == 0 {
+        return Err(SeraError::NotFound(format!("routine {name}")));
+    }
+    Ok(())
+}
+
 pub fn ensure_daily_routine(
     store: &Store,
     user_id: &str,
@@ -127,7 +150,16 @@ pub fn ensure_daily_routine(
 /// for its date yet. Claiming is atomic per routine and cross-user by design:
 /// the scheduler service is shared, and every claimed occurrence carries its
 /// owning user so the enqueued task runs under it.
-pub fn due_routines(store: &Store, now: DateTime<Utc>, tz: Tz) -> Result<Vec<DueRoutine>> {
+fn routine_timezone(config: &Value, fallback: Tz) -> Tz {
+    config
+        .get("timezone")
+        .or_else(|| config.get("tz"))
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(fallback)
+}
+
+pub fn due_routines(store: &Store, now: DateTime<Utc>, fallback_tz: Tz) -> Result<Vec<DueRoutine>> {
     let connection = store.connection()?;
     let routines: Vec<(String, String, String, String)> = {
         let mut statement = connection.prepare(
@@ -162,6 +194,7 @@ pub fn due_routines(store: &Store, now: DateTime<Utc>, tz: Tz) -> Result<Vec<Due
         else {
             continue;
         };
+        let tz = routine_timezone(&config, fallback_tz);
         let Some((_occurrence, local_date)) = latest_occurrence(now, time, tz) else {
             continue;
         };
@@ -441,6 +474,34 @@ mod tests {
     }
 
     #[test]
+    fn due_routines_honour_each_rows_timezone() {
+        let store = store();
+        let admin = admin(&store);
+        let now = Utc.with_ymd_and_hms(2026, 10, 28, 12, 0, 0).unwrap();
+        let connection = store.connection().unwrap();
+        connection
+            .execute(
+                "INSERT INTO routines(
+                    id, name, kind, enabled, next_run_at, last_run_for,
+                    config_json, created_at, updated_at, user_id
+                 ) VALUES (?1, ?2, 'daily', 1, ?3, NULL, ?4, ?5, ?5, ?6)",
+                params![
+                    new_id(),
+                    "tokyo_brief",
+                    utc_string(Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap()),
+                    json!({"time": "09:00", "timezone": "Asia/Tokyo"}).to_string(),
+                    utc_string(Utc::now()),
+                    admin
+                ],
+            )
+            .unwrap();
+        let due = due_routines(&store, now, rome()).unwrap();
+        assert!(
+            due.iter().any(|routine| routine.name == "tokyo_brief"),
+            "tokyo-local 09:00 should be due when fallback is Rome"
+        );
+    }
+
     fn fall_back_chooses_earliest_ambiguous_occurrence() {
         let store = store();
         // 2026-10-25 02:30 occurs twice in Rome. 00:45 UTC is 02:45 CEST,

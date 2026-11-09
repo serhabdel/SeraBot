@@ -1112,9 +1112,11 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
                         // under the routine's owning user.
                         let due = due_routines(&store, chrono::Utc::now(), tz)?;
                         for routine in due {
-                            let kind = if routine.name == "morning_brief" { "brief" } else { "watch" };
+                            let kind = crate::config::task_kind_for_routine(&routine.name);
+                            let conversation_id = store
+                                .default_scheduled_conversation_id(&routine.user_id)?;
                             let payload = ScheduledPayload {
-                                conversation_id: "owner".into(),
+                                conversation_id,
                                 user_id: routine.user_id.clone(),
                             };
                             store.enqueue_task(

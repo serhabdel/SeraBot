@@ -21,6 +21,7 @@ mod profiles_api;
 mod status_api;
 mod vault_http;
 mod wave_a_visibility_api;
+mod wave_b_routines_api;
 
 /// The bootstrap admin's id â€” the acting user behind the config token
 /// the tests use.

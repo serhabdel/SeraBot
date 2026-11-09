@@ -1633,6 +1633,53 @@ impl Default for ScheduleConfig {
     }
 }
 
+/// How many `watch_{n}` slots a member may own (0.30.0, Wave B1).
+pub const MAX_MEMBER_WATCH_SLOTS: usize = 12;
+
+/// Member-editable scheduled routine names (morning brief + watch slots).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberRoutineKind {
+    Brief,
+    Watch(usize),
+}
+
+/// Classify a routine name the member may configure. Rejects admin-only or
+/// arbitrary names.
+pub fn classify_member_routine(name: &str) -> Result<MemberRoutineKind> {
+    if name == "morning_brief" {
+        return Ok(MemberRoutineKind::Brief);
+    }
+    let Some(index) = name.strip_prefix("watch_") else {
+        return Err(SeraError::Validation("unknown routine name".into()));
+    };
+    let index: usize = index
+        .parse()
+        .map_err(|_| SeraError::Validation("invalid watch slot".into()))?;
+    if index >= MAX_MEMBER_WATCH_SLOTS {
+        return Err(SeraError::Validation("watch slot out of range".into()));
+    }
+    Ok(MemberRoutineKind::Watch(index))
+}
+
+/// Task kind enqueued when a scheduled routine fires.
+pub fn task_kind_for_routine(name: &str) -> &'static str {
+    if name == "morning_brief" {
+        "brief"
+    } else {
+        "watch"
+    }
+}
+
+/// Default local time for a watch slot when the member has not set one yet.
+pub fn default_watch_time(schedule: &ScheduleConfig, index: usize) -> String {
+    schedule
+        .watch_times
+        .get(index)
+        .cloned()
+        .filter(|value| parse_hhmm(value).is_some())
+        .unwrap_or_else(|| "12:00".into())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentsConfig {
     #[serde(default = "default_watch_dir")]

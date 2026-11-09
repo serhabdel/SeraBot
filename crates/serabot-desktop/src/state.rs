@@ -27,7 +27,9 @@ pub fn merge_transcript(current: &[Message], incoming: Vec<Message>) -> Vec<Mess
             continue;
         }
         if let Some((idx, _cur)) = current.iter().enumerate().find(|(i, row)| {
-            row.id.starts_with("opt-") && !used_opts.contains(i) && pairs_optimistic(row, &inc)
+            row.id.starts_with("opt-")
+                && !used_opts.contains(i)
+                && pairs_optimistic(row, &inc)
         }) {
             used_opts.insert(idx);
             merged.push(inc);
@@ -973,7 +975,7 @@ mod tests {
             attachments: Vec::new(),
             limit_reached: false,
         };
-        let merged = merge_transcript(std::slice::from_ref(&opt), Vec::new());
+        let merged = merge_transcript(&[opt.clone()], Vec::new());
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].id, "opt-1");
     }

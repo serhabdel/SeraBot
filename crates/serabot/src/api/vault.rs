@@ -156,7 +156,12 @@ pub(super) async fn test_vault_provider(
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
     let provider = password_manager(&id)?;
-    let report =
-        vault_providers::probe(&state.users, &state.vault_providers, &user.id, provider).await?;
+    let report = vault_providers::probe(
+        &state.users,
+        &state.vault_providers,
+        &user.id,
+        provider,
+    )
+    .await?;
     Ok(Json(json!(report)))
 }

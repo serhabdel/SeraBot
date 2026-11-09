@@ -178,6 +178,26 @@ pub fn parse_active_workflows(value: &Value) -> Option<Vec<ActiveWorkflow>> {
     Some(rows.iter().filter_map(parse_active).collect())
 }
 
+/// Morning brief row and `watch_{n}` rows for the merged schedule panel (B2).
+pub fn split_schedule_routines(routines: &[Routine]) -> (Option<Routine>, Vec<Routine>) {
+    let mut brief = None;
+    let mut watch = Vec::new();
+    for routine in routines {
+        if routine.name == "morning_brief" {
+            brief = Some(routine.clone());
+        } else if routine.name.starts_with("watch_") {
+            watch.push(routine.clone());
+        }
+    }
+    watch.sort_by(|left, right| left.name.cmp(&right.name));
+    (brief, watch)
+}
+
+/// Placeholder watch slot names when the server has not created rows yet.
+pub fn default_watch_slot_names() -> Vec<String> {
+    (0..3).map(|index| format!("watch_{index}")).collect()
+}
+
 /// Short label for the next run timestamp (shown as-is after trim).
 pub fn format_next_run(raw: &str) -> String {
     let flat: String = raw
@@ -240,7 +260,7 @@ mod tests {
             }]
         }))
         .unwrap();
-        assert!(!sources[0].last_run.as_ref().unwrap().ok);
+        assert_eq!(sources[0].last_run.as_ref().unwrap().ok, false);
 
         let active = parse_active_workflows(&json!({
             "workflows": [{

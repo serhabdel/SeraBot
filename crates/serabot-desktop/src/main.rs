@@ -21,6 +21,8 @@ mod ui_jobs;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_logs;
 #[cfg(any(windows, feature = "ui-check"))]
+mod ui_workflows;
+#[cfg(any(windows, feature = "ui-check"))]
 mod ui_settings;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_settings_page;
@@ -30,8 +32,6 @@ mod ui_tasks;
 mod ui_usage;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_vault;
-#[cfg(any(windows, feature = "ui-check"))]
-mod ui_workflows;
 
 fn main() {
     if std::env::args()
