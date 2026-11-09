@@ -112,6 +112,8 @@ pub enum OperationKind {
     TaskCalendar,
     /// The owner-only log ring buffer (0.28.0), for the Logs tab.
     Logs,
+    /// Wave A visibility bundle for the Workflows tab (0.29.0).
+    Workflows,
     /// A server-rendered artifact preview (0.28.0), for the preview pane.
     DocPreview,
 }
@@ -261,6 +263,8 @@ pub enum Operation {
         level: Option<String>,
         query: String,
     },
+    /// Routines, monitoring sources and active plans (0.29.0).
+    Workflows,
     /// `GET /v1/artifacts/{hash}/preview` for one document artifact.
     DocPreview {
         hash: String,
@@ -461,6 +465,7 @@ impl Operation {
             Self::PreviewArtifact { .. } => OperationKind::PreviewArtifact,
             Self::MediaJobs => OperationKind::MediaJobs,
             Self::Logs { .. } => OperationKind::Logs,
+            Self::Workflows => OperationKind::Workflows,
             Self::DocPreview { .. } => OperationKind::DocPreview,
             Self::TurnLimits => OperationKind::TurnLimits,
             Self::SaveTurnLimits { .. } | Self::ResetTurnLimits => OperationKind::TurnLimitsWrite,
@@ -563,6 +568,8 @@ pub enum Reply {
     MediaJobs(Vec<crate::api::MediaJob>),
     /// The Logs tab read. `None` when the server has no logs route yet (404).
     Logs(Option<Vec<crate::logs::LogEntry>>),
+    /// The Workflows tab read (0.29.0).
+    Workflows(crate::workflows::WorkflowsSnapshot),
     /// One artifact's server-rendered preview; `None` means "no preview,
     /// use the download route".
     DocPreview {
@@ -999,6 +1006,7 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         }
         Operation::MediaJobs => client.media_jobs(conversation).map(Reply::MediaJobs),
         Operation::Logs { level, query } => client.logs(level.as_deref(), query).map(Reply::Logs),
+        Operation::Workflows => client.workflows_snapshot().map(Reply::Workflows),
         Operation::DocPreview { hash } => {
             client
                 .artifact_preview(hash)

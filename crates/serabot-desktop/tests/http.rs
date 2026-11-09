@@ -1253,6 +1253,45 @@ fn vault_routes_validate_and_never_echo_a_value() {
 }
 
 #[test]
+fn vault_provider_test_parses_the_probe_and_never_echoes_a_token() {
+    let (client, handle) = server(vec![
+        (
+            200,
+            r#"{"ok":false,"cli_found":false,"configured":true,"message":"the 1Password CLI is not installed on the server"}"#.into(),
+        ),
+        (
+            200,
+            r#"{"ok":true,"cli_found":true,"configured":true,"message":"the token answered","token":"leak"}"#.into(),
+        ),
+    ]);
+    let probe = client.password_manager_test("onepassword").unwrap();
+    assert!(!probe.ok);
+    assert!(!probe.cli_found);
+    assert!(probe.configured);
+    assert!(probe.message.contains("CLI"));
+
+    // Extra secret-looking fields are refused by deny_unknown_fields.
+    assert_eq!(
+        client.password_manager_test("onepassword"),
+        Err(ApiError::InvalidResponse)
+    );
+
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("POST /v1/vault/providers/onepassword/test "));
+    for r in &requests {
+        assert!(
+            r.to_lowercase()
+                .contains(&format!("authorization: bearer {TOKEN}\r\n"))
+        );
+        // Probe is exit-code style: never posts a provider token in the body.
+        assert!(
+            !r.contains("\"token\""),
+            "vault provider test must not send a token in the request body"
+        );
+    }
+}
+
+#[test]
 fn vault_writes_are_validated_before_the_network() {
     use serabot_desktop::{VaultKind, VaultPut, normalize_vault_domain, valid_vault_name};
     use zeroize::Zeroizing;

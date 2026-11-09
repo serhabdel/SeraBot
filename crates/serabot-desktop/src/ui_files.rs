@@ -46,6 +46,54 @@ if (!window.__serabotPasteBridge) {
 }
 "#;
 
+/// Keeps the message list pinned to the bottom while content grows (streaming
+/// tokens, activity rows) without fighting a scroll-up. `data-stick` tracks
+/// whether the owner is near the bottom; ResizeObserver pins only then.
+pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
+(function () {
+  if (window.__serabotChatScroll) return;
+  window.__serabotChatScroll = true;
+  const BOTTOM = 80;
+  const el = () => document.getElementById('messages');
+  const pinIfStuck = () => {
+    const box = el();
+    if (!box || box.dataset.stick !== '1') return;
+    requestAnimationFrame(() => {
+      box.scrollTop = box.scrollHeight;
+    });
+  };
+  const updateStick = (box) => {
+    if (!box) return;
+    const near = box.scrollHeight - box.scrollTop - box.clientHeight < BOTTOM;
+    box.dataset.stick = near ? '1' : '0';
+  };
+  window.__serabotPinMessages = (force) => {
+    const box = el();
+    if (!box) return;
+    if (force) box.dataset.stick = '1';
+    pinIfStuck();
+  };
+  document.addEventListener(
+    'scroll',
+    (event) => {
+      const target = event.target;
+      if (target && target.id === 'messages') updateStick(target);
+    },
+    { capture: true, passive: true }
+  );
+  const observer = new ResizeObserver(() => pinIfStuck());
+  const hook = () => {
+    const box = el();
+    if (!box || box.__serabotScrollHook) return;
+    box.__serabotScrollHook = true;
+    observer.observe(box);
+    updateStick(box);
+  };
+  hook();
+  new MutationObserver(hook).observe(document.body, { childList: true, subtree: true });
+})();
+"#;
+
 /// Waits 1.5 seconds, then tells Rust, so a "Copied" label can reset.
 pub const CONFIRM_RESET_JS: &str =
     "await new Promise((resolve) => setTimeout(resolve, 1500)); dioxus.send(true);";

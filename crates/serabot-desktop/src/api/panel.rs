@@ -169,6 +169,20 @@ pub struct PasswordManager {
     pub install_url: String,
 }
 
+/// Result of `POST /v1/vault/providers/{id}/test`. Never a token or CLI output.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PasswordManagerProbe {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub cli_found: bool,
+    #[serde(default)]
+    pub configured: bool,
+    #[serde(default)]
+    pub message: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PasswordManagerList {
@@ -599,6 +613,15 @@ impl ApiClient {
         } else {
             Err(ApiError::InvalidResponse)
         }
+    }
+
+    /// `POST /v1/vault/providers/{id}/test`: probe the saved token via the CLI.
+    pub fn password_manager_test(&self, id: &str) -> Result<PasswordManagerProbe, ApiError> {
+        self.panel_json::<PasswordManagerProbe, ()>(
+            Method::POST,
+            &["v1", "vault", "providers", id, "test"],
+            None,
+        )
     }
 
     /// `DELETE /v1/vault/{name}`.

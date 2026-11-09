@@ -246,3 +246,37 @@ async fn password_manager_tokens_are_write_only_per_user_and_not_ai_providers() 
     .await;
     assert_eq!(again.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn vault_provider_test_never_echoes_the_token() {
+    let (app, _, store) = app();
+    let user = store
+        .create_user("subject-vp-test", "vpt@example.example", "Synthetic VPT")
+        .unwrap();
+    let token = mint_for(&store, &user.id, "vp-test");
+    let put = call(
+        &app,
+        &token,
+        "PUT",
+        "/v1/vault/providers/onepassword",
+        Some(json!({"token": "synthetic-op-probe-token"})),
+    )
+    .await;
+    assert_eq!(put.status(), StatusCode::OK);
+
+    let probe = read_json(
+        call(
+            &app,
+            &token,
+            "POST",
+            "/v1/vault/providers/onepassword/test",
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(probe["configured"], true);
+    let text = probe.to_string();
+    assert!(!text.contains("synthetic-op-probe-token"));
+    assert!(probe.get("message").and_then(Value::as_str).is_some());
+}

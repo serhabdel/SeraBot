@@ -30,6 +30,8 @@ mod ui_tasks;
 mod ui_usage;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_vault;
+#[cfg(any(windows, feature = "ui-check"))]
+mod ui_workflows;
 
 fn main() {
     if std::env::args()

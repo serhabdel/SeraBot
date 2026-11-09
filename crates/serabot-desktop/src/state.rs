@@ -2,11 +2,69 @@ use crate::{
     ApiError, Approval, AuthUser, BotDetail, BotSummary, Catalog, ConnectorStatus,
     ConnectorTestResult, ConversationSummary, CreatedBot, CreatedConversation, CreatedGroup,
     CreatedSkill, LibraryEntry, MemoryEntry, MemoryStatsView, Message, Onboarding, ProviderStatus,
-    Scope, Selection, ServerHealth, ShippedBot, SkillSummary, Task, Team, UsageReport,
+    Role, Scope, Selection, ServerHealth, ShippedBot, SkillSummary, Task, Team, UsageReport,
     avatars::AvatarImage,
     worker::{OperationKind, Reply},
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+
+/// Merge a server transcript with what is already on screen. Rows with the same
+/// id are updated in place; optimistic `opt-*` user rows are paired by content.
+pub fn merge_transcript(current: &[Message], incoming: Vec<Message>) -> Vec<Message> {
+    if current.is_empty() {
+        return incoming;
+    }
+    let mut used_opts = HashSet::new();
+    let mut merged = Vec::with_capacity(incoming.len().max(current.len()));
+
+    for inc in incoming {
+        if let Some(cur) = current.iter().find(|row| row.id == inc.id) {
+            merged.push(if transcript_row_equal(cur, &inc) {
+                cur.clone()
+            } else {
+                inc.clone()
+            });
+            continue;
+        }
+        if let Some((idx, _cur)) = current.iter().enumerate().find(|(i, row)| {
+            row.id.starts_with("opt-") && !used_opts.contains(i) && pairs_optimistic(row, &inc)
+        }) {
+            used_opts.insert(idx);
+            merged.push(inc);
+            continue;
+        }
+        merged.push(inc);
+    }
+
+    for (idx, cur) in current.iter().enumerate() {
+        if cur.id.starts_with("opt-")
+            && !used_opts.contains(&idx)
+            && !merged.iter().any(|row| row.id == cur.id)
+        {
+            merged.push(cur.clone());
+        }
+    }
+
+    merged
+}
+
+fn transcript_row_equal(a: &Message, b: &Message) -> bool {
+    a.id == b.id
+        && a.role == b.role
+        && a.content == b.content
+        && a.created_at == b.created_at
+        && a.bot == b.bot
+        && a.name == b.name
+        && a.limit_reached == b.limit_reached
+        && a.attachments == b.attachments
+}
+
+fn pairs_optimistic(local: &Message, server: &Message) -> bool {
+    local.role == server.role
+        && local.role == Role::User
+        && local.content == server.content
+        && local.attachments.len() == server.attachments.len()
+}
 
 pub struct State {
     pub scope: Scope,
@@ -84,6 +142,10 @@ pub struct State {
     /// False once the server answers 404 on `/v1/logs`: the tab then says the
     /// route is not available instead of retrying forever.
     pub logs_supported: bool,
+    /// The Workflows tab (0.29.0): latest visibility bundle.
+    pub workflows: crate::workflows::WorkflowsSnapshot,
+    pub workflows_loaded: bool,
+    pub workflows_error: Option<String>,
     /// Server-rendered artifact previews by hash (0.28.0). `None` values mean
     /// "no preview; use download/open". A hash has at most one read in flight,
     /// tracked by the session.
@@ -194,6 +256,9 @@ impl Default for State {
             logs: Vec::new(),
             logs_loaded: false,
             logs_supported: true,
+            workflows: crate::workflows::WorkflowsSnapshot::default(),
+            workflows_loaded: false,
+            workflows_error: None,
             doc_previews: BTreeMap::new(),
             media_previews: crate::media_view::PreviewCache::default(),
             turn_limits: None,
@@ -396,7 +461,7 @@ impl State {
                 self.catalog = Some(catalog);
             }
             Reply::History(history) => {
-                self.messages = history.messages;
+                self.messages = merge_transcript(&self.messages, history.messages);
                 self.cards = history.cards;
                 self.history_loaded = true;
                 // Fetching the transcript marks the thread read on the server;
@@ -575,6 +640,11 @@ impl State {
                     }
                 }
                 self.logs_loaded = true;
+            }
+            Reply::Workflows(snapshot) => {
+                self.workflows = snapshot;
+                self.workflows_loaded = true;
+                self.workflows_error = None;
             }
             Reply::DocPreview { hash, preview } => {
                 self.doc_previews.insert(hash, preview);
@@ -833,6 +903,79 @@ mod tests {
                 .unwrap()
                 .contains("Unknown submission outcome")
         );
+    }
+
+    #[test]
+    fn merge_transcript_keeps_stable_rows_and_pairs_optimistic_user() {
+        let opt = Message {
+            id: "opt-99".into(),
+            role: Role::User,
+            content: "hello".into(),
+            created_at: "Just now".into(),
+            name: None,
+            bot: None,
+            attachments: Vec::new(),
+            limit_reached: false,
+        };
+        let bot = Message {
+            id: "m-bot".into(),
+            role: Role::Assistant,
+            content: "hi there".into(),
+            created_at: "2026-11-09T12:00:00Z".into(),
+            name: None,
+            bot: Some("main".into()),
+            attachments: Vec::new(),
+            limit_reached: false,
+        };
+        let current = vec![opt.clone(), bot.clone()];
+        let incoming = vec![
+            Message {
+                id: "m-user".into(),
+                role: Role::User,
+                content: "hello".into(),
+                created_at: "2026-11-09T12:00:01Z".into(),
+                name: None,
+                bot: None,
+                attachments: Vec::new(),
+                limit_reached: false,
+            },
+            Message {
+                id: "m-bot".into(),
+                role: Role::Assistant,
+                content: "hi there, friend".into(),
+                created_at: "2026-11-09T12:00:02Z".into(),
+                name: None,
+                bot: Some("main".into()),
+                attachments: Vec::new(),
+                limit_reached: false,
+            },
+        ];
+        let merged = merge_transcript(&current, incoming);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, "m-user");
+        assert_eq!(merged[0].content, "hello");
+        assert_eq!(merged[1].id, "m-bot");
+        assert_eq!(merged[1].content, "hi there, friend");
+        let again = merge_transcript(&merged, merged.clone());
+        assert_eq!(again[1].content, merged[1].content);
+        assert_eq!(again[1].id, merged[1].id);
+    }
+
+    #[test]
+    fn merge_transcript_keeps_in_flight_opt_not_yet_on_server() {
+        let opt = Message {
+            id: "opt-1".into(),
+            role: Role::User,
+            content: "wait".into(),
+            created_at: "Just now".into(),
+            name: None,
+            bot: None,
+            attachments: Vec::new(),
+            limit_reached: false,
+        };
+        let merged = merge_transcript(std::slice::from_ref(&opt), Vec::new());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "opt-1");
     }
 
     #[test]

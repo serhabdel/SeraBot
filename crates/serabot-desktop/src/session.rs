@@ -138,10 +138,12 @@ pub enum Section {
     Settings,
     /// The owner-only server logs viewer (0.28.0).
     Logs,
+    /// Scheduled routines, source health and active plans (0.29.0).
+    Workflows,
 }
 
 impl Section {
-    pub const NAV: [Self; 11] = [
+    pub const NAV: [Self; 12] = [
         Self::Chat,
         Self::Conversations,
         Self::Browser,
@@ -152,6 +154,7 @@ impl Section {
         Self::Approvals,
         Self::Vault,
         Self::Usage,
+        Self::Workflows,
         Self::Logs,
     ];
 
@@ -169,6 +172,7 @@ impl Section {
             Self::Tasks => "Tasks",
             Self::Settings => "Settings",
             Self::Logs => "Logs",
+            Self::Workflows => "Workflows",
         }
     }
 }
@@ -548,6 +552,8 @@ pub struct Session {
     pub worker: Option<Worker>,
     pub credentials: Option<Arc<Credentials>>,
     pub events: Option<EventStream>,
+    /// Set by the SSE thread so the UI timer can tick without waiting 120ms.
+    pub ui_wake: Arc<AtomicBool>,
     pub events_active: bool,
     /// Browser dock and vault sheet state; its own worker thread.
     pub panel: PanelState,
@@ -740,6 +746,7 @@ impl Session {
             worker,
             credentials: None,
             events: None,
+            ui_wake: Arc::new(AtomicBool::new(false)),
             events_active: false,
             events_dirty: false,
             last_event_id: 0,
@@ -1225,6 +1232,9 @@ impl Session {
         if section == Section::Logs {
             self.refresh_logs();
         }
+        if section == Section::Workflows {
+            self.refresh_workflows();
+        }
         self.ensure_section_data();
     }
 
@@ -1254,6 +1264,18 @@ impl Session {
         self.logs_level = level;
         self.logs_query = query;
         self.refresh_logs();
+    }
+
+    /// Read the Wave A visibility bundle (0.29.0). Independent of the open chat.
+    pub fn refresh_workflows(&mut self) {
+        if !self.state.connected || self.pending.is_some() {
+            if self.ready() {
+                self.schedule(Operation::Workflows, Duration::ZERO);
+            }
+            return;
+        }
+        self.state.workflows_error = None;
+        self.start_request(Operation::Workflows);
     }
 
     /// Ask for one artifact's server-rendered preview (0.28.0). A hash that
@@ -2699,6 +2721,49 @@ impl Session {
         updater::spawn_apply(info)
     }
 
+    /// Fingerprint of chat-visible state; used to skip repaints when nothing changed.
+    pub fn ui_fingerprint(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        self.state.messages.len().hash(&mut h);
+        for row in &self.state.messages {
+            row.id.hash(&mut h);
+            row.content.len().hash(&mut h);
+        }
+        self.state.cards.len().hash(&mut h);
+        self.state.activity.task_id.hash(&mut h);
+        self.state.activity.steps.len().hash(&mut h);
+        for step in &self.state.activity.steps {
+            step.call_id.hash(&mut h);
+            step.label.len().hash(&mut h);
+            format!("{:?}", step.phase).hash(&mut h);
+        }
+        if let Some(task) = &self.state.task {
+            task.id.hash(&mut h);
+            format!("{:?}", task.status).hash(&mut h);
+        }
+        self.events_active.hash(&mut h);
+        self.state.working.hash_fingerprint(&mut h);
+        if let Some(plan) = &self.state.plan {
+            plan.goal.len().hash(&mut h);
+            plan.items.len().hash(&mut h);
+            for item in &plan.items {
+                item.text.len().hash(&mut h);
+                format!("{:?}", item.status).hash(&mut h);
+            }
+        }
+        self.state.plan.is_some().hash(&mut h);
+        self.toast.hash(&mut h);
+        self.uploading.hash(&mut h);
+        self.upload_queue.len().hash(&mut h);
+        self.composer_files.len().hash(&mut h);
+        self.state.transcript.is_some().hash(&mut h);
+        self.state.transcript_error.hash(&mut h);
+        self.panel.epoch.hash(&mut h);
+        h.finish()
+    }
+
     /// Called from the UI timer. Drains completions and advances scheduled work.
     pub fn tick(&mut self) {
         self.check_session_expiry();
@@ -2794,10 +2859,11 @@ impl Session {
         let Some(credentials) = self.credentials.clone() else {
             return;
         };
+        let wake = Arc::clone(&self.ui_wake);
         self.events = Some(EventStream::start(
             credentials,
             self.last_event_id,
-            Box::new(|| {}),
+            Box::new(move || wake.store(true, Ordering::Release)),
         ));
     }
 
@@ -3175,6 +3241,11 @@ impl Session {
                         OperationKind::Logs => {
                             // The tab shows its own message; no global banner.
                             self.state.logs_loaded = true;
+                            self.state.error = None;
+                        }
+                        OperationKind::Workflows => {
+                            self.state.workflows_loaded = true;
+                            self.state.workflows_error = Some(message);
                             self.state.error = None;
                         }
                         OperationKind::DocPreview => {
@@ -3722,6 +3793,7 @@ impl Session {
                 level: self.logs_level.clone(),
                 query: self.logs_query.clone(),
             }),
+            Section::Workflows => (!self.state.workflows_loaded).then_some(Operation::Workflows),
             Section::Browser | Section::Vault | Section::Usage | Section::Settings => None,
         }
     }

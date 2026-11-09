@@ -147,3 +147,16 @@ pub(super) async fn delete_vault_provider(
     }
     Ok(Json(json!({"deleted": true})))
 }
+
+/// `POST /v1/vault/providers/{id}/test`: exit-code style probe; never a token
+/// or CLI stdout.
+pub(super) async fn test_vault_provider(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    let provider = password_manager(&id)?;
+    let report =
+        vault_providers::probe(&state.users, &state.vault_providers, &user.id, provider).await?;
+    Ok(Json(json!(report)))
+}

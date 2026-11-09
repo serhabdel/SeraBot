@@ -459,6 +459,14 @@ impl Gateway {
             .registry
             .get(name)
             .ok_or_else(|| SeraError::NotFound(format!("tool {name}")))?;
+        tracing::info!(
+            user_id = %context.user_id,
+            turn_id = tracing::field::display(
+                context.turn_id.as_deref().unwrap_or_default()
+            ),
+            tool = %name,
+            "gateway tool execute"
+        );
         let canonical = canonical_json(&args)?;
         let hash = canonical_hash(&args)?;
 
@@ -655,6 +663,12 @@ impl Gateway {
                 None,
             )?;
         }
+        tracing::info!(
+            user_id = %context.user_id,
+            turn_id = tracing::field::display(context.turn_id.as_deref().unwrap_or_default()),
+            tool = %tool.spec().name,
+            "gateway tool dispatch"
+        );
         let started = std::time::Instant::now();
         let (output, listed) = run_tool_call(tool, args, context).await;
         let output = self.redact_output(context, output);
@@ -782,6 +796,13 @@ impl Gateway {
                 "the destination changed since approval; approve it again".into(),
             ));
         }
+        tracing::info!(
+            user_id = %context.user_id,
+            turn_id = tracing::field::display(context.turn_id.as_deref().unwrap_or_default()),
+            tool = %action.tool,
+            action_id = %action_id,
+            "gateway approved tool execute"
+        );
         let started = std::time::Instant::now();
         let (output, listed) = run_tool_call(tool.as_ref(), args, context).await;
         let output = self.redact_output(context, output);

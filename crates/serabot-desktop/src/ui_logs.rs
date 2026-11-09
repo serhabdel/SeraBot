@@ -74,8 +74,8 @@ pub fn LogsView(session: Signal<Session>) -> Element {
                 input {
                     class: "input logs-search",
                     r#type: "search",
-                    placeholder: "Search logs\u{2026}",
-                    "aria-label": "Search logs",
+                    placeholder: "Search logs or tool name\u{2026}",
+                    "aria-label": "Search logs or tool name",
                     value: "{query}",
                     oninput: move |event| query.set(event.value()),
                     onkeydown: move |event: KeyboardEvent| {

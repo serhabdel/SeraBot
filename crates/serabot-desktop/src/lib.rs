@@ -38,6 +38,7 @@ pub mod ui_highlight;
 pub mod updater;
 pub mod vault_import;
 pub mod worker;
+pub mod workflows;
 pub mod working;
 pub use api::*;
 

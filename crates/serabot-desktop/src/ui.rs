@@ -19,7 +19,9 @@ use serabot_desktop::{
     teams, ui_highlight,
     working::BotActivity,
 };
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 use std::time::Instant;
 
 use crate::ui_bots::{MeetTeamSheet, NewBotSheet, NewGroupSheet, OnboardingView};
@@ -28,8 +30,8 @@ use crate::ui_cards::ChatCardRow;
 use crate::ui_connectors::ConnectorsView;
 use crate::ui_dock::BrowserDock;
 use crate::ui_files::{
-    CONFIRM_RESET_JS, ComposerFiles, MediaCards, MessageFiles, PASTE_BRIDGE_JS, PastedFile,
-    copy_script, decode_pasted,
+    CHAT_SCROLL_BRIDGE_JS, CONFIRM_RESET_JS, ComposerFiles, MediaCards, MessageFiles,
+    PASTE_BRIDGE_JS, PastedFile, copy_script, decode_pasted,
 };
 use crate::ui_settings::SettingsPanel;
 use crate::ui_settings_page::{
@@ -632,11 +634,25 @@ fn App() -> Element {
     use_coroutine(move |_: UnboundedReceiver<()>| async move {
         loop {
             #[cfg(windows)]
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            {
+                let wake = session.read().ui_wake.clone();
+                if !wake.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    for _ in 0..12 {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        if wake.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                            break;
+                        }
+                    }
+                }
+                let before = session.read().ui_fingerprint();
+                session.with_mut(|session| session.tick());
+                let after = session.read().ui_fingerprint();
+                if before != after {
+                    revision.set(revision() + 1);
+                }
+            }
             #[cfg(not(windows))]
             std::future::pending::<()>().await;
-            session.with_mut(|session| session.tick());
-            revision.set(revision() + 1);
         }
     });
     use_effect(move || {
@@ -746,6 +762,7 @@ pub(crate) fn Icon(name: String, #[props(default = 20)] size: u32) -> Element {
         "lock" => "M6 11h12v9H6zM8 11V8a4 4 0 0 1 8 0v3",
         "usage" => "M5 20V10M12 20V4M19 20v-7",
         "logs" => "M6 4h9l3 3v13H6zM9 9h6M9 13h6M9 17h4",
+        "workflows" => "M12 8v4l3 2M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z",
         "globe" => {
             "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"
         }
@@ -835,6 +852,36 @@ pub enum InlineSpan {
     Bold(Vec<InlineSpan>),
     Italic(String),
     Link { label: String, url: String },
+}
+
+const MD_CACHE_MAX: usize = 384;
+
+fn markdown_content_hash(content: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Parsed markdown blocks keyed by message id and content hash.
+fn parse_markdown_cached(message_id: &str, content: &str) -> Vec<MdBlock> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type MdCache = HashMap<(String, u64), Vec<MdBlock>>;
+    static CACHE: OnceLock<Mutex<MdCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (message_id.to_owned(), markdown_content_hash(content));
+    let mut guard = cache.lock().expect("markdown cache");
+    if let Some(blocks) = guard.get(&key) {
+        return blocks.clone();
+    }
+    let blocks = parse_markdown_blocks(content);
+    if guard.len() >= MD_CACHE_MAX {
+        guard.clear();
+    }
+    guard.insert(key, blocks.clone());
+    blocks
 }
 
 pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
@@ -1204,11 +1251,11 @@ fn CodeBlock(lang: String, code: String) -> Element {
 }
 
 #[component]
-pub fn MarkdownBody(content: String) -> Element {
-    let blocks = parse_markdown_blocks(&content);
+pub fn MarkdownBody(message_id: String, content: String) -> Element {
+    let blocks = use_memo(move || parse_markdown_cached(message_id.as_str(), content.as_str()));
     rsx! {
         div { class: "md-body",
-            for (idx, block) in blocks.into_iter().enumerate() {
+            for (idx, block) in blocks().into_iter().enumerate() {
                 {match block {
                     MdBlock::Heading { level, text } => match level {
                         1 => rsx! { h1 { key: "{idx}", class: "md-h1", InlineMarkdown { text } } },
@@ -1484,6 +1531,7 @@ fn Shell(session: Signal<Session>) -> Element {
                         Section::Vault => rsx! { VaultPage { session } },
                         Section::Usage => rsx! { UsagePage { session } },
                         Section::Logs => rsx! { crate::ui_logs::LogsView { session } },
+                        Section::Workflows => rsx! { crate::ui_workflows::WorkflowsView { session } },
                         Section::Settings => rsx! { SettingsView { session } },
                     }}
                 }
@@ -1542,7 +1590,7 @@ fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> 
     let mut session = session;
     let section = session.read().section;
     let pending = session.read().state.approvals.len();
-    let destinations: [(Section, &str, &str); 10] = [
+    let destinations: [(Section, &str, &str); 11] = [
         (Section::Chat, "chat", "Chats"),
         (Section::Browser, "globe", "Browser"),
         (Section::Tasks, "list", "Tasks"),
@@ -1551,6 +1599,7 @@ fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, bool)>>) -> 
         (Section::Connectors, "connectors", "Connectors"),
         (Section::Vault, "lock", "Vault"),
         (Section::Usage, "usage", "Usage"),
+        (Section::Workflows, "workflows", "Workflows"),
         (Section::Providers, "providers", "AI keys"),
         (Section::Logs, "logs", "Logs"),
     ];
@@ -3170,6 +3219,10 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let mut at_bottom = use_signal(|| true);
     let mut unseen = use_signal(|| 0usize);
     let mut last_count = use_signal(|| 0usize);
+    // Ids that already had their entrance animation in this conversation.
+    let entered_messages =
+        use_hook(|| Rc::new(RefCell::new((String::new(), HashSet::<String>::new()))));
+    let entered_messages_effect = Rc::clone(&entered_messages);
     let mut dragging = use_signal(|| false);
     let mut composer_focused = use_signal(|| false);
     let mut copied = use_signal(|| Option::<String>::None);
@@ -3179,6 +3232,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         while let Ok(pasted) = bridge.recv::<PastedFile>().await {
             session.write().queue_files(vec![decode_pasted(pasted)]);
         }
+    });
+    use_future(move || async move {
+        let _ = dioxus::document::eval(CHAT_SCROLL_BRIDGE_JS);
     });
     let transcript_error = session.read().state.transcript_error.clone();
     use_effect(move || {
@@ -3196,13 +3252,37 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         }
     });
     use_effect(move || {
+        let conversation = session.read().conversation.clone();
+        {
+            let mut guard = entered_messages_effect.borrow_mut();
+            guard.0 = conversation;
+            guard.1.clear();
+        }
+        last_count.set(0);
+        at_bottom.set(true);
+        unseen.set(0);
+    });
+    use_effect(move || {
         let count = session.read().state.messages.len();
         let own_send =
             session.read().state.messages.last().is_some_and(|message| {
                 message.role == Role::User && message.id.starts_with("opt-")
             });
+        let tail = session
+            .read()
+            .state
+            .messages
+            .last()
+            .map(|message| (message.id.clone(), message.content.len()));
+        let activity_steps = session.read().state.activity.steps.len();
+        let activity_tail = session
+            .read()
+            .state
+            .activity
+            .steps
+            .last()
+            .map(|step| (step.call_id.clone(), step.label.len()));
         let previous = *last_count.peek();
-        // A fresh mount (first render or a switch) starts at the newest line.
         let jump = own_send || previous == 0;
         if count != previous {
             if count > previous && !*at_bottom.peek() && !own_send {
@@ -3211,16 +3291,25 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             }
             last_count.set(count);
         }
-        // Your own message always brings you to the newest line; a reply
-        // only follows when you were already near the bottom.
         if own_send {
             at_bottom.set(true);
             unseen.set(0);
         }
+        let _ = (tail, activity_steps, activity_tail);
+        let force_pin = jump || own_send;
         let _ = dioxus::document::eval(&format!(
-            "const el=document.getElementById('messages'); if(el && ({jump} || el.scrollHeight - el.scrollTop - el.clientHeight < 80)){{el.scrollTop=el.scrollHeight;}}"
+            "window.__serabotPinMessages?.({});",
+            if force_pin { "true" } else { "false" }
         ));
     });
+    {
+        let conversation = session.read().conversation.clone();
+        let mut guard = entered_messages.borrow_mut();
+        if guard.0 != conversation {
+            guard.0 = conversation;
+            guard.1.clear();
+        }
+    }
     let empty = messages.is_empty();
     let is_one_to_one = session.read().conversation.starts_with("dir:");
     let room = teams::is_room(&session.read().conversation);
@@ -3425,7 +3514,21 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     span { "{heading}" }
                                 }
                             }
-                            div { class: "{row.class}",
+                            div {
+                                class: {
+                                    let mut guard = entered_messages.borrow_mut();
+                                    let enter = if guard.1.contains(&row.id) {
+                                        false
+                                    } else {
+                                        guard.1.insert(row.id.clone());
+                                        true
+                                    };
+                                    if enter {
+                                        format!("{} msg-enter", row.class)
+                                    } else {
+                                        row.class.clone()
+                                    }
+                                },
                                 span {
                                     class: if row.user { "msg-avatar avatar user" } else { "msg-avatar avatar bot" },
                                     style: row.bot.as_deref().map(avatar_style).unwrap_or_default(),
@@ -3453,7 +3556,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                         }
                                     }
                                     div { class: "msg-body", title: "{row.stamp}",
-                                        MarkdownBody { content: row.content.clone() }
+                                        MarkdownBody { message_id: row.id.clone(), content: row.content.clone() }
                                         if row.user {
                                             MessageFiles { session, id: row.id.clone() }
                                         }
@@ -3572,7 +3675,12 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                         "aria-label": "Scroll to the newest message",
                         title: "Newest messages",
                         onclick: move |_| {
-                            let _ = dioxus::document::eval("const el=document.getElementById('messages'); if(el){el.scrollTo({top: el.scrollHeight, behavior: 'smooth'});}");
+                            let _ = dioxus::document::eval(
+                                "window.__serabotPinMessages?.(true); \
+                                 const el=document.getElementById('messages'); \
+                                 if(el){el.scrollTo({top: el.scrollHeight, behavior: 'smooth'});}",
+                            );
+                            at_bottom.set(true);
                             unseen.set(0);
                         },
                         Icon { name: "arrow-down", size: 16 }

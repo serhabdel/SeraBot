@@ -16,9 +16,9 @@ use crate::worker::Credentials;
 use crate::{
     ApiClient, ApiError, BrowserController, BrowserHistory, BrowserInfo, BrowserInput,
     BrowserProfile, BrowserSessionInfo, ConnectorUpdate, DEFAULT_PROFILE, MAX_VAULT_DOMAINS,
-    MAX_VAULT_ENTRIES, MAX_VAULT_NOTE_CHARS, MAX_VAULT_USERNAME_CHARS, PasswordManager, VaultEntry,
-    VaultKind, VaultPut, VaultSource, normalize_vault_domain, valid_vault_name,
-    valid_vault_reference, validate_vault_put,
+    MAX_VAULT_ENTRIES, MAX_VAULT_NOTE_CHARS, MAX_VAULT_USERNAME_CHARS, PasswordManager,
+    PasswordManagerProbe, VaultEntry, VaultKind, VaultPut, VaultSource, normalize_vault_domain,
+    valid_vault_name, valid_vault_reference, validate_vault_put,
 };
 use crate::{ComposioAccount, ComposioApp};
 use std::{
@@ -77,6 +77,7 @@ pub enum PanelOp {
         token: Zeroizing<String>,
     },
     PasswordManagerClear(String),
+    PasswordManagerTest(String),
     /// List the owner's logins from a password manager on this PC (metadata).
     ImportList(VaultSource),
     /// Create the reference entries for the picked logins, as (name, write).
@@ -134,6 +135,7 @@ pub enum PanelKind {
     PasswordManagers,
     PasswordManagerSave,
     PasswordManagerClear,
+    PasswordManagerTest,
     ImportList,
     VaultImport,
     Status,
@@ -167,6 +169,7 @@ impl PanelOp {
             Self::PasswordManagers => PanelKind::PasswordManagers,
             Self::PasswordManagerSave { .. } => PanelKind::PasswordManagerSave,
             Self::PasswordManagerClear(_) => PanelKind::PasswordManagerClear,
+            Self::PasswordManagerTest(_) => PanelKind::PasswordManagerTest,
             Self::ImportList(_) => PanelKind::ImportList,
             Self::VaultImport(_) => PanelKind::VaultImport,
             Self::Status => PanelKind::Status,
@@ -204,6 +207,10 @@ pub enum PanelReply {
     PasswordManagers(Vec<PasswordManager>),
     PasswordManagerSaved(PasswordManager),
     PasswordManagerCleared(String),
+    PasswordManagerTested {
+        id: String,
+        probe: PasswordManagerProbe,
+    },
     ImportList(Vec<ImportItem>),
     VaultImported(usize),
     Sessions(Vec<BrowserSessionInfo>),
@@ -343,6 +350,14 @@ fn execute(job: &PanelJob, cache: &mut Option<ApiClient>) -> Result<PanelReply, 
         PanelOp::PasswordManagerClear(id) => client
             .password_manager_clear(id)
             .map(|()| PanelReply::PasswordManagerCleared(id.clone())),
+        PanelOp::PasswordManagerTest(id) => {
+            client
+                .password_manager_test(id)
+                .map(|probe| PanelReply::PasswordManagerTested {
+                    id: id.clone(),
+                    probe,
+                })
+        }
         // Runs the owner's CLI on this PC: metadata only, nothing is stored.
         PanelOp::ImportList(source) => {
             vault_import::list_items(*source).map(PanelReply::ImportList)
@@ -638,6 +653,9 @@ pub struct VaultView {
     pub providers_loaded: bool,
     /// The password manager whose token is being saved or cleared.
     pub provider_busy: Option<String>,
+    /// The password manager whose server probe is in flight.
+    pub provider_testing: Option<String>,
+    pub provider_tests: std::collections::BTreeMap<String, PasswordManagerProbe>,
     pub provider_error: Option<String>,
     /// The import listing in flight, and the source it is for.
     pub import_loading: Option<VaultSource>,
@@ -1423,6 +1441,16 @@ impl PanelState {
             .push_back(PanelOp::PasswordManagerClear(id.to_owned()));
     }
 
+    /// Probe the saved token against the password manager CLI on the server.
+    pub fn test_password_manager(&mut self, id: String) {
+        if self.vault.provider_busy.is_some() || self.vault.provider_testing.is_some() {
+            return;
+        }
+        self.vault.provider_testing = Some(id.clone());
+        self.vault.provider_error = None;
+        self.queue.push_back(PanelOp::PasswordManagerTest(id));
+    }
+
     /// List the logins of a password manager on this PC, for the picker.
     pub fn start_import(&mut self, source: VaultSource) {
         self.vault.import = None;
@@ -1721,6 +1749,8 @@ impl PanelState {
             }
             PanelReply::PasswordManagerSaved(manager) => {
                 self.vault.provider_busy = None;
+                // A new token invalidates any previous probe result.
+                self.vault.provider_tests.remove(&manager.id);
                 self.vault.notice = Some(format!("{} token saved.", manager.name));
                 match self.vault.providers.iter_mut().find(|p| p.id == manager.id) {
                     Some(existing) => *existing = manager,
@@ -1732,7 +1762,16 @@ impl PanelState {
                 if let Some(manager) = self.vault.providers.iter_mut().find(|p| p.id == id) {
                     manager.configured = false;
                 }
+                self.vault.provider_tests.remove(&id);
                 self.vault.notice = Some("Token removed.".into());
+            }
+            PanelReply::PasswordManagerTested { id, probe } => {
+                self.vault.provider_testing = None;
+                if let Some(manager) = self.vault.providers.iter_mut().find(|p| p.id == id) {
+                    manager.configured = probe.configured;
+                    manager.cli_found = probe.cli_found;
+                }
+                self.vault.provider_tests.insert(id, probe);
             }
             PanelReply::ImportList(items) => {
                 let source = self.vault.import_loading.take().unwrap_or_default();
@@ -1844,6 +1883,10 @@ impl PanelState {
             }
             PanelKind::PasswordManagerSave | PanelKind::PasswordManagerClear => {
                 self.vault.provider_busy = None;
+                self.vault.provider_error = Some(message);
+            }
+            PanelKind::PasswordManagerTest => {
+                self.vault.provider_testing = None;
                 self.vault.provider_error = Some(message);
             }
             PanelKind::ImportList => {
@@ -3172,6 +3215,88 @@ mod tests {
         assert_eq!(
             composio_error_text(&limited),
             "Composio is rate limiting requests. Try again in a minute."
+        );
+    }
+
+    fn password_manager(id: &str, configured: bool, cli_found: bool) -> PasswordManager {
+        PasswordManager {
+            id: id.into(),
+            name: id.into(),
+            configured,
+            cli_found,
+            enabled: true,
+            install_url: "https://example.test/install".into(),
+        }
+    }
+
+    #[test]
+    fn vault_provider_test_stores_the_probe_and_never_keeps_a_stale_one_after_save() {
+        let mut state = PanelState::new();
+        let t0 = Instant::now();
+        state.vault.providers = vec![password_manager("onepassword", true, false)];
+
+        state.test_password_manager("onepassword".into());
+        assert_eq!(state.vault.provider_testing.as_deref(), Some("onepassword"));
+        assert!(matches!(
+            state.next_op(t0),
+            Some(PanelOp::PasswordManagerTest(id)) if id == "onepassword"
+        ));
+        // One probe at a time: a second request is ignored while one is in flight.
+        // (Status/shot polls may still be due from PanelState::new — that is fine.)
+        state.test_password_manager("protonpass".into());
+        assert_eq!(state.vault.provider_testing.as_deref(), Some("onepassword"));
+        assert!(
+            state
+                .queue
+                .iter()
+                .all(|op| !matches!(op, PanelOp::PasswordManagerTest(_))),
+            "second probe must not enqueue while one is in flight"
+        );
+
+        state.apply(
+            done(
+                &state,
+                PanelKind::PasswordManagerTest,
+                Ok(PanelReply::PasswordManagerTested {
+                    id: "onepassword".into(),
+                    probe: PasswordManagerProbe {
+                        ok: false,
+                        cli_found: false,
+                        configured: true,
+                        message: "the 1Password CLI is not installed on the server".into(),
+                    },
+                }),
+            ),
+            t0,
+        );
+        assert!(state.vault.provider_testing.is_none());
+        let probe = state.vault.provider_tests.get("onepassword").unwrap();
+        assert!(!probe.ok && !probe.cli_found);
+        assert_eq!(
+            state
+                .vault
+                .providers
+                .iter()
+                .find(|p| p.id == "onepassword")
+                .map(|p| p.cli_found),
+            Some(false)
+        );
+
+        state.apply(
+            done(
+                &state,
+                PanelKind::PasswordManagerSave,
+                Ok(PanelReply::PasswordManagerSaved(password_manager(
+                    "onepassword",
+                    true,
+                    true,
+                ))),
+            ),
+            t0,
+        );
+        assert!(
+            !state.vault.provider_tests.contains_key("onepassword"),
+            "saving a new token clears the last probe"
         );
     }
 }
