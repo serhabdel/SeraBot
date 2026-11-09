@@ -99,8 +99,8 @@ _Base: `recover/wave-b-wip` @ `fb0ca48` (rebased 2026-11-09)._
       `SafeFetcher` + policy only.
 - [ ] **B4** Reliability enqueue rules — failed `source_runs` → one capped
       watch/event enqueue; no LLM loop.
-- [ ] **B5** Standing grants API + UI — list/revoke for acting user; audit revoke.
-- [ ] **B6** Jobs panel stuck/unknown — uncertain tasks, `outcome_unknown`
+- [x] **B5** Standing grants API + UI — list/revoke for acting user; audit revoke.
+- [x] **B6** Jobs panel stuck/unknown — uncertain tasks, `outcome_unknown`
       actions; link to A5 traces.
 
 ### Wave B gate
