@@ -41,6 +41,29 @@ pub struct DueRoutine {
     pub config: Value,
 }
 
+/// Enable or disable the acting user's routine without changing its schedule.
+pub fn set_routine_enabled(
+    store: &Store,
+    user_id: &str,
+    name: &str,
+    enabled: bool,
+) -> Result<()> {
+    let connection = store.connection()?;
+    let changed = connection.execute(
+        "UPDATE routines SET enabled = ?1, updated_at = ?2 WHERE name = ?3 AND user_id = ?4",
+        params![
+            enabled as i64,
+            utc_string(Utc::now()),
+            name,
+            user_id
+        ],
+    )?;
+    if changed == 0 {
+        return Err(SeraError::NotFound(format!("routine {name}")));
+    }
+    Ok(())
+}
+
 /// Create or update the acting user's daily routine without losing its run
 /// history.
 ///

@@ -1112,7 +1112,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
                         // under the routine's owning user.
                         let due = due_routines(&store, chrono::Utc::now(), tz)?;
                         for routine in due {
-                            let kind = crate::config::task_kind_for_routine(&routine.name);
+                            let kind = serabot::config::task_kind_for_routine(&routine.name);
                             let conversation_id = store
                                 .default_scheduled_conversation_id(&routine.user_id)?;
                             let payload = ScheduledPayload {
