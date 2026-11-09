@@ -1787,14 +1787,14 @@ pub struct StatusApproval {
     pub action_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     User,
     Assistant,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Message {
     pub id: String,
     pub role: Role,
@@ -2349,6 +2349,40 @@ impl ApiClient {
     /// `{entries:[{ts,level,target,message}]}`. A 404 means the server
     /// predates the route, reported as `Ok(None)` so the Logs tab can say
     /// "not available" instead of failing.
+    /// Wave A visibility reads for the Workflows tab (0.29.0). Each leg treats
+    /// 404 as unsupported instead of failing the whole bundle.
+    pub fn workflows_snapshot(&self) -> Result<crate::workflows::WorkflowsSnapshot, ApiError> {
+        let mut snapshot = crate::workflows::WorkflowsSnapshot::default();
+        match self.get::<serde_json::Value>(&["v1", "routines"], &[]) {
+            Ok(value) => {
+                snapshot.routines =
+                    crate::workflows::parse_routines(&value).ok_or(ApiError::InvalidResponse)?;
+                snapshot.routines_supported = true;
+            }
+            Err(ApiError::Http(404)) => snapshot.routines_supported = false,
+            Err(error) => return Err(error),
+        }
+        match self.get::<serde_json::Value>(&["v1", "monitoring", "sources"], &[]) {
+            Ok(value) => {
+                snapshot.sources =
+                    crate::workflows::parse_sources(&value).ok_or(ApiError::InvalidResponse)?;
+                snapshot.sources_supported = true;
+            }
+            Err(ApiError::Http(404)) => snapshot.sources_supported = false,
+            Err(error) => return Err(error),
+        }
+        match self.get::<serde_json::Value>(&["v1", "workflows", "active"], &[]) {
+            Ok(value) => {
+                snapshot.active = crate::workflows::parse_active_workflows(&value)
+                    .ok_or(ApiError::InvalidResponse)?;
+                snapshot.active_supported = true;
+            }
+            Err(ApiError::Http(404)) => snapshot.active_supported = false,
+            Err(error) => return Err(error),
+        }
+        Ok(snapshot)
+    }
+
     pub fn logs(
         &self,
         level: Option<&str>,

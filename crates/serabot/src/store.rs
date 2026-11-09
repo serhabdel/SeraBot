@@ -302,6 +302,42 @@ impl TelegramBinding {
     }
 }
 
+/// One scheduled routine row for visibility APIs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RoutineRow {
+    pub name: String,
+    pub enabled: bool,
+    pub next_run_at: String,
+    pub last_run_for: Option<String>,
+    pub config: Value,
+}
+
+/// Latest recorded watch run for one configured source.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SourceRunStatus {
+    pub source: String,
+    pub ok: bool,
+    pub error: Option<String>,
+    pub items_seen: i64,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+/// A redacted audit point on a conversation timeline.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ConversationTrace {
+    pub id: i64,
+    pub at: String,
+    pub event: String,
+    pub tool: Option<String>,
+    pub approval_id: Option<String>,
+    pub action_id: Option<String>,
+    pub canonical_hash: Option<String>,
+    pub destination: Option<String>,
+    pub elapsed_ms: Option<u64>,
+    pub artifact_hash: Option<String>,
+}
+
 /// Token-usage rollup over `model.used` audit rows.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct UsageRollup {
@@ -2849,6 +2885,168 @@ impl Store {
                 details: row
                     .get::<_, Option<String>>(9)?
                     .and_then(|value| serde_json::from_str(&value).ok()),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Conversation that receives scheduled brief and watch notifications for
+    /// the acting user (`dir:main`, created if missing).
+    pub fn default_scheduled_conversation_id(&self, user_id: &str) -> Result<String> {
+        let id = "dir:main";
+        self.ensure_conversation_accepts_turns(user_id, id)?;
+        Ok(id.to_string())
+    }
+
+    /// Whether the acting user owns a routine with this name.
+    pub fn routine_exists(&self, user_id: &str, name: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT 1 FROM routines WHERE user_id = ?1 AND name = ?2",
+                params![user_id, name],
+                |_row| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// The acting user's scheduled routines, oldest name first.
+    pub fn list_routines(&self, user_id: &str) -> Result<Vec<RoutineRow>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT name, enabled, next_run_at, last_run_for, config_json
+             FROM routines WHERE user_id = ?1 ORDER BY name ASC",
+        )?;
+        let rows = statement.query_map(params![user_id], |row| {
+            Ok(RoutineRow {
+                name: row.get(0)?,
+                enabled: row.get::<_, i64>(1)? != 0,
+                next_run_at: row.get(2)?,
+                last_run_for: row.get(3)?,
+                config: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or(Value::Null),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The latest `source_runs` row per source for the acting user.
+    pub fn list_source_run_status(&self, user_id: &str) -> Result<Vec<SourceRunStatus>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT sr.source, sr.ok, sr.error, sr.items_seen, sr.started_at, sr.finished_at
+             FROM source_runs sr
+             WHERE sr.user_id = ?1
+               AND sr.started_at = (
+                   SELECT MAX(started_at) FROM source_runs
+                   WHERE user_id = ?1 AND source = sr.source
+               )
+             ORDER BY sr.source ASC",
+        )?;
+        let rows = statement.query_map(params![user_id], |row| {
+            Ok(SourceRunStatus {
+                source: row.get(0)?,
+                ok: row.get::<_, i64>(1)? != 0,
+                error: row.get(2)?,
+                items_seen: row.get(3)?,
+                started_at: row.get(4)?,
+                finished_at: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Conversations whose stored plan still has checklist work left.
+    pub fn list_active_workflow_plans(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::plans::Plan>> {
+        use crate::plans::{Plan, PlanItem};
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT conversation_id, goal, items, updated_at
+             FROM conversation_plans WHERE user_id = ?1
+             ORDER BY updated_at DESC LIMIT ?2",
+        )?;
+        let cap = limit.clamp(1, 500) as i64;
+        let rows = statement.query_map(params![user_id, cap], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut plans = Vec::new();
+        for row in rows {
+            let (conversation_id, goal, items, updated_at) = row?;
+            let items: Vec<PlanItem> = serde_json::from_str(&items).unwrap_or_default();
+            let plan = Plan {
+                conversation_id,
+                goal,
+                items,
+                updated_at,
+            };
+            if !plan.items.is_empty() && !plan.is_complete() {
+                plans.push(plan);
+            }
+        }
+        Ok(plans)
+    }
+
+    /// Redacted tool and approval audit rows for one conversation, oldest
+    /// first. Never selects canonical argument text — only hashes and
+    /// destinations joined from `actions`.
+    pub fn list_conversation_traces(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ConversationTrace>> {
+        let connection = self.connection()?;
+        let cap = limit.clamp(1, 500) as i64;
+        let mut statement = connection.prepare(
+            "SELECT a.id, a.at, a.event, a.tool, a.approval_id, a.action_id, a.details_json,
+                    act.canonical_hash, act.destination
+             FROM audit_log a
+             LEFT JOIN tasks t ON t.id = a.task_id
+             LEFT JOIN actions act ON act.id = a.action_id AND act.user_id = ?1
+             LEFT JOIN turns tr ON tr.id = act.turn_id AND tr.user_id = ?1
+             WHERE (a.event LIKE 'tool.%' OR a.event LIKE 'approval.%')
+               AND COALESCE(t.user_id, a.actor) = ?1
+               AND COALESCE(
+                   json_extract(t.payload_json, '$.conversation_id'),
+                   tr.conversation_id,
+                   json_extract(a.details_json, '$.conversation_id')
+               ) = ?2
+             ORDER BY a.id ASC
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![user_id, conversation_id, cap], |row| {
+            let details: Option<Value> = row
+                .get::<_, Option<String>>(6)?
+                .and_then(|value| serde_json::from_str(&value).ok());
+            Ok(ConversationTrace {
+                id: row.get(0)?,
+                at: row.get(1)?,
+                event: row.get(2)?,
+                tool: row.get(3)?,
+                approval_id: row.get(4)?,
+                action_id: row.get(5)?,
+                canonical_hash: row.get(7)?,
+                destination: row.get(8)?,
+                elapsed_ms: details
+                    .as_ref()
+                    .and_then(|value| value.get("elapsed_ms"))
+                    .and_then(Value::as_u64),
+                artifact_hash: details.as_ref().and_then(|value| {
+                    value
+                        .get("artifact_hash")
+                        .or_else(|| value.get("sha256"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                }),
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)

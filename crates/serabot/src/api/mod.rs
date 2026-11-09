@@ -65,7 +65,11 @@ mod logs;
 mod media;
 mod memories;
 mod messages;
+mod monitoring;
 mod preview;
+mod routines;
+mod traces;
+mod workflows;
 mod profiles;
 mod settings;
 mod skills;
@@ -87,6 +91,10 @@ use conversations::*;
 use jobs::*;
 use logs::*;
 use media::*;
+use monitoring::*;
+use routines::*;
+use traces::*;
+use workflows::*;
 use memories::*;
 use messages::*;
 use preview::*;
@@ -378,6 +386,7 @@ pub fn router(state: ApiState) -> Router {
             "/v1/vault/providers/{id}",
             put(put_vault_provider).delete(delete_vault_provider),
         )
+        .route("/v1/vault/providers/{id}/test", post(test_vault_provider))
         .route("/v1/vault/{name}", put(put_vault).delete(delete_vault))
         .route("/v1/providers", get(list_providers))
         .route("/v1/providers/{id}/key", put(set_provider_key))
@@ -507,6 +516,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/artifacts/{hash}/preview", get(artifact_preview))
         .route("/v1/artifacts/{hash}/approve", post(approve_artifact))
         .route("/v1/jobs", get(list_jobs))
+        .route("/v1/routines", get(list_routines))
+        .route("/v1/monitoring/sources", get(list_monitoring_sources))
+        .route("/v1/workflows/active", get(list_active_workflows))
+        .route("/v1/traces", get(list_traces))
         .route("/v1/logs", get(list_logs))
         .route("/v1/me", get(auth_me))
         .route("/v1/auth/logout", post(auth_logout))

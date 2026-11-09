@@ -10,6 +10,7 @@
 //! control characters are dropped. If the stream goes quiet (a lost event) an
 //! entry expires after [`STALE_AFTER`], so a ring never spins forever.
 
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -26,7 +27,7 @@ pub const WORKING_LABEL: &str = "Working…";
 pub const WAITING_LABEL: &str = "Waiting for approval";
 
 /// What one bot is doing.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BotActivity {
     /// Running a turn; the label is the current step ("Reading files"), if known.
     Working(Option<String>),
@@ -181,6 +182,16 @@ impl WorkingBots {
             .filter(|entry| same_conversation(&entry.conversation, conversation))
             .map(|entry| (entry.bot.clone(), entry.activity.clone()))
             .collect()
+    }
+
+    /// Mix live entry ids and activities into `h` for UI dirty detection.
+    pub fn hash_fingerprint<H: Hasher>(&self, h: &mut H) {
+        self.entries.len().hash(h);
+        for entry in &self.entries {
+            entry.task_id.hash(h);
+            entry.bot.hash(h);
+            entry.activity.hash(h);
+        }
     }
 
     /// The bots that are working right now, sorted.

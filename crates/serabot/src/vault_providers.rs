@@ -596,6 +596,107 @@ pub struct ProviderStatus {
     pub install_url: &'static str,
 }
 
+/// Arguments for a token probe. Stdout is discarded; only the exit code matters.
+pub fn probe_args(provider: Provider) -> Vec<String> {
+    match provider {
+        Provider::OnePassword => vec!["account".to_owned(), "list".to_owned()],
+        Provider::ProtonPass => vec!["vault".to_owned(), "list".to_owned()],
+    }
+}
+
+/// Result of probing a saved password-manager token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderProbe {
+    pub ok: bool,
+    pub cli_found: bool,
+    pub configured: bool,
+    pub message: String,
+}
+
+/// Check whether the acting user's token works against the provider CLI.
+/// Never returns token text or CLI stdout.
+pub async fn probe(
+    users: &UserSecrets,
+    providers: &Providers,
+    user_id: &str,
+    provider: Provider,
+) -> Result<ProviderProbe> {
+    let cli_found = providers.cli_found(provider);
+    let configured = users
+        .vault_provider_token(user_id, provider.id())?
+        .is_some();
+    if !providers.enabled(provider) {
+        return Ok(ProviderProbe {
+            ok: false,
+            cli_found,
+            configured,
+            message: format!(
+                "{} is disabled on this server",
+                provider.label()
+            ),
+        });
+    }
+    if !configured {
+        return Ok(ProviderProbe {
+            ok: false,
+            cli_found,
+            configured,
+            message: "save an access token first".into(),
+        });
+    }
+    if !cli_found {
+        return Ok(ProviderProbe {
+            ok: false,
+            cli_found,
+            configured,
+            message: format!(
+                "the {} CLI is not installed on the server",
+                provider.label()
+            ),
+        });
+    }
+    let token = users
+        .vault_provider_token(user_id, provider.id())?
+        .ok_or_else(|| SeraError::InvalidState("token missing after check".into()))?;
+    let args = probe_args(provider);
+    let program = program_for(provider, &providers.config).ok_or_else(|| {
+        SeraError::External(format!(
+            "the {} CLI is not installed on the server",
+            provider.label()
+        ))
+    })?;
+    let runner = providers.runner.clone();
+    let env_name = provider.token_env();
+    let token = Zeroizing::new(token.expose_secret().to_owned());
+    let output = tokio::task::spawn_blocking(move || {
+        runner.run(&program, &args, &[(env_name, token.as_str())])
+    })
+    .await
+    .map_err(|_| SeraError::Internal("the password manager probe failed".into()))??;
+    let ok = output.status == Some(0);
+    drop(output.stdout);
+    if ok {
+        Ok(ProviderProbe {
+            ok: true,
+            cli_found,
+            configured,
+            message: "the token answered".into(),
+        })
+    } else {
+        tracing::warn!(
+            provider = provider.id(),
+            exit_code = ?output.status,
+            "password manager probe failed"
+        );
+        Ok(ProviderProbe {
+            ok: false,
+            cli_found,
+            configured,
+            message: format!("{} rejected the token", provider.label()),
+        })
+    }
+}
+
 pub fn status(
     users: &UserSecrets,
     providers: &Providers,
@@ -1080,6 +1181,19 @@ mod tests {
         assert!(status.configured && !status.cli_found);
         assert!(clear_token(&users, &user, Provider::OnePassword).unwrap());
         assert!(!clear_token(&users, &user, Provider::OnePassword).unwrap());
+    }
+
+    #[tokio::test]
+    async fn probe_uses_exit_code_only_and_never_returns_stdout() {
+        let (_, users, user) = setup();
+        set_token(&users, &user, Provider::OnePassword, "synthetic-token").unwrap();
+        let runner = fake(Some(0), "synthetic-account-email@example.example");
+        let providers = Providers::with_runner(&config_with_op(), runner);
+        let report = probe(&users, &providers, &user, Provider::OnePassword)
+            .await
+            .unwrap();
+        assert!(report.ok);
+        assert!(!report.message.contains("synthetic-account"));
     }
 
     #[test]

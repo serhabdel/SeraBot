@@ -1232,7 +1232,6 @@ body {
   gap: 12px;
   padding: 6px 10px;
   border-radius: var(--r-md);
-  animation: msg-in var(--dur-2) var(--ease);
 }
 
 /* A full-width hover highlight makes the list read as a table of records.
@@ -3395,7 +3394,7 @@ button:not(:disabled):active,
   content: "· ";
 }
 
-/* Floating, translucent composer. Messages scroll beneath it. */
+/* Floating composer layout (surface tokens live in Chat 0.19). */
 .composer-wrap {
   position: absolute;
   left: 18px;
@@ -3414,13 +3413,8 @@ button:not(:disabled):active,
 .composer {
   flex-direction: row;
   flex-wrap: wrap;
-  align-items: center;
+  align-items: flex-end;
   gap: 8px;
-  padding: 8px 8px 8px 10px;
-  border-radius: 14px;
-  background: var(--glass);
-  backdrop-filter: blur(18px) saturate(160%);
-  -webkit-backdrop-filter: blur(18px) saturate(160%);
 }
 
 .composer-row {
@@ -4915,6 +4909,88 @@ html[data-reduce-transparency="true"] .chat-header {
   background: var(--card-bg);
 }
 
+.vault-section-title {
+  margin: 0 0 4px;
+  font-size: var(--fs-body);
+  font-weight: 650;
+}
+
+.vault-providers {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px 0 4px;
+  border-top: 1px solid var(--hairline);
+}
+
+.vault-connected {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--hairline);
+  background: var(--surface-2);
+}
+
+.vault-connected-title {
+  margin: 0;
+  font-size: var(--fs-caption);
+  font-weight: 650;
+  color: var(--label-2);
+}
+
+.vault-connected-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.vault-connected-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+}
+
+.vault-connected-name {
+  min-width: 7rem;
+  font-weight: 600;
+  color: var(--label-1);
+}
+
+.vault-provider-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 0;
+  border-top: 1px solid var(--hairline);
+}
+
+.vault-provider-token,
+.vault-provider-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.vault-provider-token .input {
+  flex: 1 1 12rem;
+  min-width: 10rem;
+}
+
+.tiny.ok {
+  color: var(--ok);
+}
+
+.tiny.err {
+  color: var(--danger);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .browser-card {
     transition: none;
@@ -4932,13 +5008,17 @@ html[data-reduce-transparency="true"] .chat-header {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  margin: 4px 0 12px 44px;
+  margin: 4px auto 12px;
   padding: 10px 14px;
-  max-width: min(var(--chat-w), 100%);
+  max-width: min(640px, 100%);
+  width: 100%;
   background: var(--surface-2);
   border-radius: var(--r-md);
   font-size: var(--fs-body);
   color: var(--label-2);
+  contain: layout style;
+  min-height: 2.75rem;
+  animation: chat-fade var(--dur-fade) ease-out backwards;
 }
 
 .activity.done {
@@ -4967,6 +5047,7 @@ html[data-reduce-transparency="true"] .chat-header {
 
 .shimmer {
   align-self: flex-start;
+  min-height: 1.25rem;
   color: transparent;
   background: linear-gradient(
     90deg,
@@ -5809,10 +5890,17 @@ html[data-reduce-transparency="true"] .chat-header {
   box-shadow: var(--composer-shadow), inset 0 1px 0 var(--composer-top-edge);
   backdrop-filter: blur(20px) saturate(180%);
   -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border-radius: 20px;
+  padding: 10px 10px 10px 14px;
+  gap: 10px;
+  transition:
+    border-color var(--dur-1) var(--ease),
+    box-shadow var(--dur-1) var(--ease);
 }
 
 .composer:focus-within {
   border-color: var(--accent-soft);
+  box-shadow: var(--composer-shadow), inset 0 1px 0 var(--composer-top-edge), var(--ring);
 }
 
 .composer .composer-hint {
@@ -5856,15 +5944,35 @@ html[data-reduce-transparency="true"] .chat-header {
   flex: none;
 }
 
+.composer-mic {
+  transition:
+    background var(--dur-1) var(--ease),
+    color var(--dur-1) var(--ease),
+    transform var(--dur-press) ease-out;
+}
+
+.composer-mic:active:not(:disabled) {
+  transform: scale(var(--press-scale));
+}
+
+.composer-input {
+  min-height: 36px;
+  padding: 8px 6px;
+  line-height: 1.45;
+}
+
 /* Send and stop: feedback on press, not on release. */
 .send-btn,
 .stop-btn {
-  transition: transform 100ms ease-out, background-color 120ms ease, opacity 120ms ease;
+  transition:
+    transform var(--dur-press) ease-out,
+    background-color var(--dur-1) var(--ease),
+    opacity var(--dur-1) var(--ease);
 }
 
 .send-btn:active:not(:disabled),
 .stop-btn:active {
-  transform: scale(0.97);
+  transform: scale(var(--press-scale));
 }
 
 .stop-btn {
@@ -5944,9 +6052,9 @@ html[data-reduce-transparency="true"] .chat-header {
   box-shadow: var(--shadow-3);
 }
 
-/* Messages: a new one enters with a short fade and a 4px rise. */
-.messages > .msg {
-  animation: chat-msg-in 200ms cubic-bezier(0.2, 0.8, 0.2, 1);
+/* Only brand-new rows animate; streaming edits keep stable layout. */
+.messages > .msg.msg-enter {
+  animation: chat-msg-in 200ms var(--spring);
 }
 
 .msg-body {
@@ -6204,7 +6312,7 @@ html[data-reduce-transparency="true"] .chat-header {
 
 /* Reduced motion and reduced transparency: opacity only, solid surfaces. */
 @media (prefers-reduced-motion: reduce) {
-  .messages > .msg {
+  .messages > .msg.msg-enter {
     animation: chat-fade 120ms linear;
   }
 
@@ -6220,7 +6328,7 @@ html[data-reduce-transparency="true"] .chat-header {
   }
 }
 
-[data-motion="reduced"] .messages > .msg {
+[data-motion="reduced"] .messages > .msg.msg-enter {
   animation: chat-fade 120ms linear;
 }
 

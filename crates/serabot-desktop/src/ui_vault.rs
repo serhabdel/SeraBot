@@ -9,7 +9,7 @@ use crate::ui::Icon;
 use dioxus::prelude::*;
 use serabot_desktop::panel::last_used_label;
 use serabot_desktop::session::Session;
-use serabot_desktop::{PasswordManager, VaultEntry, VaultKind, VaultSource};
+use serabot_desktop::{PasswordManager, PasswordManagerProbe, VaultEntry, VaultKind, VaultSource};
 use zeroize::{Zeroize, Zeroizing};
 
 fn kind_icon(kind: VaultKind) -> &'static str {
@@ -490,28 +490,67 @@ fn source_of(id: &str) -> Option<VaultSource> {
     }
 }
 
+fn entry_count_for(source: VaultSource, entries: &[VaultEntry]) -> usize {
+    entries.iter().filter(|entry| entry.source == source).count()
+}
+
+/// Short connection status for the Connected vaults summary. Never a token.
+fn provider_status_label(manager: &PasswordManager) -> &'static str {
+    if !manager.enabled {
+        "off on this server"
+    } else if manager.configured && manager.cli_found {
+        "ready"
+    } else if manager.configured {
+        "token saved · CLI missing"
+    } else if manager.cli_found {
+        "CLI found · no token"
+    } else {
+        "not connected"
+    }
+}
+
+fn entries_label(count: usize) -> String {
+    match count {
+        0 => "no entries".to_owned(),
+        1 => "1 entry".to_owned(),
+        n => format!("{n} entries"),
+    }
+}
+
 /// Password managers (0.23): each one's token and CLI status, and an import
 /// from this PC. A token is write-only, like a vault value: it is sent and
 /// never shown again. Requests run on the panel worker.
 #[component]
 fn PasswordManagersPanel(session: Signal<Session>) -> Element {
-    let (loaded, providers, error, importing, import_error, picker_open) = {
+    let (loaded, vault_loaded, entries, providers, tests, error, importing, import_error, picker_open) = {
         let s = session.read();
         let v = &s.panel.vault;
         (
             v.providers_loaded,
+            v.loaded,
+            v.entries.clone(),
             v.providers.clone(),
+            v.provider_tests.clone(),
             v.provider_error.clone(),
             v.import_loading,
             v.import_error.clone(),
             v.import.is_some(),
         )
     };
+    let local_count = vault_loaded.then(|| entry_count_for(VaultSource::Local, &entries));
     rsx! {
         section { class: "vault-providers", "aria-label": "Password managers",
             h2 { class: "vault-section-title", "Password managers" }
             p { class: "tiny vault-hint",
                 "Use a login from 1Password or Proton Pass without copying it. The password stays in your manager and is read only when a bot types it."
+            }
+            if loaded || vault_loaded {
+                ConnectedVaultsSummary {
+                    providers: providers.clone(),
+                    tests: tests.clone(),
+                    entries: if vault_loaded { Some(entries.clone()) } else { None },
+                    local_count,
+                }
             }
             if let Some(message) = error {
                 div { class: "error-text tiny", role: "alert", "{message}" }
@@ -535,11 +574,86 @@ fn PasswordManagersPanel(session: Signal<Session>) -> Element {
     }
 }
 
+/// Providers status, last Test result, and entry counts — never a token or value.
+#[component]
+fn ConnectedVaultsSummary(
+    providers: Vec<PasswordManager>,
+    tests: std::collections::BTreeMap<String, PasswordManagerProbe>,
+    entries: Option<Vec<VaultEntry>>,
+    local_count: Option<usize>,
+) -> Element {
+    rsx! {
+        div { class: "vault-connected", role: "status", "aria-label": "Connected vaults",
+            h3 { class: "vault-connected-title", "Connected vaults" }
+            ul { class: "vault-connected-list",
+                if let Some(count) = local_count {
+                    li { class: "vault-connected-row",
+                        span { class: "vault-connected-name", "Stored here" }
+                        span { class: "chip", "{entries_label(count)}" }
+                    }
+                }
+                for manager in providers {
+                    ConnectedProviderStatus {
+                        key: "{manager.id}",
+                        manager: manager.clone(),
+                        probe: tests.get(&manager.id).cloned(),
+                        entry_count: entries.as_ref().and_then(|list| {
+                            source_of(&manager.id).map(|source| entry_count_for(source, list))
+                        }),
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ConnectedProviderStatus(
+    manager: PasswordManager,
+    probe: Option<PasswordManagerProbe>,
+    entry_count: Option<usize>,
+) -> Element {
+    let status = provider_status_label(&manager);
+    let chip = if !manager.enabled {
+        "chip muted"
+    } else if manager.configured && manager.cli_found {
+        "chip ok"
+    } else if manager.configured || manager.cli_found {
+        "chip warn"
+    } else {
+        "chip muted"
+    };
+    rsx! {
+        li { class: "vault-connected-row",
+            span { class: "vault-connected-name", "{manager.name}" }
+            span { class: "{chip}", "{status}" }
+            if let Some(count) = entry_count {
+                span { class: "chip", "{entries_label(count)}" }
+            }
+            if let Some(PasswordManagerProbe { ok, message, .. }) = probe {
+                span {
+                    class: if ok { "tiny ok" } else { "tiny err" },
+                    "Last test: {message}"
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn ProviderRow(session: Signal<Session>, manager: PasswordManager) -> Element {
     let mut session = session;
     let mut token = use_signal(String::new);
-    let busy = session.read().panel.vault.provider_busy.as_deref() == Some(manager.id.as_str());
+    let id = manager.id.clone();
+    let busy = session.read().panel.vault.provider_busy.as_deref() == Some(id.as_str());
+    let testing = session.read().panel.vault.provider_testing.as_deref() == Some(id.as_str());
+    let probe = session
+        .read()
+        .panel
+        .vault
+        .provider_tests
+        .get(&id)
+        .cloned();
     let filled = !token.read().is_empty();
     let token_line = if manager.configured {
         "Access token saved on this server"
@@ -581,7 +695,7 @@ fn ProviderRow(session: Signal<Session>, manager: PasswordManager) -> Element {
                 }
                 button {
                     class: "btn primary sm",
-                    disabled: busy || !filled,
+                    disabled: busy || testing || !filled,
                     onclick: move |_| {
                         // Move the token out of the signal: nothing is left behind.
                         let secret = Zeroizing::new(std::mem::take(&mut *token.write()));
@@ -594,17 +708,38 @@ fn ProviderRow(session: Signal<Session>, manager: PasswordManager) -> Element {
                 if manager.configured {
                     button {
                         class: "btn ghost sm",
-                        disabled: busy,
+                        disabled: busy || testing,
                         onclick: move |_| session.write().panel.clear_password_manager(&clear_id),
                         "Remove"
                     }
                 }
             }
-            if let Some(source) = source {
+            div { class: "vault-provider-actions",
                 button {
-                    class: "btn sm",
-                    onclick: move |_| session.write().panel.start_import(source),
-                    "Import from this PC"
+                    class: "btn ghost sm",
+                    title: "Check the saved token against the CLI on the server",
+                    disabled: busy || testing,
+                    onclick: {
+                        let test_id = id.clone();
+                        move |_| session.write().panel.test_password_manager(test_id.clone())
+                    },
+                    Icon { name: "refresh", size: 14 }
+                    if testing { "Testing\u{2026}" } else { "Test" }
+                }
+                if let Some(source) = source {
+                    button {
+                        class: "btn sm",
+                        disabled: busy || testing,
+                        onclick: move |_| session.write().panel.start_import(source),
+                        "Import from this PC"
+                    }
+                }
+            }
+            if let Some(PasswordManagerProbe { ok, message, .. }) = probe {
+                p {
+                    class: if ok { "tiny ok" } else { "tiny err" },
+                    role: "status",
+                    "{message}"
                 }
             }
         }

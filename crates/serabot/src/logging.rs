@@ -482,6 +482,23 @@ mod tests {
     }
 
     #[test]
+    fn ring_filter_matches_gateway_tool_field() {
+        // A7: Logs `q` can find a tool name from the gateway correlation line.
+        let ring = RingBuffer::default();
+        ring.push(event(
+            "info",
+            "gateway tool execute user_id=u1 turn_id=t1 tool=web_fetch",
+        ));
+        ring.push(event(
+            "info",
+            "gateway tool execute user_id=u1 turn_id=t2 tool=browser_click",
+        ));
+        let hits = ring.snapshot(None, Some("web_fetch"), 100);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].message.contains("tool=web_fetch"));
+    }
+
+    #[test]
     fn builtin_scrub_hides_tokens_and_long_keys() {
         let scrubbed = builtin_scrub("auth: Bearer abcdef123456 tail");
         assert!(scrubbed.contains("Bearer [redacted]"));
