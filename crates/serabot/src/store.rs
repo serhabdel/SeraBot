@@ -38,8 +38,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::domain::{
-    Action, Approval, AuditEntry, Event, Id, LlmMessage, Role, StoredMessage, Task, Turn, new_id,
-    utc_now,
+    Action, Approval, AuditEntry, Event, Id, LlmMessage, Role, StandingGrant, StoredMessage,
+    Task, Turn, new_id, utc_now,
 };
 use crate::error::{Result, SeraError};
 use crate::util::sha256_hex;
@@ -3646,6 +3646,86 @@ impl Store {
         )?)
     }
 
+    /// Active and revoked standing grants for the acting user, newest first.
+    pub fn list_standing_grants(&self, user_id: &str, limit: usize) -> Result<Vec<StandingGrant>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, tool, canonical_hash, destination, policy_version, approval_id, revoked_at, created_at
+             FROM standing_grants WHERE user_id = ?1
+             ORDER BY created_at DESC, rowid DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![user_id, limit as i64], |row| {
+            Ok(StandingGrant {
+                id: row.get(0)?,
+                tool: row.get(1)?,
+                canonical_hash: row.get(2)?,
+                destination: row.get(3)?,
+                policy_version: row.get(4)?,
+                approval_id: row.get(5)?,
+                revoked_at: row
+                    .get::<_, Option<String>>(6)?
+                    .as_deref()
+                    .map(parse_datetime),
+                created_at: parse_datetime(&row.get::<_, String>(7)?),
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Revoke one standing grant for the acting user. The bool is true when
+    /// this call transitioned the row from active to revoked.
+    pub fn revoke_standing_grant(
+        &self,
+        user_id: &str,
+        grant_id: &str,
+    ) -> Result<Option<(StandingGrant, bool)>> {
+        let connection = self.connection()?;
+        let grant = connection
+            .query_row(
+                "SELECT id, tool, canonical_hash, destination, policy_version, approval_id, revoked_at, created_at
+                 FROM standing_grants WHERE id = ?1 AND user_id = ?2",
+                params![grant_id, user_id],
+                |row| {
+                    Ok(StandingGrant {
+                        id: row.get(0)?,
+                        tool: row.get(1)?,
+                        canonical_hash: row.get(2)?,
+                        destination: row.get(3)?,
+                        policy_version: row.get(4)?,
+                        approval_id: row.get(5)?,
+                        revoked_at: row
+                            .get::<_, Option<String>>(6)?
+                            .as_deref()
+                            .map(parse_datetime),
+                        created_at: parse_datetime(&row.get::<_, String>(7)?),
+                    })
+                },
+            )
+            .optional()?;
+        let Some(grant) = grant else {
+            return Ok(None);
+        };
+        if grant.revoked_at.is_some() {
+            return Ok(Some((grant, false)));
+        }
+        let now = now_string();
+        let changed = connection.execute(
+            "UPDATE standing_grants SET revoked_at = ?1 WHERE id = ?2 AND user_id = ?3 AND revoked_at IS NULL",
+            params![now, grant_id, user_id],
+        )?;
+        if changed == 0 {
+            return Ok(Some((grant, false)));
+        }
+        Ok(Some((
+            StandingGrant {
+                revoked_at: Some(parse_datetime(&now)),
+                ..grant
+            },
+            true,
+        )))
+    }
+
     pub fn record_telegram_update(&self, update_id: i64) -> Result<bool> {
         let connection = self.connection()?;
         let inserted = connection.execute(
@@ -6881,6 +6961,33 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(store.revoke_grants(&admin_id).unwrap(), 1);
+        let listed = store.list_standing_grants(&admin_id, 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].revoked_at.is_some());
+        assert!(store.list_standing_grants(&member.id, 10).unwrap().is_empty());
+        store
+            .insert_grant(
+                &admin_id,
+                "upload",
+                "grant-hash-2",
+                None,
+                "p1",
+                &grant_approval.id,
+            )
+            .unwrap();
+        let active = store
+            .list_standing_grants(&admin_id, 10)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.revoked_at.is_none())
+            .unwrap();
+        let (revoked, fresh) = store
+            .revoke_standing_grant(&admin_id, &active.id)
+            .unwrap()
+            .unwrap();
+        assert!(fresh);
+        assert!(revoked.revoked_at.is_some());
+        assert!(store.revoke_standing_grant(&member.id, &active.id).unwrap().is_none());
     }
 
     /// The pre-existing single-operator flow keeps working end to end under

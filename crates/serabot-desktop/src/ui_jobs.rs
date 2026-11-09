@@ -39,13 +39,22 @@ fn state_mark(state: JobState) -> Element {
 
 /// One row of the panel.
 #[component]
-fn JobRow(item: JobItem) -> Element {
+fn JobRow(item: JobItem, session: Signal<Session>) -> Element {
+    let trace = item.trace_conversation.clone();
     rsx! {
         div { class: "{state_class(item.state)}", role: "listitem",
             span { class: "job-mark", {state_mark(item.state)} }
             span { class: "job-icon", Icon { name: item.icon().to_owned(), size: 13 } }
             span { class: "job-title", title: "{item.title}", "{item.title}" }
             span { class: "job-meta", "{item.bot} \u{b7} {item.state.label()}" }
+            if let Some(conversation) = trace {
+                button {
+                    class: "btn ghost sm job-trace",
+                    title: "Open chat for trace context",
+                    onclick: move |_| session.write().open_conversation(conversation.clone()),
+                    "Trace"
+                }
+            }
         }
     }
 }
@@ -62,6 +71,7 @@ pub fn JobsPanel(session: Signal<Session>) -> Element {
             &state.state.working,
             &state.state.activity,
             &state.conversation,
+            &state.state.jobs_reliability,
             Instant::now(),
         )
     };
@@ -79,7 +89,7 @@ pub fn JobsPanel(session: Signal<Session>) -> Element {
             }
             div { class: "jobs-list", role: "list", "aria-label": "Ongoing work",
                 for item in items {
-                    JobRow { key: "{item.id}", item }
+                    JobRow { key: "{item.id}", item, session }
                 }
             }
         }

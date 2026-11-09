@@ -100,6 +100,10 @@ pub struct State {
     pub working: crate::working::WorkingBots,
     pub approvals: Vec<Approval>,
     pub approvals_loaded: bool,
+    pub standing_grants: crate::standing_grants::StandingGrantsSnapshot,
+    pub standing_grants_loaded: bool,
+    pub jobs_reliability: crate::jobs_reliability::JobsReliabilitySnapshot,
+    pub jobs_reliability_loaded: bool,
     pub conversations: Vec<ConversationSummary>,
     pub conversations_loaded: bool,
     /// Archived threads, loaded only when the rail expands the group.
@@ -227,6 +231,10 @@ impl Default for State {
             working: Default::default(),
             approvals: Vec::new(),
             approvals_loaded: false,
+            standing_grants: crate::standing_grants::StandingGrantsSnapshot::default(),
+            standing_grants_loaded: false,
+            jobs_reliability: crate::jobs_reliability::JobsReliabilitySnapshot::default(),
+            jobs_reliability_loaded: false,
             conversations: Vec::new(),
             conversations_loaded: false,
             archived: Vec::new(),
@@ -486,6 +494,15 @@ impl State {
             Reply::Approvals(approvals) => {
                 self.approvals = approvals;
                 self.approvals_loaded = true;
+            }
+            Reply::StandingGrants(snapshot) => {
+                self.standing_grants = snapshot;
+                self.standing_grants_loaded = true;
+            }
+            Reply::StandingGrantRevoked => {}
+            Reply::JobsReliability(snapshot) => {
+                self.jobs_reliability = snapshot;
+                self.jobs_reliability_loaded = true;
             }
             Reply::Decided => {}
             Reply::CreatedBot(bot) => self.created_bot = Some(bot),

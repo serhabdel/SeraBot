@@ -18,6 +18,7 @@ mod logs_api;
 mod personal_api;
 mod preview_api;
 mod profiles_api;
+mod standing_grants_api;
 mod status_api;
 mod vault_http;
 mod wave_a_visibility_api;

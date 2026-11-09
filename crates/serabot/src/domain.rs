@@ -266,6 +266,19 @@ pub struct Approval {
     pub note: Option<String>,
 }
 
+/// One "always allow" decision the acting user may revoke.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StandingGrant {
+    pub id: Id,
+    pub tool: String,
+    pub canonical_hash: String,
+    pub destination: Option<String>,
+    pub policy_version: String,
+    pub approval_id: Id,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub id: i64,

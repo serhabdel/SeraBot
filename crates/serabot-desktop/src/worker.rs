@@ -31,6 +31,9 @@ pub enum OperationKind {
     Submit,
     Task,
     Approvals,
+    StandingGrants,
+    RevokeStandingGrant,
+    JobsReliability,
     Decide,
     CreateBot,
     CreateConversation,
@@ -148,6 +151,11 @@ pub enum Operation {
     },
     Task(String),
     Approvals,
+    StandingGrants,
+    RevokeStandingGrant {
+        id: String,
+    },
+    JobsReliability,
     Decide {
         id: String,
         decision: ApprovalDecision,
@@ -438,6 +446,9 @@ impl Operation {
             Self::UploadAttachment { .. } => OperationKind::Attach,
             Self::Task(_) => OperationKind::Task,
             Self::Approvals => OperationKind::Approvals,
+            Self::StandingGrants => OperationKind::StandingGrants,
+            Self::RevokeStandingGrant { .. } => OperationKind::RevokeStandingGrant,
+            Self::JobsReliability => OperationKind::JobsReliability,
             Self::Decide { .. } => OperationKind::Decide,
             Self::CreateBot { .. } => OperationKind::CreateBot,
             Self::CreateConversation { .. } => OperationKind::CreateConversation,
@@ -529,6 +540,9 @@ pub enum Reply {
     Selection(Selection),
     Task(Task),
     Approvals(Vec<Approval>),
+    StandingGrants(crate::standing_grants::StandingGrantsSnapshot),
+    StandingGrantRevoked,
+    JobsReliability(crate::jobs_reliability::JobsReliabilitySnapshot),
     Decided,
     CreatedBot(CreatedBot),
     CreatedConversation(CreatedConversation),
@@ -863,6 +877,11 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
             .map(Reply::Attached),
         Operation::Task(id) => client.task(id).map(Reply::Task),
         Operation::Approvals => client.approvals().map(Reply::Approvals),
+        Operation::StandingGrants => client.standing_grants().map(Reply::StandingGrants),
+        Operation::RevokeStandingGrant { id } => client
+            .revoke_standing_grant(&id)
+            .map(|()| Reply::StandingGrantRevoked),
+        Operation::JobsReliability => client.jobs_reliability().map(Reply::JobsReliability),
         Operation::Decide { id, decision } => client
             .decide_approval(id, *decision)
             .map(|_| Reply::Decided),

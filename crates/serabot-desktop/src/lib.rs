@@ -17,6 +17,8 @@ pub mod creds;
 pub mod events;
 pub mod file_icons;
 pub mod jobs;
+pub mod jobs_reliability;
+pub mod standing_grants;
 pub mod local_folders;
 pub mod local_fs;
 pub mod local_xfer;

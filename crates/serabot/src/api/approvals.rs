@@ -208,3 +208,73 @@ pub(super) async fn approve_artifact(
         "content_approved": true,
     })))
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StandingGrantsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+fn standing_grant_view(grant: &crate::domain::StandingGrant) -> Value {
+    json!({
+        "id": grant.id,
+        "tool": grant.tool,
+        "canonical_hash": grant.canonical_hash,
+        "destination": grant.destination,
+        "policy_version": grant.policy_version,
+        "approval_id": grant.approval_id,
+        "revoked_at": grant
+            .revoked_at
+            .as_ref()
+            .map(|at| crate::store::to_string(*at)),
+        "created_at": crate::store::to_string(grant.created_at),
+        "active": grant.revoked_at.is_none(),
+    })
+}
+
+/// `GET /v1/standing-grants`: hashes and destinations only — never canonical args.
+pub(super) async fn list_standing_grants(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Query(query): Query<StandingGrantsQuery>,
+) -> Result<Json<Value>> {
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let grants = state
+        .store
+        .list_standing_grants(&user.id, limit)?
+        .into_iter()
+        .map(|grant| standing_grant_view(&grant))
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "grants": grants, "limit": limit })))
+}
+
+/// `DELETE /v1/standing-grants/{id}`: revoke one grant for the acting user.
+pub(super) async fn revoke_standing_grant_endpoint(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    crate::util::validate_id(&id)?;
+    let (grant, revoked_now) = state
+        .store
+        .revoke_standing_grant(&user.id, &id)?
+        .ok_or_else(|| SeraError::NotFound("standing_grant".into()))?;
+    if revoked_now {
+        state.store.record_audit(
+            &user.id,
+            "standing_grant.revoked",
+            Some(&grant.tool),
+            None,
+            Some(&grant.approval_id),
+            None,
+            Some(&grant.policy_version),
+            Some(&json!({
+                "grant_id": grant.id,
+                "canonical_hash": grant.canonical_hash,
+                "destination": grant.destination,
+            })),
+        )?;
+    }
+    Ok(Json(json!({ "grant": standing_grant_view(&grant) })))
+}
