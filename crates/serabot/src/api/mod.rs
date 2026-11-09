@@ -67,17 +67,17 @@ mod memories;
 mod messages;
 mod monitoring;
 mod preview;
-mod routines;
-mod traces;
-mod workflows;
 mod profiles;
+mod routines;
 mod settings;
 mod skills;
 mod status;
 mod tasks;
 #[cfg(test)]
 mod tests;
+mod traces;
 mod vault;
+mod workflows;
 
 use accounts::*;
 use admin::*;
@@ -91,18 +91,18 @@ use conversations::*;
 use jobs::*;
 use logs::*;
 use media::*;
-use monitoring::*;
-use routines::*;
-use traces::*;
-use workflows::*;
 use memories::*;
 use messages::*;
+use monitoring::*;
 use preview::*;
+use routines::*;
 use settings::*;
 use skills::*;
 use status::*;
 use tasks::*;
+use traces::*;
 use vault::*;
+use workflows::*;
 
 #[derive(Clone)]
 pub struct ApiNotifier {

@@ -2427,7 +2427,8 @@ impl ApiClient {
         struct Body {
             task_id: String,
         }
-        let body: Body = self.request(Method::POST, &["v1", "monitoring", "run"], &[], None::<&()>)?;
+        let body: Body =
+            self.request(Method::POST, &["v1", "monitoring", "run"], &[], None::<&()>)?;
         Ok(body.task_id)
     }
 

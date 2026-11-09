@@ -27,9 +27,7 @@ pub fn merge_transcript(current: &[Message], incoming: Vec<Message>) -> Vec<Mess
             continue;
         }
         if let Some((idx, _cur)) = current.iter().enumerate().find(|(i, row)| {
-            row.id.starts_with("opt-")
-                && !used_opts.contains(i)
-                && pairs_optimistic(row, &inc)
+            row.id.starts_with("opt-") && !used_opts.contains(i) && pairs_optimistic(row, &inc)
         }) {
             used_opts.insert(idx);
             merged.push(inc);
