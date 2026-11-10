@@ -4248,6 +4248,40 @@ impl Store {
         Ok(())
     }
 
+    /// Enabled routines whose `next_run_at` is still in the past (Wave C4 scheduler lag).
+    pub fn count_scheduler_lag(&self, now: chrono::DateTime<chrono::Utc>) -> Result<(u64, u64)> {
+        let connection = self.connection()?;
+        let now_string = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let mut statement = connection
+            .prepare("SELECT next_run_at FROM routines WHERE enabled = 1 AND next_run_at <= ?1")?;
+        let rows = statement.query_map(params![now_string], |row| row.get::<_, String>(0))?;
+        let mut count = 0u64;
+        let mut max_lag = 0u64;
+        for next in rows {
+            let next = next?;
+            if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&next) {
+                let lag = now
+                    .signed_duration_since(parsed.with_timezone(&chrono::Utc))
+                    .num_seconds()
+                    .max(0) as u64;
+                count += 1;
+                max_lag = max_lag.max(lag);
+            }
+        }
+        Ok((count, max_lag))
+    }
+
+    /// Uncertain watcher tasks (scheduled work that ended without a known outcome).
+    pub fn count_uncertain_watcher_tasks(&self) -> Result<u64> {
+        let connection = self.connection()?;
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE uncertain = 1 AND bot = 'watcher'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
     /// Create a consistent SQLite backup without overwriting an existing file.
     pub fn backup_to(&self, destination: &Path) -> Result<()> {
         if destination.exists() {

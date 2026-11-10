@@ -136,8 +136,12 @@ pub(super) async fn admin_status(
         .parent()
         .map(std::path::Path::to_path_buf)
         .filter(|path| path.is_dir());
+    let now = Utc::now();
+    let reliability = crate::sysstatus::reliability_counts(&state.store, &state.config, now)
+        .map_err(|error| SeraError::Internal(format!("reliability counts failed: {error}")))?;
     let work = {
         let state = state.clone();
+        let reliability = serde_json::to_value(&reliability)?;
         move || -> Result<Value> {
             use crate::sysstatus::{Category, Rules};
             let mut users = crate::sysstatus::user_totals(&state.store)?;
@@ -179,6 +183,7 @@ pub(super) async fn admin_status(
             Ok(json!({
                 "ok": true,
                 "version": env!("CARGO_PKG_VERSION"),
+                "reliability": reliability,
                 "uptime_secs": state.sys_status.uptime_secs(),
                 "process": {
                     "memory_bytes": host.process_rss_bytes,
