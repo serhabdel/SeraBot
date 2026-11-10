@@ -43,6 +43,27 @@ Gate must be green before the smoke; record pass/fail, not screenshots of secret
 Demo script (spec two-week cut): routine countdown visible, one red source row,
 one active plan, vault Test OK, one browser tool in traces without secrets.
 
+### Agent automated pass (2026-11-10)
+
+Checked out `main` @ `112a6e06` (PR #50). Did **not** mark A8 complete; owner
+smoke + demo below still required.
+
+| Layer | Result |
+| --- | --- |
+| `cargo check --workspace --all-targets --locked` | **Pass** (Windows) |
+| `cargo test --workspace --locked` | **Pass** |
+| `serabot-desktop` build + `--version` | **Pass** (`0.31.0`) |
+| Wave A HTTP (`wave_a_visibility_api`, vault probe) | **Pass** |
+| E1/E2 API (`memory_settings_api`, usage quota fields) | **Pass** |
+| Desktop vault probe parsing (`serabot-desktop` tests) | **Pass** |
+| Live WebView2 smoke (steps 1–7) | **Blocked** — owner session (Microsoft
+  sign-in / Credential Manager token); no agent access to secrets; local
+  `:8787` not listening; production origin responds but needs auth. |
+
+**Extras (E1/E2, not in step table):** quota meter + Mem0 Settings UI verified
+in source (`ui_usage.rs`, `ui_settings_page.rs`); not exercised against a live
+server from this agent run.
+
 ---
 
 ## C6 — Wave C gate checklist (0.31.0)
