@@ -2394,10 +2394,10 @@ impl ApiClient {
         if name.is_empty() || name.len() > 128 {
             return Err(ApiError::Validation("Invalid routine name."));
         }
-        if let Some(time) = time {
-            if !Self::valid_routine_time(time) {
-                return Err(ApiError::Validation("Time must be HH:MM (24-hour)."));
-            }
+        if let Some(time) = time
+            && !Self::valid_routine_time(time)
+        {
+            return Err(ApiError::Validation("Time must be HH:MM (24-hour)."));
         }
         #[derive(Serialize)]
         struct Body<'a> {
@@ -2427,7 +2427,8 @@ impl ApiClient {
         struct Body {
             task_id: String,
         }
-        let body: Body = self.request(Method::POST, &["v1", "monitoring", "run"], &[], None::<&()>)?;
+        let body: Body =
+            self.request(Method::POST, &["v1", "monitoring", "run"], &[], None::<&()>)?;
         Ok(body.task_id)
     }
 
@@ -2804,12 +2805,7 @@ impl ApiClient {
 
     pub fn revoke_standing_grant(&self, id: &str) -> Result<(), ApiError> {
         check_id(id)?;
-        self.request::<(), ()>(
-            Method::DELETE,
-            &["v1", "standing-grants", id],
-            &[],
-            None,
-        )?;
+        self.request::<(), ()>(Method::DELETE, &["v1", "standing-grants", id], &[], None)?;
         Ok(())
     }
 

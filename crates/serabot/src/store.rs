@@ -38,8 +38,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::domain::{
-    Action, Approval, AuditEntry, Event, Id, LlmMessage, Role, StandingGrant, StoredMessage,
-    Task, Turn, new_id, utc_now,
+    Action, Approval, AuditEntry, Event, Id, LlmMessage, Role, StandingGrant, StoredMessage, Task,
+    Turn, new_id, utc_now,
 };
 use crate::error::{Result, SeraError};
 use crate::util::sha256_hex;
@@ -6964,7 +6964,12 @@ mod tests {
         let listed = store.list_standing_grants(&admin_id, 10).unwrap();
         assert_eq!(listed.len(), 1);
         assert!(listed[0].revoked_at.is_some());
-        assert!(store.list_standing_grants(&member.id, 10).unwrap().is_empty());
+        assert!(
+            store
+                .list_standing_grants(&member.id, 10)
+                .unwrap()
+                .is_empty()
+        );
         store
             .insert_grant(
                 &admin_id,
@@ -6987,7 +6992,12 @@ mod tests {
             .unwrap();
         assert!(fresh);
         assert!(revoked.revoked_at.is_some());
-        assert!(store.revoke_standing_grant(&member.id, &active.id).unwrap().is_none());
+        assert!(
+            store
+                .revoke_standing_grant(&member.id, &active.id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The pre-existing single-operator flow keeps working end to end under

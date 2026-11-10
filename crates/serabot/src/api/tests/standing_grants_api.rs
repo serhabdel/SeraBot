@@ -138,13 +138,14 @@ async fn standing_grants_are_scoped_and_revoke_audits() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(!read_json(response).await["grant"]["active"].as_bool().unwrap());
+    assert!(
+        !read_json(response).await["grant"]["active"]
+            .as_bool()
+            .unwrap()
+    );
 
     let audit = store.list_audit_for_user(&alice.id, 20).unwrap();
-    assert!(
-        audit.iter().any(|row| {
-            row.event == "standing_grant.revoked"
-                && row.tool.as_deref() == Some("synthetic_tool")
-        })
-    );
+    assert!(audit.iter().any(|row| {
+        row.event == "standing_grant.revoked" && row.tool.as_deref() == Some("synthetic_tool")
+    }));
 }

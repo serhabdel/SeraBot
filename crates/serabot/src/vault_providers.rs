@@ -630,10 +630,7 @@ pub async fn probe(
             ok: false,
             cli_found,
             configured,
-            message: format!(
-                "{} is disabled on this server",
-                provider.label()
-            ),
+            message: format!("{} is disabled on this server", provider.label()),
         });
     }
     if !configured {

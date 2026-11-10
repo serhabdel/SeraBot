@@ -221,10 +221,7 @@ async fn jobs_reliability_lists_uncertain_work_for_the_acting_user_only() {
     let uncertain = body["reliability"]["uncertain_tasks"].as_array().unwrap();
     assert_eq!(uncertain.len(), 1);
     assert_eq!(uncertain[0]["id"], task.id);
-    assert_eq!(
-        uncertain[0]["conversation_id"].as_str(),
-        Some("dir:main")
-    );
+    assert_eq!(uncertain[0]["conversation_id"].as_str(), Some("dir:main"));
     let unknown = body["reliability"]["unknown_actions"].as_array().unwrap();
     assert_eq!(unknown.len(), 1);
     assert_eq!(unknown[0]["conversation_id"].as_str(), Some("dir:main"));

@@ -120,11 +120,7 @@ fn list_active_tasks(
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-fn list_uncertain_tasks(
-    store: &Store,
-    user_id: &str,
-    limit: usize,
-) -> Result<Vec<Value>> {
+fn list_uncertain_tasks(store: &Store, user_id: &str, limit: usize) -> Result<Vec<Value>> {
     let connection = store.connection()?;
     let mut statement = connection.prepare(
         "SELECT id, kind, bot, payload_json, status, last_error, updated_at
@@ -151,11 +147,7 @@ fn list_uncertain_tasks(
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-fn list_outcome_unknown_actions(
-    store: &Store,
-    user_id: &str,
-    limit: usize,
-) -> Result<Vec<Value>> {
+fn list_outcome_unknown_actions(store: &Store, user_id: &str, limit: usize) -> Result<Vec<Value>> {
     let connection = store.connection()?;
     let mut statement = connection.prepare(
         "SELECT a.id, a.tool, a.task_id, a.turn_id, a.destination, a.canonical_hash, a.updated_at,

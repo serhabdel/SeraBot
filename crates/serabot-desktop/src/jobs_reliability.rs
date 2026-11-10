@@ -54,7 +54,10 @@ pub fn parse_jobs_reliability(body: &Value) -> Option<JobsReliabilitySnapshot> {
         traces_path: clean(reliability, "traces_path", 64),
         ..JobsReliabilitySnapshot::default()
     };
-    if let Some(rows) = reliability.get("uncertain_tasks").and_then(|v| v.as_array()) {
+    if let Some(rows) = reliability
+        .get("uncertain_tasks")
+        .and_then(|v| v.as_array())
+    {
         for row in rows.iter().take(MAX_ROWS) {
             let Some(id) = clean(row, "id", MAX_ID) else {
                 continue;
@@ -67,10 +70,12 @@ pub fn parse_jobs_reliability(body: &Value) -> Option<JobsReliabilitySnapshot> {
                 kind,
                 bot,
                 status,
-                last_error: row
-                    .get("last_error")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.chars().filter(|c| !c.is_control()).take(MAX_ERROR).collect()),
+                last_error: row.get("last_error").and_then(|v| v.as_str()).map(|s| {
+                    s.chars()
+                        .filter(|c| !c.is_control())
+                        .take(MAX_ERROR)
+                        .collect()
+                }),
                 conversation_id: clean(row, "conversation_id", MAX_CONVERSATION),
             });
         }
