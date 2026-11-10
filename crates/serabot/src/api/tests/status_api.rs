@@ -82,6 +82,14 @@ async fn status_reports_health_storage_and_members_without_content() {
     .await;
     assert_eq!(body["ok"], true);
     assert!(body["version"].as_str().is_some_and(|v| !v.is_empty()));
+    assert_eq!(
+        body["reliability"]["scheduler_lag_routines"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        body["reliability"]["routine_claim_failures"].as_u64(),
+        Some(0)
+    );
     assert!(body["uptime_secs"].as_u64().is_some());
     assert!(body["process"]["memory_bytes"].as_u64().unwrap() > 0);
     assert!(body["host"]["memory_total_bytes"].as_u64().unwrap() > 0);

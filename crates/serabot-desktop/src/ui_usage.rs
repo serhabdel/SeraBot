@@ -355,6 +355,38 @@ fn ServerHealthCard(session: Signal<Session>) -> Element {
                     p { class: "caption",
                         "Version {status.version} · running for {format_uptime(status.uptime_secs)} · {status.host.cpu_cores} processor cores"
                     }
+                    h4 { class: "health-heading", "Reliability" }
+                    div { class: "health-summary",
+                        HealthItem {
+                            label: "Scheduler lag",
+                            value: format!(
+                                "{} routine{}",
+                                status.reliability.scheduler_lag_routines,
+                                if status.reliability.scheduler_lag_routines == 1 { "" } else { "s" }
+                            ),
+                            note: if status.reliability.scheduler_lag_max_secs > 0 {
+                                Some(format!(
+                                    "Longest overdue: {}s",
+                                    status.reliability.scheduler_lag_max_secs
+                                ))
+                            } else {
+                                None
+                            },
+                            bar: None,
+                        }
+                        HealthItem {
+                            label: "Watcher uncertainty",
+                            value: status.reliability.routine_claim_failures.to_string(),
+                            note: Some("Uncertain scheduled tasks".into()),
+                            bar: None,
+                        }
+                        HealthItem {
+                            label: "Stale sources",
+                            value: status.reliability.source_staleness.to_string(),
+                            note: Some("Enabled sources past failure threshold".into()),
+                            bar: None,
+                        }
+                    }
                     h4 { class: "health-heading", "Memory and processor" }
                     div { class: "health-split",
                         HealthItem {

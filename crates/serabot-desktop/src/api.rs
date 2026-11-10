@@ -1056,11 +1056,26 @@ pub struct HealthUser {
     pub file_bytes: u64,
 }
 
+/// Reliability counts from `GET /v1/admin/status` (Wave C4).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct ReliabilityCounts {
+    #[serde(default)]
+    pub scheduler_lag_routines: u64,
+    #[serde(default)]
+    pub scheduler_lag_max_secs: u64,
+    #[serde(default)]
+    pub routine_claim_failures: u64,
+    #[serde(default)]
+    pub source_staleness: u64,
+}
+
 /// `GET /v1/admin/status` (admin only): server health at a glance.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 pub struct ServerHealth {
     #[serde(default)]
     pub version: String,
+    #[serde(default)]
+    pub reliability: ReliabilityCounts,
     #[serde(default)]
     pub uptime_secs: u64,
     #[serde(default)]

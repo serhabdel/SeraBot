@@ -22,7 +22,9 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sysinfo::{Disks, MINIMUM_CPU_UPDATE_INTERVAL, Pid, ProcessesToUpdate, System};
 
+use crate::config::Config;
 use crate::error::Result;
+use crate::sources::effective_sources_for_user;
 use crate::store::Store;
 
 /// How long a storage scan is reused.
@@ -304,6 +306,48 @@ pub fn disk_for(path: &Path) -> Option<DiskInfo> {
                 free_bytes: free,
             }
         })
+}
+
+/// Aggregate operator reliability metrics (Wave C4, counts only).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReliabilityCounts {
+    pub scheduler_lag_routines: u64,
+    pub scheduler_lag_max_secs: u64,
+    /// Uncertain scheduled (`watcher`) tasks across all users.
+    pub routine_claim_failures: u64,
+    /// Enabled sources whose latest run failed before the reliability cutoff.
+    pub source_staleness: u64,
+}
+
+/// Admin-only counts for scheduler lag, watcher uncertainty, and source staleness.
+pub fn reliability_counts(
+    store: &Store,
+    config: &Config,
+    now: DateTime<Utc>,
+) -> Result<ReliabilityCounts> {
+    let (scheduler_lag_routines, scheduler_lag_max_secs) = store.count_scheduler_lag(now)?;
+    let routine_claim_failures = store.count_uncertain_watcher_tasks()?;
+    let hours = config.watcher.reliability_failed_hours.max(1);
+    let cutoff = now - chrono::Duration::hours(hours as i64);
+    let mut source_staleness = 0u64;
+    for user_id in store.list_active_user_ids()? {
+        let sources = match effective_sources_for_user(config, store, &user_id) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        for source in sources.iter().filter(|s| s.enabled) {
+            let name = source.name.clone();
+            if store.user_has_stale_failed_sources(&user_id, &[name], cutoff)? {
+                source_staleness += 1;
+            }
+        }
+    }
+    Ok(ReliabilityCounts {
+        scheduler_lag_routines,
+        scheduler_lag_max_secs,
+        routine_claim_failures,
+        source_staleness,
+    })
 }
 
 struct Sampler {
