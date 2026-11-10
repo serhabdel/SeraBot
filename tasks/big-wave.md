@@ -9,86 +9,73 @@ owner's OK**.
 
 ## Post-merge tracker (2026-11-10)
 
-- **Wave A shipped** — [PR #37](https://github.com/serhabdel/SeraBot/pull/37)
-  (`a8157b4` on `main`).
-- **Wave B shipped to `main`** — integration [PR #39](https://github.com/serhabdel/SeraBot/pull/39)
-  (`d5b52f7`), B5/B6 [PR #40](https://github.com/serhabdel/SeraBot/pull/40)
-  (`a1c3d8a`), B3/B4 [PR #41](https://github.com/serhabdel/SeraBot/pull/41)
-  (`6cef441`). `main` @ `d62e869` after chat merge.
-- **Wave C C1** — [PR #38](https://github.com/serhabdel/SeraBot/pull/38)
-  (`b9c4135`).
-- **Chat deepen (0.29)** — [PR #42](https://github.com/serhabdel/SeraBot/pull/42)
-  (`d62e869`).
-- **In flight** — `release/0.30.0` (B7 gate + version bump);
-  `feat/wave-c3-presets` (C3 prompt blocks).
+- **`main` tip** — `b7e2c2e` after [PR #45](https://github.com/serhabdel/SeraBot/pull/45)
+  (C2 vault accounts), [PR #44](https://github.com/serhabdel/SeraBot/pull/44)
+  (C3 presets), [PR #43](https://github.com/serhabdel/SeraBot/pull/43) (0.30.0).
+- **Wave A** — [PR #37](https://github.com/serhabdel/SeraBot/pull/37) (0.29.0).
+- **Wave B** — [PR #39](https://github.com/serhabdel/SeraBot/pull/39),
+  [PR #40](https://github.com/serhabdel/SeraBot/pull/40),
+  [PR #41](https://github.com/serhabdel/SeraBot/pull/41); 0.30.0 via #43.
+- **Wave C** — C1 [PR #38](https://github.com/serhabdel/SeraBot/pull/38);
+  C2 #45; C3 #44; C4 [PR #46](https://github.com/serhabdel/SeraBot/pull/46) open.
+- **Chat deepen** — [PR #42](https://github.com/serhabdel/SeraBot/pull/42).
 
-## Active workstreams (in progress)
+---
 
-- [x] **Wave A backend APIs** — A1–A3, A5–A7.
-- [x] **Desktop Workflows tab** — A4.
-- [~] **Chat UX polish** — PR #42: stable streaming merge, 60fps SSE pacing,
-      composer focus/draft isolation, caret bridge (`ui_files.rs`). Remaining:
-      optional smooth autoscroll / spring micro-motion (non-blocking).
+## A8 — Desktop smoke checklist (owner)
+
+Run against a local or staging server with two test accounts (admin + member).
+Gate must be green before the smoke; record pass/fail, not screenshots of secrets.
+
+| Step | Action | Pass criteria |
+| --- | --- | --- |
+| 1 | Admin → **Workflows** tab, **Refresh** | Routines countdown, source health rows, and active plans load without opening chat. |
+| 2 | Admin → **Jobs** | Uncertain / outcome-unknown rows appear when present; trace link opens **Logs** or traces path. |
+| 3 | Admin → **Logs** | Search `q=tool=` shows a redacted `tool.completed` line (no canonical secret args). |
+| 4 | Admin → **Vault** | **Test** on a provider returns `{ok, cli_found, configured, message}` only; missing CLI fails gracefully. |
+| 5 | Admin → **Usage** | Server health card loads (uptime, memory, storage categories); counts only, no member message text. |
+| 6 | Member → **Workflows** | Member sees **only** their routines/sources/plans; admin rows are not visible. |
+| 7 | Member → **Usage** | No server health card (403 backstop if forced via API). |
+
+Demo script (spec two-week cut): routine countdown visible, one red source row,
+one active plan, vault Test OK, one browser tool in traces without secrets.
 
 ---
 
 ## Wave A — See the machine (0.29.0)
 
-### Server (`crates/serabot`)
-
-- [x] **A1**–**A3**, **A5**–**A7** (see spec).
-
-### Desktop (`crates/serabot-desktop`)
-
-- [x] **A4** Workflows tab.
-
-### Wave A gate
-
-- [x] **Shipped** — PR #37 merged to `main` (0.29.0 Wave A).
-- [ ] **A8** Phase gate: desktop smoke (Workflows tab, one trace, vault test);
-      owner demo script. Automated gate green on `main` @ `d62e869` (2026-11-10).
+- [x] **A1**–**A7**, **A4** desktop Workflows tab — PR #37.
+- [ ] **A8** Phase gate — automated gate green on `main`; desktop smoke table
+      above + owner demo still outstanding.
 
 ---
 
 ## Wave B — Reliable circle (0.30.0)
 
-- [x] **B1** Per-user routine CRUD — PR #39.
-- [x] **B2** Merge watch into routines UX — PR #39.
-- [x] **B3** Per-user source overlay (v1) — PR #41.
-- [x] **B4** Reliability enqueue rules — PR #41.
-- [x] **B5** Standing grants API + UI — PR #40.
-- [x] **B6** Jobs panel stuck/unknown — PR #40.
-
-### Wave B gate
-
-- [~] **B7** Phase gate — Windows `cargo test --workspace --locked` green
-      2026-11-10 on `release/0.30.0` worktree; release branch + `0.30.0` version
-      bump next; isolation + URL policy review for B3 done in PR #41 tests.
+- [x] **B1**–**B6** — PRs #39–#41.
+- [x] **B7** — 0.30.0 release merged (#43).
 
 ---
 
 ## Wave C — Deep ops (0.31.0)
 
 - [x] **C1** Browser console upgrades — PR #38.
-- [ ] **C2** Vault accounts view — local + external refs + cards; domain filter;
-      last used from audit.
-- [ ] **C3** Autonomy presets — watcher/analyst prompt blocks reference
-      Workflows + `watch_now` + `plan_update`; no new tools (`feat/wave-c3-presets`).
-- [ ] **C4** Admin reliability dashboard — scheduler lag, claim failures,
-      source staleness (counts only).
+- [x] **C2** Vault accounts view — PR #45.
+- [x] **C3** Autonomy presets — PR #44.
+- [ ] **C4** Admin reliability dashboard — PR #46 (scheduler/source counts on
+      Usage server card).
 - [ ] **C5** Flutter Workflows + traces — read-only parity with desktop.
-
-### Wave C gate
-
-- [ ] C6 Phase gate + commit + push; `flutter analyze` / `flutter test` if C5 touched.
+- [ ] **C6** Phase gate; `flutter analyze` / `flutter test` when C5 lands.
 
 ---
 
 ## Cross-wave extras (from spec theme 6)
 
-- [ ] **E1** Quota near-limit surfacing in console (usage API exists).
-- [ ] **E2** Mem0 provider — document + optional console toggle if enabled in config.
-- [ ] **E3** Update `docs/README.md` index row for Big Wave spec when Wave A ships.
+- [ ] **E1** Quota near-limit surfacing in console — `GET /v1/usage` exists;
+      UI tile still TODO (near-limit thresholds in config / store quotas).
+- [ ] **E2** Mem0 provider — documented in `docs/memory.md`; optional Settings
+      toggle when `[memory] provider = "mem0"` still TODO.
+- [x] **E3** `docs/README.md` index row for Big Wave spec (this pass).
 
 ---
 
