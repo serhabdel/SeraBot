@@ -24,8 +24,13 @@ Spec: `docs/specs/big-wave.md`. Checklist: `tasks/big-wave.md`.
   compile check on every PR and `main` push — see `docs/ci-and-secrets.md` and
   `docs/mobile-client.md`.
 
-## Still open (not in 0.31.0)
+## Shipped after 0.31.0 tag (on `main`)
 
-- **A8** — Owner desktop smoke checklist in `tasks/big-wave.md`.
-- **E1** — Quota near-limit surfacing in console.
-- **E2** — Mem0 provider console toggle when enabled in config.
+- **E1** / **E2** — Quota meter and Mem0 Settings console
+  ([PR #50](https://github.com/serhabdel/SeraBot/pull/50)).
+
+## Still open
+
+- **A8** — Owner desktop smoke checklist in `tasks/big-wave.md` (agent automated
+  pass recorded in [PR #51](https://github.com/serhabdel/SeraBot/pull/51); live
+  WebView2 smoke blocked on owner OIDC).
