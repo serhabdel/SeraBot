@@ -184,6 +184,8 @@ pub struct State {
     /// The owner's per-turn work limits (0.24), once read or saved.
     pub turn_limits: Option<crate::api::TurnLimitsView>,
     pub turn_limits_error: Option<String>,
+    pub memory_settings: Option<crate::api::MemorySettingsView>,
+    pub memory_settings_error: Option<String>,
     /// Goal and todo list of the open conversation, conversation-scoped.
     pub plan: Option<crate::chat_plan::ChatPlan>,
     /// The owner's auto-approve switch for the open conversation. Defaults
@@ -296,6 +298,8 @@ impl Default for State {
             media_previews: crate::media_view::PreviewCache::default(),
             turn_limits: None,
             turn_limits_error: None,
+            memory_settings: None,
+            memory_settings_error: None,
             plan: None,
             auto_approve: false,
             transcript: None,
@@ -697,6 +701,16 @@ impl State {
             Reply::TurnLimits(view) => {
                 self.turn_limits = Some(view);
                 self.turn_limits_error = None;
+            }
+            Reply::MemorySettings(view) => {
+                self.memory_settings = Some(view);
+                self.memory_settings_error = None;
+            }
+            Reply::Mem0KeySaved | Reply::Mem0KeyDeleted => {
+                if let Some(settings) = self.memory_settings.as_mut() {
+                    settings.mem0.configured = matches!(reply, Reply::Mem0KeySaved);
+                }
+                self.memory_settings_error = None;
             }
             Reply::ChatPlan { plan, auto_approve } => {
                 self.plan = plan;

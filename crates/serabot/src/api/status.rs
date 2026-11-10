@@ -80,6 +80,9 @@ pub(super) async fn usage(
         query.bot.as_deref(),
         query.conversation_id.as_deref(),
     )?;
+    let limit = state.config.users.tasks_per_user_per_day;
+    let used = state.store.daily_task_count(&user.id)?;
+    let threshold = limit.saturating_mul(80).saturating_div(100);
     let body = json!({
         "totals": rollup.totals,
         "per_day": rollup.per_day,
@@ -87,6 +90,14 @@ pub(super) async fn usage(
         "per_model": rollup.per_model,
         "tools": rollup.tools,
         "scope": if all_users { "all" } else { "me" },
+        "quota": {
+            "daily_tasks": {
+                "used": used,
+                "limit": limit,
+                "near_limit": used >= i64::try_from(threshold).unwrap_or(i64::MAX),
+                "at_limit": used >= i64::try_from(limit).unwrap_or(i64::MAX),
+            }
+        },
     });
     // Same egress scan as the model catalog endpoints.
     state

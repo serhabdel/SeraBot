@@ -71,6 +71,8 @@ pub enum OperationKind {
     TurnLimits,
     /// Save or reset the owner's per-turn work limits.
     TurnLimitsWrite,
+    /// Mem0 console settings (read or write the per-user key).
+    MemorySettingsWrite,
     Transcribe,
     AdminWrite,
     /// Save the account's own key for a provider.
@@ -297,6 +299,14 @@ pub enum Operation {
     },
     /// `DELETE /v1/settings/turn-limits`: back to the config defaults.
     ResetTurnLimits,
+    /// `GET /v1/memory/settings`.
+    MemorySettings,
+    /// `PUT /v1/memory/mem0/key`.
+    SetMem0Key {
+        key: Zeroizing<String>,
+    },
+    /// `DELETE /v1/memory/mem0/key`.
+    DeleteMem0Key,
     TranscribeAudio {
         filename: String,
         bytes: Vec<u8>,
@@ -492,6 +502,8 @@ impl Operation {
             Self::DocPreview { .. } => OperationKind::DocPreview,
             Self::TurnLimits => OperationKind::TurnLimits,
             Self::SaveTurnLimits { .. } | Self::ResetTurnLimits => OperationKind::TurnLimitsWrite,
+            Self::MemorySettings => OperationKind::MemorySettingsWrite,
+            Self::SetMem0Key { .. } | Self::DeleteMem0Key => OperationKind::MemorySettingsWrite,
             Self::TranscribeAudio { .. } => OperationKind::Transcribe,
             Self::AdminSaveProvider(_)
             | Self::AdminRemoveProvider(_)
@@ -604,6 +616,9 @@ pub enum Reply {
     },
     /// The owner's turn limits, after a read, a save or a reset.
     TurnLimits(crate::api::TurnLimitsView),
+    MemorySettings(crate::api::MemorySettingsView),
+    Mem0KeySaved,
+    Mem0KeyDeleted,
     /// A media file as a data URL, ready for an inline player.
     Preview {
         hash: String,
@@ -1064,6 +1079,11 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
             .set_turn_limits(*calls, *rounds)
             .map(Reply::TurnLimits),
         Operation::ResetTurnLimits => client.reset_turn_limits().map(Reply::TurnLimits),
+        Operation::MemorySettings => client.memory_settings().map(Reply::MemorySettings),
+        Operation::SetMem0Key { key } => client
+            .set_mem0_key(&key)
+            .map(|_| Reply::Mem0KeySaved),
+        Operation::DeleteMem0Key => client.delete_mem0_key().map(|_| Reply::Mem0KeyDeleted),
         Operation::TranscribeAudio { filename, bytes } => client
             .transcribe_audio(filename, bytes)
             .map(Reply::Transcribed),
