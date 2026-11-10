@@ -25,6 +25,7 @@ artifacts.
 | [Knowledge packs](knowledge-packs.md) | Import the owner's own accounting guides into the comptable bot's document inbox. |
 | [Multi-user spec](specs/multi-user-reconstruction.md) | Owner-approved and implemented: small-circle multi-user — OIDC sign-in, UID-scoped data, per-user bots, credentials, and connectors. |
 | [Big Wave (0.29–0.31)](specs/big-wave.md) | Visibility, reliability, and deep ops waves — Workflows, traces, per-user schedules, vault/browser polish; checklist in `tasks/big-wave.md`. |
+| [Release 0.31.0](release-0.31.0.md) | Wave C gate: browser/vault polish, admin reliability counts, Flutter Workflows/traces. |
 
 ## Bot roster
 

@@ -8,7 +8,7 @@ verification path.
 
 | Trigger | Workflow | Output |
 | --- | --- | --- |
-| Push to `main`, pull request, manual dispatch | `clients.yml` | `flutter analyze`, `flutter test`, then a debug APK uploaded as the artifact `serabot-mobile-debug-<sha>` (14 days) |
+| Push to `main`, pull request, manual dispatch | `clients.yml` | `flutter analyze`, `flutter test`, debug APK artifact, plus a **release-mode APK compile check** (not published) so Wave C5+ UI regressions fail on PRs |
 | Tag push (`v*`) or `release.yml` dispatch with a `tag` input | `release.yml` | Versioned and `latest` APK/AAB release assets |
 
 Local Dart checks are optional and need no Android SDK:

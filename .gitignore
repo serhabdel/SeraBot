@@ -8,6 +8,7 @@ config/sources.toml
 models/
 data/
 target/
+target-*/
 target-linux2404/
 .cargo2404/
 dist/
