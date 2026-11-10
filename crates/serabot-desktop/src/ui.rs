@@ -16,7 +16,7 @@ use serabot_desktop::{
     chat_cards::{self, CardState, CardView},
     chat_compose, chat_feed, chat_scroll, file_icons, provider_presets, provider_view,
     session::{Section, Session, SettingsSection, SignInPhase, Theme, humanize_label},
-    teams, ui_highlight,
+    teams, ui_highlight, ui_tick,
     working::BotActivity,
 };
 use std::cell::RefCell;
@@ -632,17 +632,15 @@ fn App() -> Element {
     let mut session = use_signal(Session::new);
     let mut revision = use_signal(|| 0u64);
     use_coroutine(move |_: UnboundedReceiver<()>| async move {
-        const POLL_MS: u64 = 10;
-        const IDLE_POLLS: u32 = 12;
-        const FRAME_MS: u64 = 16;
         loop {
             #[cfg(windows)]
             {
                 let wake = session.read().ui_wake.clone();
                 let mut saw_wake = wake.swap(false, std::sync::atomic::Ordering::AcqRel);
                 if !saw_wake {
-                    for _ in 0..IDLE_POLLS {
-                        tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
+                    for _ in 0..ui_tick::UI_IDLE_POLLS {
+                        tokio::time::sleep(std::time::Duration::from_millis(ui_tick::UI_POLL_MS))
+                            .await;
                         if wake.swap(false, std::sync::atomic::Ordering::AcqRel) {
                             saw_wake = true;
                             break;
@@ -657,7 +655,8 @@ fn App() -> Element {
                 }
                 // SSE wakes skip the idle wait; pace at ~60fps so we do not spin.
                 if saw_wake {
-                    tokio::time::sleep(std::time::Duration::from_millis(FRAME_MS)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(ui_tick::UI_SSE_FRAME_MS))
+                        .await;
                 }
             }
             #[cfg(not(windows))]
@@ -3250,7 +3249,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     });
     use_effect(move || {
         let external = session.read().composer.clone();
-        if !composer_focused() || external.is_empty() {
+        if chat_compose::sync_composer_from_session(composer_focused(), external.is_empty()) {
             composer_draft.set(external);
         }
     });
@@ -3314,7 +3313,6 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             .last()
             .map(|step| (step.call_id.clone(), step.label.len()));
         let previous = *last_count.peek();
-        let jump = own_send || previous == 0;
         if count != previous {
             if count > previous && !*at_bottom.peek() && !own_send {
                 let added = *unseen.peek() + (count - previous);
@@ -3327,8 +3325,13 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             unseen.set(0);
         }
         let streaming_growth = tail.is_some() || activity_steps > 0;
-        let force_pin = jump || own_send || (*at_bottom.peek() && streaming_growth);
-        if force_pin || count != previous || streaming_growth {
+        if let Some(force_pin) = chat_scroll::transcript_pin_action(
+            previous,
+            count,
+            own_send,
+            *at_bottom.peek(),
+            streaming_growth,
+        ) {
             let _ = dioxus::document::eval(&chat_scroll::pin_messages_js(force_pin));
         }
         let _ = (tail, activity_tail);

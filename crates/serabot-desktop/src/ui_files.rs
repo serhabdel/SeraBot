@@ -517,6 +517,20 @@ mod tests {
     }
 
     #[test]
+    fn composer_caret_setup_installs_once_and_tracks_selection() {
+        assert!(COMPOSER_CARET_SETUP_JS.contains("window.__serabotComposerCaret"));
+        assert!(COMPOSER_CARET_SETUP_JS.contains("selectionchange"));
+        assert!(COMPOSER_CARET_SETUP_JS.contains("__serabotComposerSel"));
+    }
+
+    #[test]
+    fn composer_caret_bridge_restores_only_when_focused() {
+        assert!(COMPOSER_CARET_BRIDGE_JS.contains("document.activeElement"));
+        assert!(COMPOSER_CARET_BRIDGE_JS.contains("setSelectionRange"));
+        assert!(COMPOSER_CARET_BRIDGE_JS.contains("requestAnimationFrame"));
+    }
+
+    #[test]
     fn pasted_payloads_decode_and_bad_base64_is_empty() {
         let (name, bytes) = decode_pasted(PastedFile {
             name: "shot.png".into(),

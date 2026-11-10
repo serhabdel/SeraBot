@@ -38,6 +38,7 @@ pub mod state;
 pub mod status_view;
 pub mod teams;
 pub mod ui_highlight;
+pub mod ui_tick;
 pub mod updater;
 pub mod vault_import;
 pub mod worker;
