@@ -85,7 +85,7 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap();
-        Config::load(root).unwrap()
+        Config::load(root.join("serabot.toml")).unwrap()
     }
 
     #[test]

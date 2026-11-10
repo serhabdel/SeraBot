@@ -235,7 +235,7 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap();
-        let config = Config::load(root).unwrap();
+        let config = Config::load(root.join("serabot.toml")).unwrap();
         assert!(validate_member_rss_url(&config, "https://evil.example/feed").is_err());
     }
 }
