@@ -7,6 +7,24 @@ Spec: `docs/specs/big-wave.md` (owner-approved 2026-11-09). Prior release:
 before each wave commit. Push after each wave gate; **never merge without the
 owner's OK**.
 
+## Post-merge tracker (2026-11-09)
+
+- **Wave A shipped** — merged to `main` via [PR #37](https://github.com/serhabdel/SeraBot/pull/37)
+  (`origin/main` @ `a8157b4`, includes release tip `3208a1a`).
+- **Wave B integration branch** — `recover/wave-b-wip` rebased onto post-0.29
+  `origin/main` (`a8157b42`); B1/B2 integration rebased @ `41c198d` (remote tip
+  advancing, draft PR #39). Clippy hygiene on recover tracked locally.
+- **Wave B slices** — `feat/big-wave-b3b4` @ `be67c20` (rebased on `8e33d66`,
+  one commit behind `fb0ca48` — rebase onto `origin/recover/wave-b-wip` before
+  merge); `feat/big-wave-b5-b6` @ `726c711` (same); local only until gated.
+- **Wave C draft** — `feat/big-wave-c1` rebased onto `main` @ `7f1a1c4`
+  (PR #38 was **closed** on GitHub; reopen or open a new PR when ready).
+- **Worktree hygiene** — `H:/source/SeraBot-wt/big-wave-c1` still has an
+  in-progress `git rebase` + dirty tree from parallel agents; use
+  `H:/source/SeraBot-wt/rebase-c1-tmp` as the canonical rebased C1 checkout
+  until that worktree is reset (`git rebase --abort` then `git reset --hard
+  origin/feat/big-wave-c1`).
+
 ## Active workstreams (in progress)
 
 These run in parallel for **0.29 / Wave A** visibility:
@@ -59,6 +77,7 @@ vault probe.
 
 ### Wave A gate
 
+- [x] **Shipped** — PR #37 merged to `main` (0.29.0 Wave A).
 - [ ] A8 Phase gate: full workspace check + test green; desktop smoke (Workflows
       tab, one trace, vault test); owner demo script from spec two-week cut.
       - Automated gate: `cargo-win check` + `test --workspace --locked` green
@@ -67,6 +86,8 @@ vault probe.
 ---
 
 ## Wave B — Reliable circle (0.30.0)
+
+_Base: `recover/wave-b-wip` @ `fb0ca48` (rebased 2026-11-09)._
 
 - [ ] **B1** Per-user routine CRUD — enable/disable/schedule for self; enqueue
       to member default conversation (not hardcoded `"owner"`).
@@ -91,7 +112,7 @@ vault probe.
 ## Wave C — Deep ops (0.31.0)
 
 - [ ] **C1** Browser console upgrades — profile picker, last host, idle TTL,
-      sign-in helper status.
+      sign-in helper status (`feat/big-wave-c1` @ `03bb523`, rebased on main).
 - [ ] **C2** Vault accounts view — local + external refs + cards; domain filter;
       last used from audit.
 - [ ] **C3** Autonomy presets — watcher/analyst prompt blocks reference

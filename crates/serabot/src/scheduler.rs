@@ -41,6 +41,19 @@ pub struct DueRoutine {
     pub config: Value,
 }
 
+/// Enable or disable the acting user's routine without changing its schedule.
+pub fn set_routine_enabled(store: &Store, user_id: &str, name: &str, enabled: bool) -> Result<()> {
+    let connection = store.connection()?;
+    let changed = connection.execute(
+        "UPDATE routines SET enabled = ?1, updated_at = ?2 WHERE name = ?3 AND user_id = ?4",
+        params![enabled as i64, utc_string(Utc::now()), name, user_id],
+    )?;
+    if changed == 0 {
+        return Err(SeraError::NotFound(format!("routine {name}")));
+    }
+    Ok(())
+}
+
 /// Create or update the acting user's daily routine without losing its run
 /// history.
 ///
@@ -127,7 +140,16 @@ pub fn ensure_daily_routine(
 /// for its date yet. Claiming is atomic per routine and cross-user by design:
 /// the scheduler service is shared, and every claimed occurrence carries its
 /// owning user so the enqueued task runs under it.
-pub fn due_routines(store: &Store, now: DateTime<Utc>, tz: Tz) -> Result<Vec<DueRoutine>> {
+fn routine_timezone(config: &Value, fallback: Tz) -> Tz {
+    config
+        .get("timezone")
+        .or_else(|| config.get("tz"))
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(fallback)
+}
+
+pub fn due_routines(store: &Store, now: DateTime<Utc>, fallback_tz: Tz) -> Result<Vec<DueRoutine>> {
     let connection = store.connection()?;
     let routines: Vec<(String, String, String, String)> = {
         let mut statement = connection.prepare(
@@ -162,6 +184,7 @@ pub fn due_routines(store: &Store, now: DateTime<Utc>, tz: Tz) -> Result<Vec<Due
         else {
             continue;
         };
+        let tz = routine_timezone(&config, fallback_tz);
         let Some((_occurrence, local_date)) = latest_occurrence(now, time, tz) else {
             continue;
         };
@@ -283,7 +306,14 @@ mod tests {
     use super::*;
 
     fn store() -> Store {
-        Store::open_in_memory(384).unwrap()
+        // File-backed pool (max 8) avoids r2d2 exhaustion in `due_routines`, which
+        // holds one connection for the whole claim loop while helpers may need another.
+        Store::open(
+            std::env::temp_dir().join(format!("serabot-scheduler-test-{}.db", new_id())),
+            384,
+            5000,
+        )
+        .unwrap()
     }
 
     /// The acting user for the scheduled routines.
@@ -295,11 +325,13 @@ mod tests {
         "Europe/Rome".parse().unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_routine(
         store: &Store,
         user_id: &str,
         name: &str,
         time: &str,
+        timezone: &str,
         enabled: bool,
         next_run_at: DateTime<Utc>,
         last_run_for: Option<&str>,
@@ -317,7 +349,7 @@ mod tests {
                     enabled as i64,
                     utc_string(next_run_at),
                     last_run_for,
-                    json!({"time": time, "timezone": "Europe/Rome"}).to_string(),
+                    json!({"time": time, "timezone": timezone}).to_string(),
                     utc_string(Utc::now()),
                     user_id
                 ],
@@ -364,6 +396,7 @@ mod tests {
             &admin(&store),
             "daily",
             "08:00",
+            "Europe/Rome",
             true,
             Utc.with_ymd_and_hms(2026, 10, 1, 6, 0, 0).unwrap(),
             None,
@@ -386,6 +419,7 @@ mod tests {
             &admin(&store),
             "daily",
             "08:00",
+            "Europe/Rome",
             true,
             Utc.with_ymd_and_hms(2026, 10, 20, 6, 0, 0).unwrap(),
             Some("2026-10-20"),
@@ -406,6 +440,7 @@ mod tests {
             &admin(&store),
             "disabled",
             "08:00",
+            "Europe/Rome",
             false,
             Utc.with_ymd_and_hms(2026, 10, 1, 6, 0, 0).unwrap(),
             None,
@@ -424,6 +459,7 @@ mod tests {
             &admin(&store),
             "dst",
             "02:30",
+            "Europe/Rome",
             true,
             Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap(),
             None,
@@ -441,6 +477,28 @@ mod tests {
     }
 
     #[test]
+    fn due_routines_honour_each_rows_timezone() {
+        let store = store();
+        let admin = admin(&store);
+        let now = Utc.with_ymd_and_hms(2026, 10, 28, 12, 0, 0).unwrap();
+        insert_routine(
+            &store,
+            &admin,
+            "tokyo_brief",
+            "09:00",
+            "Asia/Tokyo",
+            true,
+            Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap(),
+            None,
+        );
+        let due = due_routines(&store, now, rome()).unwrap();
+        assert!(
+            due.iter().any(|routine| routine.name == "tokyo_brief"),
+            "tokyo-local 09:00 should be due when fallback is Rome"
+        );
+    }
+
+    #[test]
     fn fall_back_chooses_earliest_ambiguous_occurrence() {
         let store = store();
         // 2026-10-25 02:30 occurs twice in Rome. 00:45 UTC is 02:45 CEST,
@@ -452,6 +510,7 @@ mod tests {
             &admin(&store),
             "dst",
             "02:30",
+            "Europe/Rome",
             true,
             Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap(),
             None,
@@ -484,6 +543,7 @@ mod tests {
             &admin,
             "morning_brief",
             "08:00",
+            "Europe/Rome",
             true,
             Utc.with_ymd_and_hms(2026, 10, 1, 6, 0, 0).unwrap(),
             None,
@@ -493,6 +553,7 @@ mod tests {
             &member.id,
             "morning_brief",
             "08:00",
+            "Europe/Rome",
             true,
             Utc.with_ymd_and_hms(2026, 10, 1, 6, 0, 0).unwrap(),
             None,

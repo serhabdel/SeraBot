@@ -1278,6 +1278,35 @@ impl Session {
         self.start_request(Operation::Workflows);
     }
 
+    /// Update one scheduled routine (0.30.0 Wave B1).
+    pub fn save_workflow_routine(
+        &mut self,
+        name: String,
+        enabled: Option<bool>,
+        time: Option<String>,
+        timezone: Option<String>,
+    ) {
+        if !self.state.connected || self.pending.is_some() {
+            return;
+        }
+        self.state.workflows_error = None;
+        self.start_request(Operation::SaveRoutine {
+            name,
+            enabled,
+            time,
+            timezone,
+        });
+    }
+
+    /// Enqueue a manual watch run (0.30.0 Wave B2).
+    pub fn run_all_watch_sources(&mut self) {
+        if !self.state.connected || self.pending.is_some() {
+            return;
+        }
+        self.state.workflows_error = None;
+        self.start_request(Operation::RunAllWatchSources);
+    }
+
     /// Ask for one artifact's server-rendered preview (0.28.0). A hash that
     /// is cached or already being read sends nothing.
     pub fn request_doc_preview(&mut self, hash: String) {
@@ -3243,7 +3272,7 @@ impl Session {
                             self.state.logs_loaded = true;
                             self.state.error = None;
                         }
-                        OperationKind::Workflows => {
+                        OperationKind::Workflows | OperationKind::WorkflowsWrite => {
                             self.state.workflows_loaded = true;
                             self.state.workflows_error = Some(message);
                             self.state.error = None;

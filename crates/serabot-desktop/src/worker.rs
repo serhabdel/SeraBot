@@ -114,6 +114,8 @@ pub enum OperationKind {
     Logs,
     /// Wave A visibility bundle for the Workflows tab (0.29.0).
     Workflows,
+    /// Schedule write or manual watch run on the Workflows tab (0.30.0).
+    WorkflowsWrite,
     /// A server-rendered artifact preview (0.28.0), for the preview pane.
     DocPreview,
 }
@@ -265,6 +267,15 @@ pub enum Operation {
     },
     /// Routines, monitoring sources and active plans (0.29.0).
     Workflows,
+    /// `PUT /v1/routines/{name}` then refresh workflows (0.30.0 B1).
+    SaveRoutine {
+        name: String,
+        enabled: Option<bool>,
+        time: Option<String>,
+        timezone: Option<String>,
+    },
+    /// `POST /v1/monitoring/run` then refresh workflows (0.30.0 B2).
+    RunAllWatchSources,
     /// `GET /v1/artifacts/{hash}/preview` for one document artifact.
     DocPreview {
         hash: String,
@@ -466,6 +477,7 @@ impl Operation {
             Self::MediaJobs => OperationKind::MediaJobs,
             Self::Logs { .. } => OperationKind::Logs,
             Self::Workflows => OperationKind::Workflows,
+            Self::SaveRoutine { .. } | Self::RunAllWatchSources => OperationKind::WorkflowsWrite,
             Self::DocPreview { .. } => OperationKind::DocPreview,
             Self::TurnLimits => OperationKind::TurnLimits,
             Self::SaveTurnLimits { .. } | Self::ResetTurnLimits => OperationKind::TurnLimitsWrite,
@@ -1007,6 +1019,19 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::MediaJobs => client.media_jobs(conversation).map(Reply::MediaJobs),
         Operation::Logs { level, query } => client.logs(level.as_deref(), query).map(Reply::Logs),
         Operation::Workflows => client.workflows_snapshot().map(Reply::Workflows),
+        Operation::SaveRoutine {
+            name,
+            enabled,
+            time,
+            timezone,
+        } => {
+            client.put_routine(name, *enabled, time.as_deref(), timezone.as_deref())?;
+            client.workflows_snapshot().map(Reply::Workflows)
+        }
+        Operation::RunAllWatchSources => {
+            client.run_all_watch_sources()?;
+            client.workflows_snapshot().map(Reply::Workflows)
+        }
         Operation::DocPreview { hash } => {
             client
                 .artifact_preview(hash)

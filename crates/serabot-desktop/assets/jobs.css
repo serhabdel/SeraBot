@@ -316,6 +316,67 @@
   font-size: var(--fs-body-2);
 }
 
+.wf-head-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.wf-schedule {
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  overflow: auto;
+}
+
+.wf-schedule-row {
+  display: grid;
+  grid-template-columns: minmax(100px, 0.9fr) 72px minmax(120px, 1.2fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--hairline);
+  font-size: var(--fs-body-2);
+}
+
+.wf-schedule-row:last-child {
+  border-bottom: none;
+}
+
+.wf-field {
+  display: flex;
+  margin: 0;
+}
+
+.wf-input {
+  width: 100%;
+  padding: 4px 8px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface-1);
+  color: var(--label-1);
+  font-size: var(--fs-caption);
+}
+
+.wf-input-wide {
+  min-width: 120px;
+}
+
+.wf-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--fs-caption);
+  color: var(--label-2);
+  white-space: nowrap;
+}
+
+.wf-schedule-meta {
+  margin: 8px 0 0;
+  font-size: var(--fs-caption);
+}
+
 /* Reduced motion: the spinner dots and chevron transitions stop. */
 .root[data-motion="reduce"] .jobs-summary svg {
   transition: none;

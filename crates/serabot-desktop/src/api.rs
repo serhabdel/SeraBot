@@ -2383,6 +2383,68 @@ impl ApiClient {
         Ok(snapshot)
     }
 
+    /// `PUT /v1/routines/{name}` (0.30.0 Wave B1).
+    pub fn put_routine(
+        &self,
+        name: &str,
+        enabled: Option<bool>,
+        time: Option<&str>,
+        timezone: Option<&str>,
+    ) -> Result<(), ApiError> {
+        if name.is_empty() || name.len() > 128 {
+            return Err(ApiError::Validation("Invalid routine name."));
+        }
+        if let Some(time) = time
+            && !Self::valid_routine_time(time)
+        {
+            return Err(ApiError::Validation("Time must be HH:MM (24-hour)."));
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            enabled: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            time: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            timezone: Option<&'a str>,
+        }
+        let _: serde_json::Value = self.request(
+            Method::PUT,
+            &["v1", "routines", name],
+            &[],
+            Some(&Body {
+                enabled,
+                time,
+                timezone,
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// `POST /v1/monitoring/run` (0.30.0 Wave B2).
+    pub fn run_all_watch_sources(&self) -> Result<String, ApiError> {
+        #[derive(Deserialize)]
+        struct Body {
+            task_id: String,
+        }
+        let body: Body =
+            self.request(Method::POST, &["v1", "monitoring", "run"], &[], None::<&()>)?;
+        Ok(body.task_id)
+    }
+
+    fn valid_routine_time(value: &str) -> bool {
+        let Some((hour, minute)) = value.trim().split_once(':') else {
+            return false;
+        };
+        let Ok(hour) = hour.parse::<u32>() else {
+            return false;
+        };
+        let Ok(minute) = minute.parse::<u32>() else {
+            return false;
+        };
+        hour < 24 && minute < 60
+    }
+
     pub fn logs(
         &self,
         level: Option<&str>,
