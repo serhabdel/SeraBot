@@ -17,9 +17,9 @@ use crate::{
     ApiClient, ApiError, BrowserController, BrowserHistory, BrowserInfo, BrowserInput,
     BrowserProfile, BrowserSessionInfo, BrowserSessionsList, ConnectorUpdate, DEFAULT_PROFILE,
     MAX_VAULT_DOMAINS, MAX_VAULT_ENTRIES, MAX_VAULT_NOTE_CHARS, MAX_VAULT_USERNAME_CHARS,
-    PasswordManager, PasswordManagerProbe, SigninHelperStatus, VaultEntry, VaultKind, VaultPut,
-    VaultSource, normalize_vault_domain, valid_vault_name, valid_vault_reference,
-    validate_vault_put,
+    PasswordManager, PasswordManagerProbe, SigninHelperStatus, VaultAccounts, VaultEntry,
+    VaultKind, VaultPendingSecret, VaultPut, VaultSource, normalize_vault_domain, valid_vault_name,
+    valid_vault_reference, validate_vault_put,
 };
 use crate::{ComposioAccount, ComposioApp};
 use std::{
@@ -62,7 +62,9 @@ impl TabAction {
 const MAX_INPUTS_IN_FLIGHT: usize = 4;
 
 pub enum PanelOp {
-    VaultList,
+    VaultList {
+        domain: Option<String>,
+    },
     VaultPut {
         name: String,
         input: VaultPut,
@@ -164,7 +166,7 @@ pub enum PanelKind {
 impl PanelOp {
     pub fn kind(&self) -> PanelKind {
         match self {
-            Self::VaultList => PanelKind::VaultList,
+            Self::VaultList { .. } => PanelKind::VaultList,
             Self::VaultPut { .. } => PanelKind::VaultPut,
             Self::VaultDelete { .. } => PanelKind::VaultDelete,
             Self::PasswordManagers => PanelKind::PasswordManagers,
@@ -202,7 +204,7 @@ impl PanelOp {
 }
 
 pub enum PanelReply {
-    VaultList(Vec<VaultEntry>),
+    VaultList(VaultAccounts),
     VaultSaved(VaultEntry),
     VaultDeleted(String),
     PasswordManagers(Vec<PasswordManager>),
@@ -337,7 +339,9 @@ fn execute(job: &PanelJob, cache: &mut Option<ApiClient>) -> Result<PanelReply, 
     }
     let client = cache.as_ref().ok_or(ApiError::Transport)?;
     match &job.op {
-        PanelOp::VaultList => client.vault_list().map(PanelReply::VaultList),
+        PanelOp::VaultList { domain } => client
+            .vault_accounts(domain.as_deref())
+            .map(PanelReply::VaultList),
         PanelOp::VaultPut { name, input } => {
             client.vault_put(name, input).map(PanelReply::VaultSaved)
         }
@@ -664,6 +668,9 @@ pub struct VaultView {
     /// The logins listed for import, while the picker is open.
     pub import: Option<ImportPicker>,
     pub notice: Option<String>,
+    /// Subdomain-aware site filter for the accounts list (`GET /v1/vault?domain=`).
+    pub domain_filter: String,
+    pub pending_secrets: Vec<VaultPendingSecret>,
     want_list: bool,
 }
 
@@ -1370,6 +1377,14 @@ impl PanelState {
         self.vault.error = None;
     }
 
+    pub fn set_vault_domain_filter(&mut self, draft: String) {
+        self.vault.domain_filter = draft;
+    }
+
+    pub fn apply_vault_domain_filter(&mut self) {
+        self.ask_vault_list();
+    }
+
     pub fn open_add_form(&mut self) {
         self.vault.notice = None;
         self.vault.form = Some(VaultForm::new());
@@ -1532,7 +1547,9 @@ impl PanelState {
     pub fn next_op(&mut self, now: Instant) -> Option<PanelOp> {
         if self.vault.want_list {
             self.vault.want_list = false;
-            return Some(PanelOp::VaultList);
+            let filter = self.vault.domain_filter.trim();
+            let domain = (!filter.is_empty()).then(|| filter.to_owned());
+            return Some(PanelOp::VaultList { domain });
         }
         if let Some(front) = self.queue.front() {
             let is_input = matches!(
@@ -1726,8 +1743,9 @@ impl PanelState {
                 self.connectors.google_error = None;
                 self.connectors.refresh_due = true;
             }
-            PanelReply::VaultList(entries) => {
-                self.vault.entries = entries;
+            PanelReply::VaultList(accounts) => {
+                self.vault.entries = accounts.entries;
+                self.vault.pending_secrets = accounts.pending_secrets;
                 self.vault.loaded = true;
                 self.vault.loading = false;
                 self.vault.error = None;
@@ -2629,7 +2647,10 @@ mod tests {
             done(
                 &state,
                 PanelKind::VaultList,
-                Ok(PanelReply::VaultList(vec![stored])),
+                Ok(PanelReply::VaultList(VaultAccounts {
+                    entries: vec![stored],
+                    pending_secrets: Vec::new(),
+                })),
             ),
             t0,
         );

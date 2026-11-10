@@ -7,12 +7,20 @@ use super::*;
 use crate::vault::{self, VaultInput, VaultKind, VaultSource};
 use crate::vault_providers::{self, Provider};
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ListVaultQuery {
+    #[serde(default)]
+    domain: Option<String>,
+}
+
 pub(super) async fn list_vault(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
+    Query(query): Query<ListVaultQuery>,
 ) -> Result<Json<Value>> {
-    let entries = vault::list(&state.users, &user.id)?;
-    Ok(Json(json!({"entries": entries})))
+    let accounts = vault::list_accounts(&state.users, &user.id, query.domain.as_deref())?;
+    Ok(Json(serde_json::to_value(accounts)?))
 }
 
 #[derive(Deserialize)]

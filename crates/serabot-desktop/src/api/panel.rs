@@ -189,10 +189,24 @@ struct PasswordManagerList {
     providers: Vec<PasswordManager>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct VaultList {
-    entries: Vec<VaultEntry>,
+pub struct VaultPendingSecret {
+    pub card_id: String,
+    pub conversation_id: String,
+    pub name: String,
+    pub kind: VaultKind,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VaultAccounts {
+    pub entries: Vec<VaultEntry>,
+    #[serde(default)]
+    pub pending_secrets: Vec<VaultPendingSecret>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -532,15 +546,33 @@ impl ApiClient {
     }
 
     /// `GET /v1/vault`: names, kinds and metadata. Never a value.
-    pub fn vault_list(&self) -> Result<Vec<VaultEntry>, ApiError> {
-        let list: VaultList = self.panel_json::<_, ()>(Method::GET, &["v1", "vault"], None)?;
+    pub fn vault_accounts(&self, domain: Option<&str>) -> Result<VaultAccounts, ApiError> {
+        let query = domain
+            .filter(|value| !value.trim().is_empty())
+            .map(|filter| ("domain", filter.trim()));
+        let bytes = match query {
+            Some((key, value)) => self.panel_exchange_query::<()>(
+                Method::GET,
+                &["v1", "vault"],
+                &[(key, value)],
+                None,
+            )?,
+            None => self.panel_exchange::<()>(Method::GET, &["v1", "vault"], None)?,
+        };
+        let list: VaultAccounts =
+            serde_json::from_slice(&bytes).map_err(|_| ApiError::InvalidResponse)?;
         if list.entries.len() > MAX_VAULT_ENTRIES {
             return Err(ApiError::InvalidResponse);
         }
         for entry in &list.entries {
             check_vault_entry(entry)?;
         }
-        Ok(list.entries)
+        Ok(list)
+    }
+
+    /// `GET /v1/vault`: names, kinds and metadata. Never a value.
+    pub fn vault_list(&self) -> Result<Vec<VaultEntry>, ApiError> {
+        Ok(self.vault_accounts(None)?.entries)
     }
 
     /// `PUT /v1/vault/{name}`: create or replace. A write: an unknown

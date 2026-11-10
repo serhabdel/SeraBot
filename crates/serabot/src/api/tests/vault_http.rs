@@ -280,3 +280,64 @@ async fn vault_provider_test_never_echoes_the_token() {
     assert!(!text.contains("synthetic-op-probe-token"));
     assert!(probe.get("message").and_then(Value::as_str).is_some());
 }
+
+#[tokio::test]
+async fn vault_list_supports_domain_filter_and_pending_secrets() {
+    let (app, _, store) = app();
+    let user = store
+        .create_user("subject-vault-filter", "f@example.example", "Filter")
+        .unwrap();
+    let token = mint_for(&store, &user.id, "vault-filter");
+    for (name, domains) in [
+        ("mail", vec!["mail.google.com"]),
+        ("bank", vec!["chase.com"]),
+    ] {
+        call(
+            &app,
+            &token,
+            "PUT",
+            &format!("/v1/vault/{name}"),
+            Some(json!({
+                "kind": "password",
+                "username": "user",
+                "value": format!("synthetic-{name}"),
+                "domains": domains,
+            })),
+        )
+        .await;
+    }
+    let filtered =
+        read_json(call(&app, &token, "GET", "/v1/vault?domain=google.com", None).await).await;
+    let names: Vec<_> = filtered["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["mail"]);
+    assert!(
+        filtered
+            .get("pending_secrets")
+            .and_then(Value::as_array)
+            .is_none_or(|items| items.is_empty())
+    );
+
+    store
+        .create_card(
+            &user.id,
+            "dir:main",
+            "main",
+            crate::cards::CardKind::SecretRequest,
+            &json!({
+                "purpose": "save",
+                "kind": "password",
+                "name": "portal",
+                "reason": "synthetic",
+                "domains": ["portal.example.com"],
+            }),
+        )
+        .unwrap();
+    let with_pending = read_json(call(&app, &token, "GET", "/v1/vault", None).await).await;
+    assert_eq!(with_pending["pending_secrets"].as_array().unwrap().len(), 1);
+    assert_eq!(with_pending["pending_secrets"][0]["name"], "portal");
+}

@@ -12,6 +12,8 @@
 //! and [`Redactor`] scrubs a user's values out of anything bound for the
 //! model. Audit rows carry the entry name and host only.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{OptionalExtension, params};
@@ -25,6 +27,7 @@ use crate::error::{Result, SeraError};
 use crate::gateway::{Tool, ToolContext, ToolOutput, ToolRegistry, ToolSpec};
 use crate::plans::clean_text;
 use crate::policy::Policy;
+use crate::store::Store;
 use crate::user_secrets::UserSecrets;
 use crate::vault_providers;
 use std::sync::Arc;
@@ -152,6 +155,25 @@ pub struct VaultEntry {
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<String>,
+}
+
+/// A pending secret-request card waiting on the owner in chat. Metadata only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VaultPendingSecret {
+    pub card_id: String,
+    pub conversation_id: String,
+    pub name: String,
+    pub kind: VaultKind,
+    pub domains: Vec<String>,
+    pub created_at: String,
+}
+
+/// Accounts view: stored entries plus in-flight secret cards (Wave C2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VaultAccounts {
+    pub entries: Vec<VaultEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_secrets: Vec<VaultPendingSecret>,
 }
 
 /// A write request. `Debug` redacts the value.
@@ -362,12 +384,91 @@ const COLUMNS: &str = "name, kind, username, domains_json, note, created_at, upd
 
 /// The acting user's entries, sorted by name. Never a value.
 pub fn list(users: &UserSecrets, user_id: &str) -> Result<Vec<VaultEntry>> {
-    let connection = users.store().connection()?;
-    let mut statement = connection.prepare(&format!(
-        "SELECT {COLUMNS} FROM vault_entries WHERE user_id = ?1 ORDER BY name LIMIT {MAX_ENTRIES}"
-    ))?;
-    let rows = statement.query_map(params![user_id], row_to_entry)?;
-    rows.map(|row| finish_entry(row?)).collect()
+    list_accounts(users, user_id, None).map(|view| view.entries)
+}
+
+/// Stored entries, optional domain filter, `vault.resolve` last-used times, and
+/// pending secret-request cards. Never a value.
+pub fn list_accounts(
+    users: &UserSecrets,
+    user_id: &str,
+    domain: Option<&str>,
+) -> Result<VaultAccounts> {
+    let store = users.store();
+    let mut entries = {
+        let connection = store.connection()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {COLUMNS} FROM vault_entries WHERE user_id = ?1 ORDER BY name LIMIT {MAX_ENTRIES}"
+        ))?;
+        let rows = statement.query_map(params![user_id], row_to_entry)?;
+        rows.map(|row| finish_entry(row?))
+            .collect::<Result<Vec<_>>>()?
+    };
+    apply_last_resolve_from_audit(store, user_id, &mut entries)?;
+    if let Some(filter) = domain.filter(|value| !value.trim().is_empty()) {
+        entries.retain(|entry| entry_matches_domain(entry, filter));
+    }
+    let mut pending = store.list_pending_secret_cards(user_id)?;
+    if let Some(filter) = domain.filter(|value| !value.trim().is_empty()) {
+        pending.retain(|item| entry_matches_domain_domains(&item.domains, filter));
+    }
+    Ok(VaultAccounts {
+        entries,
+        pending_secrets: pending,
+    })
+}
+
+fn entry_matches_domain(entry: &VaultEntry, filter: &str) -> bool {
+    entry_matches_domain_domains(&entry.domains, filter)
+}
+
+fn entry_matches_domain_domains(domains: &[String], filter: &str) -> bool {
+    let Some(filter_host) = normalize_host(filter.trim()) else {
+        return false;
+    };
+    if domains.is_empty() {
+        return false;
+    }
+    domains.iter().any(|domain| {
+        host_allowed(std::slice::from_ref(domain), &filter_host)
+            || normalize_host(domain)
+                .is_some_and(|host| host_allowed(std::slice::from_ref(&filter_host), &host))
+    })
+}
+
+/// Fill `last_used_at` from the newest `vault.resolve` audit row per entry name.
+fn apply_last_resolve_from_audit(
+    store: &Store,
+    user_id: &str,
+    entries: &mut [VaultEntry],
+) -> Result<()> {
+    let times = latest_resolve_times(store, user_id)?;
+    for entry in entries {
+        let Some(audit_at) = times.get(&entry.name) else {
+            continue;
+        };
+        entry.last_used_at = Some(match entry.last_used_at.as_deref() {
+            None => audit_at.clone(),
+            Some(column) if audit_at.as_str() > column => audit_at.clone(),
+            Some(column) => column.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn latest_resolve_times(store: &Store, user_id: &str) -> Result<HashMap<String, String>> {
+    let connection = store.connection()?;
+    let mut statement = connection.prepare(
+        "SELECT json_extract(details_json, '$.name'), MAX(at)
+         FROM audit_log
+         WHERE actor = ?1 AND event = 'vault.resolve' AND details_json IS NOT NULL
+         GROUP BY json_extract(details_json, '$.name')",
+    )?;
+    let rows = statement.query_map(params![user_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect::<std::result::Result<HashMap<_, _>, _>>()
+        .map_err(Into::into)
 }
 
 /// One of the acting user's entries.
