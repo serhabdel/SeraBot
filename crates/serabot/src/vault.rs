@@ -430,9 +430,9 @@ fn entry_matches_domain_domains(domains: &[String], filter: &str) -> bool {
         return false;
     }
     domains.iter().any(|domain| {
-        host_allowed(&[domain.clone()], &filter_host)
+        host_allowed(std::slice::from_ref(domain), &filter_host)
             || normalize_host(domain)
-                .is_some_and(|host| host_allowed(&[filter_host.clone()], &host))
+                .is_some_and(|host| host_allowed(std::slice::from_ref(&filter_host), &host))
     })
 }
 

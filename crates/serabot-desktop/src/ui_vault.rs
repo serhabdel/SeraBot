@@ -167,7 +167,7 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
 
 #[component]
 fn VaultPendingRow(item: VaultPendingSecret) -> Element {
-    let meta = vec![item.kind.label().to_owned(), "card".to_owned()];
+    let meta = [item.kind.label().to_owned(), "card".to_owned()];
     let meta = meta.join(" \u{b7} ");
     rsx! {
         li { class: "vault-row vault-row-pending",
