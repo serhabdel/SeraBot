@@ -973,7 +973,7 @@ mod tests {
             attachments: Vec::new(),
             limit_reached: false,
         };
-        let merged = merge_transcript(&[opt.clone()], Vec::new());
+        let merged = merge_transcript(std::slice::from_ref(&opt), Vec::new());
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].id, "opt-1");
     }

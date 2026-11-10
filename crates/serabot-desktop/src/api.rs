@@ -2394,10 +2394,10 @@ impl ApiClient {
         if name.is_empty() || name.len() > 128 {
             return Err(ApiError::Validation("Invalid routine name."));
         }
-        if let Some(time) = time {
-            if !Self::valid_routine_time(time) {
-                return Err(ApiError::Validation("Time must be HH:MM (24-hour)."));
-            }
+        if let Some(time) = time
+            && !Self::valid_routine_time(time)
+        {
+            return Err(ApiError::Validation("Time must be HH:MM (24-hour)."));
         }
         #[derive(Serialize)]
         struct Body<'a> {
