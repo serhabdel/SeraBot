@@ -216,7 +216,7 @@ fn ProfilePicker(session: Signal<Session>, current: String) -> Element {
                 .collect()
         };
         let mut sorted = rows;
-        sorted.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        sorted.sort_by_key(|a| a.1.to_lowercase());
         sorted
     };
     rsx! {
