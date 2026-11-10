@@ -13,8 +13,8 @@ async fn memory_settings_reports_builtin_and_refuses_mem0_writes() {
     )
     .await;
     assert_eq!(body["provider"], "builtin");
-    assert_eq!(body["mem0"]["available"], false);
-    assert_eq!(body["mem0"]["configured"], false);
+    assert!(!body["mem0"]["available"].as_bool().unwrap());
+    assert!(!body["mem0"]["configured"].as_bool().unwrap());
 
     let denied = app
         .clone()
@@ -44,8 +44,8 @@ async fn usage_includes_daily_task_quota_for_the_acting_user() {
     let quota = &body["quota"]["daily_tasks"];
     assert!(quota["limit"].as_u64().unwrap() > 0);
     assert_eq!(quota["used"].as_i64().unwrap(), 0);
-    assert_eq!(quota["near_limit"].as_bool().unwrap(), false);
-    assert_eq!(quota["at_limit"].as_bool().unwrap(), false);
+    assert!(!quota["near_limit"].as_bool().unwrap());
+    assert!(!quota["at_limit"].as_bool().unwrap());
 
     store
         .enqueue_task(
