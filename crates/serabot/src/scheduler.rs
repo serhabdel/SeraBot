@@ -41,15 +41,6 @@ pub struct DueRoutine {
     pub config: Value,
 }
 
-/// Task kind enqueued when a scheduled routine fires (`brief` or `watch`).
-pub fn task_kind_for_routine(name: &str) -> &'static str {
-    if name == "morning_brief" {
-        "brief"
-    } else {
-        "watch"
-    }
-}
-
 /// Enable or disable the acting user's routine without changing its schedule.
 pub fn set_routine_enabled(store: &Store, user_id: &str, name: &str, enabled: bool) -> Result<()> {
     let connection = store.connection()?;

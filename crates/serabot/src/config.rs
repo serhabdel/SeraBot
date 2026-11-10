@@ -1661,6 +1661,15 @@ pub fn classify_member_routine(name: &str) -> Result<MemberRoutineKind> {
     Ok(MemberRoutineKind::Watch(index))
 }
 
+/// Task kind enqueued when a scheduled routine fires.
+pub fn task_kind_for_routine(name: &str) -> &'static str {
+    if name == "morning_brief" {
+        "brief"
+    } else {
+        "watch"
+    }
+}
+
 /// Default local time for a watch slot when the member has not set one yet.
 pub fn default_watch_time(schedule: &ScheduleConfig, index: usize) -> String {
     schedule
