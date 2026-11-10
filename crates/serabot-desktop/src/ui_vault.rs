@@ -9,7 +9,9 @@ use crate::ui::Icon;
 use dioxus::prelude::*;
 use serabot_desktop::panel::last_used_label;
 use serabot_desktop::session::Session;
-use serabot_desktop::{PasswordManager, PasswordManagerProbe, VaultEntry, VaultKind, VaultSource};
+use serabot_desktop::{
+    PasswordManager, PasswordManagerProbe, VaultEntry, VaultKind, VaultPendingSecret, VaultSource,
+};
 use zeroize::{Zeroize, Zeroizing};
 
 fn kind_icon(kind: VaultKind) -> &'static str {
@@ -28,7 +30,7 @@ fn kind_icon(kind: VaultKind) -> &'static str {
 pub fn VaultPage(session: Signal<Session>) -> Element {
     let mut session = session;
 
-    let (loaded, loading, error, notice, entries, has_form) = {
+    let (loaded, loading, error, notice, entries, pending, domain_filter, has_form) = {
         let s = session.read();
         let v = &s.panel.vault;
         (
@@ -37,6 +39,8 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
             v.error.clone(),
             v.notice.clone(),
             v.entries.clone(),
+            v.pending_secrets.clone(),
+            v.domain_filter.clone(),
             v.form.is_some(),
         )
     };
@@ -81,6 +85,45 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
                             }
                         }
                         PasswordManagersPanel { session }
+                        if loaded || !entries.is_empty() || !pending.is_empty() {
+                            div { class: "vault-filter",
+                                label { class: "field-label", r#for: "vault-domain-filter", "Filter by site" }
+                                div { class: "vault-filter-row",
+                                    input {
+                                        id: "vault-domain-filter",
+                                        class: "field",
+                                        r#type: "text",
+                                        value: "{domain_filter}",
+                                        placeholder: "example.com",
+                                        oninput: move |event| {
+                                            session.write().panel.set_vault_domain_filter(event.value());
+                                        },
+                                        onkeydown: move |event: KeyboardEvent| {
+                                            if event.key() == Key::Enter {
+                                                event.prevent_default();
+                                                session.write().panel.apply_vault_domain_filter();
+                                            }
+                                        },
+                                    }
+                                    button {
+                                        class: "btn sm",
+                                        disabled: loading,
+                                        onclick: move |_| session.write().panel.apply_vault_domain_filter(),
+                                        "Apply"
+                                    }
+                                }
+                            }
+                        }
+                        if !pending.is_empty() {
+                            section { class: "vault-pending", "aria-label": "Waiting in chat",
+                                h3 { class: "vault-form-title", "Waiting in chat" }
+                                ul { class: "vault-list", role: "list",
+                                    for item in pending.iter() {
+                                        VaultPendingRow { key: "{item.card_id}", item: item.clone() }
+                                    }
+                                }
+                            }
+                        }
                         if loading && !loaded {
                             div { class: "vault-list", "aria-busy": "true",
                                 div { class: "skeleton row", " " }
@@ -117,6 +160,31 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+#[component]
+fn VaultPendingRow(item: VaultPendingSecret) -> Element {
+    let meta = vec![item.kind.label().to_owned(), "card".to_owned()];
+    let meta = meta.join(" \u{b7} ");
+    rsx! {
+        li { class: "vault-row vault-row-pending",
+            span { class: "vault-kind", title: "{item.kind.label()}",
+                Icon { name: "lock", size: 15 }
+            }
+            div { class: "vault-row-main",
+                strong { class: "vault-name", "{item.name}" }
+                span { class: "vault-meta caption", "{meta}" }
+                if !item.domains.is_empty() {
+                    div { class: "vault-chips",
+                        for domain in item.domains.iter() {
+                            span { key: "{domain}", class: "chip mono", "{domain}" }
+                        }
+                    }
+                }
+                span { class: "vault-used tiny", "Finish the card in chat" }
             }
         }
     }

@@ -456,6 +456,62 @@ impl Store {
         Ok(card)
     }
 
+    /// Pending secret-request cards for the accounts view (Wave C2). Metadata
+    /// only; capped so the vault page stays bounded.
+    pub fn list_pending_secret_cards(&self, user_id: &str) -> Result<Vec<crate::vault::VaultPendingSecret>> {
+        use crate::vault::{VaultKind, VaultPendingSecret};
+        const MAX_PENDING: usize = 32;
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(&format!(
+            "SELECT {CARD_COLUMNS} FROM chat_cards
+             WHERE user_id = ?1 AND kind = ?2 AND status = 'pending'
+             ORDER BY created_at ASC, id ASC LIMIT ?3"
+        ))?;
+        let rows = statement.query_map(
+            params![user_id, CardKind::SecretRequest.as_str(), MAX_PENDING as i64],
+            raw_card,
+        )?;
+        let mut pending = Vec::new();
+        for raw in rows {
+            let card = into_card(raw?)?;
+            let Some(name) = card.payload.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if crate::vault::validate_name(name).is_err() {
+                continue;
+            }
+            let Some(kind_raw) = card.payload.get("kind").and_then(Value::as_str) else {
+                continue;
+            };
+            let kind = match kind_raw {
+                "password" => VaultKind::Password,
+                "api_key" => VaultKind::ApiKey,
+                "note" => VaultKind::Note,
+                _ => continue,
+            };
+            let domains = card
+                .payload
+                .get("domains")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|domain| domain.as_str().map(str::to_owned))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            pending.push(VaultPendingSecret {
+                card_id: card.id,
+                conversation_id: card.conversation_id,
+                name: name.to_owned(),
+                kind,
+                domains,
+                created_at: card.created_at,
+            });
+        }
+        Ok(pending)
+    }
+
     /// The acting user's cards in one conversation, oldest first. Only the
     /// newest `MAX_LISTED_CARDS` are returned.
     pub fn list_cards(&self, user_id: &str, conversation_id: &str) -> Result<Vec<Card>> {
