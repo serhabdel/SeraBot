@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'chat_models.dart';
 import 'models.dart';
 import 'validation.dart';
+import 'workflows_models.dart';
 
 const _maxResponseBytes = 2 * 1024 * 1024;
 
@@ -1033,6 +1034,107 @@ class ApiClient {
       },
     );
     return _checkCreatedSkill(json, id);
+  }
+
+  Future<Map<String, dynamic>?> _requestOptional(
+    String method,
+    List<String> segments, {
+    Map<String, String>? query,
+    Map<String, dynamic>? body,
+  }) async {
+    try {
+      return await _request(method, segments, query: query, body: body);
+    } on ApiException catch (e) {
+      if (e.kind == ApiErrorKind.http && e.statusCode == 404) {
+        return null;
+      }
+      rethrow;
+    }
+  }
+
+  /// Routines, monitoring sources and active plans (0.29 Wave A / C5 read-only).
+  /// Each leg treats HTTP 404 as unsupported instead of failing the bundle.
+  Future<WorkflowsSnapshot> workflowsSnapshot() async {
+    var snapshot = const WorkflowsSnapshot();
+    final routinesJson = await _requestOptional('GET', ['v1', 'routines']);
+    if (routinesJson != null) {
+      final rows = parseRoutines(routinesJson);
+      if (rows == null) {
+        throw ApiException(ApiErrorKind.invalidResponse);
+      }
+      snapshot = WorkflowsSnapshot(
+        routines: rows,
+        sources: snapshot.sources,
+        active: snapshot.active,
+        routinesSupported: true,
+        sourcesSupported: snapshot.sourcesSupported,
+        activeSupported: snapshot.activeSupported,
+      );
+    }
+    final sourcesJson =
+        await _requestOptional('GET', ['v1', 'monitoring', 'sources']);
+    if (sourcesJson != null) {
+      final rows = parseSources(sourcesJson);
+      if (rows == null) {
+        throw ApiException(ApiErrorKind.invalidResponse);
+      }
+      snapshot = WorkflowsSnapshot(
+        routines: snapshot.routines,
+        sources: rows,
+        active: snapshot.active,
+        routinesSupported: snapshot.routinesSupported,
+        sourcesSupported: true,
+        activeSupported: snapshot.activeSupported,
+      );
+    }
+    final activeJson =
+        await _requestOptional('GET', ['v1', 'workflows', 'active']);
+    if (activeJson != null) {
+      final rows = parseActiveWorkflows(activeJson);
+      if (rows == null) {
+        throw ApiException(ApiErrorKind.invalidResponse);
+      }
+      snapshot = WorkflowsSnapshot(
+        routines: snapshot.routines,
+        sources: snapshot.sources,
+        active: rows,
+        routinesSupported: snapshot.routinesSupported,
+        sourcesSupported: snapshot.sourcesSupported,
+        activeSupported: true,
+      );
+    }
+    return snapshot;
+  }
+
+  /// Redacted tool and approval timeline for one conversation (Wave A5).
+  /// Returns null when the server does not expose `/v1/traces` yet.
+  Future<ConversationTracePage?> conversationTraces(
+    String conversationId, {
+    int limit = 100,
+  }) async {
+    _checkId(conversationId);
+    if (limit < 1 || limit > 500) {
+      throw ApiException(
+        ApiErrorKind.validation,
+        detail: 'Trace limit must be 1–500.',
+      );
+    }
+    final json = await _requestOptional(
+      'GET',
+      ['v1', 'traces'],
+      query: {
+        'conversation_id': conversationId,
+        'limit': '$limit',
+      },
+    );
+    if (json == null) {
+      return null;
+    }
+    try {
+      return parseTraces(json);
+    } catch (_) {
+      throw ApiException(ApiErrorKind.invalidResponse);
+    }
   }
 
   /// On-disk skill summaries. Bodies are not part of this response.

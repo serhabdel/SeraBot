@@ -8,6 +8,7 @@ import 'approvals_screen.dart';
 import 'bots_screen.dart';
 import 'chats_screen.dart';
 import 'settings_screen.dart';
+import 'workflows_screen.dart';
 
 /// Signed-in shell: Chats, Approvals (badge), Bots, Settings. It owns the
 /// [AppState] so the conversation list, unread counts and event stream live
@@ -64,6 +65,7 @@ class _HomeScreenState extends State<HomeScreen> {
             children: [
               ChatsScreen(app: _app, device: _device),
               ApprovalsScreen(app: _app),
+              WorkflowsScreen(app: _app),
               BotsScreen(app: _app, device: _device),
               SettingsScreen(
                 session: widget.session,
@@ -93,6 +95,11 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
                 selectedIcon: const Icon(Icons.gavel),
                 label: 'Approvals',
+              ),
+              const NavigationDestination(
+                icon: Icon(Icons.schedule_outlined),
+                selectedIcon: Icon(Icons.schedule),
+                label: 'Workflows',
               ),
               const NavigationDestination(
                 icon: Icon(Icons.smart_toy_outlined),

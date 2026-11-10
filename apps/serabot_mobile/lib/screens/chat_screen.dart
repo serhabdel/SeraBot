@@ -9,6 +9,7 @@ import '../markdown.dart';
 import '../models.dart';
 import '../preview_pane.dart';
 import '../widgets.dart';
+import 'trace_sheet.dart';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({
@@ -143,6 +144,16 @@ class _ChatScreenState extends State<ChatScreen> {
                   label: Text('${chat.library.length}'),
                   child: const Icon(Icons.folder_open),
                 ),
+              ),
+              IconButton(
+                tooltip: 'Tool trace',
+                onPressed: () => showConversationTraceSheet(
+                  context,
+                  client: widget.app.client,
+                  conversationId: widget.conversation.id,
+                  title: c.displayTitle,
+                ),
+                icon: const Icon(Icons.timeline_outlined),
               ),
             ],
           ),
