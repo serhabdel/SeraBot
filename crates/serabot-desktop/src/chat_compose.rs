@@ -125,6 +125,13 @@ pub fn thumbnail_data_url(name: &str, bytes: &[u8]) -> Option<String> {
     ))
 }
 
+/// Whether a session composer value should replace the on-screen draft during
+/// streaming repaints. While the textarea is focused and the session still
+/// holds non-empty text, the local draft wins.
+pub fn sync_composer_from_session(composer_focused: bool, session_composer_empty: bool) -> bool {
+    !composer_focused || session_composer_empty
+}
+
 /// True when the draft can go out: text or files, under the length limit,
 /// and no upload still in flight.
 pub fn can_submit(text: &str, files: usize, busy: bool) -> bool {
@@ -319,6 +326,14 @@ mod tests {
         let big = vec![0u8; THUMBNAIL_MAX_BYTES + 1];
         assert_eq!(thumbnail_data_url("big.jpg", &big), None);
         assert_eq!(image_mime("a.webp"), Some("image/webp"));
+    }
+
+    #[test]
+    fn composer_draft_keeps_local_text_while_focused() {
+        assert!(!sync_composer_from_session(true, false));
+        assert!(sync_composer_from_session(true, true));
+        assert!(sync_composer_from_session(false, false));
+        assert!(sync_composer_from_session(false, true));
     }
 
     #[test]

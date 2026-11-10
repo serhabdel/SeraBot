@@ -1045,6 +1045,64 @@ mod tests {
     }
 
     #[test]
+    fn merge_transcript_counts_unicode_for_assistant_regression() {
+        let live = Message {
+            id: "m-bot".into(),
+            role: Role::Assistant,
+            content: "café ☕ and more".into(),
+            created_at: "2026-11-09T12:00:02Z".into(),
+            name: None,
+            bot: Some("main".into()),
+            attachments: Vec::new(),
+            limit_reached: false,
+        };
+        let current = vec![live.clone()];
+        let mut stale = live.clone();
+        stale.content = "café".into();
+        let merged = merge_transcript(&current, vec![stale]);
+        assert_eq!(merged[0].content, live.content);
+    }
+
+    #[test]
+    fn merge_transcript_shorter_user_row_takes_incoming() {
+        let live = Message {
+            id: "m-user".into(),
+            role: Role::User,
+            content: "draft with typos fixed later".into(),
+            created_at: "Just now".into(),
+            name: None,
+            bot: None,
+            attachments: Vec::new(),
+            limit_reached: false,
+        };
+        let mut shorter = live.clone();
+        shorter.content = "draft".into();
+        let merged = merge_transcript(std::slice::from_ref(&live), vec![shorter.clone()]);
+        assert_eq!(merged[0].content, shorter.content);
+    }
+
+    #[test]
+    fn merge_transcript_keeps_limit_reached_when_preserving_longer_assistant() {
+        let live = Message {
+            id: "m-bot".into(),
+            role: Role::Assistant,
+            content: "long streaming answer".into(),
+            created_at: "2026-11-09T12:00:02Z".into(),
+            name: None,
+            bot: Some("main".into()),
+            attachments: Vec::new(),
+            limit_reached: false,
+        };
+        let current = vec![live.clone()];
+        let mut stale = live.clone();
+        stale.content = "long".into();
+        stale.limit_reached = true;
+        let merged = merge_transcript(&current, vec![stale]);
+        assert_eq!(merged[0].content, live.content);
+        assert!(merged[0].limit_reached);
+    }
+
+    #[test]
     fn merge_transcript_keeps_in_flight_opt_not_yet_on_server() {
         let opt = Message {
             id: "opt-1".into(),

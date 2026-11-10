@@ -10,6 +10,24 @@ pub fn near_bottom(scroll_height: f64, scroll_top: f64, client_height: f64) -> b
     (scroll_height - scroll_top - client_height) < STICK_BOTTOM_PX
 }
 
+/// Whether the chat view should call the scroll pin bridge after a transcript or
+/// activity change, and whether to force stick-to-bottom.
+pub fn transcript_pin_action(
+    previous_count: usize,
+    count: usize,
+    own_send: bool,
+    at_bottom: bool,
+    streaming_growth: bool,
+) -> Option<bool> {
+    let jump = own_send || previous_count == 0;
+    let force_pin = jump || own_send || (at_bottom && streaming_growth);
+    if force_pin || count != previous_count || streaming_growth {
+        Some(force_pin)
+    } else {
+        None
+    }
+}
+
 /// Pin or refresh the message list when transcript rows grow (streaming tokens).
 pub fn pin_messages_js(force: bool) -> String {
     format!(
@@ -164,5 +182,59 @@ mod tests {
         assert!(CHAT_SCROLL_BRIDGE_JS.contains("window.__serabotChatScroll"));
         assert!(CHAT_SCROLL_BRIDGE_JS.contains("window.__serabotPinMessages"));
         assert!(CHAT_SCROLL_BRIDGE_JS.contains("reducedMotion"));
+    }
+
+    #[test]
+    fn bridge_bottom_threshold_matches_rust() {
+        assert!(
+            CHAT_SCROLL_BRIDGE_JS.contains("const BOTTOM = 80"),
+            "JS stick threshold must match STICK_BOTTOM_PX"
+        );
+        assert_eq!(STICK_BOTTOM_PX, 80.0);
+    }
+
+    #[test]
+    fn scroll_to_bottom_snaps_when_reduced() {
+        assert!(SCROLL_TO_BOTTOM_JS.contains("behavior: reduced ? 'auto' : 'smooth'"));
+        assert!(SCROLL_TO_BOTTOM_JS.contains("dataset.motion === 'reduce'"));
+    }
+
+    #[test]
+    fn reduced_motion_snaps_scroll_top_in_bridge() {
+        assert!(CHAT_SCROLL_BRIDGE_JS.contains("if (reducedMotion())"));
+        assert!(CHAT_SCROLL_BRIDGE_JS.contains("box.scrollTop = target"));
+        assert!(CHAT_SCROLL_BRIDGE_JS.contains("box.scrollTop = destTop(box)"));
+    }
+
+    #[test]
+    fn near_bottom_after_list_grows_while_pinned() {
+        let client = 400.0;
+        let top = 800.0;
+        assert!(near_bottom(1200.0, top, client));
+        assert!(near_bottom(2400.0, top + 1200.0, client));
+        assert!(!near_bottom(2400.0, top, client));
+    }
+
+    #[test]
+    fn transcript_pin_forces_while_at_bottom_and_streaming() {
+        assert_eq!(transcript_pin_action(3, 3, false, true, true), Some(true));
+    }
+
+    #[test]
+    fn transcript_pin_soft_while_scrolled_up_but_streaming() {
+        assert_eq!(transcript_pin_action(3, 3, false, false, true), Some(false));
+    }
+
+    #[test]
+    fn transcript_pin_skips_when_idle_at_bottom() {
+        assert_eq!(transcript_pin_action(3, 3, false, true, false), None);
+    }
+
+    #[test]
+    fn transcript_pin_on_new_row_without_force_when_scrolled_up() {
+        assert_eq!(
+            transcript_pin_action(3, 4, false, false, false),
+            Some(false)
+        );
     }
 }
