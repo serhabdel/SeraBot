@@ -64,7 +64,7 @@ one active plan, vault Test OK, one browser tool in traces without secrets.
 - [x] **C3** Autonomy presets — PR #44.
 - [ ] **C4** Admin reliability dashboard — PR #46 (scheduler/source counts on
       Usage server card).
-- [ ] **C5** Flutter Workflows + traces — read-only parity with desktop.
+- [x] **C5** Flutter Workflows + traces — read-only parity with desktop.
 - [ ] **C6** Phase gate; `flutter analyze` / `flutter test` when C5 lands.
 
 ---

@@ -285,5 +285,29 @@ void main() {
       app.dispose();
     });
   });
+
+  test('workflowsSnapshot tolerates missing routes (404)', () async {
+    final c = clientFor((r) async {
+      if (r.url.path == '/v1/routines') {
+        return json({'routines': []});
+      }
+      if (r.url.path == '/v1/monitoring/sources') {
+        return json({}, 404);
+      }
+      if (r.url.path == '/v1/workflows/active') {
+        return json({'workflows': []});
+      }
+      return json({}, 404);
+    });
+    final snap = await c.workflowsSnapshot();
+    expect(snap.routinesSupported, isTrue);
+    expect(snap.sourcesSupported, isFalse);
+    expect(snap.activeSupported, isTrue);
+  });
+
+  test('conversationTraces returns null on 404', () async {
+    final c = clientFor((r) async => json({}, 404));
+    expect(await c.conversationTraces('dir:main'), isNull);
+  });
 }
 
