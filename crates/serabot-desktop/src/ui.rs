@@ -3452,7 +3452,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     onscroll: move |event: ScrollEvent| {
                         let bottom = chat_scroll::near_bottom(
                             event.scroll_height() as f64,
-                            event.scroll_top() as f64,
+                            event.scroll_top(),
                             event.client_height() as f64,
                         );
                         at_bottom.set(bottom);
