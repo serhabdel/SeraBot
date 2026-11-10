@@ -4994,6 +4994,9 @@ fn ApprovalsView(session: Signal<Session>) -> Element {
         })
         .collect();
     let approvals_empty = approvals.is_empty();
+    let grants = session.read().state.standing_grants.grants.clone();
+    let grants_loaded = session.read().state.standing_grants_loaded;
+    let active_grants: Vec<_> = grants.iter().filter(|g| g.active).cloned().collect();
     rsx! {
         div { class: "pane",
             div { class: "pane-head",
@@ -5008,6 +5011,40 @@ fn ApprovalsView(session: Signal<Session>) -> Element {
                 }
             }
             div { class: "pane-body",
+                if grants_loaded {
+                    section { class: "card-section",
+                        h2 { class: "section-title", "Standing grants" }
+                        p { class: "muted", "Tools you chose Always for. Revoke to require approval again." }
+                        if active_grants.is_empty() {
+                            p { class: "muted", "No active standing grants." }
+                        } else {
+                            div { class: "card-grid",
+                                for grant in active_grants {
+                                    div { class: "card", key: "{grant.id}",
+                                        div { class: "card-head",
+                                            span { class: "chip accent", "{grant.tool}" }
+                                            span { class: "tiny", "since {grant.created_at}" }
+                                        }
+                                        if let Some(dest) = grant.destination.as_deref() {
+                                            p { class: "card-sub", "Destination: {dest}" }
+                                        }
+                                        p { class: "tiny muted", "Hash {grant.canonical_hash}" }
+                                        div { class: "card-actions",
+                                            button {
+                                                class: "btn danger sm",
+                                                onclick: {
+                                                    let id = grant.id.clone();
+                                                    move |_| session.write().revoke_standing_grant(id.clone())
+                                                },
+                                                "Revoke"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 div { class: "card-grid",
                     if !approvals_loaded {
                         div { class: "card",

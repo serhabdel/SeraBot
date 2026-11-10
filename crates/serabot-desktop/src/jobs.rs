@@ -9,6 +9,7 @@
 
 use crate::activity::Activity;
 use crate::api::{MediaJob, Task, TaskStatus};
+use crate::jobs_reliability::JobsReliabilitySnapshot;
 use crate::media_view::placeholder_label;
 use crate::working::WorkingBots;
 use std::time::Instant;
@@ -25,6 +26,8 @@ pub enum JobKind {
     Media,
     /// A handoff to another bot working in this room.
     Handoff,
+    /// Uncertain task or unknown-outcome action from `GET /v1/jobs`.
+    Reliability,
 }
 
 /// Where one row sits in its lifecycle.
@@ -78,6 +81,8 @@ pub struct JobItem {
     pub bot: String,
     pub title: String,
     pub state: JobState,
+    /// When set, the console can open this chat for trace context (B6).
+    pub trace_conversation: Option<String>,
 }
 
 impl JobItem {
@@ -86,6 +91,7 @@ impl JobItem {
             JobKind::Task => "bolt",
             JobKind::Media => "image",
             JobKind::Handoff => "users",
+            JobKind::Reliability => "shield",
         }
     }
 }
@@ -109,6 +115,7 @@ pub fn build(
     working: &WorkingBots,
     activity: &Activity,
     conversation: &str,
+    reliability: &JobsReliabilitySnapshot,
     now: Instant,
 ) -> Vec<JobItem> {
     let mut items: Vec<JobItem> = Vec::new();
@@ -137,6 +144,7 @@ pub fn build(
             bot: task.bot.clone(),
             title,
             state,
+            trace_conversation: None,
         });
     }
 
@@ -150,6 +158,7 @@ pub fn build(
             bot: job.bot.clone(),
             title: placeholder_label(job),
             state,
+            trace_conversation: None,
         });
     }
 
@@ -170,6 +179,33 @@ pub fn build(
             bot: bot.clone(),
             title: format!("Handed off to {bot}"),
             state,
+            trace_conversation: None,
+        });
+    }
+
+    for row in &reliability.uncertain_tasks {
+        let title = row
+            .last_error
+            .clone()
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| format!("Uncertain {} task", row.kind));
+        items.push(JobItem {
+            kind: JobKind::Reliability,
+            id: format!("uncertain:{}", row.id),
+            bot: row.bot.clone(),
+            title,
+            state: JobState::Failed,
+            trace_conversation: row.conversation_id.clone(),
+        });
+    }
+    for row in &reliability.unknown_actions {
+        items.push(JobItem {
+            kind: JobKind::Reliability,
+            id: format!("unknown:{}", row.id),
+            bot: row.tool.clone(),
+            title: format!("Unknown outcome: {}", row.tool),
+            state: JobState::Failed,
+            trace_conversation: row.conversation_id.clone(),
         });
     }
 
@@ -191,6 +227,7 @@ impl JobKind {
             Self::Task => 0,
             Self::Media => 1,
             Self::Handoff => 2,
+            Self::Reliability => 3,
         }
     }
 }
@@ -269,6 +306,7 @@ mod tests {
             &working,
             &activity,
             "room:ops",
+            &JobsReliabilitySnapshot::default(),
             now,
         );
         let states: Vec<JobState> = items.iter().map(|i| i.state).collect();
@@ -309,6 +347,7 @@ mod tests {
             &working,
             &Activity::default(),
             "dir:main",
+            &JobsReliabilitySnapshot::default(),
             now,
         );
         assert_eq!(items.len(), 1);
@@ -326,6 +365,7 @@ mod tests {
             &WorkingBots::default(),
             &Activity::default(),
             "dir:main",
+            &JobsReliabilitySnapshot::default(),
             Instant::now(),
         );
         let states: Vec<JobState> = items.iter().map(|i| i.state).collect();
@@ -349,6 +389,7 @@ mod tests {
             &WorkingBots::default(),
             &Activity::default(),
             "dir:main",
+            &JobsReliabilitySnapshot::default(),
             Instant::now(),
         );
         // 30 valid pending jobs, capped at MAX_ITEMS.
@@ -365,6 +406,7 @@ mod tests {
                 bot: "main".into(),
                 title: "x".into(),
                 state: JobState::Running,
+                trace_conversation: None,
             },
             JobItem {
                 kind: JobKind::Media,
@@ -372,6 +414,7 @@ mod tests {
                 bot: "maker".into(),
                 title: "y".into(),
                 state: JobState::Done,
+                trace_conversation: None,
             },
         ];
         assert_eq!(headline(&items), "1 job running");
@@ -384,6 +427,7 @@ mod tests {
             bot: "a".into(),
             title: "z".into(),
             state: JobState::Queued,
+            trace_conversation: None,
         });
         assert_eq!(headline(&two), "2 jobs running");
     }
@@ -398,6 +442,7 @@ mod tests {
             &WorkingBots::default(),
             &activity,
             "dir:main",
+            &JobsReliabilitySnapshot::default(),
             Instant::now(),
         );
         assert_eq!(items[0].title, "Working");

@@ -3357,6 +3357,9 @@ impl Session {
                     }
                     if matches!(completion.kind, OperationKind::Approvals) {
                         self.note_approvals();
+                        if !self.state.standing_grants_loaded {
+                            self.schedule(Operation::StandingGrants, Duration::ZERO);
+                        }
                     }
                     match completion.kind {
                         OperationKind::Health if self.state.connected => {
@@ -3431,6 +3434,10 @@ impl Session {
                         }
                         OperationKind::Decide => {
                             self.schedule(Operation::Approvals, Duration::ZERO);
+                        }
+                        OperationKind::RevokeStandingGrant => {
+                            self.toast = Some("Standing grant revoked.".into());
+                            self.schedule(Operation::StandingGrants, Duration::ZERO);
                         }
                         // The answer or decline posted a message: read the transcript
                         // and the cards together.
@@ -3626,6 +3633,7 @@ impl Session {
                             self.schedule(Operation::MediaJobs, Duration::ZERO);
                         }
                         OperationKind::MediaJobs => {
+                            self.schedule(Operation::JobsReliability, Duration::ZERO);
                             self.schedule(Operation::ChatPlan, Duration::ZERO);
                         }
                         OperationKind::OAuthSignIn => {
@@ -3810,7 +3818,15 @@ impl Session {
             }
             Section::Providers => (!self.state.providers_loaded).then_some(Operation::Providers),
             Section::Connectors => (!self.state.connectors_loaded).then_some(Operation::Connectors),
-            Section::Approvals => (!self.state.approvals_loaded).then_some(Operation::Approvals),
+            Section::Approvals => {
+                if !self.state.approvals_loaded {
+                    Some(Operation::Approvals)
+                } else if !self.state.standing_grants_loaded {
+                    Some(Operation::StandingGrants)
+                } else {
+                    None
+                }
+            }
             Section::Tasks => {
                 if self.state.tasks_loaded {
                     None
@@ -4341,6 +4357,18 @@ impl Session {
 
     pub fn refresh_approvals(&mut self) {
         self.start_request(Operation::Approvals);
+        self.start_request(Operation::StandingGrants);
+    }
+
+    pub fn revoke_standing_grant(&mut self, id: String) {
+        self.start_request(Operation::RevokeStandingGrant { id });
+    }
+
+    pub fn refresh_jobs_reliability(&mut self) {
+        if !self.state.connected {
+            return;
+        }
+        self.start_request(Operation::JobsReliability);
     }
 
     pub fn load_conversations(&mut self) {

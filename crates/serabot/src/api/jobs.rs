@@ -54,10 +54,19 @@ pub(super) async fn list_jobs(
     media_jobs.sort_by_key(|job| std::cmp::Reverse(job.updated_at));
     media_jobs.truncate(limit);
 
+    let reliability_limit = 50;
+    let uncertain_tasks = list_uncertain_tasks(&state.store, &user.id, reliability_limit)?;
+    let unknown_actions = list_outcome_unknown_actions(&state.store, &user.id, reliability_limit)?;
+
     Ok(Json(json!({
         "tasks": tasks,
         "media_jobs": media_jobs,
         "limits": {"tasks": limit, "media_jobs": limit},
+        "reliability": {
+            "uncertain_tasks": uncertain_tasks,
+            "unknown_actions": unknown_actions,
+            "traces_path": "/v1/traces",
+        },
     })))
 }
 
@@ -108,5 +117,59 @@ fn list_active_tasks(
             }))
         },
     )?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn list_uncertain_tasks(store: &Store, user_id: &str, limit: usize) -> Result<Vec<Value>> {
+    let connection = store.connection()?;
+    let mut statement = connection.prepare(
+        "SELECT id, kind, bot, payload_json, status, last_error, updated_at
+         FROM tasks WHERE user_id = ?1 AND uncertain = 1
+         ORDER BY updated_at DESC, rowid DESC LIMIT ?2",
+    )?;
+    let rows = statement.query_map(rusqlite::params![user_id, limit as i64], |row| {
+        let payload: Value = serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or(Value::Null);
+        let conversation_id = payload
+            .get("conversation_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        Ok(json!({
+            "id": row.get::<_, String>(0)?,
+            "kind": row.get::<_, String>(1)?,
+            "bot": row.get::<_, String>(2)?,
+            "status": row.get::<_, String>(4)?,
+            "last_error": row.get::<_, Option<String>>(5)?,
+            "updated_at": row.get::<_, String>(6)?,
+            "conversation_id": conversation_id,
+            "uncertain": true,
+        }))
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn list_outcome_unknown_actions(store: &Store, user_id: &str, limit: usize) -> Result<Vec<Value>> {
+    let connection = store.connection()?;
+    let mut statement = connection.prepare(
+        "SELECT a.id, a.tool, a.task_id, a.turn_id, a.destination, a.canonical_hash, a.updated_at,
+                t.conversation_id
+         FROM actions a
+         LEFT JOIN turns t ON t.id = a.turn_id AND t.user_id = ?1
+         WHERE a.user_id = ?1 AND a.status = 'outcome_unknown'
+         ORDER BY a.updated_at DESC, a.rowid DESC LIMIT ?2",
+    )?;
+    let rows = statement.query_map(rusqlite::params![user_id, limit as i64], |row| {
+        let conversation_id: Option<String> = row.get(7)?;
+        Ok(json!({
+            "id": row.get::<_, String>(0)?,
+            "tool": row.get::<_, String>(1)?,
+            "task_id": row.get::<_, Option<String>>(2)?,
+            "turn_id": row.get::<_, Option<String>>(3)?,
+            "destination": row.get::<_, Option<String>>(4)?,
+            "canonical_hash": row.get::<_, String>(5)?,
+            "updated_at": row.get::<_, String>(6)?,
+            "conversation_id": conversation_id,
+            "status": "outcome_unknown",
+        }))
+    })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }

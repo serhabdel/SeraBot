@@ -2796,6 +2796,26 @@ impl ApiClient {
         Ok(())
     }
 
+    pub fn standing_grants(
+        &self,
+    ) -> Result<crate::standing_grants::StandingGrantsSnapshot, ApiError> {
+        let value: serde_json::Value = self.get(&["v1", "standing-grants"], &[])?;
+        crate::standing_grants::parse_standing_grants(&value).ok_or(ApiError::InvalidResponse)
+    }
+
+    pub fn revoke_standing_grant(&self, id: &str) -> Result<(), ApiError> {
+        check_id(id)?;
+        self.request::<(), ()>(Method::DELETE, &["v1", "standing-grants", id], &[], None)?;
+        Ok(())
+    }
+
+    pub fn jobs_reliability(
+        &self,
+    ) -> Result<crate::jobs_reliability::JobsReliabilitySnapshot, ApiError> {
+        let value: serde_json::Value = self.get(&["v1", "jobs"], &[])?;
+        crate::jobs_reliability::parse_jobs_reliability(&value).ok_or(ApiError::InvalidResponse)
+    }
+
     /// `POST /v1/cards/{id}/answer`: the owner's answer to a question card.
     /// The server posts it into the conversation, which starts a bot turn.
     pub fn answer_card(&self, id: &str, answer: &str) -> Result<(), ApiError> {

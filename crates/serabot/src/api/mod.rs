@@ -510,6 +510,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/tasks/{id}", get(task))
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}/decide", post(decide_approval))
+        .route("/v1/standing-grants", get(list_standing_grants))
+        .route(
+            "/v1/standing-grants/{id}",
+            delete(revoke_standing_grant_endpoint),
+        )
         .route("/v1/events", get(events))
         .route("/v1/audit", get(audit))
         .route("/v1/artifacts/{hash}", get(artifact))
