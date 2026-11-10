@@ -10,6 +10,7 @@ use super::*;
 use crate::browser::guard::{validate_navigation_url, validate_resolved};
 use crate::browser::manager::{BrowserBackend, PageInfo};
 use crate::browser::outline::key_def;
+use crate::browser::signin::signin_helper_statuses;
 use crate::browser::{BrowserManager, Controller};
 use crate::browser_profiles::{
     BrowserProfile, DEFAULT_PROFILE, MAX_PROFILE_NAME_CHARS, remove_profile_dir, valid_profile_id,
@@ -151,16 +152,24 @@ pub(super) async fn browser_input(
 
 // ---- 0.16 per-profile session routes ----
 
+fn sessions_envelope(state: &ApiState, sessions: Vec<Value>) -> Value {
+    json!({
+        "sessions": sessions,
+        "idle_timeout_secs": state.config.browser.idle_timeout_secs,
+        "signin_helpers": signin_helper_statuses(),
+    })
+}
+
 /// `GET /v1/browser/sessions` — one entry per profile of the acting user.
 pub(super) async fn sessions_list(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
 ) -> Result<Json<Value>> {
-    let Some(browser) = state.browser.as_ref() else {
-        return Ok(Json(json!({"sessions": []})));
-    };
     let profiles = state.store.list_browser_profiles(&user.id)?;
-    let live = browser.user_sessions(&user.id).await;
+    let live = match state.browser.as_ref() {
+        Some(browser) => browser.user_sessions(&user.id).await,
+        None => Vec::new(),
+    };
     let sessions = profiles
         .into_iter()
         .map(|profile| {
@@ -180,7 +189,7 @@ pub(super) async fn sessions_list(
             entry
         })
         .collect::<Vec<_>>();
-    Ok(Json(json!({"sessions": sessions})))
+    Ok(Json(sessions_envelope(&state, sessions)))
 }
 
 pub(super) async fn session_screenshot(
@@ -254,6 +263,7 @@ pub(super) async fn session_tab_open(
     let browser = manager(&state)?;
     let url = validate_resolved(&body.url).await?;
     let lease = browser.user_lease(&user.id, &id).await?;
+    lease.note_navigation(url.as_str());
     lease.backend().open_tab(url.as_str()).await?;
     drop(lease);
     session_reply(
@@ -281,6 +291,9 @@ async fn tab_op(
         lease.backend().close_tab(tab).await?;
     } else {
         lease.backend().switch_tab(tab).await?;
+        if let Ok(page) = lease.backend().info().await {
+            lease.note_navigation(&page.url);
+        }
     }
     drop(lease);
     session_reply(state, user, id, browser.info(&user.id, id).await.to_json())
@@ -397,19 +410,23 @@ async fn input_for(
         (BrowserInput::Key { key }, _) => backend.press(key).await?,
         (BrowserInput::Scroll { dy }, _) => backend.scroll(*dy).await?,
         (BrowserInput::Navigate { .. }, Some(url)) => {
-            backend.navigate(url.as_str()).await?;
+            let page = backend.navigate(url.as_str()).await?;
+            lease.note_navigation(&page.url);
         }
         (BrowserInput::Back, _) => {
             let landed = backend.history_step(-1).await?;
-            check_landing(backend.as_ref(), landed).await?;
+            check_landing(backend.as_ref(), landed.clone()).await?;
+            lease.note_navigation(&landed.url);
         }
         (BrowserInput::Forward, _) => {
             let landed = backend.history_step(1).await?;
-            check_landing(backend.as_ref(), landed).await?;
+            check_landing(backend.as_ref(), landed.clone()).await?;
+            lease.note_navigation(&landed.url);
         }
         (BrowserInput::Reload, _) => {
             let landed = backend.reload().await?;
-            check_landing(backend.as_ref(), landed).await?;
+            check_landing(backend.as_ref(), landed.clone()).await?;
+            lease.note_navigation(&landed.url);
         }
         _ => {}
     }

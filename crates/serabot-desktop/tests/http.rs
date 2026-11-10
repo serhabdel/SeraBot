@@ -1605,7 +1605,7 @@ fn browser_sessions_route_every_action_by_session_id() {
         (200, SESSION.into()),
         (200, r#"{"closed":true}"#.into()),
     ]);
-    let sessions = client.browser_sessions().unwrap();
+    let sessions = client.browser_sessions().unwrap().sessions;
     assert_eq!(sessions[0].id, "work");
     assert_eq!(sessions[0].conversation_id.as_deref(), Some("dir:main"));
     assert_eq!(

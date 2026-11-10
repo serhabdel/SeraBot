@@ -16,8 +16,9 @@
 
 use crate::ui::{ChatView, Icon, Overlay, avatar_style};
 use dioxus::prelude::*;
+use serabot_desktop::SigninHelperStatus;
 use serabot_desktop::panel::{
-    address_to_url, host_label, idle_label, profile_users, tab_count_label,
+    address_to_url, host_label, idle_label, idle_timeout_label, profile_users, tab_count_label,
 };
 use serabot_desktop::session::{Section, Session};
 use serabot_desktop::{
@@ -164,10 +165,93 @@ fn controller_pill(controller: BrowserController) -> (&'static str, &'static str
     }
 }
 
+/// Idle close time and sign-in refusal helpers from the server.
+#[component]
+fn BrowserConsoleMeta(idle_ttl: Option<u64>, helpers: Vec<SigninHelperStatus>) -> Element {
+    if idle_ttl.is_none() && helpers.is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        div { class: "browser-console-meta", role: "status",
+            if let Some(secs) = idle_ttl {
+                span { class: "caption browser-idle-ttl", "{idle_timeout_label(secs)}" }
+            }
+            if !helpers.is_empty() {
+                ul { class: "browser-signin-helpers", "aria-label": "Sign-in helper status",
+                    for helper in helpers {
+                        li { key: "{helper.provider}",
+                            span {
+                                class: "chip ok",
+                                title: "{helper.status}",
+                                "{helper.provider} · {helper.host}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Switch focus between profiles without leaving the Browser page.
+#[component]
+fn ProfilePicker(session: Signal<Session>, current: String) -> Element {
+    let mut session = session;
+    let options: Vec<(String, String, bool)> = {
+        let s = session.read();
+        let rows: Vec<_> = if s.panel.profiles.is_empty() {
+            s.panel
+                .sessions
+                .iter()
+                .map(|sess| (sess.id.clone(), sess.profile_name.clone(), sess.active))
+                .collect()
+        } else {
+            s.panel
+                .profiles
+                .iter()
+                .map(|profile| {
+                    let active = s.panel.session(&profile.id).is_some_and(|sess| sess.active);
+                    (profile.id.clone(), profile.name.clone(), active)
+                })
+                .collect()
+        };
+        let mut sorted = rows;
+        sorted.sort_by_key(|a| a.1.to_lowercase());
+        sorted
+    };
+    rsx! {
+        label { class: "browser-profile-picker",
+            span { class: "sr-only", "Profile" }
+            select {
+                class: "input sm",
+                value: "{current}",
+                "aria-label": "Browser profile",
+                onchange: move |event| {
+                    let id = event.value();
+                    if id != current {
+                        session.write().focus_browser(&id);
+                    }
+                },
+                for (id, name, active) in options {
+                    option {
+                        value: "{id}",
+                        selected: id == current,
+                        if active {
+                            "{name} (open)"
+                        } else {
+                            "{name}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[component]
 fn BrowserGrid(session: Signal<Session>) -> Element {
     let mut session = session;
-    let (cards, loaded) = {
+    let (cards, loaded, idle_ttl, helpers) = {
         let s = session.read();
         let cards: Vec<Card> = s
             .panel
@@ -182,7 +266,12 @@ fn BrowserGrid(session: Signal<Session>) -> Element {
                 (info.clone(), shot, bot)
             })
             .collect();
-        (cards, s.panel.sessions_loaded)
+        (
+            cards,
+            s.panel.sessions_loaded,
+            s.panel.idle_timeout_secs,
+            s.panel.signin_helpers.clone(),
+        )
     };
     rsx! {
         div { class: "pane browser-page",
@@ -190,6 +279,7 @@ fn BrowserGrid(session: Signal<Session>) -> Element {
                 div {
                     h1 { class: "pane-title", "Browser" }
                     p { class: "muted", "Websites your bots have open. Watch them, step in, or close them." }
+                    BrowserConsoleMeta { idle_ttl, helpers }
                 }
             }
             div { class: "pane-body",
@@ -215,6 +305,7 @@ fn BrowserGrid(session: Signal<Session>) -> Element {
                                 let tabs_text = (!info.tabs.is_empty())
                                     .then(|| tab_count_label(info.tabs.len()));
                                 let idle = if info.active { idle_label(info.idle_secs) } else { None };
+                                let last_nav = info.last_nav_host.clone();
                                 let refused = info.signin_blocked.is_some();
                                 rsx! {
                                     div { key: "{info.id}", class: "browser-card",
@@ -241,6 +332,9 @@ fn BrowserGrid(session: Signal<Session>) -> Element {
                                                     }
                                                     if let Some(text) = idle {
                                                         span { "{text}" }
+                                                    }
+                                                    if let Some(nav_host) = last_nav {
+                                                        span { class: "browser-last-nav", "Last nav {nav_host}" }
                                                     }
                                                     if refused {
                                                         span { class: "browser-flag", "Sign-in refused" }
@@ -476,7 +570,7 @@ fn FocusView(session: Signal<Session>, overlay: Signal<Overlay>, id: String) -> 
     let mut opening = use_signal(|| false);
     let mut draft = use_signal(String::new);
     let mut confirm_end = use_signal(|| false);
-    let (info, shot, busy, error, bot, in_control) = {
+    let (info, shot, busy, error, bot, in_control, idle_ttl, helpers) = {
         let s = session.read();
         let info = s.panel.session(&id).cloned();
         let bot = info.as_ref().and_then(|i| i.bot.clone());
@@ -487,6 +581,8 @@ fn FocusView(session: Signal<Session>, overlay: Signal<Overlay>, id: String) -> 
             s.panel.browser_error.clone(),
             bot,
             s.panel.user_in_control(),
+            s.panel.idle_timeout_secs,
+            s.panel.signin_helpers.clone(),
         )
     };
     let signin = info.as_ref().and_then(|i| i.signin_blocked.clone());
@@ -497,6 +593,7 @@ fn FocusView(session: Signal<Session>, overlay: Signal<Overlay>, id: String) -> 
         .unwrap_or_else(|| id.clone());
     let tabs = info.as_ref().map(|i| i.tabs.clone()).unwrap_or_default();
     let pointer = info.as_ref().and_then(|i| i.pointer.clone());
+    let last_nav_host = info.as_ref().and_then(|i| i.last_nav_host.clone());
     let url = info
         .as_ref()
         .and_then(|i| i.url.clone())
@@ -530,8 +627,14 @@ fn FocusView(session: Signal<Session>, overlay: Signal<Overlay>, id: String) -> 
                         Icon { name: "chevron-left", size: 14 }
                         "All browsers"
                     }
-                    strong { class: "focus-name", "{profile_name}" }
+                    ProfilePicker { session, current: id.clone() }
                     span { class: "{pill}", role: "status", if active { "{label}" } else { "Closed" } }
+                    if let Some(text) = idle_label(info.as_ref().and_then(|i| i.idle_secs)) {
+                        span { class: "caption", "{text}" }
+                    }
+                    if let Some(secs) = idle_ttl {
+                        span { class: "caption browser-idle-ttl", "{idle_timeout_label(secs)}" }
+                    }
                     div { class: "focus-spacer" }
                     button {
                         class: "icon-btn",
@@ -541,6 +644,15 @@ fn FocusView(session: Signal<Session>, overlay: Signal<Overlay>, id: String) -> 
                         onclick: move |_| full.set(!full()),
                         Icon { name: if full() { "minimize" } else { "maximize" }, size: 16 }
                     }
+                }
+                div { class: "focus-host-row",
+                    span { class: "caption", "Now: {host_label(info.as_ref().and_then(|i| i.url.as_deref()))}" }
+                    if let Some(nav_host) = last_nav_host {
+                        span { class: "caption browser-last-nav", "Last nav: {nav_host}" }
+                    }
+                }
+                if !helpers.is_empty() {
+                    BrowserConsoleMeta { idle_ttl: None, helpers: helpers.clone() }
                 }
                 if let Some(block) = signin.clone() {
                     SigninBanner { session, block }
