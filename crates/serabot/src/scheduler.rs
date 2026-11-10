@@ -325,11 +325,13 @@ mod tests {
         "Europe/Rome".parse().unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_routine(
         store: &Store,
         user_id: &str,
         name: &str,
         time: &str,
+        timezone: &str,
         enabled: bool,
         next_run_at: DateTime<Utc>,
         last_run_for: Option<&str>,
@@ -347,7 +349,7 @@ mod tests {
                     enabled as i64,
                     utc_string(next_run_at),
                     last_run_for,
-                    json!({"time": time, "timezone": "Europe/Rome"}).to_string(),
+                    json!({"time": time, "timezone": timezone}).to_string(),
                     utc_string(Utc::now()),
                     user_id
                 ],
@@ -394,6 +396,7 @@ mod tests {
             &admin(&store),
             "daily",
             "08:00",
+            "Europe/Rome",
             true,
             Utc.with_ymd_and_hms(2026, 10, 1, 6, 0, 0).unwrap(),
             None,
@@ -416,6 +419,7 @@ mod tests {
             &admin(&store),
             "daily",
             "08:00",
+            "Europe/Rome",
             true,
             Utc.with_ymd_and_hms(2026, 10, 20, 6, 0, 0).unwrap(),
             Some("2026-10-20"),
@@ -436,6 +440,7 @@ mod tests {
             &admin(&store),
             "disabled",
             "08:00",
+            "Europe/Rome",
             false,
             Utc.with_ymd_and_hms(2026, 10, 1, 6, 0, 0).unwrap(),
             None,
@@ -454,6 +459,7 @@ mod tests {
             &admin(&store),
             "dst",
             "02:30",
+            "Europe/Rome",
             true,
             Utc.with_ymd_and_hms(2026, 3, 1, 0, 0, 0).unwrap(),
             None,
@@ -475,23 +481,16 @@ mod tests {
         let store = store();
         let admin = admin(&store);
         let now = Utc.with_ymd_and_hms(2026, 10, 28, 12, 0, 0).unwrap();
-        let connection = store.connection().unwrap();
-        connection
-            .execute(
-                "INSERT INTO routines(
-                    id, name, kind, enabled, next_run_at, last_run_for,
-                    config_json, created_at, updated_at, user_id
-                 ) VALUES (?1, ?2, 'daily', 1, ?3, NULL, ?4, ?5, ?5, ?6)",
-                params![
-                    new_id(),
-                    "tokyo_brief",
-                    utc_string(Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap()),
-                    json!({"time": "09:00", "timezone": "Asia/Tokyo"}).to_string(),
-                    utc_string(Utc::now()),
-                    admin
-                ],
-            )
-            .unwrap();
+        insert_routine(
+            &store,
+            &admin,
+            "tokyo_brief",
+            "09:00",
+            "Asia/Tokyo",
+            true,
+            Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap(),
+            None,
+        );
         let due = due_routines(&store, now, rome()).unwrap();
         assert!(
             due.iter().any(|routine| routine.name == "tokyo_brief"),
@@ -511,6 +510,7 @@ mod tests {
             &admin(&store),
             "dst",
             "02:30",
+            "Europe/Rome",
             true,
             Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap(),
             None,
@@ -543,6 +543,7 @@ mod tests {
             &admin,
             "morning_brief",
             "08:00",
+            "Europe/Rome",
             true,
             Utc.with_ymd_and_hms(2026, 10, 1, 6, 0, 0).unwrap(),
             None,
@@ -552,6 +553,7 @@ mod tests {
             &member.id,
             "morning_brief",
             "08:00",
+            "Europe/Rome",
             true,
             Utc.with_ymd_and_hms(2026, 10, 1, 6, 0, 0).unwrap(),
             None,
