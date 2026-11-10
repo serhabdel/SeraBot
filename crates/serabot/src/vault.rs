@@ -401,7 +401,8 @@ pub fn list_accounts(
             "SELECT {COLUMNS} FROM vault_entries WHERE user_id = ?1 ORDER BY name LIMIT {MAX_ENTRIES}"
         ))?;
         let rows = statement.query_map(params![user_id], row_to_entry)?;
-        rows.map(|row| finish_entry(row?)).collect::<Result<Vec<_>>>()?
+        rows.map(|row| finish_entry(row?))
+            .collect::<Result<Vec<_>>>()?
     };
     apply_last_resolve_from_audit(store, user_id, &mut entries)?;
     if let Some(filter) = domain.filter(|value| !value.trim().is_empty()) {
@@ -430,7 +431,8 @@ fn entry_matches_domain_domains(domains: &[String], filter: &str) -> bool {
     }
     domains.iter().any(|domain| {
         host_allowed(&[domain.clone()], &filter_host)
-            || normalize_host(domain).is_some_and(|host| host_allowed(&[filter_host.clone()], &host))
+            || normalize_host(domain)
+                .is_some_and(|host| host_allowed(&[filter_host.clone()], &host))
     })
 }
 

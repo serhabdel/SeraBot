@@ -19,11 +19,7 @@ pub(super) async fn list_vault(
     Extension(user): Extension<ActingUser>,
     Query(query): Query<ListVaultQuery>,
 ) -> Result<Json<Value>> {
-    let accounts = vault::list_accounts(
-        &state.users,
-        &user.id,
-        query.domain.as_deref(),
-    )?;
+    let accounts = vault::list_accounts(&state.users, &user.id, query.domain.as_deref())?;
     Ok(Json(serde_json::to_value(accounts)?))
 }
 

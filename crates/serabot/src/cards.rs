@@ -458,7 +458,10 @@ impl Store {
 
     /// Pending secret-request cards for the accounts view (Wave C2). Metadata
     /// only; capped so the vault page stays bounded.
-    pub fn list_pending_secret_cards(&self, user_id: &str) -> Result<Vec<crate::vault::VaultPendingSecret>> {
+    pub fn list_pending_secret_cards(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<crate::vault::VaultPendingSecret>> {
         use crate::vault::{VaultKind, VaultPendingSecret};
         const MAX_PENDING: usize = 32;
         let connection = self.connection()?;
@@ -468,7 +471,11 @@ impl Store {
              ORDER BY created_at ASC, id ASC LIMIT ?3"
         ))?;
         let rows = statement.query_map(
-            params![user_id, CardKind::SecretRequest.as_str(), MAX_PENDING as i64],
+            params![
+                user_id,
+                CardKind::SecretRequest.as_str(),
+                MAX_PENDING as i64
+            ],
             raw_card,
         )?;
         let mut pending = Vec::new();

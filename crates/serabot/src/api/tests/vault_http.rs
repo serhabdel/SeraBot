@@ -288,7 +288,10 @@ async fn vault_list_supports_domain_filter_and_pending_secrets() {
         .create_user("subject-vault-filter", "f@example.example", "Filter")
         .unwrap();
     let token = mint_for(&store, &user.id, "vault-filter");
-    for (name, domains) in [("mail", vec!["mail.google.com"]), ("bank", vec!["chase.com"])] {
+    for (name, domains) in [
+        ("mail", vec!["mail.google.com"]),
+        ("bank", vec!["chase.com"]),
+    ] {
         call(
             &app,
             &token,
@@ -303,17 +306,8 @@ async fn vault_list_supports_domain_filter_and_pending_secrets() {
         )
         .await;
     }
-    let filtered = read_json(
-        call(
-            &app,
-            &token,
-            "GET",
-            "/v1/vault?domain=google.com",
-            None,
-        )
-        .await,
-    )
-    .await;
+    let filtered =
+        read_json(call(&app, &token, "GET", "/v1/vault?domain=google.com", None).await).await;
     let names: Vec<_> = filtered["entries"]
         .as_array()
         .unwrap()

@@ -18,9 +18,8 @@ use crate::{
     BrowserProfile, BrowserSessionInfo, BrowserSessionsList, ConnectorUpdate, DEFAULT_PROFILE,
     MAX_VAULT_DOMAINS, MAX_VAULT_ENTRIES, MAX_VAULT_NOTE_CHARS, MAX_VAULT_USERNAME_CHARS,
     PasswordManager, PasswordManagerProbe, SigninHelperStatus, VaultAccounts, VaultEntry,
-    VaultKind, VaultPendingSecret, VaultPut,
-    VaultSource, normalize_vault_domain, valid_vault_name, valid_vault_reference,
-    validate_vault_put,
+    VaultKind, VaultPendingSecret, VaultPut, VaultSource, normalize_vault_domain, valid_vault_name,
+    valid_vault_reference, validate_vault_put,
 };
 use crate::{ComposioAccount, ComposioApp};
 use std::{
