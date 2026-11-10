@@ -9,20 +9,30 @@ owner's OK**.
 
 ## Post-merge tracker (2026-11-10)
 
-- **`main` tip** — `f8fd31f` after [PR #51](https://github.com/serhabdel/SeraBot/pull/51)
-  (A8 agent smoke record); [PR #50](https://github.com/serhabdel/SeraBot/pull/50)
-  (E1 quota meter, E2 Mem0 settings); [PR #48](https://github.com/serhabdel/SeraBot/pull/48)
-  (C5); C4–C1 chain on `main`.
+- **`main` tip** — `bca2c1b` after [PR #53](https://github.com/serhabdel/SeraBot/pull/53)
+  (desktop chat streaming scroll polish on #42); [PR #52](https://github.com/serhabdel/SeraBot/pull/52)
+  (tracker refresh); [PR #51](https://github.com/serhabdel/SeraBot/pull/51) (A8 agent smoke);
+  [PR #50](https://github.com/serhabdel/SeraBot/pull/50) (E1/E2); C5–C1 on `main`.
 - **Wave A** — [PR #37](https://github.com/serhabdel/SeraBot/pull/37) (0.29.0).
 - **Wave B** — [PR #39](https://github.com/serhabdel/SeraBot/pull/39)–#41;
   0.30.0 via [PR #43](https://github.com/serhabdel/SeraBot/pull/43).
 - **Wave C** — C1 [PR #38](https://github.com/serhabdel/SeraBot/pull/38); C2 #45;
   C3 #44; C4 [PR #46](https://github.com/serhabdel/SeraBot/pull/46); C5 #48;
   **C6** 0.31.0 gate on `main`.
-- **Chat deepen** — [PR #42](https://github.com/serhabdel/SeraBot/pull/42).
+- **Chat deepen** — [PR #42](https://github.com/serhabdel/SeraBot/pull/42); streaming scroll
+  polish [PR #53](https://github.com/serhabdel/SeraBot/pull/53) (`chat_scroll.rs`).
 
-**Big Wave program** — Waves A–C and **E1**/**E2** ([PR #50](https://github.com/serhabdel/SeraBot/pull/50))
-  are on `main`; **A8 owner smoke** remains (not a full program sign-off).
+**Big Wave program** — Waves A–C, **E1**/**E2**, and chat deepen (#42, #53) are on `main`;
+  **A8 owner smoke** (owner OIDC) remains (not a full program sign-off).
+
+### Wrap-up gate evidence @ `bca2c1b` (2026-11-10)
+
+Windows isolated target dirs (H: full; C: filled after check):
+
+| Layer | Result |
+| --- | --- |
+| `cargo check --workspace --all-targets --locked` | **Pass** (`CARGO_TARGET_DIR=C:\cargo-target-serabot-wrapup`, ~4m14s) |
+| `cargo test --workspace --locked` | **Pass** (`CARGO_TARGET_DIR=F:\cargo-target-serabot-wrapup`, ~7m49s) |
 
 ---
 
