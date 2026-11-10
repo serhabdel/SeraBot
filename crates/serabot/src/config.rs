@@ -1002,6 +1002,15 @@ pub struct WatcherConfig {
     /// Default false keeps the current always-notify behavior.
     #[serde(default)]
     pub silent_when_empty: bool,
+    /// Hostnames (or `*.suffix`) members may use when adding RSS feeds (B3).
+    #[serde(default)]
+    pub rss_allowlist_hosts: Vec<String>,
+    /// Failed `source_runs` older than this many hours may trigger recovery (B4).
+    #[serde(default = "default_reliability_failed_hours")]
+    pub reliability_failed_hours: u64,
+    /// Maximum recovery watch enqueues per user per UTC day (B4).
+    #[serde(default = "default_reliability_max_per_day")]
+    pub reliability_max_per_day: u32,
 }
 
 impl Default for WatcherConfig {
@@ -1013,6 +1022,9 @@ impl Default for WatcherConfig {
             max_response_bytes: default_fetch_bytes(),
             morning_brief_enabled: false,
             silent_when_empty: false,
+            rss_allowlist_hosts: Vec::new(),
+            reliability_failed_hours: default_reliability_failed_hours(),
+            reliability_max_per_day: default_reliability_max_per_day(),
         }
     }
 }
@@ -2531,6 +2543,12 @@ fn default_fetch_timeout() -> u64 {
 }
 fn default_fetch_bytes() -> usize {
     5 * 1024 * 1024
+}
+fn default_reliability_failed_hours() -> u64 {
+    48
+}
+fn default_reliability_max_per_day() -> u32 {
+    1
 }
 fn default_graph_base() -> String {
     "https://graph.microsoft.com/v1.0".into()

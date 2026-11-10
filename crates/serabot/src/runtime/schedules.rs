@@ -67,7 +67,7 @@ impl Runtime {
         let payload: ScheduledPayload = serde_json::from_value(task.payload.clone())
             .map_err(|error| SeraError::Validation(format!("invalid watch payload: {error}")))?;
         let user = task.user_id.clone();
-        let sources = crate::config::load_sources(&self.config)?;
+        let sources = crate::sources::effective_sources_for_user(&self.config, &self.store, &user)?;
         if sources.iter().all(|source| !source.enabled) {
             self.notifier
                 .send_text(
@@ -82,7 +82,8 @@ impl Runtime {
             self.config.watcher.user_agent.clone(),
             self.config.watcher.timeout_secs,
             self.config.watcher.max_response_bytes,
-        )?;
+        )?
+        .allow_hosts(crate::sources::watcher_allow_hosts(&self.config)?);
         let reports =
             crate::watcher::watch_all(&self.store, &user, &fetcher, &sources, &self.config).await?;
         let mut failures = 0;

@@ -71,6 +71,7 @@ mod profiles;
 mod routines;
 mod settings;
 mod skills;
+mod sources;
 mod status;
 mod tasks;
 #[cfg(test)]
@@ -98,6 +99,7 @@ use preview::*;
 use routines::*;
 use settings::*;
 use skills::*;
+use sources::*;
 use status::*;
 use tasks::*;
 use traces::*;
@@ -374,6 +376,12 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/tasks/calendar", get(calendar_events))
         .route("/v1/tasks/{id}", patch(patch_task).delete(delete_task))
+        .route("/v1/sources", get(list_sources))
+        .route("/v1/sources/rss", post(add_member_rss))
+        .route(
+            "/v1/sources/{name}",
+            patch(patch_source_enabled).delete(delete_member_source),
+        )
         .route("/v1/memories", get(list_memories).post(add_memory))
         .route("/v1/memories/stats", get(memory_stats))
         .route(

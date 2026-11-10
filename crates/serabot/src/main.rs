@@ -679,19 +679,7 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         config.watcher.timeout_secs,
         config.watcher.max_response_bytes,
     )?;
-    let mut source_hosts = std::collections::BTreeSet::new();
-    for source in serabot::config::load_sources(&config)? {
-        if let Ok(url) = url::Url::parse(&source.url)
-            && let Some(host) = url.host_str()
-        {
-            source_hosts.insert(host.to_ascii_lowercase());
-            if let Some(stripped) = host.strip_prefix("www.") {
-                source_hosts.insert(stripped.to_ascii_lowercase());
-            } else {
-                source_hosts.insert(format!("www.{}", host.to_ascii_lowercase()));
-            }
-        }
-    }
+    let source_hosts = serabot::sources::watcher_allow_hosts(&config)?;
     let fetcher = fetcher.allow_hosts(source_hosts);
     registry.register(FetchUrlTool::new(fetcher.clone()))?;
     registry.register(WatchNowTool::new(store.clone(), fetcher, config.clone()))?;
@@ -1070,6 +1058,31 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
                                 }
                             }
                             Err(error) => tracing::warn!(%error, "inbox indexing failed"),
+                        }
+                    }
+                }
+            }
+            Ok::<(), SeraError>(())
+        }));
+    }
+
+    {
+        let store = store.clone();
+        let config = config.clone();
+        let shutdown_reliability = shutdown.clone();
+        let tick = Duration::from_secs(config.schedule.tick_secs.max(60));
+        services.push(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tick);
+            loop {
+                tokio::select! {
+                    _ = shutdown_reliability.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Err(error) = serabot::reliability::enqueue_source_reliability_recoveries(
+                            &store,
+                            &config,
+                            chrono::Utc::now(),
+                        ) {
+                            tracing::warn!(%error, "reliability enqueue failed");
                         }
                     }
                 }

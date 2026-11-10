@@ -230,7 +230,11 @@ impl Tool for WatchNowTool {
     }
 
     async fn execute(&self, args: Value, context: &ToolContext) -> Result<ToolOutput> {
-        let mut sources = crate::config::load_sources(&self.config)?;
+        let mut sources = crate::sources::effective_sources_for_user(
+            &self.config,
+            &self.store,
+            &context.user_id,
+        )?;
         if let Some(name) = args.get("source").and_then(Value::as_str) {
             sources.retain(|source| source.name == name);
             if sources.is_empty() {

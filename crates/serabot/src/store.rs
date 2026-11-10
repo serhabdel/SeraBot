@@ -71,6 +71,7 @@ const MIGRATION_29: &str = include_str!("../migrations/0029_media_jobs.sql");
 const MIGRATION_30: &str = include_str!("../migrations/0030_user_turn_limits.sql");
 const MIGRATION_31: &str = include_str!("../migrations/0031_media_job_finishing.sql");
 const MIGRATION_32: &str = include_str!("../migrations/0032_user_tasks.sql");
+const MIGRATION_33: &str = include_str!("../migrations/0033_user_sources.sql");
 
 /// Fixed admin id written by migration 0008 and mirrored in
 /// `kv['admin_user_id']`. Code resolves the admin through the kv entry (the
@@ -640,6 +641,11 @@ impl Store {
         if version < 32 {
             connection.execute_batch(MIGRATION_32)?;
             connection.pragma_update(None, "user_version", 32)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 33 {
+            connection.execute_batch(MIGRATION_33)?;
+            connection.pragma_update(None, "user_version", 33)?;
         }
         // VACUUM INTO (backups) may renumber rowids; rebuild the external-content
         // FTS index only when its row count no longer matches `memories`.
@@ -4080,6 +4086,168 @@ impl Store {
         )?)
     }
 
+    /// Active account ids (for cross-user maintenance such as reliability enqueue).
+    pub fn list_active_user_ids(&self) -> Result<Vec<String>> {
+        let connection = self.connection()?;
+        let mut statement =
+            connection.prepare("SELECT id FROM users WHERE status = 'active' ORDER BY id ASC")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Per-user watcher overlay rows (B3).
+    pub fn list_user_sources(&self, user_id: &str) -> Result<Vec<UserSourceRow>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT name, origin, url, kind, enabled
+             FROM user_sources WHERE user_id = ?1 ORDER BY name ASC",
+        )?;
+        let rows = statement.query_map(params![user_id], |row| {
+            Ok(UserSourceRow {
+                name: row.get(0)?,
+                origin: row.get(1)?,
+                url: row.get(2)?,
+                kind: row.get(3)?,
+                enabled: row.get::<_, i64>(4)? != 0,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn upsert_user_source_overlay(
+        &self,
+        user_id: &str,
+        name: &str,
+        enabled: bool,
+        kind: &str,
+    ) -> Result<()> {
+        if name.trim().is_empty() || name.chars().count() > 128 {
+            return Err(SeraError::Validation("invalid source name".into()));
+        }
+        let now = now_string();
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE user_sources
+             SET enabled = ?1, updated_at = ?2
+             WHERE user_id = ?3 AND name = ?4 AND origin = 'overlay'",
+            params![enabled as i64, now, user_id, name],
+        )?;
+        if changed == 0 {
+            connection.execute(
+                "INSERT INTO user_sources(
+                    id, user_id, name, origin, url, kind, enabled, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 'overlay', NULL, ?4, ?5, ?6, ?6)",
+                params![new_id(), user_id, name, kind, enabled as i64, now],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn add_member_rss_source(&self, user_id: &str, name: &str, url: &str) -> Result<()> {
+        if name.trim().is_empty() || name.chars().count() > 128 {
+            return Err(SeraError::Validation("invalid source name".into()));
+        }
+        let now = now_string();
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO user_sources(
+                id, user_id, name, origin, url, kind, enabled, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'member', ?4, 'rss', 1, ?5, ?5)",
+            params![new_id(), user_id, name, url, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_member_rss_source(&self, user_id: &str, name: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "DELETE FROM user_sources WHERE user_id = ?1 AND name = ?2 AND origin = 'member'",
+            params![user_id, name],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Latest run still failing before `cutoff` for one of the configured source names.
+    pub fn user_has_stale_failed_sources(
+        &self,
+        user_id: &str,
+        source_names: &[String],
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        if source_names.is_empty() {
+            return Ok(false);
+        }
+        let connection = self.connection()?;
+        let cutoff = cutoff.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        for name in source_names {
+            let failed: Option<i64> = connection
+                .query_row(
+                    "SELECT ok FROM source_runs
+                     WHERE user_id = ?1 AND source = ?2
+                     ORDER BY started_at DESC LIMIT 1",
+                    params![user_id, name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(ok) = failed else {
+                continue;
+            };
+            if ok != 0 {
+                continue;
+            }
+            let started: String = connection.query_row(
+                "SELECT started_at FROM source_runs
+                 WHERE user_id = ?1 AND source = ?2
+                 ORDER BY started_at DESC LIMIT 1",
+                params![user_id, name],
+                |row| row.get(0),
+            )?;
+            if started <= cutoff {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn reliability_enqueue_count_today(
+        &self,
+        user_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u32> {
+        let day_start = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
+        let day_start =
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(day_start, chrono::Utc);
+        let start = day_start.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let connection = self.connection()?;
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM reliability_enqueues
+             WHERE user_id = ?1 AND enqueued_at >= ?2",
+            params![user_id, start],
+            |row| row.get(0),
+        )?;
+        Ok(count as u32)
+    }
+
+    pub fn record_reliability_enqueue(
+        &self,
+        user_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        trigger_source: Option<&str>,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO reliability_enqueues(id, user_id, enqueued_at, trigger_source)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                new_id(),
+                user_id,
+                now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                trigger_source,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Create a consistent SQLite backup without overwriting an existing file.
     pub fn backup_to(&self, destination: &Path) -> Result<()> {
         if destination.exists() {
@@ -4096,6 +4264,16 @@ impl Store {
         connection.execute("VACUUM INTO ?1", params![destination.to_string_lossy()])?;
         Ok(())
     }
+}
+
+/// One per-user watcher overlay row (B3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserSourceRow {
+    pub name: String,
+    pub origin: String,
+    pub url: Option<String>,
+    pub kind: String,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5075,7 +5253,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 32);
+        assert_eq!(version, 33);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -5140,7 +5318,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 32);
+        assert_eq!(version, 33);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -5214,7 +5392,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 32);
+        assert_eq!(version, 33);
         let admin = admin(&store);
         let memory = crate::memory::get(&store, &admin, "mem-legacy").unwrap();
         assert_eq!(memory.origin, "explicit");
@@ -5303,7 +5481,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 32);
+        assert_eq!(version, 33);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -5434,7 +5612,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 32);
+        assert_eq!(version, 33);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -5589,7 +5767,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 32);
+        assert_eq!(version, 33);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.

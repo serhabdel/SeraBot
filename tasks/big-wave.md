@@ -7,16 +7,13 @@ Spec: `docs/specs/big-wave.md` (owner-approved 2026-11-09). Prior release:
 before each wave commit. Push after each wave gate; **never merge without the
 owner's OK**.
 
-## Post-merge tracker (2026-11-09)
+## Post-merge tracker (2026-11-10)
 
 - **Wave A shipped** — merged to `main` via [PR #37](https://github.com/serhabdel/SeraBot/pull/37)
   (`origin/main` @ `a8157b4`, includes release tip `3208a1a`).
-- **Wave B integration branch** — `recover/wave-b-wip` rebased onto post-0.29
-  `origin/main` (`a8157b42`); B1/B2 integration rebased @ `41c198d` (remote tip
-  advancing, draft PR #39). Clippy hygiene on recover tracked locally.
-- **Wave B slices** — `feat/big-wave-b3b4` @ `be67c20` (rebased on `8e33d66`,
-  one commit behind `fb0ca48` — rebase onto `origin/recover/wave-b-wip` before
-  merge); `feat/big-wave-b5-b6` @ `726c711` (same); local only until gated.
+- **Wave B integration** — [PR #39](https://github.com/serhabdel/SeraBot/pull/39)
+  merged (`d5b52f7`); B1/B2 on `main`. [PR #40](https://github.com/serhabdel/SeraBot/pull/40)
+  merged B5/B6 (`a1c3d8a`). **B3/B4** landing via PR #41 (rebased onto `main`).
 - **Wave C draft** — `feat/big-wave-c1` rebased onto `main` @ `7f1a1c4`
   (PR #38 was **closed** on GitHub; reopen or open a new PR when ready).
 - **Worktree hygiene** — `H:/source/SeraBot-wt/big-wave-c1` still has an
@@ -87,21 +84,20 @@ vault probe.
 
 ## Wave B — Reliable circle (0.30.0)
 
-_Base: `recover/wave-b-wip` @ `fb0ca48` (rebased 2026-11-09)._
+_Base: Wave B B1–B2 on `main` via PR #39; B5–B6 via PR #40._
 
-- [ ] **B1** Per-user routine CRUD — enable/disable/schedule for self; enqueue
-      to member default conversation (not hardcoded `"owner"`).
-      - Files: `scheduler.rs`, `store.rs`, `api/routines.rs`, `config.rs`.
-      - Owner decision: default conversation target before merge.
-- [ ] **B2** Merge watch into routines UX — one Workflows screen for brief,
-      watch times, manual “Run all sources”.
-- [ ] **B3** Per-user source overlay (v1) — allowlisted subset/add RSS;
-      `SafeFetcher` + policy only.
-- [ ] **B4** Reliability enqueue rules — failed `source_runs` → one capped
-      watch/event enqueue; no LLM loop.
-- [x] **B5** Standing grants API + UI — list/revoke for acting user; audit revoke.
+- [x] **B1** Per-user routine CRUD — `PUT /v1/routines`, member default
+      conversation enqueue (PR #39).
+- [x] **B2** Merge watch into routines UX — Workflows schedule panel
+      (`workflows.rs`, `ui_workflows.rs`, PR #39).
+- [x] **B3** Per-user source overlay (v1) — `GET/PATCH/POST/DELETE /v1/sources`;
+      HTTP tests in `big_wave_b3_b4.rs` (PR #41).
+- [x] **B4** Reliability enqueue rules — `reliability.rs` + migration `0033`;
+      capped daily `reliability_enqueues` (PR #41).
+- [x] **B5** Standing grants API + UI — list/revoke for acting user; audit revoke
+      (PR #40).
 - [x] **B6** Jobs panel stuck/unknown — uncertain tasks, `outcome_unknown`
-      actions; link to A5 traces.
+      actions; link to A5 traces (PR #40).
 
 ### Wave B gate
 
