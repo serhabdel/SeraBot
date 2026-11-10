@@ -315,7 +315,14 @@ mod tests {
     use super::*;
 
     fn store() -> Store {
-        Store::open_in_memory(384).unwrap()
+        // File-backed pool (max 8) avoids r2d2 exhaustion in `due_routines`, which
+        // holds one connection for the whole claim loop while helpers may need another.
+        Store::open(
+            std::env::temp_dir().join(format!("serabot-scheduler-test-{}.db", new_id())),
+            384,
+            5000,
+        )
+        .unwrap()
     }
 
     /// The acting user for the scheduled routines.
