@@ -9,16 +9,19 @@ owner's OK**.
 
 ## Post-merge tracker (2026-11-10)
 
-- **`main` tip** — `b7e2c2e` after [PR #45](https://github.com/serhabdel/SeraBot/pull/45)
-  (C2 vault accounts), [PR #44](https://github.com/serhabdel/SeraBot/pull/44)
-  (C3 presets), [PR #43](https://github.com/serhabdel/SeraBot/pull/43) (0.30.0).
+- **`main` tip** — `f55e941` after [PR #48](https://github.com/serhabdel/SeraBot/pull/48)
+  (C5 Flutter Workflows/traces); [PR #47](https://github.com/serhabdel/SeraBot/pull/47)
+  (tracker/docs); C4–C1 chain on `main`.
 - **Wave A** — [PR #37](https://github.com/serhabdel/SeraBot/pull/37) (0.29.0).
-- **Wave B** — [PR #39](https://github.com/serhabdel/SeraBot/pull/39),
-  [PR #40](https://github.com/serhabdel/SeraBot/pull/40),
-  [PR #41](https://github.com/serhabdel/SeraBot/pull/41); 0.30.0 via #43.
-- **Wave C** — C1 [PR #38](https://github.com/serhabdel/SeraBot/pull/38);
-  C2 #45; C3 #44; C4 [PR #46](https://github.com/serhabdel/SeraBot/pull/46) open.
+- **Wave B** — [PR #39](https://github.com/serhabdel/SeraBot/pull/39)–#41;
+  0.30.0 via [PR #43](https://github.com/serhabdel/SeraBot/pull/43).
+- **Wave C** — C1 [PR #38](https://github.com/serhabdel/SeraBot/pull/38); C2 #45;
+  C3 #44; C4 [PR #46](https://github.com/serhabdel/SeraBot/pull/46); C5 #48;
+  **C6** 0.31.0 gate (this branch).
 - **Chat deepen** — [PR #42](https://github.com/serhabdel/SeraBot/pull/42).
+
+**Big Wave program** — Waves A–C features are on `main` after C6; **A8 smoke**,
+**E1**, and **E2** remain (not a full program sign-off).
 
 ---
 
@@ -42,6 +45,20 @@ one active plan, vault Test OK, one browser tool in traces without secrets.
 
 ---
 
+## C6 — Wave C gate checklist (0.31.0)
+
+Automated expectations before merge; owner OK required.
+
+| Layer | Command / CI | Notes |
+| --- | --- | --- |
+| Rust workspace | `cargo check --workspace --all-targets`, `cargo test --workspace --locked` | `scripts\cargo-win.bat` on Windows; WSL fmt + clippy `-D warnings` before commit. |
+| Desktop client | `clients.yml` → `desktop` job | `cargo check/test -p serabot-desktop` on Ubuntu + Windows; Windows release exe artifact. |
+| Flutter (C5) | `clients.yml` → `mobile` job | `flutter analyze`, `flutter test`, debug APK upload, **release APK compile check** on PR/`main` — no local Android SDK required (`docs/mobile-client.md`). |
+
+Release notes: `docs/release-0.31.0.md`.
+
+---
+
 ## Wave A — See the machine (0.29.0)
 
 - [x] **A1**–**A7**, **A4** desktop Workflows tab — PR #37.
@@ -62,10 +79,10 @@ one active plan, vault Test OK, one browser tool in traces without secrets.
 - [x] **C1** Browser console upgrades — PR #38.
 - [x] **C2** Vault accounts view — PR #45.
 - [x] **C3** Autonomy presets — PR #44.
-- [ ] **C4** Admin reliability dashboard — PR #46 (scheduler/source counts on
-      Usage server card).
-- [x] **C5** Flutter Workflows + traces — read-only parity with desktop.
-- [ ] **C6** Phase gate; `flutter analyze` / `flutter test` when C5 lands.
+- [x] **C4** Admin reliability dashboard — PR #46.
+- [x] **C5** Flutter Workflows + traces — PR #48.
+- [x] **C6** Phase gate — workspace 0.31.0; Rust + `clients.yml` Flutter gate
+      (see checklist above).
 
 ---
 
@@ -75,7 +92,7 @@ one active plan, vault Test OK, one browser tool in traces without secrets.
       UI tile still TODO (near-limit thresholds in config / store quotas).
 - [ ] **E2** Mem0 provider — documented in `docs/memory.md`; optional Settings
       toggle when `[memory] provider = "mem0"` still TODO.
-- [x] **E3** `docs/README.md` index row for Big Wave spec (this pass).
+- [x] **E3** `docs/README.md` index row for Big Wave spec (PR #47).
 
 ---
 
