@@ -6187,13 +6187,17 @@ html[data-reduce-transparency="true"] .chat-header {
   gap: 3px;
 }
 
+.working-text {
+  transition: opacity var(--dur-fade) var(--ease);
+}
+
 .working-dots span {
   width: 5px;
   height: 5px;
   border-radius: 50%;
   background: currentColor;
   opacity: 0.3;
-  animation: working-pulse 1.4s ease-in-out infinite;
+  animation: working-pulse 1.4s var(--spring) infinite;
 }
 
 .working-dots span:nth-child(2) {
@@ -6208,11 +6212,11 @@ html[data-reduce-transparency="true"] .chat-header {
   0%,
   100% {
     opacity: 0.25;
-    transform: translateY(0);
+    transform: translateY(0) scale(1);
   }
   50% {
-    opacity: 0.9;
-    transform: translateY(-2px);
+    opacity: 0.92;
+    transform: translateY(-2px) scale(1.08);
   }
 }
 
