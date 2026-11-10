@@ -1080,7 +1080,7 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
             .map(Reply::TurnLimits),
         Operation::ResetTurnLimits => client.reset_turn_limits().map(Reply::TurnLimits),
         Operation::MemorySettings => client.memory_settings().map(Reply::MemorySettings),
-        Operation::SetMem0Key { key } => client.set_mem0_key(&key).map(|_| Reply::Mem0KeySaved),
+        Operation::SetMem0Key { key } => client.set_mem0_key(key).map(|_| Reply::Mem0KeySaved),
         Operation::DeleteMem0Key => client.delete_mem0_key().map(|_| Reply::Mem0KeyDeleted),
         Operation::TranscribeAudio { filename, bytes } => client
             .transcribe_audio(filename, bytes)
