@@ -11,6 +11,7 @@ pub mod chat_cards;
 pub mod chat_compose;
 pub mod chat_feed;
 pub mod chat_plan;
+pub mod chat_scroll;
 pub mod composio_flow;
 pub mod connector_card;
 pub mod creds;
