@@ -16,10 +16,10 @@
 
 use crate::ui::{ChatView, Icon, Overlay, avatar_style};
 use dioxus::prelude::*;
+use serabot_desktop::SigninHelperStatus;
 use serabot_desktop::panel::{
     address_to_url, host_label, idle_label, idle_timeout_label, profile_users, tab_count_label,
 };
-use serabot_desktop::SigninHelperStatus;
 use serabot_desktop::session::{Section, Session};
 use serabot_desktop::{
     BrowserController, BrowserHistory, BrowserInput, BrowserPointer, BrowserSessionInfo,

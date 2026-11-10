@@ -484,8 +484,8 @@ impl BrowserManager {
 
     async fn info_of(session: &Arc<Session>) -> BrowserInfo {
         let page = session.backend.info().await.unwrap_or_default();
-        let (controller, updated_at, bot, conversation_id, idle, last_nav_host) =
-            session.with_state(|state| {
+        let (controller, updated_at, bot, conversation_id, idle, last_nav_host) = session
+            .with_state(|state| {
                 (
                     state.controller,
                     state.updated_at,
@@ -719,10 +719,7 @@ mod tests {
     #[tokio::test]
     async fn navigation_host_is_recorded_on_bot_navigate() {
         let (manager, _) = manager_with(4, Duration::from_secs(600));
-        let lease = manager
-            .bot_lease("alice", D, true, None)
-            .await
-            .unwrap();
+        let lease = manager.bot_lease("alice", D, true, None).await.unwrap();
         lease
             .backend()
             .navigate("https://shop.example/items")
