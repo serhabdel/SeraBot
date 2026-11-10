@@ -32,7 +32,12 @@ async fn sources_overlay_is_uid_scoped() {
 
     let response = app
         .clone()
-        .oneshot(request_with_token("GET", "/v1/sources", &member_token, None))
+        .oneshot(request_with_token(
+            "GET",
+            "/v1/sources",
+            &member_token,
+            None,
+        ))
         .await
         .unwrap();
     let body = read_json(response).await;

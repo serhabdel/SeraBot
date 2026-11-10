@@ -25,7 +25,8 @@ pub fn enqueue_source_reliability_recoveries(
     let cutoff = now - Duration::hours(hours as i64);
     let mut enqueued = 0usize;
     for user_id in store.list_active_user_ids()? {
-        if store.reliability_enqueue_count_today(&user_id, now)? >= config.watcher.reliability_max_per_day
+        if store.reliability_enqueue_count_today(&user_id, now)?
+            >= config.watcher.reliability_max_per_day
         {
             continue;
         }
@@ -104,7 +105,8 @@ mod tests {
             .upsert_user_source_overlay(&admin, &source_name, true, kind)
             .unwrap();
         let now = Utc::now();
-        let old = (now - chrono::Duration::hours(72)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let old = (now - chrono::Duration::hours(72))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         store
             .connection()
             .unwrap()

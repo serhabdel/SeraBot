@@ -82,10 +82,9 @@ pub fn merge_sources(
         if row.origin != "member" {
             continue;
         }
-        let url = row
-            .url
-            .as_deref()
-            .ok_or_else(|| SeraError::Internal(format!("member source {} missing url", row.name)))?;
+        let url = row.url.as_deref().ok_or_else(|| {
+            SeraError::Internal(format!("member source {} missing url", row.name))
+        })?;
         effective.push(SourceConfig {
             name: row.name.clone(),
             url: url.to_owned(),
@@ -120,7 +119,9 @@ pub fn validate_member_rss_url(config: &Config, url: &str) -> Result<String> {
         return Err(SeraError::Validation("member RSS must use https".into()));
     }
     if parsed.username() != "" || parsed.password().is_some() {
-        return Err(SeraError::Validation("url must not embed credentials".into()));
+        return Err(SeraError::Validation(
+            "url must not embed credentials".into(),
+        ));
     }
     let host = parsed
         .host_str()
@@ -159,8 +160,8 @@ fn host_matches(allowed: &str, host: &str) -> bool {
 }
 
 fn extend_host_aliases(hosts: &mut BTreeSet<String>, url: &str) -> Result<()> {
-    let parsed = Url::parse(url)
-        .map_err(|_| SeraError::Config(format!("invalid source url: {url}")))?;
+    let parsed =
+        Url::parse(url).map_err(|_| SeraError::Config(format!("invalid source url: {url}")))?;
     let Some(host) = parsed.host_str() else {
         return Err(SeraError::Config(format!("source url missing host: {url}")));
     };
@@ -237,5 +238,4 @@ mod tests {
         let config = Config::load(root).unwrap();
         assert!(validate_member_rss_url(&config, "https://evil.example/feed").is_err());
     }
-
 }

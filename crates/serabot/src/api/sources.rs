@@ -18,7 +18,8 @@ pub(super) async fn list_sources(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
 ) -> Result<Json<Value>> {
-    let sources = crate::sources::effective_sources_for_user(&state.config, &state.store, &user.id)?;
+    let sources =
+        crate::sources::effective_sources_for_user(&state.config, &state.store, &user.id)?;
     let rows = sources
         .into_iter()
         .map(|source| {
@@ -80,8 +81,13 @@ pub(super) async fn add_member_rss(
         .gateway()
         .scan_egress(&user.id, &url)
         .map_err(|_| SeraError::Validation("url blocked by policy".into()))?;
-    match state.store.add_member_rss_source(&user.id, &body.name, &url) {
-        Ok(()) => Ok(Json(json!({"name": body.name, "url": url, "kind": "rss", "enabled": true}))),
+    match state
+        .store
+        .add_member_rss_source(&user.id, &body.name, &url)
+    {
+        Ok(()) => Ok(Json(
+            json!({"name": body.name, "url": url, "kind": "rss", "enabled": true}),
+        )),
         Err(SeraError::Database(rusqlite::Error::SqliteFailure(err, _)))
             if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
         {

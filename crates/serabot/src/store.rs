@@ -4143,12 +4143,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn add_member_rss_source(
-        &self,
-        user_id: &str,
-        name: &str,
-        url: &str,
-    ) -> Result<()> {
+    pub fn add_member_rss_source(&self, user_id: &str, name: &str, url: &str) -> Result<()> {
         if name.trim().is_empty() || name.chars().count() > 128 {
             return Err(SeraError::Validation("invalid source name".into()));
         }
@@ -4220,10 +4215,8 @@ impl Store {
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<u32> {
         let day_start = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
-        let day_start = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-            day_start,
-            chrono::Utc,
-        );
+        let day_start =
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(day_start, chrono::Utc);
         let start = day_start.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let connection = self.connection()?;
         let count: i64 = connection.query_row(

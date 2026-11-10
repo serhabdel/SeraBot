@@ -67,8 +67,7 @@ impl Runtime {
         let payload: ScheduledPayload = serde_json::from_value(task.payload.clone())
             .map_err(|error| SeraError::Validation(format!("invalid watch payload: {error}")))?;
         let user = task.user_id.clone();
-        let sources =
-            crate::sources::effective_sources_for_user(&self.config, &self.store, &user)?;
+        let sources = crate::sources::effective_sources_for_user(&self.config, &self.store, &user)?;
         if sources.iter().all(|source| !source.enabled) {
             self.notifier
                 .send_text(

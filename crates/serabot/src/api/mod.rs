@@ -378,7 +378,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/tasks/{id}", patch(patch_task).delete(delete_task))
         .route("/v1/sources", get(list_sources))
         .route("/v1/sources/rss", post(add_member_rss))
-        .route("/v1/sources/{name}", patch(patch_source_enabled).delete(delete_member_source))
+        .route(
+            "/v1/sources/{name}",
+            patch(patch_source_enabled).delete(delete_member_source),
+        )
         .route("/v1/memories", get(list_memories).post(add_memory))
         .route("/v1/memories/stats", get(memory_stats))
         .route(
