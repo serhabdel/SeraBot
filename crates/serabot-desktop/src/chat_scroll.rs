@@ -149,8 +149,14 @@ mod tests {
 
     #[test]
     fn pin_script_matches_bridge_entrypoint() {
-        assert_eq!(pin_messages_js(true), "window.__serabotPinMessages?.(true);");
-        assert_eq!(pin_messages_js(false), "window.__serabotPinMessages?.(false);");
+        assert_eq!(
+            pin_messages_js(true),
+            "window.__serabotPinMessages?.(true);"
+        );
+        assert_eq!(
+            pin_messages_js(false),
+            "window.__serabotPinMessages?.(false);"
+        );
     }
 
     #[test]
