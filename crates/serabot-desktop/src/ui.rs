@@ -31,8 +31,8 @@ use crate::ui_connectors::ConnectorsView;
 use crate::ui_dock::BrowserDock;
 use crate::ui_files::{
     CHAT_SCROLL_BRIDGE_JS, COMPOSER_CARET_BRIDGE_JS, COMPOSER_CARET_SETUP_JS, CONFIRM_RESET_JS,
-    ComposerFiles, MediaCards,
-    MessageFiles, PASTE_BRIDGE_JS, PastedFile, copy_script, decode_pasted,
+    ComposerFiles, MediaCards, MessageFiles, PASTE_BRIDGE_JS, PastedFile, copy_script,
+    decode_pasted,
 };
 use crate::ui_settings::SettingsPanel;
 use crate::ui_settings_page::{
@@ -640,8 +640,7 @@ fn App() -> Element {
             #[cfg(windows)]
             {
                 let wake = session.read().ui_wake.clone();
-                let mut saw_wake =
-                    wake.swap(false, std::sync::atomic::Ordering::AcqRel);
+                let mut saw_wake = wake.swap(false, std::sync::atomic::Ordering::AcqRel);
                 if !saw_wake {
                     for _ in 0..IDLE_POLLS {
                         tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
