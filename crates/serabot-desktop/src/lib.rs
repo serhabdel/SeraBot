@@ -18,7 +18,6 @@ pub mod events;
 pub mod file_icons;
 pub mod jobs;
 pub mod jobs_reliability;
-pub mod standing_grants;
 pub mod local_folders;
 pub mod local_fs;
 pub mod local_xfer;
@@ -33,6 +32,7 @@ pub mod provider_presets;
 pub mod provider_view;
 pub mod session;
 pub mod signin;
+pub mod standing_grants;
 pub mod state;
 pub mod status_view;
 pub mod teams;
@@ -40,8 +40,8 @@ pub mod ui_highlight;
 pub mod updater;
 pub mod vault_import;
 pub mod worker;
-pub mod working;
 pub mod workflows;
+pub mod working;
 pub use api::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
