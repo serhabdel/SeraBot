@@ -36,8 +36,8 @@ use crate::ui_files::{
 };
 use crate::ui_settings::SettingsPanel;
 use crate::ui_settings_page::{
-    AboutCard, AppearanceCard, ChatPrefsCard, LocalFoldersCard, NotificationsCard, SettingsNav,
-    TurnLimitsCard, WebSearchCard,
+    AboutCard, AppearanceCard, ChatPrefsCard, LocalFoldersCard, Mem0RecallCard, NotificationsCard,
+    SettingsNav, TurnLimitsCard, WebSearchCard,
 };
 use crate::ui_usage::UsagePage;
 use crate::ui_vault::VaultPage;
@@ -6452,6 +6452,9 @@ fn SettingsView(session: Signal<Session>) -> Element {
         }
         if sel == SettingsSection::WebSearch {
             WebSearchCard { session }
+        }
+        if sel == SettingsSection::Memory {
+            Mem0RecallCard { session }
         }
         if sel == SettingsSection::LocalFolders {
             LocalFoldersCard { session }

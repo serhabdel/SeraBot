@@ -76,6 +76,91 @@ pub(super) async fn memory_stats(
     Ok(Json(json!({"stats": stats})))
 }
 
+/// Console-safe memory configuration for the acting user: provider name and
+/// whether a Mem0 key is saved (never the key itself).
+pub(super) async fn memory_settings(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    let provider = state.config.memory.provider.clone();
+    let mem0_available = provider == "mem0";
+    let mem0_configured = mem0_available
+        && state
+            .users
+            .credential_status(&user.id, crate::mem0::CREDENTIAL_ID)?
+            .usable();
+    Ok(Json(json!({
+        "provider": provider,
+        "mem0": {
+            "available": mem0_available,
+            "configured": mem0_configured,
+        },
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SetMem0KeyRequest {
+    api_key: String,
+}
+
+/// Save the acting user's Mem0 API key. Only when `[memory] provider = "mem0"`.
+pub(super) async fn set_mem0_key(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Json(request): Json<SetMem0KeyRequest>,
+) -> Result<Json<Value>> {
+    if state.config.memory.provider != "mem0" {
+        return Err(SeraError::Validation(
+            "Mem0 is not enabled on this server".into(),
+        ));
+    }
+    crate::user_secrets::validate_value(request.api_key.trim())?;
+    let credential = crate::user_secrets::ProviderCredential {
+        api_key: request.api_key.trim().to_owned(),
+        refresh_token: String::new(),
+        ..Default::default()
+    };
+    state
+        .users
+        .set(&user.id, crate::mem0::CREDENTIAL_ID, &credential.encode()?)?;
+    state.store.record_audit(
+        &user.id,
+        "memory.mem0.configured",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        None,
+    )?;
+    Ok(Json(json!({"configured": true})))
+}
+
+/// Remove the acting user's Mem0 key. Local memories are unchanged.
+pub(super) async fn delete_mem0_key(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+) -> Result<Json<Value>> {
+    if state.config.memory.provider != "mem0" {
+        return Err(SeraError::Validation(
+            "Mem0 is not enabled on this server".into(),
+        ));
+    }
+    let deleted = state.users.delete(&user.id, crate::mem0::CREDENTIAL_ID)?;
+    state.store.record_audit(
+        &user.id,
+        "memory.mem0.cleared",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({"deleted": deleted})),
+    )?;
+    Ok(Json(json!({"configured": false, "deleted": deleted})))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AddMemoryRequest {

@@ -4035,6 +4035,23 @@ impl Store {
         self.get_task(user_id, &id)
     }
 
+    /// Tasks the acting user enqueued since UTC midnight today. Matches the
+    /// window enforced by [`Store::enqueue_task_with_quota`].
+    pub fn daily_task_count(&self, user_id: &str) -> Result<i64> {
+        let now = utc_now();
+        let day_start = now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is a valid time")
+            .and_utc();
+        let connection = self.connection()?;
+        Ok(connection.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE user_id = ?1 AND created_at >= ?2",
+            params![user_id, to_string(day_start)],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Tasks of the acting user still in flight.
     pub fn pending_task_count(&self, user_id: &str) -> Result<i64> {
         let connection = self.connection()?;

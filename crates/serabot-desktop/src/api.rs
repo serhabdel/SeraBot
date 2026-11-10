@@ -954,6 +954,25 @@ pub struct UsageTool {
     pub failed: i64,
 }
 
+/// Daily task quota slice on `GET /v1/usage`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct UsageDailyTaskQuota {
+    #[serde(default)]
+    pub used: i64,
+    #[serde(default)]
+    pub limit: u64,
+    #[serde(default)]
+    pub near_limit: bool,
+    #[serde(default)]
+    pub at_limit: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct UsageQuota {
+    #[serde(default)]
+    pub daily_tasks: UsageDailyTaskQuota,
+}
+
 /// Report of `GET /v1/usage?days=&bot=&conversation_id=`.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct UsageReport {
@@ -967,6 +986,25 @@ pub struct UsageReport {
     pub per_model: Vec<UsageModel>,
     #[serde(default)]
     pub tools: Vec<UsageTool>,
+    #[serde(default)]
+    pub quota: UsageQuota,
+}
+
+/// `GET /v1/memory/settings` — provider name and Mem0 key status only.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct MemorySettingsView {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub mem0: Mem0SettingsView,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct Mem0SettingsView {
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub configured: bool,
 }
 
 /// Process numbers of `GET /v1/admin/status`.
@@ -2528,6 +2566,53 @@ impl ApiClient {
             None::<&()>,
         )
     }
+
+    /// `GET /v1/memory/settings`: Mem0 availability and key status for the
+    /// acting user (never the key itself).
+    pub fn memory_settings(&self) -> Result<MemorySettingsView, ApiError> {
+        self.request(Method::GET, &["v1", "memory", "settings"], &[], None::<&()>)
+    }
+
+    /// `PUT /v1/memory/mem0/key` when the server has `memory.provider = "mem0"`.
+    pub fn set_mem0_key(&self, api_key: &str) -> Result<(), ApiError> {
+        let key = api_key.trim();
+        if key.is_empty() {
+            return Err(ApiError::Validation("Mem0 API key is empty."));
+        }
+        #[derive(Deserialize)]
+        struct Saved {
+            configured: bool,
+        }
+        let saved: Saved = self.request(
+            Method::PUT,
+            &["v1", "memory", "mem0", "key"],
+            &[],
+            Some(&serde_json::json!({ "api_key": key })),
+        )?;
+        if !saved.configured {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(())
+    }
+
+    /// `DELETE /v1/memory/mem0/key`.
+    pub fn delete_mem0_key(&self) -> Result<(), ApiError> {
+        #[derive(Deserialize)]
+        struct Cleared {
+            configured: bool,
+        }
+        let cleared: Cleared = self.request(
+            Method::DELETE,
+            &["v1", "memory", "mem0", "key"],
+            &[],
+            None::<&()>,
+        )?;
+        if cleared.configured {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(())
+    }
+
     /// `PUT /v1/conversations/{id}/thinking`: set the conversation's thinking
     /// level (`None` goes back to the model's default).
     pub fn set_thinking(
@@ -5109,7 +5194,12 @@ fn check_usage_report(report: UsageReport) -> Result<UsageReport, ApiError> {
         report.totals.completion_tokens,
         report.totals.total_tokens,
     );
+    let quota_ok = report.quota.daily_tasks.limit == 0
+        || (report.quota.daily_tasks.used >= 0
+            && report.quota.daily_tasks.limit > 0
+            && report.quota.daily_tasks.limit <= 10_000);
     let bad = !totals_ok
+        || !quota_ok
         || report.per_day.len() > MAX_USAGE_DAYS as usize + 1
         || report.per_bot.len() > MAX_BOT_CONFIG_ITEMS
         || report.per_model.len() > 100

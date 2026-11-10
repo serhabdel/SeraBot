@@ -20,6 +20,16 @@ const REFRESH_SECS: u64 = 30;
 /// Ranges offered by the picker, in days.
 const RANGES: [(u32, &str); 3] = [(7, "7 days"), (30, "30 days"), (90, "90 days")];
 
+fn quota_percent(used: i64, limit: u64) -> u32 {
+    if limit == 0 {
+        return 0;
+    }
+    ((used.max(0) as u64)
+        .saturating_mul(100)
+        .saturating_div(limit)
+        .min(100)) as u32
+}
+
 /// `12345` -> `12,345`.
 pub fn group_digits(value: i64) -> String {
     let digits = value.max(0).to_string();
@@ -104,6 +114,9 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                 }
             }
             div { class: "pane-body",
+                if let Some(report) = report.clone() {
+                    DailyTaskQuotaCard { quota: report.quota.daily_tasks.clone() }
+                }
                 if is_admin {
                     ServerHealthCard { session }
                 }
@@ -207,6 +220,44 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                     p { class: "caption", "Usage could not be loaded. Pick a period to try again." }
                 }
                 ThisPcCard { session }
+            }
+        }
+    }
+}
+
+/// Daily per-user task quota (Big Wave E1), shipped on `GET /v1/usage`.
+#[component]
+fn DailyTaskQuotaCard(quota: serabot_desktop::UsageDailyTaskQuota) -> Element {
+    if quota.limit == 0 {
+        return rsx! {};
+    }
+    let fill = quota_percent(quota.used, quota.limit);
+    let warn = quota.near_limit || quota.at_limit;
+    let note = if quota.at_limit {
+        "You reached today's task limit. New bot turns wait until UTC midnight.".to_owned()
+    } else if quota.near_limit {
+        "You are close to today's task limit.".to_owned()
+    } else {
+        "Queued and completed tasks count toward this UTC-day budget.".to_owned()
+    };
+    rsx! {
+        div {
+            class: if warn { "card quota-card warn" } else { "card quota-card" },
+            role: if quota.at_limit { "alert" } else { "status" },
+            div { class: "card-head",
+                h3 { class: "card-title", "Daily task quota" }
+            }
+            div { class: "health-item",
+                span { class: "usage-tile-label", "Tasks today (UTC)" }
+                span { class: "health-value",
+                    "{group_digits(quota.used)} of {group_digits(quota.limit as i64)}"
+                }
+                Meter {
+                    percent: fill,
+                    label: "Daily task quota".to_owned(),
+                    warn,
+                }
+                span { class: "tiny", "{note}" }
             }
         }
     }

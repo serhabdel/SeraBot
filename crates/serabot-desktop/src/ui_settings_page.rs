@@ -13,13 +13,20 @@ use serabot_desktop::session::{Session, SettingsSection, Theme};
 #[component]
 pub fn SettingsNav(session: Signal<Session>) -> Element {
     let mut session = session;
-    let (current, is_admin) = {
+    let (current, is_admin, mem0_available) = {
         let s = session.read();
-        (s.settings_section, s.can_admin())
+        let mem0_available = s
+            .state
+            .memory_settings
+            .as_ref()
+            .is_some_and(|view| view.mem0.available);
+        (s.settings_section, s.can_admin(), mem0_available)
     };
     rsx! {
         nav { class: "settings-nav", "aria-label": "Settings sections",
-            for section in SettingsSection::ALL.into_iter().filter(|s| s.visible(is_admin)) {
+            for section in SettingsSection::ALL.into_iter().filter(|s| {
+                s.visible_with_memory(is_admin, mem0_available)
+            }) {
                 button {
                     key: "{section.label()}",
                     class: if current == section { "settings-nav-item on" } else { "settings-nav-item" },
@@ -335,6 +342,82 @@ pub fn WebSearchCard(session: Signal<Session>) -> Element {
             }
             p { class: "tiny",
                 "Turning one on makes its tools available to bots (give them in Bots). Connectors also carry a Test button for a read-only key check."
+            }
+        }
+    }
+}
+
+/// Settings > Memory: optional Mem0 recall when the server enables it (Big Wave E2).
+#[component]
+pub fn Mem0RecallCard(session: Signal<Session>) -> Element {
+    let mut session = session;
+    let mut key_draft = use_signal(String::new);
+    use_effect(move || session.write().load_memory_settings());
+    let (settings, error) = {
+        let s = session.read();
+        (
+            s.state.memory_settings.clone(),
+            s.state.memory_settings_error.clone(),
+        )
+    };
+    let Some(settings) = settings.filter(|view| view.mem0.available) else {
+        return rsx! {
+            div { class: "card",
+                p { class: "tiny", "Loading memory settings\u{2026}" }
+            }
+        };
+    };
+    let configured = settings.mem0.configured;
+    rsx! {
+        div { class: "card",
+            div { class: "card-head",
+                h3 { class: "card-title", "Mem0 recall" }
+            }
+            p { class: "tiny",
+                "When on, your turns also recall matching facts from Mem0 Platform and merge them with local memory. Your API key stays encrypted on the server and is never shown again after you save it. See docs/memory.md."
+            }
+            label { class: "check",
+                input {
+                    r#type: "checkbox",
+                    checked: configured,
+                    disabled: true,
+                    "aria-readonly": "true",
+                }
+                span { "Use Mem0 for extra recall (save or remove your key below)" }
+            }
+            span {
+                class: if configured { "chip ok" } else { "chip muted" },
+                if configured { "Key saved" } else { "Off — no key" }
+            }
+            label { class: "field",
+                span { "Mem0 API key" }
+                input {
+                    r#type: "password",
+                    autocomplete: "off",
+                    placeholder: if configured { "Paste a new key to replace yours" } else { "Paste your Mem0 API key" },
+                    value: "{key_draft}",
+                    oninput: move |event| key_draft.set(event.value()),
+                }
+            }
+            div { class: "row-actions",
+                button {
+                    class: "btn primary small",
+                    onclick: move |_| {
+                        session.write().save_mem0_key(&key_draft.read());
+                        key_draft.set(String::new());
+                    },
+                    if configured { "Replace key" } else { "Save key" }
+                }
+                if configured {
+                    button {
+                        class: "btn small",
+                        onclick: move |_| session.write().delete_mem0_key(),
+                        "Remove key"
+                    }
+                }
+            }
+            if let Some(error) = error {
+                p { class: "tiny", role: "alert", "{error}" }
             }
         }
     }

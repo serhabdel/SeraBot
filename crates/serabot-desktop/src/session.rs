@@ -3,6 +3,8 @@
 //! The Dioxus desktop shell drives this on a timer; all network work stays on
 //! the worker and SSE threads, never on the UI thread.
 
+use zeroize::Zeroizing;
+
 use crate::{
     ApiClient, ApiError, ApprovalDecision, AudioUpdate, BotConfigUpdate, ConnectorUpdate,
     ConversationKind, MAX_SKILL_BODY_BYTES, MAX_SKILL_DESCRIPTION_CHARS, MAX_USAGE_DAYS, Message,
@@ -188,13 +190,15 @@ pub enum SettingsSection {
     Voice,
     /// Web search/crawl switches (Tavily, Firecrawl) with API key status (0.28.0).
     WebSearch,
+    /// Mem0 recall toggle when the server uses `memory.provider = "mem0"`.
+    Memory,
     LocalFolders,
     Admin,
     About,
 }
 
 impl SettingsSection {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Account,
         Self::Appearance,
         Self::Notifications,
@@ -202,6 +206,7 @@ impl SettingsSection {
         Self::Telegram,
         Self::Voice,
         Self::WebSearch,
+        Self::Memory,
         Self::LocalFolders,
         Self::Admin,
         Self::About,
@@ -216,15 +221,25 @@ impl SettingsSection {
             Self::Telegram => "Telegram",
             Self::Voice => "Voice",
             Self::WebSearch => "Web search",
+            Self::Memory => "Memory",
             Self::LocalFolders => "Local folders",
             Self::Admin => "Admin",
             Self::About => "About",
         }
     }
 
-    /// Only admins see the Admin section.
+    /// Only admins see the Admin section; Memory appears when Mem0 is enabled
+    /// on the server (see [`SettingsSection::visible_with_memory`]).
     pub fn visible(self, is_admin: bool) -> bool {
-        self != Self::Admin || is_admin
+        self.visible_with_memory(is_admin, false)
+    }
+
+    pub fn visible_with_memory(self, is_admin: bool, mem0_available: bool) -> bool {
+        match self {
+            Self::Admin => is_admin,
+            Self::Memory => mem0_available,
+            _ => true,
+        }
     }
 }
 
@@ -1228,6 +1243,7 @@ impl Session {
         if section == Section::Settings {
             self.refresh_status();
             self.refresh_telegram();
+            self.load_memory_settings();
         }
         if section == Section::Logs {
             self.refresh_logs();
@@ -2302,6 +2318,27 @@ impl Session {
         self.start_request(Operation::ResetTurnLimits);
     }
 
+    pub fn load_memory_settings(&mut self) {
+        self.schedule(Operation::MemorySettings, Duration::ZERO);
+    }
+
+    pub fn save_mem0_key(&mut self, api_key: &str) {
+        let key = api_key.trim();
+        if key.is_empty() {
+            self.state.memory_settings_error = Some("Paste a Mem0 API key first.".into());
+            return;
+        }
+        self.state.memory_settings_error = None;
+        self.start_request(Operation::SetMem0Key {
+            key: Zeroizing::new(key.to_owned()),
+        });
+    }
+
+    pub fn delete_mem0_key(&mut self) {
+        self.state.memory_settings_error = None;
+        self.start_request(Operation::DeleteMem0Key);
+    }
+
     /// The paperclip: pick files in a native dialog (off the UI thread),
     /// check name and size, and queue them for upload.
     pub fn pick_attachments(&mut self) {
@@ -3230,6 +3267,10 @@ impl Session {
                         OperationKind::TurnLimitsWrite => {
                             self.state.turn_limits_error = Some(message.clone());
                             self.toast = Some(format!("Work limits were not saved: {message}"));
+                        }
+                        OperationKind::MemorySettingsWrite => {
+                            self.state.memory_settings_error = Some(message.clone());
+                            self.toast = Some(format!("Mem0 settings were not saved: {message}"));
                         }
                         OperationKind::ChatPlan => {
                             // The plan panel is optional; a failed read leaves

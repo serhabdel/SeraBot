@@ -134,6 +134,14 @@ memory tools.
 
 ## Console and API
 
+### Console (desktop)
+
+- **Usage** shows your daily task quota (used/limit, near-limit warning) from
+  `GET /v1/usage` — the same UTC-day window as enqueue limits.
+- When the server runs `memory.provider = "mem0"`, **Settings → Memory** lists
+  Mem0 recall. Save your Mem0 API key there (stored as `conn.mem0`); turn recall
+  off with **Remove key**. The key is never shown again after save.
+
 - `GET /v1/memories`: `q` (lexical search; `query` is an older alias),
   `origin` (`explicit`, `extracted`, `all`), `status` (`active` by default,
   `superseded`, `pending`, `all`), `bot`, `limit`, `offset`. A search ignores

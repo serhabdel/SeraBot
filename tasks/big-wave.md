@@ -88,10 +88,10 @@ Release notes: `docs/release-0.31.0.md`.
 
 ## Cross-wave extras (from spec theme 6)
 
-- [ ] **E1** Quota near-limit surfacing in console — `GET /v1/usage` exists;
-      UI tile still TODO (near-limit thresholds in config / store quotas).
-- [ ] **E2** Mem0 provider — documented in `docs/memory.md`; optional Settings
-      toggle when `[memory] provider = "mem0"` still TODO.
+- [x] **E1** Quota near-limit surfacing in console — `quota.daily_tasks` on
+      `GET /v1/usage`; Usage page meter + near/at-limit warning.
+- [x] **E2** Mem0 provider — `docs/memory.md` console notes; Settings → Memory
+      when `[memory] provider = "mem0"` (`GET/PUT/DELETE /v1/memory/mem0/key`).
 - [x] **E3** `docs/README.md` index row for Big Wave spec (PR #47).
 
 ---
