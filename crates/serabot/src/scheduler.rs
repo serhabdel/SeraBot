@@ -327,6 +327,7 @@ mod tests {
         "Europe/Rome".parse().unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_routine(
         store: &Store,
         user_id: &str,
