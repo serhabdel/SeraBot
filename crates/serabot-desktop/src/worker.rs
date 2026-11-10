@@ -879,7 +879,7 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::Approvals => client.approvals().map(Reply::Approvals),
         Operation::StandingGrants => client.standing_grants().map(Reply::StandingGrants),
         Operation::RevokeStandingGrant { id } => client
-            .revoke_standing_grant(&id)
+            .revoke_standing_grant(id)
             .map(|()| Reply::StandingGrantRevoked),
         Operation::JobsReliability => client.jobs_reliability().map(Reply::JobsReliability),
         Operation::Decide { id, decision } => client
