@@ -1225,6 +1225,8 @@ body {
   /* No smooth scroll on the container: it hijacks wheel and anchor jumps.
      Smooth scrolling is requested only for programmatic appends. */
   scroll-behavior: auto;
+  /* Scroll anchoring fights stick-to-bottom while tokens stream in. */
+  overflow-anchor: none;
 }
 
 .msg {
@@ -6370,11 +6372,13 @@ html[data-reduce-transparency="true"] .chat-header {
   }
 }
 
-[data-motion="reduced"] .messages > .msg.msg-enter {
+[data-motion="reduced"] .messages > .msg.msg-enter,
+.root[data-motion="reduce"] .messages > .msg.msg-enter {
   animation: chat-fade 120ms linear;
 }
 
-[data-motion="reduced"] .working-dots span {
+[data-motion="reduced"] .working-dots span,
+.root[data-motion="reduce"] .working-dots span {
   animation: none;
   opacity: 0.7;
 }
@@ -6389,7 +6393,9 @@ html[data-reduce-transparency="true"] .chat-header {
 }
 
 [data-motion="reduced"] .composer,
-[data-motion="reduced"] .scroll-bottom {
+[data-motion="reduced"] .scroll-bottom,
+.root[data-motion="reduce"] .composer,
+.root[data-motion="reduce"] .scroll-bottom {
   background: var(--surface);
   backdrop-filter: none;
   -webkit-backdrop-filter: none;

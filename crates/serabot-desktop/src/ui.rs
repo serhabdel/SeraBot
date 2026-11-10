@@ -14,7 +14,7 @@ use serabot_desktop::{
     audio_capture::MicRecorder,
     branding,
     chat_cards::{self, CardState, CardView},
-    chat_compose, chat_feed, file_icons, provider_presets, provider_view,
+    chat_compose, chat_feed, chat_scroll, file_icons, provider_presets, provider_view,
     session::{Section, Session, SettingsSection, SignInPhase, Theme, humanize_label},
     teams, ui_highlight,
     working::BotActivity,
@@ -30,9 +30,8 @@ use crate::ui_cards::ChatCardRow;
 use crate::ui_connectors::ConnectorsView;
 use crate::ui_dock::BrowserDock;
 use crate::ui_files::{
-    CHAT_SCROLL_BRIDGE_JS, COMPOSER_CARET_BRIDGE_JS, COMPOSER_CARET_SETUP_JS, CONFIRM_RESET_JS,
-    ComposerFiles, MediaCards, MessageFiles, PASTE_BRIDGE_JS, PastedFile, copy_script,
-    decode_pasted,
+    COMPOSER_CARET_BRIDGE_JS, COMPOSER_CARET_SETUP_JS, CONFIRM_RESET_JS, ComposerFiles, MediaCards,
+    MessageFiles, PASTE_BRIDGE_JS, PastedFile, copy_script, decode_pasted,
 };
 use crate::ui_settings::SettingsPanel;
 use crate::ui_settings_page::{
@@ -3263,7 +3262,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         }
     });
     use_future(move || async move {
-        let _ = dioxus::document::eval(CHAT_SCROLL_BRIDGE_JS);
+        let _ = dioxus::document::eval(chat_scroll::CHAT_SCROLL_BRIDGE_JS);
         let _ = dioxus::document::eval(COMPOSER_CARET_SETUP_JS);
     });
     let transcript_error = session.read().state.transcript_error.clone();
@@ -3327,12 +3326,12 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             at_bottom.set(true);
             unseen.set(0);
         }
-        let _ = (tail, activity_steps, activity_tail);
-        let force_pin = jump || own_send;
-        let _ = dioxus::document::eval(&format!(
-            "window.__serabotPinMessages?.({});",
-            if force_pin { "true" } else { "false" }
-        ));
+        let streaming_growth = tail.is_some() || activity_steps > 0;
+        let force_pin = jump || own_send || (*at_bottom.peek() && streaming_growth);
+        if force_pin || count != previous || streaming_growth {
+            let _ = dioxus::document::eval(&chat_scroll::pin_messages_js(force_pin));
+        }
+        let _ = (tail, activity_tail);
     });
     {
         let conversation = session.read().conversation.clone();
@@ -3451,10 +3450,11 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     class: if group_like { "messages group" } else { "messages" },
                     id: "messages",
                     onscroll: move |event: ScrollEvent| {
-                        let distance = event.scroll_height() as f64
-                            - event.scroll_top()
-                            - event.client_height() as f64;
-                        let bottom = distance < 80.0;
+                        let bottom = chat_scroll::near_bottom(
+                            event.scroll_height() as f64,
+                            event.scroll_top() as f64,
+                            event.client_height() as f64,
+                        );
                         at_bottom.set(bottom);
                         if bottom {
                             unseen.set(0);
@@ -3713,11 +3713,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                         "aria-label": "Scroll to the newest message",
                         title: "Newest messages",
                         onclick: move |_| {
-                            let _ = dioxus::document::eval(
-                                "window.__serabotPinMessages?.(true); \
-                                 const el=document.getElementById('messages'); \
-                                 if(el){el.scrollTo({top: el.scrollHeight, behavior: 'smooth'});}",
-                            );
+                            let _ = dioxus::document::eval(chat_scroll::SCROLL_TO_BOTTOM_JS);
                             at_bottom.set(true);
                             unseen.set(0);
                         },
