@@ -385,7 +385,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/memories", get(list_memories).post(add_memory))
         .route("/v1/memories/stats", get(memory_stats))
         .route("/v1/memory/settings", get(memory_settings))
-        .route("/v1/memory/mem0/key", put(set_mem0_key).delete(delete_mem0_key))
+        .route(
+            "/v1/memory/mem0/key",
+            put(set_mem0_key).delete(delete_mem0_key),
+        )
         .route(
             "/v1/memories/{id}",
             patch(patch_memory).delete(delete_memory),

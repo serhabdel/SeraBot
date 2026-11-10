@@ -2570,12 +2570,7 @@ impl ApiClient {
     /// `GET /v1/memory/settings`: Mem0 availability and key status for the
     /// acting user (never the key itself).
     pub fn memory_settings(&self) -> Result<MemorySettingsView, ApiError> {
-        self.request(
-            Method::GET,
-            &["v1", "memory", "settings"],
-            &[],
-            None::<&()>,
-        )
+        self.request(Method::GET, &["v1", "memory", "settings"], &[], None::<&()>)
     }
 
     /// `PUT /v1/memory/mem0/key` when the server has `memory.provider = "mem0"`.
