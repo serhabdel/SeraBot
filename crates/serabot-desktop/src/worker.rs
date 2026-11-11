@@ -42,6 +42,9 @@ pub enum OperationKind {
     ListBots,
     ListConversations,
     ListArchived,
+    ListBotChats,
+    CreateBotChat,
+    SetBotRefresh,
     RenameConversation,
     ArchiveConversation,
     UnarchiveConversation,
@@ -185,6 +188,17 @@ pub enum Operation {
         include_archived: bool,
     },
     ListArchived,
+    ListBotChats {
+        bot: String,
+    },
+    CreateBotChat {
+        bot: String,
+        title: Option<String>,
+    },
+    SetBotRefresh {
+        bot: String,
+        every: u32,
+    },
     RenameConversation {
         id: String,
         title: Zeroizing<String>,
@@ -491,6 +505,9 @@ impl Operation {
             Self::ListBots => OperationKind::ListBots,
             Self::ListConversations { .. } => OperationKind::ListConversations,
             Self::ListArchived => OperationKind::ListArchived,
+            Self::ListBotChats { .. } => OperationKind::ListBotChats,
+            Self::CreateBotChat { .. } => OperationKind::CreateBotChat,
+            Self::SetBotRefresh { .. } => OperationKind::SetBotRefresh,
             Self::RenameConversation { .. } => OperationKind::RenameConversation,
             Self::ArchiveConversation { .. } => OperationKind::ArchiveConversation,
             Self::UnarchiveConversation { .. } => OperationKind::UnarchiveConversation,
@@ -590,6 +607,12 @@ pub enum Reply {
     CreatedConversation(CreatedConversation),
     CreatedSkill(CreatedSkill),
     Skills(Vec<SkillSummary>),
+    BotChats(crate::bot_chats::BotChatList),
+    BotChatCreated {
+        bot: String,
+        created: crate::bot_chats::CreatedBotChat,
+    },
+    BotRefreshSet(crate::bot_chats::BotChatSettings),
     Bots(Vec<BotSummary>),
     Conversations(ConversationPage),
     ArchivedConversations(ConversationPage),
@@ -968,6 +991,16 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::ListArchived => client
             .list_conversations(100, None, true)
             .map(Reply::ArchivedConversations),
+        Operation::ListBotChats { bot } => client.list_bot_chats(bot).map(Reply::BotChats),
+        Operation::CreateBotChat { bot, title } => client
+            .create_bot_chat(bot, title.as_deref())
+            .map(|created| Reply::BotChatCreated {
+                bot: bot.clone(),
+                created,
+            }),
+        Operation::SetBotRefresh { bot, every } => client
+            .set_bot_refresh(bot, *every)
+            .map(Reply::BotRefreshSet),
         Operation::RenameConversation { id, title } => client
             .rename_conversation(id, title)
             .map(Reply::RenamedConversation),

@@ -3433,6 +3433,86 @@ impl ApiClient {
         Ok(page)
     }
 
+    /// `GET /v1/bots/{bot}/chats`: the bot's chats, primary chat first.
+    pub fn list_bot_chats(&self, bot: &str) -> Result<crate::bot_chats::BotChatList, ApiError> {
+        check_id(bot)?;
+        let list: crate::bot_chats::BotChatList = self.get(
+            &["v1", "bots", bot, "chats"],
+            &[("include_archived", "false")],
+        )?;
+        if list.chats.len() > crate::bot_chats::MAX_CHATS_PER_BOT
+            || !crate::bot_chats::valid_refresh_turns(list.refresh_every_turns)
+        {
+            return Err(ApiError::InvalidResponse);
+        }
+        for chat in &list.chats {
+            check_bot_chat(chat)?;
+        }
+        Ok(list)
+    }
+
+    /// `POST /v1/bots/{bot}/chats`: start another chat with the bot. It begins
+    /// with the bot's memory and a short summary, not the old transcript.
+    pub fn create_bot_chat(
+        &self,
+        bot: &str,
+        title: Option<&str>,
+    ) -> Result<crate::bot_chats::CreatedBotChat, ApiError> {
+        check_id(bot)?;
+        let title = title.map(str::trim).filter(|title| !title.is_empty());
+        if let Some(title) = title
+            && !valid_conversation_title(title)
+        {
+            return Err(ApiError::Validation(
+                "Title must be 1\u{2013}120 characters, without control characters.",
+            ));
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            title: Option<&'a str>,
+        }
+        let created: crate::bot_chats::CreatedBotChat = self.request(
+            Method::POST,
+            &["v1", "bots", bot, "chats"],
+            &[],
+            Some(&Body { title }),
+        )?;
+        check_bot_chat(&created.chat)?;
+        Ok(created)
+    }
+
+    /// `PUT /v1/bots/{bot}/chat-settings`: refresh the bot's memory every N
+    /// user turns (5 to 500).
+    pub fn set_bot_refresh(
+        &self,
+        bot: &str,
+        every: u32,
+    ) -> Result<crate::bot_chats::BotChatSettings, ApiError> {
+        check_id(bot)?;
+        if !crate::bot_chats::valid_refresh_turns(every) {
+            return Err(ApiError::Validation(
+                "Memory refresh must be between 5 and 500 turns.",
+            ));
+        }
+        #[derive(Serialize)]
+        struct Body {
+            refresh_every_turns: u32,
+        }
+        let settings: crate::bot_chats::BotChatSettings = self.request(
+            Method::PUT,
+            &["v1", "bots", bot, "chat-settings"],
+            &[],
+            Some(&Body {
+                refresh_every_turns: every,
+            }),
+        )?;
+        if settings.refresh_every_turns != every {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(settings)
+    }
+
     pub fn rename_conversation(
         &self,
         id: &str,
@@ -5003,6 +5083,18 @@ pub fn valid_conversation_title(title: &str) -> bool {
     !title.is_empty()
         && title.chars().count() <= MAX_CONVERSATION_TITLE_CHARS
         && !title.chars().any(char::is_control)
+}
+
+fn check_bot_chat(chat: &crate::bot_chats::BotChat) -> Result<(), ApiError> {
+    if !valid_id(&chat.id)
+        || chat.title.as_deref().is_some_and(|title| {
+            title.chars().count() > MAX_CONVERSATION_TITLE_CHARS
+                || title.chars().any(char::is_control)
+        })
+    {
+        return Err(ApiError::InvalidResponse);
+    }
+    Ok(())
 }
 
 fn check_conversation_summary(conversation: &ConversationSummary) -> Result<(), ApiError> {

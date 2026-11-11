@@ -9,6 +9,7 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
     let chat = section == Section::Chat;
     let mut drawer_open = use_signal(|| false);
     let mut toast = use_signal(|| Option::<(String, bool)>::None);
+    let undo = use_signal(|| Option::<String>::None);
     let onboarding_open = chat && session.read().onboarding_ui.open;
     let settings_open = session.read().bot_settings.open;
     // One stylesheet defines every avatar image; tiles only reference it.
@@ -19,7 +20,7 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
         div { class: "app-shell",
             IconRail { session, toast }
             if chat {
-                Sidebar { session, overlay, drawer_open, toast }
+                Sidebar { session, overlay, drawer_open, toast, undo }
                 div {
                     class: if drawer_open() { "scrim drawer-scrim open" } else { "scrim drawer-scrim" },
                     onclick: move |_| drawer_open.set(false),
@@ -27,7 +28,7 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
             }
             main { class: "main",
                 if chat && !onboarding_open {
-                    Topbar { session, overlay, drawer_open, toast }
+                    Topbar { session, overlay, drawer_open, toast, undo }
                 }
                 StatusBanner { session }
                 UpdateBanner { session }
@@ -87,6 +88,7 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                 },
                 Overlay::None => rsx! {},
             }}
+            UndoBar { session, undo }
             if let Some((message, failed)) = toast() {
                 div { class: if failed { "toast err" } else { "toast" }, role: "status",
                     span { "{message}" }
@@ -329,6 +331,7 @@ pub(super) fn Sidebar(
     overlay: Signal<Overlay>,
     drawer_open: Signal<bool>,
     toast: Signal<Option<(String, bool)>>,
+    undo: Signal<Option<String>>,
 ) -> Element {
     let mut overlay = overlay;
     let mut toast = toast;
@@ -337,6 +340,10 @@ pub(super) fn Sidebar(
     let mut renaming = use_signal(|| Option::<(String, String)>::None);
     // Which row's "more actions" menu is open (by row id).
     let menu = use_signal(|| Option::<String>::None);
+    // A bot's chat list: the owner's explicit open or closed choice, and the
+    // bots whose whole list is shown instead of the first five.
+    let mut chats_open = use_signal(HashMap::<String, bool>::new);
+    let mut chats_all = use_signal(HashSet::<String>::new);
     let needle = search().trim().to_lowercase();
     let current = session.read().conversation.clone();
     let loaded = session.read().state.conversations_loaded;
@@ -379,6 +386,20 @@ pub(super) fn Sidebar(
                         .find(|conversation| conversation.id == id)
                         .map(|conversation| conversation.unread_count)
                         .unwrap_or(0);
+                    let chats = state
+                        .state
+                        .bot_chats
+                        .get(&bot.id)
+                        .map(serabot_desktop::bot_chats::live_chats)
+                        .unwrap_or_default();
+                    let extra = chats.iter().filter(|chat| !chat.primary).count();
+                    let has_active = chats.iter().any(|chat| chat.id == current);
+                    // Open when the reader chose so; else when an extra chat
+                    // exists and one of them is the open chat.
+                    let open = chats_open()
+                        .get(&bot.id)
+                        .copied()
+                        .unwrap_or(extra > 0 && has_active);
                     items.push(RailItem::Bot {
                         active: id == current,
                         pinned: pins.contains(&bot.id),
@@ -389,7 +410,36 @@ pub(super) fn Sidebar(
                         enabled: bot.enabled,
                         live: bot.live,
                         unread,
+                        extra_chats: extra,
+                        chats_open: open,
                     });
+                    if open && extra > 0 {
+                        let all = chats_all().contains(&bot.id);
+                        let (shown, hidden) =
+                            serabot_desktop::bot_chats::visible_chats(&chats, all, &current);
+                        for chat in shown {
+                            let chat_unread = conversations
+                                .iter()
+                                .find(|conversation| conversation.id == chat.id)
+                                .map(|conversation| conversation.unread_count)
+                                .unwrap_or(0);
+                            items.push(RailItem::BotChat {
+                                bot: bot.id.clone(),
+                                id: chat.id.clone(),
+                                title: serabot_desktop::bot_chats::chat_title(chat),
+                                primary: chat.primary,
+                                active: chat.id == current,
+                                unread: chat_unread,
+                            });
+                        }
+                        if hidden > 0 || all {
+                            items.push(RailItem::ShowMore {
+                                bot: bot.id.clone(),
+                                hidden,
+                                all,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -463,6 +513,7 @@ pub(super) fn Sidebar(
                 conversation.parent_id.is_none()
                     && conversation.normalized_kind() != "section"
                     && !bot_chats.contains(&conversation.id)
+                    && !serabot_desktop::bot_chats::is_extra_chat_id(&conversation.id)
             })
             .collect::<Vec<_>>();
         roots.sort_by(|left, right| {
@@ -622,7 +673,7 @@ pub(super) fn Sidebar(
                                 }
                             }
                         },
-                        RailItem::Bot { id, label, role, avatar, active, enabled, live, unread, pinned } => {
+                        RailItem::Bot { id, label, role, avatar, active, enabled, live, unread, pinned, extra_chats, chats_open: is_open } => {
                             let pin_id = id.strip_prefix("dir:").unwrap_or(&id).to_owned();
                             let removable = serabot_desktop::can_remove_bot(&pin_id, &role);
                             let act = session.read().state.working.activity_of(&pin_id, Instant::now());
@@ -640,6 +691,23 @@ pub(super) fn Sidebar(
                                             menu.set(Some(id.clone()));
                                         }
                                     },
+                                    {
+                                        let toggle_bot = pin_id.clone();
+                                        rsx! {
+                                            button {
+                                                class: if extra_chats > 0 { "row-chevron" } else { "row-chevron placeholder" },
+                                                title: if is_open { "Hide this bot\u{2019}s chats" } else { "Show this bot\u{2019}s chats" },
+                                                "aria-label": if is_open { "Hide chats of {label}" } else { "Show chats of {label}" },
+                                                "aria-expanded": if is_open { "true" } else { "false" },
+                                                disabled: extra_chats == 0,
+                                                onclick: move |event| {
+                                                    event.stop_propagation();
+                                                    chats_open.write().insert(toggle_bot.clone(), !is_open);
+                                                },
+                                                Icon { name: if is_open { "chevron-down" } else { "chevron-right" }, size: 14 }
+                                            }
+                                        }
+                                    }
                                     button {
                                         class: "thread-main thread-bot",
                                         onclick: {
@@ -675,6 +743,20 @@ pub(super) fn Sidebar(
                                         let open_id = id.clone();
                                         rsx! {
                                             button {
+                                                class: "row-new",
+                                                title: "New chat with {label}",
+                                                "aria-label": "New chat with {label}",
+                                                disabled: !enabled,
+                                                onclick: {
+                                                    let bot = pin_id.clone();
+                                                    move |event| {
+                                                        event.stop_propagation();
+                                                        session.write().new_bot_chat(bot.clone());
+                                                    }
+                                                },
+                                                Icon { name: "plus", size: 15 }
+                                            }
+                                            button {
                                                 class: "row-more",
                                                 title: "More actions",
                                                 "aria-label": "More actions for {label}",
@@ -690,6 +772,7 @@ pub(super) fn Sidebar(
                                                 RowMenu {
                                                     session,
                                                     toast,
+                                                    undo,
                                                     renaming,
                                                     menu,
                                                     id: row_id.clone(),
@@ -705,6 +788,96 @@ pub(super) fn Sidebar(
                                             }
                                         }
                                     }
+                                }
+                            }
+                        },
+                        RailItem::BotChat { id, title, primary, active, unread, .. } => {
+                            let editing = renaming().as_ref().map(|(edit, _)| edit == &id).unwrap_or(false);
+                            let open_id = id.clone();
+                            let row_id = id.clone();
+                            let pinned = session.read().pins.contains(&id);
+                            rsx! {
+                                div {
+                                    key: "{id}",
+                                    class: if active { "thread chat-row active" } else { "thread chat-row" },
+                                    oncontextmenu: {
+                                        let id = id.clone();
+                                        let mut menu = menu;
+                                        move |event: MouseEvent| {
+                                            event.prevent_default();
+                                            if !primary {
+                                                menu.set(Some(id.clone()));
+                                            }
+                                        }
+                                    },
+                                    if editing {
+                                        RenameField { session, toast, renaming, id: id.clone() }
+                                    } else {
+                                        button {
+                                            class: "thread-main",
+                                            "aria-current": if active { "true" } else { "false" },
+                                            onclick: {
+                                                let id = id.clone();
+                                                move |_| session.write().open_conversation(id.clone())
+                                            },
+                                            div { class: "thread-copy",
+                                                span { class: if unread > 0 { "thread-title unread" } else { "thread-title" }, "{title}" }
+                                            }
+                                            if unread > 0 {
+                                                span { class: "unread-badge", "{unread}" }
+                                            }
+                                        }
+                                        if !primary {
+                                            {
+                                                let mut menu = menu;
+                                                rsx! {
+                                                    button {
+                                                        class: "row-more",
+                                                        title: "More actions",
+                                                        "aria-label": "More actions for {title}",
+                                                        "aria-haspopup": "menu",
+                                                        "aria-expanded": if menu().as_deref() == Some(row_id.as_str()) { "true" } else { "false" },
+                                                        onclick: move |event| {
+                                                            event.stop_propagation();
+                                                            menu.set(Some(open_id.clone()));
+                                                        },
+                                                        Icon { name: "dots", size: 16 }
+                                                    }
+                                                    if menu().as_deref() == Some(row_id.as_str()) {
+                                                        RowMenu {
+                                                            session,
+                                                            toast,
+                                                            undo,
+                                                            renaming,
+                                                            menu,
+                                                            id: row_id.clone(),
+                                                            pin_id: row_id.clone(),
+                                                            label: title.clone(),
+                                                            kind: RowKind::Thread { archived: false },
+                                                            pinned,
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        RailItem::ShowMore { bot, hidden, all } => {
+                            rsx! {
+                                button {
+                                    key: "more-{bot}",
+                                    class: "thread-group chat-more",
+                                    onclick: move |_| {
+                                        let mut set = chats_all.write();
+                                        if all {
+                                            set.remove(&bot);
+                                        } else {
+                                            set.insert(bot.clone());
+                                        }
+                                    },
+                                    if all { "Show fewer" } else { "Show {hidden} more" }
                                 }
                             }
                         },
@@ -826,6 +999,7 @@ pub(super) fn Sidebar(
                                                     RowMenu {
                                                         session,
                                                         toast,
+                                                        undo,
                                                         renaming,
                                                         menu,
                                                         id: row_id.clone(),
@@ -1014,6 +1188,22 @@ pub(super) enum RailItem {
         live: bool,
         unread: i64,
         pinned: bool,
+        /// Chats beyond the primary one, and whether the list is open.
+        extra_chats: usize,
+        chats_open: bool,
+    },
+    BotChat {
+        bot: String,
+        id: String,
+        title: String,
+        primary: bool,
+        active: bool,
+        unread: i64,
+    },
+    ShowMore {
+        bot: String,
+        hidden: usize,
+        all: bool,
     },
     Thread {
         id: String,
@@ -1112,6 +1302,7 @@ pub(super) fn Topbar(
     overlay: Signal<Overlay>,
     drawer_open: Signal<bool>,
     toast: Signal<Option<(String, bool)>>,
+    undo: Signal<Option<String>>,
 ) -> Element {
     let mut header_menu = use_signal(|| Option::<String>::None);
     let header_rename = use_signal(|| Option::<(String, String)>::None);
@@ -1119,7 +1310,10 @@ pub(super) fn Topbar(
     let header_kind = {
         let state = session.read();
         let conversation = state.conversation.clone();
-        match conversation.strip_prefix("dir:") {
+        match state.conversation_bot(&conversation).as_deref() {
+            _ if serabot_desktop::bot_chats::is_extra_chat_id(&conversation) => {
+                Some(serabot_desktop::row_menu::RowKind::Thread { archived: false })
+            }
             Some(bot) => state
                 .state
                 .listed_bots
@@ -1150,11 +1344,10 @@ pub(super) fn Topbar(
     let mut overlay = overlay;
     let mut drawer_open = drawer_open;
     let title = session.read().conversation_title();
-    let active_bot = session
-        .read()
-        .conversation
-        .strip_prefix("dir:")
-        .map(str::to_owned);
+    let active_bot = {
+        let state = session.read();
+        state.conversation_bot(&state.conversation)
+    };
     let is_bot_chat = active_bot.is_some();
     let settings_open = session.read().bot_settings.open;
     let connected = session.read().state.connected;
@@ -1351,6 +1544,7 @@ pub(super) fn Topbar(
                             RowMenu {
                                 session,
                                 toast,
+                                undo,
                                 renaming: header_rename,
                                 menu: header_menu,
                                 id: header_ids.0.clone(),

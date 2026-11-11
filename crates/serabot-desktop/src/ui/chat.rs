@@ -148,18 +148,14 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let accepts = session.read().conversation_accepts_turns();
     let (active_bot, active_name, active_avatar, roster) = {
         let state = session.read();
-        let active = state
-            .conversation
-            .strip_prefix("dir:")
-            .map(str::to_owned)
-            .or_else(|| {
-                state
-                    .state
-                    .listed_bots
-                    .iter()
-                    .find(|bot| bot.role == "orchestrator")
-                    .map(|bot| bot.id.clone())
-            });
+        let active = state.conversation_bot(&state.conversation).or_else(|| {
+            state
+                .state
+                .listed_bots
+                .iter()
+                .find(|bot| bot.role == "orchestrator")
+                .map(|bot| bot.id.clone())
+        });
         let name = active
             .as_deref()
             .map(|id| state.bot_display_name(id))
@@ -401,6 +397,26 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         }
     }
     let empty = messages.is_empty();
+    // On a new chat: where it started from (the bot's memory and a summary).
+    let memory_note = {
+        let state = session.read();
+        state.bot_chat(&state.conversation).and_then(|chat| {
+            let bot = state.conversation_bot(&chat.id)?;
+            let previous = chat
+                .carried_from
+                .as_deref()
+                .and_then(|id| state.bot_chat(id))
+                .map(|prev| match prev.title.as_deref().map(str::trim) {
+                    Some(title) if !title.is_empty() => title.to_owned(),
+                    _ => "the main chat".to_owned(),
+                });
+            serabot_desktop::bot_chats::memory_divider(
+                chat,
+                previous.as_deref(),
+                &state.bot_display_name(&bot),
+            )
+        })
+    };
     let is_one_to_one = session.read().conversation.starts_with("dir:");
     let room = teams::is_room(&session.read().conversation);
     let in_team: Vec<String> = session
@@ -519,6 +535,16 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     role: "log",
                     "aria-label": "Conversation",
                     "aria-live": "off",
+                    if let Some(note) = memory_note.clone() {
+                        div { class: "memory-divider", role: "note",
+                            span { "{note}" }
+                            button {
+                                class: "btn ghost sm",
+                                onclick: move |_| session.write().open_section(Section::Memory),
+                                "View"
+                            }
+                        }
+                    }
                     if empty {
                         div { class: "empty",
                             div {
@@ -827,6 +853,18 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                         session.write().composer = String::new();
                                         slash.set(None);
                                         match action {
+                                            chat_compose::SlashAction::NewChat => {
+                                                let bot = {
+                                                    let state = session.read();
+                                                    state.conversation_bot(&state.conversation)
+                                                };
+                                                if let Some(bot) = bot {
+                                                    session.write().new_bot_chat(bot);
+                                                }
+                                            }
+                                            chat_compose::SlashAction::Memory => {
+                                                session.write().open_section(Section::Memory);
+                                            }
                                             chat_compose::SlashAction::Attach => session.write().pick_attachments(),
                                             chat_compose::SlashAction::Stop => session.write().stop_turn(),
                                             chat_compose::SlashAction::Expand => {

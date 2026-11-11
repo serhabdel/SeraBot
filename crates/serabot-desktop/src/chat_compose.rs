@@ -219,13 +219,25 @@ pub fn escape_stops_run(run_active: bool, awaiting_approval: bool) -> bool {
 /// A slash command that does something instead of inserting text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlashAction {
+    NewChat,
+    Memory,
     Attach,
     Stop,
     Expand,
 }
 
 /// `(command, what it does, action)`, in the order the picker lists them.
-pub const SLASH_ACTIONS: [(&str, &str, SlashAction); 3] = [
+pub const SLASH_ACTIONS: [(&str, &str, SlashAction); 5] = [
+    (
+        "new",
+        "Start a new chat with this bot",
+        SlashAction::NewChat,
+    ),
+    (
+        "memory",
+        "Open the bots\u{2019} memory",
+        SlashAction::Memory,
+    ),
     ("attach", "Attach files", SlashAction::Attach),
     ("stop", "Stop the reply", SlashAction::Stop),
     (
@@ -388,8 +400,9 @@ mod tests {
     #[test]
     fn only_an_exact_command_is_an_action() {
         assert_eq!(parse_slash_action("/attach"), Some(SlashAction::Attach));
-        // Commands that need the chats-per-bot server work are not offered yet.
-        assert_eq!(parse_slash_action("/new"), None);
+        assert_eq!(parse_slash_action("/new"), Some(SlashAction::NewChat));
+        assert_eq!(parse_slash_action("/Memory"), Some(SlashAction::Memory));
+        assert_eq!(parse_slash_action("/new chat please"), None);
         assert_eq!(parse_slash_action("  /Stop "), Some(SlashAction::Stop));
         assert_eq!(parse_slash_action("/stop now please"), None);
         assert_eq!(parse_slash_action("new"), None);

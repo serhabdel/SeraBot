@@ -198,6 +198,13 @@ pub struct State {
     pub transcript_loading: bool,
     pub created_bot: Option<CreatedBot>,
     pub created_conversation: Option<CreatedConversation>,
+    /// Each bot's chats (owner-scoped, kept across conversation switches).
+    pub bot_chats: BTreeMap<String, crate::bot_chats::BotChatList>,
+    /// Bots whose chat list has been read at least once.
+    pub bot_chats_loaded: std::collections::BTreeSet<String>,
+    /// A chat the owner just started: `(bot, chat id, carried_from)`. The
+    /// session opens it and clears this.
+    pub created_bot_chat: Option<(String, String, Option<String>)>,
     pub created_skill: Option<CreatedSkill>,
     pub created_group: Option<CreatedGroup>,
     /// The bot onboarding interview, owner-scoped like the bot list.
@@ -307,6 +314,9 @@ impl Default for State {
             transcript_loading: false,
             created_bot: None,
             created_conversation: None,
+            bot_chats: BTreeMap::new(),
+            bot_chats_loaded: std::collections::BTreeSet::new(),
+            created_bot_chat: None,
             created_skill: None,
             created_group: None,
             onboarding: None,
@@ -344,6 +354,9 @@ impl State {
         let conversation_titles = self.conversation_titles;
         let created_bot = self.created_bot.clone();
         let created_conversation = self.created_conversation.clone();
+        let bot_chats = self.bot_chats.clone();
+        let bot_chats_loaded = self.bot_chats_loaded.clone();
+        let created_bot_chat = self.created_bot_chat.clone();
         let created_skill = self.created_skill.clone();
         let created_group = self.created_group.clone();
         let onboarding = self.onboarding.clone();
@@ -392,6 +405,9 @@ impl State {
             conversation_titles,
             created_bot,
             created_conversation,
+            bot_chats,
+            bot_chats_loaded,
+            created_bot_chat,
             created_skill,
             created_group,
             onboarding,
@@ -535,6 +551,24 @@ impl State {
             Reply::CreatedBot(bot) => self.created_bot = Some(bot),
             Reply::CreatedConversation(node) => self.created_conversation = Some(node),
             Reply::CreatedSkill(skill) => self.created_skill = Some(skill),
+            Reply::BotChats(list) => {
+                self.bot_chats_loaded.insert(list.bot.clone());
+                self.bot_chats.insert(list.bot.clone(), list);
+            }
+            Reply::BotChatCreated { bot, created } => {
+                let carried = created.carried_from.clone();
+                self.created_bot_chat = Some((bot.clone(), created.chat.id.clone(), carried));
+                if let Some(list) = self.bot_chats.get_mut(&bot)
+                    && !list.chats.iter().any(|chat| chat.id == created.chat.id)
+                {
+                    list.chats.push(created.chat);
+                }
+            }
+            Reply::BotRefreshSet(settings) => {
+                if let Some(list) = self.bot_chats.get_mut(&settings.bot) {
+                    list.refresh_every_turns = settings.refresh_every_turns;
+                }
+            }
             Reply::Skills(skills) => {
                 self.listed_skills = skills;
                 self.skills_loaded = true;
@@ -788,6 +822,8 @@ impl State {
                 | OperationKind::CreateBot
                 | OperationKind::CreateConversation
                 | OperationKind::CreateSkill
+                | OperationKind::CreateBotChat
+                | OperationKind::SetBotRefresh
                 | OperationKind::RenameConversation
                 | OperationKind::ArchiveConversation
                 | OperationKind::UnarchiveConversation
@@ -807,6 +843,8 @@ impl State {
                 OperationKind::CreateBot => "bot scaffold",
                 OperationKind::CreateConversation => "conversation create",
                 OperationKind::CreateSkill => "skill create",
+                OperationKind::CreateBotChat => "new chat",
+                OperationKind::SetBotRefresh => "memory refresh change",
                 OperationKind::RenameConversation => "rename",
                 OperationKind::ArchiveConversation => "archive",
                 OperationKind::UnarchiveConversation => "unarchive",
@@ -1341,6 +1379,73 @@ mod tests {
                 .unwrap()
                 .contains("Unknown unarchive outcome")
         );
+    }
+
+    fn bot_chat(id: &str, primary: bool) -> crate::bot_chats::BotChat {
+        crate::bot_chats::BotChat {
+            id: id.to_owned(),
+            bot: "analyst".into(),
+            title: None,
+            primary,
+            archived: false,
+            carried_from: None,
+            created_at: "2026-11-01T00:00:00Z".into(),
+            updated_at: "2026-11-01T00:00:00Z".into(),
+            last_message_at: None,
+            turns: 0,
+            has_summary: false,
+        }
+    }
+
+    #[test]
+    fn bot_chat_replies_fill_the_list_and_survive_conversation_switches() {
+        let mut state = State::default();
+        let scope = state.scope.clone();
+        state.receive(
+            &scope,
+            Reply::BotChats(crate::bot_chats::BotChatList {
+                bot: "analyst".into(),
+                refresh_every_turns: 40,
+                chats: vec![bot_chat("dir:analyst", true)],
+            }),
+        );
+        assert!(state.bot_chats_loaded.contains("analyst"));
+        assert_eq!(state.bot_chats["analyst"].chats.len(), 1);
+
+        // A new chat is added to the list and remembered for the session to open.
+        state.receive(
+            &scope,
+            Reply::BotChatCreated {
+                bot: "analyst".into(),
+                created: crate::bot_chats::CreatedBotChat {
+                    chat: bot_chat("dir:chat-0a1b2c3d4e5f", false),
+                    carried_from: Some("dir:analyst".into()),
+                },
+            },
+        );
+        assert_eq!(state.bot_chats["analyst"].chats.len(), 2);
+        assert_eq!(
+            state.created_bot_chat,
+            Some((
+                "analyst".into(),
+                "dir:chat-0a1b2c3d4e5f".into(),
+                Some("dir:analyst".into())
+            ))
+        );
+
+        state.receive(
+            &scope,
+            Reply::BotRefreshSet(crate::bot_chats::BotChatSettings {
+                bot: "analyst".into(),
+                refresh_every_turns: 25,
+            }),
+        );
+        assert_eq!(state.bot_chats["analyst"].refresh_every_turns, 25);
+
+        // Switching conversation keeps the lists: they belong to the owner.
+        state.new_scope("dir:legal".into(), true);
+        assert_eq!(state.bot_chats["analyst"].chats.len(), 2);
+        assert!(state.bot_chats_loaded.contains("analyst"));
     }
 
     #[test]

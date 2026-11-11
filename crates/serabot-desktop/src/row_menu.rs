@@ -46,7 +46,7 @@ impl RowAction {
             RowAction::SwitchOff => "Switch off",
             RowAction::DeleteBot => "Delete bot\u{2026}",
             RowAction::Rename => "Rename",
-            RowAction::Archive => "Archive\u{2026}",
+            RowAction::Archive => "Archive",
             RowAction::Unarchive => "Restore",
         }
     }
@@ -69,9 +69,9 @@ impl RowAction {
         matches!(self, RowAction::DeleteBot | RowAction::Archive)
     }
 
-    /// Entries the menu itself confirms before acting. Deleting a bot already
-    /// opens its own confirm dialog, so it is not asked twice.
-    pub fn confirms_in_menu(self) -> bool {
+    /// Archiving keeps the chat and can be undone for a few seconds, so it
+    /// does not ask. Deleting a bot opens its own confirm dialog.
+    pub fn is_undoable(self) -> bool {
         matches!(self, RowAction::Archive)
     }
 }
@@ -173,13 +173,14 @@ mod tests {
     }
 
     #[test]
-    fn destructive_entries_are_marked_and_archive_asks_first() {
+    fn destructive_entries_are_marked_and_archive_is_undoable() {
         assert!(RowAction::Archive.is_danger());
         assert!(RowAction::DeleteBot.is_danger());
         assert!(!RowAction::Pin.is_danger());
-        assert!(RowAction::Archive.confirms_in_menu());
-        // Deleting a bot opens its own confirm dialog; do not ask twice.
-        assert!(!RowAction::DeleteBot.confirms_in_menu());
+        // Archive can be undone from a toast; deleting a bot is not undoable
+        // and goes through its own confirm dialog.
+        assert!(RowAction::Archive.is_undoable());
+        assert!(!RowAction::DeleteBot.is_undoable());
     }
 
     #[test]
