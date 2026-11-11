@@ -1,0 +1,131 @@
+/* Desktop foundation (PR-2): status chips, secret fields, Usage sections and the
+   jump-to-latest pill. Tokens only; colours come from app.css. */
+
+/* Status chip: colour + icon + word. Never colour alone. */
+.status-chip {
+  gap: 4px;
+  font-weight: 500;
+}
+
+.status-chip svg {
+  flex: 0 0 auto;
+}
+
+/* Masked field with a Show/Hide toggle. */
+.secret-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.secret-field .input,
+.secret-field input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.secret-toggle {
+  flex: 0 0 auto;
+  min-width: 36px;
+  min-height: 36px;
+}
+
+/* Usage page sections: Quota, then Reliability (owner), then activity. */
+.usage-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.usage-section-title {
+  margin: 0;
+  color: var(--label-1);
+  font-size: var(--fs-title);
+  font-weight: 600;
+}
+
+.usage-section-sub {
+  margin: 0;
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+}
+
+.quota-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.quota-card.near,
+.quota-card.warn {
+  border-color: var(--warn);
+}
+
+.quota-card.at-limit {
+  border-color: var(--danger);
+}
+
+.meter-fill.danger {
+  background: var(--danger);
+}
+
+.health-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Jump to latest: a pill with a word, a count and a live dot. */
+.scroll-bottom.jump-pill {
+  width: auto;
+  height: 36px;
+  padding: 0 14px;
+  gap: 8px;
+  border-radius: var(--r-pill);
+  font-size: var(--fs-caption);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.jump-pill .scroll-badge {
+  position: static;
+  min-width: 20px;
+  height: 20px;
+  line-height: 20px;
+}
+
+.jump-live {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent-ink);
+  animation: jump-live-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes jump-live-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .jump-live {
+    animation: none;
+  }
+}
+
+.root[data-motion="reduce"] .jump-live,
+.root[data-motion="reduce"] .scroll-bottom.jump-pill {
+  animation: none;
+}
+
+/* Fallback for the quota meter when motion is reduced: no width easing. */
+.root[data-motion="reduce"] .meter-fill {
+  transition: none;
+}

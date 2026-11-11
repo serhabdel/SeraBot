@@ -8,6 +8,9 @@ use crate::ui::Icon;
 use dioxus::prelude::*;
 use serabot_desktop::local_folders::BotScope;
 use serabot_desktop::session::{Session, SettingsSection, Theme};
+use serabot_desktop::theme::Tone;
+
+use crate::ui_widgets::{SecretField, StatusChip};
 
 /// The list of sections on the left. Admin only shows for admins.
 #[component]
@@ -351,7 +354,8 @@ pub fn WebSearchCard(session: Signal<Session>) -> Element {
 #[component]
 pub fn Mem0RecallCard(session: Signal<Session>) -> Element {
     let mut session = session;
-    let mut key_draft = use_signal(String::new);
+    let key_draft = use_signal(String::new);
+    let mut confirming_remove = use_signal(|| false);
     use_effect(move || session.write().load_memory_settings());
     let (settings, error) = {
         let s = session.read();
@@ -385,34 +389,59 @@ pub fn Mem0RecallCard(session: Signal<Session>) -> Element {
                 }
                 span { "Use Mem0 for extra recall (save or remove your key below)" }
             }
-            span {
-                class: if configured { "chip ok" } else { "chip muted" },
-                if configured { "Key saved" } else { "Off — no key" }
+            div { class: "health-status",
+                if configured {
+                    StatusChip { tone: Tone::Ok, text: "Key saved".to_owned() }
+                } else {
+                    StatusChip { tone: Tone::Muted, text: "Off, no key".to_owned() }
+                }
             }
-            label { class: "field",
+            div { class: "field",
                 span { "Mem0 API key" }
-                input {
-                    r#type: "password",
-                    autocomplete: "off",
-                    placeholder: if configured { "Paste a new key to replace yours" } else { "Paste your Mem0 API key" },
-                    value: "{key_draft}",
-                    oninput: move |event| key_draft.set(event.value()),
+                SecretField {
+                    value: key_draft,
+                    label: "Mem0 API key".to_owned(),
+                    placeholder: if configured {
+                        "Paste a new key to replace yours".to_owned()
+                    } else {
+                        "Paste your Mem0 API key".to_owned()
+                    },
                 }
             }
             div { class: "row-actions",
                 button {
                     class: "btn primary small",
+                    disabled: key_draft.read().trim().is_empty(),
                     onclick: move |_| {
+                        let mut key_draft = key_draft;
                         session.write().save_mem0_key(&key_draft.read());
                         key_draft.set(String::new());
                     },
                     if configured { "Replace key" } else { "Save key" }
                 }
-                if configured {
+                if configured && !confirming_remove() {
                     button {
                         class: "btn small",
-                        onclick: move |_| session.write().delete_mem0_key(),
+                        onclick: move |_| confirming_remove.set(true),
                         "Remove key"
+                    }
+                }
+            }
+            if configured && confirming_remove() {
+                div { class: "vault-confirm", role: "group", "aria-label": "Confirm removing the Mem0 key",
+                    span { class: "caption", "Remove your Mem0 key? Extra recall stops until you save a new one." }
+                    button {
+                        class: "btn danger sm",
+                        onclick: move |_| {
+                            confirming_remove.set(false);
+                            session.write().delete_mem0_key();
+                        },
+                        "Remove key"
+                    }
+                    button {
+                        class: "btn ghost sm",
+                        onclick: move |_| confirming_remove.set(false),
+                        "Keep key"
                     }
                 }
             }
