@@ -1346,6 +1346,20 @@ pub(super) fn StatusBanner(session: Signal<Session>) -> Element {
             div { class: "banner err", span { "{message}" } }
         }
     });
+    let credential_view = session.read().credential_save_failed.then(|| {
+        rsx! {
+            div { class: "banner warn", role: "alert",
+                span {
+                    "Signed in for this run only. Windows Credential Manager would not save your session, so you will need to sign in again after SeraBot restarts. "
+                }
+                button {
+                    class: "btn ghost sm",
+                    onclick: move |_| session.write().retry_save_credentials(),
+                    "Try saving again"
+                }
+            }
+        }
+    });
     let unknown_view = unknown.then(|| {
         rsx! {
             div { class: "banner warn",
@@ -1429,6 +1443,7 @@ pub(super) fn StatusBanner(session: Signal<Session>) -> Element {
         {restarting_view}
         {link_view}
         {error_view}
+        {credential_view}
         {unknown_view}
         {task_view}
     }

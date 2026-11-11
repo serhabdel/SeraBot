@@ -18,6 +18,10 @@ pub const CALLBACK_PATH: &str = "/oauth-callback";
 pub const AUTH_DONE_PATH: &str = "/auth-done";
 const PREFERRED_PORT: u16 = 51121;
 const MAX_REQUEST_HEAD: usize = 8 * 1024;
+/// Requests the sign-in listener ignores (wrong path, state, or host) before it
+/// gives up. A stray local process can knock on the port, but cannot keep the
+/// sign-in waiting forever.
+const MAX_IGNORED_REQUESTS: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OAuthError {
@@ -31,6 +35,8 @@ pub enum OAuthError {
     StateMismatch,
     /// The user cancelled the sign-in from the console.
     Cancelled,
+    /// The listener received too many requests that were not the sign-in redirect.
+    TooManyRequests,
 }
 
 impl std::fmt::Display for OAuthError {
@@ -41,6 +47,9 @@ impl std::fmt::Display for OAuthError {
             Self::Denied => "Sign-in was cancelled or refused.",
             Self::StateMismatch => "Sign-in redirect did not match this request. Start it again.",
             Self::Cancelled => "Sign-in was cancelled.",
+            Self::TooManyRequests => {
+                "Too many unexpected requests reached the sign-in listener. Start sign-in again."
+            }
         })
     }
 }
@@ -175,11 +184,33 @@ fn read_request_url(stream: &mut TcpStream) -> Option<url::Url> {
         respond(stream, "400 Bad Request", "Bad request");
         return None;
     };
+    let host = head
+        .lines()
+        .skip(1)
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("host")
+                .then(|| value.trim().to_owned())
+        })
+        .unwrap_or_default();
+    let port = stream.local_addr().map(|addr| addr.port()).unwrap_or(0);
+    if !host_allowed(&host, port) {
+        respond(stream, "400 Bad Request", "Bad request");
+        return None;
+    }
     let Ok(url) = url::Url::parse(&format!("http://127.0.0.1{target}")) else {
         respond(stream, "400 Bad Request", "Bad request");
         return None;
     };
     Some(url)
+}
+
+/// Only the loopback names the redirect can carry, on the port this listener
+/// owns. A `Host` naming any other site means a browser page on another origin
+/// (DNS rebinding) or a crafted request, and it is refused before parsing.
+fn host_allowed(host: &str, port: u16) -> bool {
+    host == format!("127.0.0.1:{port}") || host == format!("localhost:{port}")
 }
 
 /// What the browser brought back to `/auth-done`.
@@ -210,6 +241,7 @@ pub fn wait_for_auth_done(
         .set_nonblocking(true)
         .map_err(|_| OAuthError::Listen)?;
     let deadline = Instant::now() + timeout;
+    let mut ignored = 0usize;
     loop {
         if cancel.load(Ordering::SeqCst) {
             return Err(OAuthError::Cancelled);
@@ -218,6 +250,10 @@ pub fn wait_for_auth_done(
             Ok((stream, _)) => {
                 if let Some(done) = handle_auth_done(stream, expected_state) {
                     return Ok(done);
+                }
+                ignored += 1;
+                if ignored >= MAX_IGNORED_REQUESTS {
+                    return Err(OAuthError::TooManyRequests);
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -333,7 +369,11 @@ mod tests {
 
     fn get(port: u16, target: &str) {
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        write!(stream, "GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+        write!(
+            stream,
+            "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        )
+        .unwrap();
         let mut sink = String::new();
         let _ = stream.read_to_string(&mut sink);
     }
@@ -469,7 +509,7 @@ mod tests {
             let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
             write!(
                 stream,
-                "GET /auth-done?handoff=h&state=expected-state HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+                "GET /auth-done?handoff=h&state=expected-state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
             )
             .unwrap();
             let mut reply = String::new();
@@ -500,6 +540,59 @@ mod tests {
     fn handoff_return_to_is_the_loopback_auth_done_address() {
         assert_eq!(handoff_return_to(51121), "http://127.0.0.1:51121/auth-done");
         assert!(crate::valid_handoff_return_to(&handoff_return_to(51121)));
+    }
+
+    #[test]
+    fn auth_done_refuses_a_host_that_is_not_this_listener() {
+        let (listener, port) = bind_loopback().unwrap();
+        // A correct state with a foreign Host (DNS rebinding) must not complete the wait.
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            write!(
+                stream,
+                "GET /auth-done?handoff=h&state=expected-state HTTP/1.1\r\nHost: evil.example:{port}\r\n\r\n"
+            )
+            .unwrap();
+            let mut reply = String::new();
+            let _ = stream.read_to_string(&mut reply);
+            reply
+        });
+        let result = wait_for_auth_done(
+            &listener,
+            "expected-state",
+            Duration::from_millis(300),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(result, Err(OAuthError::TimedOut));
+        assert!(client.join().unwrap().starts_with("HTTP/1.1 400"));
+    }
+
+    #[test]
+    fn host_must_name_loopback_and_this_port() {
+        assert!(host_allowed("127.0.0.1:51121", 51121));
+        assert!(host_allowed("localhost:51121", 51121));
+        assert!(!host_allowed("127.0.0.1", 51121));
+        assert!(!host_allowed("127.0.0.1:51122", 51121));
+        assert!(!host_allowed("evil.example:51121", 51121));
+        assert!(!host_allowed("", 51121));
+    }
+
+    #[test]
+    fn auth_done_gives_up_after_the_ignored_request_budget() {
+        let (listener, port) = bind_loopback().unwrap();
+        // The wait must run while the requests arrive: each `get` blocks on its reply.
+        let waiter = std::thread::spawn(move || {
+            wait_for_auth_done(
+                &listener,
+                "expected-state",
+                Duration::from_secs(10),
+                &AtomicBool::new(false),
+            )
+        });
+        for _ in 0..MAX_IGNORED_REQUESTS {
+            get(port, "/somewhere-else");
+        }
+        assert_eq!(waiter.join().unwrap(), Err(OAuthError::TooManyRequests));
     }
 
     #[test]

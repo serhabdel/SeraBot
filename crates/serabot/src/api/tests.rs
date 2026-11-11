@@ -8,6 +8,7 @@ use axum::body::Body;
 use axum::http::Request;
 use tower::ServiceExt;
 
+mod a8_smoke_api;
 mod big_wave_b3_b4;
 mod browser_api;
 mod cards_api;
@@ -25,6 +26,19 @@ mod status_api;
 mod vault_http;
 mod wave_a_visibility_api;
 mod wave_b_routines_api;
+
+/// The one log directory every test shares. The tracing subscriber is
+/// process-wide, so only the first installer's file writer is live; giving each
+/// test its own directory would make the file assertions depend on test order.
+fn shared_log_dir() -> std::path::PathBuf {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("serabot-test-logs-{}", uuid::Uuid::new_v4()));
+        crate::logging::install_default(&dir).unwrap();
+        dir
+    })
+    .clone()
+}
 
 /// The bootstrap admin's id â€” the acting user behind the config token
 /// the tests use.

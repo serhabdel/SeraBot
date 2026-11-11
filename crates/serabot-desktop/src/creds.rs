@@ -39,6 +39,20 @@ pub struct Settings {
     pub pins: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefs: Option<UiPrefs>,
+    /// Seconds the sign-in waits for the browser. Unset means the default;
+    /// a stored value is clamped to 1–15 minutes when it is read or written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in_timeout_secs: Option<u64>,
+}
+
+/// The stored sign-in wait, kept inside the range the sign-in accepts.
+fn sanitize_timeout(secs: Option<u64>) -> Option<u64> {
+    secs.map(|secs| {
+        secs.clamp(
+            crate::signin::SIGN_IN_TIMEOUT_MIN_SECS,
+            crate::signin::SIGN_IN_TIMEOUT_MAX_SECS,
+        )
+    })
 }
 
 /// Look-and-feel and chat preferences of this device (0.17). Local only:
@@ -174,18 +188,21 @@ pub fn load_settings_from(dir: &Path) -> Settings {
         .map(sanitize_pins)
         .filter(|pins| !pins.is_empty());
     let prefs = settings.prefs.map(UiPrefs::sanitized);
+    let sign_in_timeout_secs = sanitize_timeout(settings.sign_in_timeout_secs);
     match validate_endpoint(settings.server.trim()) {
         Ok(url) => Settings {
             server: url.origin().ascii_serialization(),
             theme,
             pins,
             prefs,
+            sign_in_timeout_secs,
         },
         Err(_) => Settings {
             server: String::new(),
             theme,
             pins,
             prefs,
+            sign_in_timeout_secs,
         },
     }
 }
@@ -210,6 +227,7 @@ pub fn save_settings_to(dir: &Path, settings: &Settings) -> Result<(), String> {
             .map(|pins| sanitize_pins(pins.clone()))
             .filter(|pins| !pins.is_empty()),
         prefs: settings.prefs.clone().map(UiPrefs::sanitized),
+        sign_in_timeout_secs: sanitize_timeout(settings.sign_in_timeout_secs),
     })
     .map_err(|_| "Could not encode settings.".to_owned())?;
     fs::create_dir_all(dir).map_err(|_| "Could not create the settings directory.".to_owned())?;
@@ -367,6 +385,7 @@ mod tests {
                 theme: Some("light".into()),
                 pins: Some(vec!["dir:analyst".into(), "room:review".into()]),
                 prefs: None,
+                sign_in_timeout_secs: Some(10),
             },
         )
         .unwrap();
@@ -377,6 +396,7 @@ mod tests {
                 theme: Some("light".into()),
                 pins: Some(vec!["dir:analyst".into(), "room:review".into()]),
                 prefs: None,
+                sign_in_timeout_secs: Some(60),
             }
         );
         let text = fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
@@ -391,6 +411,7 @@ mod tests {
                 theme: None,
                 pins: None,
                 prefs: None,
+                sign_in_timeout_secs: None,
             },
         )
         .unwrap();
@@ -415,6 +436,7 @@ mod tests {
                 theme: Some("system".into()),
                 pins: None,
                 prefs: Some(prefs.clone()),
+                sign_in_timeout_secs: None,
             },
         )
         .unwrap();
@@ -449,6 +471,7 @@ mod tests {
                     "12345".into(),
                 ]),
                 prefs: None,
+                sign_in_timeout_secs: None,
             },
         )
         .unwrap();
@@ -571,6 +594,7 @@ mod tests {
             theme: None,
             pins: None,
             prefs: None,
+            sign_in_timeout_secs: None,
         };
         // Invalid saved origins fall back to the optional compiled hint.
         assert_eq!(prefill_server(&settings), default_server_url());

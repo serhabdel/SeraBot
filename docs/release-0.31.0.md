@@ -29,7 +29,8 @@ Spec: `docs/specs/big-wave.md`. Checklist: `tasks/big-wave.md`.
 - **E1** / **E2** — Quota meter and Mem0 Settings console
   ([PR #50](https://github.com/serhabdel/SeraBot/pull/50)).
 - **Chat** — Desktop streaming scroll polish atop 0.28 D1 / #42
-  ([PR #53](https://github.com/serhabdel/SeraBot/pull/53)).
+  ([PR #53](https://github.com/serhabdel/SeraBot/pull/53)); stream glitch regressions
+  ([PR #55](https://github.com/serhabdel/SeraBot/pull/55)).
 
 ## Still open
 

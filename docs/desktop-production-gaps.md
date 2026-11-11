@@ -18,14 +18,25 @@ the sign-in pass touched or read, not a full audit.
   be accepted by `GET /v1/me`. The console tolerates a failed `/v1/me` and lets
   the next read (the model catalog) decide, but this was not checked against a
   real device token.
-- The loopback listener answers any local process that knows the port. The
-  `state` check blocks a forged redirect from being used, and a wrong-state
-  request is ignored, but there is no `Host` header check and no rate limit.
-- The sign-in wait is fixed at 5 minutes and has no "copy the link" fallback
-  for a machine whose default browser cannot be opened.
-- If Windows Credential Manager refuses the write, the session lives for this
-  run only. The user sees "Connected, but the credential could not be saved."
-  but gets no retry button.
+- Fixed (PR `feat/hardening-a8`): the loopback listener refuses any request
+  whose `Host` is not `127.0.0.1` or `localhost` on its own port (DNS rebinding
+  and forged requests), and the sign-in wait gives up after 50 ignored
+  requests. Each sign-in already gets a fresh random `state`, and a wrong-state
+  request is still ignored. Not changed: the listener still answers any local
+  process that knows the port, so a local process can keep ignoring requests
+  until the budget ends the wait.
+- Fixed (PR `feat/hardening-a8`): the sign-in wait is configurable with
+  `sign_in_timeout_secs` in the settings file, clamped to 60–900 seconds, default
+  300. There is no settings control in the UI yet; edit the file and restart.
+  If the browser does not open, the sign-in URL is shown with a read-only field
+  and a "Copy link" button, and the wait continues.
+- Fixed (PR `feat/hardening-a8`): if Windows Credential Manager refuses the
+  write, the session still works for this run. A warning says so and tells the
+  user to sign in again after a restart, with a "Try saving again" button.
+- Open: `GET /v1/monitoring/sources` returns the configured source names and
+  URLs to every member. Only the run status (last run, error) is per user.
+  Whether the URL list should be admin-only is a decision for the Security
+  Reviewer; it is not changed here.
 
 ## Panics, threads and I/O
 
@@ -56,6 +67,11 @@ the sign-in pass touched or read, not a full audit.
 - `ui.rs` is about 7,000 lines. It is type-checked (`--features ui-check`) but
   the connect screen, settings card and sign-out flow have no automated UI test.
   Session-level behaviour (reject, sign-out, offline sign-out) is unit tested.
+  The copy-link field and the credential warning with its retry button are
+  covered by the `ui-check` type-check only; no test drives them.
+- Automated A8 smoke (`crates/serabot/src/api/tests/a8_smoke_api.rs`) drives
+  steps 1–7 of `tasks/big-wave.md` against a seeded admin and member over the
+  real router. It does not drive WebView2 or the owner's Microsoft sign-in.
 - Unit tests that touch the token store now use the in-memory store on Windows
   as well, so they cannot read or delete a developer's real saved credential.
   There is no test that exercises the real Windows Credential Manager.
