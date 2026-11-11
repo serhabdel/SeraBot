@@ -25,6 +25,7 @@ artifacts.
 | [Knowledge packs](knowledge-packs.md) | Import the owner's own accounting guides into the comptable bot's document inbox. |
 | [Multi-user spec](specs/multi-user-reconstruction.md) | Owner-approved and implemented: small-circle multi-user — OIDC sign-in, UID-scoped data, per-user bots, credentials, and connectors. |
 | [Big Wave (0.29–0.31)](specs/big-wave.md) | Visibility, reliability, and deep ops waves — Workflows, traces, per-user schedules, vault/browser polish; checklist in `tasks/big-wave.md`. |
+| [Release 0.35.0](release-0.35.0.md) | Several chats per bot, memory refresh, steadier chat view, bigger composer, Tasks fix. |
 | [Release 0.34.0](release-0.34.0.md) | Desktop chat view and composer fixes; Tasks, Logs and Browser repairs; workflow management and page layout. |
 | [Release 0.33.0](release-0.33.0.md) | Server retries and on-demand digest; desktop and Android client polish. |
 | [Release 0.32.0](release-0.32.0.md) | Server stability and security (feed-URL visibility, session expiry, retries) and Android parity with desktop polish. |

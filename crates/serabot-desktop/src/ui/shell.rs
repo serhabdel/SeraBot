@@ -424,7 +424,6 @@ pub(super) fn Sidebar(
                                 .map(|conversation| conversation.unread_count)
                                 .unwrap_or(0);
                             items.push(RailItem::BotChat {
-                                bot: bot.id.clone(),
                                 id: chat.id.clone(),
                                 title: serabot_desktop::bot_chats::chat_title(chat),
                                 primary: chat.primary,
@@ -791,7 +790,7 @@ pub(super) fn Sidebar(
                                 }
                             }
                         },
-                        RailItem::BotChat { id, title, primary, active, unread, .. } => {
+                        RailItem::BotChat { id, title, primary, active, unread } => {
                             let editing = renaming().as_ref().map(|(edit, _)| edit == &id).unwrap_or(false);
                             let open_id = id.clone();
                             let row_id = id.clone();
@@ -1193,7 +1192,6 @@ pub(super) enum RailItem {
         chats_open: bool,
     },
     BotChat {
-        bot: String,
         id: String,
         title: String,
         primary: bool,
