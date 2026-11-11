@@ -739,11 +739,18 @@ impl Session {
         let theme = Theme::from_stored(settings.theme.as_deref());
         let pins = settings.pins.clone().unwrap_or_default();
         let server = creds::prefill_server(&settings);
-        let token = creds::load_token()
+        // An expired saved session is refused here and never reconnects. The
+        // expiry is read after that check, so a refused session leaves none behind.
+        let restored = creds::load_session(unix_now());
+        let session_expires = restored
+            .as_ref()
+            .and_then(|_| creds::load_settings().session_expires_at);
+        let token = restored
             .map(|token| token.expose_secret().to_owned())
             .unwrap_or_default();
         let worker = Worker::start().ok();
         let mut session = Self::assemble(server, theme, pins, token, worker);
+        session.session_expires = session_expires;
         session.prefs = settings.prefs.clone().unwrap_or_default().sanitized();
         if session.worker.is_some()
             && !session.server.trim().is_empty()
@@ -1119,14 +1126,15 @@ impl Session {
             .as_ref()
             .map(|credentials| credentials.endpoint.origin().ascii_serialization())
             .unwrap_or_else(|| self.server.clone());
-        // Keep the stored sign-in wait: this snapshot is written whole.
-        let sign_in_timeout_secs = creds::load_settings().sign_in_timeout_secs;
+        // Keep the stored sign-in wait and session expiry: this snapshot is written whole.
+        let stored = creds::load_settings();
         (!origin.is_empty()).then(|| creds::Settings {
             server: origin,
             theme: Some(self.theme.as_str().into()),
             pins: (!self.pins.is_empty()).then(|| self.pins.clone()),
             prefs: Some(self.prefs.clone()),
-            sign_in_timeout_secs,
+            sign_in_timeout_secs: stored.sign_in_timeout_secs,
+            session_expires_at: stored.session_expires_at,
         })
     }
 
@@ -1513,12 +1521,13 @@ impl Session {
     /// store, show the user at once and connect with the new token.
     fn complete_sign_in(&mut self, signed_in: SignedIn) {
         let mut token = signed_in.token.expose_secret().to_owned();
+        let expires = signed_in.expires_at.as_deref().and_then(parse_rfc3339_unix);
         // A store failure is reported by persist_credentials once connected.
-        let _ = creds::save_token(&token);
+        let _ = creds::save_session(&token, expires);
         self.token.zeroize();
         self.token = token.clone();
         token.zeroize();
-        self.session_expires = signed_in.expires_at.as_deref().and_then(parse_rfc3339_unix);
+        self.session_expires = expires;
         self.state.user = Some(signed_in.user);
         self.sign_in.clear_secrets();
         self.sign_in.show_invite = false;
@@ -1583,7 +1592,7 @@ impl Session {
             .as_ref()
             .map(|credentials| credentials.endpoint.origin().ascii_serialization())
             .unwrap_or_else(|| self.server.clone());
-        let stored = creds::forget_token();
+        let stored = creds::forget_session();
         self.stop_events();
         self.reset_scope(false);
         self.reset_panel();
@@ -3850,7 +3859,7 @@ impl Session {
         let settings = self
             .ui_settings_snapshot()
             .map(|snapshot| creds::save_settings(&snapshot));
-        let token = creds::save_token(credentials.token.expose_secret());
+        let token = creds::save_session(credentials.token.expose_secret(), self.session_expires);
         self.server = origin;
         self.credential_save_failed = token.is_err();
         if settings.as_ref().is_some_and(|result| result.is_err()) {
@@ -3864,7 +3873,7 @@ impl Session {
         let Some(credentials) = self.credentials.clone() else {
             return;
         };
-        match creds::save_token(credentials.token.expose_secret()) {
+        match creds::save_session(credentials.token.expose_secret(), self.session_expires) {
             Ok(()) => {
                 self.credential_save_failed = false;
                 self.toast = Some("Session saved. You will stay signed in after a restart.".into());

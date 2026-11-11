@@ -2,12 +2,16 @@
 
 use super::*;
 use crate::runtime::ScheduledPayload;
+use crate::util::redact_url_queries;
 
 const MAX_SOURCE_ERROR_CHARS: usize = 240;
 
-/// Strip HTML-ish watcher errors before they reach the API.
+/// Strip HTML-ish watcher errors before they reach the API. URL queries and
+/// fragments are removed too: a run error can name a feed with an access key,
+/// and rows stored by earlier builds may still carry one.
 fn sanitize_source_error(raw: Option<&str>) -> Option<String> {
-    let text = raw?.trim();
+    let redacted = redact_url_queries(raw?.trim());
+    let text = redacted.trim();
     if text.is_empty() {
         return None;
     }
@@ -22,7 +26,18 @@ fn sanitize_source_error(raw: Option<&str>) -> Option<String> {
     Some(truncate_chars(&flat, MAX_SOURCE_ERROR_CHARS))
 }
 
+/// The feed URL a caller may see: admins get it, members get `null`. Feed URLs
+/// can carry access tokens in their query string, so they stay admin-only.
+pub(super) fn visible_feed_url(acting: &ActingUser, url: &str) -> Value {
+    if acting.is_admin() {
+        json!(url)
+    } else {
+        Value::Null
+    }
+}
+
 /// `GET /v1/monitoring/sources`: configured sources and last-run status.
+/// Source names and kinds are shared config; feed URLs are admin-only.
 pub(super) async fn list_monitoring_sources(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
@@ -41,7 +56,7 @@ pub(super) async fn list_monitoring_sources(
                 "name": source.name,
                 "kind": source.kind,
                 "enabled": source.enabled,
-                "url": source.url,
+                "url": visible_feed_url(&user, &source.url),
                 "last_run": last.as_ref().map(|run| json!({
                     "ok": run.ok,
                     "error": sanitize_source_error(run.error.as_deref()),

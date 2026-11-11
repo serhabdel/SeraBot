@@ -29,6 +29,48 @@ const MAX_REDIRECTS: usize = 3;
 /// Status codes that are handled as redirects when a `Location` header exists.
 const REDIRECT_STATUSES: [u16; 5] = [301, 302, 303, 307, 308];
 
+/// A URL as it may appear in an error message: scheme, host, port and path.
+/// The query and fragment are left out, since a feed's query can hold a key.
+struct Shown<'a>(&'a Url);
+
+impl std::fmt::Display for Shown<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut url = self.0.clone();
+        url.set_query(None);
+        url.set_fragment(None);
+        write!(f, "{url}")
+    }
+}
+
+/// Attempts for one GET when the connection fails before any response arrives.
+const SEND_ATTEMPTS: u32 = 3;
+
+/// Wait before the first connection retry; each later retry waits twice as long.
+const SEND_RETRY_BASE: Duration = Duration::from_millis(250);
+
+/// Send a GET, retrying connect failures, timeouts and connections dropped
+/// before a response. A GET has no body and no side effect, so repeating it is
+/// safe. Any response, including an error status, is returned at once.
+async fn send_get(
+    client: &Client,
+    url: &Url,
+) -> std::result::Result<reqwest::Response, reqwest::Error> {
+    let mut attempt = 1;
+    loop {
+        match client.get(url.clone()).send().await {
+            Ok(response) => return Ok(response),
+            Err(error)
+                if attempt < SEND_ATTEMPTS
+                    && (error.is_connect() || error.is_timeout() || error.is_request()) =>
+            {
+                tokio::time::sleep(SEND_RETRY_BASE * 2u32.pow(attempt - 1)).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// A successfully retrieved HTTP response.
 #[derive(Debug, Clone, Serialize)]
 pub struct FetchedPage {
@@ -122,18 +164,20 @@ impl SafeFetcher {
         let mut redirects = 0usize;
 
         loop {
-            let response = self
-                .client
-                .get(current.clone())
-                .send()
-                .await
-                .map_err(|error| SeraError::External(format!("fetch {current}: {error}")))?;
+            let response = send_get(&self.client, &current).await.map_err(|error| {
+                SeraError::External(format!(
+                    "fetch {}: {}",
+                    Shown(&current),
+                    error.without_url()
+                ))
+            })?;
             let status = response.status();
 
             if REDIRECT_STATUSES.contains(&status.as_u16()) {
                 if redirects >= MAX_REDIRECTS {
                     return Err(SeraError::External(format!(
-                        "too many redirects while fetching {url}"
+                        "too many redirects while fetching {}",
+                        Shown(&current)
                     )));
                 }
                 let location = response
@@ -142,12 +186,16 @@ impl SafeFetcher {
                     .and_then(|value| value.to_str().ok())
                     .ok_or_else(|| {
                         SeraError::External(format!(
-                            "redirect without a usable Location header from {current}"
+                            "redirect without a usable Location header from {}",
+                            Shown(&current)
                         ))
                     })?
                     .to_owned();
                 let next = current.join(&location).map_err(|error| {
-                    SeraError::External(format!("invalid redirect target from {current}: {error}"))
+                    SeraError::External(format!(
+                        "invalid redirect target from {}: {error}",
+                        Shown(&current)
+                    ))
                 })?;
                 current = self.validate_parsed(next).await?;
                 redirects += 1;
@@ -165,7 +213,8 @@ impl SafeFetcher {
                 .is_some_and(|length| length > self.max_bytes as u64)
             {
                 return Err(SeraError::External(format!(
-                    "response from {current} exceeds {} bytes",
+                    "response from {} exceeds {} bytes",
+                    Shown(&current),
                     self.max_bytes
                 )));
             }
@@ -174,11 +223,16 @@ impl SafeFetcher {
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|error| {
-                    SeraError::External(format!("read body from {current}: {error}"))
+                    SeraError::External(format!(
+                        "read body from {}: {}",
+                        Shown(&current),
+                        error.without_url()
+                    ))
                 })?;
                 if body.len().saturating_add(chunk.len()) > self.max_bytes {
                     return Err(SeraError::External(format!(
-                        "response from {current} exceeds {} bytes",
+                        "response from {} exceeds {} bytes",
+                        Shown(&current),
                         self.max_bytes
                     )));
                 }
@@ -196,7 +250,8 @@ impl SafeFetcher {
 
     async fn validate(&self, raw: &str) -> Result<Url> {
         let parsed = Url::parse(raw)
-            .map_err(|error| SeraError::Validation(format!("invalid URL {raw:?}: {error}")))?;
+            // The input is not echoed: it can carry a key in its query string.
+            .map_err(|error| SeraError::Validation(format!("invalid URL: {error}")))?;
         self.validate_parsed(parsed).await
     }
 
@@ -374,6 +429,73 @@ mod tests {
         let uri = Url::parse(&server.uri()).unwrap();
         let port = uri.port().unwrap();
         format!("http://localhost:{port}{path}")
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_error_never_repeats_the_query_string() {
+        // Bind and release a port so the connection is refused.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let error = fetcher(1024)
+            .fetch(&format!(
+                "http://localhost:{port}/feed?access=synthetic-feed-key#frag"
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("/feed"), "{error}");
+        assert!(!error.contains("synthetic-feed-key"), "{error}");
+        assert!(!error.contains("access="), "{error}");
+        assert!(!error.contains("frag"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_connection_dropped_before_a_response_is_retried() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // The first connection is closed with no reply; the retry gets a 200.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (dropped, _) = listener.accept().await.unwrap();
+            drop(dropped);
+            let (mut served, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 1024];
+            let _ = served.read(&mut head).await;
+            served
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let page = fetcher(1024)
+            .fetch(&format!("http://localhost:{port}/page"))
+            .await
+            .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(page.status, 200);
+        assert_eq!(page.body, "ok");
+    }
+
+    #[tokio::test]
+    async fn an_error_status_is_returned_without_retrying_in_the_fetcher() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/busy"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let page = fetcher(1024)
+            .fetch(&localhost_url(&server, "/busy"))
+            .await
+            .unwrap();
+
+        assert_eq!(page.status, 503);
     }
 
     #[tokio::test]

@@ -105,9 +105,65 @@ pub fn truncate_chars(value: &str, max: usize) -> String {
     value.chars().take(max).collect()
 }
 
+/// Remove the query string and fragment from every `http(s)://` URL in `text`.
+/// Feed URLs can carry access keys in their query, so any text that may be
+/// shown to a member is passed through this first. A redacted query is
+/// replaced with `?[redacted]` so the reader still sees one was there.
+pub fn redact_url_queries(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = next_scheme(rest) {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let end = tail
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '(' | ')' | ',')
+            })
+            .unwrap_or(tail.len());
+        // Sentence punctuation after the URL is not part of it.
+        let url_len = tail[..end].trim_end_matches(['.', ':', ';', '!']).len();
+        let url = &tail[..url_len];
+        match url.find(['?', '#']) {
+            Some(cut) => {
+                out.push_str(&url[..cut]);
+                out.push_str("?[redacted]");
+            }
+            None => out.push_str(url),
+        }
+        rest = &tail[url_len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn next_scheme(text: &str) -> Option<usize> {
+    match (text.find("https://"), text.find("http://")) {
+        (Some(https), Some(http)) => Some(https.min(http)),
+        (https, http) => https.or(http),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_queries_and_fragments_are_redacted_everywhere_in_text() {
+        assert_eq!(
+            redact_url_queries("fetch https://host.example/feed?access=KEY: timeout"),
+            "fetch https://host.example/feed?[redacted]: timeout"
+        );
+        assert_eq!(
+            redact_url_queries("a http://h.example/x#frag and https://h.example/y?k=1&j=2)"),
+            "a http://h.example/x?[redacted] and https://h.example/y?[redacted])"
+        );
+        // Text without a URL, and URLs without a query, pass through unchanged.
+        assert_eq!(redact_url_queries("plain text"), "plain text");
+        assert_eq!(
+            redact_url_queries("see https://h.example/feed."),
+            "see https://h.example/feed."
+        );
+    }
 
     #[test]
     fn mime_matches_the_extension() {
