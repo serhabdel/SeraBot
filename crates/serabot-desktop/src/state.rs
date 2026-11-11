@@ -198,6 +198,14 @@ pub struct State {
     pub transcript_loading: bool,
     pub created_bot: Option<CreatedBot>,
     pub created_conversation: Option<CreatedConversation>,
+    /// The Marketplace catalog with this user's state (owner-scoped).
+    pub marketplace: Vec<crate::marketplace::PluginSummary>,
+    pub marketplace_loaded: bool,
+    /// A server without the marketplace routes (404): the screen says so.
+    pub marketplace_unavailable: bool,
+    pub marketplace_error: Option<String>,
+    /// The open plugin page.
+    pub marketplace_detail: Option<crate::marketplace::PluginDetail>,
     /// Each bot's chats (owner-scoped, kept across conversation switches).
     pub bot_chats: BTreeMap<String, crate::bot_chats::BotChatList>,
     /// Bots whose chat list has been read at least once.
@@ -314,6 +322,11 @@ impl Default for State {
             transcript_loading: false,
             created_bot: None,
             created_conversation: None,
+            marketplace: Vec::new(),
+            marketplace_loaded: false,
+            marketplace_unavailable: false,
+            marketplace_error: None,
+            marketplace_detail: None,
             bot_chats: BTreeMap::new(),
             bot_chats_loaded: std::collections::BTreeSet::new(),
             created_bot_chat: None,
@@ -354,6 +367,11 @@ impl State {
         let conversation_titles = self.conversation_titles;
         let created_bot = self.created_bot.clone();
         let created_conversation = self.created_conversation.clone();
+        let marketplace = self.marketplace.clone();
+        let marketplace_loaded = self.marketplace_loaded;
+        let marketplace_unavailable = self.marketplace_unavailable;
+        let marketplace_error = self.marketplace_error.clone();
+        let marketplace_detail = self.marketplace_detail.clone();
         let bot_chats = self.bot_chats.clone();
         let bot_chats_loaded = self.bot_chats_loaded.clone();
         let created_bot_chat = self.created_bot_chat.clone();
@@ -405,6 +423,11 @@ impl State {
             conversation_titles,
             created_bot,
             created_conversation,
+            marketplace,
+            marketplace_loaded,
+            marketplace_unavailable,
+            marketplace_error,
+            marketplace_detail,
             bot_chats,
             bot_chats_loaded,
             created_bot_chat,
@@ -551,6 +574,25 @@ impl State {
             Reply::CreatedBot(bot) => self.created_bot = Some(bot),
             Reply::CreatedConversation(node) => self.created_conversation = Some(node),
             Reply::CreatedSkill(skill) => self.created_skill = Some(skill),
+            Reply::MarketplacePlugins(plugins) => {
+                self.marketplace = plugins;
+                self.marketplace_loaded = true;
+                self.marketplace_unavailable = false;
+                self.marketplace_error = None;
+            }
+            Reply::MarketplaceDetail(detail) => {
+                self.marketplace_detail = Some(*detail);
+                self.marketplace_error = None;
+            }
+            Reply::MarketplaceChanged { plugins, detail } => {
+                self.marketplace = plugins;
+                self.marketplace_loaded = true;
+                self.marketplace_unavailable = false;
+                self.marketplace_error = None;
+                if let Some(detail) = detail {
+                    self.marketplace_detail = Some(*detail);
+                }
+            }
             Reply::BotChats(list) => {
                 self.bot_chats_loaded.insert(list.bot.clone());
                 self.bot_chats.insert(list.bot.clone(), list);
@@ -1395,6 +1437,57 @@ mod tests {
             turns: 0,
             has_summary: false,
         }
+    }
+
+    fn plugin(slug: &str, installed: bool) -> crate::marketplace::PluginSummary {
+        crate::marketplace::PluginSummary {
+            slug: slug.into(),
+            name: slug.to_uppercase(),
+            tagline: String::new(),
+            category: "research".into(),
+            version: "1.0.0".into(),
+            installed,
+            enabled: false,
+            status: String::new(),
+        }
+    }
+
+    #[test]
+    fn marketplace_replies_fill_the_catalog_and_keep_it_across_switches() {
+        let mut state = State::default();
+        let scope = state.scope.clone();
+        assert!(!state.marketplace_loaded);
+        state.receive(
+            &scope,
+            Reply::MarketplacePlugins(vec![plugin("search", false), plugin("mail", false)]),
+        );
+        assert!(state.marketplace_loaded);
+        assert_eq!(state.marketplace.len(), 2);
+
+        // A change returns the refreshed list; an uninstall keeps the old page
+        // until the server's detail arrives.
+        state.receive(
+            &scope,
+            Reply::MarketplaceChanged {
+                plugins: vec![plugin("search", true), plugin("mail", false)],
+                detail: None,
+            },
+        );
+        assert!(state.marketplace[0].installed);
+        assert!(state.marketplace_detail.is_none());
+
+        // A failed read earlier is cleared by a good one.
+        state.marketplace_error = Some("old".into());
+        state.receive(
+            &scope,
+            Reply::MarketplacePlugins(vec![plugin("search", true)]),
+        );
+        assert!(state.marketplace_error.is_none());
+
+        // The catalog belongs to the owner, not the open chat.
+        state.new_scope("dir:legal".into(), true);
+        assert_eq!(state.marketplace.len(), 1);
+        assert!(state.marketplace_loaded);
     }
 
     #[test]

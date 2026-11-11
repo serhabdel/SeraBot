@@ -54,6 +54,7 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                         Section::Usage => rsx! { UsagePage { session } },
                         Section::Logs => rsx! { crate::ui_logs::LogsView { session } },
                         Section::Workflows => rsx! { crate::ui_workflows::WorkflowsView { session } },
+                        Section::Marketplace => rsx! { crate::ui_marketplace::MarketplaceView { session } },
                         Section::Settings => rsx! { SettingsView { session } },
                     }}
                 }
@@ -113,13 +114,14 @@ pub(super) fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, b
     let mut session = session;
     let section = session.read().section;
     let pending = session.read().state.approvals.len();
-    let destinations: [(Section, &str, &str); 11] = [
+    let destinations: [(Section, &str, &str); 12] = [
         (Section::Chat, "chat", "Chats"),
         (Section::Browser, "globe", "Browser"),
         (Section::Tasks, "list", "Tasks"),
         (Section::Approvals, "approvals", "Approvals"),
         (Section::Memory, "memory", "Memory"),
         (Section::Connectors, "connectors", "Connectors"),
+        (Section::Marketplace, "grid", "Plugins"),
         (Section::Vault, "lock", "Vault"),
         (Section::Usage, "usage", "Usage"),
         (Section::Workflows, "workflows", "Workflows"),

@@ -42,6 +42,9 @@ pub enum OperationKind {
     ListBots,
     ListConversations,
     ListArchived,
+    MarketplaceList,
+    MarketplaceDetail,
+    MarketplaceWrite,
     ListBotChats,
     CreateBotChat,
     SetBotRefresh,
@@ -188,6 +191,19 @@ pub enum Operation {
         include_archived: bool,
     },
     ListArchived,
+    MarketplaceList,
+    MarketplaceDetail {
+        slug: String,
+    },
+    MarketplaceAct {
+        slug: String,
+        action: crate::marketplace::PluginAction,
+    },
+    /// The typed values are sent once and dropped; `Zeroizing` wipes them.
+    MarketplaceConfig {
+        slug: String,
+        values: Vec<(String, Zeroizing<String>)>,
+    },
     ListBotChats {
         bot: String,
     },
@@ -505,6 +521,11 @@ impl Operation {
             Self::ListBots => OperationKind::ListBots,
             Self::ListConversations { .. } => OperationKind::ListConversations,
             Self::ListArchived => OperationKind::ListArchived,
+            Self::MarketplaceList => OperationKind::MarketplaceList,
+            Self::MarketplaceDetail { .. } => OperationKind::MarketplaceDetail,
+            Self::MarketplaceAct { .. } | Self::MarketplaceConfig { .. } => {
+                OperationKind::MarketplaceWrite
+            }
             Self::ListBotChats { .. } => OperationKind::ListBotChats,
             Self::CreateBotChat { .. } => OperationKind::CreateBotChat,
             Self::SetBotRefresh { .. } => OperationKind::SetBotRefresh,
@@ -608,6 +629,14 @@ pub enum Reply {
     CreatedSkill(CreatedSkill),
     Skills(Vec<SkillSummary>),
     BotChats(crate::bot_chats::BotChatList),
+    MarketplacePlugins(Vec<crate::marketplace::PluginSummary>),
+    MarketplaceDetail(Box<crate::marketplace::PluginDetail>),
+    /// After a change: the refreshed catalog and the plugin that changed
+    /// (absent when it was uninstalled and the page is closed).
+    MarketplaceChanged {
+        plugins: Vec<crate::marketplace::PluginSummary>,
+        detail: Option<Box<crate::marketplace::PluginDetail>>,
+    },
     BotChatCreated {
         bot: String,
         created: crate::bot_chats::CreatedBotChat,
@@ -991,6 +1020,18 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         Operation::ListArchived => client
             .list_conversations(100, None, true)
             .map(Reply::ArchivedConversations),
+        Operation::MarketplaceList => client.marketplace_plugins().map(Reply::MarketplacePlugins),
+        Operation::MarketplaceDetail { slug } => client
+            .marketplace_plugin(slug)
+            .map(|detail| Reply::MarketplaceDetail(Box::new(detail))),
+        Operation::MarketplaceAct { slug, action } => {
+            client.marketplace_act(slug, *action)?;
+            marketplace_changed(client, slug)
+        }
+        Operation::MarketplaceConfig { slug, values } => {
+            client.marketplace_config(slug, values)?;
+            marketplace_changed(client, slug)
+        }
         Operation::ListBotChats { bot } => client.list_bot_chats(bot).map(Reply::BotChats),
         Operation::CreateBotChat { bot, title } => client
             .create_bot_chat(bot, title.as_deref())
@@ -1296,6 +1337,14 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
             .submit_secret_card(id, value)
             .map(|_| Reply::CardWritten),
     }
+}
+
+/// The catalog and one plugin, read again after a change. An uninstalled
+/// plugin still has a detail page, so the read is the same either way.
+fn marketplace_changed(client: &ApiClient, slug: &str) -> Result<Reply, ApiError> {
+    let plugins = client.marketplace_plugins()?;
+    let detail = client.marketplace_plugin(slug).ok().map(Box::new);
+    Ok(Reply::MarketplaceChanged { plugins, detail })
 }
 
 #[cfg(test)]

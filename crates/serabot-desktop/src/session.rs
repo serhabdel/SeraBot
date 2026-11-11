@@ -142,10 +142,12 @@ pub enum Section {
     Logs,
     /// Scheduled routines, source health and active plans (0.29.0).
     Workflows,
+    /// Plugins: install, turn on and off, and set up (v0.37).
+    Marketplace,
 }
 
 impl Section {
-    pub const NAV: [Self; 12] = [
+    pub const NAV: [Self; 13] = [
         Self::Chat,
         Self::Conversations,
         Self::Browser,
@@ -153,6 +155,7 @@ impl Section {
         Self::Memory,
         Self::Providers,
         Self::Connectors,
+        Self::Marketplace,
         Self::Approvals,
         Self::Vault,
         Self::Usage,
@@ -175,6 +178,7 @@ impl Section {
             Self::Settings => "Settings",
             Self::Logs => "Logs",
             Self::Workflows => "Workflows",
+            Self::Marketplace => "Marketplace",
         }
     }
 }
@@ -714,6 +718,10 @@ pub struct Session {
     /// The bot whose chat list is being read, so a failed read (an older
     /// server without the route) marks it loaded instead of retrying forever.
     bot_chats_pending: Option<String>,
+    /// The plugin whose page is open on the Marketplace screen.
+    pub marketplace_open: Option<String>,
+    /// A change is in flight (so its buttons wait).
+    pub marketplace_busy: bool,
     /// The bot config write in flight: (bot id, update), kept so the cached
     /// detail can be updated optimistically when the save succeeds.
     bot_config_pending: Option<(String, BotConfigUpdate)>,
@@ -869,6 +877,8 @@ impl Session {
             pending_open_group: None,
             bot_detail_pending: None,
             bot_chats_pending: None,
+            marketplace_open: None,
+            marketplace_busy: false,
             bot_config_pending: None,
             pending_team: None,
             pending_room_refresh: false,
@@ -1277,6 +1287,9 @@ impl Session {
         if section == Section::Workflows {
             self.refresh_workflows();
         }
+        if section == Section::Marketplace {
+            self.refresh_marketplace();
+        }
         self.ensure_section_data();
     }
 
@@ -1309,6 +1322,55 @@ impl Session {
     }
 
     /// Read the Wave A visibility bundle (0.29.0). Independent of the open chat.
+    /// Read the catalog. A manual Refresh calls this again.
+    pub fn refresh_marketplace(&mut self) {
+        if !self.state.connected {
+            return;
+        }
+        if self.pending.is_some() {
+            if self.ready() {
+                self.schedule(Operation::MarketplaceList, Duration::ZERO);
+            }
+            return;
+        }
+        self.state.marketplace_error = None;
+        self.start_request(Operation::MarketplaceList);
+    }
+
+    /// Open a plugin's page: show what the list already knows and read the rest.
+    pub fn open_plugin(&mut self, slug: String) {
+        if !self.state.connected || !crate::valid_id(&slug) {
+            return;
+        }
+        self.state.marketplace_detail = None;
+        self.marketplace_open = Some(slug.clone());
+        self.state.marketplace_error = None;
+        self.start_request(Operation::MarketplaceDetail { slug });
+    }
+
+    pub fn close_plugin(&mut self) {
+        self.marketplace_open = None;
+        self.state.marketplace_detail = None;
+    }
+
+    pub fn plugin_action(&mut self, slug: String, action: crate::marketplace::PluginAction) {
+        if !self.state.connected || !crate::valid_id(&slug) {
+            return;
+        }
+        self.state.marketplace_error = None;
+        self.start_request(Operation::MarketplaceAct { slug, action });
+    }
+
+    /// Send what the user typed into a plugin's setup form. The values are
+    /// moved into the request and wiped when it finishes.
+    pub fn save_plugin_config(&mut self, slug: String, values: Vec<(String, Zeroizing<String>)>) {
+        if !self.state.connected || !crate::valid_id(&slug) {
+            return;
+        }
+        self.state.marketplace_error = None;
+        self.start_request(Operation::MarketplaceConfig { slug, values });
+    }
+
     pub fn refresh_workflows(&mut self) {
         if !self.state.connected || self.pending.is_some() {
             if self.ready() {
@@ -3174,6 +3236,9 @@ impl Session {
         match &operation {
             Operation::BotDetail { id } => self.bot_detail_pending = Some(id.clone()),
             Operation::ListBotChats { bot } => self.bot_chats_pending = Some(bot.clone()),
+            Operation::MarketplaceAct { .. } | Operation::MarketplaceConfig { .. } => {
+                self.marketplace_busy = true
+            }
             Operation::UpdateBotConfig { id, update } => {
                 self.bot_config_pending = Some((id.clone(), update.clone()))
             }
@@ -3365,6 +3430,7 @@ impl Session {
                     let message = error.to_string();
                     let sign_in_message = error.sign_in_text();
                     let rate_limited = error == ApiError::Http(429);
+                    let not_found = error == ApiError::Http(404);
                     let dropped = error.is_transport();
                     self.state.fail(&completion.scope, completion.kind, error);
                     if dropped && self.state.connected {
@@ -3489,6 +3555,21 @@ impl Session {
                         OperationKind::Logs => {
                             // The tab shows its own message; no global banner.
                             self.state.logs_loaded = true;
+                            self.state.error = None;
+                        }
+                        OperationKind::MarketplaceList
+                        | OperationKind::MarketplaceDetail
+                        | OperationKind::MarketplaceWrite => {
+                            self.marketplace_busy = false;
+                            // Older servers have no marketplace routes. Say so
+                            // once, instead of retrying or showing a raw status.
+                            if not_found {
+                                self.state.marketplace_unavailable = true;
+                                self.state.marketplace_loaded = true;
+                                self.state.marketplace_error = None;
+                            } else {
+                                self.state.marketplace_error = Some(message);
+                            }
                             self.state.error = None;
                         }
                         OperationKind::Workflows | OperationKind::WorkflowsWrite => {
@@ -3744,6 +3825,11 @@ impl Session {
                                     Duration::ZERO,
                                 );
                             }
+                        }
+                        OperationKind::MarketplaceList | OperationKind::MarketplaceDetail => {}
+                        OperationKind::MarketplaceWrite => {
+                            self.marketplace_busy = false;
+                            self.toast = Some("Saved.".into());
                         }
                         OperationKind::CreateBotChat => {
                             if let Some((_, chat, _)) = self.state.created_bot_chat.take() {
@@ -4099,6 +4185,9 @@ impl Session {
                 query: self.logs_query.clone(),
             }),
             Section::Workflows => (!self.state.workflows_loaded).then_some(Operation::Workflows),
+            Section::Marketplace => (!self.state.marketplace_loaded
+                && !self.state.marketplace_unavailable)
+                .then_some(Operation::MarketplaceList),
             Section::Browser | Section::Vault | Section::Usage | Section::Settings => None,
         }
     }
