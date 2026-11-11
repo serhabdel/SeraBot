@@ -32,6 +32,116 @@ class _ChatsScreenState extends State<ChatsScreen> {
     super.dispose();
   }
 
+  /// Long-press menu: Rename or Archive. Archive is what the server's delete
+  /// does (the chat can be restored), so it asks first and offers Undo.
+  Future<void> _actions(ConversationSummary c) async {
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheet) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              key: const Key('chat-rename'),
+              leading: const Icon(Icons.edit_outlined),
+              title: const Text('Rename'),
+              onTap: () => Navigator.of(sheet).pop('rename'),
+            ),
+            ListTile(
+              key: const Key('chat-archive'),
+              leading: const Icon(Icons.archive_outlined),
+              title: const Text('Archive'),
+              onTap: () => Navigator.of(sheet).pop('archive'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted) {
+      return;
+    }
+    if (choice == 'rename') {
+      await _rename(c);
+    } else if (choice == 'archive') {
+      await _archive(c);
+    }
+  }
+
+  Future<void> _rename(ConversationSummary c) async {
+    final controller = TextEditingController(text: c.displayTitle);
+    final title = await showDialog<String>(
+      context: context,
+      builder: (dialog) => AlertDialog(
+        title: const Text('Rename chat'),
+        content: TextField(
+          key: const Key('rename-field'),
+          controller: controller,
+          autofocus: true,
+          maxLength: 120,
+          decoration: const InputDecoration(labelText: 'Name'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialog).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            key: const Key('rename-save'),
+            onPressed: () => Navigator.of(dialog).pop(controller.text),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    final next = title?.trim() ?? '';
+    if (next.isEmpty || next == c.displayTitle || !mounted) {
+      return;
+    }
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await app.client.renameConversation(c.id, next);
+      await app.refreshConversations();
+    } on ApiException catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text(e.messageForUser())));
+    }
+  }
+
+  Future<void> _archive(ConversationSummary c) async {
+    final ok = await confirmAction(
+      context,
+      title: 'Archive this chat?',
+      message: '"${c.displayTitle}" leaves your list. You can undo right after.',
+      confirmLabel: 'Archive',
+    );
+    if (!ok || !mounted) {
+      return;
+    }
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await app.client.archiveConversation(c.id);
+      await app.refreshConversations();
+    } on ApiException catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text(e.messageForUser())));
+      return;
+    }
+    messenger.showSnackBar(SnackBar(
+      content: const Text('Chat archived'),
+      action: SnackBarAction(
+        label: 'Undo',
+        onPressed: () async {
+          try {
+            await app.client.unarchiveConversation(c.id);
+            await app.refreshConversations();
+          } on ApiException catch (e) {
+            messenger.showSnackBar(SnackBar(content: Text(e.messageForUser())));
+          }
+        },
+      ),
+    ));
+  }
+
   void _open(ConversationSummary c) {
     Navigator.of(context).push(MaterialPageRoute<void>(
       builder: (_) => ChatScreen(app: app, conversation: c, device: widget.device),
@@ -102,24 +212,47 @@ class _ChatsScreenState extends State<ChatsScreen> {
 
   Widget _body(BuildContext context, List<ConversationBucket> buckets) {
     if (app.conversationsError != null && app.conversations.isEmpty) {
-      return ListView(padding: const EdgeInsets.all(16), children: [
+      return ListView(physics: const AlwaysScrollableScrollPhysics(), padding: const EdgeInsets.all(16), children: [
         ErrorBanner(app.conversationsError!, onRetry: app.refreshConversations),
       ]);
     }
     if (app.loadingConversations && app.conversations.isEmpty) {
-      return const Center(child: CircularProgressIndicator());
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        children: const [
+          SizedBox(height: 120),
+          Center(child: CircularProgressIndicator()),
+        ],
+      );
     }
     if (buckets.isEmpty) {
-      return ListView(children: [
-        const SizedBox(height: 120),
-        Center(
-          child: Text(_search.text.isEmpty
-              ? 'No chats yet. Start one below.'
-              : 'No chat matches the search.'),
-        ),
-      ]);
+      final searching = _search.text.isNotEmpty;
+      return ListView(
+        key: const Key('chats-empty'),
+        physics: const AlwaysScrollableScrollPhysics(),
+        children: [
+          const SizedBox(height: 120),
+          Icon(
+            searching ? Icons.search_off : Icons.chat_bubble_outline,
+            size: 48,
+            color: Theme.of(context).colorScheme.onSurfaceVariant,
+          ),
+          const SizedBox(height: 12),
+          Center(
+            child: Text(searching
+                ? 'No chat matches the search.'
+                : 'No chats yet. Start one below.'),
+          ),
+          if (!searching)
+            const Padding(
+              padding: EdgeInsets.only(top: 4),
+              child: Center(child: Text('Pull down to refresh.')),
+            ),
+        ],
+      );
     }
     return ListView(
+      physics: const AlwaysScrollableScrollPhysics(),
       padding: const EdgeInsets.only(bottom: 96),
       children: [
         if (app.conversationsError != null)
@@ -144,7 +277,13 @@ class _ChatsScreenState extends State<ChatsScreen> {
                 if (b.unread > 0) Text('${b.unread}'),
               ]),
             ),
-          for (final c in b.chats) ConversationTile(app: app, c: c, onTap: () => _open(c)),
+          for (final c in b.chats)
+            ConversationTile(
+              app: app,
+              c: c,
+              onTap: () => _open(c),
+              onLongPress: () => _actions(c),
+            ),
         ],
       ],
     );
@@ -152,11 +291,18 @@ class _ChatsScreenState extends State<ChatsScreen> {
 }
 
 class ConversationTile extends StatelessWidget {
-  const ConversationTile({super.key, required this.app, required this.c, required this.onTap});
+  const ConversationTile({
+    super.key,
+    required this.app,
+    required this.c,
+    required this.onTap,
+    this.onLongPress,
+  });
 
   final AppState app;
   final ConversationSummary c;
   final VoidCallback onTap;
+  final VoidCallback? onLongPress;
 
   @override
   Widget build(BuildContext context) {
@@ -169,6 +315,7 @@ class ConversationTile extends StatelessWidget {
         : (last.role == 'user' ? 'You: ${last.text}' : last.text);
     return ListTile(
       onTap: onTap,
+      onLongPress: onLongPress,
       leading: SeraAvatar(
         label: c.displayTitle,
         app: app,

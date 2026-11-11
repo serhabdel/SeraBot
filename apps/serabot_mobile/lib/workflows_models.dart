@@ -283,6 +283,52 @@ String formatNextRun(String raw) {
   return flat.isEmpty ? '\u2014' : flat;
 }
 
+/// "5m ago" or "in 2h" for an RFC 3339 stamp. A stamp that cannot be read is
+/// shown trimmed as-is, so nothing is hidden. [now] is for tests.
+String relativeTime(String raw, {DateTime? now}) {
+  final at = DateTime.tryParse(raw.trim());
+  if (at == null) {
+    return formatNextRun(raw);
+  }
+  final diff = at.difference(now ?? DateTime.now()).inSeconds;
+  if (diff.abs() < 45) {
+    return 'just now';
+  }
+  final secs = diff.abs();
+  final String span;
+  if (secs < 3600) {
+    span = '${((secs + 30) ~/ 60).clamp(1, 59)}m';
+  } else if (secs < 86400) {
+    span = '${secs ~/ 3600}h';
+  } else {
+    span = '${secs ~/ 86400}d';
+  }
+  return diff < 0 ? '$span ago' : 'in $span';
+}
+
+/// The host of a feed URL for a short subtitle; null when it is not a URL.
+String? sourceHost(String url) {
+  final uri = Uri.tryParse(url.trim());
+  final host = uri?.host ?? '';
+  return host.isEmpty ? null : host;
+}
+
+/// A conversation id cut short for display, ending in an ellipsis.
+String shortId(String id, {int max = 14}) {
+  final runes = id.runes.toList();
+  if (runes.length <= max) {
+    return id;
+  }
+  return '${String.fromCharCodes(runes.take(max - 1))}\u2026';
+}
+
+/// The label of an active plan's conversation: its name when known, else a
+/// shortened id.
+String planConversationLabel(String? name, String id) {
+  final n = name?.trim() ?? '';
+  return n.isEmpty ? shortId(id) : n;
+}
+
 String planProgress(int done, int total) {
   if (total == 0) {
     return '0 steps';

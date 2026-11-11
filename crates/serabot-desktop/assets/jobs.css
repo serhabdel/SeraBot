@@ -381,3 +381,37 @@
 .root[data-motion="reduce"] .jobs-summary svg {
   transition: none;
 }
+
+/* Source rows: feed host under the name, with a copy button. */
+.wf-name-col {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
+}
+
+.wf-sub {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+}
+
+.wf-url {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wf-url-missing {
+  color: var(--label-3);
+  font-style: italic;
+}
+
+.wf-copy {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0 6px;
+}

@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../api_client.dart';
 import '../app_state.dart';
@@ -180,12 +181,22 @@ class _WorkflowsScreenState extends State<WorkflowsScreen> {
     );
   }
 
+  String? _conversationName(String id) {
+    for (final c in widget.app.conversations) {
+      if (c.id == id) {
+        return c.displayTitle;
+      }
+    }
+    return null;
+  }
+
   Widget _activeList(List<ActiveWorkflow> plans) {
     return Column(
       children: [
         for (final p in plans)
           _ActiveTile(
             plan: p,
+            conversation: _conversationName(p.conversationId),
             onTraces: () => _openTraces(p.conversationId),
           ),
       ],
@@ -210,7 +221,7 @@ class _RoutineTile extends StatelessWidget {
       child: ListTile(
         title: Text(routine.name, maxLines: 1, overflow: TextOverflow.ellipsis),
         subtitle: Text(
-          'Next ${formatNextRun(routine.nextRunAt)}\n$schedule'
+          'Next ${relativeTime(routine.nextRunAt)}\n$schedule'
           '${routine.lastRunFor != null ? '\nLast ${routine.lastRunFor}' : ''}',
         ),
         isThreeLine: routine.lastRunFor != null,
@@ -231,8 +242,13 @@ class _SourceTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final run = source.lastRun;
+    final at = run?.finishedAt ?? run?.startedAt;
+    final when = at == null ? null : relativeTime(at);
+    final url = source.url;
+    final host = url == null ? null : (sourceHost(url) ?? url);
     final status = switch (run?.ok) {
-      true => 'OK \u00b7 ${run!.itemsSeen.clamp(0, 1 << 30)} items',
+      true => 'OK \u00b7 ${run!.itemsSeen.clamp(0, 1 << 30)} items'
+          '${when == null ? '' : ' \u00b7 $when'}',
       false => run?.error ?? 'Error',
       null => 'No run yet',
     };
@@ -240,7 +256,43 @@ class _SourceTile extends StatelessWidget {
       margin: const EdgeInsets.only(bottom: 8),
       child: ListTile(
         title: Text(source.name, maxLines: 1, overflow: TextOverflow.ellipsis),
-        subtitle: Text('${source.kind}\n$status'),
+        subtitle: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    host ?? 'URL unavailable',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: host == null
+                        ? TextStyle(
+                            fontStyle: FontStyle.italic,
+                            color: scheme.onSurfaceVariant,
+                          )
+                        : null,
+                  ),
+                ),
+                if (url != null)
+                  IconButton(
+                    key: const Key('copy-source-url'),
+                    tooltip: 'Copy feed URL',
+                    visualDensity: VisualDensity.compact,
+                    icon: const Icon(Icons.copy, size: 18),
+                    onPressed: () async {
+                      final messenger = ScaffoldMessenger.of(context);
+                      await Clipboard.setData(ClipboardData(text: url));
+                      messenger.showSnackBar(
+                        const SnackBar(content: Text('Feed URL copied')),
+                      );
+                    },
+                  ),
+              ],
+            ),
+            Text('${source.kind}\n$status'),
+          ],
+        ),
         isThreeLine: true,
         trailing: _StatusPill(
           label: source.enabled ? 'Enabled' : 'Disabled',
@@ -252,9 +304,14 @@ class _SourceTile extends StatelessWidget {
 }
 
 class _ActiveTile extends StatelessWidget {
-  const _ActiveTile({required this.plan, required this.onTraces});
+  const _ActiveTile({
+    required this.plan,
+    required this.onTraces,
+    this.conversation,
+  });
 
   final ActiveWorkflow plan;
+  final String? conversation;
   final VoidCallback onTraces;
 
   @override
@@ -264,9 +321,9 @@ class _ActiveTile extends StatelessWidget {
       child: ListTile(
         title: Text(plan.goal, maxLines: 2, overflow: TextOverflow.ellipsis),
         subtitle: Text(
-          '${plan.conversationId}\n'
+          '${planConversationLabel(conversation, plan.conversationId)}\n'
           '${planProgress(plan.done, plan.total)}'
-          '${plan.updatedAt != null ? ' \u00b7 Updated ${plan.updatedAt}' : ''}',
+          '${plan.updatedAt != null ? ' \u00b7 Updated ${relativeTime(plan.updatedAt!)}' : ''}',
         ),
         isThreeLine: true,
         trailing: IconButton(

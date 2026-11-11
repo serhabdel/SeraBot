@@ -3,6 +3,7 @@
 //! loaded through the session worker, not from the chat composer.
 
 use crate::ui::Icon;
+use crate::ui_files::copy_script;
 use dioxus::prelude::*;
 use serabot_desktop::session::Session;
 use serabot_desktop::workflows::{self, ActiveWorkflow, MonitoringSource, Routine};
@@ -20,7 +21,9 @@ fn RoutineRow(routine: Routine) -> Element {
             span { class: "wf-name", title: "{routine.name}", "{routine.name}" }
             span { class: "wf-meta", "{schedule}" }
             span { class: if routine.enabled { "wf-pill ok" } else { "wf-pill muted" }, "{status}" }
-            span { class: "wf-meta", "Next {workflows::format_next_run(&routine.next_run_at)}" }
+            span { class: "wf-meta", title: "{routine.next_run_at}",
+                "Next {workflows::relative_time(&routine.next_run_at, workflows::now_secs())}"
+            }
             if let Some(last) = routine.last_run_for.as_deref() {
                 span { class: "wf-meta", "Last {last}" }
             }
@@ -30,8 +33,16 @@ fn RoutineRow(routine: Routine) -> Element {
 
 #[component]
 fn SourceRow(source: MonitoringSource) -> Element {
+    let when = source
+        .last_run
+        .as_ref()
+        .and_then(|run| run.finished_at.as_deref().or(run.started_at.as_deref()))
+        .map(|at| workflows::relative_time(at, workflows::now_secs()));
     let status = match &source.last_run {
-        Some(run) if run.ok => format!("OK · {} items", run.items_seen.max(0)),
+        Some(run) if run.ok => match &when {
+            Some(when) => format!("OK · {} items · {when}", run.items_seen.max(0)),
+            None => format!("OK · {} items", run.items_seen.max(0)),
+        },
         Some(run) => run.error.clone().unwrap_or_else(|| "Error".into()),
         None => "No run yet".into(),
     };
@@ -42,7 +53,32 @@ fn SourceRow(source: MonitoringSource) -> Element {
     };
     rsx! {
         div { class: "wf-row", role: "listitem",
-            span { class: "wf-name", title: "{source.name}", "{source.name}" }
+            div { class: "wf-name-col",
+                span { class: "wf-name", title: "{source.name}", "{source.name}" }
+                match source.url.clone() {
+                    Some(url) => {
+                        let host = workflows::source_host(&url).unwrap_or_else(|| url.clone());
+                        rsx! {
+                            span { class: "wf-sub",
+                                span { class: "wf-url", title: "{url}", "{host}" }
+                                button {
+                                    class: "btn ghost sm wf-copy",
+                                    r#type: "button",
+                                    "aria-label": "Copy feed URL",
+                                    title: "Copy feed URL",
+                                    onclick: move |_| {
+                                        let _ = dioxus::document::eval(&copy_script(&url));
+                                    },
+                                    Icon { name: "copy", size: 12 }
+                                }
+                            }
+                        }
+                    }
+                    None => rsx! {
+                        span { class: "wf-sub wf-url-missing", "URL unavailable" }
+                    },
+                }
+            }
             span { class: "wf-meta", "{source.kind}" }
             span { class: if source.enabled { "wf-pill ok" } else { "wf-pill muted" },
                 if source.enabled { "Enabled" } else { "Disabled" }
@@ -53,15 +89,18 @@ fn SourceRow(source: MonitoringSource) -> Element {
 }
 
 #[component]
-fn ActiveRow(plan: ActiveWorkflow) -> Element {
+fn ActiveRow(plan: ActiveWorkflow, conversation: Option<String>) -> Element {
     let progress = workflows::plan_progress(plan.done, plan.total);
+    let label = workflows::plan_conversation_label(conversation.as_deref(), &plan.conversation_id);
     rsx! {
         div { class: "wf-row", role: "listitem",
             span { class: "wf-name", title: "{plan.goal}", "{plan.goal}" }
-            span { class: "wf-meta", title: "{plan.conversation_id}", "{plan.conversation_id}" }
+            span { class: "wf-meta", title: "{plan.conversation_id}", "{label}" }
             span { class: "wf-pill", "{progress}" }
             if let Some(at) = plan.updated_at.as_deref() {
-                span { class: "wf-meta", "Updated {at}" }
+                span { class: "wf-meta", title: "{at}",
+                    "Updated {workflows::relative_time(at, workflows::now_secs())}"
+                }
             }
         }
     }
@@ -74,6 +113,14 @@ pub fn WorkflowsView(session: Signal<Session>) -> Element {
     let snapshot = state.state.workflows.clone();
     let loaded = state.state.workflows_loaded;
     let error = state.state.workflows_error.clone();
+    // Conversation names for the plan rows (id -> label), from the list the
+    // app already holds.
+    let names: std::collections::HashMap<String, String> = state
+        .state
+        .conversations
+        .iter()
+        .map(|c| (c.id.clone(), state.conversation_label(c)))
+        .collect();
     drop(state);
     rsx! {
         div { class: "pane",
@@ -141,7 +188,11 @@ pub fn WorkflowsView(session: Signal<Session>) -> Element {
                         } else {
                             div { class: "wf-list", role: "list",
                                 for plan in snapshot.active.clone() {
-                                    ActiveRow { key: "{plan.conversation_id}", plan }
+                                    ActiveRow {
+                                        key: "{plan.conversation_id}",
+                                        conversation: names.get(&plan.conversation_id).cloned(),
+                                        plan,
+                                    }
                                 }
                             }
                         }

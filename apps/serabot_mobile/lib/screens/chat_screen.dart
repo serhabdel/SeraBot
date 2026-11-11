@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../api_client.dart';
 import '../app_state.dart';
@@ -373,6 +374,7 @@ class MessageBubble extends StatelessWidget {
                 onPressed: onAttachment == null ? null : () => onAttachment!(a),
               ),
             ),
+          _BubbleFooter(message: message),
         ],
       ),
     );
@@ -394,6 +396,54 @@ class MessageBubble extends StatelessWidget {
             const SizedBox(width: 6),
           ],
           Flexible(child: bubble),
+        ],
+      ),
+    );
+  }
+}
+
+/// Send time and a Copy action under a message, like the desktop bubbles.
+class _BubbleFooter extends StatelessWidget {
+  const _BubbleFooter({required this.message});
+
+  final ChatMessage message;
+
+  @override
+  Widget build(BuildContext context) {
+    final time = shortTime(message.createdAt);
+    final canCopy = message.content.isNotEmpty;
+    if (time.isEmpty && !canCopy) {
+      return const SizedBox.shrink();
+    }
+    final muted = Theme.of(context).colorScheme.onSurfaceVariant;
+    return Padding(
+      padding: const EdgeInsets.only(top: 4),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (time.isNotEmpty)
+            Text(time,
+                key: const Key('bubble-time'),
+                style: Theme.of(context)
+                    .textTheme
+                    .labelSmall
+                    ?.copyWith(color: muted)),
+          if (canCopy)
+            IconButton(
+              key: const Key('copy-message'),
+              tooltip: 'Copy message',
+              visualDensity: VisualDensity.compact,
+              iconSize: 16,
+              color: muted,
+              icon: const Icon(Icons.copy),
+              onPressed: () async {
+                final messenger = ScaffoldMessenger.of(context);
+                await Clipboard.setData(ClipboardData(text: message.content));
+                messenger.showSnackBar(
+                  const SnackBar(content: Text('Copied')),
+                );
+              },
+            ),
         ],
       ),
     );

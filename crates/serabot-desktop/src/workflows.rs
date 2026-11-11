@@ -213,6 +213,99 @@ pub fn format_next_run(raw: &str) -> String {
     }
 }
 
+/// Seconds since the Unix epoch for an RFC 3339 UTC stamp such as
+/// `2026-11-09T10:00:00Z` (fractions and a `+00:00` offset are accepted).
+/// Other offsets are not guessed at: they return `None`.
+pub fn epoch_secs(raw: &str) -> Option<i64> {
+    let raw = raw.trim();
+    let date = raw.get(..10)?;
+    let time = raw.get(11..19)?;
+    if raw.get(10..11)? != "T" && raw.get(10..11)? != " " {
+        return None;
+    }
+    let rest = raw.get(19..)?;
+    let rest = rest.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    if !(rest == "Z" || rest == "z" || rest == "+00:00" || rest.is_empty()) {
+        return None;
+    }
+    let y: i64 = date.get(..4)?.parse().ok()?;
+    let m: i64 = date.get(5..7)?.parse().ok()?;
+    let d: i64 = date.get(8..10)?.parse().ok()?;
+    let h: i64 = time.get(..2)?.parse().ok()?;
+    let mi: i64 = time.get(3..5)?.parse().ok()?;
+    let se: i64 = time.get(6..8)?.parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
+        return None;
+    }
+    // Days from civil (Howard Hinnant's algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3_600 + mi * 60 + se)
+}
+
+fn span(secs: i64) -> String {
+    match secs {
+        0..=44 => "a moment".into(),
+        45..=3_599 => format!("{}m", ((secs + 30) / 60).max(1)),
+        3_600..=86_399 => format!("{}h", secs / 3_600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+/// "5m ago" or "in 2h" for a stamp, given the current time. A stamp that
+/// cannot be read is shown trimmed as-is, so nothing is hidden.
+pub fn relative_time(raw: &str, now_secs: i64) -> String {
+    let Some(at) = epoch_secs(raw) else {
+        return format_next_run(raw);
+    };
+    let diff = at - now_secs;
+    if diff.abs() < 45 {
+        return "just now".into();
+    }
+    if diff < 0 {
+        format!("{} ago", span(-diff))
+    } else {
+        format!("in {}", span(diff))
+    }
+}
+
+/// The current time in whole seconds since the Unix epoch.
+pub fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The host of a feed URL for a short subtitle; `None` when it is not a URL.
+pub fn source_host(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url.trim()).ok()?;
+    parsed.host_str().map(str::to_owned)
+}
+
+/// A conversation id cut short for display, ending in an ellipsis.
+pub fn short_id(id: &str, max: usize) -> String {
+    if id.chars().count() <= max {
+        id.to_owned()
+    } else {
+        let head: String = id.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}\u{2026}")
+    }
+}
+
+/// The label of an active plan's conversation: its name when known, else a
+/// shortened id.
+pub fn plan_conversation_label(name: Option<&str>, id: &str) -> String {
+    match name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(name) => name.to_owned(),
+        None => short_id(id, 14),
+    }
+}
+
 /// Progress text for an active plan row.
 pub fn plan_progress(done: usize, total: usize) -> String {
     if total == 0 {
@@ -273,5 +366,54 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(active[0].done, 1);
+    }
+
+    #[test]
+    fn epoch_parses_utc_stamps() {
+        assert_eq!(epoch_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(epoch_secs("2026-11-01T00:00:00Z"), Some(20_758 * 86_400));
+        assert_eq!(
+            epoch_secs("2026-11-01T10:30:15.250Z"),
+            Some(20_758 * 86_400 + 37_815)
+        );
+        assert_eq!(
+            epoch_secs("2026-11-01T00:00:00+00:00"),
+            Some(20_758 * 86_400)
+        );
+        assert_eq!(epoch_secs("2026-11-01T00:00:00+02:00"), None);
+        assert_eq!(epoch_secs("nope"), None);
+        assert_eq!(epoch_secs("2026-13-01T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn relative_times_read_naturally() {
+        let now = epoch_secs("2026-11-10T12:00:00Z").unwrap();
+        assert_eq!(relative_time("2026-11-10T11:55:00Z", now), "5m ago");
+        assert_eq!(relative_time("2026-11-10T09:00:00Z", now), "3h ago");
+        assert_eq!(relative_time("2026-11-08T12:00:00Z", now), "2d ago");
+        assert_eq!(relative_time("2026-11-10T14:00:00Z", now), "in 2h");
+        assert_eq!(relative_time("2026-11-10T12:00:20Z", now), "just now");
+        assert_eq!(relative_time("garbage", now), "garbage");
+        assert_eq!(relative_time("", now), "\u{2014}");
+    }
+
+    #[test]
+    fn source_host_and_short_id() {
+        assert_eq!(
+            source_host("https://example.test/feed?k=1").as_deref(),
+            Some("example.test")
+        );
+        assert_eq!(source_host("not a url"), None);
+        assert_eq!(short_id("abc", 14), "abc");
+        assert_eq!(
+            short_id("0123456789abcdefghij", 14),
+            "0123456789abc\u{2026}"
+        );
+        assert_eq!(plan_conversation_label(Some("  Trip  "), "x"), "Trip");
+        assert_eq!(plan_conversation_label(Some(" "), "dir:main"), "dir:main");
+        assert_eq!(
+            plan_conversation_label(None, "0123456789abcdefghij"),
+            "0123456789abc\u{2026}"
+        );
     }
 }
