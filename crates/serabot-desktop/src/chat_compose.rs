@@ -216,6 +216,57 @@ pub fn escape_stops_run(run_active: bool, awaiting_approval: bool) -> bool {
     run_active && !awaiting_approval
 }
 
+/// A slash command that does something instead of inserting text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlashAction {
+    NewChat,
+    Attach,
+    Stop,
+    Settings,
+    Expand,
+}
+
+/// `(command, what it does, action)`, in the order the picker lists them.
+pub const SLASH_ACTIONS: [(&str, &str, SlashAction); 5] = [
+    ("new", "Start a new chat", SlashAction::NewChat),
+    ("attach", "Attach files", SlashAction::Attach),
+    ("stop", "Stop the reply", SlashAction::Stop),
+    (
+        "settings",
+        "Open this chat's settings",
+        SlashAction::Settings,
+    ),
+    (
+        "expand",
+        "Make the message box bigger or smaller",
+        SlashAction::Expand,
+    ),
+];
+
+/// The actions whose command contains `query` (case-insensitive).
+pub fn slash_actions(query: &str) -> Vec<(&'static str, &'static str, SlashAction)> {
+    let needle = query.trim().to_lowercase();
+    SLASH_ACTIONS
+        .iter()
+        .copied()
+        .filter(|(command, description, _)| {
+            needle.is_empty()
+                || command.contains(&needle)
+                || description.to_lowercase().contains(&needle)
+        })
+        .collect()
+}
+
+/// The action a draft stands for: exactly `/command` and nothing else, so a
+/// message that merely starts with a slash is still sent as text.
+pub fn parse_slash_action(draft: &str) -> Option<SlashAction> {
+    let command = draft.trim().strip_prefix('/')?;
+    SLASH_ACTIONS
+        .iter()
+        .find(|(name, _, _)| *name == command.to_lowercase())
+        .map(|(_, _, action)| *action)
+}
+
 /// The text Up recalls into an empty composer: the owner's latest message
 /// that is not blank. `texts` runs oldest to newest.
 pub fn recall_text(texts: &[&str]) -> Option<String> {
@@ -332,6 +383,24 @@ mod tests {
         assert!(enter_sends(true, true, true));
         assert!(!enter_sends(false, false, false));
         assert!(enter_sends(false, false, true));
+    }
+
+    #[test]
+    fn slash_actions_match_by_command_or_description() {
+        assert_eq!(slash_actions("").len(), SLASH_ACTIONS.len());
+        assert_eq!(slash_actions("ne")[0].2, SlashAction::NewChat);
+        assert_eq!(slash_actions("FILES")[0].2, SlashAction::Attach);
+        assert!(slash_actions("zzz").is_empty());
+    }
+
+    #[test]
+    fn only_an_exact_command_is_an_action() {
+        assert_eq!(parse_slash_action("/new"), Some(SlashAction::NewChat));
+        assert_eq!(parse_slash_action("  /Stop "), Some(SlashAction::Stop));
+        assert_eq!(parse_slash_action("/new chat please"), None);
+        assert_eq!(parse_slash_action("new"), None);
+        assert_eq!(parse_slash_action("/unknown"), None);
+        assert_eq!(parse_slash_action(""), None);
     }
 
     #[test]

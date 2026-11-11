@@ -31,6 +31,7 @@ pub mod pc_stats;
 pub mod preview;
 pub mod provider_presets;
 pub mod provider_view;
+pub mod row_menu;
 pub mod session;
 pub mod signin;
 pub mod standing_grants;
