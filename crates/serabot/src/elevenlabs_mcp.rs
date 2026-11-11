@@ -118,6 +118,10 @@ const MAX_INLINE_MEDIA_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 48 * 1024 * 1024;
 /// Media files saved from one call.
 const MAX_MEDIA_PER_CALL: usize = 4;
+/// Redirects followed for one media link.
+const MAX_MEDIA_REDIRECTS: usize = 3;
+/// Shown when a paid result is not media this build can save.
+const MEDIA_UNRECOGNISED: &str = "ElevenLabs returned a file this app cannot save. It was not retried, so no credits were used again.";
 /// Text returned to the model from one call.
 const MAX_TEXT_CHARS: usize = 8_000;
 const MAX_ARGUMENT_BYTES: usize = 32 * 1024;
@@ -634,50 +638,20 @@ impl ElevenLabsMcp {
         if !media_link_allowed(&url) {
             return Ok(None);
         }
-        let mut response = self
-            .http
-            .get(url.clone())
-            .send()
-            .await
-            .map_err(|error| SeraError::External(format!("media download failed: {error}")))?;
-        if !response.status().is_success() {
-            return Err(SeraError::External(format!(
-                "media download failed with status {}",
-                response.status()
-            )));
-        }
-        let declared = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_owned();
-        let mut body: Vec<u8> = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|error| SeraError::External(format!("media download read failed: {error}")))?
-        {
-            if body.len() + chunk.len() > MAX_FLOW_DOWNLOAD_BYTES {
-                return Err(SeraError::Validation(
-                    "generated media exceeds size limit".into(),
-                ));
-            }
-            body.extend_from_slice(&chunk);
-        }
+        let (final_url, declared, body) = self.fetch_media(url).await?;
         if body.is_empty() {
             return Err(SeraError::External("ElevenLabs download was empty".into()));
         }
-        // Signed download URLs often answer `application/octet-stream` or no
-        // content type at all even when the bytes are a valid image (0.28
-        // fix for "download was not audio, image or video"): trust the
-        // declared type when it is a known media type, otherwise sniff the
-        // magic bytes, then the URL's file extension. Only when all three
-        // fail is the payload refused.
-        let mime = media_type(&declared)
-            .or_else(|| sniff_media(&body).map(str::to_owned))
+        // The bytes are the reliable signal. A CDN may label a valid image as
+        // application/octet-stream, text/plain or a wrong type, so magic bytes
+        // win over the declared type. The declared type and the URL's extension
+        // only decide when the bytes are unrecognised.
+        let mime = sniff_media(&body)
+            .map(str::to_owned)
+            .or_else(|| media_type(&declared))
             .or_else(|| {
-                url.path_segments()
+                final_url
+                    .path_segments()
                     .and_then(|mut segments| segments.next_back())
                     .and_then(|name| {
                         name.rsplit_once('.')
@@ -686,11 +660,98 @@ impl ElevenLabsMcp {
                     .and_then(|ext| extension_media_type(&ext))
             });
         let Some(mime) = mime else {
-            return Err(SeraError::External(
-                "ElevenLabs download was not audio, image or video".into(),
-            ));
+            // The generation already ran and was paid for. Refuse it as a final
+            // error, so the task is not run again and the next try does not
+            // spend credits on the same result.
+            return Err(SeraError::Rejected {
+                code: "media_unrecognised",
+                message: MEDIA_UNRECOGNISED.into(),
+            });
         };
         self.store(&body, &mime).map(Some)
+    }
+
+    /// GET a media link, following up to [`MAX_MEDIA_REDIRECTS`] redirects. Each
+    /// hop is checked against the media allowlist before it is requested, so a
+    /// redirect cannot leave the allowed hosts. Returns the final URL, the
+    /// declared content type and the body. A JSON body that names one media
+    /// URL is followed once, since some results point at a document rather
+    /// than the file.
+    async fn fetch_media(&self, first: url::Url) -> Result<(url::Url, String, Vec<u8>)> {
+        let mut current = first;
+        let mut json_hops = 0usize;
+        for _ in 0..=MAX_MEDIA_REDIRECTS {
+            let mut response = self
+                .http
+                .get(current.clone())
+                .send()
+                .await
+                .map_err(|error| SeraError::External(format!("media download failed: {error}")))?;
+            let status = response.status();
+            if status.is_redirection() {
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| {
+                        SeraError::External("media download redirected without a target".into())
+                    })?;
+                let next = current.join(location).map_err(|_| {
+                    SeraError::External("media download redirected to an invalid target".into())
+                })?;
+                if !media_link_allowed(&next) {
+                    return Err(SeraError::External(
+                        "media download redirected to a host that is not allowed".into(),
+                    ));
+                }
+                current = next;
+                continue;
+            }
+            if !status.is_success() {
+                return Err(SeraError::External(format!(
+                    "media download failed with status {status}"
+                )));
+            }
+            let declared = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let mut body: Vec<u8> = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|error| {
+                SeraError::External(format!("media download read failed: {error}"))
+            })? {
+                if body.len() + chunk.len() > MAX_FLOW_DOWNLOAD_BYTES {
+                    return Err(SeraError::Validation(
+                        "generated media exceeds size limit".into(),
+                    ));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            // A document that names the real file: follow that link once.
+            if sniff_media(&body).is_none()
+                && media_type(&declared).is_none()
+                && json_hops == 0
+                && let Ok(value) = serde_json::from_slice::<Value>(&body)
+            {
+                let mut nested = Vec::new();
+                collect_links(&value, &mut nested);
+                if let Some(next) = nested
+                    .iter()
+                    .filter_map(|text| url::Url::parse(text).ok())
+                    .find(media_link_allowed)
+                {
+                    json_hops += 1;
+                    current = next;
+                    continue;
+                }
+            }
+            return Ok((current, declared, body));
+        }
+        Err(SeraError::External(
+            "media download redirected too many times".into(),
+        ))
     }
 
     fn store(&self, bytes: &[u8], mime: &str) -> Result<SavedMedia> {
@@ -2955,7 +3016,16 @@ mod tests {
             .save_media(&json!({"content": [{"type": "resource_link", "uri": page}]}))
             .await
             .unwrap_err();
-        assert!(refused.to_string().contains("not audio, image or video"));
+        assert!(
+            matches!(
+                refused,
+                SeraError::Rejected {
+                    code: "media_unrecognised",
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
         let saved = h
             .service
             .save_media(&json!({"structuredContent": {"audio_url": link}}))
@@ -3008,6 +3078,141 @@ mod tests {
             .unwrap();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].mime, "image/jpeg");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_the_file_is_followed_and_saved() {
+        // Recorded-style: the result link answers 302 to the signed file URL.
+        let h = harness(fake(fixture(9, false), json!({}))).await;
+        let file = format!("{}/signed/file", h.mcp.uri());
+        Mock::given(method("GET"))
+            .and(path("/result/redirect"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", file.as_str()))
+            .mount(&h.mcp)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/signed/file"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(b"\x89PNG\r\n\x1a\nimage".to_vec()),
+            )
+            .mount(&h.mcp)
+            .await;
+        let link = format!("{}/result/redirect", h.mcp.uri());
+        let saved = h
+            .service
+            .save_media(&json!({"structuredContent": {"image_url": link}}))
+            .await
+            .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].mime, "image/png");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_off_the_allowed_hosts_is_refused_before_it_is_followed() {
+        let h = harness(fake(fixture(9, false), json!({}))).await;
+        Mock::given(method("GET"))
+            .and(path("/result/elsewhere"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", "https://attacker.example.invalid/steal.png"),
+            )
+            .mount(&h.mcp)
+            .await;
+        let link = format!("{}/result/elsewhere", h.mcp.uri());
+        let error = h
+            .service
+            .save_media(&json!({"structuredContent": {"image_url": link}}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not allowed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_json_result_document_that_names_the_file_is_followed_once() {
+        // Recorded-style: the result is a JSON document whose url field names the file.
+        let h = harness(fake(fixture(9, false), json!({}))).await;
+        let file = format!("{}/media/final.jpg", h.mcp.uri());
+        Mock::given(method("GET"))
+            .and(path("/result/document"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(json!({"status": "done", "file_url": file})),
+            )
+            .mount(&h.mcp)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/media/final.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_bytes(b"\xff\xd8\xff\xe0jpeg".to_vec()),
+            )
+            .mount(&h.mcp)
+            .await;
+        let link = format!("{}/result/document", h.mcp.uri());
+        let saved = h
+            .service
+            .save_media(&json!({"structuredContent": {"result_url": link}}))
+            .await
+            .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].mime, "image/jpeg");
+    }
+
+    #[tokio::test]
+    async fn a_paid_result_that_is_not_media_is_refused_as_final_not_retried() {
+        // The result cost credits and is not a file this build can save. The
+        // refusal must be final, so the task is not run again.
+        let h = harness(fake(fixture(9, false), json!({}))).await;
+        Mock::given(method("GET"))
+            .and(path("/media/unknown"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/x-unknown")
+                    .set_body_bytes(b"not-a-known-format".to_vec()),
+            )
+            .mount(&h.mcp)
+            .await;
+        let link = format!("{}/media/unknown", h.mcp.uri());
+        let error = h
+            .service
+            .save_media(&json!({"structuredContent": {"image_url": link}}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SeraError::Rejected {
+                    code: "media_unrecognised",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_generation_id_is_never_stored_as_the_account_credential() {
+        // Recorded-style: a generation result carries a job id. The id is
+        // extracted for the model as a reference. The stored sign-in keeps its
+        // own access token, untouched by the result.
+        let h = harness(fake(fixture(9, false), json!({}))).await;
+        let result = json!({
+            "structuredContent": {"status": "pending", "generation_id": "gen_0123456789ab"}
+        });
+        let (status, generation_id) = status_fields(&result);
+        assert_eq!(status.as_deref(), Some("pending"));
+        assert_eq!(generation_id.as_deref(), Some("gen_0123456789ab"));
+        let _ = h.service.save_media(&result).await.unwrap();
+        let stored = ProviderCredential::parse(
+            &h.users.get(&h.owner, CREDENTIAL_PROVIDER).unwrap().unwrap(),
+        )
+        .unwrap();
+        assert_ne!(stored.api_key, "gen_0123456789ab");
+        assert_eq!(stored.api_key, "stale-access");
     }
 
     #[test]
