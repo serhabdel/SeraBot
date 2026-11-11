@@ -550,7 +550,10 @@ impl ComposioService {
         if let Some(body) = body {
             request = request.json(body);
         }
-        let mut response = request.send().await.map_err(transport_failure)?;
+        // Retry only where repeating the request is safe; see `crate::retry`.
+        let mut response = crate::retry::send(request, crate::retry::idempotent_method(method))
+            .await
+            .map_err(transport_failure)?;
         let status = response.status();
         let mut bytes: Vec<u8> = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(transport_failure)? {

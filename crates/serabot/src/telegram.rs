@@ -15,6 +15,7 @@ use crate::error::{Result, SeraError};
 use crate::gateway::Decision;
 use crate::maker::ArtifactStore;
 use crate::memory;
+use crate::retry;
 use crate::runtime::{ApprovalNotice, Notifier, Runtime};
 use crate::store::{Store, UserStatus};
 use crate::util::{sha256_hex, truncate_chars};
@@ -229,16 +230,37 @@ impl TelegramClient {
         if let Some(mode) = parse_mode {
             body["parse_mode"] = json!(mode);
         }
-        let response: TelegramResponse<Value> = self
-            .http
-            .post(self.url("sendMessage"))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| telegram_http_error("sendMessage failed", error))?
-            .json()
-            .await
-            .map_err(|error| telegram_http_error("sendMessage response", error))?;
+        // sendMessage is not idempotent, so only a 429 is retried: Telegram refused
+        // the message, so it was not sent. The wait is Telegram's `retry_after`.
+        let mut attempt: u32 = 0;
+        let response: TelegramResponse<Value> = loop {
+            let response = self
+                .http
+                .post(self.url("sendMessage"))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|error| telegram_http_error("sendMessage failed", error))?;
+            if response.status().as_u16() == 429 && attempt + 1 < retry::MAX_ATTEMPTS {
+                let header_hint = retry::retry_after(response.headers());
+                let parsed: Option<TelegramResponse<Value>> = response.json().await.ok();
+                let body_hint = parsed
+                    .and_then(|parsed| parsed.parameters)
+                    .and_then(|parameters| parameters.retry_after)
+                    .map(|seconds| Duration::from_secs(seconds).min(retry::MAX_RETRY_AFTER));
+                let hint = match (header_hint, body_hint) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
+                tokio::time::sleep(retry::delay(Duration::from_millis(500), attempt, hint)).await;
+                attempt += 1;
+                continue;
+            }
+            break response
+                .json()
+                .await
+                .map_err(|error| telegram_http_error("sendMessage response", error))?;
+        };
         if !response.ok {
             return Err(telegram_rejected("sendMessage", response.description));
         }
@@ -1011,6 +1033,15 @@ impl TelegramClient {
                 self.send_message(chat_id, &format!("Revoked {count} standing grant(s)."))
                     .await?;
             }
+            _ if text == "/digest" || text.starts_with("/digest ") => {
+                let reply = crate::digest::command_reply(
+                    store,
+                    user_id,
+                    text.trim_start_matches("/digest"),
+                    chrono::Utc::now(),
+                )?;
+                self.send_message(chat_id, &reply).await?;
+            }
             "/help" => {
                 self.send_message(
                     chat_id,
@@ -1019,6 +1050,7 @@ impl TelegramClient {
                      /xlsx <request> — spreadsheet analysis\n\
                      /timesheets <request> — timesheet analysis\n\
                      /brief — morning brief\n\
+                     /digest [hours] — new items from your watched sources\n\
                      /status — queue and approvals\n\
                      /models — configured providers and models\n\
                      /providers — same allowlist grouped by provider\n\
@@ -1218,6 +1250,14 @@ struct TelegramResponse<T> {
     ok: bool,
     result: Option<T>,
     description: Option<String>,
+    #[serde(default)]
+    parameters: Option<TelegramParameters>,
+}
+
+/// Extra fields Telegram sends with an error. A 429 carries `retry_after`.
+#[derive(Debug, Default, Deserialize)]
+struct TelegramParameters {
+    retry_after: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1463,6 +1503,7 @@ fn bot_commands() -> Vec<Value> {
         ("xlsx", "Spreadsheet analysis — /xlsx <request>"),
         ("timesheets", "Timesheet analysis — /timesheets <request>"),
         ("brief", "Generate the morning brief"),
+        ("digest", "New items from watched sources — /digest [hours]"),
         ("models", "List configured providers and models"),
         ("providers", "List models grouped by provider"),
         ("model", "Show or set provider/model for this chat"),

@@ -1421,24 +1421,25 @@ impl AgentMailClient {
     }
 
     async fn get_json(&self, url: &str) -> Result<Value> {
-        let response = self
+        let request = self
             .http
             .get(url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
-            .send()
+            .header(AUTHORIZATION, format!("Bearer {}", self.api_key));
+        let response = crate::retry::send(request, true)
             .await
             .map_err(|error| map_transport("agentmail", error))?;
         parse_api_response(response, &self.api_key).await
     }
 
     async fn post_json(&self, url: &str, body: &Value) -> Result<Value> {
-        let response = self
+        // Non-idempotent (a sent email): only rate-limit refusals are retried.
+        let request = self
             .http
             .post(url)
             .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
             .header(CONTENT_TYPE, "application/json")
-            .json(body)
-            .send()
+            .json(body);
+        let response = crate::retry::send(request, false)
             .await
             .map_err(|error| map_transport("agentmail", error))?;
         parse_api_response(response, &self.api_key).await

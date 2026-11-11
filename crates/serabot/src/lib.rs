@@ -20,6 +20,7 @@ pub mod deck;
 pub mod deck_pptx;
 pub mod default_avatars;
 pub mod delegate;
+pub mod digest;
 pub mod documents;
 #[cfg(feature = "docx")]
 pub mod docx_ops;
@@ -61,6 +62,7 @@ pub mod providers;
 pub mod reliability;
 pub mod render;
 pub mod retrieval;
+pub mod retry;
 pub mod runtime;
 pub mod scheduler;
 pub mod secrets;
