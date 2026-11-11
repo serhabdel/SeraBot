@@ -21,6 +21,18 @@ pub use panel::*;
 pub use profiles::*;
 
 const MAX_RESPONSE: u64 = 2 * 1024 * 1024;
+
+/// Largest error body read for a rejection message.
+const MAX_ERROR_BODY: u64 = 4 * 1024;
+
+/// The `error` sentence of a rejection body, if it is safe to show: short,
+/// one line, and not empty. `None` keeps the generic status text.
+pub fn rejection_message(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let message = value.get("error")?.as_str()?.trim();
+    (!message.is_empty() && message.len() <= 200 && !message.chars().any(char::is_control))
+        .then(|| message.to_owned())
+}
 /// Server cap for one artifact download (100 MiB).
 const MAX_ARTIFACT_BYTES: u64 = 100 * 1024 * 1024;
 
@@ -2295,6 +2307,16 @@ impl ApiClient {
         note_rate_limit(&response);
         let status = response.status();
         if !status.is_success() {
+            // A 422 names the field that failed. Show that server-authored
+            // sentence; any other rejection keeps the generic status text.
+            if status.as_u16() == 422 {
+                let mut body = Vec::new();
+                if response.take(MAX_ERROR_BODY).read_to_end(&mut body).is_ok()
+                    && let Some(message) = rejection_message(&body)
+                {
+                    return Err(ApiError::Rejected(message));
+                }
+            }
             return Err(ApiError::Http(status.as_u16()));
         }
         if response
@@ -6004,5 +6026,26 @@ mod tests {
             .unwrap();
         assert_eq!(filename, "clip.mp4");
         assert_eq!(bytes, b"hello");
+    }
+}
+
+#[cfg(test)]
+mod rejection_message_tests {
+    use super::rejection_message;
+
+    #[test]
+    fn a_field_message_is_shown_and_unsafe_bodies_are_not() {
+        assert_eq!(
+            rejection_message(
+                br#"{"error":"due must be an RFC 3339 timestamp or date","code":"validation"}"#
+            )
+            .as_deref(),
+            Some("due must be an RFC 3339 timestamp or date")
+        );
+        // Not JSON, no error sentence, empty, or with a control character.
+        assert!(rejection_message(b"<html>422</html>").is_none());
+        assert!(rejection_message(br#"{"code":"validation"}"#).is_none());
+        assert!(rejection_message(br#"{"error":""}"#).is_none());
+        assert!(rejection_message(br#"{"error":"bad\nvalue"}"#).is_none());
     }
 }

@@ -1503,8 +1503,9 @@ pub struct MemoryConfig {
     /// Facts injected per turn (1..=20).
     #[serde(default = "default_recall_k")]
     pub recall_k: usize,
-    /// Summarize a conversation after this many new messages; `0` turns
-    /// summaries off, otherwise 10..=500.
+    /// Turn the memory refresh on or off: `0` turns it off for every bot.
+    /// When on, each bot refreshes after its own `refresh_every_turns` user
+    /// turns (default 40). This value is only the switch; it must be 0 or 10..=500.
     #[serde(default = "default_summary_every")]
     pub summary_every: usize,
     /// Mem0 Platform base URL. Must be https, or http on loopback (tests).

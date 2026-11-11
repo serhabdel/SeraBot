@@ -383,6 +383,16 @@ pub(super) async fn calendar_events(
 ) -> Result<Json<Value>> {
     let prefs = crate::personal_tasks::get_prefs(&state.store, &user.id)?;
     let provider = prefs.sync_provider;
+    // Only the calendar providers have events. Any other choice, including
+    // "none" (the default), is an empty calendar, not a rejected request: the
+    // Tasks window asks for the calendar every time it opens.
+    if !matches!(
+        provider.as_str(),
+        crate::personal_tasks::PROVIDER_GOOGLE_CALENDAR
+            | crate::personal_tasks::PROVIDER_OUTLOOK_CALENDAR
+    ) {
+        return Ok(Json(json!({"provider": provider, "events": []})));
+    }
     let family = crate::task_sync::provider_family(&provider)
         .ok_or_else(|| SeraError::Validation("choose a calendar provider first".into()))?;
     let (client_id, client_secret) = sync_client_credentials(&state, family)?;

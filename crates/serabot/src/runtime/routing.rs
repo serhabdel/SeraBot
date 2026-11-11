@@ -149,24 +149,29 @@ impl Runtime {
         } else {
             // Rooms always run as the orchestrator; only a handoff names a specialist.
             // A `dir:<bot>` conversation talks to that bot one-to-one.
-            let bot = match parse_conversation_scope(conversation_id) {
-                Ok(scope) if scope.kind == ConversationKind::Room => ORCHESTRATOR_BOT,
+            let bot: String = match parse_conversation_scope(conversation_id) {
+                Ok(scope) if scope.kind == ConversationKind::Room => ORCHESTRATOR_BOT.to_string(),
                 Ok(scope) if scope.kind == ConversationKind::Direct && bot_override.is_none() => {
-                    match conversation_id.strip_prefix("dir:") {
-                        Some(id) if fleet.contains_key(id) => {
-                            if !fleet[id].config.enabled {
+                    // An extra chat is bound to its bot. The primary chat
+                    // `dir:<bot>` is routed by its slug, as before.
+                    let bound = self.store.bot_for_chat(user_id, conversation_id)?;
+                    let target =
+                        bound.or_else(|| conversation_id.strip_prefix("dir:").map(str::to_owned));
+                    match target {
+                        Some(id) if fleet.contains_key(&id) => {
+                            if !fleet[&id].config.enabled {
                                 return Err(SeraError::InvalidState(format!(
                                     "bot {id} is disabled"
                                 )));
                             }
                             id
                         }
-                        _ => ORCHESTRATOR_BOT,
+                        _ => ORCHESTRATOR_BOT.to_string(),
                     }
                 }
-                _ => bot_override.unwrap_or(ORCHESTRATOR_BOT),
+                _ => bot_override.unwrap_or(ORCHESTRATOR_BOT).to_string(),
             };
-            (bot.to_string(), text.to_string(), false)
+            (bot, text.to_string(), false)
         };
         if !fleet.contains_key(&bot) {
             return Err(SeraError::NotFound(format!("bot {bot}")));
