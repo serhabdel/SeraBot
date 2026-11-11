@@ -711,6 +711,9 @@ pub struct Session {
     pending_open_group: Option<String>,
     /// Bot id whose `GET /v1/bots/{id}` is in flight (dedup of loads).
     bot_detail_pending: Option<String>,
+    /// The bot whose chat list is being read, so a failed read (an older
+    /// server without the route) marks it loaded instead of retrying forever.
+    bot_chats_pending: Option<String>,
     /// The bot config write in flight: (bot id, update), kept so the cached
     /// detail can be updated optimistically when the save succeeds.
     bot_config_pending: Option<(String, BotConfigUpdate)>,
@@ -865,6 +868,7 @@ impl Session {
             creating_named_bot: false,
             pending_open_group: None,
             bot_detail_pending: None,
+            bot_chats_pending: None,
             bot_config_pending: None,
             pending_team: None,
             pending_room_refresh: false,
@@ -915,17 +919,13 @@ impl Session {
         let mut unauthorized = false;
         // Point the dock at the browser of the bot being talked to, and tell
         // the scheduler whether the Browser page is on screen.
-        let chat_bot = self
-            .conversation
-            .strip_prefix("dir:")
-            .map(str::to_owned)
-            .or_else(|| {
-                self.state
-                    .listed_bots
-                    .iter()
-                    .find(|bot| bot.role == "orchestrator")
-                    .map(|bot| bot.id.clone())
-            });
+        let chat_bot = self.conversation_bot(&self.conversation).or_else(|| {
+            self.state
+                .listed_bots
+                .iter()
+                .find(|bot| bot.role == "orchestrator")
+                .map(|bot| bot.id.clone())
+        });
         if let Some(bot) = chat_bot {
             let profile = crate::profile_for_bot(&self.panel.profiles, &bot);
             self.panel.set_dock_profile(&profile);
@@ -1922,6 +1922,56 @@ impl Session {
         }
     }
 
+    /// The bot a conversation talks to: the bot of a `dir:<bot>` chat, or the
+    /// owner of an extra chat (from the loaded per-bot lists).
+    pub fn conversation_bot(&self, conversation: &str) -> Option<String> {
+        crate::bot_chats::bot_of_chat(self.state.bot_chats.values(), conversation)
+    }
+
+    /// One chat from the loaded per-bot lists.
+    pub fn bot_chat(&self, id: &str) -> Option<&crate::bot_chats::BotChat> {
+        self.state
+            .bot_chats
+            .values()
+            .flat_map(|list| list.chats.iter())
+            .find(|chat| chat.id == id)
+    }
+
+    /// Read a bot's chat list.
+    pub fn load_bot_chats(&mut self, bot: String) {
+        if valid_id(&bot) && self.state.connected {
+            self.start_request(Operation::ListBotChats { bot });
+        }
+    }
+
+    /// Read every list that is already loaded again (after a rename, archive
+    /// or new chat).
+    fn reload_bot_chats(&mut self) {
+        let bots: Vec<String> = self.state.bot_chats_loaded.iter().cloned().collect();
+        for bot in bots {
+            self.start_request(Operation::ListBotChats { bot });
+        }
+    }
+
+    /// Start another chat with a bot. The server seeds it from the bot's memory
+    /// and a short summary; it opens when the server answers.
+    pub fn new_bot_chat(&mut self, bot: String) {
+        if !valid_id(&bot) || !self.state.connected {
+            return;
+        }
+        self.state.error = None;
+        self.start_request(Operation::CreateBotChat { bot, title: None });
+    }
+
+    /// Save "refresh memory every N turns" for a bot.
+    pub fn set_bot_refresh(&mut self, bot: String, every: u32) {
+        if !valid_id(&bot) || !crate::bot_chats::valid_refresh_turns(every) {
+            return;
+        }
+        self.state.error = None;
+        self.start_request(Operation::SetBotRefresh { bot, every });
+    }
+
     pub fn open_conversation(&mut self, id: String) {
         if !valid_id(&id) {
             return;
@@ -1961,10 +2011,8 @@ impl Session {
     /// conversation opens and on reconnect, next to the catalog refresh.
     fn schedule_open_bot_detail(&mut self) {
         let Some(bot) = self
-            .conversation
-            .strip_prefix("dir:")
+            .conversation_bot(&self.conversation)
             .filter(|bot| valid_speaker(bot))
-            .map(str::to_owned)
         else {
             return;
         };
@@ -2255,7 +2303,7 @@ impl Session {
             return ("You".into(), "Y".into(), None);
         }
         let dir_bot = if self.state.bot_chat_binding == Some(true) {
-            self.conversation.strip_prefix("dir:")
+            self.conversation_bot(&self.conversation)
         } else {
             None
         };
@@ -2263,7 +2311,7 @@ impl Session {
             .bot
             .as_deref()
             .or(message.name.as_deref())
-            .or(dir_bot)
+            .or(dir_bot.as_deref())
             .or_else(|| {
                 self.state
                     .listed_bots
@@ -3125,6 +3173,7 @@ impl Session {
         // update the cached detail optimistically when it completes.
         match &operation {
             Operation::BotDetail { id } => self.bot_detail_pending = Some(id.clone()),
+            Operation::ListBotChats { bot } => self.bot_chats_pending = Some(bot.clone()),
             Operation::UpdateBotConfig { id, update } => {
                 self.bot_config_pending = Some((id.clone(), update.clone()))
             }
@@ -3358,6 +3407,14 @@ impl Session {
                         OperationKind::CreateConversation => {
                             // No room was created, so no team is pending.
                             self.pending_team = None;
+                        }
+                        OperationKind::ListBotChats => {
+                            // An older server has no chat list: show the bot
+                            // with its one chat and do not ask again.
+                            if let Some(bot) = self.bot_chats_pending.take() {
+                                self.state.bot_chats_loaded.insert(bot);
+                            }
+                            self.state.error = None;
                         }
                         OperationKind::Transcribe => {
                             self.state.transcript_error = Some(message.clone());
@@ -3688,7 +3745,24 @@ impl Session {
                                 );
                             }
                         }
+                        OperationKind::CreateBotChat => {
+                            if let Some((_, chat, _)) = self.state.created_bot_chat.take() {
+                                self.open_conversation(chat);
+                            }
+                            self.reload_bot_chats();
+                            self.schedule(
+                                Operation::ListConversations {
+                                    include_archived: false,
+                                },
+                                Duration::ZERO,
+                            );
+                        }
+                        OperationKind::SetBotRefresh => {
+                            self.toast = Some("Memory refresh saved.".into());
+                        }
+                        OperationKind::ListBotChats => {}
                         OperationKind::RenameConversation | OperationKind::ArchiveConversation => {
+                            self.reload_bot_chats();
                             let archived_current = completion.kind
                                 == OperationKind::ArchiveConversation
                                 && self.archive_confirm.as_deref()
@@ -3707,6 +3781,7 @@ impl Session {
                             }
                         }
                         OperationKind::UnarchiveConversation => {
+                            self.reload_bot_chats();
                             self.schedule(
                                 Operation::ListConversations {
                                     include_archived: false,
@@ -3979,7 +4054,14 @@ impl Session {
                 } else if !self.state.bots_loaded {
                     Some(Operation::ListBots)
                 } else {
-                    None
+                    // One bot's chat list per tick, until every bot has one.
+                    self.state
+                        .listed_bots
+                        .iter()
+                        .find(|bot| !self.state.bot_chats_loaded.contains(&bot.id))
+                        .map(|bot| Operation::ListBotChats {
+                            bot: bot.id.clone(),
+                        })
                 }
             }
             Section::Conversations => {
@@ -4120,6 +4202,12 @@ impl Session {
         }
         if self.conversation == "windows-owner" {
             return "Owner".into();
+        }
+        if crate::bot_chats::is_extra_chat_id(&self.conversation) {
+            return self
+                .bot_chat(&self.conversation)
+                .map(crate::bot_chats::chat_title)
+                .unwrap_or_else(|| "New chat".into());
         }
         if let Some(bot) = self.conversation.strip_prefix("dir:") {
             return self.bot_display_name(bot);

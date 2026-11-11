@@ -215,7 +215,7 @@ impl Session {
 
     /// Show the panel for the open conversation (a bot chat, or a group).
     pub fn open_settings_for_conversation(&mut self) {
-        match self.conversation.strip_prefix("dir:").map(str::to_owned) {
+        match self.conversation_bot(&self.conversation) {
             Some(bot) => self.open_bot_settings(bot),
             None => {
                 self.bot_settings.open = true;

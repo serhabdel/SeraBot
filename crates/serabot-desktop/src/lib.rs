@@ -5,6 +5,7 @@ mod api;
 #[cfg(any(windows, feature = "ui-check"))]
 pub mod audio_capture;
 pub mod avatars;
+pub mod bot_chats;
 pub mod branding;
 pub mod capabilities;
 pub mod chat_cards;
@@ -31,6 +32,7 @@ pub mod pc_stats;
 pub mod preview;
 pub mod provider_presets;
 pub mod provider_view;
+pub mod row_menu;
 pub mod session;
 pub mod signin;
 pub mod standing_grants;

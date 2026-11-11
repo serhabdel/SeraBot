@@ -134,9 +134,84 @@ pub fn SettingsPanel(session: Signal<Session>, overlay: Signal<Overlay>) -> Elem
             if open {
                 {match (tab, bot_id) {
                     (SettingsTab::Files, _) => rsx! { FilesTab { session } },
-                    (SettingsTab::Settings, Some(id)) => rsx! { BotForm { session, id } },
+                    (SettingsTab::Settings, Some(id)) => rsx! {
+                        BotForm { session, id: id.clone() }
+                        MemoryRefreshCard { session, id }
+                    },
                     (SettingsTab::Settings, None) => rsx! { MembersTab { session, overlay } },
                 }}
+            }
+        }
+    }
+}
+
+/// "Refresh memory every N turns" for one bot (5 to 500, default 40). After N
+/// of the owner's turns the server folds them into a short summary and saves
+/// the lasting facts, in the background. The setting covers all of the bot's chats.
+#[component]
+fn MemoryRefreshCard(session: Signal<Session>, id: String) -> Element {
+    let mut session = session;
+    let mut draft = use_signal(String::new);
+    let mut seeded = use_signal(|| false);
+    let bot = id.clone();
+    use_effect(move || {
+        let loaded = session.read().state.bot_chats.contains_key(&bot);
+        if !loaded {
+            session.write().load_bot_chats(bot.clone());
+        }
+    });
+    let current = session
+        .read()
+        .state
+        .bot_chats
+        .get(&id)
+        .map(|list| list.refresh_every_turns);
+    // Seed the field once the server's value is known.
+    if let Some(value) = current
+        && !seeded()
+    {
+        draft.set(value.to_string());
+        seeded.set(true);
+    }
+    let parsed = serabot_desktop::bot_chats::parse_refresh_turns(&draft.read());
+    let changed = parsed.is_some() && parsed != current;
+    let invalid = !draft.read().trim().is_empty() && parsed.is_none();
+    let save_id = id.clone();
+    rsx! {
+        div { class: "card memory-card",
+            div { class: "card-head",
+                h3 { class: "card-title", "Memory refresh" }
+            }
+            p { class: "tiny",
+                "Every so many of your messages, this bot summarises the recent turns and saves the lasting facts to its memory, in the background. It covers all of this bot\u{2019}s chats. Default 40."
+            }
+            label { class: "field",
+                span { "Refresh every (turns)" }
+                input {
+                    class: "input",
+                    r#type: "number",
+                    min: "{serabot_desktop::bot_chats::MIN_REFRESH_TURNS}",
+                    max: "{serabot_desktop::bot_chats::MAX_REFRESH_TURNS}",
+                    value: "{draft}",
+                    disabled: current.is_none(),
+                    "aria-invalid": if invalid { "true" } else { "false" },
+                    oninput: move |event| draft.set(event.value()),
+                }
+            }
+            if invalid {
+                p { class: "tiny", role: "alert", "Enter a whole number from 5 to 500." }
+            }
+            div { class: "row-actions",
+                button {
+                    class: "btn primary small",
+                    disabled: !changed,
+                    onclick: move |_| {
+                        if let Some(every) = parsed {
+                            session.write().set_bot_refresh(save_id.clone(), every);
+                        }
+                    },
+                    "Save"
+                }
             }
         }
     }

@@ -148,18 +148,14 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let accepts = session.read().conversation_accepts_turns();
     let (active_bot, active_name, active_avatar, roster) = {
         let state = session.read();
-        let active = state
-            .conversation
-            .strip_prefix("dir:")
-            .map(str::to_owned)
-            .or_else(|| {
-                state
-                    .state
-                    .listed_bots
-                    .iter()
-                    .find(|bot| bot.role == "orchestrator")
-                    .map(|bot| bot.id.clone())
-            });
+        let active = state.conversation_bot(&state.conversation).or_else(|| {
+            state
+                .state
+                .listed_bots
+                .iter()
+                .find(|bot| bot.role == "orchestrator")
+                .map(|bot| bot.id.clone())
+        });
         let name = active
             .as_deref()
             .map(|id| state.bot_display_name(id))
@@ -260,6 +256,8 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         use_hook(|| Rc::new(RefCell::new((String::new(), HashSet::<String>::new()))));
     let entered_messages_effect = Rc::clone(&entered_messages);
     let mut dragging = use_signal(|| false);
+    // The composer grows to about 40% of the window; Expand lifts that to 70%.
+    let mut composer_expanded = use_signal(|| false);
     let mut composer_focused = use_signal(|| false);
     let mut copied = use_signal(|| Option::<String>::None);
     let mut composer_room = use_signal(|| session.read().conversation.clone());
@@ -287,6 +285,17 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     use_future(move || async move {
         let _ = dioxus::document::eval(chat_scroll::CHAT_SCROLL_BRIDGE_JS);
         let _ = dioxus::document::eval(COMPOSER_CARET_SETUP_JS);
+        // Follow state comes from the page, only when it changes. There is no
+        // per-scroll-event round trip and no scroll-position maths in Rust.
+        let mut follow = dioxus::document::eval(chat_scroll::FOLLOW_SINK_JS);
+        while let Ok(following) = follow.recv::<bool>().await {
+            if *at_bottom.peek() != following {
+                at_bottom.set(following);
+            }
+            if following && *unseen.peek() != 0 {
+                unseen.set(0);
+            }
+        }
     });
     let transcript_error = session.read().state.transcript_error.clone();
     use_effect(move || {
@@ -388,6 +397,26 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         }
     }
     let empty = messages.is_empty();
+    // On a new chat: where it started from (the bot's memory and a summary).
+    let memory_note = {
+        let state = session.read();
+        state.bot_chat(&state.conversation).and_then(|chat| {
+            let bot = state.conversation_bot(&chat.id)?;
+            let previous = chat
+                .carried_from
+                .as_deref()
+                .and_then(|id| state.bot_chat(id))
+                .map(|prev| match prev.title.as_deref().map(str::trim) {
+                    Some(title) if !title.is_empty() => title.to_owned(),
+                    _ => "the main chat".to_owned(),
+                });
+            serabot_desktop::bot_chats::memory_divider(
+                chat,
+                previous.as_deref(),
+                &state.bot_display_name(&bot),
+            )
+        })
+    };
     let is_one_to_one = session.read().conversation.starts_with("dir:");
     let room = teams::is_room(&session.read().conversation);
     let in_team: Vec<String> = session
@@ -425,7 +454,12 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     } else {
         Vec::new()
     };
-    let slash_total = slash_skills.len() + slash_tools.len();
+    let slash_actions = if show_slash {
+        chat_compose::slash_actions(&slash_q)
+    } else {
+        Vec::new()
+    };
+    let slash_total = slash_skills.len() + slash_tools.len() + slash_actions.len();
     let slash_active = slash_idx().min(slash_total.saturating_sub(1));
     // Copies for the key handler closures (they move their captures).
     let key_mention_bots = mention_bots.clone();
@@ -501,21 +535,16 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     role: "log",
                     "aria-label": "Conversation",
                     "aria-live": "off",
-                    onscroll: move |event: ScrollEvent| {
-                        let bottom = chat_scroll::near_bottom(
-                            event.scroll_height() as f64,
-                            event.scroll_top(),
-                            event.client_height() as f64,
-                        );
-                        // Write only on change: every write re-renders the whole
-                        // chat view, and scroll events arrive once per frame.
-                        if *at_bottom.peek() != bottom {
-                            at_bottom.set(bottom);
+                    if let Some(note) = memory_note.clone() {
+                        div { class: "memory-divider", role: "note",
+                            span { "{note}" }
+                            button {
+                                class: "btn ghost sm",
+                                onclick: move |_| session.write().open_section(Section::Memory),
+                                "View"
+                            }
                         }
-                        if bottom && *unseen.peek() != 0 {
-                            unseen.set(0);
-                        }
-                    },
+                    }
                     if empty {
                         div { class: "empty",
                             div {
@@ -762,6 +791,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             }
                         }
                     }
+                    // Bottom sentinel: the page watches it to know the reader
+                    // is at the end of the conversation.
+                    div { id: "messages-end", class: "messages-end", "aria-hidden": "true" }
                 }
                 if !at_bottom() {
                     button {
@@ -788,7 +820,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     if let Some(message) = transcript_error {
                         div { class: "banner err", span { "{message}" } }
                     }
-                    div { class: "composer",
+                    div { class: if composer_expanded() { "composer expanded" } else { "composer" },
                         ComposerFiles { session }
                         textarea {
                             class: "composer-input",
@@ -810,6 +842,37 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 slash_idx.set(0);
                             },
                             onkeydown: move |event: KeyboardEvent| {
+                                // `/new`, `/stop` and friends run as actions. Checked
+                                // first so an open picker with no match cannot swallow Enter.
+                                if event.key() == Key::Enter
+                                    && !event.is_composing()
+                                    && let Some(action) = chat_compose::parse_slash_action(&composer_draft())
+                                {
+                                        event.prevent_default();
+                                        composer_draft.set(String::new());
+                                        session.write().composer = String::new();
+                                        slash.set(None);
+                                        match action {
+                                            chat_compose::SlashAction::NewChat => {
+                                                let bot = {
+                                                    let state = session.read();
+                                                    state.conversation_bot(&state.conversation)
+                                                };
+                                                if let Some(bot) = bot {
+                                                    session.write().new_bot_chat(bot);
+                                                }
+                                            }
+                                            chat_compose::SlashAction::Memory => {
+                                                session.write().open_section(Section::Memory);
+                                            }
+                                            chat_compose::SlashAction::Attach => session.write().pick_attachments(),
+                                            chat_compose::SlashAction::Stop => session.write().stop_turn(),
+                                            chat_compose::SlashAction::Expand => {
+                                                composer_expanded.set(!composer_expanded());
+                                            }
+                                        }
+                                        return;
+                                }
                                 // Same priority as the render below: slash wins.
                                 let mention_open = mention().is_some() && slash().is_none();
                                 let slash_open = slash().is_some();
@@ -1018,6 +1081,14 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 }
                                 button {
                                     class: "composer-mic",
+                                    title: if composer_expanded() { "Make the message box smaller" } else { "Make the message box bigger" },
+                                    "aria-label": if composer_expanded() { "Make the message box smaller" } else { "Make the message box bigger" },
+                                    "aria-pressed": if composer_expanded() { "true" } else { "false" },
+                                    onclick: move |_| composer_expanded.set(!composer_expanded()),
+                                    Icon { name: if composer_expanded() { "minimize" } else { "maximize" }, size: 16 }
+                                }
+                                button {
+                                    class: "composer-mic",
                                     title: "Attach files (images, PDF, Office, text; up to 25 MB)",
                                     "aria-label": "Attach files",
                                     disabled: !accepts,
@@ -1127,7 +1198,27 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             }
                             div { class: "pop-list",
                                 if slash_total == 0 {
-                                    div { class: "pop-empty", "No skills or tools match." }
+                                    div { class: "pop-empty", "No commands, skills or tools match." }
+                                }
+                                if !slash_actions.is_empty() {
+                                    div { class: "pop-group", "Actions (type the command, then Enter)" }
+                                    for (command, description, _) in slash_actions.iter() {
+                                        button {
+                                            key: "{command}",
+                                            class: "pop-item",
+                                            onclick: {
+                                                let command = (*command).to_owned();
+                                                move |_| {
+                                                    let text = format!("/{command}");
+                                                    composer_draft.set(text.clone());
+                                                    session.write().composer = text;
+                                                    focus_composer();
+                                                }
+                                            },
+                                            span { "/{command}" }
+                                            span { class: "micro", "{description}" }
+                                        }
+                                    }
                                 }
                                 if !slash_skills.is_empty() {
                                     div { class: "pop-group", "Skills" }

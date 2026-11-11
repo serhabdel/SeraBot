@@ -163,3 +163,238 @@
   color: var(--label-2);
   font-size: var(--fs-micro);
 }
+
+/* End-of-list sentinel for the follow logic: 1px, takes no visual space. */
+.messages-end {
+  flex: 0 0 1px;
+  width: 100%;
+  height: 1px;
+  pointer-events: none;
+}
+
+/* Row actions live in one menu (PR-F). The row shows a single quiet "more"
+   button on hover or focus; the menu opens from it, from a right click, or
+   from the chat header. */
+.thread .row-more {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: var(--clear);
+  color: var(--label-2);
+  cursor: pointer;
+  opacity: 0.7;
+  transition: opacity var(--dur-1) var(--ease), background var(--dur-1) var(--ease);
+}
+
+.thread:hover .row-more,
+.thread:focus-within .row-more,
+.thread .row-more[aria-expanded="true"] {
+  opacity: 1;
+}
+
+.thread .row-more:hover,
+.thread .row-more[aria-expanded="true"] {
+  background: var(--active);
+  color: var(--label-1);
+}
+
+.thread .row-more:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.row-menu-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+}
+
+.row-menu {
+  position: absolute;
+  right: 6px;
+  top: calc(100% - 4px);
+  z-index: 41;
+  min-width: 190px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--glass-sheet);
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--r-sm);
+  box-shadow: var(--shadow-2);
+}
+
+.row-menu.header {
+  top: calc(100% + 4px);
+  right: 0;
+}
+
+.row-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 4px 10px;
+  border: 0;
+  border-radius: var(--r-xs);
+  background: var(--clear);
+  color: var(--label-1);
+  font-size: var(--fs-body-2);
+  text-align: left;
+  cursor: pointer;
+}
+
+.row-menu-item:hover,
+.row-menu-item:focus-visible {
+  background: var(--hover);
+}
+
+.row-menu-item.danger {
+  color: var(--danger);
+  margin-top: 2px;
+  border-top: 1px solid var(--hairline);
+  border-radius: 0 0 var(--r-xs) var(--r-xs);
+}
+
+.row-menu-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+  max-width: 260px;
+}
+
+.row-menu-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.header-more {
+  position: relative;
+  display: inline-flex;
+}
+
+/* Composer size (PR-F): about three lines at rest, growing to 40% of the
+   window, 70% when expanded. */
+.composer .composer-input {
+  min-height: 72px;
+  max-height: 40vh;
+}
+
+.composer.expanded .composer-input {
+  min-height: 40vh;
+  max-height: 70vh;
+}
+
+.composer-count {
+  text-align: right;
+}
+
+/* Chats per bot in the sidebar (PR-F). */
+.thread .row-chevron {
+  flex: 0 0 20px;
+  width: 20px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: var(--r-xs);
+  background: var(--clear);
+  color: var(--label-2);
+  cursor: pointer;
+  padding: 0;
+}
+
+.thread .row-chevron.placeholder {
+  visibility: hidden;
+}
+
+.thread .row-chevron:hover {
+  background: var(--hover);
+}
+
+.thread .row-new {
+  position: absolute;
+  right: 36px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: var(--clear);
+  color: var(--label-2);
+  cursor: pointer;
+  opacity: 0.7;
+}
+
+.thread .row-new:hover,
+.thread .row-new:focus-visible {
+  opacity: 1;
+  background: var(--active);
+  color: var(--label-1);
+}
+
+.thread .row-new:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.thread.chat-row {
+  min-height: 32px;
+  padding-left: 44px;
+}
+
+.thread.chat-row.active {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.thread-title.unread {
+  font-weight: 700;
+}
+
+.thread-group.chat-more {
+  padding-left: 44px;
+  min-height: 28px;
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+}
+
+.undo-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* The first line of a new chat: what it carries over from the bot. */
+.memory-divider {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  color: var(--label-2);
+  font-size: var(--fs-micro);
+  text-align: center;
+}
+
+.memory-card .field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
