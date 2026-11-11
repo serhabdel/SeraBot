@@ -398,3 +398,103 @@
   flex-direction: column;
   gap: 4px;
 }
+
+/* Composer layout (PR-I). One container. The text area runs the full width at
+   the top with no border of its own; the container carries the focus ring.
+   Below it, one toolbar row: + and the model chip on the left; mic, expand,
+   attach and send on the right. The key hint sits under the container.
+
+   Why it broke: the composer was a wrapping flex ROW whose children included
+   the text area, so the text area shared a line with the + button, the model
+   chip and the actions, and the hint was pulled to the top with a negative
+   order. The text area also showed the global focus outline (a purple box).
+   Everything below overrides those rules; this file loads last. */
+.composer-wrap .composer {
+  display: flex;
+  flex-direction: column;
+  flex-wrap: nowrap;
+  align-items: stretch;
+  gap: 4px;
+  padding: 12px 12px 8px 16px;
+}
+
+.composer-wrap .composer:focus-within {
+  border-color: var(--accent);
+  box-shadow: var(--composer-shadow), inset 0 1px 0 var(--composer-top-edge), var(--ring);
+}
+
+.composer-wrap .composer .composer-input {
+  order: 1;
+  flex: 0 0 auto;
+  width: 100%;
+  min-width: 0;
+  min-height: 72px;
+  max-height: 40vh;
+  padding: 2px 0;
+  border: 0;
+  border-radius: 0;
+  outline: none;
+  box-shadow: none;
+  background: var(--clear);
+  overflow-y: auto;
+}
+
+.composer-wrap .composer .composer-input:hover,
+.composer-wrap .composer .composer-input:focus,
+.composer-wrap .composer .composer-input:focus-visible {
+  border: 0;
+  outline: none;
+  box-shadow: none;
+  background: var(--clear);
+}
+
+.composer-wrap .composer.expanded .composer-input {
+  min-height: 40vh;
+  max-height: 70vh;
+}
+
+.composer-wrap .composer .composer-row {
+  order: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+}
+
+/* The member chip of a group chat sits in the toolbar, not on its own line. */
+.composer-wrap .composer .composer-row .team-row {
+  order: 0;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.composer-wrap .composer .composer-row .team-row:empty {
+  display: none;
+}
+
+.composer-wrap .composer .composer-row .menu-wrap {
+  order: 0;
+}
+
+.composer-wrap .composer .composer-row .composer-actions {
+  order: 0;
+  margin-left: auto;
+  gap: 4px;
+}
+
+/* Notices and the character count stay above the text, inside the container. */
+.composer-wrap .composer .composer-count,
+.composer-wrap .composer .composer-notice {
+  order: 0;
+  flex: 0 0 auto;
+}
+
+.composer-wrap .composer-hint {
+  padding: 4px 16px 0;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--label-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
