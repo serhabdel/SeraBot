@@ -36,6 +36,19 @@ Windows isolated target dirs (H: full; C: filled after check):
 
 ---
 
+## PR-2 — Desktop foundation (draft, `feat/desktop-foundation`)
+
+- [x] **Refactor** — `ui.rs` (7.2k lines) split into `src/ui/{markdown,connect,shell,chat,sheets,approvals,providers,memory,conversations,settings_view}.rs`; no behavior change (own commit).
+- [x] **Theme module** — `theme.rs` (`Tone`, `Level`: colour + icon + word), shared `StatusChip`, `LevelChip`, `SecretField` in `ui_widgets.rs`, styles in `assets/foundation.css`.
+- [x] **Usage page** — order is now Quota, then Reliability (owner only, always visible, not behind "Show details"), then Activity, then This computer. Status shown as OK / Near limit / At limit.
+- [x] **Settings > Memory and Vault** — Show/Hide on typed secrets, "Key saved" chip, confirm before removing the Mem0 key, Vault Test shown as a Test passed / Test failed chip.
+- [x] **Chat** — jump-to-latest pill (label, unseen count, live dot while a reply streams); animation off with reduce motion.
+- [ ] **Manual Windows look** (owner, WebView2): Usage page in light and dark theme; quota at 80% and 100% (chip icon + word, not colour only); Show/Hide toggle; Mem0 remove confirm; Vault Test pass and fail; jump pill while streaming, with Reduce motion on and off.
+
+Mobile parity (Flutter) is PR-3 and starts after this lands.
+
+---
+
 ## A8 — Desktop smoke checklist (owner)
 
 Run against a local or staging server with two test accounts (admin + member).
