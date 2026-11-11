@@ -729,17 +729,22 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                 }
                 if !at_bottom() {
                     button {
-                        class: "scroll-bottom",
-                        "aria-label": "Scroll to the newest message",
-                        title: "Newest messages",
+                        class: "scroll-bottom jump-pill",
+                        r#type: "button",
+                        "aria-label": if live_task.is_some() { "Jump to the latest message, a reply is still coming in" } else { "Jump to the latest message" },
+                        title: "Jump to latest",
                         onclick: move |_| {
                             let _ = dioxus::document::eval(chat_scroll::SCROLL_TO_BOTTOM_JS);
                             at_bottom.set(true);
                             unseen.set(0);
                         },
                         Icon { name: "arrow-down", size: 16 }
+                        span { class: "jump-label", "Jump to latest" }
                         if let Some(badge) = chat_feed::unseen_badge(unseen()) {
                             span { class: "scroll-badge", "aria-label": "{badge} unseen messages", "{badge}" }
+                        }
+                        if live_task.is_some() {
+                            span { class: "jump-live", "aria-hidden": "true" }
                         }
                     }
                 }
