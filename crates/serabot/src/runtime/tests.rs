@@ -886,17 +886,21 @@ async fn failed_background_extraction_never_fails_the_turn() {
 #[tokio::test]
 async fn summary_folds_thirty_messages_and_reaches_the_next_prompt() {
     let server = MockServer::start().await;
+    // Every call gets the same reply: the refresh makes a facts call and a
+    // summary call, and this reply is not a fact list, so no fact is stored.
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(Sequence::new(vec![serde_json::json!({
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "choices": [{"message": {"role": "assistant", "content": "Owner planned the Milan trip."}, "finish_reason": "stop"}]
-        })]))
+        })))
         .mount(&server)
         .await;
     let notifier = Arc::new(Capture::default());
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (runtime, store) = setup(&server.uri(), notifier, calls);
     let admin_id = admin(&store);
+    // The refresh runs every N owner turns; this test uses the minimum, 5.
+    store.set_bot_refresh_every(&admin_id, "main", 5).unwrap();
     for index in 0..30 {
         let role = if index % 2 == 0 {
             Role::User
@@ -1529,6 +1533,24 @@ async fn direct_bot_chats_bind_without_an_override() {
         .unwrap();
     assert_eq!(unknown.bot, "main");
     assert_eq!(store.pending_task_count(&admin(&store)).unwrap(), 2);
+}
+
+#[tokio::test]
+async fn an_extra_chat_routes_to_the_bot_it_was_bound_to() {
+    let (runtime, store) = setup_orchestration("http://127.0.0.1:9", Arc::new(Capture::default()));
+    let owner = admin(&store);
+    store
+        .bind_bot_chat(&owner, "dir:chat-0123456789ab", "analyst", None)
+        .unwrap();
+    let bound = runtime
+        .submit_text(&owner, "dir:chat-0123456789ab", "synthetic", None)
+        .unwrap();
+    assert_eq!(bound.bot, "analyst");
+    // A chat with no binding is not guessed from its id: it goes to the orchestrator.
+    let unbound = runtime
+        .submit_text(&owner, "dir:chat-ffffffffffff", "synthetic", None)
+        .unwrap();
+    assert_eq!(unbound.bot, "main");
 }
 
 #[tokio::test]

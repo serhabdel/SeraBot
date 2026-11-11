@@ -52,6 +52,7 @@ use crate::util::{constant_time_eq, sha256_hex, truncate_chars};
 mod accounts;
 mod admin;
 mod approvals;
+mod bot_chats;
 mod bots;
 mod browser;
 mod cards;
@@ -83,6 +84,7 @@ mod workflows;
 use accounts::*;
 use admin::*;
 use approvals::*;
+use bot_chats::*;
 use bots::*;
 use browser::*;
 use cards::*;
@@ -346,6 +348,11 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/messages", post(send_message))
         .route("/v1/bots", get(list_bots).post(create_bot))
+        .route(
+            "/v1/bots/{bot}/chats",
+            get(list_bot_chats).post(create_bot_chat),
+        )
+        .route("/v1/bots/{bot}/chat-settings", put(put_bot_chat_settings))
         .route("/v1/bots/catalog", get(bot_catalog))
         .route("/v1/bots/catalog/{name}/install", post(install_catalog_bot))
         .route(
@@ -909,11 +916,11 @@ impl IntoResponse for SeraError {
             // The reason is logged only for the audited static texts.
             match safe_validation_text(text) {
                 Some(safe) => {
-                    warn!(reason = safe, "api request failed validation");
+                    warn!(reason = %safe, "api request failed validation");
                     return (
                         StatusCode::UNPROCESSABLE_ENTITY,
                         Json(ApiErrorBody {
-                            error: safe.to_owned(),
+                            error: safe,
                             code: "validation",
                         }),
                     )
@@ -972,11 +979,33 @@ const SAFE_VALIDATION_TEXTS: &[&str] = &[
     "model is not allowed for this provider",
 ];
 
-fn safe_validation_text(text: &str) -> Option<&'static str> {
-    SAFE_VALIDATION_TEXTS
+/// Field-level rejections whose wording is fixed in the server (the length
+/// limits are constants). Only these prefixes are shown; they name the field
+/// that failed and never echo the value that was sent.
+const SAFE_VALIDATION_PREFIXES: &[&str] = &[
+    "title must be ",
+    "title must not ",
+    "notes must be ",
+    "status must be ",
+    "due must be ",
+    "sync_provider must be ",
+    "provider must be ",
+    "refresh_every_turns must be ",
+];
+
+fn safe_validation_text(text: &str) -> Option<String> {
+    if let Some(exact) = SAFE_VALIDATION_TEXTS
         .iter()
         .copied()
         .find(|candidate| *candidate == text)
+    {
+        return Some(exact.to_owned());
+    }
+    let field_message = SAFE_VALIDATION_PREFIXES
+        .iter()
+        .any(|prefix| text.starts_with(prefix));
+    (field_message && text.len() <= 160 && !text.chars().any(char::is_control))
+        .then(|| text.to_owned())
 }
 
 pub fn sanitize_for_event(value: &str) -> String {

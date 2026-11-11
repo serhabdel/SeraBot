@@ -10,6 +10,7 @@ use tower::ServiceExt;
 
 mod a8_smoke_api;
 mod big_wave_b3_b4;
+mod bot_chats_api;
 mod browser_api;
 mod cards_api;
 mod chat_api;
@@ -25,6 +26,7 @@ mod preview_api;
 mod profiles_api;
 mod standing_grants_api;
 mod status_api;
+mod task_contract_api;
 mod vault_http;
 mod wave_a_visibility_api;
 mod wave_b_routines_api;
