@@ -12,6 +12,9 @@ use serabot_desktop::session::{Session, humanize_label};
 use serabot_desktop::status_view::{
     Health, bar_percent, format_bytes, format_percent, format_uptime, health, member_label, percent,
 };
+use serabot_desktop::theme::{Level, Tone};
+
+use crate::ui_widgets::{LevelChip, StatusChip};
 
 /// How often the health cards refresh while the Usage page is open.
 #[cfg(windows)]
@@ -114,12 +117,24 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                 }
             }
             div { class: "pane-body",
-                if let Some(report) = report.clone() {
-                    DailyTaskQuotaCard { quota: report.quota.daily_tasks.clone() }
+                if let Some(quota) = report
+                    .as_ref()
+                    .map(|report| report.quota.daily_tasks.clone())
+                    .filter(|quota| quota.limit > 0)
+                {
+                    section { class: "usage-section", "aria-labelledby": "usage-quota-title",
+                        h2 { class: "usage-section-title", id: "usage-quota-title", "Quota" }
+                        DailyTaskQuotaCard { quota }
+                    }
                 }
                 if is_admin {
-                    ServerHealthCard { session }
+                    section { class: "usage-section", "aria-labelledby": "usage-reliability-title",
+                        h2 { class: "usage-section-title", id: "usage-reliability-title", "Reliability" }
+                        p { class: "usage-section-sub", "Only you, the owner, see this." }
+                        ServerHealthCard { session }
+                    }
                 }
+                h2 { class: "usage-section-title", "Activity" }
                 if loading && report.is_none() {
                     p { class: "caption", "Loading your usage…" }
                 } else if let Some(report) = report {
@@ -219,6 +234,7 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                 } else {
                     p { class: "caption", "Usage could not be loaded. Pick a period to try again." }
                 }
+                h2 { class: "usage-section-title", "This computer" }
                 ThisPcCard { session }
             }
         }
@@ -226,26 +242,33 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
 }
 
 /// Daily per-user task quota (Big Wave E1), shipped on `GET /v1/usage`.
+/// The state is colour + icon + word: OK, Near limit or At limit.
 #[component]
 fn DailyTaskQuotaCard(quota: serabot_desktop::UsageDailyTaskQuota) -> Element {
     if quota.limit == 0 {
         return rsx! {};
     }
     let fill = quota_percent(quota.used, quota.limit);
-    let warn = quota.near_limit || quota.at_limit;
-    let note = if quota.at_limit {
-        "You reached today's task limit. New bot turns wait until UTC midnight.".to_owned()
-    } else if quota.near_limit {
-        "You are close to today's task limit.".to_owned()
-    } else {
-        "Queued and completed tasks count toward this UTC-day budget.".to_owned()
+    let level = Level::from_flags(quota.near_limit, quota.at_limit);
+    let note = match level {
+        Level::AtLimit => {
+            "You reached today's task limit. New bot turns wait until UTC midnight.".to_owned()
+        }
+        Level::Near => "You are close to today's task limit.".to_owned(),
+        Level::Ok => "Queued and completed tasks count toward this UTC-day budget.".to_owned(),
+    };
+    let class = match level {
+        Level::Ok => "card quota-card",
+        Level::Near => "card quota-card near",
+        Level::AtLimit => "card quota-card at-limit",
     };
     rsx! {
         div {
-            class: if warn { "card quota-card warn" } else { "card quota-card" },
-            role: if quota.at_limit { "alert" } else { "status" },
-            div { class: "card-head",
+            class: "{class}",
+            role: if level == Level::AtLimit { "alert" } else { "status" },
+            div { class: "quota-head",
                 h3 { class: "card-title", "Daily task quota" }
+                LevelChip { level }
             }
             div { class: "health-item",
                 span { class: "usage-tile-label", "Tasks today (UTC)" }
@@ -255,7 +278,8 @@ fn DailyTaskQuotaCard(quota: serabot_desktop::UsageDailyTaskQuota) -> Element {
                 Meter {
                     percent: fill,
                     label: "Daily task quota".to_owned(),
-                    warn,
+                    warn: level == Level::Near,
+                    danger: level == Level::AtLimit,
                 }
                 span { class: "tiny", "{note}" }
             }
@@ -265,7 +289,19 @@ fn DailyTaskQuotaCard(quota: serabot_desktop::UsageDailyTaskQuota) -> Element {
 
 /// A thin progress bar. `warn` turns it amber when something is nearly full.
 #[component]
-fn Meter(percent: u32, label: String, warn: bool) -> Element {
+fn Meter(
+    percent: u32,
+    label: String,
+    warn: bool,
+    #[props(default = false)] danger: bool,
+) -> Element {
+    let class = if danger {
+        "meter-fill danger"
+    } else if warn {
+        "meter-fill warn"
+    } else {
+        "meter-fill"
+    };
     rsx! {
         div {
             class: "meter",
@@ -275,7 +311,7 @@ fn Meter(percent: u32, label: String, warn: bool) -> Element {
             "aria-valuemax": "100",
             "aria-valuenow": "{percent}",
             div {
-                class: if warn { "meter-fill warn" } else { "meter-fill" },
+                class: "{class}",
                 style: "width: {percent}%;",
             }
         }
@@ -289,11 +325,15 @@ fn HealthItem(
     value: String,
     note: Option<String>,
     bar: Option<(u32, bool)>,
+    #[props(default)] level: Option<Level>,
 ) -> Element {
     rsx! {
         div { class: "health-item",
             span { class: "usage-tile-label", "{label}" }
             span { class: "health-value", "{value}" }
+            if let Some(level) = level {
+                LevelChip { level }
+            }
             if let Some((fill, warn)) = bar {
                 Meter { percent: fill, label: label.clone(), warn }
             }
@@ -370,9 +410,13 @@ fn ServerHealthCard(session: Signal<Session>) -> Element {
             div { class: "health-summary",
                 div { class: "health-item",
                     span { class: "usage-tile-label", "Server" }
-                    span {
-                        class: if level == Health::Ok { "health-value health-ok" } else { "health-value health-watch" },
-                        "{word}"
+                    div { class: "health-status",
+                        if level == Health::Ok {
+                            StatusChip { tone: Tone::Ok, text: "OK".to_owned() }
+                        } else {
+                            StatusChip { tone: Tone::Warn, text: "Needs a look".to_owned() }
+                            span { class: "tiny", "{word}" }
+                        }
                     }
                 }
                 HealthItem {
@@ -384,18 +428,56 @@ fn ServerHealthCard(session: Signal<Session>) -> Element {
                     ),
                     note: None,
                     bar: Some((ram_pct, ram_pct >= 90)),
+                    level: Level::from_percent(ram_pct, 90).flagged(),
                 }
                 HealthItem {
                     label: "Processor",
                     value: format_percent(status.host.cpu_percent),
                     note: None,
                     bar: Some((status.host.cpu_percent.clamp(0.0, 100.0) as u32, status.host.cpu_percent >= 90.0)),
+                    level: Level::from_percent(status.host.cpu_percent.clamp(0.0, 100.0) as u32, 90).flagged(),
                 }
                 HealthItem {
                     label: "Storage",
                     value: format!("{} of {}", format_bytes(storage_used), format_bytes(storage_total)),
                     note: None,
                     bar: Some((storage_pct, storage_pct >= 90)),
+                    level: Level::from_percent(storage_pct, 90).flagged(),
+                }
+            }
+            h4 { class: "health-heading", "Reliability" }
+            div { class: "health-summary",
+                HealthItem {
+                    label: "Scheduler lag",
+                    value: format!(
+                        "{} routine{}",
+                        status.reliability.scheduler_lag_routines,
+                        if status.reliability.scheduler_lag_routines == 1 { "" } else { "s" }
+                    ),
+                    note: if status.reliability.scheduler_lag_max_secs > 0 {
+                        Some(format!(
+                            "Longest overdue: {}s",
+                            status.reliability.scheduler_lag_max_secs
+                        ))
+                    } else {
+                        None
+                    },
+                    bar: None,
+                    level: Some(Level::from_problem_count(status.reliability.scheduler_lag_routines)),
+                }
+                HealthItem {
+                    label: "Watcher uncertainty",
+                    value: status.reliability.routine_claim_failures.to_string(),
+                    note: Some("Uncertain scheduled tasks".into()),
+                    bar: None,
+                    level: Some(Level::from_problem_count(status.reliability.routine_claim_failures)),
+                }
+                HealthItem {
+                    label: "Stale sources",
+                    value: status.reliability.source_staleness.to_string(),
+                    note: Some("Enabled sources past failure threshold".into()),
+                    bar: None,
+                    level: Some(Level::from_problem_count(status.reliability.source_staleness)),
                 }
             }
             if let Some(error) = error {
@@ -405,38 +487,6 @@ fn ServerHealthCard(session: Signal<Session>) -> Element {
                 div { class: "health-details",
                     p { class: "caption",
                         "Version {status.version} · running for {format_uptime(status.uptime_secs)} · {status.host.cpu_cores} processor cores"
-                    }
-                    h4 { class: "health-heading", "Reliability" }
-                    div { class: "health-summary",
-                        HealthItem {
-                            label: "Scheduler lag",
-                            value: format!(
-                                "{} routine{}",
-                                status.reliability.scheduler_lag_routines,
-                                if status.reliability.scheduler_lag_routines == 1 { "" } else { "s" }
-                            ),
-                            note: if status.reliability.scheduler_lag_max_secs > 0 {
-                                Some(format!(
-                                    "Longest overdue: {}s",
-                                    status.reliability.scheduler_lag_max_secs
-                                ))
-                            } else {
-                                None
-                            },
-                            bar: None,
-                        }
-                        HealthItem {
-                            label: "Watcher uncertainty",
-                            value: status.reliability.routine_claim_failures.to_string(),
-                            note: Some("Uncertain scheduled tasks".into()),
-                            bar: None,
-                        }
-                        HealthItem {
-                            label: "Stale sources",
-                            value: status.reliability.source_staleness.to_string(),
-                            note: Some("Enabled sources past failure threshold".into()),
-                            bar: None,
-                        }
                     }
                     h4 { class: "health-heading", "Memory and processor" }
                     div { class: "health-split",
