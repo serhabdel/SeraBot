@@ -100,6 +100,16 @@ class _SeraBotMobileAppState extends State<SeraBotMobileApp> {
       theme: buildTheme(Brightness.light),
       darkTheme: buildTheme(Brightness.dark),
       themeMode: _theme.mode,
+      builder: (context, child) {
+        final content = child ?? const SizedBox.shrink();
+        if (!MediaQuery.disableAnimationsOf(context)) {
+          return content;
+        }
+        return Theme(
+          data: withoutPageTransitions(Theme.of(context)),
+          child: content,
+        );
+      },
       home: home,
     );
   }

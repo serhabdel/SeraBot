@@ -25,6 +25,7 @@ class OwnerSession extends ChangeNotifier {
   String? _serverVersion;
   String? _statusMessage;
   bool _busy = false;
+  ({String endpoint, String token})? _pendingSave;
 
   bool get connected => _client != null;
   String? get endpoint => _endpoint;
@@ -32,6 +33,10 @@ class OwnerSession extends ChangeNotifier {
   String? get serverVersion => _serverVersion;
   String? get statusMessage => _statusMessage;
   bool get busy => _busy;
+
+  /// True when sign-in worked but the phone would not store the token, so the
+  /// user would have to sign in again after a restart. See [retrySave].
+  bool get saveFailed => _pendingSave != null;
 
   ApiClient get client {
     final c = _client;
@@ -76,14 +81,39 @@ class OwnerSession extends ChangeNotifier {
         launch,
         inviteCode: inviteCode,
       );
-      await _store.write(endpoint, result.token);
       _detach();
       _install(endpoint, result.token, result.user);
+      // A refused save must not undo a good sign-in: keep the session for this
+      // run and offer a retry.
+      await _trySave(endpoint, result.token);
     } on ValidationException {
       throw const SignInException('server');
     } finally {
       _setBusy(false);
     }
+  }
+
+  Future<bool> _trySave(String endpoint, String token) async {
+    try {
+      await _store.write(endpoint, token);
+      _pendingSave = null;
+      return true;
+    } catch (_) {
+      _pendingSave = (endpoint: endpoint, token: token);
+      notifyListeners();
+      return false;
+    }
+  }
+
+  /// Try again to store the sign-in. Returns whether it is stored now.
+  Future<bool> retrySave() async {
+    final pending = _pendingSave;
+    if (pending == null) {
+      return true;
+    }
+    final ok = await _trySave(pending.endpoint, pending.token);
+    notifyListeners();
+    return ok;
   }
 
   Future<void> _attach(String endpoint, String token) async {
@@ -155,6 +185,7 @@ class OwnerSession extends ChangeNotifier {
     _user = null;
     _serverVersion = null;
     _statusMessage = null;
+    _pendingSave = null;
   }
 
   @override

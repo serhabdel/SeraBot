@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -122,6 +123,30 @@ void main() {
       expect(s256Challenge(handoff['verifier'] as String), start['handoff_challenge']);
       expect(result.user.label, 'Ada');
       expect(result.token, 't' * 43);
+    });
+
+    test('a closed sign-in page is a cancel, a missing browser is its own error', () async {
+      MockClient start() => MockClient((req) async => http.Response(
+            jsonEncode({'url': 'https://login.example.com/authorize'}),
+            200,
+          ));
+      Future<void> run(Object error) => AuthApi(httpClient: start()).signIn(
+            'https://example.com',
+            (url) async => throw error,
+          );
+      await expectLater(
+        run(const PlatformException(code: 'CANCELED')),
+        throwsA(isA<SignInException>().having((e) => e.code, 'code', 'cancelled')),
+      );
+      await expectLater(
+        run(const PlatformException(code: 'ActivityNotFound')),
+        throwsA(isA<SignInException>().having((e) => e.code, 'code', 'browser')),
+      );
+      await expectLater(
+        run(StateError('x')),
+        throwsA(isA<SignInException>().having((e) => e.code, 'code', 'cancelled')),
+      );
+      expect(signInErrorMessage('browser'), contains('browser'));
     });
 
     test('a state mismatch never reaches the handoff endpoint', () async {

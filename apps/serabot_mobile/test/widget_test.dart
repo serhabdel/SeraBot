@@ -305,6 +305,11 @@ void main() {
     expect(Theme.of(tester.element(find.byType(Scaffold).first)).brightness, Brightness.dark);
     await tester.tap(find.byKey(const Key('sign-out')));
     await tester.pumpAndSettle();
+    // Signing out asks first; nothing is sent until the user confirms.
+    expect(find.text('Sign out?'), findsOneWidget);
+    expect(srv.requests, isNot(contains('POST /v1/auth/logout')));
+    await tester.tap(find.byKey(const Key('confirm-action')));
+    await tester.pumpAndSettle();
     expect(srv.requests, contains('POST /v1/auth/logout'));
     expect(find.text('Sign in with Microsoft'), findsOneWidget);
   });

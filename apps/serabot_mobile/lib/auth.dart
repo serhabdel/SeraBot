@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:math';
 
 import 'package:crypto/crypto.dart';
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 
@@ -56,6 +57,9 @@ String signInErrorMessage(String code) {
       return 'Sign-in could not be verified. Please try again.';
     case 'cancelled':
       return 'Sign-in was cancelled.';
+    case 'browser':
+      return 'The sign-in page could not be opened. Make sure a browser '
+          '(such as Chrome) is installed and enabled, then try again.';
     case 'handoff':
       return 'Sign-in expired or was already used. Please try again.';
     case 'network':
@@ -147,6 +151,10 @@ class AuthApi {
     final String callback;
     try {
       callback = await launch(url);
+    } on PlatformException catch (e) {
+      // The user closing the sign-in page is a cancel; any other platform
+      // error means no browser could show it.
+      throw SignInException(e.code == 'CANCELED' ? 'cancelled' : 'browser');
     } catch (_) {
       throw const SignInException('cancelled');
     }

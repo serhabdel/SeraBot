@@ -105,3 +105,79 @@ String shortTime(String iso, {DateTime? now}) {
   const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   return '${t.day} ${months[t.month - 1]}';
 }
+
+/// An animation duration that is zero when the system asks for reduced motion
+/// (Android "Remove animations").
+Duration motionDuration(BuildContext context, Duration duration) =>
+    MediaQuery.disableAnimationsOf(context) ? Duration.zero : duration;
+
+/// Masked text field with a Show/Hide toggle. The toggle only reveals what
+/// was typed in this field.
+class SecretField extends StatefulWidget {
+  const SecretField({
+    super.key,
+    required this.controller,
+    required this.label,
+    this.hint,
+  });
+
+  final TextEditingController controller;
+  final String label;
+  final String? hint;
+
+  @override
+  State<SecretField> createState() => _SecretFieldState();
+}
+
+class _SecretFieldState extends State<SecretField> {
+  bool _shown = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return TextField(
+      controller: widget.controller,
+      obscureText: !_shown,
+      autocorrect: false,
+      enableSuggestions: false,
+      decoration: InputDecoration(
+        labelText: widget.label,
+        hintText: widget.hint,
+        border: const OutlineInputBorder(),
+        suffixIcon: IconButton(
+          key: const Key('secret-toggle'),
+          tooltip: _shown ? 'Hide what I typed' : 'Show what I typed',
+          icon: Icon(_shown ? Icons.visibility_off : Icons.visibility),
+          onPressed: () => setState(() => _shown = !_shown),
+        ),
+      ),
+    );
+  }
+}
+
+/// Asks before something that cannot be undone. Returns true on confirm.
+Future<bool> confirmAction(
+  BuildContext context, {
+  required String title,
+  required String message,
+  required String confirmLabel,
+}) async {
+  final result = await showDialog<bool>(
+    context: context,
+    builder: (dialog) => AlertDialog(
+      title: Text(title),
+      content: Text(message),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(dialog).pop(false),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          key: const Key('confirm-action'),
+          onPressed: () => Navigator.of(dialog).pop(true),
+          child: Text(confirmLabel),
+        ),
+      ],
+    ),
+  );
+  return result ?? false;
+}
