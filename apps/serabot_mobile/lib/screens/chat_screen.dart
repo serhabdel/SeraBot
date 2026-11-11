@@ -4,6 +4,7 @@ import '../api_client.dart';
 import '../app_state.dart';
 import '../chat_controller.dart';
 import '../chat_models.dart';
+import '../chat_scroll.dart';
 import '../device.dart';
 import '../markdown.dart';
 import '../models.dart';
@@ -29,18 +30,71 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   late final ChatController chat;
+  final _scroll = ScrollController();
+  bool _atBottom = true;
+  int _unseen = 0;
+  int _lastCount = 0;
 
   @override
   void initState() {
     super.initState();
     chat = ChatController(widget.conversation.id, widget.app.client, widget.app)
       ..load();
+    _scroll.addListener(_onScroll);
+    chat.addListener(_onChat);
   }
 
   @override
   void dispose() {
+    chat.removeListener(_onChat);
+    _scroll.removeListener(_onScroll);
+    _scroll.dispose();
     chat.dispose();
     super.dispose();
+  }
+
+  void _onScroll() {
+    if (!_scroll.hasClients || !mounted) {
+      return;
+    }
+    final near = nearBottom(_scroll.position.pixels);
+    if (near != _atBottom || (near && _unseen != 0)) {
+      setState(() {
+        _atBottom = near;
+        if (near) {
+          _unseen = 0;
+        }
+      });
+    }
+  }
+
+  void _onChat() {
+    final count = chat.messages.length;
+    final unseen = nextUnseen(
+      unseen: _unseen,
+      previousCount: _lastCount,
+      count: count,
+      atBottom: _atBottom,
+    );
+    _lastCount = count;
+    if (unseen != _unseen && mounted) {
+      setState(() => _unseen = unseen);
+    }
+  }
+
+  void _jumpToLatest() {
+    if (_scroll.hasClients) {
+      final duration = motionDuration(context, const Duration(milliseconds: 250));
+      if (duration == Duration.zero) {
+        _scroll.jumpTo(0);
+      } else {
+        _scroll.animateTo(0, duration: duration, curve: Curves.easeOut);
+      }
+    }
+    setState(() {
+      _atBottom = true;
+      _unseen = 0;
+    });
   }
 
   Future<void> _download(String name, Future<List<int>> Function() fetch) async {
@@ -159,11 +213,30 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
           body: Column(
             children: [
-              Expanded(child: _messages(context)),
+              Expanded(
+                child: Stack(
+                  children: [
+                    _messages(context),
+                    if (!_atBottom)
+                      Positioned(
+                        left: 0,
+                        right: 0,
+                        bottom: 12,
+                        child: Center(
+                          child: _JumpToLatestPill(
+                            badge: unseenBadge(_unseen),
+                            replying: chat.running,
+                            onPressed: _jumpToLatest,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
               if (chat.error != null)
                 Padding(
                   padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-                  child: ErrorBanner(chat.error!),
+                  child: ErrorBanner(chat.error!, onRetry: chat.load),
                 ),
               Composer(chat: chat, device: widget.device),
             ],
@@ -180,6 +253,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final items = chat.messages.reversed.toList();
     final showActivity = chat.running || !chat.activity.isEmpty;
     return ListView.builder(
+      controller: _scroll,
       reverse: true,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       itemCount: items.length + (showActivity ? 1 : 0),
@@ -197,6 +271,48 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
         );
       },
+    );
+  }
+}
+
+/// "Jump to latest" with an unseen count and a marker while a reply is still
+/// coming in. The marker is static when the system asks for reduced motion.
+class _JumpToLatestPill extends StatelessWidget {
+  const _JumpToLatestPill({
+    required this.badge,
+    required this.replying,
+    required this.onPressed,
+  });
+
+  final String? badge;
+  final bool replying;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final reduced = MediaQuery.disableAnimationsOf(context);
+    final label = badge == null ? 'Jump to latest' : 'Jump to latest \u00b7 $badge';
+    return FilledButton.tonalIcon(
+      key: const Key('jump-to-latest'),
+      onPressed: onPressed,
+      icon: const Icon(Icons.arrow_downward, size: 18),
+      label: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(label),
+          if (replying) ...[
+            const SizedBox(width: 8),
+            if (reduced)
+              const Icon(Icons.more_horiz, size: 16)
+            else
+              const SizedBox(
+                width: 12,
+                height: 12,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+          ],
+        ],
+      ),
     );
   }
 }

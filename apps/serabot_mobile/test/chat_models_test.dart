@@ -208,6 +208,31 @@ void main() {
       });
       expect(u.totals.totalTokens, 30);
       expect(u.perModel.single.model, 'm');
+      expect(u.quota.enforced, isFalse);
+    });
+
+    test('usage report parses the daily task quota', () {
+      final u = UsageReport.fromJson({
+        'quota': {
+          'daily_tasks': {
+            'used': 45,
+            'limit': 50,
+            'near_limit': true,
+            'at_limit': false,
+          },
+        },
+      });
+      expect(u.quota.enforced, isTrue);
+      expect(u.quota.used, 45);
+      expect(u.quota.limit, 50);
+      expect(u.quota.nearLimit, isTrue);
+      expect(u.quota.atLimit, isFalse);
+    });
+
+    test('a missing or malformed quota means no quota', () {
+      expect(UsageReport.fromJson({'quota': 'x'}).quota.enforced, isFalse);
+      expect(UsageReport.fromJson({'quota': {'daily_tasks': 3}}).quota.enforced,
+          isFalse);
     });
   });
 }

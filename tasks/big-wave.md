@@ -38,6 +38,22 @@ Windows isolated target dirs (H: full; C: filled after check):
 
 ---
 
+## PR-3 — Mobile parity (draft, `feat/mobile-parity-v032`)
+
+Android catches up with the desktop polish from PR-2 and PR-1. Mobile stays read-only for routines and sources.
+
+- [x] **Quota** — Settings shows the daily task quota with a bar and an OK / Near limit / At limit chip (icon and word, not colour alone).
+- [x] **Errors with retry** — Settings (connectors, usage), chat and sign-in errors show a Retry button.
+- [x] **Sign-in failures** — a missing browser gets its own message. The copy-link fallback used on desktop does not apply: the sign-in must return to the app through its own link, so a link opened elsewhere cannot finish it.
+- [x] **Save failure** — if the phone refuses to store the sign-in, the session still works and a banner offers "Try saving again".
+- [x] **Secrets** — the invite code field is masked with a Show/Hide toggle.
+- [x] **Confirm** — Sign out asks first.
+- [x] **Chat** — "Jump to latest" pill with an unseen count and a reply-in-progress marker.
+- [x] **Reduce motion** — Android "Remove animations" turns off page transitions and the chat scroll animation.
+- [ ] **Manual Android look** (owner): see the checklist in the PR body.
+
+---
+
 ## PR-2 — Desktop foundation (draft, `feat/desktop-foundation`)
 
 - [x] **Refactor** — `ui.rs` (7.2k lines) split into `src/ui/{markdown,connect,shell,chat,sheets,approvals,providers,memory,conversations,settings_view}.rs`; no behavior change (own commit).
