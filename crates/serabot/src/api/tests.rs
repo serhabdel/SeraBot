@@ -14,6 +14,7 @@ mod browser_api;
 mod cards_api;
 mod chat_api;
 mod composio_api;
+mod digest_api;
 mod files_api;
 mod jobs_api;
 mod logs_api;

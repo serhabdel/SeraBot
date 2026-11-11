@@ -13,14 +13,21 @@ pub(super) struct AddRssBody {
     pub url: String,
 }
 
-/// `GET /v1/sources` — effective merged sources for the acting user. The feed
-/// URL is admin-only, as on `GET /v1/monitoring/sources`: members get `null`.
+/// `GET /v1/sources` — effective merged sources for the acting user. A feed URL
+/// is shown to admins and to the member who added that feed; other members get `null`.
 pub(super) async fn list_sources(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
 ) -> Result<Json<Value>> {
     let sources =
         crate::sources::effective_sources_for_user(&state.config, &state.store, &user.id)?;
+    let own: std::collections::HashSet<String> = state
+        .store
+        .list_user_sources(&user.id)?
+        .into_iter()
+        .filter(|row| row.origin == "member")
+        .map(|row| row.name)
+        .collect();
     let rows = sources
         .into_iter()
         .map(|source| {
@@ -28,7 +35,11 @@ pub(super) async fn list_sources(
                 "name": source.name,
                 "kind": source.kind,
                 "enabled": source.enabled,
-                "url": super::monitoring::visible_feed_url(&user, &source.url),
+                "url": super::monitoring::visible_feed_url(
+                    &user,
+                    own.contains(&source.name),
+                    &source.url,
+                ),
             })
         })
         .collect::<Vec<_>>();

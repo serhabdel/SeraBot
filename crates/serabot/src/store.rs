@@ -313,6 +313,15 @@ pub struct RoutineRow {
     pub config: Value,
 }
 
+/// One item a watched source reported for this user.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DigestItem {
+    pub source: String,
+    pub title: String,
+    pub url: Option<String>,
+    pub first_seen: String,
+}
+
 /// Latest recorded watch run for one configured source.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SourceRunStatus {
@@ -2937,6 +2946,29 @@ impl Store {
     }
 
     /// The latest `source_runs` row per source for the acting user.
+    /// Items this user first saw after `since`, newest first. `since` must be
+    /// RFC 3339 with milliseconds (the stored format), so text order is time
+    /// order. Withdrawn items are left out.
+    pub fn items_since(&self, user_id: &str, since: &str, limit: usize) -> Result<Vec<DigestItem>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT source, title, url, first_seen
+             FROM opportunities
+             WHERE user_id = ?1 AND status <> 'withdrawn' AND first_seen > ?2
+             ORDER BY first_seen DESC
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![user_id, since, limit as i64], |row| {
+            Ok(DigestItem {
+                source: row.get(0)?,
+                title: row.get(1)?,
+                url: row.get(2)?,
+                first_seen: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn list_source_run_status(&self, user_id: &str) -> Result<Vec<SourceRunStatus>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(

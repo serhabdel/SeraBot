@@ -16,6 +16,7 @@ use crate::providers::{
 use crate::domain::{LlmMessage, Role, ToolCall};
 use crate::error::{Result, SeraError};
 use crate::gateway::ToolSpec;
+use crate::retry;
 use crate::secrets::{AgeCredentialWriter, CredentialWriter, SharedSecrets};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -275,7 +276,9 @@ impl LlmClient {
                         })?;
                         return parse_response(&bytes);
                     }
-                    let retryable = status.as_u16() == 429 || status.is_server_error();
+                    // The provider answered, so the completion did not run: safe to retry.
+                    let retryable = retry::transient_status(status.as_u16());
+                    let hint = retry::retry_after(response.headers());
                     let text = response.text().await.unwrap_or_default();
                     let sanitized = sanitize_provider_error(&text);
                     last_error = Some(SeraError::External(format!(
@@ -285,14 +288,26 @@ impl LlmClient {
                     if !retryable || attempt == self.max_retries {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
+                    tokio::time::sleep(retry::delay(
+                        Duration::from_millis(500),
+                        attempt as u32,
+                        hint,
+                    ))
+                    .await;
                 }
                 Err(error) => {
+                    // A completion POST that timed out may still have run, so only a
+                    // connect failure (the request never left) is retried here.
                     last_error = Some(SeraError::External(format!("LLM request failed: {error}")));
-                    if attempt == self.max_retries {
+                    if !retry::transport_retryable(&error, false) || attempt == self.max_retries {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
+                    tokio::time::sleep(retry::delay(
+                        Duration::from_millis(500),
+                        attempt as u32,
+                        None,
+                    ))
+                    .await;
                 }
             }
         }
@@ -350,8 +365,9 @@ impl LlmClient {
                         return parse_model_catalog(&bytes, strict);
                     }
                     // Drop the body. Provider errors can echo credentials; the status is enough.
+                    let hint = retry::retry_after(response.headers());
                     let _ = response.bytes().await;
-                    let retryable = status.as_u16() == 429 || status.is_server_error();
+                    let retryable = retry::transient_status(status.as_u16());
                     last_error = Some(SeraError::External(format!(
                         "model catalog failed with status {}",
                         status.as_u16()
@@ -359,14 +375,25 @@ impl LlmClient {
                     if !retryable || attempt == self.max_retries {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(200 * (1 << attempt))).await;
+                    tokio::time::sleep(retry::delay(
+                        Duration::from_millis(200),
+                        attempt as u32,
+                        hint,
+                    ))
+                    .await;
                 }
-                Err(_) => {
+                Err(error) => {
+                    // A catalog GET is idempotent, so timeouts are retried too.
                     last_error = Some(SeraError::External("model catalog request failed".into()));
-                    if attempt == self.max_retries {
+                    if !retry::transport_retryable(&error, true) || attempt == self.max_retries {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(200 * (1 << attempt))).await;
+                    tokio::time::sleep(retry::delay(
+                        Duration::from_millis(200),
+                        attempt as u32,
+                        None,
+                    ))
+                    .await;
                 }
             }
         }

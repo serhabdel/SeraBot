@@ -537,6 +537,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/routines", get(list_routines))
         .route("/v1/routines/{name}", put(put_routine))
         .route("/v1/monitoring/sources", get(list_monitoring_sources))
+        .route("/v1/digest", get(get_digest))
         .route("/v1/monitoring/run", post(run_all_sources))
         .route("/v1/workflows/active", get(list_active_workflows))
         .route("/v1/traces", get(list_traces))
