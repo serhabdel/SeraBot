@@ -190,7 +190,7 @@
   background: var(--clear);
   color: var(--label-2);
   cursor: pointer;
-  opacity: 0;
+  opacity: 0.7;
   transition: opacity var(--dur-1) var(--ease), background var(--dur-1) var(--ease);
 }
 
@@ -282,12 +282,6 @@
 .header-more {
   position: relative;
   display: inline-flex;
-}
-
-@media (hover: none) {
-  .thread .row-more {
-    opacity: 1;
-  }
 }
 
 /* Composer size (PR-F): about three lines at rest, growing to 40% of the

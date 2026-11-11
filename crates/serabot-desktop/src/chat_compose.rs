@@ -219,23 +219,15 @@ pub fn escape_stops_run(run_active: bool, awaiting_approval: bool) -> bool {
 /// A slash command that does something instead of inserting text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlashAction {
-    NewChat,
     Attach,
     Stop,
-    Settings,
     Expand,
 }
 
 /// `(command, what it does, action)`, in the order the picker lists them.
-pub const SLASH_ACTIONS: [(&str, &str, SlashAction); 5] = [
-    ("new", "Start a new chat", SlashAction::NewChat),
+pub const SLASH_ACTIONS: [(&str, &str, SlashAction); 3] = [
     ("attach", "Attach files", SlashAction::Attach),
     ("stop", "Stop the reply", SlashAction::Stop),
-    (
-        "settings",
-        "Open this chat's settings",
-        SlashAction::Settings,
-    ),
     (
         "expand",
         "Make the message box bigger or smaller",
@@ -388,16 +380,18 @@ mod tests {
     #[test]
     fn slash_actions_match_by_command_or_description() {
         assert_eq!(slash_actions("").len(), SLASH_ACTIONS.len());
-        assert_eq!(slash_actions("ne")[0].2, SlashAction::NewChat);
+        assert_eq!(slash_actions("att")[0].2, SlashAction::Attach);
         assert_eq!(slash_actions("FILES")[0].2, SlashAction::Attach);
         assert!(slash_actions("zzz").is_empty());
     }
 
     #[test]
     fn only_an_exact_command_is_an_action() {
-        assert_eq!(parse_slash_action("/new"), Some(SlashAction::NewChat));
+        assert_eq!(parse_slash_action("/attach"), Some(SlashAction::Attach));
+        // Commands that need the chats-per-bot server work are not offered yet.
+        assert_eq!(parse_slash_action("/new"), None);
         assert_eq!(parse_slash_action("  /Stop "), Some(SlashAction::Stop));
-        assert_eq!(parse_slash_action("/new chat please"), None);
+        assert_eq!(parse_slash_action("/stop now please"), None);
         assert_eq!(parse_slash_action("new"), None);
         assert_eq!(parse_slash_action("/unknown"), None);
         assert_eq!(parse_slash_action(""), None);

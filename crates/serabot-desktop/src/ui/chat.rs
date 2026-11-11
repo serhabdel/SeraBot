@@ -827,15 +827,8 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                         session.write().composer = String::new();
                                         slash.set(None);
                                         match action {
-                                            chat_compose::SlashAction::NewChat => {
-                                                session.write().fleet.conv_kind = ConversationKind::Direct;
-                                                overlay.set(Overlay::NewConversation);
-                                            }
                                             chat_compose::SlashAction::Attach => session.write().pick_attachments(),
                                             chat_compose::SlashAction::Stop => session.write().stop_turn(),
-                                            chat_compose::SlashAction::Settings => {
-                                                session.write().open_settings_for_conversation();
-                                            }
                                             chat_compose::SlashAction::Expand => {
                                                 composer_expanded.set(!composer_expanded());
                                             }
