@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "slug": "workspace-files",
+  "name": "Files and Calendar",
+  "tagline": "Files and calendar from the owner's cloud workspace.",
+  "description": "List and read files and calendar events. Connect the owner's account with the browser sign-in.",
+  "category": "productivity",
+  "iconUrl": "https://workspace-files.example.invalid/icon.png",
+  "version": "1.0.0",
+  "minServerVersion": "0.36.0",
+  "prompts": [
+    {
+      "id": "workspace-files-0",
+      "text": "What is on my calendar tomorrow?"
+    }
+  ],
+  "apps": [
+    {
+      "id": "files",
+      "name": "Workspace files",
+      "server": {
+        "transport": "http",
+        "url": "https://mcp.workspace.example.invalid/mcp"
+      },
+      "auth": [
+        {
+          "id": "link",
+          "kind": "oauth-link",
+          "fields": []
+        }
+      ]
+    }
+  ],
+  "permissions": {
+    "egress": [
+      "mcp.workspace.example.invalid"
+    ]
+  },
+  "websiteUrl": "https://workspace.example.invalid",
+  "privacyPolicyUrl": "https://workspace.example.invalid/privacy",
+  "termsUrl": "https://workspace-files.example.invalid/terms"
+}

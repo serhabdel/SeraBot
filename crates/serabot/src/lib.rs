@@ -40,6 +40,7 @@ pub mod local_relay;
 pub mod local_transfer;
 pub mod logging;
 pub mod maker;
+pub mod marketplace;
 pub mod mcp_client;
 pub mod media_jobs;
 pub mod mem0;

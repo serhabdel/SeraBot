@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "slug": "resend",
+  "name": "Email Sending",
+  "tagline": "Send transactional email through Resend.",
+  "description": "Send email messages from a verified domain. Sends go to the email service under the owner's own key.",
+  "category": "communication",
+  "iconUrl": "https://resend.example.invalid/icon.png",
+  "version": "1.0.0",
+  "minServerVersion": "0.36.0",
+  "prompts": [
+    {
+      "id": "resend-0",
+      "text": "Draft a short thank-you note to the client."
+    }
+  ],
+  "apps": [
+    {
+      "id": "email",
+      "name": "Email",
+      "server": {
+        "transport": "http",
+        "url": "https://mcp.resend.example.invalid/mcp"
+      },
+      "auth": [
+        {
+          "id": "key",
+          "kind": "api-key",
+          "fields": [
+            {
+              "id": "api_key",
+              "label": "API key",
+              "secretKey": "resend.api_key",
+              "hint": "Paste the Email Sending API key. It is stored only for your account.",
+              "docsUrl": "https://resend.example.invalid/docs/keys"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "permissions": {
+    "egress": [
+      "mcp.resend.example.invalid"
+    ]
+  },
+  "websiteUrl": "https://resend.example.invalid",
+  "privacyPolicyUrl": "https://resend.example.invalid/privacy",
+  "termsUrl": "https://resend.example.invalid/terms"
+}

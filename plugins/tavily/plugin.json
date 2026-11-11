@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "slug": "tavily",
+  "name": "Research Search",
+  "tagline": "Search and answer questions with cited sources.",
+  "description": "Run research searches that return sources and a short answer. Queries go to the research API under the owner's own key.",
+  "category": "research",
+  "iconUrl": "https://tavily.example.invalid/icon.png",
+  "version": "1.0.0",
+  "minServerVersion": "0.36.0",
+  "prompts": [
+    {
+      "id": "tavily-0",
+      "text": "Research the main arguments for and against this policy."
+    }
+  ],
+  "apps": [
+    {
+      "id": "research",
+      "name": "Research",
+      "server": {
+        "transport": "http",
+        "url": "https://mcp.tavily.example.invalid/mcp"
+      },
+      "auth": [
+        {
+          "id": "key",
+          "kind": "api-key",
+          "fields": [
+            {
+              "id": "api_key",
+              "label": "API key",
+              "secretKey": "tavily.api_key",
+              "hint": "Paste the Research Search API key. It is stored only for your account.",
+              "docsUrl": "https://tavily.example.invalid/docs/keys"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "permissions": {
+    "egress": [
+      "mcp.tavily.example.invalid"
+    ]
+  },
+  "websiteUrl": "https://tavily.example.invalid",
+  "privacyPolicyUrl": "https://tavily.example.invalid/privacy",
+  "termsUrl": "https://tavily.example.invalid/terms"
+}

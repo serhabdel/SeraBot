@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "slug": "elevenlabs",
+  "name": "Voice and Audio",
+  "tagline": "Speech and sound generation through ElevenLabs.",
+  "description": "Generate speech and sound effects, and transcribe audio. Connect the owner's account with the browser sign-in.",
+  "category": "media",
+  "iconUrl": "https://elevenlabs.example.invalid/icon.png",
+  "version": "1.0.0",
+  "minServerVersion": "0.36.0",
+  "prompts": [
+    {
+      "id": "elevenlabs-0",
+      "text": "Read this paragraph aloud in a calm voice."
+    }
+  ],
+  "apps": [
+    {
+      "id": "voice",
+      "name": "Voice",
+      "server": {
+        "transport": "http",
+        "url": "https://mcp.elevenlabs.example.invalid/mcp"
+      },
+      "auth": [
+        {
+          "id": "link",
+          "kind": "oauth-link",
+          "fields": []
+        }
+      ]
+    }
+  ],
+  "permissions": {
+    "egress": [
+      "mcp.elevenlabs.example.invalid"
+    ]
+  },
+  "websiteUrl": "https://elevenlabs.example.invalid",
+  "privacyPolicyUrl": "https://elevenlabs.example.invalid/privacy",
+  "termsUrl": "https://elevenlabs.example.invalid/terms"
+}

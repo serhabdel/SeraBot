@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "slug": "brave-search",
+  "name": "Private Search",
+  "tagline": "Web search through a privacy-focused index.",
+  "description": "Search the web and get results with snippets. Queries are sent to the search provider under the owner's own key.",
+  "category": "research",
+  "iconUrl": "https://brave-search.example.invalid/icon.png",
+  "version": "1.0.0",
+  "minServerVersion": "0.36.0",
+  "prompts": [
+    {
+      "id": "brave-search-0",
+      "text": "Search for recent reviews of this product."
+    }
+  ],
+  "apps": [
+    {
+      "id": "search",
+      "name": "Search",
+      "server": {
+        "transport": "http",
+        "url": "https://mcp.search.example.invalid/mcp"
+      },
+      "auth": [
+        {
+          "id": "key",
+          "kind": "api-key",
+          "fields": [
+            {
+              "id": "api_key",
+              "label": "API key",
+              "secretKey": "brave-search.api_key",
+              "hint": "Paste the Private Search API key. It is stored only for your account.",
+              "docsUrl": "https://search.example.invalid/docs/keys"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "permissions": {
+    "egress": [
+      "mcp.search.example.invalid"
+    ]
+  },
+  "websiteUrl": "https://search.example.invalid",
+  "privacyPolicyUrl": "https://search.example.invalid/privacy",
+  "termsUrl": "https://brave-search.example.invalid/terms"
+}
