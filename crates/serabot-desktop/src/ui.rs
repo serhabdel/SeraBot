@@ -19,6 +19,9 @@ use serabot_desktop::{
     teams, ui_highlight,
     working::BotActivity,
 };
+// The UI pacing constants are only read by the Windows message pump below.
+#[cfg(windows)]
+use serabot_desktop::ui_tick;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
@@ -651,8 +654,11 @@ pub fn run() {
 
 #[component]
 fn App() -> Element {
-    let session = use_signal(Session::new);
-    let revision = use_signal(|| 0u64);
+    // `mut` is needed only by the Windows message pump below.
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut session = use_signal(Session::new);
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut revision = use_signal(|| 0u64);
     use_coroutine(move |_: UnboundedReceiver<()>| async move {
         loop {
             #[cfg(windows)]
