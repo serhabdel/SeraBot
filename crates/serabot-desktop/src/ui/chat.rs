@@ -439,6 +439,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let composer_file_count = session.read().composer_files.len();
     let busy = session.read().uploading || session.read().upload_pending() > 0;
     let send_ready = chat_compose::can_submit(&composer_text, composer_file_count, busy);
+    let run_active = live_task.is_some();
     rsx! {
         div { class: "pane-body chat-body",
             ondragover: move |event: DragEvent| {
@@ -495,6 +496,11 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                 div {
                     class: if group_like { "messages group" } else { "messages" },
                     id: "messages",
+                    // A log landmark for screen readers. Live announcements are
+                    // off: announcing every streamed token would be noise.
+                    role: "log",
+                    "aria-label": "Conversation",
+                    "aria-live": "off",
                     onscroll: move |event: ScrollEvent| {
                         let bottom = chat_scroll::near_bottom(
                             event.scroll_height() as f64,
@@ -876,6 +882,14 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     }
                                     return;
                                 }
+                                // Esc stops a running reply, like the Stop button.
+                                if event.key() == Key::Escape
+                                    && chat_compose::escape_stops_run(run_active, awaiting_approval)
+                                {
+                                    event.prevent_default();
+                                    session.write().stop_turn();
+                                    return;
+                                }
                                 // Up in an empty composer recalls the last message.
                                 if event.key() == Key::ArrowUp && composer_draft().is_empty() {
                                     let texts: Vec<String> = session
@@ -898,10 +912,11 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     let command = modifiers.contains(Modifiers::CONTROL)
                                         || modifiers.contains(Modifiers::META);
                                     let enter_sends = session.read().prefs.enter_sends;
-                                    if chat_compose::enter_sends(
+                                    if chat_compose::submit_on_enter(
                                         enter_sends,
                                         modifiers.contains(Modifiers::SHIFT),
                                         command,
+                                        event.is_composing(),
                                     ) {
                                         event.prevent_default();
                                         session.write().submit();
@@ -909,7 +924,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 }
                             },
                         }
-                        if composer_focused() && composer_text.is_empty() {
+                        if composer_focused() {
                             div { class: "composer-hint", "{chat_compose::COMPOSER_HINT}" }
                         }
                         if let Some(note) = length_note.clone() {
