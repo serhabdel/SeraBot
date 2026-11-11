@@ -987,9 +987,6 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 }
                             },
                         }
-                        if composer_focused() {
-                            div { class: "composer-hint", "{chat_compose::COMPOSER_HINT}" }
-                        }
                         if let Some(note) = length_note.clone() {
                             div {
                                 class: if over_limit { "composer-count over" } else { "composer-count" },
@@ -1120,6 +1117,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             }
                         }
                     }
+                    // The key hint sits under the container, always, so it never
+                    // overlaps the text and the box never jumps when focus moves.
+                    div { class: "composer-hint", "{chat_compose::COMPOSER_HINT}" }
                     if show_mention {
                         div { class: "mention-pop pop above open",
                             // Hidden closer: GLOBAL_KEYS_JS clicks it on Esc /
