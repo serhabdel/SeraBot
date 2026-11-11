@@ -129,3 +129,37 @@
 .root[data-motion="reduce"] .meter-fill {
   transition: none;
 }
+
+/* Chat stability (PR-D): bounded media and a composer that grows to 8 lines. */
+.msg-body img {
+  display: block;
+  max-width: 100%;
+  max-height: 420px;
+  height: auto;
+  object-fit: contain;
+  border-radius: var(--r-sm);
+}
+
+.md-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.messages .msg {
+  overflow-anchor: none;
+}
+
+.composer .composer-input {
+  min-height: 40px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.scroll-bottom.jump-pill {
+  height: 32px;
+}
+
+.composer-hint {
+  color: var(--label-2);
+  font-size: var(--fs-micro);
+}

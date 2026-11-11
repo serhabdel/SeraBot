@@ -199,6 +199,23 @@ pub fn enter_sends(enter_sends_pref: bool, shift: bool, command: bool) -> bool {
     command || (enter_sends_pref && !shift)
 }
 
+/// Whether an Enter key press should send. An Enter that confirms an input
+/// method (IME) candidate must never send: it belongs to the composition.
+pub fn submit_on_enter(
+    enter_sends_pref: bool,
+    shift: bool,
+    command: bool,
+    composing: bool,
+) -> bool {
+    !composing && enter_sends(enter_sends_pref, shift, command)
+}
+
+/// Whether Esc in the composer should stop the running reply: only while a
+/// reply is running and no approval is pending (that has its own Decline).
+pub fn escape_stops_run(run_active: bool, awaiting_approval: bool) -> bool {
+    run_active && !awaiting_approval
+}
+
 /// The text Up recalls into an empty composer: the owner's latest message
 /// that is not blank. `texts` runs oldest to newest.
 pub fn recall_text(texts: &[&str]) -> Option<String> {
@@ -315,6 +332,21 @@ mod tests {
         assert!(enter_sends(true, true, true));
         assert!(!enter_sends(false, false, false));
         assert!(enter_sends(false, false, true));
+    }
+
+    #[test]
+    fn enter_during_ime_composition_never_sends() {
+        assert!(submit_on_enter(true, false, false, false));
+        assert!(!submit_on_enter(true, false, false, true));
+        assert!(!submit_on_enter(false, false, true, true));
+        assert!(submit_on_enter(false, false, true, false));
+    }
+
+    #[test]
+    fn escape_stops_only_a_running_reply() {
+        assert!(escape_stops_run(true, false));
+        assert!(!escape_stops_run(false, false));
+        assert!(!escape_stops_run(true, true));
     }
 
     #[test]

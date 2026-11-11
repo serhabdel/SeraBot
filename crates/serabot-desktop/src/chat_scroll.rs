@@ -10,17 +10,38 @@ pub fn near_bottom(scroll_height: f64, scroll_top: f64, client_height: f64) -> b
     (scroll_height - scroll_top - client_height) < STICK_BOTTOM_PX
 }
 
+/// A cheap fingerprint of what the transcript shows: row count, the last
+/// message (id and length, so streamed tokens count) and the activity steps.
+/// Two equal marks mean nothing grew, so the view must not re-pin.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TranscriptMark {
+    pub count: usize,
+    pub tail: Option<(String, usize)>,
+    pub steps: usize,
+    pub step_tail: Option<(String, usize)>,
+}
+
+/// Whether the open conversation is a different one from the one the view last
+/// set itself up for. The view re-runs its effects on every session write, so
+/// per-conversation resets must be gated on this, not run unconditionally.
+pub fn conversation_switched(current: &str, seen: &str) -> bool {
+    current != seen
+}
+
 /// Whether the chat view should call the scroll pin bridge after a transcript or
 /// activity change, and whether to force stick-to-bottom.
+///
+/// Only the owner's own send or a freshly opened conversation forces a jump.
+/// Streaming growth pins softly: the bridge follows only while it still knows
+/// the reader is at the bottom, so scrolling up is never overridden by a stale
+/// Rust-side flag.
 pub fn transcript_pin_action(
     previous_count: usize,
     count: usize,
     own_send: bool,
-    at_bottom: bool,
     streaming_growth: bool,
 ) -> Option<bool> {
-    let jump = own_send || previous_count == 0;
-    let force_pin = jump || own_send || (at_bottom && streaming_growth);
+    let force_pin = own_send || previous_count == 0;
     if force_pin || count != previous_count || streaming_growth {
         Some(force_pin)
     } else {
@@ -216,25 +237,49 @@ mod tests {
     }
 
     #[test]
-    fn transcript_pin_forces_while_at_bottom_and_streaming() {
-        assert_eq!(transcript_pin_action(3, 3, false, true, true), Some(true));
+    fn streaming_growth_pins_softly_and_never_forces() {
+        // The bridge decides from its own stick state; Rust must not force it
+        // from a flag that can be stale after a scroll-up.
+        assert_eq!(transcript_pin_action(3, 3, false, true), Some(false));
     }
 
     #[test]
-    fn transcript_pin_soft_while_scrolled_up_but_streaming() {
-        assert_eq!(transcript_pin_action(3, 3, false, false, true), Some(false));
+    fn transcript_pin_skips_when_nothing_grew() {
+        assert_eq!(transcript_pin_action(3, 3, false, false), None);
     }
 
     #[test]
-    fn transcript_pin_skips_when_idle_at_bottom() {
-        assert_eq!(transcript_pin_action(3, 3, false, true, false), None);
+    fn transcript_pin_on_new_row_is_soft() {
+        assert_eq!(transcript_pin_action(3, 4, false, false), Some(false));
     }
 
     #[test]
-    fn transcript_pin_on_new_row_without_force_when_scrolled_up() {
-        assert_eq!(
-            transcript_pin_action(3, 4, false, false, false),
-            Some(false)
-        );
+    fn own_send_and_first_load_force_a_jump() {
+        assert_eq!(transcript_pin_action(3, 4, true, false), Some(true));
+        assert_eq!(transcript_pin_action(0, 5, false, false), Some(true));
+    }
+
+    #[test]
+    fn an_unchanged_mark_is_not_growth() {
+        // Regression: any session write used to count as "streaming growth".
+        let mark = TranscriptMark {
+            count: 4,
+            tail: Some(("m4".into(), 120)),
+            steps: 1,
+            step_tail: Some(("c1".into(), 8)),
+        };
+        assert_eq!(mark, mark.clone());
+        let mut grown = mark.clone();
+        grown.tail = Some(("m4".into(), 125));
+        assert_ne!(mark, grown, "a streamed token changes the mark");
+        let mut stepped = mark.clone();
+        stepped.steps = 2;
+        assert_ne!(mark, stepped);
+    }
+
+    #[test]
+    fn switch_is_detected_only_on_a_different_conversation() {
+        assert!(!conversation_switched("dir:main", "dir:main"));
+        assert!(conversation_switched("dir:legal", "dir:main"));
     }
 }

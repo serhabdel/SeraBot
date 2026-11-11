@@ -248,6 +248,13 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let mut at_bottom = use_signal(|| true);
     let mut unseen = use_signal(|| 0usize);
     let mut last_count = use_signal(|| 0usize);
+    // The conversation the scroll state was last reset for, and the last
+    // transcript fingerprint. `use_effect` closures that read `session` re-run
+    // on EVERY session write, so resets and growth checks compare against these.
+    let mut seen_conversation = use_signal(|| session.peek().conversation.clone());
+    let last_mark = use_hook(|| Rc::new(RefCell::new(chat_scroll::TranscriptMark::default())));
+    let last_mark_reset = Rc::clone(&last_mark);
+    let last_mark_effect = Rc::clone(&last_mark);
     // Ids that already had their entrance animation in this conversation.
     let entered_messages =
         use_hook(|| Rc::new(RefCell::new((String::new(), HashSet::<String>::new()))));
@@ -300,11 +307,19 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     });
     use_effect(move || {
         let conversation = session.read().conversation.clone();
+        // Reset only when the conversation really changed. Running this on
+        // every session write replayed every entrance animation and forced a
+        // jump to the bottom, which read as glitching and endless scrolling.
+        if !chat_scroll::conversation_switched(&conversation, &seen_conversation.peek()) {
+            return;
+        }
+        seen_conversation.set(conversation.clone());
         {
             let mut guard = entered_messages_effect.borrow_mut();
             guard.0 = conversation;
             guard.1.clear();
         }
+        *last_mark_reset.borrow_mut() = chat_scroll::TranscriptMark::default();
         last_count.set(0);
         at_bottom.set(true);
         unseen.set(0);
@@ -329,6 +344,19 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             .steps
             .last()
             .map(|step| (step.call_id.clone(), step.label.len()));
+        let mark = chat_scroll::TranscriptMark {
+            count,
+            tail,
+            steps: activity_steps,
+            step_tail: activity_tail,
+        };
+        // Real growth only: this effect also runs for unrelated session writes.
+        let streaming_growth = {
+            let mut last = last_mark_effect.borrow_mut();
+            let grew = *last != mark;
+            *last = mark;
+            grew
+        };
         let previous = *last_count.peek();
         if count != previous {
             if count > previous && !*at_bottom.peek() && !own_send {
@@ -338,20 +366,18 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             last_count.set(count);
         }
         if own_send {
-            at_bottom.set(true);
-            unseen.set(0);
+            if !*at_bottom.peek() {
+                at_bottom.set(true);
+            }
+            if *unseen.peek() != 0 {
+                unseen.set(0);
+            }
         }
-        let streaming_growth = tail.is_some() || activity_steps > 0;
-        if let Some(force_pin) = chat_scroll::transcript_pin_action(
-            previous,
-            count,
-            own_send,
-            *at_bottom.peek(),
-            streaming_growth,
-        ) {
+        if let Some(force_pin) =
+            chat_scroll::transcript_pin_action(previous, count, own_send, streaming_growth)
+        {
             let _ = dioxus::document::eval(&chat_scroll::pin_messages_js(force_pin));
         }
-        let _ = (tail, activity_tail);
     });
     {
         let conversation = session.read().conversation.clone();
@@ -413,6 +439,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let composer_file_count = session.read().composer_files.len();
     let busy = session.read().uploading || session.read().upload_pending() > 0;
     let send_ready = chat_compose::can_submit(&composer_text, composer_file_count, busy);
+    let run_active = live_task.is_some();
     rsx! {
         div { class: "pane-body chat-body",
             ondragover: move |event: DragEvent| {
@@ -469,14 +496,23 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                 div {
                     class: if group_like { "messages group" } else { "messages" },
                     id: "messages",
+                    // A log landmark for screen readers. Live announcements are
+                    // off: announcing every streamed token would be noise.
+                    role: "log",
+                    "aria-label": "Conversation",
+                    "aria-live": "off",
                     onscroll: move |event: ScrollEvent| {
                         let bottom = chat_scroll::near_bottom(
                             event.scroll_height() as f64,
                             event.scroll_top(),
                             event.client_height() as f64,
                         );
-                        at_bottom.set(bottom);
-                        if bottom {
+                        // Write only on change: every write re-renders the whole
+                        // chat view, and scroll events arrive once per frame.
+                        if *at_bottom.peek() != bottom {
+                            at_bottom.set(bottom);
+                        }
+                        if bottom && *unseen.peek() != 0 {
                             unseen.set(0);
                         }
                     },
@@ -846,6 +882,14 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     }
                                     return;
                                 }
+                                // Esc stops a running reply, like the Stop button.
+                                if event.key() == Key::Escape
+                                    && chat_compose::escape_stops_run(run_active, awaiting_approval)
+                                {
+                                    event.prevent_default();
+                                    session.write().stop_turn();
+                                    return;
+                                }
                                 // Up in an empty composer recalls the last message.
                                 if event.key() == Key::ArrowUp && composer_draft().is_empty() {
                                     let texts: Vec<String> = session
@@ -868,10 +912,11 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     let command = modifiers.contains(Modifiers::CONTROL)
                                         || modifiers.contains(Modifiers::META);
                                     let enter_sends = session.read().prefs.enter_sends;
-                                    if chat_compose::enter_sends(
+                                    if chat_compose::submit_on_enter(
                                         enter_sends,
                                         modifiers.contains(Modifiers::SHIFT),
                                         command,
+                                        event.is_composing(),
                                     ) {
                                         event.prevent_default();
                                         session.write().submit();
@@ -879,7 +924,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 }
                             },
                         }
-                        if composer_focused() && composer_text.is_empty() {
+                        if composer_focused() {
                             div { class: "composer-hint", "{chat_compose::COMPOSER_HINT}" }
                         }
                         if let Some(note) = length_note.clone() {
