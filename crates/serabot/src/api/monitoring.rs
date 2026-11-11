@@ -72,6 +72,7 @@ pub(super) async fn list_monitoring_sources(
                 "kind": source.kind,
                 "enabled": source.enabled,
                 "url": visible_feed_url(&user, false, &source.url),
+                "own": false,
                 "last_run": last_run_json(last.as_ref()),
             })
         })
@@ -86,6 +87,7 @@ pub(super) async fn list_monitoring_sources(
             "kind": row.kind,
             "enabled": row.enabled,
             "url": visible_feed_url(&user, true, url),
+            "own": true,
             "last_run": last_run_json(last.as_ref()),
         }));
     }

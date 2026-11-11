@@ -326,6 +326,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/browser/sessions/{id}/handback", post(session_handback))
         .route("/v1/browser/sessions/{id}/input", post(session_input))
         .route("/v1/browser/sessions/{id}/close", post(session_close))
+        .route("/v1/browser/sessions/{id}/open", post(session_open))
         .route("/v1/browser/sessions/{id}/tabs", post(session_tab_open))
         .route(
             "/v1/browser/sessions/{id}/tabs/{tab}/switch",
@@ -380,7 +381,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/sources/rss", post(add_member_rss))
         .route(
             "/v1/sources/{name}",
-            patch(patch_source_enabled).delete(delete_member_source),
+            patch(patch_source).delete(delete_member_source),
         )
         .route("/v1/memories", get(list_memories).post(add_memory))
         .route("/v1/memories/stats", get(memory_stats))
@@ -535,7 +536,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/artifacts/{hash}/approve", post(approve_artifact))
         .route("/v1/jobs", get(list_jobs))
         .route("/v1/routines", get(list_routines))
-        .route("/v1/routines/{name}", put(put_routine))
+        .route(
+            "/v1/routines/{name}",
+            put(put_routine).delete(delete_routine),
+        )
+        .route("/v1/routines/{name}/run", post(run_routine))
         .route("/v1/monitoring/sources", get(list_monitoring_sources))
         .route("/v1/digest", get(get_digest))
         .route("/v1/monitoring/run", post(run_all_sources))

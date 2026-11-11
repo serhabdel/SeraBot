@@ -2,9 +2,13 @@
 
 use super::*;
 
+/// Body of `PATCH /v1/sources/{name}`. Either field may be sent alone.
 #[derive(Deserialize)]
-pub(super) struct SourceEnableBody {
-    pub enabled: bool,
+pub(super) struct SourcePatchBody {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -46,26 +50,52 @@ pub(super) async fn list_sources(
     Ok(Json(json!({"sources": rows})))
 }
 
-/// `PATCH /v1/sources/{name}` — enable/disable an admin-defined source.
-pub(super) async fn patch_source_enabled(
+/// `PATCH /v1/sources/{name}`. The caller's own feed takes `enabled` and a new
+/// `url` (checked against the host allowlist, as on add). An admin-defined
+/// source takes `enabled` only, as an overlay for this user.
+pub(super) async fn patch_source(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
     Path(name): Path<String>,
-    Json(body): Json<SourceEnableBody>,
+    Json(body): Json<SourcePatchBody>,
 ) -> Result<Json<Value>> {
-    let admin_sources = crate::config::load_sources(&state.config)?;
-    if !admin_sources.iter().any(|s| s.name == name) {
-        return Err(SeraError::NotFound(format!("source {name}")));
+    if body.enabled.is_none() && body.url.is_none() {
+        return Err(SeraError::Validation("no source fields to update".into()));
     }
-    let kind = admin_sources
-        .iter()
-        .find(|s| s.name == name)
-        .map(|s| s.kind.as_str())
-        .unwrap_or("rss");
+    let own = state
+        .store
+        .list_user_sources(&user.id)?
+        .into_iter()
+        .any(|row| row.origin == "member" && row.name == name);
+    if own {
+        let url = match body.url.as_deref() {
+            Some(raw) => Some(crate::sources::validate_member_rss_url(&state.config, raw)?),
+            None => None,
+        };
+        if !state
+            .store
+            .update_member_rss_source(&user.id, &name, body.enabled, url.as_deref())?
+        {
+            return Err(SeraError::NotFound(format!("source {name}")));
+        }
+        return Ok(Json(json!({"name": name, "enabled": body.enabled})));
+    }
+    if body.url.is_some() {
+        return Err(SeraError::Validation(
+            "only a feed you added can change its URL".into(),
+        ));
+    }
+    let Some(enabled) = body.enabled else {
+        return Err(SeraError::Validation("no source fields to update".into()));
+    };
+    let admin_sources = crate::config::load_sources(&state.config)?;
+    let Some(admin) = admin_sources.iter().find(|s| s.name == name) else {
+        return Err(SeraError::NotFound(format!("source {name}")));
+    };
     state
         .store
-        .upsert_user_source_overlay(&user.id, &name, body.enabled, kind)?;
-    Ok(Json(json!({"name": name, "enabled": body.enabled})))
+        .upsert_user_source_overlay(&user.id, &name, enabled, &admin.kind)?;
+    Ok(Json(json!({"name": name, "enabled": enabled})))
 }
 
 /// `POST /v1/sources/rss` — add a member RSS feed on the host allowlist.

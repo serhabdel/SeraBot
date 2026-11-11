@@ -2474,6 +2474,89 @@ impl ApiClient {
         Ok(())
     }
 
+    /// `DELETE /v1/routines/{name}`: remove one routine's schedule (0.34.0).
+    pub fn delete_routine(&self, name: &str) -> Result<(), ApiError> {
+        if name.is_empty() || name.len() > 128 {
+            return Err(ApiError::Validation("Invalid routine name."));
+        }
+        let _: serde_json::Value =
+            self.request(Method::DELETE, &["v1", "routines", name], &[], None::<&()>)?;
+        Ok(())
+    }
+
+    /// `POST /v1/routines/{name}/run`: run one routine now (0.34.0).
+    pub fn run_routine(&self, name: &str) -> Result<String, ApiError> {
+        if name.is_empty() || name.len() > 128 {
+            return Err(ApiError::Validation("Invalid routine name."));
+        }
+        #[derive(Deserialize)]
+        struct Body {
+            task_id: String,
+        }
+        let body: Body = self.request(
+            Method::POST,
+            &["v1", "routines", name, "run"],
+            &[],
+            None::<&()>,
+        )?;
+        Ok(body.task_id)
+    }
+
+    /// `POST /v1/sources/rss`: add one of the caller's own RSS feeds (0.34.0).
+    pub fn add_member_feed(&self, name: &str, url: &str) -> Result<(), ApiError> {
+        if name.trim().is_empty() || name.chars().count() > 128 {
+            return Err(ApiError::Validation(
+                "Give the feed a name of 1 to 128 characters.",
+            ));
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            name: &'a str,
+            url: &'a str,
+        }
+        let _: serde_json::Value = self.request(
+            Method::POST,
+            &["v1", "sources", "rss"],
+            &[],
+            Some(&Body {
+                name: name.trim(),
+                url: url.trim(),
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// `DELETE /v1/sources/{name}`: remove one of the caller's own feeds (0.34.0).
+    pub fn delete_member_feed(&self, name: &str) -> Result<(), ApiError> {
+        let _: serde_json::Value =
+            self.request(Method::DELETE, &["v1", "sources", name], &[], None::<&()>)?;
+        Ok(())
+    }
+
+    /// `PATCH /v1/sources/{name}` (0.34.0): `enabled` for any source the caller
+    /// can see, `url` only for the caller's own feed.
+    pub fn patch_source(
+        &self,
+        name: &str,
+        enabled: Option<bool>,
+        url: Option<&str>,
+    ) -> Result<(), ApiError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            enabled: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            url: Option<&'a str>,
+        }
+        let _: serde_json::Value = self.request(
+            Method::PATCH,
+            &["v1", "sources", name],
+            &[],
+            Some(&Body { enabled, url }),
+        )?;
+        Ok(())
+    }
+
     /// `POST /v1/monitoring/run` (0.30.0 Wave B2).
     pub fn run_all_watch_sources(&self) -> Result<String, ApiError> {
         #[derive(Deserialize)]

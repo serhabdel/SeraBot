@@ -251,7 +251,7 @@ fn ProfilePicker(session: Signal<Session>, current: String) -> Element {
 #[component]
 fn BrowserGrid(session: Signal<Session>) -> Element {
     let mut session = session;
-    let (cards, loaded, idle_ttl, helpers) = {
+    let (cards, loaded, idle_ttl, helpers, idle_profiles) = {
         let s = session.read();
         let cards: Vec<Card> = s
             .panel
@@ -266,11 +266,20 @@ fn BrowserGrid(session: Signal<Session>) -> Element {
                 (info.clone(), shot, bot)
             })
             .collect();
+        // Profiles whose browser is not running: opened on demand from here.
+        let idle_profiles: Vec<(String, String)> = s
+            .panel
+            .sessions
+            .iter()
+            .filter(|info| !info.active)
+            .map(|info| (info.id.clone(), info.profile_name.clone()))
+            .collect();
         (
             cards,
             s.panel.sessions_loaded,
             s.panel.idle_timeout_secs,
             s.panel.signin_helpers.clone(),
+            idle_profiles,
         )
     };
     rsx! {
@@ -291,8 +300,8 @@ fn BrowserGrid(session: Signal<Session>) -> Element {
                 } else if cards.is_empty() {
                     div { class: "empty browser-empty",
                         div { class: "empty-icon", Icon { name: "globe", size: 20 } }
-                        h2 { class: "empty-title", "No browser open." }
-                        p { class: "empty-text", "Ask a bot to open a website." }
+                        h2 { class: "empty-title", "No browser is running." }
+                        p { class: "empty-text", "Open one from the list below, or ask a bot to open a website." }
                     }
                 } else {
                     div { class: "browser-grid",
@@ -350,6 +359,30 @@ fn BrowserGrid(session: Signal<Session>) -> Element {
                                                 }
                                             }
                                         }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !idle_profiles.is_empty() {
+                    section { class: "browser-ready", "aria-label": "Browsers ready to open",
+                        h2 { class: "pane-subtitle", "Ready to open" }
+                        p { class: "muted",
+                            "Opening a browser starts it here. A bot can also start one when it needs it."
+                        }
+                        div { class: "browser-grid",
+                            for (id, name) in idle_profiles.clone() {
+                                div { key: "{id}", class: "browser-card browser-card-idle",
+                                    div { class: "browser-card-copy",
+                                        strong { class: "browser-profile", "{name}" }
+                                        span { class: "muted", "Not running" }
+                                    }
+                                    button {
+                                        class: "btn primary sm",
+                                        r#type: "button",
+                                        onclick: move |_| session.write().panel.open_browser(&id),
+                                        "Open browser"
                                     }
                                 }
                             }

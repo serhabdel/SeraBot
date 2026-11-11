@@ -258,7 +258,7 @@ pub(super) fn MemoryView(session: Signal<Session>) -> Element {
                     if memories_loaded && memories_empty {
                         div { class: "empty",
                             div { class: "empty-icon", Icon { name: "bolt", size: 20 } }
-                            h3 { class: "empty-title", "No memories yet" }
+                            h3 { class: "empty-title", "No memories saved yet" }
                             p { class: "empty-text", "Durable facts you add here reach the orchestrator." }
                         }
                     }

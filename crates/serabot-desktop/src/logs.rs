@@ -1,9 +1,10 @@
 //! The Logs tab model (0.28.0): parsing, validating and filtering the ring
-//! buffer served by `GET /v1/logs?level=&q=` (`{entries:[{ts,level,target,message}]}`).
+//! buffer served by `GET /v1/logs?level=&q=` (`{logs:[{ts,level,target,message}]}`).
 //!
-//! The endpoint is new in 0.28.0: until the server ships it the client treats
-//! a 404 as "not available" (see `ApiClient::logs`), and this module never
-//! invents rows. Entries are untrusted display data: strings are bounded and
+//! The server answers `{logs:[...], count, capacity}` (the key is `logs`, as
+//! in `crates/serabot/src/logging.rs`). Until the server ships the endpoint the
+//! client treats a 404 as "not available" (see `ApiClient::logs`), and this
+//! module never invents rows. Entries are untrusted display data: strings are bounded and
 //! control characters dropped before they reach the UI.
 
 use serde_json::Value;
@@ -39,9 +40,9 @@ fn clean(value: &Value, key: &str, max: usize, keep_newlines: bool) -> Option<St
     (!text.is_empty()).then_some(text)
 }
 
-/// Parse the documented response shape; `None` when anything is off.
+/// Parse the server's response shape (`logs`); `None` when anything is off.
 pub fn parse_entries(value: &Value) -> Option<Vec<LogEntry>> {
-    let entries = value.get("entries")?.as_array()?;
+    let entries = value.get("logs")?.as_array()?;
     if entries.len() > MAX_ENTRIES {
         return None;
     }
@@ -137,7 +138,7 @@ mod tests {
     use serde_json::json;
 
     fn entries() -> Vec<LogEntry> {
-        parse_entries(&json!({"entries": [
+        parse_entries(&json!({"logs": [
             {"ts": "2026-11-08T10:00:00.000Z", "level": "INFO", "target": "serabot::api", "message": "listening on :8080"},
             {"ts": "2026-11-08T10:00:01.000Z", "level": "warn", "target": "serabot::gateway", "message": "slow approval"},
             {"ts": "2026-11-08T10:00:02.000Z", "level": "error", "target": "serabot::runtime", "message": "turn failed\u{7}"},
@@ -159,15 +160,15 @@ mod tests {
 
     #[test]
     fn rejects_malformed_payloads() {
-        assert!(parse_entries(&json!({"entries": "nope"})).is_none());
+        assert!(parse_entries(&json!({"logs": "nope"})).is_none());
         assert!(parse_entries(&json!({})).is_none());
-        assert!(parse_entries(&json!({"entries": [{"ts": "x"}]})).is_none());
+        assert!(parse_entries(&json!({"logs": [{"ts": "x"}]})).is_none());
         // A level alone is a valid (if quiet) row; ts/target/message default.
-        let bare = parse_entries(&json!({"entries": [{"level": "info"}]})).unwrap();
+        let bare = parse_entries(&json!({"logs": [{"level": "info"}]})).unwrap();
         assert_eq!(bare[0].message, "");
-        let huge = json!({"entries": (0..=MAX_ENTRIES).map(|i| json!({"level": format!("l{i}"), "message": "x"})).collect::<Vec<_>>()});
+        let huge = json!({"logs": (0..=MAX_ENTRIES).map(|i| json!({"level": format!("l{i}"), "message": "x"})).collect::<Vec<_>>()});
         assert!(parse_entries(&huge).is_none());
-        let long = json!({"entries": [{"level": "info", "message": "x".repeat(MAX_MESSAGE + 1)}]});
+        let long = json!({"logs": [{"level": "info", "message": "x".repeat(MAX_MESSAGE + 1)}]});
         let parsed = parse_entries(&long).unwrap();
         assert!(parsed[0].message.chars().count() <= MAX_MESSAGE);
     }
@@ -222,5 +223,20 @@ mod tests {
             assert!(!level_class(level).is_empty());
         }
         assert_eq!(level_class("something-else"), "log-trace");
+    }
+
+    #[test]
+    fn parses_the_server_envelope() {
+        // The shape `GET /v1/logs` actually returns (`logs`, `count`, `capacity`).
+        let parsed = parse_entries(&json!({
+            "logs": [{"ts": "2026-11-11T10:00:00.000Z", "level": "info",
+                      "target": "serabot::api", "message": "started"}],
+            "count": 1,
+            "capacity": 2000
+        }))
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].message, "started");
+        assert_eq!(parsed[0].level, "info");
     }
 }

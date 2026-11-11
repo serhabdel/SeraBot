@@ -103,8 +103,28 @@ pub fn LogsView(session: Signal<Session>) -> Element {
                     }
                 } else if !loaded {
                     p { class: "muted", role: "status", "Loading logs\u{2026}" }
+                } else if entries.is_empty() {
+                    div { class: "empty logs-empty",
+                        h2 { class: "empty-title", "No log entries yet" }
+                        p { class: "empty-text",
+                            "Logs appear once the server starts a task, a routine or a sign-in."
+                        }
+                        button {
+                            class: "btn ghost sm",
+                            onclick: move |_| session.write().refresh_logs(),
+                            "Refresh"
+                        }
+                    }
                 } else if filtered.is_empty() {
-                    p { class: "muted", role: "status", "No log lines match." }
+                    div { class: "empty logs-empty",
+                        h2 { class: "empty-title", "No lines match these filters" }
+                        p { class: "empty-text", "Clear the level or search to see every line." }
+                        button {
+                            class: "btn ghost sm",
+                            onclick: move |_| session.write().set_logs_filter(None, String::new()),
+                            "Clear filters"
+                        }
+                    }
                 } else {
                     for (index, entry) in filtered.into_iter().enumerate() {
                         LogRow { key: "{index}", entry: entry.clone() }

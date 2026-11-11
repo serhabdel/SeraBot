@@ -84,3 +84,69 @@ pub(super) async fn put_routine(
     )?;
     Ok(Json(json!({"routine": routine})))
 }
+
+/// `DELETE /v1/routines/{name}`: remove the caller's schedule for one member
+/// routine. A removed routine is scheduled again with `PUT` (enabled or time).
+pub(super) async fn delete_routine(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>> {
+    crate::config::classify_member_routine(&name)?;
+    if !state.store.delete_routine(&user.id, &name)? {
+        return Err(SeraError::NotFound(format!("routine {name}")));
+    }
+    state.store.record_audit(
+        &user.id,
+        "routine.deleted",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({"name": name})),
+    )?;
+    Ok(Json(json!({"deleted": name})))
+}
+
+/// `POST /v1/routines/{name}/run`: run one routine now, the same as `/brief`
+/// or `/watch` in chat. `morning_brief` queues a brief; a watch slot queues a
+/// check of the caller's sources.
+pub(super) async fn run_routine(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>> {
+    let kind = crate::config::classify_member_routine(&name)?;
+    if !state.store.routine_exists(&user.id, &name)? {
+        return Err(SeraError::NotFound(format!("routine {name}")));
+    }
+    let task_kind = match kind {
+        crate::config::MemberRoutineKind::Brief => "brief",
+        crate::config::MemberRoutineKind::Watch(_) => "watch",
+    };
+    let conversation_id = state.store.default_scheduled_conversation_id(&user.id)?;
+    let task = state.store.enqueue_task_with_quota(
+        &user.id,
+        task_kind,
+        "watcher",
+        &serde_json::to_value(crate::runtime::ScheduledPayload {
+            conversation_id,
+            user_id: user.id.clone(),
+        })?,
+        5,
+        chrono::Utc::now(),
+        state.config.users.tasks_per_user_per_day,
+    )?;
+    state.store.record_audit(
+        &user.id,
+        "routine.run_now",
+        None,
+        Some(&task.id),
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({"name": name, "kind": task_kind})),
+    )?;
+    Ok(Json(json!({"task_id": task.id, "kind": task_kind})))
+}

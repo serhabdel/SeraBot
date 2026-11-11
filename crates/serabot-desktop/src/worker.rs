@@ -286,6 +286,30 @@ pub enum Operation {
     },
     /// `POST /v1/monitoring/run` then refresh workflows (0.30.0 B2).
     RunAllWatchSources,
+    /// `DELETE /v1/routines/{name}` then refresh workflows.
+    DeleteRoutine {
+        name: String,
+    },
+    /// `POST /v1/routines/{name}/run` then refresh workflows.
+    RunRoutine {
+        name: String,
+    },
+    /// `POST /v1/sources/rss` then refresh workflows.
+    AddFeed {
+        name: String,
+        url: String,
+    },
+    /// `DELETE /v1/sources/{name}` (the caller's own feed) then refresh.
+    DeleteFeed {
+        name: String,
+    },
+    /// `PATCH /v1/sources/{name}`: enable or disable, or change the URL of the
+    /// caller's own feed. Then refresh workflows.
+    PatchSource {
+        name: String,
+        enabled: Option<bool>,
+        url: Option<String>,
+    },
     /// `GET /v1/artifacts/{hash}/preview` for one document artifact.
     DocPreview {
         hash: String,
@@ -498,7 +522,13 @@ impl Operation {
             Self::MediaJobs => OperationKind::MediaJobs,
             Self::Logs { .. } => OperationKind::Logs,
             Self::Workflows => OperationKind::Workflows,
-            Self::SaveRoutine { .. } | Self::RunAllWatchSources => OperationKind::WorkflowsWrite,
+            Self::SaveRoutine { .. }
+            | Self::RunAllWatchSources
+            | Self::DeleteRoutine { .. }
+            | Self::RunRoutine { .. }
+            | Self::AddFeed { .. }
+            | Self::DeleteFeed { .. }
+            | Self::PatchSource { .. } => OperationKind::WorkflowsWrite,
             Self::DocPreview { .. } => OperationKind::DocPreview,
             Self::TurnLimits => OperationKind::TurnLimits,
             Self::SaveTurnLimits { .. } | Self::ResetTurnLimits => OperationKind::TurnLimitsWrite,
@@ -1064,6 +1094,26 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
         }
         Operation::RunAllWatchSources => {
             client.run_all_watch_sources()?;
+            client.workflows_snapshot().map(Reply::Workflows)
+        }
+        Operation::DeleteRoutine { name } => {
+            client.delete_routine(name)?;
+            client.workflows_snapshot().map(Reply::Workflows)
+        }
+        Operation::RunRoutine { name } => {
+            client.run_routine(name)?;
+            client.workflows_snapshot().map(Reply::Workflows)
+        }
+        Operation::AddFeed { name, url } => {
+            client.add_member_feed(name, url)?;
+            client.workflows_snapshot().map(Reply::Workflows)
+        }
+        Operation::DeleteFeed { name } => {
+            client.delete_member_feed(name)?;
+            client.workflows_snapshot().map(Reply::Workflows)
+        }
+        Operation::PatchSource { name, enabled, url } => {
+            client.patch_source(name, *enabled, url.as_deref())?;
             client.workflows_snapshot().map(Reply::Workflows)
         }
         Operation::DocPreview { hash } => {
