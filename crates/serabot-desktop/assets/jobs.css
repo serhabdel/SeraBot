@@ -415,3 +415,84 @@
   min-height: 28px;
   padding: 0 6px;
 }
+
+/* v0.34.0: workflow management actions. The action cell sits on its own
+   line under each row, so the four-column row keeps its layout. */
+.wf-row-routine,
+.wf-row-source {
+  grid-template-columns: minmax(120px, 1.2fr) minmax(80px, 1fr) auto minmax(100px, 1fr);
+}
+
+.wf-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.wf-time,
+.wf-url-input {
+  min-width: 0;
+  padding: 4px 6px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface-1, var(--surface-2));
+  color: var(--label-1);
+  font: inherit;
+  font-size: var(--fs-caption);
+}
+
+.wf-url-input {
+  flex: 1 1 220px;
+}
+
+.wf-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.wf-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 120px;
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+}
+
+.wf-field-wide {
+  flex: 1 1 240px;
+}
+
+.wf-field input,
+.wf-field select {
+  padding: 6px 8px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface-1, var(--surface-2));
+  color: var(--label-1);
+  font: inherit;
+}
+
+.wf-list {
+  max-height: 420px;
+}
+
+.browser-ready {
+  margin-top: 16px;
+}
+
+.browser-card-idle {
+  align-items: center;
+  justify-content: space-between;
+}
+
+.pane-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}

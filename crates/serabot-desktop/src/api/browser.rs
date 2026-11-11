@@ -468,6 +468,12 @@ impl ApiClient {
         Ok(info)
     }
 
+    /// `POST /v1/browser/sessions/{id}/open` (0.34.0): start the profile's
+    /// browser on demand. A running browser is returned unchanged.
+    pub fn browser_session_open(&self, id: &str) -> Result<BrowserSessionInfo, ApiError> {
+        self.session_control(id, "open")
+    }
+
     /// `POST /v1/browser/sessions/{id}/takeover`.
     pub fn browser_session_takeover(&self, id: &str) -> Result<BrowserSessionInfo, ApiError> {
         self.session_control(id, "takeover")

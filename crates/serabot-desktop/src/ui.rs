@@ -16,7 +16,7 @@ use serabot_desktop::{
     chat_cards::{self, CardState, CardView},
     chat_compose, chat_feed, chat_scroll, file_icons, provider_presets, provider_view,
     session::{Section, Session, SettingsSection, SignInPhase, Theme, humanize_label},
-    teams, ui_highlight, ui_tick,
+    teams, ui_highlight,
     working::BotActivity,
 };
 use std::cell::RefCell;
@@ -651,8 +651,8 @@ pub fn run() {
 
 #[component]
 fn App() -> Element {
-    let mut session = use_signal(Session::new);
-    let mut revision = use_signal(|| 0u64);
+    let session = use_signal(Session::new);
+    let revision = use_signal(|| 0u64);
     use_coroutine(move |_: UnboundedReceiver<()>| async move {
         loop {
             #[cfg(windows)]

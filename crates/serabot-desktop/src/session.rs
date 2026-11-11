@@ -691,6 +691,9 @@ pub struct Session {
     /// Unix seconds at which the signed-in session ends, when the server
     /// reported one this run. A restored token has no known expiry.
     session_expires: Option<u64>,
+    /// Requests that found the worker's one-slot queue busy. The tick sends
+    /// them in order when the queue has room (0.34.0), instead of failing.
+    backlog: std::collections::VecDeque<Operation>,
     pending: Option<OperationKind>,
     /// The create-bot sheet draft.
     pub new_bot: NewBotDraft,
@@ -852,6 +855,7 @@ impl Session {
             launch_tx,
             launch_rx,
             session_expires: None,
+            backlog: std::collections::VecDeque::new(),
             pending: None,
             new_bot: NewBotDraft::default(),
             new_group: NewGroupDraft::default(),
@@ -1052,6 +1056,7 @@ impl Session {
     }
 
     fn reset_scope(&mut self, connected: bool) {
+        self.backlog.clear();
         self.state.new_scope(self.conversation.clone(), connected);
         if let Some(worker) = &self.worker {
             worker.set_epoch(self.state.scope.epoch);
@@ -1315,7 +1320,8 @@ impl Session {
         self.start_request(Operation::Workflows);
     }
 
-    /// Update one scheduled routine (0.30.0 Wave B1).
+    /// Update one scheduled routine (0.30.0 Wave B1). A write made while
+    /// another request is in flight waits in the backlog rather than being dropped.
     pub fn save_workflow_routine(
         &mut self,
         name: String,
@@ -1323,11 +1329,7 @@ impl Session {
         time: Option<String>,
         timezone: Option<String>,
     ) {
-        if !self.state.connected || self.pending.is_some() {
-            return;
-        }
-        self.state.workflows_error = None;
-        self.start_request(Operation::SaveRoutine {
+        self.queue_workflow_write(Operation::SaveRoutine {
             name,
             enabled,
             time,
@@ -1337,11 +1339,47 @@ impl Session {
 
     /// Enqueue a manual watch run (0.30.0 Wave B2).
     pub fn run_all_watch_sources(&mut self) {
-        if !self.state.connected || self.pending.is_some() {
-            return;
+        self.queue_workflow_write(Operation::RunAllWatchSources);
+    }
+
+    /// Remove one routine's schedule (0.34.0). Schedule it again with
+    /// [`Session::save_workflow_routine`].
+    pub fn delete_workflow_routine(&mut self, name: String) {
+        self.queue_workflow_write(Operation::DeleteRoutine { name });
+    }
+
+    /// Run one routine now (0.34.0): a brief, or a check of the sources.
+    pub fn run_workflow_routine(&mut self, name: String) {
+        if self.queue_workflow_write(Operation::RunRoutine { name }) {
+            self.toast = Some("Run queued. It shows up in Jobs.".into());
+        }
+    }
+
+    /// Add one of the caller's own RSS feeds (0.34.0).
+    pub fn add_feed(&mut self, name: String, url: String) {
+        self.queue_workflow_write(Operation::AddFeed { name, url });
+    }
+
+    /// Remove one of the caller's own RSS feeds (0.34.0).
+    pub fn delete_feed(&mut self, name: String) {
+        self.queue_workflow_write(Operation::DeleteFeed { name });
+    }
+
+    /// Enable or disable a source, or change the URL of the caller's own feed
+    /// (0.34.0).
+    pub fn patch_source(&mut self, name: String, enabled: Option<bool>, url: Option<String>) {
+        self.queue_workflow_write(Operation::PatchSource { name, enabled, url });
+    }
+
+    /// Start one Workflows write. Returns `false` when it was not sent (no
+    /// connection).
+    fn queue_workflow_write(&mut self, operation: Operation) -> bool {
+        if !self.state.connected {
+            return false;
         }
         self.state.workflows_error = None;
-        self.start_request(Operation::RunAllWatchSources);
+        self.start_request(operation);
+        true
     }
 
     /// Ask for one artifact's server-rendered preview (0.28.0). A hash that
@@ -2869,6 +2907,7 @@ impl Session {
         self.check_session_expiry();
         self.poll_events();
         self.receive();
+        self.drain_backlog();
         self.flush_events();
         self.poll_updates();
         self.poll_status();
@@ -3042,6 +3081,37 @@ impl Session {
         }
     }
 
+    /// Keep a request for a later tick. A repeated read replaces the one already
+    /// waiting, so a render that loads the same tab twice does not grow the queue.
+    fn queue_backlog(&mut self, operation: Operation) {
+        let read = matches!(
+            operation,
+            Operation::ListTasks
+                | Operation::TaskPrefs
+                | Operation::TaskSyncStatus
+                | Operation::TaskCalendar { .. }
+                | Operation::Workflows
+                | Operation::Logs { .. }
+        );
+        if read
+            && let Some(slot) = self.backlog.iter_mut().find(|queued| {
+                std::mem::discriminant(*queued) == std::mem::discriminant(&operation)
+            })
+        {
+            *slot = operation;
+            return;
+        }
+        self.backlog.push_back(operation);
+    }
+
+    /// Send the oldest backlogged request. If the queue is still full, it goes
+    /// back in the backlog for the next tick.
+    fn drain_backlog(&mut self) {
+        if let Some(operation) = self.backlog.pop_front() {
+            self.start_request(operation);
+        }
+    }
+
     fn start_request(&mut self, operation: Operation) {
         self.scheduled = None;
         let Some(credentials) = &self.credentials else {
@@ -3081,12 +3151,29 @@ impl Session {
             credentials: Arc::clone(credentials),
             operation,
         };
-        if worker.dispatch(job).is_err() {
-            self.state.error = Some("Network worker unavailable. Reconnect.".into());
-            self.refreshing = false;
-            self.poll_paused = true;
-            self.state.media_previews.fail_in_flight();
-            return;
+        if let Err(error) = worker.dispatch(job) {
+            match *error {
+                // The one-slot queue is busy, not the worker. A plain read or write
+                // waits in the backlog. A request that already recorded state before
+                // dispatch cannot be replayed later, so it reports a busy queue.
+                std::sync::mpsc::TrySendError::Full(job) => {
+                    if has_dispatch_guard(&job.operation) {
+                        self.state.media_previews.fail_in_flight();
+                        self.state.error =
+                            Some("Another request is still running. Try again in a moment.".into());
+                    } else {
+                        self.queue_backlog(job.operation);
+                    }
+                    return;
+                }
+                std::sync::mpsc::TrySendError::Disconnected(_) => {
+                    self.state.error = Some("Network worker unavailable. Reconnect.".into());
+                    self.refreshing = false;
+                    self.poll_paused = true;
+                    self.state.media_previews.fail_in_flight();
+                    return;
+                }
+            }
         }
         self.pending = Some(kind);
         self.next_request = Instant::now() + REQUEST_GAP;
@@ -5259,6 +5346,22 @@ fn model_csv(raw: &str) -> Vec<String> {
 }
 
 /// Current time as Unix seconds. A clock before 1970 reads as 0.
+/// Requests that record state before they are sent (a per-file preview guard,
+/// an in-flight avatar or bot write). Such a request is never replayed from the
+/// backlog, because replaying would find its own state already set.
+fn has_dispatch_guard(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::BotDetail { .. }
+            | Operation::UpdateBotConfig { .. }
+            | Operation::AvatarFetch { .. }
+            | Operation::AvatarUpload { .. }
+            | Operation::AvatarRemove { .. }
+            | Operation::PreviewArtifact { .. }
+            | Operation::DocPreview { .. }
+    )
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -5642,5 +5745,81 @@ mod tests {
         session.cancel_bot_settings();
         assert!(session.bot_settings.draft.tools.is_empty());
         assert!(!session.bot_settings.dirty() && !session.bot_settings.open);
+    }
+}
+
+#[cfg(test)]
+mod backlog_tests {
+    use super::*;
+
+    /// A worker that is busy on its first request: the socket accepts the
+    /// connection and never answers, so the queue fills behind it.
+    #[test]
+    fn a_busy_worker_queue_keeps_requests_for_later_instead_of_failing() {
+        let _guard = crate::creds::test_lock();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let worker = crate::worker::Worker::start().unwrap();
+        let mut session = Session::assemble(
+            String::new(),
+            Theme::Dark,
+            Vec::new(),
+            String::new(),
+            Some(worker),
+        );
+        let endpoint = crate::validate_endpoint(&format!("http://127.0.0.1:{port}")).unwrap();
+        session.credentials = Some(Arc::new(crate::worker::Credentials {
+            endpoint,
+            token: secrecy::SecretString::new("synthetic-backlog-token-0123456789abcdef".into()),
+        }));
+        session.start_request(Operation::ListTasks);
+        session.start_request(Operation::TaskPrefs);
+        session.start_request(Operation::TaskSyncStatus);
+        session.start_request(Operation::Workflows);
+        assert!(session.state.error.is_none(), "{:?}", session.state.error);
+        assert!(!session.backlog.is_empty(), "overflow must wait, not fail");
+        drop(listener);
+    }
+
+    #[test]
+    fn a_repeated_read_replaces_the_waiting_one_of_its_kind() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.queue_backlog(Operation::TaskCalendar {
+            from: "2026-11-01".into(),
+            to: "2026-11-30".into(),
+        });
+        session.queue_backlog(Operation::TaskCalendar {
+            from: "2026-12-01".into(),
+            to: "2026-12-31".into(),
+        });
+        session.queue_backlog(Operation::AddTask {
+            title: "one".into(),
+            due: None,
+        });
+        session.queue_backlog(Operation::AddTask {
+            title: "two".into(),
+            due: None,
+        });
+        // Reads collapse to the latest; writes are never merged away.
+        assert_eq!(session.backlog.len(), 3);
+        match session.backlog.front() {
+            Some(Operation::TaskCalendar { from, .. }) => assert_eq!(from, "2026-12-01"),
+            _ => panic!("the calendar read should be kept, latest first"),
+        }
+    }
+
+    #[test]
+    fn without_a_worker_nothing_is_sent_or_backlogged() {
+        let mut session =
+            Session::assemble(String::new(), Theme::Dark, Vec::new(), String::new(), None);
+        session.credentials = Some(Arc::new(crate::worker::Credentials {
+            endpoint: crate::validate_endpoint("http://127.0.0.1:9").unwrap(),
+            token: secrecy::SecretString::new("synthetic-closed-token-0123456789abcdef".into()),
+        }));
+        // With no worker, requests are not sent at all.
+        session.start_request(Operation::ListTasks);
+        assert!(session.backlog.is_empty());
+        assert!(session.state.error.is_none());
     }
 }

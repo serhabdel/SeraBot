@@ -192,6 +192,25 @@ pub(super) async fn sessions_list(
     Ok(Json(sessions_envelope(&state, sessions)))
 }
 
+/// `POST /v1/browser/sessions/{id}/open`: start this profile's browser when it
+/// is not running, so the owner can open a browser from the Browser page without
+/// an agent. An already running browser is left as it is.
+pub(super) async fn session_open(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    existing_profile(&state, &user, &id)?;
+    let browser = manager(&state)?;
+    browser.open_session(&user.id, &id).await?;
+    session_reply(
+        &state,
+        &user,
+        &id,
+        browser.info(&user.id, &id).await.to_json(),
+    )
+}
+
 pub(super) async fn session_screenshot(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,

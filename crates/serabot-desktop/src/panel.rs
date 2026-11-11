@@ -90,6 +90,8 @@ pub enum PanelOp {
     Takeover(String),
     Handback(String),
     Close(String),
+    /// Start a profile's browser on demand (0.34.0).
+    Open(String),
     Input(String, BrowserInput),
     /// Switch to or close a tab (user in control).
     Tab(String, TabAction),
@@ -183,6 +185,7 @@ impl PanelOp {
             Self::Input(..) | Self::Tab(..) | Self::TabOpen(..) | Self::History(..) => {
                 PanelKind::Input
             }
+            Self::Open(_) => PanelKind::Input,
             Self::ProfilesList => PanelKind::ProfilesList,
             Self::ProfileCreate(_) | Self::ProfileRename { .. } | Self::ProfileDelete(_) => {
                 PanelKind::ProfileChange
@@ -382,6 +385,7 @@ fn execute(job: &PanelJob, cache: &mut Option<ApiClient>) -> Result<PanelReply, 
         PanelOp::Takeover(id) => client.browser_session_takeover(id).map(PanelReply::Control),
         PanelOp::Handback(id) => client.browser_session_handback(id).map(PanelReply::Control),
         PanelOp::Close(id) => client.browser_session_close(id).map(|_| PanelReply::Closed),
+        PanelOp::Open(id) => client.browser_session_open(id).map(PanelReply::Input),
         PanelOp::Input(id, input) => client
             .browser_session_input(id, input)
             .map(PanelReply::Input),
@@ -1084,6 +1088,13 @@ impl PanelState {
 
     /// Close the session on the server. From the dock the panel shuts right
     /// away; on the Browser page the card disappears with the next refresh.
+    /// Start the browser of one profile, so it can be watched and driven from
+    /// the Browser page. Does nothing if that browser is already running.
+    pub fn open_browser(&mut self, id: &str) {
+        self.browser_error = None;
+        self.queue.push_back(PanelOp::Open(id.to_owned()));
+    }
+
     pub fn close_browser(&mut self) {
         let Some(id) = self
             .control_target()

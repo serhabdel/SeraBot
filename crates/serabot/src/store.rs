@@ -4216,6 +4216,42 @@ impl Store {
         Ok(changed == 1)
     }
 
+    /// Change a member's own RSS feed. `None` leaves a field as it is. Returns
+    /// `false` when the caller has no member feed by that name.
+    pub fn update_member_rss_source(
+        &self,
+        user_id: &str,
+        name: &str,
+        enabled: Option<bool>,
+        url: Option<&str>,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE user_sources
+             SET enabled = COALESCE(?1, enabled), url = COALESCE(?2, url), updated_at = ?3
+             WHERE user_id = ?4 AND name = ?5 AND origin = 'member'",
+            params![
+                enabled.map(|value| value as i64),
+                url,
+                now_string(),
+                user_id,
+                name
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Remove the caller's schedule for one routine. Returns `false` if there
+    /// was none. A removed routine can be scheduled again with a PUT.
+    pub fn delete_routine(&self, user_id: &str, name: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "DELETE FROM routines WHERE user_id = ?1 AND name = ?2",
+            params![user_id, name],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Latest run still failing before `cutoff` for one of the configured source names.
     pub fn user_has_stale_failed_sources(
         &self,

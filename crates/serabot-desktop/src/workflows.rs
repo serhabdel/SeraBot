@@ -46,6 +46,8 @@ pub struct MonitoringSource {
     pub kind: String,
     pub enabled: bool,
     pub url: Option<String>,
+    /// A feed this user added, as opposed to an admin-defined one (0.34.0).
+    pub own: bool,
     pub last_run: Option<SourceLastRun>,
 }
 
@@ -136,6 +138,7 @@ fn parse_source(row: &Value) -> Option<MonitoringSource> {
         kind,
         enabled,
         url: opt_str(row, "url", MAX_URL),
+        own: row.get("own").and_then(|v| v.as_bool()).unwrap_or(false),
         last_run,
     })
 }
@@ -196,6 +199,14 @@ pub fn split_schedule_routines(routines: &[Routine]) -> (Option<Routine>, Vec<Ro
 /// Placeholder watch slot names when the server has not created rows yet.
 pub fn default_watch_slot_names() -> Vec<String> {
     (0..3).map(|index| format!("watch_{index}")).collect()
+}
+
+/// Every routine name a member can schedule: the morning brief and the watch
+/// slots. Matches the server's limit of twelve watch slots.
+pub fn member_routine_slots() -> Vec<String> {
+    std::iter::once("morning_brief".to_owned())
+        .chain((0..12).map(|index| format!("watch_{index}")))
+        .collect()
 }
 
 /// Short label for the next run timestamp (shown as-is after trim).

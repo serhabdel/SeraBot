@@ -1,23 +1,34 @@
-//! The Workflows tab (0.29.0, Wave A4): scheduled routines, monitoring source
-//! health and active multi-step plans. Data comes from three read-only APIs
-//! loaded through the session worker, not from the chat composer.
+//! The Workflows tab (0.29.0, Wave A4; manage actions 0.34.0): scheduled
+//! routines, monitoring source health and active multi-step plans. Reads and
+//! writes both go through the session worker.
 
 use crate::ui::Icon;
 use crate::ui_files::copy_script;
 use dioxus::prelude::*;
 use serabot_desktop::session::Session;
-use serabot_desktop::workflows::{self, ActiveWorkflow, MonitoringSource, Routine};
+use serabot_desktop::workflows::{
+    self, ActiveWorkflow, MonitoringSource, Routine, member_routine_slots,
+};
 
+/// Turn-on, turn-off, run, edit time and delete for one routine.
 #[component]
-fn RoutineRow(routine: Routine) -> Element {
+fn RoutineRow(session: Signal<Session>, routine: Routine) -> Element {
+    let mut session = session;
+    let mut confirming = use_signal(|| false);
+    let mut time = use_signal(|| routine.time.clone().unwrap_or_default());
     let schedule = match (&routine.time, &routine.timezone) {
         (Some(time), Some(tz)) => format!("{time} ({tz})"),
         (Some(time), None) => time.clone(),
         _ => "—".into(),
     };
     let status = if routine.enabled { "On" } else { "Off" };
+    let toggle_name = routine.name.clone();
+    let toggle_to = !routine.enabled;
+    let run_name = routine.name.clone();
+    let time_name = routine.name.clone();
+    let delete_name = routine.name.clone();
     rsx! {
-        div { class: "wf-row", role: "listitem",
+        div { class: "wf-row wf-row-routine", role: "listitem",
             span { class: "wf-name", title: "{routine.name}", "{routine.name}" }
             span { class: "wf-meta", "{schedule}" }
             span { class: if routine.enabled { "wf-pill ok" } else { "wf-pill muted" }, "{status}" }
@@ -27,12 +38,62 @@ fn RoutineRow(routine: Routine) -> Element {
             if let Some(last) = routine.last_run_for.as_deref() {
                 span { class: "wf-meta", "Last {last}" }
             }
+            div { class: "wf-actions",
+                button { class: "btn ghost sm", r#type: "button",
+                    onclick: move |_| session.write().save_workflow_routine(toggle_name.clone(), Some(toggle_to), None, None),
+                    if routine.enabled { "Turn off" } else { "Turn on" }
+                }
+                button { class: "btn ghost sm", r#type: "button",
+                    onclick: move |_| session.write().run_workflow_routine(run_name.clone()),
+                    "Run now"
+                }
+                input {
+                    class: "wf-time",
+                    r#type: "time",
+                    "aria-label": "Time for {routine.name}",
+                    value: "{time}",
+                    oninput: move |e| time.set(e.value()),
+                }
+                button { class: "btn ghost sm", r#type: "button",
+                    onclick: move |_| {
+                        let value = time.read().trim().to_owned();
+                        if !value.is_empty() {
+                            session.write().save_workflow_routine(time_name.clone(), None, Some(value), None);
+                        }
+                    },
+                    "Save time"
+                }
+                if *confirming.read() {
+                    button { class: "btn danger sm", r#type: "button",
+                        onclick: move |_| {
+                            confirming.set(false);
+                            session.write().delete_workflow_routine(delete_name.clone());
+                        },
+                        "Confirm delete"
+                    }
+                    button { class: "btn ghost sm", r#type: "button",
+                        onclick: move |_| confirming.set(false),
+                        "Keep"
+                    }
+                } else {
+                    button { class: "btn ghost sm", r#type: "button",
+                        onclick: move |_| confirming.set(true),
+                        "Delete"
+                    }
+                }
+            }
         }
     }
 }
 
+/// Enable or disable a source. The caller's own feed also takes a new URL and
+/// can be removed.
 #[component]
-fn SourceRow(source: MonitoringSource) -> Element {
+fn SourceRow(session: Signal<Session>, source: MonitoringSource) -> Element {
+    let mut session = session;
+    let mut confirming = use_signal(|| false);
+    let mut editing = use_signal(|| false);
+    let mut url_draft = use_signal(|| source.url.clone().unwrap_or_default());
     let when = source
         .last_run
         .as_ref()
@@ -51,8 +112,12 @@ fn SourceRow(source: MonitoringSource) -> Element {
         Some(false) => "wf-pill err",
         None => "wf-pill muted",
     };
+    let toggle_name = source.name.clone();
+    let toggle_to = !source.enabled;
+    let edit_name = source.name.clone();
+    let delete_name = source.name.clone();
     rsx! {
-        div { class: "wf-row", role: "listitem",
+        div { class: "wf-row wf-row-source", role: "listitem",
             div { class: "wf-name-col",
                 span { class: "wf-name", title: "{source.name}", "{source.name}" }
                 match source.url.clone() {
@@ -84,6 +149,55 @@ fn SourceRow(source: MonitoringSource) -> Element {
                 if source.enabled { "Enabled" } else { "Disabled" }
             }
             span { class: "{status_class}", title: "{status}", "{status}" }
+            div { class: "wf-actions",
+                button { class: "btn ghost sm", r#type: "button",
+                    onclick: move |_| session.write().patch_source(toggle_name.clone(), Some(toggle_to), None),
+                    if source.enabled { "Disable" } else { "Enable" }
+                }
+                if source.own {
+                    button { class: "btn ghost sm", r#type: "button",
+                        onclick: move |_| editing.toggle(),
+                        if *editing.read() { "Close" } else { "Edit URL" }
+                    }
+                    if *editing.read() {
+                        input {
+                            class: "wf-url-input",
+                            r#type: "url",
+                            "aria-label": "Feed URL for {edit_name}",
+                            value: "{url_draft}",
+                            oninput: move |e| url_draft.set(e.value()),
+                        }
+                        button { class: "btn primary sm", r#type: "button",
+                            onclick: move |_| {
+                                let value = url_draft.read().trim().to_owned();
+                                if !value.is_empty() {
+                                    editing.set(false);
+                                    session.write().patch_source(edit_name.clone(), None, Some(value));
+                                }
+                            },
+                            "Save URL"
+                        }
+                    }
+                    if *confirming.read() {
+                        button { class: "btn danger sm", r#type: "button",
+                            onclick: move |_| {
+                                confirming.set(false);
+                                session.write().delete_feed(delete_name.clone());
+                            },
+                            "Confirm delete"
+                        }
+                        button { class: "btn ghost sm", r#type: "button",
+                            onclick: move |_| confirming.set(false),
+                            "Keep"
+                        }
+                    } else {
+                        button { class: "btn ghost sm", r#type: "button",
+                            onclick: move |_| confirming.set(true),
+                            "Delete"
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -109,6 +223,9 @@ fn ActiveRow(plan: ActiveWorkflow, conversation: Option<String>) -> Element {
 #[component]
 pub fn WorkflowsView(session: Signal<Session>) -> Element {
     let mut session = session;
+    let mut new_slot = use_signal(String::new);
+    let mut new_feed_name = use_signal(String::new);
+    let mut new_feed_url = use_signal(String::new);
     let state = session.read();
     let snapshot = state.state.workflows.clone();
     let loaded = state.state.workflows_loaded;
@@ -122,6 +239,21 @@ pub fn WorkflowsView(session: Signal<Session>) -> Element {
         .map(|c| (c.id.clone(), state.conversation_label(c)))
         .collect();
     drop(state);
+    // Routine slots not yet scheduled, offered in the add form.
+    let free_slots: Vec<String> = member_routine_slots()
+        .into_iter()
+        .filter(|slot| {
+            !snapshot
+                .routines
+                .iter()
+                .any(|routine| &routine.name == slot)
+        })
+        .collect();
+    let selected_slot = if free_slots.contains(&new_slot.read()) {
+        new_slot.read().clone()
+    } else {
+        free_slots.first().cloned().unwrap_or_default()
+    };
     rsx! {
         div { class: "pane",
             div { class: "pane-head",
@@ -131,11 +263,20 @@ pub fn WorkflowsView(session: Signal<Session>) -> Element {
                         "Your scheduled routines, watcher source health and in-progress plans."
                     }
                 }
-                button {
-                    class: "btn ghost sm",
-                    onclick: move |_| session.write().refresh_workflows(),
-                    Icon { name: "refresh", size: 14 }
-                    "Refresh"
+                div { class: "pane-actions",
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        onclick: move |_| session.write().run_all_watch_sources(),
+                        "Check sources now"
+                    }
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        onclick: move |_| session.write().refresh_workflows(),
+                        Icon { name: "refresh", size: 14 }
+                        "Refresh"
+                    }
                 }
             }
             if let Some(message) = error.as_ref() {
@@ -151,12 +292,38 @@ pub fn WorkflowsView(session: Signal<Session>) -> Element {
                             p { class: "muted", role: "status",
                                 "This server does not expose /v1/routines yet."
                             }
-                        } else if snapshot.routines.is_empty() {
-                            p { class: "muted", role: "status", "No routines configured." }
                         } else {
-                            div { class: "wf-list", role: "list",
-                                for routine in snapshot.routines.clone() {
-                                    RoutineRow { key: "{routine.name}", routine }
+                            if snapshot.routines.is_empty() {
+                                p { class: "muted", role: "status", "No routines configured." }
+                            } else {
+                                div { class: "wf-list", role: "list",
+                                    for routine in snapshot.routines.clone() {
+                                        RoutineRow { key: "{routine.name}", session, routine }
+                                    }
+                                }
+                            }
+                            if !free_slots.is_empty() {
+                                form {
+                                    class: "wf-form",
+                                    "aria-label": "Add a routine",
+                                    onsubmit: move |event| {
+                                        event.prevent_default();
+                                        let slot = selected_slot.clone();
+                                        if !slot.is_empty() {
+                                            session.write().save_workflow_routine(slot, Some(true), None, None);
+                                        }
+                                    },
+                                    label { class: "wf-field",
+                                        span { "Add a routine" }
+                                        select {
+                                            "aria-label": "Routine to add",
+                                            onchange: move |e| new_slot.set(e.value()),
+                                            for slot in free_slots.clone() {
+                                                option { value: "{slot}", selected: slot == selected_slot, "{slot}" }
+                                            }
+                                        }
+                                    }
+                                    button { class: "btn primary sm", r#type: "submit", "Turn on" }
                                 }
                             }
                         }
@@ -167,13 +334,47 @@ pub fn WorkflowsView(session: Signal<Session>) -> Element {
                             p { class: "muted", role: "status",
                                 "This server does not expose /v1/monitoring/sources yet."
                             }
-                        } else if snapshot.sources.is_empty() {
-                            p { class: "muted", role: "status", "No watcher sources configured." }
                         } else {
-                            div { class: "wf-list", role: "list",
-                                for source in snapshot.sources.clone() {
-                                    SourceRow { key: "{source.name}", source }
+                            if snapshot.sources.is_empty() {
+                                p { class: "muted", role: "status", "No watcher sources configured." }
+                            } else {
+                                div { class: "wf-list", role: "list",
+                                    for source in snapshot.sources.clone() {
+                                        SourceRow { key: "{source.name}", session, source }
+                                    }
                                 }
+                            }
+                            form {
+                                class: "wf-form",
+                                "aria-label": "Add an RSS feed",
+                                onsubmit: move |event| {
+                                    event.prevent_default();
+                                    let name = new_feed_name.read().trim().to_owned();
+                                    let url = new_feed_url.read().trim().to_owned();
+                                    if !name.is_empty() && !url.is_empty() {
+                                        session.write().add_feed(name, url);
+                                        new_feed_name.set(String::new());
+                                        new_feed_url.set(String::new());
+                                    }
+                                },
+                                label { class: "wf-field",
+                                    span { "Feed name" }
+                                    input {
+                                        r#type: "text",
+                                        maxlength: "128",
+                                        value: "{new_feed_name}",
+                                        oninput: move |e| new_feed_name.set(e.value()),
+                                    }
+                                }
+                                label { class: "wf-field wf-field-wide",
+                                    span { "RSS URL" }
+                                    input {
+                                        r#type: "url",
+                                        value: "{new_feed_url}",
+                                        oninput: move |e| new_feed_url.set(e.value()),
+                                    }
+                                }
+                                button { class: "btn primary sm", r#type: "submit", "Add feed" }
                             }
                         }
                     }

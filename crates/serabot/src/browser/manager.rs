@@ -468,6 +468,12 @@ impl BrowserManager {
     }
 
     /// Lease for owner input; only while the user holds control.
+    /// Start the profile's browser if none is running. Used by the owner's
+    /// Browser page; a running browser is returned unchanged.
+    pub async fn open_session(&self, user_id: &str, profile_id: &str) -> Result<()> {
+        self.launch(user_id, profile_id).await.map(|_| ())
+    }
+
     pub async fn user_lease(&self, user_id: &str, profile_id: &str) -> Result<Lease> {
         let session = self
             .live_session(user_id, profile_id)
