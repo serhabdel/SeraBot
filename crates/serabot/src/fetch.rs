@@ -29,6 +29,35 @@ const MAX_REDIRECTS: usize = 3;
 /// Status codes that are handled as redirects when a `Location` header exists.
 const REDIRECT_STATUSES: [u16; 5] = [301, 302, 303, 307, 308];
 
+/// Attempts for one GET when the connection fails before any response arrives.
+const SEND_ATTEMPTS: u32 = 3;
+
+/// Wait before the first connection retry; each later retry waits twice as long.
+const SEND_RETRY_BASE: Duration = Duration::from_millis(250);
+
+/// Send a GET, retrying connect failures, timeouts and connections dropped
+/// before a response. A GET has no body and no side effect, so repeating it is
+/// safe. Any response, including an error status, is returned at once.
+async fn send_get(
+    client: &Client,
+    url: &Url,
+) -> std::result::Result<reqwest::Response, reqwest::Error> {
+    let mut attempt = 1;
+    loop {
+        match client.get(url.clone()).send().await {
+            Ok(response) => return Ok(response),
+            Err(error)
+                if attempt < SEND_ATTEMPTS
+                    && (error.is_connect() || error.is_timeout() || error.is_request()) =>
+            {
+                tokio::time::sleep(SEND_RETRY_BASE * 2u32.pow(attempt - 1)).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// A successfully retrieved HTTP response.
 #[derive(Debug, Clone, Serialize)]
 pub struct FetchedPage {
@@ -122,10 +151,7 @@ impl SafeFetcher {
         let mut redirects = 0usize;
 
         loop {
-            let response = self
-                .client
-                .get(current.clone())
-                .send()
+            let response = send_get(&self.client, &current)
                 .await
                 .map_err(|error| SeraError::External(format!("fetch {current}: {error}")))?;
             let status = response.status();
@@ -374,6 +400,52 @@ mod tests {
         let uri = Url::parse(&server.uri()).unwrap();
         let port = uri.port().unwrap();
         format!("http://localhost:{port}{path}")
+    }
+
+    #[tokio::test]
+    async fn a_connection_dropped_before_a_response_is_retried() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // The first connection is closed with no reply; the retry gets a 200.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (dropped, _) = listener.accept().await.unwrap();
+            drop(dropped);
+            let (mut served, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 1024];
+            let _ = served.read(&mut head).await;
+            served
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let page = fetcher(1024)
+            .fetch(&format!("http://localhost:{port}/page"))
+            .await
+            .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(page.status, 200);
+        assert_eq!(page.body, "ok");
+    }
+
+    #[tokio::test]
+    async fn an_error_status_is_returned_without_retrying_in_the_fetcher() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/busy"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let page = fetcher(1024)
+            .fetch(&localhost_url(&server, "/busy"))
+            .await
+            .unwrap();
+
+        assert_eq!(page.status, 503);
     }
 
     #[tokio::test]

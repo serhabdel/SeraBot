@@ -14,6 +14,7 @@ use chrono_tz::Europe::Rome;
 const SECRET_PROBE: &str = "synthetic-a8-probe-token";
 const BEARER_SHAPED: &str = "Bearer abcdef0123456789abcdef";
 const ADMIN_SOURCE: &str = "a8-admin-source";
+const ADMIN_FEED_URL: &str = "https://example.invalid/a8-feed?access=a8-feed-key";
 
 async fn send(app: &Router, token: &str, method: &str, uri: &str, body: Option<Value>) -> Response {
     app.clone()
@@ -45,7 +46,7 @@ async fn a8_smoke_steps_one_to_seven_hold_for_admin_and_member() {
     std::fs::write(
         base.join("config").join("sources.toml"),
         format!(
-            "[[sources]]\nname = \"{ADMIN_SOURCE}\"\nurl = \"https://example.invalid/a8-feed\"\nenabled = true\n"
+            "[[sources]]\nname = \"{ADMIN_SOURCE}\"\nurl = \"{ADMIN_FEED_URL}\"\nenabled = true\n"
         ),
     )
     .unwrap();
@@ -107,6 +108,10 @@ async fn a8_smoke_steps_one_to_seven_hold_for_admin_and_member() {
     assert!(
         sources.to_string().contains(ADMIN_SOURCE),
         "admin source health row missing: {sources}"
+    );
+    assert_eq!(
+        sources["sources"][0]["url"], ADMIN_FEED_URL,
+        "admin must see the feed URL: {sources}"
     );
 
     // Step 2 — Jobs: the queued task is listed, and traces are reachable from it.
@@ -219,6 +224,15 @@ async fn a8_smoke_steps_one_to_seven_hold_for_admin_and_member() {
     // run status (last run, error text) must not.
     let member_sources = ok_json(&app, &member_token, "/v1/monitoring/sources").await;
     let member_rows = member_sources["sources"].as_array().unwrap();
+    assert_eq!(member_rows[0]["name"], ADMIN_SOURCE, "{member_sources}");
+    assert!(
+        member_rows.iter().all(|row| row["url"].is_null()),
+        "feed URL must be redacted for a member: {member_sources}"
+    );
+    assert!(
+        !member_sources.to_string().contains(ADMIN_FEED_URL),
+        "feed URL leaked to member: {member_sources}"
+    );
     assert!(
         member_rows.iter().all(|row| row["last_run"].is_null()),
         "admin run status leaked to member: {member_sources}"
@@ -234,12 +248,58 @@ async fn a8_smoke_steps_one_to_seven_hold_for_admin_and_member() {
     );
 
     // Step 7 — Member Usage: no health card; admin-only views answer 403.
-    let member_status = send(&app, &member_token, "GET", "/v1/admin/status", None).await;
-    assert_eq!(member_status.status(), StatusCode::FORBIDDEN);
-    let member_logs = send(&app, &member_token, "GET", "/v1/logs", None).await;
-    assert_eq!(member_logs.status(), StatusCode::FORBIDDEN);
+    for uri in ["/v1/admin/status", "/v1/logs", "/v1/admin/grants"] {
+        let member_denied = send(&app, &member_token, "GET", uri, None).await;
+        assert_eq!(
+            member_denied.status(),
+            StatusCode::FORBIDDEN,
+            "member must get 403 from admin-only {uri}"
+        );
+    }
     let member_usage = ok_json(&app, &member_token, "/v1/usage").await;
     assert_eq!(member_usage["scope"], "me", "{member_usage}");
     assert!(member_usage.get("uptime_secs").is_none(), "{member_usage}");
     assert!(member_usage.get("storage").is_none(), "{member_usage}");
+
+    // No secrets in responses. Every body a member can read, error bodies included,
+    // lacks the probe secret, the admin's bearer token, the bearer-shaped probe and
+    // the admin feed URL. The admin's own views also never echo a bearer token.
+    let member_views = [
+        "/v1/routines",
+        "/v1/workflows/active",
+        "/v1/monitoring/sources",
+        "/v1/jobs",
+        "/v1/usage",
+        "/v1/admin/status",
+        "/v1/logs",
+        "/v1/admin/grants",
+    ];
+    let mut member_bodies = String::new();
+    for uri in member_views {
+        let response = send(&app, &member_token, "GET", uri, None).await;
+        member_bodies.push_str(&read_body(response).await);
+    }
+    for secret in [
+        SECRET_PROBE,
+        BEARER_SHAPED,
+        admin_token.as_str(),
+        member_token.as_str(),
+        ADMIN_FEED_URL,
+    ] {
+        assert!(
+            !member_bodies.contains(secret),
+            "secret leaked into a member response: {secret}"
+        );
+    }
+    let mut admin_bodies = String::new();
+    for uri in ["/v1/monitoring/sources", "/v1/admin/status", "/v1/vault"] {
+        let response = send(&app, &admin_token, "GET", uri, None).await;
+        admin_bodies.push_str(&read_body(response).await);
+    }
+    for secret in [SECRET_PROBE, admin_token.as_str(), member_token.as_str()] {
+        assert!(
+            !admin_bodies.contains(secret),
+            "secret leaked into an admin response: {secret}"
+        );
+    }
 }

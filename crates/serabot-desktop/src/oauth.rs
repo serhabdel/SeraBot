@@ -119,6 +119,8 @@ pub fn redirect_uri(port: u16) -> String {
 
 /// Wait for the provider redirect and return its authorization code. Requests
 /// for any other path are answered 404 and ignored; a wrong state is refused.
+/// Like [`wait_for_auth_done`], the wait gives up after [`MAX_IGNORED_REQUESTS`]
+/// ignored requests, so a stray local client cannot hold it open.
 pub fn wait_for_callback(
     listener: &TcpListener,
     expected_state: &str,
@@ -128,11 +130,16 @@ pub fn wait_for_callback(
         .set_nonblocking(true)
         .map_err(|_| OAuthError::Listen)?;
     let deadline = Instant::now() + timeout;
+    let mut ignored = 0usize;
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
                 if let Some(result) = handle_connection(stream, expected_state) {
                     return result;
+                }
+                ignored += 1;
+                if ignored >= MAX_IGNORED_REQUESTS {
+                    return Err(OAuthError::TooManyRequests);
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -593,6 +600,23 @@ mod tests {
             get(port, "/somewhere-else");
         }
         assert_eq!(waiter.join().unwrap(), Err(OAuthError::TooManyRequests));
+    }
+
+    #[test]
+    fn callback_gives_up_after_the_ignored_request_budget() {
+        let (listener, port) = bind_loopback().unwrap();
+        // The wait must run while the requests arrive: each `get` blocks on its reply.
+        let waiter = std::thread::spawn(move || {
+            wait_for_callback(&listener, "expected-state", Duration::from_secs(10))
+        });
+        for _ in 0..MAX_IGNORED_REQUESTS {
+            get(port, "/somewhere-else");
+        }
+        let result = waiter.join().unwrap();
+        assert!(
+            matches!(result, Err(OAuthError::TooManyRequests)),
+            "{result:?}"
+        );
     }
 
     #[test]

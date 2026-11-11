@@ -43,6 +43,11 @@ pub struct Settings {
     /// a stored value is clamped to 1–15 minutes when it is read or written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sign_in_timeout_secs: Option<u64>,
+    /// Unix seconds when the saved session ends, as the server reported it at
+    /// sign-in. Not a secret: the token itself stays in the credential store,
+    /// and this value is what lets an expired token be rejected on load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_expires_at: Option<u64>,
 }
 
 /// The stored sign-in wait, kept inside the range the sign-in accepts.
@@ -189,6 +194,7 @@ pub fn load_settings_from(dir: &Path) -> Settings {
         .filter(|pins| !pins.is_empty());
     let prefs = settings.prefs.map(UiPrefs::sanitized);
     let sign_in_timeout_secs = sanitize_timeout(settings.sign_in_timeout_secs);
+    let session_expires_at = settings.session_expires_at.filter(|at| *at > 0);
     match validate_endpoint(settings.server.trim()) {
         Ok(url) => Settings {
             server: url.origin().ascii_serialization(),
@@ -196,6 +202,7 @@ pub fn load_settings_from(dir: &Path) -> Settings {
             pins,
             prefs,
             sign_in_timeout_secs,
+            session_expires_at,
         },
         Err(_) => Settings {
             server: String::new(),
@@ -203,6 +210,7 @@ pub fn load_settings_from(dir: &Path) -> Settings {
             pins,
             prefs,
             sign_in_timeout_secs,
+            session_expires_at,
         },
     }
 }
@@ -228,6 +236,7 @@ pub fn save_settings_to(dir: &Path, settings: &Settings) -> Result<(), String> {
             .filter(|pins| !pins.is_empty()),
         prefs: settings.prefs.clone().map(UiPrefs::sanitized),
         sign_in_timeout_secs: sanitize_timeout(settings.sign_in_timeout_secs),
+        session_expires_at: settings.session_expires_at.filter(|at| *at > 0),
     })
     .map_err(|_| "Could not encode settings.".to_owned())?;
     fs::create_dir_all(dir).map_err(|_| "Could not create the settings directory.".to_owned())?;
@@ -257,6 +266,66 @@ pub fn save_token(token: &str) -> Result<(), String> {
 /// Remove the stored session token. Missing entries are not an error.
 pub fn forget_token() -> Result<(), String> {
     delete_token()
+}
+
+/// Store a session token together with the expiry the server reported. `None`
+/// means the expiry is unknown (a token typed in by hand), so none is kept.
+pub fn save_session(token: &str, expires_at: Option<u64>) -> Result<(), String> {
+    save_session_in(settings_dir().as_deref(), token, expires_at)
+}
+
+/// Load the stored session token for a session that is still running at `now`
+/// (Unix seconds). A token whose recorded expiry has passed is deleted and not
+/// returned, so a stale session never reconnects on its own.
+pub fn load_session(now: u64) -> Option<SecretString> {
+    load_session_in(settings_dir().as_deref(), now)
+}
+
+/// Remove the stored token and its recorded expiry.
+pub fn forget_session() -> Result<(), String> {
+    let cleared = forget_token();
+    if let Some(dir) = settings_dir() {
+        // A failed settings write leaves only a stale date with no token behind it.
+        let _ = clear_session_expiry_in(&dir);
+    }
+    cleared
+}
+
+fn save_session_in(dir: Option<&Path>, token: &str, expires_at: Option<u64>) -> Result<(), String> {
+    save_token(token)?;
+    match dir {
+        Some(dir) => write_session_expiry(dir, expires_at),
+        None => Ok(()),
+    }
+}
+
+fn load_session_in(dir: Option<&Path>, now: u64) -> Option<SecretString> {
+    if let Some(dir) = dir {
+        let expired = load_settings_from(dir)
+            .session_expires_at
+            .is_some_and(|at| now >= at);
+        if expired {
+            let _ = forget_token();
+            let _ = clear_session_expiry_in(dir);
+            return None;
+        }
+    }
+    load_token()
+}
+
+/// Drop a recorded expiry. Writes only when one is stored, so a device with no
+/// saved expiry never has its settings file rewritten.
+fn clear_session_expiry_in(dir: &Path) -> Result<(), String> {
+    if load_settings_from(dir).session_expires_at.is_none() {
+        return Ok(());
+    }
+    write_session_expiry(dir, None)
+}
+
+fn write_session_expiry(dir: &Path, expires_at: Option<u64>) -> Result<(), String> {
+    let mut settings = load_settings_from(dir);
+    settings.session_expires_at = expires_at.filter(|at| *at > 0);
+    save_settings_to(dir, &settings)
 }
 
 /// Server origin to prefill when no saved settings exist.
@@ -386,6 +455,7 @@ mod tests {
                 pins: Some(vec!["dir:analyst".into(), "room:review".into()]),
                 prefs: None,
                 sign_in_timeout_secs: Some(10),
+                session_expires_at: None,
             },
         )
         .unwrap();
@@ -397,6 +467,7 @@ mod tests {
                 pins: Some(vec!["dir:analyst".into(), "room:review".into()]),
                 prefs: None,
                 sign_in_timeout_secs: Some(60),
+                session_expires_at: None,
             }
         );
         let text = fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
@@ -412,6 +483,7 @@ mod tests {
                 pins: None,
                 prefs: None,
                 sign_in_timeout_secs: None,
+                session_expires_at: None,
             },
         )
         .unwrap();
@@ -437,6 +509,7 @@ mod tests {
                 pins: None,
                 prefs: Some(prefs.clone()),
                 sign_in_timeout_secs: None,
+                session_expires_at: None,
             },
         )
         .unwrap();
@@ -472,6 +545,7 @@ mod tests {
                 ]),
                 prefs: None,
                 sign_in_timeout_secs: None,
+                session_expires_at: None,
             },
         )
         .unwrap();
@@ -595,6 +669,7 @@ mod tests {
             pins: None,
             prefs: None,
             sign_in_timeout_secs: None,
+            session_expires_at: None,
         };
         // Invalid saved origins fall back to the optional compiled hint.
         assert_eq!(prefill_server(&settings), default_server_url());
@@ -613,6 +688,68 @@ mod tests {
         // Idempotent: clearing an absent credential succeeds.
         forget_token().unwrap();
         assert!(stored_token().is_none());
+    }
+
+    #[test]
+    fn expired_session_is_rejected_and_cleared_on_load() {
+        let _guard = test_lock();
+        let dir = temp_dir("session-expired");
+        let token = "synthetic-session-token-0000000000000000";
+        save_session_in(Some(&dir), token, Some(1_000)).unwrap();
+        assert_eq!(load_settings_from(&dir).session_expires_at, Some(1_000));
+
+        // Still running before the recorded expiry.
+        let loaded = load_session_in(Some(&dir), 999).unwrap();
+        assert_eq!(loaded.expose_secret(), token);
+
+        // At and after the recorded expiry: refused, deleted, and the date cleared.
+        assert!(load_session_in(Some(&dir), 1_000).is_none());
+        assert!(stored_token().is_none());
+        assert_eq!(load_settings_from(&dir).session_expires_at, None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn session_without_a_recorded_expiry_still_loads() {
+        let _guard = test_lock();
+        let dir = temp_dir("session-unknown-expiry");
+        let token = "synthetic-session-token-1111111111111111";
+        save_session_in(Some(&dir), token, None).unwrap();
+        assert!(load_settings_from(&dir).session_expires_at.is_none());
+        let loaded = load_session_in(Some(&dir), u64::MAX).unwrap();
+        assert_eq!(loaded.expose_secret(), token);
+        forget_token().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn manual_token_save_clears_a_stale_expiry() {
+        let _guard = test_lock();
+        let dir = temp_dir("session-manual-save");
+        save_session_in(
+            Some(&dir),
+            "synthetic-first-token-2222222222222222",
+            Some(5_000),
+        )
+        .unwrap();
+        save_session_in(Some(&dir), "synthetic-second-token-333333333333333", None).unwrap();
+        assert_eq!(load_settings_from(&dir).session_expires_at, None);
+        // The new token is not refused as expired even though the old date is past.
+        assert!(load_session_in(Some(&dir), 9_999).is_some());
+        forget_token().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_zero_recorded_expiry_is_treated_as_unknown() {
+        let dir = temp_dir("session-zero-expiry");
+        fs::write(
+            dir.join(SETTINGS_FILE),
+            r#"{"server":"","session_expires_at":0}"#,
+        )
+        .unwrap();
+        assert_eq!(load_settings_from(&dir).session_expires_at, None);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

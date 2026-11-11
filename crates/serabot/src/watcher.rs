@@ -15,6 +15,7 @@
 
 use std::collections::HashSet;
 use std::io::Cursor;
+use std::time::Duration;
 
 use chrono::{
     DateTime, MappedLocalTime, NaiveDate, NaiveDateTime, NaiveTime, SecondsFormat, TimeZone, Utc,
@@ -31,7 +32,7 @@ use unicode_normalization::char::is_combining_mark;
 use crate::config::{Config, SourceConfig};
 use crate::domain::{new_id, utc_now};
 use crate::error::{Result, SeraError};
-use crate::fetch::SafeFetcher;
+use crate::fetch::{FetchedPage, SafeFetcher};
 use crate::store::Store;
 use crate::util::{sha256_hex, truncate_chars};
 
@@ -138,6 +139,32 @@ pub async fn watch_all(
     Ok(reports)
 }
 
+/// Attempts for one source page, the first included.
+const FETCH_ATTEMPTS: u32 = 3;
+
+/// Wait before the first retry of a source page; each later retry waits twice as long.
+const FETCH_RETRY_BASE: Duration = Duration::from_millis(500);
+
+/// Statuses that often clear on their own: rate limiting and upstream overload.
+fn transient_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+/// Fetch a source page, retrying transient HTTP statuses with exponential
+/// backoff. Returns the last page and how many attempts were made. Connection
+/// retries happen inside [`SafeFetcher::fetch`]; other errors return at once.
+async fn fetch_source_page(fetcher: &SafeFetcher, url: &str) -> Result<(FetchedPage, u32)> {
+    let mut attempt = 1;
+    loop {
+        let page = fetcher.fetch(url).await?;
+        if !transient_status(page.status) || attempt >= FETCH_ATTEMPTS {
+            return Ok((page, attempt));
+        }
+        tokio::time::sleep(FETCH_RETRY_BASE * 2u32.pow(attempt - 1)).await;
+        attempt += 1;
+    }
+}
+
 /// Fetch, parse and persist a single source for the acting user.
 ///
 /// Source-level fetch/parse failures are recorded with `ok = 0` in the acting
@@ -172,8 +199,8 @@ pub async fn watch_source(
         ..WatchReport::default()
     };
 
-    let page = match fetcher.fetch(&source.url).await {
-        Ok(page) => page,
+    let (page, attempts) = match fetch_source_page(fetcher, &source.url).await {
+        Ok(fetched) => fetched,
         Err(error) => {
             let message = format!("fetch failed: {error}");
             finish_source_run(store, user_id, &run_id, false, 0, Some(&message))?;
@@ -184,7 +211,14 @@ pub async fn watch_source(
     };
 
     if !(200..300).contains(&page.status) {
-        let message = format!("unexpected HTTP status {}", page.status);
+        let message = if attempts > 1 {
+            format!(
+                "unexpected HTTP status {} after {attempts} attempts",
+                page.status
+            )
+        } else {
+            format!("unexpected HTTP status {}", page.status)
+        };
         finish_source_run(store, user_id, &run_id, false, 0, Some(&message))?;
         report.failed = 1;
         report.warn(message);
@@ -898,6 +932,65 @@ mod tests {
         SafeFetcher::new("SeraBot-test/0.1", 5, 2 * 1024 * 1024)
             .unwrap()
             .allow_insecure_localhost()
+    }
+
+    #[tokio::test]
+    async fn a_busy_source_is_retried_until_it_answers() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/feed"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/feed"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<rss></rss>"))
+            .mount(&server)
+            .await;
+
+        let (page, attempts) = fetch_source_page(&fetcher(), &server_url(&server, "/feed"))
+            .await
+            .unwrap();
+
+        assert_eq!(page.status, 200);
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn a_source_that_stays_down_stops_at_the_attempt_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/feed"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(u64::from(FETCH_ATTEMPTS))
+            .mount(&server)
+            .await;
+
+        let (page, attempts) = fetch_source_page(&fetcher(), &server_url(&server, "/feed"))
+            .await
+            .unwrap();
+
+        assert_eq!(page.status, 503);
+        assert_eq!(attempts, FETCH_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn a_missing_source_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/gone"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (page, attempts) = fetch_source_page(&fetcher(), &server_url(&server, "/gone"))
+            .await
+            .unwrap();
+
+        assert_eq!(page.status, 404);
+        assert_eq!(attempts, 1);
     }
 
     fn server_url(server: &MockServer, path: &str) -> String {
