@@ -390,6 +390,27 @@ mod tests {
     }
 
     #[test]
+    fn composer_layout_rules_stay_in_place() {
+        // Guards the PR-I fix: a column container, a full-width borderless text
+        // area (no focus outline of its own), a toolbar row, and the hint kept
+        // out of the container.
+        let css = include_str!("../assets/foundation.css");
+        for needle in [
+            ".composer-wrap .composer {\n  display: flex;\n  flex-direction: column;",
+            ".composer-wrap .composer .composer-input:focus-visible",
+            "outline: none;",
+            ".composer-wrap .composer .composer-row {",
+            "margin-left: auto;",
+            ".composer-wrap .composer-hint {",
+            "max-height: 40vh;",
+            "max-height: 70vh;",
+            "min-height: 72px;",
+        ] {
+            assert!(css.contains(needle), "missing composer rule: {needle}");
+        }
+    }
+
+    #[test]
     fn slash_actions_match_by_command_or_description() {
         assert_eq!(slash_actions("").len(), SLASH_ACTIONS.len());
         assert_eq!(slash_actions("att")[0].2, SlashAction::Attach);
