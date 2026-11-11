@@ -6,9 +6,11 @@
 //! worker (`panel.rs`); this file only draws and forwards clicks.
 
 use crate::ui::Icon;
+use crate::ui_widgets::{SecretField, StatusChip};
 use dioxus::prelude::*;
 use serabot_desktop::panel::last_used_label;
 use serabot_desktop::session::Session;
+use serabot_desktop::theme::Tone;
 use serabot_desktop::{
     PasswordManager, PasswordManagerProbe, VaultEntry, VaultKind, VaultPendingSecret, VaultSource,
 };
@@ -711,11 +713,42 @@ fn ConnectedProviderStatus(
             if let Some(count) = entry_count {
                 span { class: "chip", "{entries_label(count)}" }
             }
-            if let Some(PasswordManagerProbe { ok, message, .. }) = probe {
-                span {
-                    class: if ok { "tiny ok" } else { "tiny err" },
-                    "Last test: {message}"
-                }
+            if let Some(probe) = probe {
+                ProbeResult { probe, prefix: "Last test".to_owned() }
+            }
+        }
+    }
+}
+
+/// The Test result as a status chip (passed or failed) with the server's
+/// short message beside it. Never shows a token or a value.
+#[component]
+fn ProbeResult(probe: PasswordManagerProbe, #[props(default)] prefix: String) -> Element {
+    let (tone, text) = if probe.ok {
+        (Tone::Ok, "Test passed")
+    } else {
+        (Tone::Danger, "Test failed")
+    };
+    let cli = if probe.cli_found {
+        "CLI found"
+    } else {
+        "CLI not found"
+    };
+    let token = if probe.configured {
+        "Token saved"
+    } else {
+        "No token"
+    };
+    rsx! {
+        div { class: "health-status", role: "status",
+            if !prefix.is_empty() {
+                span { class: "tiny", "{prefix}:" }
+            }
+            StatusChip { tone, text: text.to_owned() }
+            span { class: "chip muted status-chip", "{cli}" }
+            span { class: "chip muted status-chip", "{token}" }
+            if !probe.message.is_empty() {
+                span { class: "tiny", "{probe.message}" }
             }
         }
     }
@@ -758,15 +791,10 @@ fn ProviderRow(session: Signal<Session>, manager: PasswordManager) -> Element {
                 span { class: "tiny vault-hint", "{cli_line}" }
             }
             div { class: "vault-provider-token",
-                input {
-                    class: "input",
-                    r#type: "password",
-                    autocomplete: "off",
-                    spellcheck: false,
-                    "aria-label": "{input_label}",
-                    placeholder: "Access token",
-                    value: "{token}",
-                    oninput: move |event| token.set(event.value()),
+                SecretField {
+                    value: token,
+                    label: input_label.clone(),
+                    placeholder: "Access token".to_owned(),
                 }
                 button {
                     class: "btn primary sm",
@@ -810,12 +838,8 @@ fn ProviderRow(session: Signal<Session>, manager: PasswordManager) -> Element {
                     }
                 }
             }
-            if let Some(PasswordManagerProbe { ok, message, .. }) = probe {
-                p {
-                    class: if ok { "tiny ok" } else { "tiny err" },
-                    role: "status",
-                    "{message}"
-                }
+            if let Some(probe) = probe {
+                ProbeResult { probe }
             }
         }
     }
