@@ -29,6 +29,19 @@ const MAX_REDIRECTS: usize = 3;
 /// Status codes that are handled as redirects when a `Location` header exists.
 const REDIRECT_STATUSES: [u16; 5] = [301, 302, 303, 307, 308];
 
+/// A URL as it may appear in an error message: scheme, host, port and path.
+/// The query and fragment are left out, since a feed's query can hold a key.
+struct Shown<'a>(&'a Url);
+
+impl std::fmt::Display for Shown<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut url = self.0.clone();
+        url.set_query(None);
+        url.set_fragment(None);
+        write!(f, "{url}")
+    }
+}
+
 /// Attempts for one GET when the connection fails before any response arrives.
 const SEND_ATTEMPTS: u32 = 3;
 
@@ -151,15 +164,20 @@ impl SafeFetcher {
         let mut redirects = 0usize;
 
         loop {
-            let response = send_get(&self.client, &current)
-                .await
-                .map_err(|error| SeraError::External(format!("fetch {current}: {error}")))?;
+            let response = send_get(&self.client, &current).await.map_err(|error| {
+                SeraError::External(format!(
+                    "fetch {}: {}",
+                    Shown(&current),
+                    error.without_url()
+                ))
+            })?;
             let status = response.status();
 
             if REDIRECT_STATUSES.contains(&status.as_u16()) {
                 if redirects >= MAX_REDIRECTS {
                     return Err(SeraError::External(format!(
-                        "too many redirects while fetching {url}"
+                        "too many redirects while fetching {}",
+                        Shown(&current)
                     )));
                 }
                 let location = response
@@ -168,12 +186,16 @@ impl SafeFetcher {
                     .and_then(|value| value.to_str().ok())
                     .ok_or_else(|| {
                         SeraError::External(format!(
-                            "redirect without a usable Location header from {current}"
+                            "redirect without a usable Location header from {}",
+                            Shown(&current)
                         ))
                     })?
                     .to_owned();
                 let next = current.join(&location).map_err(|error| {
-                    SeraError::External(format!("invalid redirect target from {current}: {error}"))
+                    SeraError::External(format!(
+                        "invalid redirect target from {}: {error}",
+                        Shown(&current)
+                    ))
                 })?;
                 current = self.validate_parsed(next).await?;
                 redirects += 1;
@@ -191,7 +213,8 @@ impl SafeFetcher {
                 .is_some_and(|length| length > self.max_bytes as u64)
             {
                 return Err(SeraError::External(format!(
-                    "response from {current} exceeds {} bytes",
+                    "response from {} exceeds {} bytes",
+                    Shown(&current),
                     self.max_bytes
                 )));
             }
@@ -200,11 +223,16 @@ impl SafeFetcher {
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|error| {
-                    SeraError::External(format!("read body from {current}: {error}"))
+                    SeraError::External(format!(
+                        "read body from {}: {}",
+                        Shown(&current),
+                        error.without_url()
+                    ))
                 })?;
                 if body.len().saturating_add(chunk.len()) > self.max_bytes {
                     return Err(SeraError::External(format!(
-                        "response from {current} exceeds {} bytes",
+                        "response from {} exceeds {} bytes",
+                        Shown(&current),
                         self.max_bytes
                     )));
                 }
@@ -222,7 +250,8 @@ impl SafeFetcher {
 
     async fn validate(&self, raw: &str) -> Result<Url> {
         let parsed = Url::parse(raw)
-            .map_err(|error| SeraError::Validation(format!("invalid URL {raw:?}: {error}")))?;
+            // The input is not echoed: it can carry a key in its query string.
+            .map_err(|error| SeraError::Validation(format!("invalid URL: {error}")))?;
         self.validate_parsed(parsed).await
     }
 
@@ -400,6 +429,27 @@ mod tests {
         let uri = Url::parse(&server.uri()).unwrap();
         let port = uri.port().unwrap();
         format!("http://localhost:{port}{path}")
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_error_never_repeats_the_query_string() {
+        // Bind and release a port so the connection is refused.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let error = fetcher(1024)
+            .fetch(&format!(
+                "http://localhost:{port}/feed?access=synthetic-feed-key#frag"
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("/feed"), "{error}");
+        assert!(!error.contains("synthetic-feed-key"), "{error}");
+        assert!(!error.contains("access="), "{error}");
+        assert!(!error.contains("frag"), "{error}");
     }
 
     #[tokio::test]

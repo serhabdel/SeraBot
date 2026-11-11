@@ -2,12 +2,16 @@
 
 use super::*;
 use crate::runtime::ScheduledPayload;
+use crate::util::redact_url_queries;
 
 const MAX_SOURCE_ERROR_CHARS: usize = 240;
 
-/// Strip HTML-ish watcher errors before they reach the API.
+/// Strip HTML-ish watcher errors before they reach the API. URL queries and
+/// fragments are removed too: a run error can name a feed with an access key,
+/// and rows stored by earlier builds may still carry one.
 fn sanitize_source_error(raw: Option<&str>) -> Option<String> {
-    let text = raw?.trim();
+    let redacted = redact_url_queries(raw?.trim());
+    let text = redacted.trim();
     if text.is_empty() {
         return None;
     }
@@ -24,7 +28,7 @@ fn sanitize_source_error(raw: Option<&str>) -> Option<String> {
 
 /// The feed URL a caller may see: admins get it, members get `null`. Feed URLs
 /// can carry access tokens in their query string, so they stay admin-only.
-fn visible_feed_url(acting: &ActingUser, url: &str) -> Value {
+pub(super) fn visible_feed_url(acting: &ActingUser, url: &str) -> Value {
     if acting.is_admin() {
         json!(url)
     } else {

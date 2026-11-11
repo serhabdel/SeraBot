@@ -44,6 +44,11 @@ async fn sources_overlay_is_uid_scoped() {
     let rows = body["sources"].as_array().unwrap();
     let row = rows.iter().find(|r| r["name"] == *name).unwrap();
     assert_eq!(row["enabled"], true);
+    // Feed URLs are admin-only, on GET /v1/sources as on the monitoring endpoint.
+    assert!(
+        row["url"].is_null(),
+        "member must not see the feed URL: {row}"
+    );
 
     let response = app
         .clone()
@@ -58,6 +63,7 @@ async fn sources_overlay_is_uid_scoped() {
         .find(|r| r["name"] == *name)
         .unwrap();
     assert_eq!(row["enabled"], first.enabled);
+    assert!(row["url"].is_string(), "admin must see the feed URL: {row}");
 }
 
 #[tokio::test]

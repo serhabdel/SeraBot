@@ -13,7 +13,8 @@ pub(super) struct AddRssBody {
     pub url: String,
 }
 
-/// `GET /v1/sources` — effective merged sources for the acting user.
+/// `GET /v1/sources` — effective merged sources for the acting user. The feed
+/// URL is admin-only, as on `GET /v1/monitoring/sources`: members get `null`.
 pub(super) async fn list_sources(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
@@ -27,7 +28,7 @@ pub(super) async fn list_sources(
                 "name": source.name,
                 "kind": source.kind,
                 "enabled": source.enabled,
-                "url": source.url,
+                "url": super::monitoring::visible_feed_url(&user, &source.url),
             })
         })
         .collect::<Vec<_>>();
