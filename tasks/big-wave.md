@@ -38,6 +38,12 @@ Windows isolated target dirs (H: full; C: filled after check):
 
 ---
 
+## PR-B — Client polish (draft, `feat/client-polish-v033`)
+
+Desktop and Android: source rows show the feed host with copy (or "URL unavailable"), active plans show the chat name, runs show relative times. Android: message time and Copy, long-press Rename / Archive (with confirm and Undo) in the chat list, pull-to-refresh and empty states that work on short lists.
+
+---
+
 ## PR-3 — Mobile parity (draft, `feat/mobile-parity-v032`)
 
 Android catches up with the desktop polish from PR-2 and PR-1. Mobile stays read-only for routines and sources.

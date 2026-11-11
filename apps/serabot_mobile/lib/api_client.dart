@@ -495,6 +495,13 @@ class ApiClient {
     await _request('DELETE', ['v1', 'conversations', id]);
   }
 
+  /// Undo [archiveConversation].
+  Future<void> unarchiveConversation(String id) async {
+    _checkId(id);
+    await _request('POST', ['v1', 'conversations', id, 'unarchive'],
+        body: const {});
+  }
+
   /// Stop the running turn of one conversation.
   Future<void> cancelTurn(String id) async {
     _checkId(id);

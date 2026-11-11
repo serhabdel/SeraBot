@@ -71,4 +71,35 @@ void main() {
     expect(page.traces.single.elapsedMs, 42);
     expect(page.conversationId, 'dir:trace-a');
   });
+
+  group('display helpers', () {
+    final now = DateTime.utc(2026, 11, 10, 12);
+
+    test('relative time reads naturally', () {
+      expect(relativeTime('2026-11-10T11:55:00Z', now: now), '5m ago');
+      expect(relativeTime('2026-11-10T09:00:00Z', now: now), '3h ago');
+      expect(relativeTime('2026-11-08T12:00:00Z', now: now), '2d ago');
+      expect(relativeTime('2026-11-10T14:00:00Z', now: now), 'in 2h');
+      expect(relativeTime('2026-11-10T12:00:20Z', now: now), 'just now');
+    });
+
+    test('an unreadable stamp is shown, not hidden', () {
+      expect(relativeTime('garbage', now: now), 'garbage');
+      expect(relativeTime('', now: now), '\u2014');
+    });
+
+    test('source host and short ids', () {
+      expect(sourceHost('https://example.test/feed?k=1'), 'example.test');
+      expect(sourceHost('not a url'), isNull);
+      expect(shortId('abc'), 'abc');
+      expect(shortId('0123456789abcdefghij'), '0123456789abc\u2026');
+    });
+
+    test('plan label prefers the conversation name', () {
+      expect(planConversationLabel('  Trip  ', 'x'), 'Trip');
+      expect(planConversationLabel(' ', 'dir:main'), 'dir:main');
+      expect(planConversationLabel(null, '0123456789abcdefghij'),
+          '0123456789abc\u2026');
+    });
+  });
 }
