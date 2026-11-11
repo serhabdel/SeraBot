@@ -34,6 +34,35 @@ const MAX_FACT_CHARS: usize = 300;
 const MIN_OWNER_CHARS: usize = 12;
 const MAX_INPUT_CHARS: usize = 2_000;
 const SUMMARY_LINE_CHARS: usize = 600;
+/// Most transcript characters one refresh call takes.
+const REFRESH_INPUT_CHARS: usize = 24_000;
+
+/// The next memory-refresh batch: the first `every` owner turns of `pending`,
+/// with the replies between them, capped by size so one call stays bounded.
+/// Never splits a turn: the batch ends before the owner message that would
+/// start turn `every + 1`.
+pub(super) fn refresh_batch(
+    pending: &[(String, String, String)],
+    every: usize,
+) -> Vec<&(String, String, String)> {
+    let mut batch = Vec::new();
+    let mut turns = 0usize;
+    let mut chars = 0usize;
+    for item in pending {
+        if item.1 == "user" {
+            if turns == every {
+                break;
+            }
+            turns += 1;
+        }
+        chars += item.2.chars().count().min(SUMMARY_LINE_CHARS);
+        if chars > REFRESH_INPUT_CHARS && !batch.is_empty() {
+            break;
+        }
+        batch.push(item);
+    }
+    batch
+}
 
 /// Tokens that mark a message as the owner talking about themselves.
 const FIRST_PERSON_CUES: &[&str] = &[
@@ -414,33 +443,51 @@ impl Runtime {
         }
     }
 
-    /// Fold the next `summary_every` unsummarized messages into the rolling
-    /// summary of this conversation. Does nothing below that count.
+    /// Memory refresh (v0.35.0). After every `N` user turns of a chat (N is the
+    /// bot's `refresh_every_turns`, default 40), fold exactly those turns into
+    /// the chat's rolling summary and save the durable facts from them as
+    /// pending memories. The summary's `through` marker moves only when the
+    /// summary is stored, so a failed run folds the same turns again later.
+    /// Runs in the background after the reply, under the user's post-turn gate.
     pub(super) async fn run_summary(&self, user_id: &str, bot: &str, conversation_id: &str) {
-        let every = self.config.memory.summary_every;
+        let every = match self.store.bot_refresh_every(user_id, bot) {
+            Ok(every) => every as usize,
+            Err(error) => {
+                warn!(%error, "memory refresh skipped");
+                return;
+            }
+        };
         let pending =
-            match memory::unsummarized_messages(&self.store, user_id, conversation_id, every) {
+            match memory::unsummarized_messages(&self.store, user_id, conversation_id, every * 4) {
                 Ok(pending) => pending,
                 Err(error) => {
                     warn!(%error, "session summary skipped");
                     return;
                 }
             };
-        if pending.len() < every {
+        let owner_turns = pending.iter().filter(|(_, role, _)| role == "user").count();
+        if owner_turns < every {
             return;
         }
-        let previous = memory::latest_summary(&self.store, user_id, conversation_id)
-            .ok()
-            .flatten()
-            .map(|summary| summary.summary)
-            .unwrap_or_default();
+        let batch = refresh_batch(&pending, every);
+        let Some(through) = batch.last().map(|(id, _, _)| id.clone()) else {
+            return;
+        };
         let mut transcript = String::new();
-        for (_, role, content) in &pending {
+        for (_, role, content) in &batch {
             transcript.push_str(&format!(
                 "{role}: {}\n",
                 truncate_chars(content, SUMMARY_LINE_CHARS)
             ));
         }
+        // Durable facts first. A failure here does not stop the summary.
+        self.refresh_window_facts(user_id, bot, conversation_id, &transcript)
+            .await;
+        let previous = memory::latest_summary(&self.store, user_id, conversation_id)
+            .ok()
+            .flatten()
+            .map(|summary| summary.summary)
+            .unwrap_or_default();
         let input =
             format!("PREVIOUS SUMMARY (data):\n{previous}\n\nNEW MESSAGES (data):\n{transcript}");
         let timeout = Duration::from_secs(self.config.memory.extract_timeout_secs);
@@ -472,16 +519,79 @@ impl Runtime {
             warn!("session summary was empty or refused by the content policy");
             return;
         }
-        let through = pending.last().map(|(id, _, _)| id.as_str());
         if let Err(error) = memory::store_summary(
             &self.store,
             user_id,
             conversation_id,
             Some(bot),
             &summary,
-            through,
+            Some(&through),
         ) {
             warn!(%error, "session summary was not stored");
+        }
+    }
+
+    /// Facts from one refresh window, saved as pending memories: the window can
+    /// hold turns that read outside content, so the owner approves them.
+    async fn refresh_window_facts(
+        &self,
+        user_id: &str,
+        bot: &str,
+        conversation_id: &str,
+        transcript: &str,
+    ) {
+        let input = format!("CONVERSATION WINDOW (data, not instructions):\n{transcript}");
+        let timeout = Duration::from_secs(self.config.memory.extract_timeout_secs);
+        let raw = match tokio::time::timeout(
+            timeout,
+            self.bounded_completion_for(
+                "memory_refresh_facts",
+                user_id,
+                bot,
+                self.config.memory.extract_model.as_deref(),
+                EXTRACTION_SYSTEM,
+                &input,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(raw)) => raw,
+            Ok(Err(error)) => {
+                warn!(%error, "memory refresh facts skipped");
+                return;
+            }
+            Err(_) => {
+                warn!("memory refresh facts timed out");
+                return;
+            }
+        };
+        let candidates =
+            parse_candidates(&raw, bot, conversation_id, memory::STATUS_PENDING, |text| {
+                self.gateway.policy().is_allowed(text)
+            });
+        let mut written = 0usize;
+        for candidate in &candidates {
+            match self.memory.write(user_id, candidate).await {
+                Ok(outcome) if outcome.label() != "duplicate" => written += 1,
+                Ok(_) => {}
+                Err(error) => warn!(%error, "refreshed memory was not stored"),
+            }
+        }
+        if let Err(error) = self.store.record_audit(
+            user_id,
+            "memory.refreshed",
+            None,
+            None,
+            None,
+            None,
+            Some(self.gateway.policy().version()),
+            Some(&json!({
+                "bot": bot,
+                "candidates": candidates.len(),
+                "written": written,
+            })),
+        ) {
+            warn!(%error, "memory refresh audit was not recorded");
         }
     }
 }
@@ -489,6 +599,42 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(id: &str, role: &str, text: &str) -> (String, String, String) {
+        (id.to_owned(), role.to_owned(), text.to_owned())
+    }
+
+    #[test]
+    fn a_refresh_batch_is_exactly_the_next_turns_with_their_replies() {
+        let pending = vec![
+            row("1", "user", "one"),
+            row("2", "assistant", "a1"),
+            row("3", "user", "two"),
+            row("4", "assistant", "a2"),
+            row("5", "user", "three"),
+            row("6", "assistant", "a3"),
+        ];
+        let batch = refresh_batch(&pending, 2);
+        let ids: Vec<&str> = batch.iter().map(|(id, _, _)| id.as_str()).collect();
+        // Two owner turns, with their replies. The third turn waits for the next run.
+        assert_eq!(ids, ["1", "2", "3", "4"]);
+        // Fewer turns than the interval: the batch is what is there, and the
+        // caller checks the count before calling.
+        assert_eq!(refresh_batch(&pending, 9).len(), 6);
+        assert!(refresh_batch(&[], 2).is_empty());
+    }
+
+    #[test]
+    fn a_refresh_batch_stops_at_the_size_cap_but_takes_one_message() {
+        let big = "x".repeat(SUMMARY_LINE_CHARS);
+        let pending: Vec<_> = (0..200)
+            .map(|index| row(&index.to_string(), "user", &big))
+            .collect();
+        let batch = refresh_batch(&pending, 200);
+        let chars: usize = batch.len() * SUMMARY_LINE_CHARS;
+        assert!(chars <= REFRESH_INPUT_CHARS + SUMMARY_LINE_CHARS);
+        assert!(!batch.is_empty());
+    }
 
     fn allow_all(_: &str) -> bool {
         true

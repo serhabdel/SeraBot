@@ -72,6 +72,7 @@ const MIGRATION_30: &str = include_str!("../migrations/0030_user_turn_limits.sql
 const MIGRATION_31: &str = include_str!("../migrations/0031_media_job_finishing.sql");
 const MIGRATION_32: &str = include_str!("../migrations/0032_user_tasks.sql");
 const MIGRATION_33: &str = include_str!("../migrations/0033_user_sources.sql");
+const MIGRATION_34: &str = include_str!("../migrations/0034_bot_chats.sql");
 
 /// Fixed admin id written by migration 0008 and mirrored in
 /// `kv['admin_user_id']`. Code resolves the admin through the kv entry (the
@@ -311,6 +312,19 @@ pub struct RoutineRow {
     pub next_run_at: String,
     pub last_run_for: Option<String>,
     pub config: Value,
+}
+
+/// Default user turns between memory refreshes for a bot.
+pub const DEFAULT_REFRESH_EVERY_TURNS: u32 = 40;
+pub const MIN_REFRESH_EVERY_TURNS: u32 = 5;
+pub const MAX_REFRESH_EVERY_TURNS: u32 = 500;
+
+/// One extra chat of a bot, as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotChatRow {
+    pub conversation_id: String,
+    pub carried_from: Option<String>,
+    pub created_at: String,
 }
 
 /// One item a watched source reported for this user.
@@ -655,6 +669,11 @@ impl Store {
         if version < 33 {
             connection.execute_batch(MIGRATION_33)?;
             connection.pragma_update(None, "user_version", 33)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 34 {
+            connection.execute_batch(MIGRATION_34)?;
+            connection.pragma_update(None, "user_version", 34)?;
         }
         // VACUUM INTO (backups) may renumber rowids; rebuild the external-content
         // FTS index only when its row count no longer matches `memories`.
@@ -4192,6 +4211,100 @@ impl Store {
         Ok(())
     }
 
+    /// Bind an extra chat to the bot it talks to. `carried_from` names the
+    /// chat whose summary the new chat starts with, if any.
+    pub fn bind_bot_chat(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        bot_id: &str,
+        carried_from: Option<&str>,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO bot_chats(conversation_id, user_id, bot_id, carried_from, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![conversation_id, user_id, bot_id, carried_from, now_string()],
+        )?;
+        Ok(())
+    }
+
+    /// The bot an extra chat talks to, or `None` for any other conversation.
+    pub fn bot_for_chat(&self, user_id: &str, conversation_id: &str) -> Result<Option<String>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT bot_id FROM bot_chats WHERE conversation_id = ?1 AND user_id = ?2",
+                params![conversation_id, user_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The extra chats of one bot, oldest first.
+    pub fn bot_chat_rows(&self, user_id: &str, bot_id: &str) -> Result<Vec<BotChatRow>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT conversation_id, carried_from, created_at FROM bot_chats
+             WHERE user_id = ?1 AND bot_id = ?2
+             ORDER BY created_at ASC, conversation_id ASC",
+        )?;
+        let rows = statement.query_map(params![user_id, bot_id], |row| {
+            Ok(BotChatRow {
+                conversation_id: row.get(0)?,
+                carried_from: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// User turns between memory refreshes for one bot (the default if unset).
+    pub fn bot_refresh_every(&self, user_id: &str, bot_id: &str) -> Result<u32> {
+        let connection = self.connection()?;
+        let every: Option<i64> = connection
+            .query_row(
+                "SELECT refresh_every_turns FROM bot_chat_settings
+                 WHERE user_id = ?1 AND bot_id = ?2",
+                params![user_id, bot_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(every
+            .map(|value| value as u32)
+            .unwrap_or(DEFAULT_REFRESH_EVERY_TURNS))
+    }
+
+    /// Set the memory refresh interval for one bot, within 5 to 500 user turns.
+    pub fn set_bot_refresh_every(&self, user_id: &str, bot_id: &str, every: u32) -> Result<()> {
+        if !(MIN_REFRESH_EVERY_TURNS..=MAX_REFRESH_EVERY_TURNS).contains(&every) {
+            return Err(SeraError::Validation(
+                "refresh_every_turns must be 5 to 500".into(),
+            ));
+        }
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO bot_chat_settings(user_id, bot_id, refresh_every_turns, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(user_id, bot_id) DO UPDATE SET
+                refresh_every_turns = excluded.refresh_every_turns,
+                updated_at = excluded.updated_at",
+            params![user_id, bot_id, every as i64, now_string()],
+        )?;
+        Ok(())
+    }
+
+    /// The owner's user messages in one conversation.
+    pub fn count_user_turns(&self, user_id: &str, conversation_id: &str) -> Result<i64> {
+        let connection = self.connection()?;
+        Ok(connection.query_row(
+            "SELECT COUNT(*) FROM messages
+             WHERE user_id = ?1 AND conversation_id = ?2 AND role = 'user'",
+            params![user_id, conversation_id],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn add_member_rss_source(&self, user_id: &str, name: &str, url: &str) -> Result<()> {
         if name.trim().is_empty() || name.chars().count() > 128 {
             return Err(SeraError::Validation("invalid source name".into()));
@@ -5372,7 +5485,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 34);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -5437,7 +5550,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 34);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -5511,7 +5624,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 34);
         let admin = admin(&store);
         let memory = crate::memory::get(&store, &admin, "mem-legacy").unwrap();
         assert_eq!(memory.origin, "explicit");
@@ -5600,7 +5713,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 34);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -5731,7 +5844,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 34);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -5886,7 +5999,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 34);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.
