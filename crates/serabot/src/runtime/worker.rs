@@ -272,6 +272,7 @@ impl Runtime {
                 let permanent = matches!(
                     &error,
                     SeraError::Forbidden(_)
+                        | SeraError::Rejected { .. }
                         | SeraError::Validation(_)
                         | SeraError::Config(_)
                         | SeraError::PolicyViolation
