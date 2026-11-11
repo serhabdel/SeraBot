@@ -19,7 +19,7 @@ class FlakyStore implements TokenStore {
   @override
   Future<void> write(String endpoint, String token) async {
     if (!allow) {
-      throw const PlatformException(code: 'store-refused');
+      throw PlatformException(code: 'store-refused');
     }
     this.token = token;
   }

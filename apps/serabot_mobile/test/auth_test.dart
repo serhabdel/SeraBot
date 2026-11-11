@@ -135,11 +135,11 @@ void main() {
             (url) async => throw error,
           );
       await expectLater(
-        run(const PlatformException(code: 'CANCELED')),
+        run(PlatformException(code: 'CANCELED')),
         throwsA(isA<SignInException>().having((e) => e.code, 'code', 'cancelled')),
       );
       await expectLater(
-        run(const PlatformException(code: 'ActivityNotFound')),
+        run(PlatformException(code: 'ActivityNotFound')),
         throwsA(isA<SignInException>().having((e) => e.code, 'code', 'browser')),
       );
       await expectLater(
