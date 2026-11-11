@@ -70,7 +70,8 @@ const CSS_PAGES: &str = concat!(
     include_str!("../assets/usage.css"),
     include_str!("../assets/settings.css"),
     include_str!("../assets/files.css"),
-    include_str!("../assets/jobs.css")
+    include_str!("../assets/jobs.css"),
+    include_str!("../assets/foundation.css")
 );
 
 /// The `data-activity` value the stylesheet keys the avatar ring and the
@@ -800,6 +801,12 @@ pub(crate) fn Icon(name: String, #[props(default = 20)] size: u32) -> Element {
             "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"
         }
         "key" => "M14.5 9.5a4 4 0 1 1-1.2-2.8L21 14.4V18h-3.6v-2h-2v-2h-2z",
+        "alert" => "M12 4l9 16H3zM12 10v4M12 17v.5",
+        "alert-circle" => "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM12 8v5M12 16v.5",
+        "eye" => "M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12zM12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z",
+        "eye-off" => {
+            "M3 3l18 18M10.6 6.1A9.7 9.7 0 0 1 12 5c6 0 10 7 10 7a17 17 0 0 1-3.2 4M6.6 7.7A16.6 16.6 0 0 0 2 12s4 7 10 7a9.7 9.7 0 0 0 4.1-.9M9.9 9.9a3 3 0 0 0 4.2 4.2"
+        }
         "panel" => "M4 5h16v14H4zM15 5v14",
         "theme" => {
             "M12 4v2M12 18v2M4 12h2M18 12h2M6.3 6.3l1.4 1.4M16.3 16.3l1.4 1.4M17.7 6.3l-1.4 1.4M7.7 16.3l-1.4 1.4M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0z"
