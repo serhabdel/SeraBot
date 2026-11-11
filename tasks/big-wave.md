@@ -9,8 +9,9 @@ owner's OK**.
 
 ## Post-merge tracker (2026-11-10)
 
-- **`main` tip** — `bca2c1b` after [PR #53](https://github.com/serhabdel/SeraBot/pull/53)
-  (desktop chat streaming scroll polish on #42); [PR #52](https://github.com/serhabdel/SeraBot/pull/52)
+- **`main` tip** — `8229ca8` after [PR #55](https://github.com/serhabdel/SeraBot/pull/55)
+  (desktop chat stream glitch regressions); [PR #53](https://github.com/serhabdel/SeraBot/pull/53)
+  (streaming scroll polish on #42); [PR #52](https://github.com/serhabdel/SeraBot/pull/52)
   (tracker refresh); [PR #51](https://github.com/serhabdel/SeraBot/pull/51) (A8 agent smoke);
   [PR #50](https://github.com/serhabdel/SeraBot/pull/50) (E1/E2); C5–C1 on `main`.
 - **Wave A** — [PR #37](https://github.com/serhabdel/SeraBot/pull/37) (0.29.0).
@@ -20,9 +21,10 @@ owner's OK**.
   C3 #44; C4 [PR #46](https://github.com/serhabdel/SeraBot/pull/46); C5 #48;
   **C6** 0.31.0 gate on `main`.
 - **Chat deepen** — [PR #42](https://github.com/serhabdel/SeraBot/pull/42); streaming scroll
-  polish [PR #53](https://github.com/serhabdel/SeraBot/pull/53) (`chat_scroll.rs`).
+  polish [PR #53](https://github.com/serhabdel/SeraBot/pull/53) (`chat_scroll.rs`);
+  stream glitch regressions [PR #55](https://github.com/serhabdel/SeraBot/pull/55).
 
-**Big Wave program** — Waves A–C, **E1**/**E2**, and chat deepen (#42, #53) are on `main`;
+**Big Wave program** — Waves A–C, **E1**/**E2**, and chat deepen (#42, #53, #55) are on `main`;
   **A8 owner smoke** (owner OIDC) remains (not a full program sign-off).
 
 ### Wrap-up gate evidence @ `bca2c1b` (2026-11-10)
