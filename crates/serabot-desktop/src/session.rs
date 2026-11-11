@@ -462,12 +462,16 @@ pub struct SignInUi {
     pub invite_code: String,
     /// The invite-code field is open ("I have an invite code").
     pub show_invite: bool,
+    /// The sign-in URL while the browser leg runs, so it can be copied by hand.
+    pub link: Option<String>,
+    /// Whether the system browser accepted the URL. False shows the link.
+    pub browser_opened: bool,
     cancel: Option<Arc<AtomicBool>>,
     rx: Option<std::sync::mpsc::Receiver<SignInMsg>>,
 }
 
 enum SignInMsg {
-    Waiting,
+    Waiting { url: String, opened: bool },
     Finished(Result<SignedIn, SignInFailure>),
 }
 
@@ -487,6 +491,8 @@ impl SignInUi {
         self.error = None;
         self.notice = None;
         self.show_invite = false;
+        self.link = None;
+        self.browser_opened = false;
         self.clear_secrets();
     }
 
@@ -566,6 +572,9 @@ pub struct Session {
     pub state: State,
     pub worker: Option<Worker>,
     pub credentials: Option<Arc<Credentials>>,
+    /// The session token could not be written to the OS credential store. It
+    /// still works for this run; the user is told and can retry the save.
+    pub credential_save_failed: bool,
     pub events: Option<EventStream>,
     /// Set by the SSE thread so the UI timer can tick without waiting 120ms.
     pub ui_wake: Arc<AtomicBool>,
@@ -806,6 +815,7 @@ impl Session {
             update: UpdateUi::default(),
             status: StatusUi::default(),
             sign_in: SignInUi::default(),
+            credential_save_failed: false,
             sign_out: SignOutUi::default(),
             telegram: TelegramUi::default(),
             toast: None,
@@ -1109,11 +1119,14 @@ impl Session {
             .as_ref()
             .map(|credentials| credentials.endpoint.origin().ascii_serialization())
             .unwrap_or_else(|| self.server.clone());
+        // Keep the stored sign-in wait: this snapshot is written whole.
+        let sign_in_timeout_secs = creds::load_settings().sign_in_timeout_secs;
         (!origin.is_empty()).then(|| creds::Settings {
             server: origin,
             theme: Some(self.theme.as_str().into()),
             pins: (!self.pins.is_empty()).then(|| self.pins.clone()),
             prefs: Some(self.prefs.clone()),
+            sign_in_timeout_secs,
         })
     }
 
@@ -1420,6 +1433,7 @@ impl Session {
         self.sign_in.phase = SignInPhase::Starting;
         self.sign_in.rx = Some(receiver);
         self.sign_in.cancel = Some(cancel);
+        let timeout = signin::sign_in_timeout(creds::load_settings().sign_in_timeout_secs);
         let spawned = std::thread::Builder::new()
             .name("serabot-signin".into())
             .spawn(move || {
@@ -1428,10 +1442,13 @@ impl Session {
                     endpoint,
                     invite.as_deref(),
                     &thread_cancel,
-                    signin::SIGN_IN_TIMEOUT,
+                    timeout,
                     &|url| webbrowser::open(url).is_ok(),
-                    &|| {
-                        let _ = waiting.send(SignInMsg::Waiting);
+                    &|url, opened| {
+                        let _ = waiting.send(SignInMsg::Waiting {
+                            url: url.to_owned(),
+                            opened,
+                        });
                     },
                 );
                 let _ = sender.send(SignInMsg::Finished(result));
@@ -1452,6 +1469,8 @@ impl Session {
         self.sign_in.rx = None;
         self.sign_in.phase = SignInPhase::Idle;
         self.sign_in.error = None;
+        self.sign_in.link = None;
+        self.sign_in.browser_opened = false;
         self.sign_in.notice = Some("Sign-in cancelled.".into());
     }
 
@@ -1467,7 +1486,11 @@ impl Session {
         let mut finished = None;
         while let Ok(message) = receiver.try_recv() {
             match message {
-                SignInMsg::Waiting => self.sign_in.phase = SignInPhase::Waiting,
+                SignInMsg::Waiting { url, opened } => {
+                    self.sign_in.phase = SignInPhase::Waiting;
+                    self.sign_in.link = Some(url);
+                    self.sign_in.browser_opened = opened;
+                }
                 SignInMsg::Finished(result) => finished = Some(result),
             }
         }
@@ -1477,6 +1500,8 @@ impl Session {
         self.sign_in.rx = None;
         self.sign_in.cancel = None;
         self.sign_in.phase = SignInPhase::Idle;
+        self.sign_in.link = None;
+        self.sign_in.browser_opened = false;
         match result {
             Ok(signed_in) => self.complete_sign_in(signed_in),
             Err(SignInFailure::Cancelled) => {}
@@ -3827,8 +3852,24 @@ impl Session {
             .map(|snapshot| creds::save_settings(&snapshot));
         let token = creds::save_token(credentials.token.expose_secret());
         self.server = origin;
-        if settings.as_ref().is_some_and(|result| result.is_err()) || token.is_err() {
-            self.state.error = Some("Connected, but the credential could not be saved.".into());
+        self.credential_save_failed = token.is_err();
+        if settings.as_ref().is_some_and(|result| result.is_err()) {
+            self.state.error = Some("Connected, but the settings could not be saved.".into());
+        }
+    }
+
+    /// Try again to write the session token to the OS credential store after
+    /// it was refused. Success clears the warning; failure keeps it.
+    pub fn retry_save_credentials(&mut self) {
+        let Some(credentials) = self.credentials.clone() else {
+            return;
+        };
+        match creds::save_token(credentials.token.expose_secret()) {
+            Ok(()) => {
+                self.credential_save_failed = false;
+                self.toast = Some("Session saved. You will stay signed in after a restart.".into());
+            }
+            Err(_) => self.credential_save_failed = true,
         }
     }
 

@@ -1374,6 +1374,13 @@ fn ConnectView(session: Signal<Session>) -> Element {
     let busy = session.read().sign_in.busy() || connecting;
     let sign_in_error = session.read().sign_in.error.clone();
     let sign_in_notice = session.read().sign_in.notice.clone();
+    // The link is shown only when the browser did not open; then the user can paste it.
+    let sign_in_link = {
+        let sign_in = &session.read().sign_in;
+        (phase == SignInPhase::Waiting && !sign_in.browser_opened)
+            .then(|| sign_in.link.clone())
+            .flatten()
+    };
     let invite_code = session.read().sign_in.invite_code.clone();
     let show_invite = session.read().sign_in.show_invite;
     let server_empty = server.trim().is_empty();
@@ -1413,6 +1420,31 @@ fn ConnectView(session: Signal<Session>) -> Element {
                     div { class: "banner info",
                         span { class: "spinner", title: "Waiting for the browser" }
                         span { "Finish signing in in your browser, then come back here." }
+                    }
+                }
+                if let Some(link) = sign_in_link {
+                    {
+                        let copy_text = link.clone();
+                        rsx! {
+                            div { class: "field",
+                                label { class: "field-label", r#for: "sign-in-link",
+                                    "Your browser did not open. Open this link to finish signing in:"
+                                }
+                                input {
+                                    class: "input",
+                                    id: "sign-in-link",
+                                    readonly: true,
+                                    value: "{link}",
+                                }
+                                button {
+                                    class: "btn ghost sm",
+                                    onclick: move |_| {
+                                        let _ = dioxus::document::eval(&copy_script(&copy_text));
+                                    },
+                                    "Copy link"
+                                }
+                            }
+                        }
                     }
                 }
                 if let Some(message) = sign_in_notice {
@@ -2838,6 +2870,20 @@ fn StatusBanner(session: Signal<Session>) -> Element {
             div { class: "banner err", span { "{message}" } }
         }
     });
+    let credential_view = session.read().credential_save_failed.then(|| {
+        rsx! {
+            div { class: "banner warn", role: "alert",
+                span {
+                    "Signed in for this run only. Windows Credential Manager would not save your session, so you will need to sign in again after SeraBot restarts. "
+                }
+                button {
+                    class: "btn ghost sm",
+                    onclick: move |_| session.write().retry_save_credentials(),
+                    "Try saving again"
+                }
+            }
+        }
+    });
     let unknown_view = unknown.then(|| {
         rsx! {
             div { class: "banner warn",
@@ -2921,6 +2967,7 @@ fn StatusBanner(session: Signal<Session>) -> Element {
         {restarting_view}
         {link_view}
         {error_view}
+        {credential_view}
         {unknown_view}
         {task_view}
     }

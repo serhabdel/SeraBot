@@ -51,6 +51,31 @@ Gate must be green before the smoke; record pass/fail, not screenshots of secret
 | 6 | Member → **Workflows** | Member sees **only** their routines/sources/plans; admin rows are not visible. |
 | 7 | Member → **Usage** | No server health card (403 backstop if forced via API). |
 
+### Automated A8 pass (PR `feat/hardening-a8`, 2026-11-11)
+
+The steps above are now also covered by an in-process test,
+`crates/serabot/src/api/tests/a8_smoke_api.rs`, which runs in the normal
+`cargo test --workspace` gate. It seeds an admin and a member through the store
+and device tokens, then calls the same endpoints the console uses:
+
+| Step | Automated check |
+| --- | --- |
+| 1 | Admin `GET /v1/routines`, `/v1/workflows/active`, `/v1/monitoring/sources` show the seeded routine, plan and failed source row. |
+| 2 | Admin `GET /v1/jobs` lists the queued task and `reliability.traces_path`; `GET /v1/traces` returns a list. |
+| 3 | Admin `GET /v1/logs?q=tool=` returns the `tool=` line, and the bearer-shaped value does not appear. |
+| 4 | Admin `PUT` then `POST .../onepassword/test` returns exactly `ok`, `cli_found`, `configured`, `message`, and never the token. |
+| 5 | Admin `GET /v1/admin/status` has uptime, process memory and storage categories; `GET /v1/usage` has the quota block. |
+| 6 | Member sees only their own routine (`08:00`, not `07:30`), plan and queued tasks; admin source run status and error text are not shown. |
+| 7 | Member `GET /v1/admin/status` and `GET /v1/logs` return 403; member `GET /v1/usage` has `scope: me` and no health card. |
+
+Not covered: the live WebView2 render, the owner's Microsoft sign-in, and real
+Credential Manager. The A8 owner smoke stays open and is not marked complete.
+
+Desktop sign-in changes in the same PR (`docs/desktop-production-gaps.md`):
+loopback `Host` check and ignored-request budget, configurable wait
+(`sign_in_timeout_secs`, 60–900 s), copy-link fallback when the browser does
+not open, and a credential-save warning with a retry button.
+
 Demo script (spec two-week cut): routine countdown visible, one red source row,
 one active plan, vault Test OK, one browser tool in traces without secrets.
 

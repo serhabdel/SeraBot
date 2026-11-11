@@ -16,8 +16,22 @@ use url::Url;
 
 /// The only sign-in provider the desktop console offers.
 pub const PROVIDER: &str = "microsoft";
-/// How long the console waits for the browser to come back.
+/// How long the console waits for the browser to come back by default.
 pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
+/// The shortest and longest wait a settings file may configure.
+pub const SIGN_IN_TIMEOUT_MIN_SECS: u64 = 60;
+pub const SIGN_IN_TIMEOUT_MAX_SECS: u64 = 900;
+
+/// The wait for the browser: the configured seconds clamped to 1–15 minutes,
+/// or the default when nothing is configured.
+pub fn sign_in_timeout(configured_secs: Option<u64>) -> Duration {
+    match configured_secs {
+        Some(secs) => {
+            Duration::from_secs(secs.clamp(SIGN_IN_TIMEOUT_MIN_SECS, SIGN_IN_TIMEOUT_MAX_SECS))
+        }
+        None => SIGN_IN_TIMEOUT,
+    }
+}
 
 /// Why a sign-in run ended without a session.
 #[derive(Debug, PartialEq, Eq)]
@@ -36,15 +50,17 @@ impl SignInFailure {
 
 /// Run one sign-in against `endpoint`.
 ///
-/// `open` shows the sign-in URL in the browser and reports whether it could;
-/// `waiting` is called once the browser is open and the console is listening.
+/// `open` tries to show the sign-in URL in the browser and reports whether it
+/// could. `waiting` is called once the console is listening, with the URL and
+/// whether the browser opened. When it did not, the URL is still valid: the
+/// caller shows it so the user can open it by hand, and the wait goes on.
 pub fn run(
     endpoint: Url,
     invite_code: Option<&str>,
     cancel: &AtomicBool,
     timeout: Duration,
     open: &dyn Fn(&str) -> bool,
-    waiting: &dyn Fn(),
+    waiting: &dyn Fn(&str, bool),
 ) -> Result<SignedIn, SignInFailure> {
     let (listener, port) = oauth::bind_loopback()
         .map_err(|_| SignInFailure::message(OAuthError::Listen.to_string()))?;
@@ -66,12 +82,8 @@ pub fn run(
     if cancel.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(SignInFailure::Cancelled);
     }
-    if !open(&url) {
-        return Err(SignInFailure::message(
-            "Could not open your browser. Open the default browser once and try again.",
-        ));
-    }
-    waiting();
+    let opened = open(&url);
+    waiting(&url, opened);
     let done =
         oauth::wait_for_auth_done(&listener, &pkce.state, timeout, cancel).map_err(|error| {
             match error {
@@ -238,7 +250,7 @@ mod tests {
                 let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
                 write!(
                     stream,
-                    "GET /auth-done?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+                    "GET /auth-done?{query} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
                 )
                 .unwrap();
                 let mut sink = String::new();
@@ -253,7 +265,7 @@ mod tests {
             &cancel,
             Duration::from_secs(10),
             &open,
-            &|| {},
+            &|_, _| {},
         );
         // Unused scripted replies (a failed run) would block `join`: drop them
         // by connecting nothing; the thread ends only when all are consumed, so
@@ -411,7 +423,7 @@ mod tests {
                 &AtomicBool::new(false),
                 Duration::from_secs(1),
                 &|_| panic!("the browser must not open"),
-                &|| {},
+                &|_, _| {},
             );
             server.join().unwrap();
             match result {
@@ -424,21 +436,27 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_browser_is_reported_and_a_cancel_stops_the_wait() {
+    fn a_missing_browser_keeps_the_link_and_still_waits() {
         let (endpoint, _requests, server) = scripted(vec![(200, START_OK.into())]);
+        let shown = std::sync::Mutex::new(Vec::new());
         let result = run(
             endpoint,
             None,
             &AtomicBool::new(false),
-            Duration::from_secs(1),
+            Duration::from_millis(200),
             &|_| false,
-            &|| {},
+            &|url, opened| shown.lock().unwrap().push((url.to_owned(), opened)),
         );
         server.join().unwrap();
+        // The run did not stop at the failed open: it waited, then timed out.
         match result {
-            Err(SignInFailure::Message(message)) => assert!(message.contains("browser")),
-            _ => panic!("expected a message"),
+            Err(SignInFailure::Message(message)) => assert!(message.contains("timed out")),
+            _ => panic!("expected a timeout message"),
         }
+        assert_eq!(
+            shown.lock().unwrap().as_slice(),
+            [("https://login.example/authorize?x=1".to_owned(), false)]
+        );
 
         let (endpoint, _requests, server) = scripted(vec![(200, START_OK.into())]);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -452,10 +470,18 @@ mod tests {
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 true
             },
-            &|| {},
+            &|_, _| {},
         );
         server.join().unwrap();
         assert!(matches!(result, Err(SignInFailure::Cancelled)));
+    }
+
+    #[test]
+    fn the_configured_timeout_is_clamped_and_defaults_to_five_minutes() {
+        assert_eq!(sign_in_timeout(None), Duration::from_secs(300));
+        assert_eq!(sign_in_timeout(Some(10)), Duration::from_secs(60));
+        assert_eq!(sign_in_timeout(Some(240)), Duration::from_secs(240));
+        assert_eq!(sign_in_timeout(Some(99_999)), Duration::from_secs(900));
     }
 
     #[test]
@@ -467,7 +493,7 @@ mod tests {
             &AtomicBool::new(false),
             Duration::from_millis(200),
             &|_| true,
-            &|| {},
+            &|_, _| {},
         );
         server.join().unwrap();
         match result {

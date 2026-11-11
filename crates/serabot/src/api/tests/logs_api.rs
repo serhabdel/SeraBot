@@ -33,8 +33,7 @@ async fn logs_are_owner_only_and_filterable() {
 
     // Emit a synthetic event through the installed ring layer and find it
     // by substring; bearer-shaped secrets must be scrubbed on the way in.
-    let log_dir = std::env::temp_dir().join(format!("serabot-logs-test-{}", uuid::Uuid::new_v4()));
-    crate::logging::install_default(&log_dir).unwrap();
+    let log_dir = super::shared_log_dir();
     let marker = format!("synthetic-marker-{}", uuid::Uuid::new_v4());
     tracing::warn!(target: "serabot::test", "{marker} Bearer abcdef0123456789abcdef");
 
@@ -81,5 +80,4 @@ async fn logs_are_owner_only_and_filterable() {
     let contents = std::fs::read_to_string(&log_file).unwrap();
     assert!(contents.contains(&marker));
     assert!(!contents.contains("abcdef0123456789abcdef"));
-    let _ = std::fs::remove_dir_all(&log_dir);
 }
