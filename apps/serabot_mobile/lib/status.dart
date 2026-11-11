@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 /// A three-step limit status, the same words the desktop console uses.
 /// Colour is never the only signal: every level has an icon and a word.
