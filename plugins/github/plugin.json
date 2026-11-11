@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "slug": "github",
+  "name": "Code Hosting",
+  "tagline": "Read repositories, issues and pull requests on GitHub.",
+  "description": "Search code, read files and review issues and pull requests. Connect the owner's account with the browser sign-in.",
+  "category": "developer",
+  "iconUrl": "https://github.example.invalid/icon.png",
+  "version": "1.0.0",
+  "minServerVersion": "0.36.0",
+  "prompts": [
+    {
+      "id": "github-0",
+      "text": "Summarise the open pull requests in this repository."
+    }
+  ],
+  "apps": [
+    {
+      "id": "repos",
+      "name": "Repositories",
+      "server": {
+        "transport": "http",
+        "url": "https://mcp.github.example.invalid/mcp"
+      },
+      "auth": [
+        {
+          "id": "link",
+          "kind": "oauth-link",
+          "fields": []
+        }
+      ]
+    }
+  ],
+  "permissions": {
+    "egress": [
+      "mcp.github.example.invalid"
+    ]
+  },
+  "websiteUrl": "https://github.example.invalid",
+  "privacyPolicyUrl": "https://github.example.invalid/privacy",
+  "termsUrl": "https://github.example.invalid/terms"
+}

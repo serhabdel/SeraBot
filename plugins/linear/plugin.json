@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "slug": "linear",
+  "name": "Issues and Projects",
+  "tagline": "Track issues and projects in Linear.",
+  "description": "List, search and update issues and projects. Connect the owner's account with the browser sign-in.",
+  "category": "productivity",
+  "iconUrl": "https://linear.example.invalid/icon.png",
+  "version": "1.0.0",
+  "minServerVersion": "0.36.0",
+  "prompts": [
+    {
+      "id": "linear-0",
+      "text": "List the open issues assigned to me."
+    }
+  ],
+  "apps": [
+    {
+      "id": "issues",
+      "name": "Issues",
+      "server": {
+        "transport": "http",
+        "url": "https://mcp.linear.example.invalid/mcp"
+      },
+      "auth": [
+        {
+          "id": "link",
+          "kind": "oauth-link",
+          "fields": []
+        }
+      ]
+    }
+  ],
+  "permissions": {
+    "egress": [
+      "mcp.linear.example.invalid"
+    ]
+  },
+  "websiteUrl": "https://linear.example.invalid",
+  "privacyPolicyUrl": "https://linear.example.invalid/privacy",
+  "termsUrl": "https://linear.example.invalid/terms"
+}

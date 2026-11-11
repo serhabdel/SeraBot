@@ -63,6 +63,7 @@ mod files;
 mod jobs;
 mod local;
 mod logs;
+mod marketplace;
 mod media;
 mod memories;
 mod messages;
@@ -93,6 +94,7 @@ use connectors::*;
 use conversations::*;
 use jobs::*;
 use logs::*;
+use marketplace::*;
 use media::*;
 use memories::*;
 use messages::*;
@@ -170,6 +172,8 @@ pub struct ApiState {
     personal: Arc<PersonalConnectors>,
     /// Per-user Composio key and linked apps.
     composio: Arc<crate::composio::ComposioService>,
+    /// The plugin catalog, loaded and validated at boot.
+    marketplace: Vec<crate::marketplace::PluginManifest>,
     /// Per-user GitHub, Todoist, Slack and Exa tokens.
     token_connectors: Arc<crate::token_connectors::TokenConnectors>,
     /// The ElevenLabs MCP service, shared with the tools; `None` while the
@@ -236,6 +240,10 @@ impl ApiState {
             &config,
             users.clone(),
         )?);
+        let (marketplace, plugin_problems) = marketplace::load(&config);
+        for problem in &plugin_problems {
+            tracing::warn!(%problem, "plugin skipped");
+        }
         Ok(Self {
             runtime,
             store,
@@ -246,6 +254,7 @@ impl ApiState {
             onedrive_consent,
             personal,
             composio,
+            marketplace,
             token_connectors,
             elevenlabs: None,
             token_hash: config.api.token_hash.to_ascii_lowercase(),
@@ -348,6 +357,24 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/messages", post(send_message))
         .route("/v1/bots", get(list_bots).post(create_bot))
+        .route("/v1/marketplace/plugins", get(list_plugins))
+        .route(
+            "/v1/marketplace/plugins/{slug}",
+            get(get_plugin).delete(uninstall_plugin),
+        )
+        .route(
+            "/v1/marketplace/plugins/{slug}/install",
+            post(install_plugin),
+        )
+        .route("/v1/marketplace/plugins/{slug}/enable", post(enable_plugin))
+        .route(
+            "/v1/marketplace/plugins/{slug}/disable",
+            post(disable_plugin),
+        )
+        .route(
+            "/v1/marketplace/plugins/{slug}/config",
+            put(put_plugin_config),
+        )
         .route(
             "/v1/bots/{bot}/chats",
             get(list_bot_chats).post(create_bot_chat),

@@ -73,6 +73,7 @@ const MIGRATION_31: &str = include_str!("../migrations/0031_media_job_finishing.
 const MIGRATION_32: &str = include_str!("../migrations/0032_user_tasks.sql");
 const MIGRATION_33: &str = include_str!("../migrations/0033_user_sources.sql");
 const MIGRATION_34: &str = include_str!("../migrations/0034_bot_chats.sql");
+const MIGRATION_35: &str = include_str!("../migrations/0035_marketplace_installs.sql");
 
 /// Fixed admin id written by migration 0008 and mirrored in
 /// `kv['admin_user_id']`. Code resolves the admin through the kv entry (the
@@ -674,6 +675,11 @@ impl Store {
         if version < 34 {
             connection.execute_batch(MIGRATION_34)?;
             connection.pragma_update(None, "user_version", 34)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 35 {
+            connection.execute_batch(MIGRATION_35)?;
+            connection.pragma_update(None, "user_version", 35)?;
         }
         // VACUUM INTO (backups) may renumber rowids; rebuild the external-content
         // FTS index only when its row count no longer matches `memories`.
@@ -4211,6 +4217,77 @@ impl Store {
         Ok(())
     }
 
+    /// The caller's install of one plugin: `(enabled, installed_version)`.
+    pub fn marketplace_install(&self, user_id: &str, slug: &str) -> Result<Option<(bool, String)>> {
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT enabled, installed_version FROM marketplace_installs
+                 WHERE user_id = ?1 AND slug = ?2",
+                params![user_id, slug],
+                |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, String>(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Every plugin the caller has installed, as `(slug, enabled, version)`.
+    pub fn marketplace_installs(&self, user_id: &str) -> Result<Vec<(String, bool, String)>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT slug, enabled, installed_version FROM marketplace_installs
+             WHERE user_id = ?1 ORDER BY slug ASC",
+        )?;
+        let rows = statement.query_map(params![user_id], |row| {
+            Ok((row.get(0)?, row.get::<_, i64>(1)? != 0, row.get(2)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Record an install, or keep an existing one unchanged (idempotent).
+    /// Returns `true` when a new row was written.
+    pub fn marketplace_install_insert(
+        &self,
+        user_id: &str,
+        slug: &str,
+        version: &str,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        let now = now_string();
+        let changed = connection.execute(
+            "INSERT INTO marketplace_installs(user_id, slug, enabled, installed_version, installed_at, updated_at)
+             VALUES (?1, ?2, 0, ?3, ?4, ?4)
+             ON CONFLICT(user_id, slug) DO NOTHING",
+            params![user_id, slug, version, now],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Turn an install on or off. `false` when the caller has no such install.
+    pub fn marketplace_install_set_enabled(
+        &self,
+        user_id: &str,
+        slug: &str,
+        enabled: bool,
+    ) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE marketplace_installs SET enabled = ?1, updated_at = ?2
+             WHERE user_id = ?3 AND slug = ?4",
+            params![enabled as i64, now_string(), user_id, slug],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Remove the caller's install. `false` when there was none.
+    pub fn marketplace_install_delete(&self, user_id: &str, slug: &str) -> Result<bool> {
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "DELETE FROM marketplace_installs WHERE user_id = ?1 AND slug = ?2",
+            params![user_id, slug],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Bind an extra chat to the bot it talks to. `carried_from` names the
     /// chat whose summary the new chat starts with, if any.
     pub fn bind_bot_chat(
@@ -5485,7 +5562,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 34);
+        assert_eq!(version, 35);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -5550,7 +5627,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 34);
+        assert_eq!(version, 35);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -5624,7 +5701,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 34);
+        assert_eq!(version, 35);
         let admin = admin(&store);
         let memory = crate::memory::get(&store, &admin, "mem-legacy").unwrap();
         assert_eq!(memory.origin, "explicit");
@@ -5713,7 +5790,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 34);
+        assert_eq!(version, 35);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -5844,7 +5921,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 34);
+        assert_eq!(version, 35);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -5999,7 +6076,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 34);
+        assert_eq!(version, 35);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.

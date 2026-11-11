@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "slug": "firecrawl",
+  "name": "Web Reader",
+  "tagline": "Read and search the web with a managed scraper.",
+  "description": "Fetch clean text from web pages, search the web and extract structured data. Requests go to the scraping service under the owner's own key.",
+  "category": "research",
+  "iconUrl": "https://firecrawl.example.invalid/icon.png",
+  "version": "1.0.0",
+  "minServerVersion": "0.36.0",
+  "prompts": [
+    {
+      "id": "firecrawl-0",
+      "text": "Summarise the page at this link."
+    },
+    {
+      "id": "firecrawl-1",
+      "text": "Find the latest pricing on this site."
+    }
+  ],
+  "apps": [
+    {
+      "id": "scraper",
+      "name": "Scraper",
+      "server": {
+        "transport": "http",
+        "url": "https://mcp.firecrawl.example.invalid/mcp"
+      },
+      "auth": [
+        {
+          "id": "key",
+          "kind": "api-key",
+          "fields": [
+            {
+              "id": "api_key",
+              "label": "API key",
+              "secretKey": "firecrawl.api_key",
+              "hint": "Paste the Web Reader API key. It is stored only for your account.",
+              "docsUrl": "https://firecrawl.example.invalid/docs/keys"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "permissions": {
+    "egress": [
+      "mcp.firecrawl.example.invalid"
+    ]
+  },
+  "websiteUrl": "https://firecrawl.example.invalid",
+  "privacyPolicyUrl": "https://firecrawl.example.invalid/privacy",
+  "termsUrl": "https://firecrawl.example.invalid/terms"
+}

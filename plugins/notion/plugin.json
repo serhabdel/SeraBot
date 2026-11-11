@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "slug": "notion",
+  "name": "Notes and Docs",
+  "tagline": "Read and update pages in Notion.",
+  "description": "Search your workspace, read pages and add content. Connect the owner's account with the browser sign-in.",
+  "category": "productivity",
+  "iconUrl": "https://notion.example.invalid/icon.png",
+  "version": "1.0.0",
+  "minServerVersion": "0.36.0",
+  "prompts": [
+    {
+      "id": "notion-0",
+      "text": "Find my meeting notes from last week."
+    }
+  ],
+  "apps": [
+    {
+      "id": "workspace",
+      "name": "Workspace",
+      "server": {
+        "transport": "http",
+        "url": "https://mcp.notion.example.invalid/mcp"
+      },
+      "auth": [
+        {
+          "id": "link",
+          "kind": "oauth-link",
+          "fields": []
+        }
+      ]
+    }
+  ],
+  "permissions": {
+    "egress": [
+      "mcp.notion.example.invalid"
+    ]
+  },
+  "websiteUrl": "https://notion.example.invalid",
+  "privacyPolicyUrl": "https://notion.example.invalid/privacy",
+  "termsUrl": "https://notion.example.invalid/terms"
+}

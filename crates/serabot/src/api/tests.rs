@@ -20,6 +20,7 @@ mod digest_api;
 mod files_api;
 mod jobs_api;
 mod logs_api;
+mod marketplace_api;
 mod memory_settings_api;
 mod personal_api;
 mod preview_api;

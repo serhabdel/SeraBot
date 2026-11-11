@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "slug": "exa",
+  "name": "Neural Search",
+  "tagline": "Find pages by meaning, not only keywords.",
+  "description": "Search by describing what you need. Results include links and extracted text. Requests go to the search API under the owner's own key.",
+  "category": "research",
+  "iconUrl": "https://exa.example.invalid/icon.png",
+  "version": "1.0.0",
+  "minServerVersion": "0.36.0",
+  "prompts": [
+    {
+      "id": "exa-0",
+      "text": "Find recent papers about this topic."
+    }
+  ],
+  "apps": [
+    {
+      "id": "neural",
+      "name": "Neural Search",
+      "server": {
+        "transport": "http",
+        "url": "https://mcp.exa.example.invalid/mcp"
+      },
+      "auth": [
+        {
+          "id": "key",
+          "kind": "api-key",
+          "fields": [
+            {
+              "id": "api_key",
+              "label": "API key",
+              "secretKey": "exa.api_key",
+              "hint": "Paste the Neural Search API key. It is stored only for your account.",
+              "docsUrl": "https://exa.example.invalid/docs/keys"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "permissions": {
+    "egress": [
+      "mcp.exa.example.invalid"
+    ]
+  },
+  "websiteUrl": "https://exa.example.invalid",
+  "privacyPolicyUrl": "https://exa.example.invalid/privacy",
+  "termsUrl": "https://exa.example.invalid/terms"
+}
