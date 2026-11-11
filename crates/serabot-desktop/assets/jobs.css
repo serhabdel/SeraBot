@@ -496,3 +496,169 @@
   align-items: center;
   gap: 8px;
 }
+
+/* Workflows rows (part B): switch status, fixed columns, wrapping plan names. */
+.wf-row-routine {
+  grid-template-columns: minmax(120px, 1.2fr) minmax(120px, 1fr) 112px minmax(110px, 1fr) minmax(110px, 1fr);
+  min-height: 48px;
+}
+
+.wf-row-source {
+  grid-template-columns: minmax(160px, 1.4fr) 72px 112px minmax(160px, 1.2fr);
+  min-height: 48px;
+}
+
+.wf-row-routine .wf-actions,
+.wf-row-source .wf-actions {
+  grid-column: 1 / -1;
+  justify-content: flex-end;
+}
+
+.wf-row-plan {
+  grid-template-columns: minmax(160px, 2fr) minmax(120px, 1fr) auto minmax(110px, 1fr);
+  min-height: 48px;
+}
+
+.wf-name-wrap {
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  line-height: 1.35;
+}
+
+.wf-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--label-2);
+  font: inherit;
+  font-size: var(--fs-caption);
+  cursor: pointer;
+}
+
+.wf-switch-track {
+  position: relative;
+  width: 30px;
+  height: 18px;
+  border-radius: 9px;
+  border: 1px solid var(--label-3);
+  background: var(--surface-3, var(--surface-2));
+  transition: background var(--dur-2) var(--ease);
+}
+
+.wf-switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--label-2);
+  transition: transform var(--dur-2) var(--ease);
+}
+
+.wf-switch.on .wf-switch-track {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.wf-switch.on .wf-switch-knob {
+  transform: translateX(12px);
+  background: var(--accent-ink, #fff);
+}
+
+.wf-switch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* Tasks add row (part B): the input shrinks, the date and Add keep their width. */
+.tasks-add {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tasks-add > .input:first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.tasks-add .tasks-due {
+  flex: 0 0 128px;
+  width: 128px;
+}
+
+.tasks-add > .btn {
+  flex: 0 0 auto;
+}
+
+/* Approvals (part B): pending requests as rows, actions in one column. */
+.ap-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ap-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.ap-row {
+  display: grid;
+  grid-template-columns: minmax(96px, auto) minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  min-height: 48px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.ap-row:last-child {
+  border-bottom: none;
+}
+
+.ap-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.ap-summary {
+  margin: 0;
+  color: var(--label-1);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  line-height: 1.4;
+}
+
+.ap-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+@media (max-width: 760px) {
+  .ap-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .ap-actions {
+    justify-content: flex-start;
+  }
+}

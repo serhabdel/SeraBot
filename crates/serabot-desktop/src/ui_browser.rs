@@ -300,8 +300,8 @@ fn BrowserGrid(session: Signal<Session>) -> Element {
                 } else if cards.is_empty() {
                     div { class: "empty browser-empty",
                         div { class: "empty-icon", Icon { name: "globe", size: 20 } }
-                        h2 { class: "empty-title", "No browser open." }
-                        p { class: "empty-text", "Ask a bot to open a website." }
+                        h2 { class: "empty-title", "No browser is running." }
+                        p { class: "empty-text", "Open one from the list below, or ask a bot to open a website." }
                     }
                 } else {
                     div { class: "browser-grid",

@@ -23,6 +23,7 @@ fn RoutineRow(session: Signal<Session>, routine: Routine) -> Element {
     };
     let status = if routine.enabled { "On" } else { "Off" };
     let toggle_name = routine.name.clone();
+    let toggle_text_name = routine.name.clone();
     let toggle_to = !routine.enabled;
     let run_name = routine.name.clone();
     let time_name = routine.name.clone();
@@ -31,16 +32,28 @@ fn RoutineRow(session: Signal<Session>, routine: Routine) -> Element {
         div { class: "wf-row wf-row-routine", role: "listitem",
             span { class: "wf-name", title: "{routine.name}", "{routine.name}" }
             span { class: "wf-meta", "{schedule}" }
-            span { class: if routine.enabled { "wf-pill ok" } else { "wf-pill muted" }, "{status}" }
+            button {
+                class: if routine.enabled { "wf-switch on" } else { "wf-switch" },
+                r#type: "button",
+                role: "switch",
+                "aria-checked": if routine.enabled { "true" } else { "false" },
+                "aria-label": "{routine.name} enabled",
+                title: "{status}",
+                onclick: move |_| session.write().save_workflow_routine(toggle_name.clone(), Some(toggle_to), None, None),
+                span { class: "wf-switch-track", "aria-hidden": "true", span { class: "wf-switch-knob" } }
+                span { class: "wf-switch-label", if routine.enabled { "Enabled" } else { "Paused" } }
+            }
             span { class: "wf-meta", title: "{routine.next_run_at}",
                 "Next {workflows::relative_time(&routine.next_run_at, workflows::now_secs())}"
             }
             if let Some(last) = routine.last_run_for.as_deref() {
                 span { class: "wf-meta", "Last {last}" }
+            } else {
+                span { class: "wf-meta", "No run yet" }
             }
             div { class: "wf-actions",
                 button { class: "btn ghost sm", r#type: "button",
-                    onclick: move |_| session.write().save_workflow_routine(toggle_name.clone(), Some(toggle_to), None, None),
+                    onclick: move |_| session.write().save_workflow_routine(toggle_text_name.clone(), Some(toggle_to), None, None),
                     if routine.enabled { "Turn off" } else { "Turn on" }
                 }
                 button { class: "btn ghost sm", r#type: "button",
@@ -145,15 +158,18 @@ fn SourceRow(session: Signal<Session>, source: MonitoringSource) -> Element {
                 }
             }
             span { class: "wf-meta", "{source.kind}" }
-            span { class: if source.enabled { "wf-pill ok" } else { "wf-pill muted" },
-                if source.enabled { "Enabled" } else { "Disabled" }
+            button {
+                class: if source.enabled { "wf-switch on" } else { "wf-switch" },
+                r#type: "button",
+                role: "switch",
+                "aria-checked": if source.enabled { "true" } else { "false" },
+                "aria-label": "{source.name} enabled",
+                onclick: move |_| session.write().patch_source(toggle_name.clone(), Some(toggle_to), None),
+                span { class: "wf-switch-track", "aria-hidden": "true", span { class: "wf-switch-knob" } }
+                span { class: "wf-switch-label", if source.enabled { "Enabled" } else { "Disabled" } }
             }
             span { class: "{status_class}", title: "{status}", "{status}" }
             div { class: "wf-actions",
-                button { class: "btn ghost sm", r#type: "button",
-                    onclick: move |_| session.write().patch_source(toggle_name.clone(), Some(toggle_to), None),
-                    if source.enabled { "Disable" } else { "Enable" }
-                }
                 if source.own {
                     button { class: "btn ghost sm", r#type: "button",
                         onclick: move |_| editing.toggle(),
@@ -207,8 +223,8 @@ fn ActiveRow(plan: ActiveWorkflow, conversation: Option<String>) -> Element {
     let progress = workflows::plan_progress(plan.done, plan.total);
     let label = workflows::plan_conversation_label(conversation.as_deref(), &plan.conversation_id);
     rsx! {
-        div { class: "wf-row", role: "listitem",
-            span { class: "wf-name", title: "{plan.goal}", "{plan.goal}" }
+        div { class: "wf-row wf-row-plan", role: "listitem",
+            span { class: "wf-name wf-name-wrap", title: "{plan.goal}", "{plan.goal}" }
             span { class: "wf-meta", title: "{plan.conversation_id}", "{label}" }
             span { class: "wf-pill", "{progress}" }
             if let Some(at) = plan.updated_at.as_deref() {
@@ -294,7 +310,9 @@ pub fn WorkflowsView(session: Signal<Session>) -> Element {
                             }
                         } else {
                             if snapshot.routines.is_empty() {
-                                p { class: "muted", role: "status", "No routines configured." }
+                                p { class: "muted", role: "status",
+                                    "No routines yet. Add the morning brief or a watch below."
+                                }
                             } else {
                                 div { class: "wf-list", role: "list",
                                     for routine in snapshot.routines.clone() {
@@ -336,7 +354,9 @@ pub fn WorkflowsView(session: Signal<Session>) -> Element {
                             }
                         } else {
                             if snapshot.sources.is_empty() {
-                                p { class: "muted", role: "status", "No watcher sources configured." }
+                                p { class: "muted", role: "status",
+                                    "No watcher sources yet. Add an RSS feed below."
+                                }
                             } else {
                                 div { class: "wf-list", role: "list",
                                     for source in snapshot.sources.clone() {

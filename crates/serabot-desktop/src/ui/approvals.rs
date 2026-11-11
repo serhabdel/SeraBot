@@ -69,53 +69,55 @@ pub(super) fn ApprovalsView(session: Signal<Session>) -> Element {
                         }
                     }
                 }
-                div { class: "card-grid",
+                section { class: "ap-section", "aria-label": "Pending approvals",
+                    h2 { class: "section-title", "Waiting for you" }
                     if !approvals_loaded {
-                        div { class: "card",
-                            div { class: "skeleton title" }
-                            div { class: "skeleton block" }
+                        div { class: "ap-list",
+                            div { class: "ap-row skeleton block", " " }
                         }
-                    }
-                    for (id, tool, summary, expires) in approvals {
-                        div { class: "card", key: "{id}",
-                            div { class: "card-head",
-                                span { class: "chip accent", "{tool}" }
-                                span { class: "tiny", "expires {expires}" }
-                            }
-                            p { class: "card-sub", "{summary}" }
-                            div { class: "card-actions",
-                                button {
-                                    class: "btn primary sm",
-                                    onclick: {
-                                        let id = id.clone();
-                                        move |_| session.write().decide(id.clone(), ApprovalDecision::Once)
-                                    },
-                                    "Approve once"
-                                }
-                                button {
-                                    class: "btn ghost sm",
-                                    onclick: {
-                                        let id = id.clone();
-                                        move |_| session.write().decide(id.clone(), ApprovalDecision::Always)
-                                    },
-                                    "Always"
-                                }
-                                button {
-                                    class: "btn danger sm",
-                                    onclick: {
-                                        let id = id.clone();
-                                        move |_| session.write().decide(id.clone(), ApprovalDecision::Deny)
-                                    },
-                                    "Deny"
-                                }
-                            }
-                        }
-                    }
-                    if approvals_loaded && approvals_empty {
+                    } else if approvals_empty {
                         div { class: "empty",
                             div { class: "empty-icon", Icon { name: "shield", size: 20 } }
-                            h3 { class: "empty-title", "Nothing pending" }
+                            h3 { class: "empty-title", "Nothing waiting for approval" }
                             p { class: "empty-text", "Requests that need your OK appear here." }
+                        }
+                    } else {
+                        div { class: "ap-list", role: "list",
+                            for (id, tool, summary, expires) in approvals {
+                                div { class: "ap-row", key: "{id}", role: "listitem",
+                                    span { class: "chip accent ap-tool", "{tool}" }
+                                    div { class: "ap-body",
+                                        p { class: "ap-summary", title: "{summary}", "{summary}" }
+                                        span { class: "tiny muted", "Expires {expires}" }
+                                    }
+                                    div { class: "ap-actions",
+                                        button {
+                                            class: "btn primary sm",
+                                            onclick: {
+                                                let id = id.clone();
+                                                move |_| session.write().decide(id.clone(), ApprovalDecision::Once)
+                                            },
+                                            "Approve once"
+                                        }
+                                        button {
+                                            class: "btn ghost sm",
+                                            onclick: {
+                                                let id = id.clone();
+                                                move |_| session.write().decide(id.clone(), ApprovalDecision::Always)
+                                            },
+                                            "Always"
+                                        }
+                                        button {
+                                            class: "btn danger sm",
+                                            onclick: {
+                                                let id = id.clone();
+                                                move |_| session.write().decide(id.clone(), ApprovalDecision::Deny)
+                                            },
+                                            "Deny"
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
