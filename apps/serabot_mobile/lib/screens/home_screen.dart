@@ -60,19 +60,40 @@ class _HomeScreenState extends State<HomeScreen> {
         final unread = _app.unread;
         final pending = _app.pendingApprovals;
         return Scaffold(
-          body: IndexedStack(
-            index: _index,
-            children: [
-              ChatsScreen(app: _app, device: _device),
-              ApprovalsScreen(app: _app),
-              WorkflowsScreen(app: _app),
-              BotsScreen(app: _app, device: _device),
-              SettingsScreen(
-                session: widget.session,
-                app: _app,
-                theme: widget.theme,
-              ),
-            ],
+          body: ListenableBuilder(
+            listenable: widget.session,
+            builder: (context, _) {
+              final failed = widget.session.saveFailed;
+              return Column(
+                children: [
+                  if (failed)
+                    SafeArea(
+                      bottom: false,
+                      child: _SaveFailedBanner(session: widget.session),
+                    ),
+                  Expanded(
+                    child: MediaQuery.removePadding(
+                      context: context,
+                      removeTop: failed,
+                      child: IndexedStack(
+                        index: _index,
+                        children: [
+                          ChatsScreen(app: _app, device: _device),
+                          ApprovalsScreen(app: _app),
+                          WorkflowsScreen(app: _app),
+                          BotsScreen(app: _app, device: _device),
+                          SettingsScreen(
+                            session: widget.session,
+                            app: _app,
+                            theme: widget.theme,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              );
+            },
           ),
           bottomNavigationBar: NavigationBar(
             selectedIndex: _index,
@@ -115,6 +136,43 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         );
       },
+    );
+  }
+}
+
+/// Shown when sign-in worked but the phone would not store the token.
+class _SaveFailedBanner extends StatelessWidget {
+  const _SaveFailedBanner({required this.session});
+
+  final OwnerSession session;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      key: const Key('save-failed-banner'),
+      color: scheme.tertiaryContainer,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
+        child: Row(
+          children: [
+            Icon(Icons.warning_amber_rounded, color: scheme.onTertiaryContainer),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                'Signed in for this session only. This phone would not save '
+                'your sign-in, so you will need to sign in again after the '
+                'app restarts.',
+                style: TextStyle(color: scheme.onTertiaryContainer),
+              ),
+            ),
+            TextButton(
+              onPressed: session.retrySave,
+              child: const Text('Try saving again'),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

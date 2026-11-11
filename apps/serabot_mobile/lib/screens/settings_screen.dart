@@ -6,7 +6,9 @@ import '../app_state.dart';
 import '../chat_models.dart';
 import '../session.dart';
 import '../theme.dart';
+import '../status.dart';
 import '../update_flow.dart';
+import '../widgets.dart';
 
 /// Account, theme, read-only connector status, usage summary and About.
 class SettingsScreen extends StatefulWidget {
@@ -43,6 +45,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   void initState() {
     super.initState();
+    _loadAll();
+  }
+
+  void _reload() {
+    setState(() {
+      _connectors = null;
+      _connectorsError = null;
+      _usage = null;
+      _usageError = null;
+    });
     _loadAll();
   }
 
@@ -127,6 +139,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
           _section(context, 'Connectors'),
           ..._connectorTiles(context),
           const Divider(),
+          if (_usage?.quota.enforced ?? false) ...[
+            _section(context, 'Quota'),
+            _quotaTile(context, _usage!.quota),
+            const Divider(),
+          ],
           _section(context, 'Usage, last 30 days'),
           ..._usageTiles(context),
           const Divider(),
@@ -146,9 +163,70 @@ class _SettingsScreenState extends State<SettingsScreen> {
             key: const Key('sign-out'),
             leading: const Icon(Icons.logout),
             title: const Text('Sign out'),
-            onTap: widget.session.signOut,
+            onTap: _confirmSignOut,
           ),
           const SizedBox(height: 24),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _confirmSignOut() async {
+    final ok = await confirmAction(
+      context,
+      title: 'Sign out?',
+      message: 'You will need to sign in again to use SeraBot on this phone.',
+      confirmLabel: 'Sign out',
+    );
+    if (ok) {
+      await widget.session.signOut();
+    }
+  }
+
+  Widget _errorTile(String message) => Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+        child: ErrorBanner(message, onRetry: _reload),
+      );
+
+  /// Daily task budget: a word, an icon and a bar, never colour alone.
+  Widget _quotaTile(BuildContext context, UsageQuota q) {
+    final level = statusLevelFromFlags(
+      nearLimit: q.nearLimit,
+      atLimit: q.atLimit,
+    );
+    final percent = quotaPercent(q.used, q.limit);
+    final note = switch (level) {
+      StatusLevel.atLimit =>
+        'You reached today\'s task limit. New bot turns wait until UTC midnight.',
+      StatusLevel.near => 'You are close to today\'s task limit.',
+      StatusLevel.ok =>
+        'Queued and completed tasks count toward this UTC-day budget.',
+    };
+    return Padding(
+      key: const Key('quota-tile'),
+      padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Expanded(child: Text('Daily task quota')),
+              StatusChip(level: level),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Semantics(
+            label: 'Daily task quota, $percent percent used',
+            child: LinearProgressIndicator(
+              value: percent / 100,
+              minHeight: 6,
+              borderRadius: BorderRadius.circular(3),
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text('Tasks today (UTC): ${q.used} of ${q.limit}',
+              style: Theme.of(context).textTheme.bodySmall),
+          Text(note, style: Theme.of(context).textTheme.bodySmall),
         ],
       ),
     );
@@ -161,7 +239,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   List<Widget> _connectorTiles(BuildContext context) {
     if (_connectorsError != null) {
-      return [ListTile(title: Text(_connectorsError!))];
+      return [_errorTile(_connectorsError!)];
     }
     final list = _connectors;
     if (list == null) {
@@ -176,7 +254,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           dense: true,
           leading: Icon(
             c.isConnected ? Icons.check_circle : Icons.link_off,
-            color: c.isConnected ? Colors.green : null,
+            color: c.isConnected ? Theme.of(context).colorScheme.primary : null,
           ),
           title: Text(c.id),
           subtitle: Text(c.account != null && c.isConnected
@@ -193,7 +271,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   List<Widget> _usageTiles(BuildContext context) {
     if (_usageError != null) {
-      return [ListTile(title: Text(_usageError!))];
+      return [_errorTile(_usageError!)];
     }
     final u = _usage;
     if (u == null) {

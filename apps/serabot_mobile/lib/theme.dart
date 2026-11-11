@@ -32,6 +32,36 @@ ThemeData buildTheme(Brightness brightness) {
   );
 }
 
+/// Page route builder with no animation, used when the system asks for
+/// reduced motion (Android "Remove animations").
+class NoTransitionsBuilder extends PageTransitionsBuilder {
+  const NoTransitionsBuilder();
+
+  @override
+  Widget buildTransitions<T>(
+    PageRoute<T> route,
+    BuildContext context,
+    Animation<double> animation,
+    Animation<double> secondaryAnimation,
+    Widget child,
+  ) =>
+      child;
+}
+
+/// [data] with page transitions switched off.
+ThemeData withoutPageTransitions(ThemeData data) => data.copyWith(
+      pageTransitionsTheme: const PageTransitionsTheme(
+        builders: {
+          TargetPlatform.android: NoTransitionsBuilder(),
+          TargetPlatform.iOS: NoTransitionsBuilder(),
+          TargetPlatform.linux: NoTransitionsBuilder(),
+          TargetPlatform.macOS: NoTransitionsBuilder(),
+          TargetPlatform.windows: NoTransitionsBuilder(),
+          TargetPlatform.fuchsia: NoTransitionsBuilder(),
+        },
+      ),
+    );
+
 /// Where the theme choice is kept (not a secret; any small key-value store).
 abstract class ThemePrefs {
   Future<String?> read();

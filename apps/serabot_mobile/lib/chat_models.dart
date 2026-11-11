@@ -543,15 +543,47 @@ class UsageTotals {
   final int totalTokens;
 }
 
+/// `quota.daily_tasks` on `GET /v1/usage`: the per-user task budget for the
+/// current UTC day. A limit of 0 means no quota is enforced.
+class UsageQuota {
+  const UsageQuota({
+    this.used = 0,
+    this.limit = 0,
+    this.nearLimit = false,
+    this.atLimit = false,
+  });
+  factory UsageQuota.fromJson(Object? v) {
+    final j = v is Map<String, dynamic> ? v : const <String, dynamic>{};
+    return UsageQuota(
+      used: _int(j['used']),
+      limit: _int(j['limit']),
+      nearLimit: j['near_limit'] as bool? ?? false,
+      atLimit: j['at_limit'] as bool? ?? false,
+    );
+  }
+  final int used;
+  final int limit;
+  final bool nearLimit;
+  final bool atLimit;
+
+  bool get enforced => limit > 0;
+}
+
 class UsageReport {
   const UsageReport({
     this.totals = const UsageTotals(),
     this.perModel = const [],
+    this.quota = const UsageQuota(),
   });
   factory UsageReport.fromJson(Map<String, dynamic> json) {
     final models = json['per_model'];
     return UsageReport(
       totals: UsageTotals.fromJson(json['totals']),
+      quota: UsageQuota.fromJson(
+        json['quota'] is Map<String, dynamic>
+            ? (json['quota'] as Map<String, dynamic>)['daily_tasks']
+            : null,
+      ),
       perModel: models is List
           ? models.whereType<Map<String, dynamic>>().map((m) {
               final t = UsageTotals.fromJson(m);
@@ -566,6 +598,7 @@ class UsageReport {
   }
   final UsageTotals totals;
   final List<({String provider, String model, UsageTotals totals})> perModel;
+  final UsageQuota quota;
 }
 
 /// `GET /v1/connectors` row (read-only on the phone).

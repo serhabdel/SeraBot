@@ -4,6 +4,7 @@ import 'package:flutter_web_auth_2/flutter_web_auth_2.dart';
 import '../auth.dart';
 import '../build_config.dart';
 import '../session.dart';
+import '../widgets.dart';
 
 class ConnectScreen extends StatefulWidget {
   const ConnectScreen({super.key, required this.session, this.launcher});
@@ -92,18 +93,16 @@ class _ConnectScreenState extends State<ConnectScreen> {
             onChanged: (v) => setState(() => _hasInvite = v ?? false),
           ),
           if (_hasInvite) ...[
-            TextField(
+            SecretField(
               controller: _inviteController,
-              decoration: const InputDecoration(
-                labelText: 'Invite code',
-                border: OutlineInputBorder(),
-              ),
-              autocorrect: false,
-              enableSuggestions: false,
+              label: 'Invite code',
             ),
             const SizedBox(height: 12),
           ],
-          if (notice != null) ...[
+          if (_error != null) ...[
+            ErrorBanner(_error!, onRetry: busy ? null : _signIn),
+            const SizedBox(height: 12),
+          ] else if (notice != null) ...[
             Text(
               notice,
               style: TextStyle(color: Theme.of(context).colorScheme.error),
