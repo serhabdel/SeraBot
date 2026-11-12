@@ -1748,6 +1748,7 @@ impl CallTool {
     fn generating_reply(
         &self,
         name: &str,
+        arguments: &Value,
         catalog: &[Value],
         generation_id: &str,
         context: &ToolContext,
@@ -1800,10 +1801,12 @@ impl CallTool {
             "generation_id": generation_id,
             "note": note,
         });
+        let cards = vec![crate::result_cards::pending_media_card(label, arguments)];
         Ok(ToolOutput {
             content: payload.to_string(),
             data: Some(payload),
             destination: Some("elevenlabs:mcp".into()),
+            cards,
             ..ToolOutput::default()
         })
     }
@@ -1901,7 +1904,7 @@ impl Tool for CallTool {
                 .as_deref()
                 .is_some_and(|word| PENDING_STATUSES.contains(&word))
         {
-            return self.generating_reply(name, &catalog, generation_id, context);
+            return self.generating_reply(name, &arguments, &catalog, generation_id, context);
         }
         // Every saved item is listed beside the call's primary artifact (0.24). The
         // saves ran on this task, inside the gateway's record of the call.
@@ -1915,6 +1918,17 @@ impl Tool for CallTool {
                 media.mime, media.bytes, media.hash, media.filename
             ));
         }
+        let media_refs: Vec<crate::result_cards::MediaRef<'_>> = outcome
+            .media
+            .iter()
+            .map(|media| crate::result_cards::MediaRef {
+                hash: &media.hash,
+                filename: &media.filename,
+                mime: &media.mime,
+                title: &media.title,
+            })
+            .collect();
+        let cards = crate::result_cards::cards_for_media(&arguments, &media_refs);
         let first = outcome.media.first().cloned();
         // Every saved item, so a later change can record them all.
         let files: Vec<Value> = outcome
@@ -1938,6 +1952,7 @@ impl Tool for CallTool {
             artifact_hash: first.as_ref().map(|m| m.hash.clone()),
             filename: first.map(|m| m.filename),
             destination: Some("elevenlabs:mcp".into()),
+            cards,
         })
     }
 }

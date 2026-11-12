@@ -78,7 +78,7 @@ const SUPERSEDE_SCAN: usize = 500;
 pub const SUMMARY_MAX_CHARS: usize = 800;
 
 const COLUMNS: &str = "id, kind, content, source, created_at, updated_at, origin, status, \
-    bot, conversation_id, importance, last_recalled_at, recall_count, superseded_by";
+    bot, conversation_id, importance, last_recalled_at, recall_count, superseded_by, pinned";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Memory {
@@ -106,6 +106,9 @@ pub struct Memory {
     pub recall_count: i64,
     #[serde(default)]
     pub superseded_by: Option<String>,
+    /// Kept at the top of the Memory page. Recall does not prefer it.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 fn default_origin() -> String {
@@ -184,12 +187,25 @@ pub struct MemoryFilter {
     pub origin: Option<String>,
     pub status: Option<String>,
     pub bot: Option<String>,
+    /// Memory kind (`preference`, `fact`, `decision`, `context`, `note`).
+    /// The API calls this `category`.
+    pub category: Option<String>,
+    /// `Some(true)` is pinned only, `Some(false)` is unpinned only.
+    pub pinned: Option<bool>,
+}
+
+struct MemoryQuery {
+    origin: String,
+    status: String,
+    bot: String,
+    category: String,
+    pinned: i64,
 }
 
 impl MemoryFilter {
     /// Validated SQL parameters: origin, status, bot. `all` (or empty bot)
     /// disables that dimension.
-    fn sql_values(&self) -> Result<(String, String, String)> {
+    fn sql_values(&self) -> Result<MemoryQuery> {
         let origin = match self.origin.as_deref().map(str::trim) {
             None | Some("") | Some("all") => "all".to_owned(),
             Some(value) => normalize_origin(value)?.to_owned(),
@@ -209,7 +225,22 @@ impl MemoryFilter {
             Some(value) if value.len() <= 64 => value.to_owned(),
             Some(_) => return Err(SeraError::Validation("bot filter is too long".into())),
         };
-        Ok((origin, status, bot))
+        let category = match self.category.as_deref().map(str::trim) {
+            None | Some("") | Some("all") => String::new(),
+            Some(value) => normalize_kind(value)?.to_owned(),
+        };
+        let pinned = match self.pinned {
+            None => -1,
+            Some(true) => 1,
+            Some(false) => 0,
+        };
+        Ok(MemoryQuery {
+            origin,
+            status,
+            bot,
+            category,
+            pinned,
+        })
     }
 }
 
@@ -223,6 +254,9 @@ pub struct MemoryPatch {
     pub importance: Option<f64>,
     #[serde(default)]
     pub status: Option<String>,
+    /// Pin or unpin. Absent leaves the stored flag alone.
+    #[serde(default)]
+    pub pinned: Option<bool>,
 }
 
 /// One scored memory from recall or search. Higher is more relevant.
@@ -250,6 +284,7 @@ pub struct MemoryStats {
     pub by_origin: BTreeMap<String, i64>,
     pub by_status: BTreeMap<String, i64>,
     pub last_extraction_at: Option<String>,
+    pub pinned: i64,
 }
 
 /// Reviewable write: validates the kind, content, source and importance, then
@@ -377,7 +412,7 @@ pub fn list_page(
     limit: usize,
 ) -> Result<Vec<Memory>> {
     let limit = limit.clamp(1, MAX_LIST_LIMIT);
-    let (origin, status, bot) = filter.sql_values()?;
+    let query = filter.sql_values()?;
     let connection = store.connection()?;
     let mut statement = connection.prepare(&format!(
         "SELECT {COLUMNS} FROM memories
@@ -385,11 +420,22 @@ pub fn list_page(
            AND (?2 = 'all' OR origin = ?2)
            AND (?3 = 'all' OR status = ?3)
            AND (?4 = '' OR bot = ?4)
-         ORDER BY updated_at DESC, id DESC
-         LIMIT ?5 OFFSET ?6"
+           AND (?5 = '' OR kind = ?5)
+           AND (?6 < 0 OR pinned = ?6)
+         ORDER BY pinned DESC, updated_at DESC, id DESC
+         LIMIT ?7 OFFSET ?8"
     ))?;
     let rows = statement.query_map(
-        params![user_id, origin, status, bot, limit as i64, offset as i64],
+        params![
+            user_id,
+            query.origin,
+            query.status,
+            query.bot,
+            query.category,
+            query.pinned,
+            limit as i64,
+            offset as i64
+        ],
         row_to_memory,
     )?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -456,16 +502,19 @@ pub fn update(store: &Store, user_id: &str, id: &str, patch: &MemoryPatch) -> Re
             ));
         }
     };
+    let pinned = patch.pinned.unwrap_or(current.pinned);
     tx.execute(
         "UPDATE memories
-         SET content = ?1, importance = ?2, status = ?3, content_hash = ?4, updated_at = ?5
-         WHERE id = ?6 AND user_id = ?7",
+         SET content = ?1, importance = ?2, status = ?3, content_hash = ?4, updated_at = ?5,
+             pinned = ?6
+         WHERE id = ?7 AND user_id = ?8",
         params![
             content,
             importance,
             status,
             content_hash(&content),
             now_string(Utc::now()),
+            pinned as i64,
             id,
             user_id,
         ],
@@ -533,11 +582,17 @@ pub fn stats(store: &Store, user_id: &str) -> Result<MemoryStats> {
         params![user_id],
         |row| row.get::<_, Option<String>>(0),
     )?;
+    let pinned: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM memories WHERE user_id = ?1 AND pinned = 1 AND status = 'active'",
+        params![user_id],
+        |row| row.get(0),
+    )?;
     Ok(MemoryStats {
         active,
         by_origin,
         by_status,
         last_extraction_at,
+        pinned,
     })
 }
 
@@ -972,6 +1027,7 @@ fn merge_by_score(
                 last_recalled_at: None,
                 recall_count: 0,
                 superseded_by: None,
+                pinned: false,
             },
             score: hit.score.clamp(0.0, 1.0),
         });
@@ -1064,7 +1120,7 @@ fn lexical_hits(
     connection: &Connection,
     user_id: &str,
     tokens: &[String],
-    values: &(String, String, String),
+    values: &MemoryQuery,
 ) -> Result<Vec<(String, f64)>> {
     let matcher = tokens
         .iter()
@@ -1078,17 +1134,21 @@ fn lexical_hits(
            AND (?2 = 'all' OR m.origin = ?2)
            AND (?3 = 'all' OR m.status = ?3)
            AND (?4 = '' OR m.bot = ?4)
+           AND (?7 = '' OR m.kind = ?7)
+           AND (?8 < 0 OR m.pinned = ?8)
          ORDER BY bm25(memories_fts)
          LIMIT ?6",
     )?;
     let rows = statement.query_map(
         params![
             matcher,
-            values.0,
-            values.1,
-            values.2,
+            values.origin,
+            values.status,
+            values.bot,
             user_id,
-            POOL_LEXICAL as i64
+            POOL_LEXICAL as i64,
+            values.category,
+            values.pinned,
         ],
         |row| Ok((row.get::<_, String>(0)?, -row.get::<_, f64>(1)?)),
     )?;
@@ -1098,7 +1158,7 @@ fn lexical_hits(
 fn recent_ids(
     connection: &Connection,
     user_id: &str,
-    values: &(String, String, String),
+    values: &MemoryQuery,
     limit: usize,
 ) -> Result<Vec<String>> {
     let mut statement = connection.prepare(
@@ -1107,10 +1167,20 @@ fn recent_ids(
            AND (?2 = 'all' OR origin = ?2)
            AND (?3 = 'all' OR status = ?3)
            AND (?4 = '' OR bot = ?4)
-         ORDER BY updated_at DESC, id DESC LIMIT ?5",
+           AND (?6 = '' OR kind = ?6)
+           AND (?7 < 0 OR pinned = ?7)
+         ORDER BY pinned DESC, updated_at DESC, id DESC LIMIT ?5",
     )?;
     let rows = statement.query_map(
-        params![user_id, values.0, values.1, values.2, limit as i64],
+        params![
+            user_id,
+            values.origin,
+            values.status,
+            values.bot,
+            limit as i64,
+            values.category,
+            values.pinned
+        ],
         |row| row.get::<_, String>(0),
     )?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1237,6 +1307,7 @@ fn row_to_memory(row: &rusqlite::Row<'_>) -> rusqlite::Result<Memory> {
         last_recalled_at: last_recalled.as_deref().map(parse_datetime),
         recall_count: row.get(12)?,
         superseded_by: row.get(13)?,
+        pinned: row.get::<_, i64>(14)? != 0,
     })
 }
 

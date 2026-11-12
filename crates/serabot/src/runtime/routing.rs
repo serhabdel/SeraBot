@@ -201,6 +201,8 @@ impl Runtime {
             team: None,
             mentions: mentions.clone(),
             attachments: attachment_ids.to_vec(),
+            help_depth: 0,
+            help_from: None,
         };
         // User-initiated work: the daily quota is checked atomically with the
         // insert, so a user at the cap gets an explicit validation error.
@@ -307,6 +309,8 @@ impl Runtime {
                     team: Some(frame.clone()),
                     mentions: Vec::new(),
                     attachments: Vec::new(),
+                    help_depth: 0,
+                    help_from: None,
                 })?)
             })();
             let payload = match payload {

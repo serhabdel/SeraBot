@@ -934,6 +934,11 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
         fleet.clone(),
         router.clone(),
     ))?;
+    registry.register(serabot::ask_teammate::AskTeammateTool::new(
+        store.clone(),
+        fleet.clone(),
+        router.clone(),
+    ))?;
     registry.register(serabot::teams::TeamAskTool::new(
         store.clone(),
         fleet.clone(),

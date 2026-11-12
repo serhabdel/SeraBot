@@ -70,4 +70,4 @@ Stay inside configured `max_pages`. Split sections instead of shrinking type. Th
 
 ## Missing public facts
 
-If a slide needs a public fact that tools have not returned, use `firecrawl_search` or `firecrawl_scrape` when allowlisted, then write only what the page supports. If those tools are absent, omit the fact and say it is missing.
+If a slide needs a public fact that tools have not returned, use `tavily_search`, `firecrawl_search`, `firecrawl_scrape` or `fetch_url`, then write only what the page supports. If those tools are absent, call `ask_teammate`. Do not invent the fact.

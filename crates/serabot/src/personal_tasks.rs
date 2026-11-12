@@ -9,6 +9,7 @@
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::domain::new_id;
 use crate::error::{Result, SeraError};
@@ -73,6 +74,14 @@ pub struct TaskPatch {
 pub struct TaskPrefs {
     pub sync_provider: String,
     pub updated_at: String,
+    /// When the last sync attempt finished, if one has run.
+    #[serde(default)]
+    pub last_sync_at: Option<String>,
+    #[serde(default)]
+    pub last_sync_ok: Option<bool>,
+    /// Secret-free reason the last sync failed.
+    #[serde(default)]
+    pub last_sync_error: Option<String>,
 }
 
 pub fn validate_title(title: &str) -> Result<String> {
@@ -385,18 +394,25 @@ pub fn delete(store: &Store, user_id: &str, id: &str) -> Result<bool> {
     )? > 0)
 }
 
+fn map_prefs(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskPrefs> {
+    let ok: Option<i64> = row.get(3)?;
+    Ok(TaskPrefs {
+        sync_provider: row.get(0)?,
+        updated_at: row.get(1)?,
+        last_sync_at: row.get(2)?,
+        last_sync_ok: ok.map(|value| value != 0),
+        last_sync_error: row.get(4)?,
+    })
+}
+
 pub fn get_prefs(store: &Store, user_id: &str) -> Result<TaskPrefs> {
     let connection = store.connection()?;
     connection
         .query_row(
-            "SELECT sync_provider, updated_at FROM user_task_prefs WHERE user_id = ?1",
+            "SELECT sync_provider, updated_at, last_sync_at, last_sync_ok, last_sync_error
+             FROM user_task_prefs WHERE user_id = ?1",
             params![user_id],
-            |row| {
-                Ok(TaskPrefs {
-                    sync_provider: row.get(0)?,
-                    updated_at: row.get(1)?,
-                })
-            },
+            map_prefs,
         )
         .optional()?
         .map(Ok)
@@ -404,8 +420,60 @@ pub fn get_prefs(store: &Store, user_id: &str) -> Result<TaskPrefs> {
             Ok(TaskPrefs {
                 sync_provider: PROVIDER_NONE.to_owned(),
                 updated_at: now_string(),
+                last_sync_at: None,
+                last_sync_ok: None,
+                last_sync_error: None,
             })
         })
+}
+
+/// Counts by Kanban column for the Tasks page header.
+pub fn counts(store: &Store, user_id: &str) -> Result<serde_json::Value> {
+    let connection = store.connection()?;
+    let mut statement = connection
+        .prepare("SELECT status, COUNT(*) FROM user_tasks WHERE user_id = ?1 GROUP BY status")?;
+    let rows = statement.query_map(params![user_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut counts = json!({"todo": 0, "doing": 0, "done": 0});
+    for row in rows {
+        let (status, count) = row?;
+        if STATUSES.contains(&status.as_str()) {
+            counts[status] = json!(count);
+        }
+    }
+    Ok(counts)
+}
+
+/// Record one sync attempt. The message is already secret-free and bounded.
+pub fn record_sync_result(
+    store: &Store,
+    user_id: &str,
+    ok: bool,
+    error: Option<&str>,
+) -> Result<()> {
+    let now = now_string();
+    let connection = store.connection()?;
+    connection.execute(
+        "INSERT INTO user_task_prefs(user_id, sync_provider, updated_at, last_sync_at, last_sync_ok, last_sync_error)
+         VALUES (?1, 'none', ?2, ?2, ?3, ?4)
+         ON CONFLICT(user_id) DO UPDATE SET
+           last_sync_at = excluded.last_sync_at,
+           last_sync_ok = excluded.last_sync_ok,
+           last_sync_error = excluded.last_sync_error",
+        params![user_id, now, i64::from(ok), error],
+    )?;
+    Ok(())
+}
+
+/// `ok`, `error`, `not_configured`, or `never_run`.
+pub fn sync_health(prefs: &TaskPrefs) -> &'static str {
+    match prefs.last_sync_ok {
+        Some(true) => "ok",
+        Some(false) => "error",
+        None if prefs.sync_provider == PROVIDER_NONE => "not_configured",
+        None => "never_run",
+    }
 }
 
 pub fn set_prefs(store: &Store, user_id: &str, sync_provider: &str) -> Result<TaskPrefs> {

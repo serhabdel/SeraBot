@@ -188,13 +188,20 @@ impl Tool for DelegateTool {
         )?;
         let route = self.router.pin(&selection)?;
 
-        let payload = json!({
+        let parent_task = self.store.get_task(&context.user_id, task_id)?;
+        let help_depth = parent_task
+            .payload
+            .get("help_depth")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let mut payload = json!({
             "conversation_id": conversation_id,
             "text": handoff.objective,
             "bot": to_bot,
             "source": "handoff",
             "ask_mode": false,
             "route": route,
+            "help_depth": help_depth,
             "handoff": HandoffContext {
                 handoff_id: handoff.id.clone(),
                 parent_task_id: task_id.to_owned(),
@@ -203,6 +210,9 @@ impl Tool for DelegateTool {
                 skill: handoff.skill.clone(),
             },
         });
+        if let Some(from) = parent_task.payload.get("help_from") {
+            payload["help_from"] = from.clone();
+        }
         // The handoff is audited before the specialist turn is queued: a failed
         // audit must never leave an untracked queued turn behind. The audit row
         // needs the child task id first and `Store::enqueue_task` allocates that

@@ -81,8 +81,8 @@ Be honest with the owner about these limits:
 - No page size or margin control, and no page count is reported.
 - No custom fonts or colours beyond the document defaults.
 
-If the owner needs a logo or a page count, say what is missing instead of
-claiming the file has it.
+If the owner needs a logo or a page count, name that gap and finish the rest
+of the document. Do not claim the file has either.
 
 ## Importing an owner file
 
@@ -156,7 +156,7 @@ artifact hash. Use it when the owner asks for a PDF version of a Word file.
 - Read before you replace. Never overwrite text you have not seen.
 - Keep the owner's language and register.
 - Do not invent owners, dates, amounts, or citations.
-- If a fact is missing, say what is missing; do not fill the gap with prose.
+- If a fact is missing, look it up or call `ask_teammate`. Do not fill the gap with prose.
 
 ## Synthetic request
 

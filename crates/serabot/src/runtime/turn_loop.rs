@@ -131,6 +131,8 @@ impl Runtime {
             handoff: payload.handoff.clone(),
             team: payload.team.clone(),
             team_asked: false,
+            help_depth: payload.help_depth,
+            help_asked: false,
             history_messages,
         };
         // Recalled facts answer the owner's message (or the objective of a
@@ -146,7 +148,14 @@ impl Runtime {
             )
             .await;
         let system = if let Some(ref handoff) = payload.handoff {
-            self.handoff_system_prompt(&user, bot, &payload.text, handoff, &memory_block)?
+            self.handoff_system_prompt(
+                &user,
+                bot,
+                &payload.text,
+                handoff,
+                &memory_block,
+                payload.help_depth < crate::collaboration::MAX_HELP_DEPTH,
+            )?
         } else if let Some(team) = &payload.team {
             self.team_system_prompt(
                 &user,
@@ -217,14 +226,22 @@ impl Runtime {
             {
                 Ok(ToolOutcome::Completed(output)) => {
                     self.record_tool_result(&mut state, &pending.call, &output);
-                    self.emit_step(
+                    let phase = if generation_still_running(&pending.call.name, &output) {
+                        StepPhase::Progress
+                    } else {
+                        StepPhase::Done
+                    };
+                    self.emit_step_detail(
                         &user,
                         task,
                         &turn,
                         &pending.call,
-                        StepPhase::Done,
+                        phase,
                         None,
                         state.tool_calls,
+                        None,
+                        Some(&output),
+                        None,
                     );
                 }
                 Ok(ToolOutcome::PendingApproval { .. }) => {
@@ -233,7 +250,8 @@ impl Runtime {
                     ));
                 }
                 Err(error) => {
-                    self.emit_step(
+                    let message = truncate_chars(&error.to_string(), 500);
+                    self.emit_step_detail(
                         &user,
                         task,
                         &turn,
@@ -241,6 +259,9 @@ impl Runtime {
                         StepPhase::Failed,
                         None,
                         state.tool_calls,
+                        None,
+                        None,
+                        Some(&message),
                     );
                     state.messages.push(LlmMessage {
                         role: Role::Tool,
@@ -252,7 +273,7 @@ impl Runtime {
                 }
             }
         } else {
-            self.emit_step(
+            self.emit_step_detail(
                 &user,
                 task,
                 &turn,
@@ -260,6 +281,9 @@ impl Runtime {
                 StepPhase::Failed,
                 None,
                 state.tool_calls,
+                None,
+                None,
+                Some("The owner denied this action. Do not retry it."),
             );
             state.messages.push(LlmMessage {
                 role: Role::Tool,
@@ -498,10 +522,12 @@ impl Runtime {
         let user = task.user_id.clone();
         let context = self.tool_context(task, turn, &bot, &state)?;
         let mut tool_names = bot.config.tools.clone();
-        for extra in [TEAM_ASK_TOOL, TEAM_REPLY_TOOL, crate::plans::PLAN_TOOL] {
-            if context.allowed_tools.contains(extra) && !tool_names.iter().any(|name| name == extra)
-            {
-                tool_names.push(extra.to_string());
+        // Allowed tools the stored list omitted (shared search/fetch/memory/ask,
+        // plan, library, and ask_teammate) are part of this turn. The gateway
+        // still refuses anything outside `allowed_tools`.
+        for name in &context.allowed_tools {
+            if !tool_names.iter().any(|existing| existing == name) {
+                tool_names.push(name.clone());
             }
         }
         let unregistered: Vec<&str> = tool_names
@@ -920,8 +946,22 @@ impl Runtime {
                     "team_reply is only available to bots taking part in a team turn".into(),
                 ));
             }
+            if call.name == crate::collaboration::ASK_TEAMMATE_TOOL {
+                if state.help_depth >= crate::collaboration::MAX_HELP_DEPTH {
+                    return Err(SeraError::Validation(
+                        "this turn already came from a teammate; finish it with the tools you have"
+                            .into(),
+                    ));
+                }
+                if state.help_asked {
+                    return Err(SeraError::Validation(
+                        "only one ask_teammate is allowed per turn".into(),
+                    ));
+                }
+            }
             state.tool_calls += 1;
             let ordinal = state.tool_calls;
+            let started = std::time::Instant::now();
             self.emit_step(
                 &task.user_id,
                 task,
@@ -966,15 +1006,33 @@ impl Runtime {
                     {
                         state.team_asked = true;
                     }
+                    if call.name == crate::collaboration::ASK_TEAMMATE_TOOL
+                        && output
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.get(crate::ask_teammate::ASK_QUEUED_KEY))
+                            .and_then(Value::as_bool)
+                            == Some(true)
+                    {
+                        state.help_asked = true;
+                    }
                     self.record_tool_result(state, call, &output);
-                    self.emit_step(
+                    let phase = if generation_still_running(&call.name, &output) {
+                        StepPhase::Progress
+                    } else {
+                        StepPhase::Done
+                    };
+                    self.emit_step_detail(
                         &task.user_id,
                         task,
                         turn,
                         call,
-                        StepPhase::Done,
+                        phase,
                         None,
                         ordinal,
+                        Some(started.elapsed()),
+                        Some(&output),
+                        None,
                     );
                 }
                 Ok(ToolOutcome::PendingApproval {
@@ -999,7 +1057,7 @@ impl Runtime {
                     }));
                 }
                 Err(SeraError::PolicyViolation) => {
-                    self.emit_step(
+                    self.emit_step_detail(
                         &task.user_id,
                         task,
                         turn,
@@ -1007,6 +1065,9 @@ impl Runtime {
                         StepPhase::Failed,
                         None,
                         ordinal,
+                        Some(started.elapsed()),
+                        None,
+                        Some("The tool output was blocked by the content policy."),
                     );
                     state.messages.push(LlmMessage {
                         role: Role::Tool,
@@ -1020,7 +1081,8 @@ impl Runtime {
                     });
                 }
                 Err(error) => {
-                    self.emit_step(
+                    let message = truncate_chars(&error.to_string(), 500);
+                    self.emit_step_detail(
                         &task.user_id,
                         task,
                         turn,
@@ -1028,6 +1090,9 @@ impl Runtime {
                         StepPhase::Failed,
                         None,
                         ordinal,
+                        Some(started.elapsed()),
+                        None,
+                        Some(&message),
                     );
                     state.messages.push(LlmMessage {
                         role: Role::Tool,
@@ -1112,6 +1177,24 @@ impl Runtime {
             .await?;
         Ok(TurnOutcome::Suspended)
     }
+}
+
+/// A generation that has been handed to a background job is still in progress.
+fn generation_still_running(tool: &str, output: &crate::gateway::ToolOutput) -> bool {
+    if !(tool.starts_with("elevenlabs_")
+        || tool.starts_with("audio_")
+        || tool == "openrouter_generate_image")
+    {
+        return false;
+    }
+    matches!(
+        output
+            .data
+            .as_ref()
+            .and_then(|data| data.get("status"))
+            .and_then(Value::as_str),
+        Some("generating" | "pending" | "running")
+    )
 }
 
 /// The reply when the model could not answer at a limit: the tool steps this

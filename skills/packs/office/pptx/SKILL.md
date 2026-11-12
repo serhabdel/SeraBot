@@ -153,6 +153,6 @@ Say what is missing instead of promising it.
 
 ## Missing public facts
 
-Look up a missing public fact with `firecrawl_search` or `firecrawl_scrape` when
-allowlisted before you put it on a slide. If those tools are absent, leave the
-slide out and say what is missing.
+Look up a missing public fact with `tavily_search`, `firecrawl_search`,
+`firecrawl_scrape` or `fetch_url` before you put it on a slide. If those tools
+are absent, call `ask_teammate`. Do not invent the fact.

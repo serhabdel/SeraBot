@@ -405,10 +405,7 @@ fn is_forbidden_v6(ip: Ipv6Addr) -> bool {
         return is_forbidden_v4(v4);
     }
     // Deprecated IPv4-compatible `::/96` addresses are never public targets.
-    if segments[0..6].iter().all(|segment| *segment == 0) {
-        return true;
-    }
-    false
+    segments[0..6].iter().all(|segment| *segment == 0)
 }
 
 #[cfg(test)]

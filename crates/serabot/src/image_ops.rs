@@ -703,6 +703,7 @@ impl Tool for ImageTransformTool {
             artifact_hash: Some(stored.hash),
             filename: Some(stored.filename),
             destination: None,
+            cards: Vec::new(),
         })
     }
 }

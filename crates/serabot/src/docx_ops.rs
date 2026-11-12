@@ -1587,6 +1587,7 @@ impl Tool for DocxImportTool {
             artifact_hash: Some(hash),
             filename: Some(filename),
             destination: None,
+            cards: Vec::new(),
         })
     }
 }
@@ -1742,6 +1743,7 @@ impl Tool for DocxPdfTool {
             artifact_hash: Some(stored.hash),
             filename: Some(stored.filename),
             destination: None,
+            cards: Vec::new(),
         })
     }
 }
@@ -2109,6 +2111,7 @@ impl Tool for DocxEditTool {
             artifact_hash: Some(stored.hash),
             filename: Some(stored.filename),
             destination: None,
+            cards: Vec::new(),
         })
     }
 }
@@ -2210,6 +2213,7 @@ impl Tool for DocxBuildTool {
             artifact_hash: Some(stored.hash),
             filename: Some(stored.filename),
             destination: None,
+            cards: Vec::new(),
         })
     }
 }

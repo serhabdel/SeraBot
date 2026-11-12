@@ -71,6 +71,51 @@ fn file_icon_of(args: &Value) -> Option<&'static str> {
     })
 }
 
+/// First line of a tool result, bounded and without control characters.
+fn summarize_result(content: &str) -> String {
+    let line = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("Finished");
+    let cleaned: String = line
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        "Finished".into()
+    } else {
+        truncate_chars(cleaned, 160)
+    }
+}
+
+/// A short error for a step card. Drops control characters and anything that
+/// looks like a credential.
+fn safe_error(error: &str) -> String {
+    let cleaned: String = error
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let lower = cleaned.to_ascii_lowercase();
+    if lower.contains("api_key")
+        || lower.contains("api key")
+        || lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("bearer ")
+    {
+        return "The step failed. Check the connection and try again.".into();
+    }
+    truncate_chars(cleaned.trim(), 200)
+}
+
 fn humanize(tool: &str) -> String {
     let words = tool
         .split(['_', '.', '-'])
@@ -202,7 +247,10 @@ pub(super) fn describe_step(tool: &str, args: &Value, bot_label: Option<&str>) -
 /// Phase of one step as the desktop sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StepPhase {
+    /// The tool call has started.
     Running,
+    /// The call returned, and the work is still going (a generation, for example).
+    Progress,
     Done,
     Failed,
     WaitingApproval,
@@ -212,6 +260,7 @@ impl StepPhase {
     fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::Progress => "progress",
             Self::Done => "done",
             Self::Failed => "failed",
             Self::WaitingApproval => "waiting_approval",
@@ -233,13 +282,43 @@ impl Runtime {
         approval_id: Option<&str>,
         ordinal: usize,
     ) {
+        self.emit_step_detail(
+            user_id,
+            task,
+            turn,
+            call,
+            phase,
+            approval_id,
+            ordinal,
+            None,
+            None,
+            None,
+        );
+    }
+
+    /// `turn.step` with the fields clients use for a step card: tool name,
+    /// a secret-free input summary, result summary, error, duration, cards
+    /// and the current plan. A failed append never fails the turn.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn emit_step_detail(
+        &self,
+        user_id: &str,
+        task: &Task,
+        turn: &Turn,
+        call: &ToolCall,
+        phase: StepPhase,
+        approval_id: Option<&str>,
+        ordinal: usize,
+        duration: Option<std::time::Duration>,
+        output: Option<&crate::gateway::ToolOutput>,
+        error: Option<&str>,
+    ) {
         let bot_label = (call.name == DELEGATE_TOOL)
             .then(|| call.arguments.get("to_bot").and_then(Value::as_str))
             .flatten()
             .filter(|bot| safe_bot_label(bot))
             .map(str::to_owned);
         let mut view = describe_step(&call.name, &call.arguments, bot_label.as_deref());
-        // The label is derived, not copied, but it still passes the blocklist.
         if !self.gateway.policy().is_allowed(&view.label) {
             view = StepView {
                 icon: "bolt",
@@ -254,11 +333,48 @@ impl Runtime {
             "call_id": truncate_chars(&call.id, 64),
             "step": ordinal,
             "phase": phase.as_str(),
+            "tool": truncate_chars(&call.name, 64),
             "icon": view.icon,
             "label": view.label,
+            "input_summary": view.label,
         });
         if let Some(id) = approval_id {
             payload["approval_id"] = json!(id);
+        }
+        if let Some(duration) = duration {
+            payload["duration_ms"] = json!(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+        }
+        if let Some(output) = output {
+            let summary = summarize_result(&output.content);
+            if self.gateway.scan_egress(user_id, &summary).is_ok() {
+                payload["result_summary"] = json!(summary);
+            }
+            let cards = crate::result_cards::cards_from_output(output);
+            if !cards.is_empty()
+                && let Ok(encoded) = serde_json::to_string(&cards)
+                && self.gateway.scan_egress(user_id, &encoded).is_ok()
+            {
+                payload["cards"] = json!(cards);
+            }
+        }
+        if let Some(error) = error {
+            let message = safe_error(error);
+            if self.gateway.scan_egress(user_id, &message).is_ok() {
+                payload["error"] = json!(message);
+            } else {
+                payload["error"] = json!("The step failed.");
+            }
+        }
+        if let Ok(Some(plan)) = self.store.get_plan(user_id, &turn.conversation_id) {
+            let body = crate::plans::plan_json(&plan);
+            let mut text = plan.goal.clone();
+            for item in &plan.items {
+                text.push('\n');
+                text.push_str(&item.text);
+            }
+            if self.gateway.scan_egress(user_id, &text).is_ok() {
+                payload["plan"] = body;
+            }
         }
         let _ = self.store.append_event(user_id, "turn.step", &payload);
     }
