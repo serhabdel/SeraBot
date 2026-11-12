@@ -542,6 +542,7 @@ impl Tool for BrowserTool {
                     artifact_hash: Some(stored.hash),
                     filename: Some(stored.filename),
                     destination: None,
+                    cards: Vec::new(),
                 })
             }
             Kind::Tabs => {

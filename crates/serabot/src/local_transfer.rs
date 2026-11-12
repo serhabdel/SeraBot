@@ -371,6 +371,7 @@ impl Tool for LocalImportTool {
             artifact_hash: Some(stored.hash),
             filename: Some(stored.filename),
             destination: None,
+            cards: Vec::new(),
         })
     }
 }

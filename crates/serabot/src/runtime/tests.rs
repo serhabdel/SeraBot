@@ -2527,7 +2527,14 @@ async fn prompts_inject_only_the_acting_users_memories() {
         .memory_context(&admin, None, &bot, "objective")
         .await;
     let admin_handoff = runtime
-        .handoff_system_prompt(&admin, &bot, "objective", &handoff, &admin_handoff_block)
+        .handoff_system_prompt(
+            &admin,
+            &bot,
+            "objective",
+            &handoff,
+            &admin_handoff_block,
+            true,
+        )
         .unwrap();
     assert!(admin_handoff.contains("ADMIN-PRIVATE-FACT"));
     assert!(!admin_handoff.contains("MEMBER-PRIVATE-FACT"));
@@ -2541,6 +2548,7 @@ async fn prompts_inject_only_the_acting_users_memories() {
             "objective",
             &handoff,
             &member_handoff_block,
+            true,
         )
         .unwrap();
     assert!(member_handoff.contains("MEMBER-PRIVATE-FACT"));
@@ -2581,7 +2589,7 @@ async fn team_and_handoff_prompts_carry_the_skill_clause_and_the_tool_honesty_ru
         skill: None,
     };
     let handoff_prompt = runtime
-        .handoff_system_prompt(&admin, &bot, "objective", &handoff, "")
+        .handoff_system_prompt(&admin, &bot, "objective", &handoff, "", true)
         .unwrap();
     assert!(handoff_prompt.contains(honesty), "{handoff_prompt}");
     assert!(handoff_prompt.contains(skills), "{handoff_prompt}");

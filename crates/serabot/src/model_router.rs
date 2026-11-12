@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -75,6 +76,12 @@ pub struct ProviderView {
     /// How the last live fetch for this account went: `ok`, `key_rejected`,
     /// `unreachable`, or `unchecked` (no fetch yet, or fetching is off).
     pub status: &'static str,
+    /// `ok`, `error`, or `unknown`. Derived from `status` for the Providers page.
+    pub health: &'static str,
+    /// What to do when `health` is `error`. Never a key or a response body.
+    pub last_error: Option<&'static str>,
+    /// When this account last fetched or failed to fetch the live model list.
+    pub last_checked: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,6 +134,8 @@ struct CatalogState {
     failures: BTreeMap<String, FetchFailure>,
     /// When each account's last fetch failed (for the retry back-off).
     failed_at: BTreeMap<String, Instant>,
+    /// Wall time of the last fetch attempt, success or failure.
+    checked_at: BTreeMap<String, DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -385,6 +394,9 @@ impl ModelRouter {
                     "fallback"
                 },
                 status: provider.fetch_status(user_id),
+                health: provider.health(user_id).0,
+                last_error: provider.health(user_id).1,
+                last_checked: provider.last_checked(user_id),
             })
             .collect()
     }
@@ -1074,6 +1086,7 @@ impl Provider {
         let mut state = self.lock_catalog();
         state.failures.remove(user_id);
         state.failed_at.remove(user_id);
+        state.checked_at.insert(user_id.to_owned(), Utc::now());
         state.snapshots.insert(
             user_id.to_owned(),
             CatalogSnapshot {
@@ -1088,6 +1101,7 @@ impl Provider {
         state.snapshots.remove(user_id);
         state.failures.insert(user_id.to_owned(), failure);
         state.failed_at.insert(user_id.to_owned(), Instant::now());
+        state.checked_at.insert(user_id.to_owned(), Utc::now());
     }
 
     fn forget_snapshot(&self, user_id: &str) {
@@ -1095,6 +1109,7 @@ impl Provider {
         state.snapshots.remove(user_id);
         state.failures.remove(user_id);
         state.failed_at.remove(user_id);
+        state.checked_at.remove(user_id);
     }
 
     fn fetch_status(&self, user_id: &str) -> &'static str {
@@ -1110,6 +1125,30 @@ impl Provider {
             Some(FetchFailure::Unreachable) => "unreachable",
             None => "unchecked",
         }
+    }
+
+    fn health(&self, user_id: &str) -> (&'static str, Option<&'static str>) {
+        match self.fetch_status(user_id) {
+            "ok" => ("ok", None),
+            "key_rejected" => (
+                "error",
+                Some(
+                    "The API key was rejected. Open Providers, paste a new key, and test the connection.",
+                ),
+            ),
+            "unreachable" => (
+                "error",
+                Some("The provider did not respond. Check the network, then use Test connection."),
+            ),
+            _ => ("unknown", None),
+        }
+    }
+
+    fn last_checked(&self, user_id: &str) -> Option<String> {
+        self.lock_catalog()
+            .checked_at
+            .get(user_id)
+            .map(|at| at.to_rfc3339_opts(SecondsFormat::Secs, true))
     }
 
     /// Whether `model` may be selected and sent by this account: the live

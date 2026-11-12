@@ -513,14 +513,26 @@ approvals cancel suspended tasks.
 | Method | Path | Notes |
 | --- | --- | --- |
 | `GET` | `/v1/events?after=<event id>&limit=100` | Server-Sent Events; replays after a known id (`after` wins over the standard `Last-Event-ID` reconnect header); 15-second keepalive. |
+| `GET` | `/v1/conversations/{id}/activity?limit=100` | Stored `turn.step` events for one conversation, oldest first (max 200). |
 | `GET` | `/v1/audit?limit=50` | Newest audit entries; no content or secrets. |
 | `GET` | `/v1/artifacts/{sha256}` | Downloads a stored PDF with sanitized filename. |
 | `POST` | `/v1/artifacts/{sha256}/approve` | Approves Italian deck content for French generation. |
 
 Event kinds include `message`, `approval`, `task.queued`, `turn.completed`,
-`memory.added`, `memory.deleted`, `approval.grants_revoked`,
-`model.selected`, and `model.used`. Client code should treat unknown event
-kinds as informational.
+`turn.step`, `help.queued`, `memory.added`, `memory.deleted`,
+`approval.grants_revoked`, `model.selected`, and `model.used`. Client code
+should treat unknown event kinds as informational.
+
+`turn.step` is the live tool card. Phases are `running`, `progress`,
+`waiting_approval`, `done`, and `failed`. The 0.37 fields (`tool`,
+`input_summary`, `result_summary`, `error`, `duration_ms`, `cards`, `plan`)
+are documented in [Events](events.md). Card types are documented in
+[Tool results](tool-results.md). Tasks, Memory, Connectors, and Providers
+page fields are documented in [Console pages](console-pages.md).
+
+`POST /v1/connectors/{id}/test` checks a connection for the signed-in user.
+`POST /v1/providers/{id}/test` checks a model provider. `GET /v1/memories`
+accepts `category` and `pinned`. `PATCH /v1/memories/{id}` accepts `pinned`.
 
 ## Polling guidance
 
