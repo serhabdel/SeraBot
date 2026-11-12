@@ -1,7 +1,7 @@
 # SeraBot 0.37.0: bots that finish the work
 
-This release is the server half of v0.37. The desktop console that renders
-the new step cards and page fields comes in a later change. Contracts:
+This release ships the 0.37 server work together with the desktop and Android
+chat changes that render it, and the desktop Marketplace screen. Contracts:
 [Events](events.md), [Tool results](tool-results.md),
 [Console pages](console-pages.md).
 
@@ -32,6 +32,26 @@ typed cards, and the current plan. Phases are `running`, `progress`,
 `waiting_approval`, `done`, and `failed`. A background media job emits the
 finished card when the file is saved. `GET /v1/conversations/{id}/activity`
 returns the stored steps after a reload.
+
+A turn that ran no tools and ends with a short reply that opens with a
+refusal ("I can't help", "I'm unable to", and a few similar phrases) is
+recorded as a `turn.refused` audit event. It only records; the reply is never
+changed. See [Events](events.md).
+
+## Desktop and Android
+
+- **Chat steps.** Each tool call shows as a step card with its label, a spinner
+  while it runs, the duration or error when it ends, and inline Approve and Deny
+  when it waits for approval. A finished turn collapses to "N steps" and can be
+  reopened. Cards render as audio, image, file, table, or link. A failed send
+  keeps the typed message and says what happened with Retry, Reconnect, or
+  Open AI keys. A dropped event stream shows "Reconnecting".
+- **Marketplace (desktop).** A Plugins destination browses the curated catalog
+  with search, categories, and a plugin page. Install, Enable, and secret entry
+  stay off because nothing can call a plugin host yet (`docs/marketplace.md`);
+  Disable and Uninstall stay available.
+- **Windows fix.** A Windows-only lint in the link checks of `user_inbox.rs` and
+  `local_folders.rs` that failed the Windows CI is fixed.
 
 ## Typed results
 
@@ -67,5 +87,7 @@ safe to show.
 ## Not yet verified
 
 - A live turn against a connected search or ElevenLabs account.
-- The Windows desktop, which does not render these fields yet.
-- Android, which can read the same events and cards but has no new UI here.
+- Nothing was rendered in the Windows WebView or on an Android device; the
+  desktop and Android changes are covered by unit tests and CI only.
+- The Marketplace screen against a live server.
+- The real-world false-positive rate of the `turn.refused` heuristic.
