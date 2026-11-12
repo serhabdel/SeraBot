@@ -5112,10 +5112,126 @@ html[data-reduce-transparency="true"] .chat-header {
 
 .step {
   display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  min-height: 26px;
+  color: var(--label-1);
+}
+
+.step-head {
+  display: flex;
   align-items: center;
   gap: 8px;
   min-height: 26px;
+}
+
+.step-copy {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  gap: 2px;
+}
+
+.step-title {
   color: var(--label-1);
+  font-size: var(--fs-body-2);
+  font-weight: 600;
+}
+
+.step-time {
+  flex: 0 0 auto;
+  color: var(--label-3);
+  font-size: var(--fs-micro);
+}
+
+.step.waiting {
+  padding: 8px;
+  border-radius: var(--r-sm);
+  background: var(--warn-soft);
+}
+
+.step.failed {
+  padding: 8px;
+  border-radius: var(--r-sm);
+  background: var(--danger-soft);
+}
+
+.step-wait {
+  color: var(--label-1);
+  font-size: var(--fs-body-2);
+  font-weight: 600;
+}
+
+.step-error {
+  margin: 0;
+  color: var(--danger);
+  font-size: var(--fs-caption);
+}
+
+.step-more > summary {
+  cursor: pointer;
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+}
+
+.step-more > summary::-webkit-details-marker {
+  display: none;
+}
+
+.step-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.step-k {
+  color: var(--label-3);
+  font-size: var(--fs-micro);
+}
+
+.step-v {
+  margin: 0;
+  color: var(--label-1);
+  font-size: var(--fs-caption);
+  overflow-wrap: anywhere;
+}
+
+.step-link {
+  color: var(--accent-ink);
+  font-size: var(--fs-caption);
+  overflow-wrap: anywhere;
+}
+
+.step-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.step-preview {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--r-sm);
+  object-fit: contain;
+}
+
+.step-spin {
+  width: 12px;
+  height: 12px;
+  border-radius: var(--r-pill);
+  border: 2px solid var(--line-2);
+  border-top-color: var(--accent);
+  animation: step-spin var(--dur-3) linear infinite;
+}
+
+@keyframes step-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .step-status {
@@ -5395,6 +5511,11 @@ html[data-reduce-transparency="true"] .chat-header {
     animation: none;
     color: var(--label-2);
     background: none;
+  }
+
+  .step-spin {
+    animation: none;
+    border-color: var(--accent);
   }
 }
 
@@ -6378,7 +6499,8 @@ html[data-reduce-transparency="true"] .chat-header {
 }
 
 [data-motion="reduced"] .working-dots span,
-.root[data-motion="reduce"] .working-dots span {
+.root[data-motion="reduce"] .working-dots span,
+.root[data-motion="reduce"] .step-spin {
   animation: none;
   opacity: 0.7;
 }

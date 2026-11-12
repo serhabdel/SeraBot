@@ -583,6 +583,9 @@ pub struct Session {
     /// Set by the SSE thread so the UI timer can tick without waiting 120ms.
     pub ui_wake: Arc<AtomicBool>,
     pub events_active: bool,
+    /// True after the event stream has connected once this session. A later
+    /// drop is "reconnecting", not the first connect.
+    pub events_seen: bool,
     /// Browser dock and vault sheet state; its own worker thread.
     pub panel: PanelState,
     panel_worker: Option<PanelWorker>,
@@ -793,6 +796,7 @@ impl Session {
             events: None,
             ui_wake: Arc::new(AtomicBool::new(false)),
             events_active: false,
+            events_seen: false,
             events_dirty: false,
             last_event_id: 0,
             last_event_kind: String::new(),
@@ -2077,6 +2081,8 @@ impl Session {
         // The draft of the conversation being left waits for its return.
         self.drafts.store(&self.conversation, &self.composer);
         self.conversation = id;
+        self.state.chat_failure = None;
+        self.state.held_draft = None;
         self.section = Section::Chat;
         self.panel.set_page_open(false);
         if self.bot_settings.open {
@@ -2439,6 +2445,8 @@ impl Session {
             return;
         }
         self.state.error = None;
+        self.state.chat_failure = None;
+        self.state.held_draft = None;
         self.state.activity.clear();
         let text = std::mem::take(&mut self.composer);
         self.drafts.clear(&self.conversation);
@@ -2868,6 +2876,58 @@ impl Session {
         }
     }
 
+    /// A send did not land. A known failure puts the text back in the composer
+    /// and shows a sentence in the chat. An unknown outcome keeps the bubble
+    /// and holds a copy the owner can put back, without sending it again.
+    fn note_submit_failure(&mut self, failure: Option<crate::chat_failure::ChatFailure>) {
+        let optimistic = self
+            .state
+            .messages
+            .last()
+            .filter(|message| message.role == Role::User && message.id.starts_with("opt-"))
+            .map(|message| message.content.clone());
+        if self.state.unknown_outcome {
+            if let Some(text) = optimistic.filter(|text| !text.trim().is_empty()) {
+                self.state.held_draft = Some(text);
+            }
+            return;
+        }
+        if let Some(text) =
+            crate::chat_failure::restore_unsent_draft(&self.composer, optimistic.as_deref())
+        {
+            self.composer = text.clone();
+            self.drafts.store(&self.conversation, &self.composer);
+            self.state.messages.pop();
+            self.state.held_draft = Some(text);
+        }
+        if let Some(failure) = failure {
+            self.state.chat_failure = Some(failure);
+            self.state.error = None;
+        }
+    }
+
+    /// Copy a held unsent message into the composer. Does not send it.
+    pub fn restore_held_draft(&mut self) {
+        let Some(text) = self.state.held_draft.clone() else {
+            return;
+        };
+        if self.composer.trim().is_empty() {
+            self.composer = text;
+            self.drafts.store(&self.conversation, &self.composer);
+        }
+    }
+
+    /// Send again after a failure. Uses the composer, or the held draft when
+    /// the composer is empty.
+    pub fn retry_send(&mut self) {
+        if self.composer.trim().is_empty()
+            && let Some(text) = self.state.held_draft.clone()
+        {
+            self.composer = text;
+        }
+        self.submit();
+    }
+
     /// Put a sent message back in the composer so it can be edited and sent.
     pub fn edit_text(&mut self, text: String) {
         self.composer = text;
@@ -3022,12 +3082,22 @@ impl Session {
             step.call_id.hash(&mut h);
             step.label.len().hash(&mut h);
             format!("{:?}", step.phase).hash(&mut h);
+            step.duration_ms.hash(&mut h);
+            step.error.as_ref().map(String::len).hash(&mut h);
+            step.cards.len().hash(&mut h);
         }
         if let Some(task) = &self.state.task {
             task.id.hash(&mut h);
             format!("{:?}", task.status).hash(&mut h);
         }
         self.events_active.hash(&mut h);
+        self.events_seen.hash(&mut h);
+        self.state
+            .chat_failure
+            .as_ref()
+            .map(|failure| failure.message.len())
+            .hash(&mut h);
+        self.state.held_draft.is_some().hash(&mut h);
         self.state.working.hash_fingerprint(&mut h);
         if let Some(plan) = &self.state.plan {
             plan.goal.len().hash(&mut h);
@@ -3164,7 +3234,10 @@ impl Session {
         if let Some(stream) = &self.events {
             while let Some(update) = stream.try_recv() {
                 match update {
-                    EventUpdate::Connected => self.events_active = true,
+                    EventUpdate::Connected => {
+                        self.events_active = true;
+                        self.events_seen = true;
+                    }
                     EventUpdate::Disconnected => self.events_active = false,
                     EventUpdate::Unauthorized => unauthorized = true,
                     EventUpdate::Event { id, kind, payload } => {
@@ -3175,7 +3248,18 @@ impl Session {
                         self.state.working.apply(&kind, &payload, Instant::now());
                         // Step events only feed the live view; the transcript
                         // is not re-read for each one.
-                        if self.state.activity.apply(&kind, &payload) {
+                        let stepped = self.state.activity.apply(&kind, &payload);
+                        if kind == "turn.step"
+                            && payload
+                                .get("conversation_id")
+                                .and_then(|value| value.as_str())
+                                == Some(self.conversation.as_str())
+                            && let Some(plan) = payload.get("plan")
+                            && let Some(plan) = crate::chat_plan::ChatPlan::from_value(plan)
+                        {
+                            self.state.plan = Some(plan);
+                        }
+                        if stepped {
                             continue;
                         }
                         // Plan updates feed the plan panel only.
@@ -3469,6 +3553,8 @@ impl Session {
                     let rate_limited = error == ApiError::Http(429);
                     let not_found = error == ApiError::Http(404);
                     let dropped = error.is_transport();
+                    let submit_failure = (completion.kind == OperationKind::Submit)
+                        .then(|| crate::chat_failure::classify_send_error(&error));
                     self.state.fail(&completion.scope, completion.kind, error);
                     if dropped && self.state.connected {
                         // A dropped connection is one calm banner with a
@@ -3633,6 +3719,7 @@ impl Session {
                             self.toast = Some(format!("No preview for this file: {message}"));
                             self.state.error = None;
                         }
+                        OperationKind::Submit => self.note_submit_failure(submit_failure),
                         _ => {}
                     }
                     if !self.state.connected {
@@ -3982,10 +4069,8 @@ impl Session {
                             let list = self.memory_list_operation();
                             self.schedule(list, Duration::ZERO);
                         }
-                        OperationKind::ListMemories => {
-                            if self.state.memory_stats.is_none() {
-                                self.schedule(Operation::MemoryStats, Duration::ZERO);
-                            }
+                        OperationKind::ListMemories if self.state.memory_stats.is_none() => {
+                            self.schedule(Operation::MemoryStats, Duration::ZERO);
                         }
                         OperationKind::Task
                             if self

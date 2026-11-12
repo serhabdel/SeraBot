@@ -775,22 +775,158 @@ class ServerEvent {
   }
 }
 
-enum StepPhase { running, done, failed, waitingApproval }
+enum StepPhase { running, progress, done, failed, waitingApproval }
 
 StepPhase? parseStepPhase(String? v) => switch (v) {
       'running' => StepPhase.running,
+      'progress' => StepPhase.progress,
       'done' => StepPhase.done,
       'failed' => StepPhase.failed,
       'waiting_approval' => StepPhase.waitingApproval,
       _ => null,
     };
 
+bool stepSpins(StepPhase phase) =>
+    phase == StepPhase.running || phase == StepPhase.progress;
+
+enum StepAction { none, retry, keys, reconnect }
+
+StepAction parseStepAction(String? v) => switch (v) {
+      'retry' => StepAction.retry,
+      'keys' => StepAction.keys,
+      'reconnect' => StepAction.reconnect,
+      _ => StepAction.none,
+    };
+
+enum ResultKind { audio, image, file, table, link, text }
+
+ResultKind parseResultKind(String? v) => switch (v) {
+      'audio' => ResultKind.audio,
+      'image' => ResultKind.image,
+      'file' => ResultKind.file,
+      'table' => ResultKind.table,
+      'link' => ResultKind.link,
+      _ => ResultKind.text,
+    };
+
+class StepResult {
+  StepResult({
+    required this.kind,
+    this.title,
+    this.url,
+    this.mime,
+    this.voice,
+    this.model,
+    this.name,
+    this.size,
+    this.text,
+    this.artifact,
+    this.columns = const [],
+    this.rows = const [],
+  });
+
+  final ResultKind kind;
+  final String? title;
+  final String? url;
+  final String? mime;
+  final String? voice;
+  final String? model;
+  final String? name;
+  final int? size;
+  final String? text;
+  final String? artifact;
+  final List<String> columns;
+  final List<List<String>> rows;
+}
+
 class ActivityStep {
-  ActivityStep(this.callId, this.label, this.phase, this.approvalId);
+  ActivityStep({
+    required this.callId,
+    required this.label,
+    required this.phase,
+    this.approvalId,
+    this.tool,
+    this.title,
+    this.inputSummary,
+    this.resultSummary,
+    this.error,
+    this.action = StepAction.none,
+    this.durationMs,
+    this.startedMs,
+    this.result,
+  });
+
   final String callId;
   String label;
   StepPhase phase;
   String? approvalId;
+  String? tool;
+  String? title;
+  String? inputSummary;
+  String? resultSummary;
+  String? error;
+  StepAction action;
+  int? durationMs;
+  int? startedMs;
+  StepResult? result;
+
+  String get heading => title ?? label;
+}
+
+/// "under 1s", "12s", "1m 4s".
+String formatDuration(int ms) {
+  if (ms < 1000) {
+    return 'under 1s';
+  }
+  if (ms < 60000) {
+    return '${(ms + 999) ~/ 1000}s';
+  }
+  final minutes = ms ~/ 60000;
+  final seconds = (ms % 60000) ~/ 1000;
+  if (seconds == 0) {
+    return '${minutes}m';
+  }
+  return '${minutes}m ${seconds}s';
+}
+
+/// "5 steps" or "5 steps, 12s".
+String formatStepsSummary(int count, int? durationMs) {
+  final steps = count == 1 ? '1 step' : '$count steps';
+  if (durationMs == null) {
+    return steps;
+  }
+  return '$steps, ${formatDuration(durationMs)}';
+}
+
+const _mediaHosts = ['elevenlabs.io', 'storage.googleapis.com'];
+
+bool safeMediaUrl(String raw) {
+  final uri = Uri.tryParse(raw.trim());
+  if (uri == null || uri.scheme != 'https' || uri.userInfo.isNotEmpty) {
+    return false;
+  }
+  if (uri.query.isNotEmpty) {
+    return false;
+  }
+  final host = uri.host.toLowerCase();
+  return _mediaHosts.any((name) => host == name || host.endsWith('.$name'));
+}
+
+bool safeLinkUrl(String raw) {
+  final uri = Uri.tryParse(raw.trim());
+  if (uri == null || uri.scheme != 'https' || uri.userInfo.isNotEmpty) {
+    return false;
+  }
+  return uri.host.isNotEmpty && uri.query.isEmpty;
+}
+
+/// A provider body or a JSON blob becomes a sentence.
+String presentError(String text) {
+  final trimmed = text.trimLeft();
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    return 'This step failed.';
+  }
+  return text;
 }
 
 String? _clean(Object? v, [int max = 120]) {
@@ -836,18 +972,310 @@ class Activity {
       taskId = task;
     }
     final approval = _clean(p['approval_id']);
+    final tool = _clean(p['tool']);
+    final title = toolHeading(tool);
+    final inputSummary = _clean(p['input_summary'], 160);
+    final resultSummary = _clean(p['result_summary']);
+    final rawError = _clean(p['error'], 200);
+    final error = rawError == null ? null : presentError(rawError);
+    final duration = _duration(p['duration_ms']);
+    final result = _firstCard(p['cards']);
     final existing = steps.where((s) => s.callId == call);
     if (existing.isNotEmpty) {
       final s = existing.first;
       s.phase = phase;
       s.label = label;
-      s.approvalId =
-          phase == StepPhase.waitingApproval ? (approval ?? s.approvalId) : null;
+      s.tool = tool ?? s.tool;
+      s.title = title ?? s.title;
+      s.inputSummary = inputSummary ?? s.inputSummary;
+      s.resultSummary = resultSummary ?? s.resultSummary;
+      s.result = result ?? s.result;
+      if (duration != null) {
+        s.durationMs = duration;
+      }
+      if (phase == StepPhase.waitingApproval) {
+        s.approvalId = approval ?? s.approvalId;
+        s.error = null;
+        s.action = StepAction.none;
+      } else if (phase == StepPhase.failed) {
+        s.approvalId = null;
+        s.error = error ?? s.error;
+        s.action = actionForError(s.error);
+      } else {
+        s.approvalId = null;
+        s.error = null;
+        s.action = StepAction.none;
+      }
     } else if (steps.length < 64) {
-      steps.add(ActivityStep(call, label, phase, approval));
+      steps.add(ActivityStep(
+        callId: call,
+        label: label,
+        phase: phase,
+        approvalId: phase == StepPhase.waitingApproval ? approval : null,
+        tool: tool,
+        title: title,
+        inputSummary: inputSummary,
+        resultSummary: resultSummary,
+        error: phase == StepPhase.failed ? error : null,
+        action: phase == StepPhase.failed ? actionForError(error) : StepAction.none,
+        durationMs: duration,
+        result: result,
+      ));
     }
     return true;
   }
 
-  String get summary => steps.length == 1 ? '1 step' : '${steps.length} steps';
+  int? get totalDurationMs {
+    final finished = steps.where((s) => !stepSpins(s.phase)).toList();
+    if (finished.isEmpty || finished.any((s) => s.durationMs == null)) {
+      return null;
+    }
+    return finished.fold<int>(0, (sum, s) => sum + (s.durationMs ?? 0));
+  }
+
+  String get summary => formatStepsSummary(steps.length, totalDurationMs);
+}
+
+String? _sha(Object? v) {
+  final text = _clean(v, 64);
+  if (text == null || !RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(text)) {
+    return null;
+  }
+  return text.toLowerCase();
+}
+
+String? _shaFromPath(String? url) {
+  if (url == null || !url.startsWith('/v1/artifacts/')) {
+    return null;
+  }
+  return _sha(url.substring('/v1/artifacts/'.length).split('?').first);
+}
+
+int? _duration(Object? v) {
+  if (v is! num) {
+    return null;
+  }
+  final ms = v.toInt();
+  if (ms < 0 || ms > 3600000) {
+    return null;
+  }
+  return ms;
+}
+
+String? toolHeading(String? tool) {
+  if (tool == null || tool.isEmpty) {
+    return null;
+  }
+  if (tool.startsWith('elevenlabs_') || tool.startsWith('audio_')) {
+    return 'ElevenLabs';
+  }
+  if (tool.startsWith('browser_')) {
+    return 'Browser';
+  }
+  if (tool.startsWith('slack_')) {
+    return 'Slack';
+  }
+  if (tool.startsWith('github_')) {
+    return 'GitHub';
+  }
+  if (tool == 'media_job') {
+    return 'Media';
+  }
+  final word = tool.split(RegExp(r'[_.-]')).firstWhere((part) => part.isNotEmpty, orElse: () => 'Tool');
+  if (word.isEmpty) {
+    return 'Tool';
+  }
+  return word[0].toUpperCase() + word.substring(1);
+}
+
+StepAction actionForError(String? error) {
+  final lower = (error ?? '').toLowerCase();
+  if (lower.contains('api key') || lower.contains('api_key') || lower.contains('credential') || lower.contains('provider key')) {
+    return StepAction.keys;
+  }
+  if (lower.contains('timed out') || lower.contains('timeout') || lower.contains('you can retry') || lower.contains('busy')) {
+    return StepAction.retry;
+  }
+  if (lower.contains('could not be reached') || lower.contains('check the connection') || lower.contains('reconnect')) {
+    return StepAction.reconnect;
+  }
+  return StepAction.none;
+}
+
+StepResult? _firstCard(Object? raw) {
+  if (raw is! List || raw.isEmpty) {
+    return null;
+  }
+  final first = raw.first;
+  if (first is! Map<String, dynamic>) {
+    return null;
+  }
+  return _parseResult(first);
+}
+
+StepResult? _parseResult(Map<String, dynamic> raw) {
+  final kindName = raw['type'] as String? ?? raw['kind'] as String?;
+  if (kindName != 'audio' && kindName != 'image' && kindName != 'file' && kindName != 'table' && kindName != 'link') {
+    return null;
+  }
+  final kind = parseResultKind(kindName);
+  final url = _clean(raw['url'], 300);
+  final safeUrl = url != null && (safeLinkUrl(url) || safeMediaUrl(url)) ? url : null;
+  final hash = _sha(raw['artifact_hash']) ?? _sha(raw['artifact']) ?? _shaFromPath(url);
+  final columns = <String>[];
+  final cols = raw['columns'];
+  if (cols is List) {
+    for (final cell in cols.take(8)) {
+      final text = _clean(cell, 80);
+      if (text != null) {
+        columns.add(text);
+      }
+    }
+  }
+  final rows = <List<String>>[];
+  final body = raw['rows'];
+  if (body is List && columns.isNotEmpty) {
+    for (final row in body.take(12)) {
+      if (row is! List) {
+        continue;
+      }
+      rows.add([
+        for (var i = 0; i < columns.length; i++)
+          i < row.length ? (_clean(row[i], 80) ?? '') : '',
+      ]);
+    }
+  }
+  final result = StepResult(
+    kind: kind == ResultKind.table && columns.isEmpty ? ResultKind.text : kind,
+    title: _clean(raw['title']),
+    url: safeUrl,
+    mime: _clean(raw['mime'], 80),
+    voice: _clean(raw['voice'], 40),
+    model: _clean(raw['model'], 40),
+    name: _clean(raw['filename'], 80) ?? _clean(raw['name'], 80),
+    size: raw['bytes'] is num
+        ? (raw['bytes'] as num).toInt()
+        : (raw['size'] is num ? (raw['size'] as num).toInt() : null),
+    text: _clean(raw['description'], 400) ?? _clean(raw['alt']) ?? _clean(raw['text'], 400),
+    artifact: hash,
+    columns: columns,
+    rows: rows,
+  );
+  final useful = result.title != null ||
+      result.url != null ||
+      result.text != null ||
+      result.artifact != null ||
+      result.name != null ||
+      result.columns.isNotEmpty;
+  return useful ? result : null;
+}
+
+enum ChatAction { retry, reconnect, keys, none }
+
+class ChatNotice {
+  const ChatNotice(this.message, this.action);
+  final String message;
+  final ChatAction action;
+}
+
+/// A sentence and an action for a failed send. JSON is never shown.
+ChatNotice classifySendError({
+  required String kind,
+  int? status,
+  String? detail,
+  String? code,
+}) {
+  if (kind == 'transport') {
+    return const ChatNotice(
+      "Can't reach SeraBot. Your message is still in the box. Check the connection, then send it again.",
+      ChatAction.retry,
+    );
+  }
+  if (status == 408 || status == 504) {
+    return const ChatNotice(
+      'The request timed out. Your message is still in the box. Send it again.',
+      ChatAction.retry,
+    );
+  }
+  if (status != null && status >= 500 && status <= 599) {
+    return const ChatNotice(
+      'SeraBot had a problem sending that message. Your text is still in the box. Try again.',
+      ChatAction.retry,
+    );
+  }
+  if (status == 429) {
+    return const ChatNotice(
+      'Too many requests right now. Your message is still in the box. Wait a moment, then send it again.',
+      ChatAction.retry,
+    );
+  }
+  final sentence = detail ?? '';
+  if (sentence.trimLeft().startsWith('{') || sentence.trimLeft().startsWith('[')) {
+    return const ChatNotice(
+      'Something went wrong sending that message. Your text is still in the box. Try again.',
+      ChatAction.retry,
+    );
+  }
+  if (_keyish(sentence) || _keyish(code ?? '')) {
+    return const ChatNotice(
+      'The provider rejected the API key. Open AI keys and check it. Your message is still in the box.',
+      ChatAction.keys,
+    );
+  }
+  if (sentence.isEmpty) {
+    return const ChatNotice(
+      'Something went wrong sending that message. Your text is still in the box. Try again.',
+      ChatAction.retry,
+    );
+  }
+  return ChatNotice(sentence, ChatAction.none);
+}
+
+bool _keyish(String text) {
+  final lower = text.toLowerCase();
+  return lower.contains('api key') ||
+      lower.contains('api_key') ||
+      lower.contains('provider key') ||
+      lower.contains('invalid key') ||
+      lower.contains('missing key');
+}
+
+class ChatPlanItem {
+  ChatPlanItem(this.text, this.status);
+  final String text;
+  final String status;
+}
+
+class ChatPlan {
+  ChatPlan(this.goal, this.items);
+  final String goal;
+  final List<ChatPlanItem> items;
+
+  int get done => items.where((item) => item.status == 'done').length;
+
+  String get progress => '$done of ${items.length} done';
+
+  static ChatPlan? parse(Map<String, dynamic>? raw) {
+    if (raw == null) {
+      return null;
+    }
+    final goal = _clean(raw['goal'], 200);
+    final list = raw['items'];
+    if (goal == null || list is! List || list.length > 20) {
+      return null;
+    }
+    final items = <ChatPlanItem>[];
+    for (final item in list) {
+      if (item is! Map<String, dynamic>) {
+        return null;
+      }
+      final text = _clean(item['text'], 160);
+      final status = item['status'];
+      if (text == null || status is! String || !const {'pending', 'doing', 'done'}.contains(status)) {
+        return null;
+      }
+      items.add(ChatPlanItem(text, status));
+    }
+    return ChatPlan(goal, items);
+  }
 }
