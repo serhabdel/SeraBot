@@ -57,6 +57,7 @@ mod notifier;
 mod prompts;
 mod rag_tool;
 mod recall;
+mod refusal;
 mod routing;
 mod schedules;
 #[cfg(test)]
@@ -68,7 +69,7 @@ pub use notifier::{ApprovalNotice, CompositeNotifier, Notifier, NullNotifier};
 pub use rag_tool::RagSearchTool;
 pub(crate) use turn_loop::LIMIT_REACHED_STATUS;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TurnPayload {
     pub conversation_id: String,
     pub text: String,

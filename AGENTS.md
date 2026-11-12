@@ -6,8 +6,10 @@ one Rust binary, one SQLite/WAL database, bounded LLM calls — still a
 pipeline of deterministic Rust. The approved reconstruction design is
 `docs/specs/multi-user-reconstruction.md`; implement it as specified. Do not
 add: open self-signup, Docker, PostgreSQL, a Node runtime, a local chat LLM,
-a plugin marketplace, free-form agent-to-agent chatter, or a web UI beyond
-the existing console pages (landing, login, health, downloads).
+free-form agent-to-agent chatter, or a web UI beyond
+the existing console pages (landing, login, health, downloads). A curated,
+owner-controlled plugin marketplace (catalog + per-user install) is in scope;
+not an open third-party store.
 
 Everything user-owned is UID-scoped — bots, skills, memory, documents,
 conversations, tasks, approvals, credentials, quotas. Store methods for

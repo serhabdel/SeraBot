@@ -518,9 +518,61 @@ approvals cancel suspended tasks.
 | `POST` | `/v1/artifacts/{sha256}/approve` | Approves Italian deck content for French generation. |
 
 Event kinds include `message`, `approval`, `task.queued`, `turn.completed`,
+`turn.step`, `turn.refused`, `plan.updated`, `handoff.queued`, `escalate.queued`,
 `memory.added`, `memory.deleted`, `approval.grants_revoked`,
 `model.selected`, and `model.used`. Client code should treat unknown event
 kinds as informational.
+
+### `turn.step` (live tool activity)
+
+One event per tool step while a turn runs. All payloads are per-user (only
+the owning session sees them). Untrusted argument text never appears; labels
+are derived server-side.
+
+| Field | When | Meaning |
+| --- | --- | --- |
+| `task_id`, `turn_id`, `conversation_id` | always | Scope |
+| `bot` | always | Bot executing the step |
+| `tool` | always | Tool name (stable id for UI cards) |
+| `call_id` | always | Matches the model tool-call id |
+| `step` | always | Ordinal within the turn (1-based) |
+| `phase` | always | `running`, `done`, `failed`, or `waiting_approval` |
+| `icon`, `label` | always | Plain-language summary for the step card |
+| `input_summary` | always | Safe human summary of what the tool is doing |
+| `approval_id` | `waiting_approval` | Pending approval row |
+| `duration_ms` | `done` / `failed` | Wall time for the call |
+| `result_preview` | `done` | Short, blocklisted preview of tool output |
+| `error` | `failed` | User-facing error (no secrets) |
+| `structured` | `done` | Optional structured result envelope (see below) |
+| `detail` | optional | Collapsed “Thinking” text (bounded) |
+
+### `turn.refused`
+
+Emitted when a turn ends with a bare assistant refusal (heuristic). Payload:
+`bot`, `task_id`, `turn_id`, `conversation_id`, `reason` (matched phrase),
+`snippet` (short excerpt). Use for ops visibility, not as a control channel.
+
+### Structured tool results
+
+Successful tool outputs may include a `structured` object (also mirrored under
+`data.structured` for JSON tool payloads). Common shape:
+
+```json
+{
+  "kind": "audio | image | file | table | link_list | text",
+  "artifact_hash": "sha256 hex (optional)",
+  "url": "https://… (optional, when a fetch URL is safe to show)",
+  "filename": "…",
+  "mime_type": "…",
+  "duration_ms": 1234,
+  "preview": "short text",
+  "voice": "…",
+  "model": "…"
+}
+```
+
+Human-readable `content` is always present for the model; clients should
+prefer `structured` for renderers (audio player, file card, table).
 
 ## Polling guidance
 

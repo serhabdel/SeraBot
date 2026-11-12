@@ -922,6 +922,7 @@ pub fn known_tool_names() -> Vec<&'static str> {
         "skill_search",
         "skill_load",
         "delegate",
+        "escalate",
         "team_ask",
         "team_reply",
         "conversation_library",

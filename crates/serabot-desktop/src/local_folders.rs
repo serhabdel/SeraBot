@@ -278,18 +278,19 @@ fn reserved_device(component: &str) -> bool {
 
 /// Symlink, junction or any other reparse point.
 pub(crate) fn is_link(meta: &std::fs::Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        if meta.file_type().is_symlink() {
             return true;
         }
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        return meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
     }
-    false
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
 }
 
 /// Split and vet the relative path the server sent. `.` alone means the root.

@@ -219,6 +219,30 @@ impl StepPhase {
     }
 }
 
+/// Optional fields on a `turn.step` event beyond the stable running/done phases.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StepExtras {
+    pub duration_ms: Option<u64>,
+    pub result_preview: Option<String>,
+    pub error_message: Option<String>,
+    pub structured: Option<Value>,
+}
+
+const MAX_PREVIEW_CHARS: usize = 240;
+
+pub(crate) fn preview_tool_output(output: &crate::gateway::ToolOutput) -> Option<String> {
+    if let Some(structured) = output.data.as_ref().and_then(|d| d.get("structured"))
+        && let Some(preview) = structured.get("preview").and_then(Value::as_str)
+    {
+        return Some(truncate_chars(preview, MAX_PREVIEW_CHARS));
+    }
+    let text = output.content.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(text, MAX_PREVIEW_CHARS))
+}
+
 impl Runtime {
     /// Best-effort `turn.step` event. A failed append never fails the turn:
     /// the activity feed is a convenience, the durable record is the audit log.
@@ -232,6 +256,7 @@ impl Runtime {
         phase: StepPhase,
         approval_id: Option<&str>,
         ordinal: usize,
+        extras: StepExtras,
     ) {
         let bot_label = (call.name == DELEGATE_TOOL)
             .then(|| call.arguments.get("to_bot").and_then(Value::as_str))
@@ -246,19 +271,36 @@ impl Runtime {
                 label: "Working".into(),
             };
         }
+        let input_summary = describe_step(&call.name, &call.arguments, bot_label.as_deref()).label;
         let mut payload = json!({
             "task_id": task.id,
             "turn_id": turn.id,
             "conversation_id": turn.conversation_id,
             "bot": turn.bot,
+            "tool": call.name,
             "call_id": truncate_chars(&call.id, 64),
             "step": ordinal,
             "phase": phase.as_str(),
             "icon": view.icon,
             "label": view.label,
+            "input_summary": input_summary,
         });
         if let Some(id) = approval_id {
             payload["approval_id"] = json!(id);
+        }
+        if let Some(ms) = extras.duration_ms {
+            payload["duration_ms"] = json!(ms);
+        }
+        if let Some(preview) = extras.result_preview
+            && self.gateway.policy().is_allowed(&preview)
+        {
+            payload["result_preview"] = json!(truncate_chars(&preview, MAX_PREVIEW_CHARS));
+        }
+        if let Some(error) = extras.error_message {
+            payload["error"] = json!(truncate_chars(&error, MAX_PREVIEW_CHARS));
+        }
+        if let Some(structured) = extras.structured {
+            payload["structured"] = structured;
         }
         let _ = self.store.append_event(user_id, "turn.step", &payload);
     }

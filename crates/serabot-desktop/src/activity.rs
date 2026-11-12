@@ -39,6 +39,10 @@ pub struct Step {
     pub icon: String,
     pub label: String,
     pub phase: StepPhase,
+    /// Tool id from the server (`turn.step` payload), when present.
+    pub tool: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub result_preview: Option<String>,
     pub approval_id: Option<String>,
     /// Reasoning text of a Thinking step, shown collapsed. Untrusted
     /// display data: bounded, control characters dropped, rendered as text.
@@ -107,10 +111,16 @@ impl Activity {
         let icon = clean(payload, "icon").unwrap_or_else(|| "bolt".into());
         let approval_id = clean(payload, "approval_id");
         let detail = clean_detail(payload, "detail");
+        let tool = clean(payload, "tool");
+        let duration_ms = payload.get("duration_ms").and_then(Value::as_u64);
+        let result_preview = clean(payload, "result_preview");
         if let Some(step) = self.steps.iter_mut().find(|step| step.call_id == call_id) {
             step.phase = phase;
             step.label = label;
             step.icon = icon;
+            step.tool = tool.or(step.tool.take());
+            step.duration_ms = duration_ms.or(step.duration_ms);
+            step.result_preview = result_preview.or(step.result_preview.take());
             step.detail = detail.or(step.detail.take());
             step.approval_id = approval_id.or(step.approval_id.take());
             if phase != StepPhase::WaitingApproval {
@@ -122,6 +132,9 @@ impl Activity {
                 icon,
                 label,
                 phase,
+                tool,
+                duration_ms,
+                result_preview,
                 approval_id,
                 detail,
             });

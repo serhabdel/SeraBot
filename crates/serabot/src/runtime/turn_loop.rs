@@ -1,5 +1,6 @@
 //! The durable turn loop: model rounds, tool execution, approvals and replies.
 
+use super::activity::{StepExtras, preview_tool_output};
 use super::*;
 use crate::turn_limits::{TurnLimits, config_defaults, resolve_turn_limits};
 
@@ -225,6 +226,7 @@ impl Runtime {
                         StepPhase::Done,
                         None,
                         state.tool_calls,
+                        StepExtras::default(),
                     );
                 }
                 Ok(ToolOutcome::PendingApproval { .. }) => {
@@ -241,6 +243,10 @@ impl Runtime {
                         StepPhase::Failed,
                         None,
                         state.tool_calls,
+                        StepExtras {
+                            error_message: Some(truncate_chars(&error.to_string(), 240)),
+                            ..StepExtras::default()
+                        },
                     );
                     state.messages.push(LlmMessage {
                         role: Role::Tool,
@@ -260,6 +266,10 @@ impl Runtime {
                 StepPhase::Failed,
                 None,
                 state.tool_calls,
+                StepExtras {
+                    error_message: Some("The owner denied this action.".into()),
+                    ..StepExtras::default()
+                },
             );
             state.messages.push(LlmMessage {
                 role: Role::Tool,
@@ -635,6 +645,18 @@ impl Runtime {
                     "sending_response",
                     &serde_json::to_value(&state)?,
                 )?;
+                if let Some(reason) = refusal::looks_like_refusal(&text) {
+                    self.log_refusal(
+                        &self.store,
+                        &user,
+                        &turn.bot,
+                        &task.id,
+                        &turn.id,
+                        conversation_id,
+                        &reason,
+                        &truncate_chars(&text, 200),
+                    );
+                }
                 self.finish_reply(&user, conversation_id, task, turn, &state, &text)
                     .await?;
                 self.store.update_turn(
@@ -930,7 +952,9 @@ impl Runtime {
                 StepPhase::Running,
                 None,
                 ordinal,
+                StepExtras::default(),
             );
+            let started = std::time::Instant::now();
             match self
                 .gateway
                 .execute(&call.name, call.arguments.clone(), context)
@@ -975,6 +999,16 @@ impl Runtime {
                         StepPhase::Done,
                         None,
                         ordinal,
+                        StepExtras {
+                            duration_ms: Some(started.elapsed().as_millis() as u64),
+                            result_preview: preview_tool_output(&output),
+                            structured: output
+                                .data
+                                .as_ref()
+                                .and_then(|d| d.get("structured"))
+                                .cloned(),
+                            ..StepExtras::default()
+                        },
                     );
                 }
                 Ok(ToolOutcome::PendingApproval {
@@ -990,6 +1024,7 @@ impl Runtime {
                         StepPhase::WaitingApproval,
                         Some(&approval_id),
                         ordinal,
+                        StepExtras::default(),
                     );
                     return Ok(Some(PendingTool {
                         call: call.clone(),
@@ -1007,6 +1042,13 @@ impl Runtime {
                         StepPhase::Failed,
                         None,
                         ordinal,
+                        StepExtras {
+                            duration_ms: Some(started.elapsed().as_millis() as u64),
+                            error_message: Some(
+                                "The tool output was blocked by the content policy.".into(),
+                            ),
+                            ..StepExtras::default()
+                        },
                     );
                     state.messages.push(LlmMessage {
                         role: Role::Tool,
@@ -1028,6 +1070,11 @@ impl Runtime {
                         StepPhase::Failed,
                         None,
                         ordinal,
+                        StepExtras {
+                            duration_ms: Some(started.elapsed().as_millis() as u64),
+                            error_message: Some(truncate_chars(&error.to_string(), 240)),
+                            ..StepExtras::default()
+                        },
                     );
                     state.messages.push(LlmMessage {
                         role: Role::Tool,

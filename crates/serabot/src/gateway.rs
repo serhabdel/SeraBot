@@ -117,6 +117,13 @@ pub struct ExtraArtifact {
 /// the extra artifacts the call listed. Only files the call saved can be
 /// listed, so a hash named in a tool's `data`, an earlier call's file or
 /// another user's file never reaches the conversation library.
+fn enrich_tool_output(tool: &str, output: Result<ToolOutput>) -> Result<ToolOutput> {
+    output.map(|mut value| {
+        crate::structured_result::attach_structured(tool, &mut value);
+        value
+    })
+}
+
 async fn run_tool_call(
     tool: &dyn Tool,
     args: Value,
@@ -489,7 +496,7 @@ impl Gateway {
 
         let started = std::time::Instant::now();
         let (output, listed) = run_tool_call(tool.as_ref(), args, context).await;
-        let output = self.redact_output(context, output);
+        let output = enrich_tool_output(name, self.redact_output(context, output));
         self.finish_tool_call(tool.as_ref(), &output, &listed, context, started.elapsed())?;
         output.map(ToolOutcome::Completed)
     }
@@ -671,7 +678,7 @@ impl Gateway {
         );
         let started = std::time::Instant::now();
         let (output, listed) = run_tool_call(tool, args, context).await;
-        let output = self.redact_output(context, output);
+        let output = enrich_tool_output(&tool.spec().name, self.redact_output(context, output));
         self.finish_tool_call(tool, &output, &listed, context, started.elapsed())?;
         output.map(ToolOutcome::Completed)
     }
@@ -805,7 +812,7 @@ impl Gateway {
         );
         let started = std::time::Instant::now();
         let (output, listed) = run_tool_call(tool.as_ref(), args, context).await;
-        let output = self.redact_output(context, output);
+        let output = enrich_tool_output(&action.tool, self.redact_output(context, output));
         let succeeded = output.is_ok();
         self.finish_tool_call(tool.as_ref(), &output, &listed, context, started.elapsed())?;
         match output {
@@ -2595,9 +2602,16 @@ mod tests {
             panic!("expected completion");
         };
         assert_eq!(own.content, "page says: [vault:site]");
+        let data = own.data.unwrap();
         assert_eq!(
-            own.data.unwrap(),
-            serde_json::json!({"nested": ["[vault:site]"]})
+            data.get("nested"),
+            Some(&serde_json::json!(["[vault:site]"]))
+        );
+        assert_eq!(
+            data.get("structured")
+                .and_then(|v| v.get("kind"))
+                .and_then(|v| v.as_str()),
+            Some("text")
         );
         let ToolOutcome::Completed(other) = gateway
             .execute("echo", args, &vault_context(&b))

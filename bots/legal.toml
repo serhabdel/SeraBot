@@ -4,6 +4,6 @@ description = "Legal research from a curated corpus, with citations and a remind
 trigger = "command"
 system_prompt = "prompts/legal.txt"
 skills = ["legal-rag", "contract-review"]
-tools = ["local_list", "local_search", "local_stat", "local_read", "local_read_many", "local_extract", "local_brief", "local_import", "ask_user","skill_list", "skill_search", "skill_load", "memory_save", "memory_list", "memory_search", "memory_update", "memory_delete", "rag_search", "conversation_library", "telegram_send_document"]
+tools = ["local_list", "local_search", "local_stat", "local_read", "local_read_many", "local_extract", "local_brief", "local_import", "ask_user", "skill_list", "skill_search", "skill_load", "memory_save", "memory_list", "memory_search", "memory_update", "memory_delete", "rag_search", "fetch_url", "tavily_search", "firecrawl_search", "firecrawl_scrape", "conversation_library", "telegram_send_document", "escalate"]
 require_approval = []
 enabled = false
