@@ -457,7 +457,7 @@ fn DocPreviewPane(session: Signal<Session>, hash: String, label: String) -> Elem
 /// An inline player for a video or audio file (0.24). Until its bytes are read
 /// back, a Play button asks the session for them. Other files draw nothing.
 #[component]
-fn InlineMedia(session: Signal<Session>, hash: String, mime: String) -> Element {
+pub(crate) fn InlineMedia(session: Signal<Session>, hash: String, mime: String) -> Element {
     let Some(player) = serabot_desktop::media_view::inline_player(&mime) else {
         return rsx! {};
     };

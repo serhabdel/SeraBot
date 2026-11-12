@@ -271,7 +271,11 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     });
     use_effect(move || {
         let external = session.read().composer.clone();
-        if chat_compose::sync_composer_from_session(composer_focused(), external.is_empty()) {
+        if chat_compose::sync_composer_from_session(
+            composer_focused(),
+            external.is_empty(),
+            composer_draft().trim().is_empty(),
+        ) {
             composer_draft.set(external);
         }
     });
@@ -298,6 +302,12 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         }
     });
     let transcript_error = session.read().state.transcript_error.clone();
+    let chat_failure = session.read().state.chat_failure.clone();
+    let held_draft = session.read().state.held_draft.is_some();
+    let reconnecting = {
+        let state = session.read();
+        state.state.connected && state.events_seen && !state.events_active
+    };
     use_effect(move || {
         let transcript = session.read().state.transcript.clone();
         let Some(text) = transcript else {
@@ -761,6 +771,12 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     // What the bot is doing right now, in plain words: a
                     // shimmer while it thinks, one row per step, and a small
                     // "N steps" summary once the reply has landed.
+                    if reconnecting {
+                        div { class: "banner warn", role: "status", "aria-live": "polite",
+                            span { class: "step-spin", "aria-hidden": "true" }
+                            "Reconnecting to live updates…"
+                        }
+                    }
                     if sending && live_task.is_none() {
                         div { class: "activity", role: "status",
                             span { class: "shimmer", "Sending…" }
@@ -817,8 +833,54 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     }
                 }
                 div { class: "composer-wrap",
+                    if let Some(failure) = chat_failure.clone() {
+                        div { class: "banner err", role: "alert",
+                            span { "{failure.message}" }
+                            match failure.action {
+                                ChatAction::Retry => rsx! {
+                                    button {
+                                        class: "btn primary sm",
+                                        r#type: "button",
+                                        "aria-label": "Send the message again",
+                                        onclick: move |_| session.write().retry_send(),
+                                        "Retry"
+                                    }
+                                },
+                                ChatAction::Reconnect => rsx! {
+                                    button {
+                                        class: "btn ghost sm",
+                                        r#type: "button",
+                                        "aria-label": "Try the connection again",
+                                        onclick: move |_| session.write().retry_link(),
+                                        "Reconnect"
+                                    }
+                                },
+                                ChatAction::OpenKeys => rsx! {
+                                    button {
+                                        class: "btn ghost sm",
+                                        r#type: "button",
+                                        "aria-label": "Open AI keys",
+                                        onclick: move |_| session.write().open_section(Section::Providers),
+                                        "Open AI keys"
+                                    }
+                                },
+                                ChatAction::None => rsx! {},
+                            }
+                        }
+                    } else if held_draft {
+                        div { class: "banner warn", role: "status",
+                            span { "That message may have reached SeraBot. It is kept here if you want it back in the box." }
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                "aria-label": "Put the message back in the box",
+                                onclick: move |_| session.write().restore_held_draft(),
+                                "Put it back"
+                            }
+                        }
+                    }
                     if let Some(message) = transcript_error {
-                        div { class: "banner err", span { "{message}" } }
+                        div { class: "banner err", role: "alert", span { "{message}" } }
                     }
                     div { class: if composer_expanded() { "composer expanded" } else { "composer" },
                         ComposerFiles { session }

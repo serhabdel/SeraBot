@@ -58,9 +58,11 @@ class SeraAvatar extends StatelessWidget {
 
 /// Shows an error sentence from the server with a retry action.
 class ErrorBanner extends StatelessWidget {
-  const ErrorBanner(this.message, {super.key, this.onRetry});
+  const ErrorBanner(this.message, {super.key, this.onRetry, this.actionLabel});
   final String message;
   final VoidCallback? onRetry;
+  /// Button word. Defaults to Retry. Hidden when [onRetry] is null.
+  final String? actionLabel;
 
   @override
   Widget build(BuildContext context) {
@@ -79,7 +81,7 @@ class ErrorBanner extends StatelessWidget {
                   style: TextStyle(color: scheme.onErrorContainer)),
             ),
             if (onRetry != null)
-              TextButton(onPressed: onRetry, child: const Text('Retry')),
+              TextButton(onPressed: onRetry, child: Text(actionLabel ?? 'Retry')),
           ],
         ),
       ),

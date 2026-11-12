@@ -126,10 +126,15 @@ pub fn thumbnail_data_url(name: &str, bytes: &[u8]) -> Option<String> {
 }
 
 /// Whether a session composer value should replace the on-screen draft during
-/// streaming repaints. While the textarea is focused and the session still
-/// holds non-empty text, the local draft wins.
-pub fn sync_composer_from_session(composer_focused: bool, session_composer_empty: bool) -> bool {
-    !composer_focused || session_composer_empty
+/// streaming repaints. While the textarea is focused and both sides have text,
+/// the local draft wins. An empty local draft still takes a restored message,
+/// so a failed send puts the text back even if the box stayed focused.
+pub fn sync_composer_from_session(
+    composer_focused: bool,
+    session_composer_empty: bool,
+    local_empty: bool,
+) -> bool {
+    !composer_focused || session_composer_empty || local_empty
 }
 
 /// True when the draft can go out: text or files, under the length limit,
@@ -459,10 +464,11 @@ mod tests {
 
     #[test]
     fn composer_draft_keeps_local_text_while_focused() {
-        assert!(!sync_composer_from_session(true, false));
-        assert!(sync_composer_from_session(true, true));
-        assert!(sync_composer_from_session(false, false));
-        assert!(sync_composer_from_session(false, true));
+        assert!(!sync_composer_from_session(true, false, false));
+        assert!(sync_composer_from_session(true, false, true));
+        assert!(sync_composer_from_session(true, true, false));
+        assert!(sync_composer_from_session(false, false, false));
+        assert!(sync_composer_from_session(false, true, false));
     }
 
     #[test]
