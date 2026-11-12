@@ -32,6 +32,7 @@ class ChatScreen extends StatefulWidget {
 class _ChatScreenState extends State<ChatScreen> {
   late final ChatController chat;
   final _scroll = ScrollController();
+  bool _sawLive = false;
   bool _atBottom = true;
   int _unseen = 0;
   int _lastCount = 0;
@@ -98,6 +99,44 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
+  String? _actionLabel(ChatAction action) => switch (action) {
+        ChatAction.retry => 'Retry',
+        ChatAction.reconnect => 'Reconnect',
+        ChatAction.keys => 'AI keys',
+        ChatAction.none => null,
+      };
+
+  Future<void> _onErrorAction(BuildContext context) async {
+    switch (chat.errorAction) {
+      case ChatAction.retry:
+        if (chat.sendFailed && chat.draft.trim().isNotEmpty) {
+          await chat.send(chat.draft);
+        } else {
+          await chat.load();
+        }
+      case ChatAction.reconnect:
+        await chat.load();
+      case ChatAction.keys:
+        if (!context.mounted) {
+          return;
+        }
+        await showDialog<void>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('AI keys'),
+            content: const Text(
+              'Provider keys are saved in the Windows app, under AI keys. Add or replace the key there, then try this message again.',
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK')),
+            ],
+          ),
+        );
+      case ChatAction.none:
+        break;
+    }
+  }
+
   Future<void> _download(String name, Future<List<int>> Function() fetch) async {
     final messenger = ScaffoldMessenger.of(context);
     try {
@@ -155,8 +194,12 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget build(BuildContext context) {
     final c = widget.conversation;
     return ListenableBuilder(
-      listenable: chat,
+      listenable: Listenable.merge([chat, widget.app]),
       builder: (context, _) {
+        if (widget.app.live) {
+          _sawLive = true;
+        }
+        final reconnecting = _sawLive && !widget.app.live;
         final sel = chat.catalog?.selection;
         return Scaffold(
           appBar: AppBar(
@@ -214,6 +257,7 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
           body: Column(
             children: [
+              if (chat.plan != null) _PlanCard(plan: chat.plan!),
               Expanded(
                 child: Stack(
                   children: [
@@ -234,10 +278,21 @@ class _ChatScreenState extends State<ChatScreen> {
                   ],
                 ),
               ),
+              if (reconnecting)
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(12, 0, 12, 8),
+                  child: _ReconnectBanner(),
+                ),
               if (chat.error != null)
                 Padding(
                   padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-                  child: ErrorBanner(chat.error!, onRetry: chat.load),
+                  child: ErrorBanner(
+                    chat.error!,
+                    actionLabel: _actionLabel(chat.errorAction),
+                    onRetry: chat.errorAction == ChatAction.none
+                        ? null
+                        : () => _onErrorAction(context),
+                  ),
                 ),
               Composer(chat: chat, device: widget.device),
             ],
@@ -450,17 +505,11 @@ class _BubbleFooter extends StatelessWidget {
   }
 }
 
-/// Live steps of the running turn, collapsed by default.
+/// Live steps of the running turn. Open while a reply is in progress, and a
+/// one-line summary ("5 steps, 12s") once it finishes.
 class ActivityPanel extends StatelessWidget {
   const ActivityPanel({super.key, required this.chat});
   final ChatController chat;
-
-  IconData _icon(StepPhase p) => switch (p) {
-        StepPhase.running => Icons.autorenew,
-        StepPhase.done => Icons.check_circle_outline,
-        StepPhase.failed => Icons.error_outline,
-        StepPhase.waitingApproval => Icons.gavel,
-      };
 
   @override
   Widget build(BuildContext context) {
@@ -469,42 +518,315 @@ class ActivityPanel extends StatelessWidget {
     final title = chat.running
         ? (a.isEmpty ? 'Working\u2026' : 'Working \u00b7 ${a.summary}')
         : a.summary;
+    final reduced = MediaQuery.disableAnimationsOf(context);
     return Card(
       margin: const EdgeInsets.symmetric(vertical: 6),
-      child: ExpansionTile(
-        key: const Key('activity-panel'),
-        leading: chat.running
-            ? const SizedBox(
-                width: 18,
-                height: 18,
-                child: CircularProgressIndicator(strokeWidth: 2),
-              )
-            : const Icon(Icons.checklist),
-        title: Text(title),
-        initiallyExpanded: waiting.isNotEmpty,
-        children: [
-          for (final s in a.steps)
-            ListTile(
-              dense: true,
-              leading: Icon(_icon(s.phase), size: 18),
-              title: Text(s.label),
-              trailing: s.phase == StepPhase.waitingApproval && s.approvalId != null
-                  ? Row(mainAxisSize: MainAxisSize.min, children: [
+      child: Semantics(
+        liveRegion: chat.running,
+        child: ExpansionTile(
+          key: const Key('activity-panel'),
+          leading: chat.running
+              ? SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: reduced
+                      ? const Icon(Icons.more_horiz, size: 18)
+                      : const CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.checklist),
+          title: Text(title),
+          initiallyExpanded: chat.running || waiting.isNotEmpty,
+          children: [
+            for (final s in a.steps) _StepCard(chat: chat, step: s),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _StepCard extends StatelessWidget {
+  const _StepCard({required this.chat, required this.step});
+  final ChatController chat;
+  final ActivityStep step;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final reduced = MediaQuery.disableAnimationsOf(context);
+    final heading = step.heading;
+    final subtitle = step.title != null && step.label != heading ? step.label : null;
+    final status = switch (step.phase) {
+      StepPhase.running => 'Running',
+      StepPhase.progress => 'Still working',
+      StepPhase.done => 'Done',
+      StepPhase.failed => 'Failed',
+      StepPhase.waitingApproval => 'Waiting for your approval',
+    };
+    final duration = step.durationMs == null ? null : formatDuration(step.durationMs!);
+    final waiting = step.phase == StepPhase.waitingApproval;
+    return Semantics(
+      label: '$heading, $status',
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(12, 4, 12, waiting ? 8 : 4),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: waiting
+                ? scheme.tertiaryContainer
+                : step.phase == StepPhase.failed
+                    ? scheme.errorContainer
+                    : null,
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Padding(
+            padding: EdgeInsets.all(waiting || step.phase == StepPhase.failed ? 8 : 0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(children: [
+                  _statusMark(step.phase, reduced, scheme),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(heading, style: Theme.of(context).textTheme.titleSmall),
+                        if (subtitle != null)
+                          Text(subtitle, style: Theme.of(context).textTheme.bodySmall),
+                      ],
+                    ),
+                  ),
+                  if (duration != null)
+                    Text(duration, style: Theme.of(context).textTheme.labelSmall),
+                ]),
+                if (waiting) ...[
+                  const Padding(
+                    padding: EdgeInsets.only(top: 6),
+                    child: Text('Waiting for your approval'),
+                  ),
+                  if (step.approvalId != null)
+                    Row(children: [
                       TextButton(
-                        onPressed: () => chat.decide(s.approvalId!, ApprovalDecision.deny),
+                        onPressed: () => chat.decide(step.approvalId!, ApprovalDecision.deny),
                         child: const Text('Deny'),
                       ),
                       FilledButton(
-                        onPressed: () => chat.decide(s.approvalId!, ApprovalDecision.once),
+                        onPressed: () => chat.decide(step.approvalId!, ApprovalDecision.once),
                         child: const Text('Approve'),
                       ),
-                    ])
-                  : null,
+                    ]),
+                ],
+                if (step.phase == StepPhase.failed && step.error != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(step.error!, style: TextStyle(color: scheme.onErrorContainer)),
+                  ),
+                if (step.phase == StepPhase.failed) _stepAction(context),
+                if (step.inputSummary != null || step.result != null || step.resultSummary != null)
+                  ExpansionTile(
+                    tilePadding: EdgeInsets.zero,
+                    title: const Text('Details'),
+                    children: [
+                      if (step.inputSummary != null)
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: Text('Input\n${step.inputSummary}'),
+                        ),
+                      if (step.result != null)
+                        _ResultBody(chat: chat, result: step.result!)
+                      else if (step.resultSummary != null)
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: Text(step.resultSummary!),
+                        ),
+                    ],
+                  ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _statusMark(StepPhase phase, bool reduced, ColorScheme scheme) {
+    if (stepSpins(phase)) {
+      return SizedBox(
+        width: 16,
+        height: 16,
+        child: reduced
+            ? Icon(Icons.more_horiz, size: 16, color: scheme.primary)
+            : CircularProgressIndicator(strokeWidth: 2, color: scheme.primary),
+      );
+    }
+    final icon = switch (phase) {
+      StepPhase.done => Icons.check_circle_outline,
+      StepPhase.failed => Icons.error_outline,
+      StepPhase.waitingApproval => Icons.gavel,
+      StepPhase.running || StepPhase.progress => Icons.more_horiz,
+    };
+    final color = switch (phase) {
+      StepPhase.done => scheme.primary,
+      StepPhase.failed => scheme.error,
+      StepPhase.waitingApproval => scheme.tertiary,
+      StepPhase.running || StepPhase.progress => scheme.primary,
+    };
+    return Icon(icon, size: 16, color: color);
+  }
+
+  Widget _stepAction(BuildContext context) {
+    final last = chat.messages.where((m) => m.role == MessageRole.user).toList();
+    final text = last.isEmpty ? null : last.last.content;
+    return switch (step.action) {
+      StepAction.retry => Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton(
+            onPressed: text == null || text.isEmpty || chat.running
+                ? null
+                : () => chat.send(text),
+            child: const Text('Retry'),
+          ),
+        ),
+      StepAction.keys => Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton(
+            onPressed: () => showDialog<void>(
+              context: context,
+              builder: (context) => AlertDialog(
+                title: const Text('AI keys'),
+                content: const Text(
+                  'Provider keys are saved in the Windows app, under AI keys.',
+                ),
+                actions: [
+                  TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK')),
+                ],
+              ),
+            ),
+            child: const Text('AI keys'),
+          ),
+        ),
+      StepAction.reconnect => Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton(onPressed: chat.load, child: const Text('Reconnect')),
+        ),
+      StepAction.none => const SizedBox.shrink(),
+    };
+  }
+}
+
+class _ResultBody extends StatelessWidget {
+  const _ResultBody({required this.chat, required this.result});
+  final ChatController chat;
+  final StepResult result;
+
+  @override
+  Widget build(BuildContext context) {
+    final caption = [
+      if (result.voice != null) result.voice!,
+      if (result.model != null) result.model!,
+    ].join(' · ');
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: switch (result.kind) {
+        ResultKind.audio => Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Audio'),
+              if (caption.isNotEmpty) Text(caption),
+              if (result.name != null) Text(result.name!),
+              if (result.artifact != null) const Text('Saved in this chat. Open it from Files.'),
+            ],
+          ),
+        ResultKind.image => _ImageResult(result: result),
+        ResultKind.file => _FileResult(result: result),
+        ResultKind.table => _table(context),
+        ResultKind.link => _link(context),
+        ResultKind.text => Text(result.text ?? ''),
+      },
+    );
+  }
+
+  Widget _table(BuildContext context) {
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: Table(
+        border: TableBorder.all(color: Theme.of(context).colorScheme.outlineVariant),
+        defaultColumnWidth: const IntrinsicColumnWidth(),
+        children: [
+          TableRow(
+            children: [
+              for (final column in result.columns)
+                Padding(padding: const EdgeInsets.all(4), child: Text(column)),
+            ],
+          ),
+          for (final row in result.rows)
+            TableRow(
+              children: [
+                for (final cell in row)
+                  Padding(padding: const EdgeInsets.all(4), child: Text(cell)),
+              ],
             ),
         ],
       ),
     );
   }
+
+  Widget _link(BuildContext context) {
+    final url = result.url;
+    if (url == null || !safeLinkUrl(url)) {
+      return Text(result.text ?? '');
+    }
+    return SelectableText(result.title ?? url);
+  }
+}
+
+class _ImageResult extends StatelessWidget {
+  const _ImageResult({required this.result});
+  final StepResult result;
+
+  @override
+  Widget build(BuildContext context) {
+    final url = result.url;
+    if (url != null && safeMediaUrl(url)) {
+      return Image.network(
+        url,
+        height: 180,
+        fit: BoxFit.contain,
+        errorBuilder: (_, _, _) => const Text('Image'),
+      );
+    }
+    if (result.artifact != null) {
+      return Text(result.name ?? 'Image saved in this chat. Open it from Files.');
+    }
+    return const Text('Image');
+  }
+}
+
+class _FileResult extends StatelessWidget {
+  const _FileResult({required this.result});
+  final StepResult result;
+
+  @override
+  Widget build(BuildContext context) {
+    final name = result.name ?? result.title ?? 'File';
+    final size = result.size == null ? '' : ' · ${_bytesLabel(result.size!)}';
+    return ListTile(
+      contentPadding: EdgeInsets.zero,
+      leading: const Icon(Icons.insert_drive_file_outlined),
+      title: Text(name),
+      subtitle: Text('${result.mime ?? 'File'}$size'),
+    );
+  }
+}
+
+String _bytesLabel(int bytes) {
+  if (bytes < 1024) {
+    return '$bytes B';
+  }
+  if (bytes < 1024 * 1024) {
+    return '${(bytes / 1024).toStringAsFixed(1)} KB';
+  }
+  return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
 }
 
 /// Text box with attach, microphone and send/stop.
@@ -521,6 +843,7 @@ class _ComposerState extends State<Composer> {
   final _text = TextEditingController();
   bool _recording = false;
   bool _transcribing = false;
+  int _seenSends = 0;
 
   ChatController get chat => widget.chat;
 
@@ -532,9 +855,11 @@ class _ComposerState extends State<Composer> {
 
   Future<void> _send() async {
     final text = _text.text;
+    chat.noteDraft(text);
     final ok = await chat.send(text);
-    if (ok) {
+    if (ok && mounted) {
       _text.clear();
+      chat.noteDraft('');
     }
   }
 
@@ -618,6 +943,18 @@ class _ComposerState extends State<Composer> {
     return ListenableBuilder(
       listenable: Listenable.merge([chat, _text]),
       builder: (context, _) {
+        if (chat.acceptedSends != _seenSends) {
+          final generation = chat.acceptedSends;
+          if (generation > _seenSends) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted && chat.acceptedSends == generation && _text.text.isNotEmpty) {
+                _text.clear();
+                chat.noteDraft('');
+              }
+            });
+          }
+          _seenSends = generation;
+        }
         final canSend = !chat.sending &&
             !chat.running &&
             !chat.uploading &&
@@ -665,7 +1002,7 @@ class _ComposerState extends State<Composer> {
                           isDense: true,
                           filled: true,
                         ),
-                        onChanged: (_) {},
+                        onChanged: chat.noteDraft,
                       ),
                     ),
                     IconButton(
@@ -838,6 +1175,86 @@ class FilesSheet extends StatelessWidget {
               onTap: () => onOpen(e),
             ),
         ],
+      ),
+    );
+  }
+}
+
+class _PlanCard extends StatelessWidget {
+  const _PlanCard({required this.plan});
+  final ChatPlan plan;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Semantics(
+      label: '${plan.goal}. ${plan.progress}',
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+        child: Material(
+          color: scheme.surfaceContainerHigh,
+          borderRadius: BorderRadius.circular(12),
+          child: ExpansionTile(
+            title: Text(plan.goal, maxLines: 1, overflow: TextOverflow.ellipsis),
+            subtitle: Text(plan.progress),
+            children: [
+              for (final item in plan.items)
+                ListTile(
+                  dense: true,
+                  leading: Icon(
+                    item.status == 'done'
+                        ? Icons.check_circle_outline
+                        : item.status == 'doing'
+                            ? Icons.radio_button_checked
+                            : Icons.radio_button_unchecked,
+                    size: 18,
+                  ),
+                  title: Text(item.text),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ReconnectBanner extends StatelessWidget {
+  const _ReconnectBanner();
+
+  @override
+  Widget build(BuildContext context) {
+    final reduced = MediaQuery.disableAnimationsOf(context);
+    final scheme = Theme.of(context).colorScheme;
+    return Semantics(
+      liveRegion: true,
+      label: 'Reconnecting to live updates',
+      child: Material(
+        color: scheme.tertiaryContainer,
+        borderRadius: BorderRadius.circular(12),
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Row(children: [
+            if (reduced)
+              Icon(Icons.sync, color: scheme.onTertiaryContainer)
+            else
+              SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  color: scheme.onTertiaryContainer,
+                ),
+              ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                'Reconnecting to live updates…',
+                style: TextStyle(color: scheme.onTertiaryContainer),
+              ),
+            ),
+          ]),
+        ),
       ),
     );
   }

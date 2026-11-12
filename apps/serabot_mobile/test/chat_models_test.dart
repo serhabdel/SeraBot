@@ -161,6 +161,87 @@ void main() {
       expect(a.steps.length, 1);
       expect(a.apply('turn.step', {'task_id': 't2'}), isFalse);
     });
+
+    test('optional step fields degrade and durations sum', () {
+      final a = Activity();
+      a.apply('turn.step', {
+        'task_id': 't1',
+        'call_id': 'c1',
+        'label': 'Working with audio',
+        'phase': 'running',
+        'tool': 'elevenlabs_mcp_call',
+        'input_summary': 'Working with audio',
+      });
+      expect(a.steps.single.heading, 'ElevenLabs');
+      expect(a.summary, '1 step');
+      a.apply('turn.step', {
+        'task_id': 't1',
+        'call_id': 'c1',
+        'label': 'Working with audio',
+        'phase': 'done',
+        'duration_ms': 12000,
+        'cards': [
+          {
+            'type': 'audio',
+            'voice': 'Rachel',
+            'artifact_hash': 'ab' * 32,
+            'filename': 'note.mp3',
+            'url': '/v1/artifacts/${'ab' * 32}',
+          },
+        ],
+      });
+      expect(a.steps.single.durationMs, 12000);
+      expect(a.steps.single.result!.kind, ResultKind.audio);
+      expect(a.steps.single.result!.url, isNull);
+      expect(a.summary, '1 step, 12s');
+      expect(safeMediaUrl('https://cdn.elevenlabs.io/note.mp3'), isTrue);
+      expect(safeMediaUrl('https://cdn.elevenlabs.io/note.mp3?sig=1'), isFalse);
+      expect(presentError('{"error":"boom"}'), 'This step failed.');
+    });
+
+    test('a table result is bounded', () {
+      final a = Activity();
+      a.apply('turn.step', {
+        'task_id': 't',
+        'call_id': 'c',
+        'label': 'Analyzing data',
+        'phase': 'done',
+        'cards': [
+          {
+            'type': 'table',
+            'columns': ['Name', 'Note'],
+            'rows': [
+              for (var i = 0; i < 20; i++) ['r$i', 'x'],
+            ],
+          },
+        ],
+      });
+      expect(a.steps.single.result!.rows.length, lessThanOrEqualTo(12));
+    });
+
+    test('send errors are sentences with an action', () {
+      final lost = classifySendError(kind: 'transport');
+      expect(lost.action, ChatAction.retry);
+      expect(lost.message.contains('{'), isFalse);
+      expect(lost.message, contains('still in the box'));
+      final key = classifySendError(kind: 'http', status: 422, detail: 'missing api key');
+      expect(key.action, ChatAction.keys);
+      final dumped = classifySendError(kind: 'http', status: 400, detail: '{"error":"boom"}');
+      expect(dumped.message.contains('boom'), isFalse);
+      expect(dumped.action, ChatAction.retry);
+    });
+
+    test('a plan parses and counts done items', () {
+      final plan = ChatPlan.parse({
+        'goal': 'Prepare the summary',
+        'items': [
+          {'text': 'Collect', 'status': 'done'},
+          {'text': 'Write', 'status': 'doing'},
+        ],
+      });
+      expect(plan!.progress, '1 of 2 done');
+      expect(ChatPlan.parse({'goal': '', 'items': []}), isNull);
+    });
   });
 
   group('bots, usage, connectors', () {
