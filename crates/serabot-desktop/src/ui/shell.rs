@@ -134,7 +134,13 @@ pub(super) fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, b
                 button {
                     key: "{label}",
                     class: if section == target { "rail-btn labeled on" } else { "rail-btn labeled" },
-                    "aria-label": if target == Section::Approvals && pending > 0 { format!("{label}, {pending} pending") } else { label.to_owned() },
+                    "aria-label": if target == Section::Approvals && pending > 0 {
+                        format!("{label}, {pending} pending")
+                    } else if target == Section::Marketplace {
+                        "Plugins. Bots cannot call these yet.".to_owned()
+                    } else {
+                        label.to_owned()
+                    },
                     "aria-current": if section == target { "page" } else { "false" },
                     onclick: move |_| session.write().open_section(target),
                     Icon { name: icon, size: 18 }

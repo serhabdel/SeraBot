@@ -275,7 +275,33 @@ pub fn marketplace_problem(
             ),
         };
     }
-    MarketplaceProblem::Message(message)
+    MarketplaceProblem::Message(plain_failure(message))
+}
+
+/// A sentence the screen can show. JSON, the generic "invalid request"
+/// placeholder, and "Retrying…" (this screen does not retry by itself) become
+/// a line that says what to do.
+fn plain_failure(message: String) -> String {
+    let trimmed = message.trim();
+    let unreadable = trimmed.is_empty()
+        || trimmed.chars().count() > 200
+        || trimmed.chars().any(char::is_control)
+        || trimmed.contains(['{', '}', '[', ']'])
+        || serde_json::from_str::<serde_json::Value>(trimmed).is_ok();
+    if unreadable {
+        return "The server sent an error this app could not read. Retry.".to_owned();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "invalid request" | "not found" | "forbidden" | "unauthorized" | "internal server error"
+    ) {
+        return "The server refused that change. Refresh and try again.".to_owned();
+    }
+    if lower.contains("retrying") {
+        return "Can't reach the server. Check the connection, then retry.".to_owned();
+    }
+    trimmed.to_owned()
 }
 
 impl PluginDetail {
@@ -714,6 +740,32 @@ mod tests {
                     .into()
             )
         );
+        let refused = marketplace_problem(MarketplaceCall::Write, false, "invalid request".into());
+        let MarketplaceProblem::Message(text) = refused else {
+            panic!("a refusal is a sentence");
+        };
+        assert!(text.contains("Refresh"));
+        assert!(!text.contains("invalid request"));
+        let raw = marketplace_problem(
+            MarketplaceCall::List,
+            false,
+            r#"{"error":"secret-value"}"#.into(),
+        );
+        let MarketplaceProblem::Message(text) = raw else {
+            panic!("json is a sentence");
+        };
+        assert!(!text.contains("secret-value"));
+        assert!(!text.contains('{'));
+        let dropped = marketplace_problem(
+            MarketplaceCall::List,
+            false,
+            "Can't reach SeraBot right now. Retrying…".into(),
+        );
+        let MarketplaceProblem::Message(text) = dropped else {
+            panic!("a dropped connection is a sentence");
+        };
+        assert!(text.contains("retry"));
+        assert!(!text.to_ascii_lowercase().contains("retrying"));
     }
 
     #[test]

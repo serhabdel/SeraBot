@@ -255,7 +255,8 @@ fn PluginPage(session: Signal<Session>, detail: PluginDetail) -> Element {
                     p { class: "mp-description", "{detail.plugin.description}" }
                 }
                 if !detail.plugin.prompts.is_empty() {
-                    h3 { class: "mp-section-title", "Try asking" }
+                    h3 { class: "mp-section-title", "Example prompts" }
+                    p { class: "tiny", "Examples only. The bot cannot run these yet." }
                     ul { class: "mp-prompts",
                         for prompt in detail.plugin.prompts.iter().cloned() {
                             li { key: "{prompt.id}{prompt.text}", "{prompt.text}" }
@@ -339,7 +340,8 @@ fn PluginPage(session: Signal<Session>, detail: PluginDetail) -> Element {
                             }
                         }
                         if busy {
-                            span { class: "spinner", title: "Working" }
+                            span { class: "tiny", role: "status", "Working\u{2026}" }
+                            span { class: "spinner", "aria-hidden": "true" }
                         }
                     }
                 }
@@ -388,18 +390,27 @@ pub fn MarketplaceView(session: Signal<Session>) -> Element {
             }
             div { class: "pane-body",
                 if unavailable {
-                    div { class: "card",
+                    div { class: "card", role: "status",
                         p { class: "card-sub", "Marketplace unavailable on this server." }
-                        p { class: "tiny", "Update the server to use plugins." }
+                        p { class: "tiny", "This server has no plugin catalog. Update the server, then check again." }
+                        button {
+                            class: "btn sm",
+                            r#type: "button",
+                            onclick: move |_| session.write().refresh_marketplace(),
+                            "Check again"
+                        }
                     }
                 } else if !connected && !loaded {
                     div { class: "card",
                         p { class: "card-sub", "Sign in to see plugins." }
                     }
                 } else if !loaded && error.is_none() {
-                    div { class: "mp-grid", role: "status", "aria-label": "Loading plugins",
-                        for index in 0..6 {
-                            div { key: "{index}", class: "mp-card skeleton", " " }
+                    div { role: "status", "aria-busy": "true",
+                        p { class: "tiny", "Loading plugins\u{2026}" }
+                        div { class: "mp-grid", "aria-hidden": "true",
+                            for index in 0..6 {
+                                div { key: "{index}", class: "mp-card skeleton", " " }
+                            }
                         }
                     }
                 } else if let (false, Some(message)) = (loaded, error.clone()) {
@@ -419,7 +430,15 @@ pub fn MarketplaceView(session: Signal<Session>) -> Element {
                         }
                     }
                     if let Some(message) = error.clone() {
-                        div { class: "banner err", role: "alert", span { "{message}" } }
+                        div { class: "banner err", role: "alert",
+                            span { "{message}" }
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                onclick: move |_| session.write().refresh_marketplace(),
+                                "Retry"
+                            }
+                        }
                     }
                     if plugins.is_empty() {
                         div { class: "card",
@@ -477,16 +496,18 @@ pub fn MarketplaceView(session: Signal<Session>) -> Element {
                                 }
                             }
                         } else {
-                            div { class: "mp-grid", role: "list",
+                            div { class: "mp-grid", role: "list", "aria-label": "Plugins",
                                 for plugin in shown {
-                                    PluginCard { key: "{plugin.slug}", session, plugin }
+                                    div { key: "{plugin.slug}", role: "listitem",
+                                        PluginCard { session, plugin }
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-            if open.is_some() {
+            if let Some(slug) = open {
                 if let Some(detail) = detail {
                     PluginPage { key: "{detail.plugin.slug}", session, detail }
                 } else if error.is_none() {
@@ -540,7 +561,15 @@ pub fn MarketplaceView(session: Signal<Session>) -> Element {
                             }
                         }
                         div { class: "mp-sheet-body",
-                            div { class: "banner err", role: "alert", span { "{message}" } }
+                            div { class: "banner err", role: "alert",
+                                span { "{message}" }
+                                button {
+                                    class: "btn ghost sm",
+                                    r#type: "button",
+                                    onclick: move |_| session.write().open_plugin(slug.clone()),
+                                    "Retry"
+                                }
+                            }
                             button {
                                 class: "btn sm",
                                 r#type: "button",

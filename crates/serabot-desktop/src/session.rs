@@ -1326,13 +1326,19 @@ impl Session {
         if !self.state.connected {
             return;
         }
+        // A retry after "unavailable" has to leave that card, or a later
+        // error (not a 404) would stay hidden behind it.
+        if self.state.marketplace_unavailable {
+            self.state.marketplace_unavailable = false;
+            self.state.marketplace_loaded = false;
+        }
+        self.state.marketplace_error = None;
         if self.pending.is_some() {
             if self.ready() {
                 self.schedule(Operation::MarketplaceList, Duration::ZERO);
             }
             return;
         }
-        self.state.marketplace_error = None;
         self.start_request(Operation::MarketplaceList);
     }
 
