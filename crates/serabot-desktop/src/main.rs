@@ -21,6 +21,8 @@ mod ui_jobs;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_logs;
 #[cfg(any(windows, feature = "ui-check"))]
+mod ui_marketplace;
+#[cfg(any(windows, feature = "ui-check"))]
 mod ui_settings;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_settings_page;

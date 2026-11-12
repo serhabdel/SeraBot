@@ -868,21 +868,22 @@ fn truncate_chars(value: &str, max: usize) -> String {
 }
 
 fn is_hidden(entry: &std::fs::DirEntry, name: &str) -> bool {
-    if name.starts_with('.') || name.starts_with("~$") {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if let Ok(metadata) = entry.metadata() {
-            const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
-            if metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0 {
-                return true;
-            }
-        }
-    }
-    #[cfg(not(windows))]
-    let _ = entry;
+    name.starts_with('.') || name.starts_with("~$") || windows_hidden(entry)
+}
+
+/// The Windows hidden attribute. Other platforms have no equivalent flag.
+#[cfg(windows)]
+fn windows_hidden(entry: &std::fs::DirEntry) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    let Ok(metadata) = entry.metadata() else {
+        return false;
+    };
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0
+}
+
+#[cfg(not(windows))]
+fn windows_hidden(_entry: &std::fs::DirEntry) -> bool {
     false
 }
 

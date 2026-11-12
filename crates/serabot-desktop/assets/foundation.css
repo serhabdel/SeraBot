@@ -498,3 +498,227 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* Marketplace (v0.37). */
+.mp-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.mp-search {
+  flex: 1 1 220px;
+  max-width: 360px;
+}
+
+/* Category chips wrap instead of overflowing a narrow pane. */
+.mp-toolbar .seg {
+  flex: 1 1 240px;
+  flex-wrap: wrap;
+  max-width: 100%;
+}
+
+.mp-toolbar .seg-btn {
+  flex: 0 1 auto;
+}
+
+.mp-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.mp-card {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  min-height: 112px;
+  padding: 16px;
+  text-align: left;
+  color: var(--label-1);
+  background: var(--card-bg);
+  border: 1px solid var(--glass-edge);
+  border-radius: var(--r-md);
+  cursor: pointer;
+}
+
+.mp-card:hover {
+  border-color: var(--hairline-strong);
+  background: var(--surface-2);
+}
+
+.mp-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.mp-card.skeleton {
+  cursor: default;
+  background: var(--surface-2);
+  animation: mp-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes mp-pulse {
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mp-card.skeleton {
+    animation: none;
+  }
+}
+
+.root[data-motion="reduce"] .mp-card.skeleton {
+  animation: none;
+}
+
+.mp-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mp-card-name {
+  min-width: 0;
+  font-size: var(--fs-title);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mp-card-tagline {
+  color: var(--label-2);
+  font-size: var(--fs-body-2);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.mp-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: auto;
+}
+
+.mp-sheet-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: var(--scrim);
+}
+
+.mp-sheet {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 61;
+  width: min(440px, 100vw);
+  display: flex;
+  flex-direction: column;
+  background: var(--glass-sheet);
+  border-left: 1px solid var(--hairline-strong);
+  box-shadow: var(--shadow-3);
+}
+
+.mp-sheet-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 20px 20px 12px;
+}
+
+.mp-sheet-title {
+  margin: 0;
+  font-size: var(--fs-display);
+}
+
+.mp-sheet-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 0 20px 24px;
+}
+
+.mp-status-line,
+.mp-egress,
+.mp-links,
+.mp-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.mp-section-title {
+  margin: 8px 0 0;
+  font-size: var(--fs-body);
+  font-weight: 600;
+}
+
+.mp-description {
+  margin: 0;
+  color: var(--label-1);
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.mp-prompts {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--label-2);
+}
+
+.mp-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 0;
+  border-top: 1px solid var(--hairline);
+}
+
+.mp-field-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mp-field-label {
+  font-weight: 600;
+}
+
+.mp-problem {
+  color: var(--danger);
+}
+
+.mp-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--danger);
+  border-radius: var(--r-sm);
+}
+
+.mp-soon {
+  margin: 0 0 16px;
+}
+
+.mp-soon-note {
+  margin: 0;
+  color: var(--label-2);
+  line-height: 1.45;
+}

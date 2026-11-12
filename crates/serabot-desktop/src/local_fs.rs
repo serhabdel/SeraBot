@@ -110,20 +110,20 @@ pub fn name_addressable(name: &str) -> bool {
 
 /// Hidden by dot-name everywhere, and by the hidden/system attribute on Windows.
 fn is_hidden(name: &str, meta: &std::fs::Metadata) -> bool {
-    if name.starts_with('.') {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const HIDDEN: u32 = 0x2;
-        const SYSTEM: u32 = 0x4;
-        if meta.file_attributes() & (HIDDEN | SYSTEM) != 0 {
-            return true;
-        }
-    }
-    #[cfg(not(windows))]
-    let _ = meta;
+    name.starts_with('.') || windows_hidden(meta)
+}
+
+/// The Windows hidden and system attributes. Other platforms have no equivalent.
+#[cfg(windows)]
+fn windows_hidden(meta: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const HIDDEN: u32 = 0x2;
+    const SYSTEM: u32 = 0x4;
+    meta.file_attributes() & (HIDDEN | SYSTEM) != 0
+}
+
+#[cfg(not(windows))]
+fn windows_hidden(_meta: &std::fs::Metadata) -> bool {
     false
 }
 

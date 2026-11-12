@@ -142,8 +142,9 @@ Wave A demo quality; no redesign beyond existing console pages.
 
 ## Non-goals (`AGENTS.md` product boundary)
 
-- No open self-signup, Docker, PostgreSQL, Node runtime, local chat LLM, or
-  plugin marketplace.
+- No open self-signup, Docker, PostgreSQL, Node runtime, or local chat LLM.
+  The plugin marketplace is an approved catalog and per-user install record.
+  Do not add a runtime that calls plugin servers.
 - No web UI beyond existing console pages (landing, login, health, downloads)
   plus the **existing** desktop/mobile clients — Workflows is a new **tab**, not
   a new public site.
