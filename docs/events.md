@@ -67,3 +67,10 @@ The older `media_job.created` and `media_job.updated` events are unchanged.
 
 `help.queued` is emitted when `ask_teammate` queues a teammate. It carries
 ids and bot names only.
+
+`turn.refused` is an audit-only event. It is appended, and written to the audit
+log, when a turn that ran no tools ends with a short reply that opens with a
+refusal ("I can't help", "I'm unable to", "I don't have access to", and a few
+similar phrases). It never changes or blocks the reply. The payload carries
+`bot`, `turn_id`, `conversation_id`, the matched `phrase`, and a `snippet` of at
+most 160 characters. Clients can ignore it.

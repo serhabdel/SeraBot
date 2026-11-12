@@ -655,6 +655,11 @@ impl Runtime {
                     text =
                         "I cannot share that output because it violates the content policy.".into();
                 }
+                if let Some(phrase) = refusal::looks_like_refusal(&text, state.tool_calls) {
+                    let details =
+                        Self::refusal_details(&turn.bot, &turn.id, conversation_id, phrase, &text);
+                    self.log_refusal(&self.store, &user, &task.id, &details);
+                }
                 self.store.update_turn(
                     &user,
                     &turn.id,
