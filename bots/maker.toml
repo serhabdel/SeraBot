@@ -55,6 +55,11 @@ tools = [
   "local_stat",
   "local_read",
   "local_import",
+  "tavily_search",
+  "firecrawl_search",
+  "firecrawl_scrape",
+  "fetch_url",
+  "ask_teammate",
 ]
 require_approval = ["onedrive_upload"]
 enabled = true

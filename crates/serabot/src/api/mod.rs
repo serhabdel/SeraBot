@@ -517,6 +517,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/admin/bots/{id}/config", put(admin_update_bot_config))
         .route("/v1/admin/restart", post(admin_restart))
         .route("/v1/connectors", get(list_connectors))
+        .route("/v1/connectors/{id}/test", post(test_connector))
         .route("/v1/models", get(models))
         .route("/v1/conversations/{id}/model", put(select_model))
         .route("/v1/conversations/{id}/thinking", put(set_thinking))
@@ -530,6 +531,10 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/v1/conversations/{id}/library", get(conversation_library))
         .route("/v1/conversations/{id}/plan", get(get_conversation_plan))
+        .route(
+            "/v1/conversations/{id}/activity",
+            get(conversation_activity),
+        )
         .route(
             "/v1/settings/turn-limits",
             get(get_turn_limits)
@@ -956,8 +961,29 @@ impl IntoResponse for SeraError {
                 None => warn!("api request failed validation (reason withheld)"),
             }
         }
+        if let SeraError::External(text) = &self {
+            let (code, message) = actionable_external(text);
+            warn!(code, "external service failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiErrorBody {
+                    error: message.into(),
+                    code,
+                }),
+            )
+                .into_response();
+        }
         let (status, code, message) = match &self {
-            SeraError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found", "not found"),
+            SeraError::NotFound(detail) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(ApiErrorBody {
+                        error: public_not_found(detail),
+                        code: "not_found",
+                    }),
+                )
+                    .into_response();
+            }
             SeraError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden", "forbidden"),
             SeraError::PolicyViolation => (
                 StatusCode::FORBIDDEN,
@@ -1018,7 +1044,63 @@ const SAFE_VALIDATION_PREFIXES: &[&str] = &[
     "sync_provider must be ",
     "provider must be ",
     "refresh_every_turns must be ",
+    "pinned must be ",
+    "memory kind must be ",
+    "category must be ",
+    "connector id must be ",
 ];
+
+/// A gateway failure the owner can act on, without the upstream body.
+fn actionable_external(text: &str) -> (&'static str, &'static str) {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        (
+            "timeout",
+            "The service timed out. Wait a moment and try again.",
+        )
+    } else if lower.contains("rate") {
+        (
+            "rate_limited",
+            "The service is busy. Wait a moment and try again.",
+        )
+    } else if lower.contains("connect") || lower.contains("dns") || lower.contains("unreachable") {
+        (
+            "unreachable",
+            "Could not reach the service. Check the connection and try again.",
+        )
+    } else {
+        (
+            "external",
+            "A connected service failed. Try again, or use Test connection on that provider or connector.",
+        )
+    }
+}
+
+/// Name a missing record when the detail is a server-authored id, not user prose.
+fn public_not_found(detail: &str) -> String {
+    const PREFIXES: &[&str] = &[
+        "bot ",
+        "tool ",
+        "provider ",
+        "task ",
+        "memory ",
+        "connector ",
+        "conversation ",
+        "media job ",
+    ];
+    if let Some(rest) = PREFIXES
+        .iter()
+        .find_map(|prefix| detail.strip_prefix(prefix))
+        && !rest.is_empty()
+        && rest.len() <= 80
+        && rest.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, ' ' | '_' | '-' | ':' | '.')
+        })
+    {
+        return format!("Not found: {detail}. Check the name and try again.");
+    }
+    "not found".into()
+}
 
 fn safe_validation_text(text: &str) -> Option<String> {
     if let Some(exact) = SAFE_VALIDATION_TEXTS

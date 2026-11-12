@@ -58,6 +58,8 @@ tools = [
   "local_import",
   "conversation_library",
   "telegram_send_document",
+  "fetch_url",
+  "ask_teammate",
 ]
 require_approval = []
 enabled = true

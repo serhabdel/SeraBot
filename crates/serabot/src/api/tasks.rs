@@ -33,8 +33,19 @@ pub(super) async fn list_tasks(
         query.to.as_deref(),
         limit,
     )?;
-    let body =
-        json!({"tasks": tasks, "limit": limit.clamp(1, crate::personal_tasks::MAX_LIST_LIMIT)});
+    let prefs = crate::personal_tasks::get_prefs(&state.store, &user.id)?;
+    let body = json!({
+        "tasks": tasks,
+        "limit": limit.clamp(1, crate::personal_tasks::MAX_LIST_LIMIT),
+        "counts": crate::personal_tasks::counts(&state.store, &user.id)?,
+        "sync": {
+            "provider": prefs.sync_provider,
+            "health": crate::personal_tasks::sync_health(&prefs),
+            "last_run": prefs.last_sync_at,
+            "last_ok": prefs.last_sync_ok,
+            "last_error": prefs.last_sync_error,
+        }
+    });
     state
         .runtime
         .scan_owner_output(&user.id, &body.to_string())?;
@@ -164,6 +175,11 @@ pub(super) async fn sync_status(
     Ok(Json(json!({
         "prefs": prefs,
         "signed_in": {"tasks_google": google, "tasks_microsoft": microsoft},
+        "health": crate::personal_tasks::sync_health(&prefs),
+        "last_run": prefs.last_sync_at,
+        "last_ok": prefs.last_sync_ok,
+        "last_error": prefs.last_sync_error,
+        "counts": crate::personal_tasks::counts(&state.store, &user.id)?,
     })))
 }
 
@@ -297,6 +313,22 @@ fn sync_client_credentials(state: &ApiState, provider: &str) -> Result<(String, 
     Ok((client_id, client_secret))
 }
 
+fn sync_failure_text(error: &SeraError) -> String {
+    match error {
+        SeraError::Upstream { message, .. } => message.clone(),
+        SeraError::Validation(text) if text.len() <= 160 && !text.chars().any(char::is_control) => {
+            text.clone()
+        }
+        SeraError::External(text)
+            if text.to_ascii_lowercase().contains("timed out")
+                || text.to_ascii_lowercase().contains("timeout") =>
+        {
+            "Task sync timed out. Wait a moment and try again.".into()
+        }
+        _ => "Task sync failed. Check the connection in Tasks and try again.".into(),
+    }
+}
+
 fn sync_http() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
@@ -329,31 +361,46 @@ pub(super) async fn run_sync(
         .ok_or_else(|| SeraError::Validation("choose a task sync provider first".into()))?;
     let (client_id, client_secret) = sync_client_credentials(&state, family)?;
     let http = sync_http()?;
-    let token = crate::task_sync::access_token(
-        &state.users,
-        &user.id,
-        family,
-        &client_id,
-        &client_secret,
-        &http,
-    )
-    .await?;
-    let mut report = crate::task_sync::SyncReport::default();
-    if matches!(
-        provider.as_str(),
-        crate::personal_tasks::PROVIDER_GOOGLE_TASKS
-            | crate::personal_tasks::PROVIDER_MICROSOFT_TODO
-    ) {
-        let pulled =
-            crate::task_sync::pull_tasks(&state.store, &user.id, &provider, &token, &http).await?;
-        let pushed =
-            crate::task_sync::push_new_tasks(&state.store, &user.id, &provider, &token, &http)
-                .await?;
-        report.imported = pulled.imported;
-        report.updated = pulled.updated;
-        report.unchanged = pulled.unchanged;
-        report.pushed = pushed.pushed;
+    let synced = async {
+        let token = crate::task_sync::access_token(
+            &state.users,
+            &user.id,
+            family,
+            &client_id,
+            &client_secret,
+            &http,
+        )
+        .await?;
+        let mut report = crate::task_sync::SyncReport::default();
+        if matches!(
+            provider.as_str(),
+            crate::personal_tasks::PROVIDER_GOOGLE_TASKS
+                | crate::personal_tasks::PROVIDER_MICROSOFT_TODO
+        ) {
+            let pulled =
+                crate::task_sync::pull_tasks(&state.store, &user.id, &provider, &token, &http)
+                    .await?;
+            let pushed =
+                crate::task_sync::push_new_tasks(&state.store, &user.id, &provider, &token, &http)
+                    .await?;
+            report.imported = pulled.imported;
+            report.updated = pulled.updated;
+            report.unchanged = pulled.unchanged;
+            report.pushed = pushed.pushed;
+        }
+        Ok::<_, SeraError>(report)
     }
+    .await;
+    if let Err(error) = &synced {
+        let _ = crate::personal_tasks::record_sync_result(
+            &state.store,
+            &user.id,
+            false,
+            Some(&sync_failure_text(error)),
+        );
+    }
+    let report = synced?;
+    crate::personal_tasks::record_sync_result(&state.store, &user.id, true, None)?;
     state.store.record_audit(
         &user.id,
         "task.sync_ran",
@@ -364,7 +411,9 @@ pub(super) async fn run_sync(
         Some(state.runtime.policy_version()),
         Some(&json!({"provider": provider, "report": report})),
     )?;
-    Ok(Json(json!({"provider": provider, "report": report})))
+    Ok(Json(
+        json!({"provider": provider, "report": report, "health": "ok"}),
+    ))
 }
 
 #[derive(Debug, Deserialize)]

@@ -29,6 +29,11 @@ tools = [
   "outlook_calendar_list_events",
   "conversation_library",
   "telegram_send_document",
+  "tavily_search",
+  "firecrawl_search",
+  "firecrawl_scrape",
+  "fetch_url",
+  "ask_teammate",
 ]
 require_approval = ["composio_execute"]
 enabled = true

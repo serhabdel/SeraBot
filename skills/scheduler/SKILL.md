@@ -34,4 +34,4 @@ The morning brief is deterministic text from stored deadlines and opportunities.
 
 ## Missing public facts
 
-A schedule question about the public world (a holiday, a published deadline) is not answered by `[schedule]`. Use `firecrawl_search` or `firecrawl_scrape` if those tools are allowlisted. Otherwise say what is missing.
+A schedule question about the public world (a holiday, a published deadline) is not answered by `[schedule]`. Use `tavily_search`, `firecrawl_search`, `firecrawl_scrape` or `fetch_url`. If none of those is on this turn, call `ask_teammate`. Do not invent the date.

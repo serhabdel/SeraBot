@@ -25,6 +25,11 @@ tools = [
   "composio_search_tools",
   "composio_connect",
   "composio_execute",
+  "tavily_search",
+  "firecrawl_search",
+  "firecrawl_scrape",
+  "fetch_url",
+  "ask_teammate",
 ]
 require_approval = ["telegram_send_document", "composio_execute"]
 enabled = true

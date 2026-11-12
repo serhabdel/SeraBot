@@ -25,9 +25,12 @@ tools = [
   "docx_build",
   "xlsx_build",
   "tavily_search",
+  "firecrawl_search",
+  "firecrawl_scrape",
   "fetch_url",
   "conversation_library",
   "telegram_send_document",
+  "ask_teammate",
 ]
 require_approval = []
 enabled = true

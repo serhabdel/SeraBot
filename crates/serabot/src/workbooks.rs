@@ -2479,6 +2479,7 @@ impl Tool for XlsxBuildTool {
             artifact_hash: Some(stored.hash),
             filename: Some(stored.filename),
             destination: None,
+            cards: Vec::new(),
         })
     }
 }
@@ -2596,6 +2597,7 @@ impl Tool for XlsxEditTool {
             artifact_hash: Some(stored.hash),
             filename: Some(stored.filename),
             destination: None,
+            cards: Vec::new(),
         })
     }
 }
@@ -2810,6 +2812,7 @@ impl Tool for XlsxImportTool {
             artifact_hash: Some(hash),
             filename: Some(filename),
             destination: None,
+            cards: Vec::new(),
         })
     }
 }

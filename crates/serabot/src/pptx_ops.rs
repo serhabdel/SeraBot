@@ -1163,6 +1163,7 @@ impl Tool for PptxImportTool {
             artifact_hash: Some(hash),
             filename: Some(filename),
             destination: None,
+            cards: Vec::new(),
         })
     }
 }
@@ -1311,6 +1312,7 @@ impl Tool for PptxPdfTool {
             artifact_hash: Some(stored.hash),
             filename: Some(stored.filename),
             destination: None,
+            cards: Vec::new(),
         })
     }
 }
@@ -1543,6 +1545,7 @@ impl Tool for PptxEditTool {
             artifact_hash: Some(stored.hash),
             filename: Some(stored.filename),
             destination: None,
+            cards: Vec::new(),
         })
     }
 }

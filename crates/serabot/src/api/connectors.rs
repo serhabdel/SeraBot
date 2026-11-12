@@ -65,6 +65,9 @@ pub(super) async fn list_providers(
                 "catalog_verified": provider.catalog_verified,
                 "model_source": provider.model_source,
                 "status": provider.status,
+                "health": provider.health,
+                "last_error": provider.last_error,
+                "last_checked": provider.last_checked,
                 "model_count": provider.models.len(),
                 "managed": managed,
                 "secrets": secrets,
@@ -122,6 +125,9 @@ pub(super) async fn list_providers(
                     "catalog_verified": false,
                     "model_source": "fallback",
                     "status": "unchecked",
+                    "health": "unknown",
+                    "last_error": Value::Null,
+                    "last_checked": Value::Null,
                     "model_count": profile.models.len(),
                     "managed": true,
                     "secrets": secrets,
@@ -245,9 +251,16 @@ pub(super) async fn list_connectors(
             "personal": personal.to_json(),
         }));
     }
+    let checks = state.store.connector_checks(&user.id)?;
     for view in &mut views {
         let group = view["id"].as_str().map(connector_group).unwrap_or("Other");
         view["group"] = json!(group);
+        let id = view["id"].as_str().unwrap_or("");
+        let check = checks.iter().find(|(connector, _, _, _)| connector == id);
+        annotate_connector_health(
+            view,
+            check.map(|(_, ok, message, at)| (*ok, message.as_str(), at.as_str())),
+        );
     }
     // Per-user OneDrive status (phase 4). The token never appears: only
     // whether the acting user has connected their own drive.
@@ -322,6 +335,9 @@ pub(super) async fn test_provider_endpoint(
         "id": id,
         "ok": report.verified,
         "status": view.map(|provider| provider.status).unwrap_or("unchecked"),
+        "health": view.map(|provider| provider.health).unwrap_or("unknown"),
+        "last_error": view.and_then(|provider| provider.last_error),
+        "last_checked": view.and_then(|provider| provider.last_checked.clone()),
         "model_source": view.map(|provider| provider.model_source).unwrap_or("fallback"),
         "model_count": report.model_count,
     })))
@@ -927,6 +943,175 @@ pub(super) async fn unlink_telegram(
 }
 
 /// Console grouping only; it carries no security meaning.
+fn annotate_connector_health(view: &mut Value, check: Option<(bool, &str, &str)>) {
+    let enabled = view.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    let connected = view.get("connected").and_then(Value::as_bool);
+    let key_configured = view
+        .pointer("/secrets/api_key/configured")
+        .and_then(Value::as_bool);
+    let (health, last_error, last_checked) = if let Some((ok, message, at)) = check {
+        if ok {
+            ("ok", None, Some(at))
+        } else {
+            ("error", Some(message), Some(at))
+        }
+    } else if !enabled {
+        ("disabled", None, None)
+    } else if connected == Some(true) || key_configured == Some(true) {
+        ("ok", None, None)
+    } else if connected == Some(false) || key_configured == Some(false) {
+        ("not_configured", None, None)
+    } else {
+        ("unknown", None, None)
+    };
+    view["health"] = json!(health);
+    view["last_error"] = json!(last_error);
+    view["last_checked"] = json!(last_checked);
+}
+
+/// `POST /v1/connectors/{id}/test` for the signed-in user.
+///
+/// Per-user connectors report that user's own sign-in. Server-wide API keys
+/// are probed only for the owner; a member is told to ask the owner. The
+/// stored message is one of the fixed strings below.
+pub(super) async fn test_connector(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    let id = id.trim();
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return Err(SeraError::Validation(
+            "connector id must be a short name".into(),
+        ));
+    }
+    let (ok, message) = connector_test_outcome(&state, &user, id).await?;
+    state
+        .store
+        .record_connector_check(&user.id, id, ok, &message)?;
+    state.store.record_audit(
+        &user.id,
+        "connector.tested",
+        None,
+        None,
+        None,
+        None,
+        Some(state.runtime.policy_version()),
+        Some(&json!({"connector": id, "ok": ok})),
+    )?;
+    Ok(Json(json!({
+        "id": id,
+        "ok": ok,
+        "health": if ok { "ok" } else { "error" },
+        "message": message,
+        "checked_at": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+    })))
+}
+
+async fn connector_test_outcome(
+    state: &ApiState,
+    user: &ActingUser,
+    id: &str,
+) -> Result<(bool, String)> {
+    if id == "elevenlabs" {
+        return Ok(
+            if crate::elevenlabs_mcp::is_signed_in(&state.users, &user.id)? {
+                (true, "Signed in with ElevenLabs.".into())
+            } else {
+                (
+                    false,
+                    "Not signed in with ElevenLabs. Connect it, then test again.".into(),
+                )
+            },
+        );
+    }
+    if id == "composio" {
+        return Ok(if state.composio.connected(&user.id)? {
+            (true, "Composio is connected for this account.".into())
+        } else {
+            (
+                false,
+                "Composio is not connected. Add a key, then test again.".into(),
+            )
+        });
+    }
+    if id == "onedrive" {
+        let connected = state
+            .onedrive
+            .as_ref()
+            .map(|registry| registry.connected(&user.id))
+            .transpose()?
+            .unwrap_or(false);
+        return Ok(if connected {
+            (true, "OneDrive is connected for this account.".into())
+        } else {
+            (
+                false,
+                "OneDrive is not connected. Sign in, then test again.".into(),
+            )
+        });
+    }
+    if crate::token_connectors::TokenConnectors::ids().contains(&id) {
+        let personal = state.token_connectors.view(&user.id, id)?;
+        return Ok(if personal.state == "connected" {
+            (true, "This account's token is saved.".into())
+        } else {
+            (
+                false,
+                "No token is saved for this account. Add one, then test again.".into(),
+            )
+        });
+    }
+    if let Some(kind) = crate::connectors::ConnectorKind::from_section(id) {
+        let personal = state.personal.view(&user.id, kind)?;
+        return Ok(match personal.map(|view| view.state) {
+            Some("connected") => (true, "Signed in.".into()),
+            _ => (
+                false,
+                "Not signed in. Connect the account, then test again.".into(),
+            ),
+        });
+    }
+    if !user.is_admin() {
+        return Err(SeraError::Rejected {
+            code: "owner_only",
+            message: "Only the owner can test a server-wide connector. Ask the owner to test it."
+                .into(),
+        });
+    }
+    let roles = connector_secret_roles(&state.config, id)?;
+    let missing = roles.iter().find(|(_, name)| !state.secrets.has(name));
+    match (missing, api_key_probe(&state.config, id)) {
+        (Some(_), _) => Ok((
+            false,
+            "The server is missing this connector's key. Add it in Connectors.".into(),
+        )),
+        (None, Some(probe)) => {
+            let key = roles
+                .iter()
+                .find(|(role, _)| *role == "api_key" || *role == "access_token")
+                .and_then(|(_, name)| state.secrets.get(name))
+                .unwrap_or_default();
+            match probe_api_key(probe, &key).await {
+                Ok(()) => Ok((true, "The key was accepted.".into())),
+                Err(_) => Ok((
+                    false,
+                    "The key was rejected. Paste a new key and test again.".into(),
+                )),
+            }
+        }
+        (None, None) => Ok((
+            true,
+            "The saved credentials are present. Sign-in was not repeated.".into(),
+        )),
+    }
+}
+
 pub(super) fn connector_group(id: &str) -> &'static str {
     match id {
         "elevenlabs" | "elevenlabs_api_key" => "Voice & Media",
