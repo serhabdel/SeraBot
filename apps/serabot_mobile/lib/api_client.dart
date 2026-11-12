@@ -313,6 +313,24 @@ class ApiClient {
     return Catalog.fromJson(json);
   }
 
+  /// The conversation's goal and checklist, or null on an older server.
+  Future<ChatPlan?> conversationPlan(String conversationId) async {
+    _checkId(conversationId);
+    try {
+      final json = await _request('GET', ['v1', 'conversations', conversationId, 'plan']);
+      final raw = json['plan'];
+      if (raw is Map<String, dynamic>) {
+        return ChatPlan.parse(raw);
+      }
+      return null;
+    } on ApiException catch (e) {
+      if (e.kind == ApiErrorKind.http && e.statusCode == 404) {
+        return null;
+      }
+      rethrow;
+    }
+  }
+
   Future<List<ChatMessage>> history(String conversationId) async {
     _checkId(conversationId);
     final json = await _request(

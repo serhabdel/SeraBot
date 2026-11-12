@@ -196,6 +196,11 @@ pub struct State {
     pub transcript: Option<String>,
     pub transcript_error: Option<String>,
     pub transcript_loading: bool,
+    /// A failed send, shown in the chat instead of a raw error banner.
+    pub chat_failure: Option<crate::chat_failure::ChatFailure>,
+    /// Text from a send that did not land, or whose outcome is unknown.
+    /// Putting it back fills the composer; it is never sent by itself.
+    pub held_draft: Option<String>,
     pub created_bot: Option<CreatedBot>,
     pub created_conversation: Option<CreatedConversation>,
     /// The Marketplace catalog with this user's state (owner-scoped).
@@ -320,6 +325,8 @@ impl Default for State {
             transcript: None,
             transcript_error: None,
             transcript_loading: false,
+            chat_failure: None,
+            held_draft: None,
             created_bot: None,
             created_conversation: None,
             marketplace: Vec::new(),

@@ -39,6 +39,13 @@ class ChatController extends ChangeNotifier {
   bool uploading = false;
   bool sending = false;
   String? error;
+  ChatAction errorAction = ChatAction.none;
+  /// True when [error] is from a send, so Retry sends [draft] again.
+  bool sendFailed = false;
+  /// Composer text, kept so a failed send can be retried from the banner.
+  String draft = '';
+  int acceptedSends = 0;
+  ChatPlan? plan;
   String? runningTaskId;
   Timer? _poll;
   StreamSubscription<ServerEvent>? _sub;
@@ -46,6 +53,27 @@ class ChatController extends ChangeNotifier {
 
   bool get running => runningTaskId != null;
   bool get canAddAttachment => attachments.length < maxAttachments;
+
+  void noteDraft(String text) {
+    draft = text;
+  }
+
+  void _fail(ApiException e, {bool send = false}) {
+    if (send) {
+      final notice = classifySendError(
+        kind: e.kind.name,
+        status: e.statusCode,
+        detail: e.detail ?? e.messageForUser(),
+      );
+      error = notice.message;
+      errorAction = notice.action;
+      sendFailed = true;
+    } else {
+      error = e.messageForUser();
+      errorAction = ChatAction.retry;
+      sendFailed = false;
+    }
+  }
 
   Future<void> load() async {
     loading = true;
@@ -55,12 +83,22 @@ class ChatController extends ChangeNotifier {
       error = null;
       app.markReadLocally(conversationId);
     } on ApiException catch (e) {
-      error = e.messageForUser();
+      _fail(e);
     } finally {
       loading = false;
       _notify();
     }
     unawaited(loadLibrary());
+    unawaited(loadPlan());
+  }
+
+  Future<void> loadPlan() async {
+    try {
+      plan = await client.conversationPlan(conversationId);
+      _notify();
+    } on ApiException {
+      // Older servers have no plan route. The checklist stays hidden.
+    }
   }
 
   Future<void> loadLibrary() async {
@@ -77,7 +115,7 @@ class ChatController extends ChangeNotifier {
       catalog = await client.models(conversationId);
       _notify();
     } on ApiException catch (e) {
-      error = e.messageForUser();
+      _fail(e);
       _notify();
     }
   }
@@ -97,6 +135,8 @@ class ChatController extends ChangeNotifier {
   Future<void> addAttachment(String filename, List<int> bytes) async {
     if (!canAddAttachment) {
       error = 'Attach at most $maxAttachments files.';
+      errorAction = ChatAction.none;
+      sendFailed = false;
       _notify();
       return;
     }
@@ -109,7 +149,7 @@ class ChatController extends ChangeNotifier {
         await client.uploadAttachment(conversationId, name, bytes),
       );
     } on ApiException catch (e) {
-      error = e.messageForUser();
+      _fail(e);
     } finally {
       uploading = false;
       _notify();
@@ -132,6 +172,7 @@ class ChatController extends ChangeNotifier {
     }
     sending = true;
     error = null;
+    sendFailed = false;
     _notify();
     try {
       final ids = attachments.map((a) => a.id).toList();
@@ -153,10 +194,12 @@ class ChatController extends ChangeNotifier {
       attachments.clear();
       activity.clear();
       runningTaskId = task.id;
+      acceptedSends++;
+      draft = '';
       _startPoll();
       return true;
     } on ApiException catch (e) {
-      error = e.messageForUser();
+      _fail(e, send: true);
       return false;
     } finally {
       sending = false;
@@ -168,7 +211,7 @@ class ChatController extends ChangeNotifier {
     try {
       await client.cancelTurn(conversationId);
     } on ApiException catch (e) {
-      error = e.messageForUser();
+      _fail(e);
       _notify();
     }
   }
@@ -179,7 +222,7 @@ class ChatController extends ChangeNotifier {
       await client.decideApproval(approvalId, d);
       await app.refreshApprovals();
     } on ApiException catch (e) {
-      error = e.messageForUser();
+      _fail(e);
       _notify();
     }
   }
@@ -193,6 +236,13 @@ class ChatController extends ChangeNotifier {
     }
     switch (e.kind) {
       case 'turn.step':
+        final plan = ChatPlan.parse(e.payload['plan'] is Map<String, dynamic>
+            ? e.payload['plan'] as Map<String, dynamic>
+            : null);
+        if (plan != null) {
+          this.plan = plan;
+          _notify();
+        }
         // Only the turn this screen started; old replayed events are ignored.
         if (runningTaskId != null && e.taskId == runningTaskId) {
           if (activity.apply(e.kind, e.payload)) {
@@ -203,6 +253,12 @@ class ChatController extends ChangeNotifier {
       case 'task.failed':
         if (runningTaskId == null || e.taskId == runningTaskId) {
           _finish(failed: e.kind == 'task.failed', detail: _errorOf(e));
+        }
+      case 'plan.updated':
+        final next = ChatPlan.parse(e.payload);
+        if (next != null) {
+          plan = next;
+          _notify();
         }
       case 'message':
         if (e.conversationId == conversationId && !running) {
@@ -241,7 +297,10 @@ class ChatController extends ChangeNotifier {
     runningTaskId = null;
     _poll?.cancel();
     if (failed) {
-      error = detail ?? 'The turn failed. Check the server log.';
+      final text = detail ?? 'The turn failed. The steps above say what went wrong.';
+      error = presentError(text);
+      errorAction = ChatAction.none;
+      sendFailed = false;
     }
     _notify();
     await _reload();
@@ -253,7 +312,7 @@ class ChatController extends ChangeNotifier {
       messages = await client.history(conversationId);
       _notify();
     } on ApiException catch (e) {
-      error = e.messageForUser();
+      _fail(e);
       _notify();
     }
   }

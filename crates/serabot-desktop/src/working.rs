@@ -114,7 +114,9 @@ impl WorkingBots {
         };
         let conversation = clean(payload, "conversation_id", MAX_ID).unwrap_or_default();
         let activity = match payload.get("phase").and_then(Value::as_str) {
-            Some("running") => BotActivity::Working(clean(payload, "label", MAX_LABEL)),
+            Some("running" | "progress") => {
+                BotActivity::Working(clean(payload, "label", MAX_LABEL))
+            }
             // The turn goes on between steps: keep the ring, drop the stale name.
             Some("done" | "failed") => BotActivity::Working(None),
             Some("waiting_approval") => BotActivity::WaitingApproval,
