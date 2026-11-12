@@ -631,9 +631,10 @@ pub enum Reply {
     BotChats(crate::bot_chats::BotChatList),
     MarketplacePlugins(Vec<crate::marketplace::PluginSummary>),
     MarketplaceDetail(Box<crate::marketplace::PluginDetail>),
-    /// After a change: the refreshed catalog and the plugin that changed
-    /// (absent when it was uninstalled and the page is closed).
+    /// After a change: the refreshed catalog and the plugin that changed.
+    /// `detail` is absent when that page could not be re-read.
     MarketplaceChanged {
+        slug: String,
         plugins: Vec<crate::marketplace::PluginSummary>,
         detail: Option<Box<crate::marketplace::PluginDetail>>,
     },
@@ -1340,11 +1341,16 @@ fn execute(job: &Job, epoch: &AtomicU64, cache: &mut Option<ApiClient>) -> Resul
 }
 
 /// The catalog and one plugin, read again after a change. An uninstalled
-/// plugin still has a detail page, so the read is the same either way.
+/// plugin still has a catalog page. A failed re-read leaves `detail` empty
+/// so the screen does not keep showing the previous buttons.
 fn marketplace_changed(client: &ApiClient, slug: &str) -> Result<Reply, ApiError> {
     let plugins = client.marketplace_plugins()?;
     let detail = client.marketplace_plugin(slug).ok().map(Box::new);
-    Ok(Reply::MarketplaceChanged { plugins, detail })
+    Ok(Reply::MarketplaceChanged {
+        slug: slug.to_owned(),
+        plugins,
+        detail,
+    })
 }
 
 #[cfg(test)]

@@ -38,3 +38,7 @@ schema is SeraBot's own, version 1.
 - The tool runtime that calls a plugin's server is not part of this release.
 - The host names in the shipped catalog are placeholders until each provider's
   real host, terms and privacy URLs are checked.
+- The desktop Marketplace screen lists the catalog and says the plugins are
+  coming soon. It does not send Install or Enable, and it does not ask for a
+  secret, until a plugin can actually be called. Placeholder hosts stay
+  blocked after the runtime exists.

@@ -584,13 +584,26 @@ impl State {
                 self.marketplace_detail = Some(*detail);
                 self.marketplace_error = None;
             }
-            Reply::MarketplaceChanged { plugins, detail } => {
+            Reply::MarketplaceChanged {
+                slug,
+                plugins,
+                detail,
+            } => {
                 self.marketplace = plugins;
                 self.marketplace_loaded = true;
                 self.marketplace_unavailable = false;
                 self.marketplace_error = None;
                 if let Some(detail) = detail {
                     self.marketplace_detail = Some(*detail);
+                } else if self
+                    .marketplace_detail
+                    .as_ref()
+                    .is_some_and(|page| page.plugin.slug == slug)
+                {
+                    // The page could not be re-read. Drop the stale copy so
+                    // its buttons don't describe a state the server didn't
+                    // confirm. The session says so.
+                    self.marketplace_detail = None;
                 }
             }
             Reply::BotChats(list) => {
@@ -1469,6 +1482,7 @@ mod tests {
         state.receive(
             &scope,
             Reply::MarketplaceChanged {
+                slug: "search".into(),
                 plugins: vec![plugin("search", true), plugin("mail", false)],
                 detail: None,
             },

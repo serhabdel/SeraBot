@@ -6,6 +6,12 @@
 //! configured. This module has no field that could hold a stored value; the
 //! only secret text on the client is what the user types into a form, and it
 //! is cleared as soon as it is sent.
+//!
+//! Plugins cannot be called yet, and the shipped catalog uses placeholder
+//! hosts (`*.example.invalid`). Install and Enable stay off until both are
+//! true for that plugin, so a click cannot end at a plugin that looks on and
+//! does nothing. Disable and Uninstall stay available so an install made
+//! through the API can still be turned off and removed.
 
 use serde::Deserialize;
 
@@ -14,10 +20,20 @@ pub const MAX_PLUGINS: usize = 500;
 pub const MAX_TEXT: usize = 4_000;
 pub const MAX_ITEMS: usize = 64;
 
+/// The tool runtime that would call a plugin is not built. While this is
+/// false, nothing in the catalog can run, so Install and Enable stay off
+/// even for a host that is not a placeholder.
+pub const RUNTIME_CALLS_PLUGINS: bool = false;
+
+/// The line at the top of the screen while [`RUNTIME_CALLS_PLUGINS`] is false.
+pub const COMING_SOON: &str = "Coming soon. You can browse plugins. Install and Enable stay off until SeraBot can call them, and a plugin whose host is still a placeholder (example.invalid) stays off after that.";
+
 /// What a card shows as its status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PluginStatus {
-    /// Not installed.
+    /// Not installed, and not offered yet.
+    ComingSoon,
+    /// Not installed, and install is allowed.
     Available,
     /// Installed but a required key is missing.
     NeedsSetup,
@@ -30,6 +46,7 @@ pub enum PluginStatus {
 impl PluginStatus {
     pub fn label(self) -> &'static str {
         match self {
+            Self::ComingSoon => "Coming soon",
             Self::Available => "Available",
             Self::NeedsSetup => "Needs setup",
             Self::Installed => "Installed",
@@ -76,7 +93,14 @@ pub struct PluginSummary {
 
 impl PluginSummary {
     pub fn state(&self) -> PluginStatus {
-        plugin_status(self.installed, self.enabled, &self.status)
+        let status = plugin_status(self.installed, self.enabled, &self.status);
+        // The list payload has no hosts. Until plugins can be called, an
+        // uninstalled card says so instead of offering itself as available.
+        if !self.installed && !RUNTIME_CALLS_PLUGINS {
+            PluginStatus::ComingSoon
+        } else {
+            status
+        }
     }
 }
 
@@ -149,6 +173,14 @@ pub struct PluginInfo {
     pub category: String,
     #[serde(default)]
     pub version: String,
+    /// Install flags live on the plugin object. `GET /v1/marketplace/plugins/{slug}`
+    /// returns `{ "plugin": { ..., "installed", "enabled", "status" } }`.
+    #[serde(default)]
+    pub installed: bool,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub status: String,
     #[serde(default)]
     pub prompts: Vec<Prompt>,
     #[serde(default)]
@@ -167,17 +199,101 @@ pub struct PluginInfo {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct PluginDetail {
     pub plugin: PluginInfo,
-    #[serde(default)]
-    pub installed: bool,
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub status: String,
+}
+
+/// Why Install and Enable must not be sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivationBlock {
+    /// SeraBot cannot call any plugin yet.
+    Runtime,
+    /// A declared host is `example.invalid`, which is not a service.
+    PlaceholderHost,
+    /// The server refuses plugins that start a local program.
+    LocalProgram,
+    /// The page is not loaded, so a placeholder host cannot be ruled out.
+    Unchecked,
+}
+
+impl ActivationBlock {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Runtime => {
+                "Coming soon. SeraBot cannot call plugins yet, so this one cannot be installed or turned on."
+            }
+            Self::PlaceholderHost => {
+                "Coming soon. This plugin still points at a placeholder host (example.invalid), so it cannot be installed or turned on."
+            }
+            Self::LocalProgram => {
+                "This plugin starts a program on the server, which is not supported yet."
+            }
+            Self::Unchecked => "Open the plugin page before installing or turning it on.",
+        }
+    }
+}
+
+/// A host, or a URL whose host, is the reserved placeholder `example.invalid`.
+pub fn placeholder_host(value: &str) -> bool {
+    fn reserved(host: &str) -> bool {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        host == "example.invalid" || host.ends_with(".example.invalid")
+    }
+    let value = value.trim();
+    if reserved(value) {
+        return true;
+    }
+    url::Url::parse(value).is_ok_and(|parsed| parsed.host_str().is_some_and(reserved))
+}
+
+/// How a failed marketplace call is shown. A missing list route means this
+/// server has no marketplace. A missing plugin does not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MarketplaceProblem {
+    Unavailable,
+    Message(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarketplaceCall {
+    List,
+    Detail,
+    Write,
+}
+
+pub fn marketplace_problem(
+    call: MarketplaceCall,
+    not_found: bool,
+    message: String,
+) -> MarketplaceProblem {
+    if not_found {
+        return match call {
+            MarketplaceCall::List => MarketplaceProblem::Unavailable,
+            MarketplaceCall::Detail => {
+                MarketplaceProblem::Message("That plugin is not in the catalog.".into())
+            }
+            MarketplaceCall::Write => MarketplaceProblem::Message(
+                "That change could not be made. Refresh the catalog and try again.".into(),
+            ),
+        };
+    }
+    MarketplaceProblem::Message(message)
 }
 
 impl PluginDetail {
+    pub fn installed(&self) -> bool {
+        self.plugin.installed
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.plugin.enabled
+    }
+
     pub fn state(&self) -> PluginStatus {
-        plugin_status(self.installed, self.enabled, &self.status)
+        let status = plugin_status(self.installed(), self.enabled(), &self.plugin.status);
+        if !self.installed() && self.activation_block().is_some() {
+            PluginStatus::ComingSoon
+        } else {
+            status
+        }
     }
 
     /// Every config field of every app, in order.
@@ -200,10 +316,54 @@ impl PluginDetail {
         self.fields().iter().all(|field| field.configured)
     }
 
-    /// Plugins that start a local program are refused by the server. The
-    /// screen still lists them and explains why Install is blocked.
+    /// Plugins that start a local program are refused by the server.
     pub fn uses_local_program(&self) -> bool {
         self.plugin.apps.iter().any(|app| app.transport == "stdio")
+    }
+
+    /// True when any declared host or link is `example.invalid`. The detail
+    /// payload does not include the app URL; egress hosts and the public
+    /// links are what the server sends.
+    pub fn uses_placeholder_host(&self) -> bool {
+        if self
+            .plugin
+            .permissions
+            .egress
+            .iter()
+            .any(|host| placeholder_host(host))
+        {
+            return true;
+        }
+        let links = [
+            self.plugin.website_url.as_deref(),
+            self.plugin.privacy_policy_url.as_deref(),
+            self.plugin.terms_url.as_deref(),
+        ];
+        if links.into_iter().flatten().any(placeholder_host) {
+            return true;
+        }
+        self.fields()
+            .iter()
+            .any(|field| field.docs_url.as_deref().is_some_and(placeholder_host))
+    }
+
+    /// Why Install and Enable are refused, if they are. Local programs and
+    /// placeholder hosts stay refused after the runtime exists.
+    pub fn activation_block(&self) -> Option<ActivationBlock> {
+        self.activation_block_when(RUNTIME_CALLS_PLUGINS)
+    }
+
+    pub fn activation_block_when(&self, runtime_calls: bool) -> Option<ActivationBlock> {
+        if self.uses_local_program() {
+            return Some(ActivationBlock::LocalProgram);
+        }
+        if self.uses_placeholder_host() {
+            return Some(ActivationBlock::PlaceholderHost);
+        }
+        if !runtime_calls {
+            return Some(ActivationBlock::Runtime);
+        }
+        None
     }
 }
 
@@ -227,15 +387,24 @@ impl PluginAction {
     }
 }
 
-/// The buttons for a plugin in its current state, safe ones first.
+/// The buttons for a plugin in its current state. Install and Enable are
+/// omitted while [`PluginDetail::activation_block`] is set. Disable and
+/// Uninstall stay, so an install that already exists can be removed.
 pub fn actions_for(detail: &PluginDetail) -> Vec<PluginAction> {
-    if !detail.installed {
+    actions_when(detail, detail.activation_block().is_some())
+}
+
+fn actions_when(detail: &PluginDetail, blocked: bool) -> Vec<PluginAction> {
+    if !detail.installed() {
+        if blocked {
+            return Vec::new();
+        }
         return vec![PluginAction::Install];
     }
     let mut actions = Vec::new();
-    if detail.enabled {
+    if detail.enabled() {
         actions.push(PluginAction::Disable);
-    } else if detail.fully_configured() {
+    } else if !blocked && detail.fully_configured() {
         actions.push(PluginAction::Enable);
     }
     actions.push(PluginAction::Uninstall);
@@ -358,6 +527,9 @@ mod tests {
                 description: String::new(),
                 category: "research".into(),
                 version: "1.0.0".into(),
+                installed,
+                enabled,
+                status: String::new(),
                 prompts: vec![],
                 apps: vec![PluginApp {
                     id: "app".into(),
@@ -380,9 +552,6 @@ mod tests {
                 privacy_policy_url: None,
                 terms_url: None,
             },
-            installed,
-            enabled,
-            status: String::new(),
         }
     }
 
@@ -395,25 +564,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(list.plugins[0].state(), PluginStatus::NeedsSetup);
+        assert_eq!(
+            summary("a", "Search", "research", false, false, "available").state(),
+            PluginStatus::ComingSoon
+        );
+
+        // The server nests installed/enabled/status inside `plugin`. Flags
+        // sitting beside `plugin` are not the install state.
+        let beside: PluginDetail = serde_json::from_str(
+            r#"{"plugin":{"slug":"search","name":"Search"},"installed":true,"enabled":true,"status":"installed"}"#,
+        )
+        .unwrap();
+        assert!(!beside.installed());
+        assert_eq!(beside.state(), PluginStatus::ComingSoon);
 
         let detail: PluginDetail = serde_json::from_str(
             r#"{"plugin":{"slug":"search","name":"Search","tagline":"t","description":"d","category":"research",
-                "version":"1.0.0","prompts":[{"id":"p","text":"Find"}],
+                "version":"1.0.0","installed":true,"enabled":false,"status":"needs_config",
+                "prompts":[{"id":"p","text":"Find"}],
                 "apps":[{"id":"a","name":"A","transport":"http","auth":[{"id":"k","kind":"api-key",
-                   "fields":[{"id":"token","label":"API key","hint":"h","docs_url":"https://d.example","configured":false}]}]}],
+                   "fields":[{"id":"token","label":"API key","hint":"h","docs_url":"https://docs.example/keys","configured":false}]}]}],
                 "permissions":{"egress":["api.example"]},"website_url":"https://w.example",
-                "privacy_policy_url":"https://p.example","terms_url":"https://t.example"},
-              "installed":true,"enabled":false,"status":"needs_config"}"#,
+                "privacy_policy_url":"https://p.example","terms_url":"https://t.example"}}"#,
         )
         .unwrap();
+        assert!(detail.installed());
+        assert!(!detail.enabled());
+        assert_eq!(detail.state(), PluginStatus::NeedsSetup);
         assert_eq!(detail.fields().len(), 1);
         assert!(!detail.fully_configured());
         assert_eq!(detail.plugin.permissions.egress, vec!["api.example"]);
         // Sparse bodies fall back to safe defaults.
         let sparse: PluginDetail =
             serde_json::from_str(r#"{"plugin":{"slug":"x","name":"X"}}"#).unwrap();
-        assert!(!sparse.installed);
+        assert!(!sparse.installed());
         assert!(!sparse.needs_config());
+        assert_eq!(sparse.state(), PluginStatus::ComingSoon);
     }
 
     #[test]
@@ -438,32 +624,96 @@ mod tests {
     }
 
     #[test]
-    fn buttons_match_the_state() {
-        assert_eq!(
-            actions_for(&detail(false, false, false, "http")),
-            vec![PluginAction::Install]
-        );
-        // Installed but not configured: no Enable until the key is set.
-        assert_eq!(
-            actions_for(&detail(true, false, false, "http")),
-            vec![PluginAction::Uninstall]
-        );
+    fn buttons_match_the_state_and_stay_off_until_a_plugin_can_run() {
+        // The runtime is off, so Install and Enable are not offered.
+        assert!(actions_for(&detail(false, false, false, "http")).is_empty());
         assert_eq!(
             actions_for(&detail(true, false, true, "http")),
-            vec![PluginAction::Enable, PluginAction::Uninstall]
+            vec![PluginAction::Uninstall]
         );
         assert_eq!(
             actions_for(&detail(true, true, true, "http")),
             vec![PluginAction::Disable, PluginAction::Uninstall]
         );
+        // Once a real host can be called, the buttons follow the flags.
+        let ready = detail(true, false, true, "http");
+        assert_eq!(
+            actions_when(&ready, false),
+            vec![PluginAction::Enable, PluginAction::Uninstall]
+        );
+        assert_eq!(
+            actions_when(&detail(false, false, false, "http"), false),
+            vec![PluginAction::Install]
+        );
+        assert_eq!(
+            actions_when(&detail(true, false, false, "http"), false),
+            vec![PluginAction::Uninstall]
+        );
     }
 
     #[test]
-    fn a_plugin_with_no_fields_can_be_enabled_at_once() {
+    fn placeholder_hosts_and_local_programs_stay_blocked_after_the_runtime_exists() {
+        let mut placeholder = detail(false, false, false, "http");
+        placeholder.plugin.permissions.egress = vec!["mcp.firecrawl.example.invalid".into()];
+        assert!(placeholder.uses_placeholder_host());
+        assert_eq!(
+            placeholder.activation_block_when(true),
+            Some(ActivationBlock::PlaceholderHost)
+        );
+        assert!(actions_for(&placeholder).is_empty());
+        assert!(placeholder_host("https://docs.example.invalid/keys"));
+        assert!(!placeholder_host("api.example"));
+
+        let local = detail(false, false, false, "stdio");
+        assert_eq!(
+            local.activation_block_when(true),
+            Some(ActivationBlock::LocalProgram)
+        );
+        assert!(
+            local
+                .activation_block()
+                .unwrap()
+                .message()
+                .contains("program")
+        );
+
+        let real = detail(false, false, false, "http");
+        assert_eq!(real.activation_block_when(true), None);
+        assert_eq!(real.activation_block(), Some(ActivationBlock::Runtime));
+    }
+
+    #[test]
+    fn a_plugin_with_no_fields_can_be_enabled_once_it_can_run() {
         let mut d = detail(true, false, true, "http");
         d.plugin.apps[0].auth.clear();
         assert!(d.fully_configured());
-        assert_eq!(actions_for(&d)[0], PluginAction::Enable);
+        assert_eq!(actions_when(&d, false)[0], PluginAction::Enable);
+    }
+
+    #[test]
+    fn a_missing_plugin_is_not_a_missing_marketplace() {
+        assert_eq!(
+            marketplace_problem(MarketplaceCall::List, true, "gone".into()),
+            MarketplaceProblem::Unavailable
+        );
+        assert_eq!(
+            marketplace_problem(MarketplaceCall::Detail, true, "gone".into()),
+            MarketplaceProblem::Message("That plugin is not in the catalog.".into())
+        );
+        let write = marketplace_problem(MarketplaceCall::Write, true, "gone".into());
+        assert!(matches!(write, MarketplaceProblem::Message(ref text) if text.contains("Refresh")));
+        assert_eq!(
+            marketplace_problem(
+                MarketplaceCall::Write,
+                false,
+                "plugin app files starts a local program, which this server does not run yet"
+                    .into()
+            ),
+            MarketplaceProblem::Message(
+                "plugin app files starts a local program, which this server does not run yet"
+                    .into()
+            )
+        );
     }
 
     #[test]
@@ -498,6 +748,7 @@ mod tests {
             ".mp-card {",
             ".mp-sheet {",
             ".mp-field {",
+            ".mp-toolbar .seg {",
         ] {
             assert!(css.contains(needle), "missing marketplace rule: {needle}");
         }

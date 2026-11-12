@@ -1,8 +1,9 @@
 # Orchestration
 
 SeraBot is a single-operator pipeline: one orchestrator bot delegates bounded work
-to specialists. There is no free-form agent-to-agent chat, no multi-user auth, and
-no plugin marketplace. A room may carry a **team** of 1–5 bots: they answer the
+to specialists. There is no free-form agent-to-agent chat and no multi-user auth.
+A plugin catalog exists (`docs/marketplace.md`); nothing in a room calls a plugin.
+A room may carry a **team** of 1–5 bots: they answer the
 owner together and may ask each other one bounded question, but the exchange is
 capped, audited, and deterministic (see [Team rooms](#team-rooms)). Examples below
 use synthetic ids only.

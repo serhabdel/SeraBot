@@ -90,19 +90,20 @@ pub fn resolve(inbox: &Path, user_id: &str, value: &str) -> Result<PathBuf> {
 /// Whether `metadata` (taken without following links) is a symlink, a junction
 /// or another reparse point.
 fn is_link(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    metadata.file_type().is_symlink() || reparse_point(metadata)
+}
+
+/// Windows junctions are reparse points that `is_symlink` does not report.
+#[cfg(windows)]
+fn reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
 }
 
 #[cfg(test)]

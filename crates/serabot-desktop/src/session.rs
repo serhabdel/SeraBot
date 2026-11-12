@@ -1321,7 +1321,6 @@ impl Session {
         self.refresh_logs();
     }
 
-    /// Read the Wave A visibility bundle (0.29.0). Independent of the open chat.
     /// Read the catalog. A manual Refresh calls this again.
     pub fn refresh_marketplace(&mut self) {
         if !self.state.connected {
@@ -1351,10 +1350,22 @@ impl Session {
     pub fn close_plugin(&mut self) {
         self.marketplace_open = None;
         self.state.marketplace_detail = None;
+        self.state.marketplace_error = None;
     }
 
+    /// Install, enable, disable or uninstall. Install and Enable are refused
+    /// while the plugin cannot be called, including when its page is not open,
+    /// so a click cannot store a secret or mark a plugin on for a runtime
+    /// that does not exist.
     pub fn plugin_action(&mut self, slug: String, action: crate::marketplace::PluginAction) {
+        use crate::marketplace::PluginAction;
         if !self.state.connected || !crate::valid_id(&slug) {
+            return;
+        }
+        if matches!(action, PluginAction::Install | PluginAction::Enable)
+            && let Some(reason) = self.plugin_activation_block(&slug)
+        {
+            self.state.marketplace_error = Some(reason.message().to_owned());
             return;
         }
         self.state.marketplace_error = None;
@@ -1362,15 +1373,34 @@ impl Session {
     }
 
     /// Send what the user typed into a plugin's setup form. The values are
-    /// moved into the request and wiped when it finishes.
+    /// moved into the request and wiped when it finishes. Refused for a plugin
+    /// that cannot run, so a key is not stored for a host nothing will call.
     pub fn save_plugin_config(&mut self, slug: String, values: Vec<(String, Zeroizing<String>)>) {
         if !self.state.connected || !crate::valid_id(&slug) {
+            return;
+        }
+        if let Some(reason) = self.plugin_activation_block(&slug) {
+            self.state.marketplace_error = Some(reason.message().to_owned());
             return;
         }
         self.state.marketplace_error = None;
         self.start_request(Operation::MarketplaceConfig { slug, values });
     }
 
+    /// The reason Install, Enable or a secret save must not be sent.
+    fn plugin_activation_block(&self, slug: &str) -> Option<crate::marketplace::ActivationBlock> {
+        if let Some(detail) = &self.state.marketplace_detail
+            && detail.plugin.slug == slug
+        {
+            return detail.activation_block();
+        }
+        if !crate::marketplace::RUNTIME_CALLS_PLUGINS {
+            return Some(crate::marketplace::ActivationBlock::Runtime);
+        }
+        Some(crate::marketplace::ActivationBlock::Unchecked)
+    }
+
+    /// Read the Wave A visibility bundle (0.29.0). Independent of the open chat.
     pub fn refresh_workflows(&mut self) {
         if !self.state.connected || self.pending.is_some() {
             if self.ready() {
@@ -3281,6 +3311,7 @@ impl Session {
                     return;
                 }
                 std::sync::mpsc::TrySendError::Disconnected(_) => {
+                    self.marketplace_busy = false;
                     self.state.error = Some("Network worker unavailable. Reconnect.".into());
                     self.refreshing = false;
                     self.poll_paused = true;
@@ -3561,14 +3592,28 @@ impl Session {
                         | OperationKind::MarketplaceDetail
                         | OperationKind::MarketplaceWrite => {
                             self.marketplace_busy = false;
-                            // Older servers have no marketplace routes. Say so
-                            // once, instead of retrying or showing a raw status.
-                            if not_found {
-                                self.state.marketplace_unavailable = true;
-                                self.state.marketplace_loaded = true;
-                                self.state.marketplace_error = None;
-                            } else {
-                                self.state.marketplace_error = Some(message);
+                            let call = match completion.kind {
+                                OperationKind::MarketplaceList => {
+                                    crate::marketplace::MarketplaceCall::List
+                                }
+                                OperationKind::MarketplaceDetail => {
+                                    crate::marketplace::MarketplaceCall::Detail
+                                }
+                                _ => crate::marketplace::MarketplaceCall::Write,
+                            };
+                            // A missing list route means this server has no
+                            // marketplace. A missing plugin does not hide the
+                            // catalog that already loaded.
+                            match crate::marketplace::marketplace_problem(call, not_found, message)
+                            {
+                                crate::marketplace::MarketplaceProblem::Unavailable => {
+                                    self.state.marketplace_unavailable = true;
+                                    self.state.marketplace_loaded = true;
+                                    self.state.marketplace_error = None;
+                                }
+                                crate::marketplace::MarketplaceProblem::Message(text) => {
+                                    self.state.marketplace_error = Some(text);
+                                }
                             }
                             self.state.error = None;
                         }
@@ -3652,8 +3697,46 @@ impl Session {
                     if let Reply::DocPreview { hash, .. } = &reply {
                         self.doc_previews_pending.remove(hash);
                     }
-                    if !self.state.receive(&completion.scope, reply) {
+                    let page_reload_failed = matches!(
+                        &reply,
+                        Reply::MarketplaceChanged { slug, detail: None, .. }
+                            if self.marketplace_open.as_deref() == Some(slug.as_str())
+                    );
+                    let reply = match reply {
+                        // A slow read for a plugin the user has already left.
+                        Reply::MarketplaceDetail(detail)
+                            if self.marketplace_open.as_deref()
+                                != Some(detail.plugin.slug.as_str()) =>
+                        {
+                            None
+                        }
+                        // Do not reopen a page the user closed while the
+                        // change was in flight.
+                        Reply::MarketplaceChanged {
+                            slug,
+                            plugins,
+                            detail,
+                        } => {
+                            let detail = detail.filter(|page| {
+                                self.marketplace_open.as_deref() == Some(page.plugin.slug.as_str())
+                            });
+                            Some(Reply::MarketplaceChanged {
+                                slug,
+                                plugins,
+                                detail,
+                            })
+                        }
+                        other => Some(other),
+                    };
+                    if let Some(reply) = reply
+                        && !self.state.receive(&completion.scope, reply)
+                    {
                         continue;
+                    }
+                    if page_reload_failed {
+                        self.state.marketplace_detail = None;
+                        self.state.marketplace_error =
+                            Some("The plugin changed, but its page could not be reloaded.".into());
                     }
                     if matches!(completion.kind, OperationKind::Approvals) {
                         self.note_approvals();
@@ -3829,7 +3912,7 @@ impl Session {
                         OperationKind::MarketplaceList | OperationKind::MarketplaceDetail => {}
                         OperationKind::MarketplaceWrite => {
                             self.marketplace_busy = false;
-                            self.toast = Some("Saved.".into());
+                            self.toast = Some("Updated.".into());
                         }
                         OperationKind::CreateBotChat => {
                             if let Some((_, chat, _)) = self.state.created_bot_chat.take() {
@@ -5613,6 +5696,45 @@ mod tests {
         assert_eq!(count(true), 10);
         assert_eq!(count(false), 9);
         assert!(!SettingsSection::Admin.visible(false));
+    }
+
+    #[test]
+    fn marketplace_install_enable_and_secrets_are_refused_until_plugins_can_run() {
+        use crate::marketplace::PluginAction;
+        use zeroize::Zeroizing;
+
+        let mut session = Session::new();
+        session.state.connected = true;
+        session.plugin_action("firecrawl".into(), PluginAction::Install);
+        let install = session.state.marketplace_error.clone().unwrap();
+        assert!(
+            install.contains("Coming soon"),
+            "install must say why it is refused: {install}"
+        );
+        assert!(!session.marketplace_busy);
+        assert!(!install.to_lowercase().contains("secret"));
+
+        session.plugin_action("firecrawl".into(), PluginAction::Enable);
+        assert!(session.state.marketplace_error.is_some());
+        assert!(!session.marketplace_busy);
+
+        session.save_plugin_config(
+            "firecrawl".into(),
+            vec![(
+                "api_key".into(),
+                Zeroizing::new("synthetic-plugin-key".into()),
+            )],
+        );
+        let saved = session.state.marketplace_error.clone().unwrap();
+        assert!(saved.contains("Coming soon"), "{saved}");
+        assert!(
+            !saved.contains("synthetic-plugin-key"),
+            "a refused save must not echo the typed value"
+        );
+        assert!(!session.marketplace_busy);
+
+        session.open_plugin("not a slug".into());
+        assert!(session.marketplace_open.is_none());
     }
 
     #[test]
