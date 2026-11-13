@@ -368,13 +368,19 @@ pub(super) fn Sidebar(
         let bot_chats: HashSet<String> = bots.iter().map(|bot| format!("dir:{}", bot.id)).collect();
         let mut items = Vec::new();
 
+        // A bot shows when its name matches or one of its chats does, so the
+        // search (and Ctrl+K, which focuses it) can jump straight to a chat.
         let bot_rows = bots
             .iter()
             .filter(|bot| {
                 matches(
                     &state.bot_display_name(&bot.id),
                     &format!("bot {}", bot.role),
+                ) || !serabot_desktop::bot_chats::chats_matching(
+                    state.state.bot_chats.get(&bot.id),
+                    &needle,
                 )
+                .is_empty()
             })
             .collect::<Vec<_>>();
         if needle.is_empty() || !bot_rows.is_empty() {
@@ -404,9 +410,21 @@ pub(super) fn Sidebar(
                     let has_active = chats.iter().any(|chat| chat.id == current);
                     // Open when the reader chose so; else for the bot being
                     // talked to, so switching and New chat are always in sight.
-                    let open = chats_open().get(&bot.id).copied().unwrap_or(
-                        serabot_desktop::bot_chats::default_chats_open(id == current || has_active),
+                    let name_matches = matches(
+                        &state.bot_display_name(&bot.id),
+                        &format!("bot {}", bot.role),
                     );
+                    let chat_hits = serabot_desktop::bot_chats::chats_matching(
+                        state.state.bot_chats.get(&bot.id),
+                        &needle,
+                    );
+                    // A search that hit a chat opens its bot's list.
+                    let open = !chat_hits.is_empty()
+                        || chats_open().get(&bot.id).copied().unwrap_or(
+                            serabot_desktop::bot_chats::default_chats_open(
+                                id == current || has_active,
+                            ),
+                        );
                     items.push(RailItem::Bot {
                         // An open bot is a group header; the open chat is
                         // marked on its own row below.
@@ -424,10 +442,16 @@ pub(super) fn Sidebar(
                     });
                     if open {
                         let all = chats_all().contains(&bot.id);
-                        let (shown, hidden) =
-                            serabot_desktop::bot_chats::visible_chats(&chats, all, &current);
+                        // While searching, a bot whose name did not match lists
+                        // only the chats that did.
+                        let searching_chats = !needle.is_empty() && !name_matches;
+                        let (shown, hidden) = if searching_chats {
+                            (chat_hits.clone(), 0)
+                        } else {
+                            serabot_desktop::bot_chats::visible_chats(&chats, all, &current)
+                        };
                         // The main chat is listed even before the list loads.
-                        if !chats.iter().any(|chat| chat.primary) {
+                        if needle.is_empty() && !chats.iter().any(|chat| chat.primary) {
                             let main_id = format!("dir:{}", bot.id);
                             items.push(RailItem::BotChat {
                                 active: main_id == current,
@@ -458,10 +482,12 @@ pub(super) fn Sidebar(
                                 all,
                             });
                         }
-                        items.push(RailItem::NewChat {
-                            bot: bot.id.clone(),
-                            enabled: bot.enabled,
-                        });
+                        if needle.is_empty() {
+                            items.push(RailItem::NewChat {
+                                bot: bot.id.clone(),
+                                enabled: bot.enabled,
+                            });
+                        }
                     }
                 }
             }
@@ -634,7 +660,7 @@ pub(super) fn Sidebar(
                     class: "input",
                     id: "global-search",
                     value: "{search}",
-                    placeholder: "Search chats",
+                    placeholder: "Search chats (Ctrl+K)",
                     "aria-label": "Search chats and bots",
                     oninput: move |event| search.set(event.value()),
                 }

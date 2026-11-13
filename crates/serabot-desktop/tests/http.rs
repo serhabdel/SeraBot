@@ -722,6 +722,39 @@ fn unarchive_and_library_use_their_routes_and_validate_responses() {
 }
 
 #[test]
+fn bot_chats_use_their_routes_and_read_the_servers_real_shapes() {
+    let (client, handle) = server(vec![
+        // A bot with no message yet: the main chat has null timestamps.
+        (
+            200,
+            r#"{"bot":"legal","refresh_every_turns":40,"chats":[{"id":"dir:legal","bot":"legal","title":null,"primary":true,"archived":false,"carried_from":null,"created_at":null,"updated_at":null,"last_message_at":null,"turns":0,"has_summary":false}]}"#.into(),
+        ),
+        (
+            200,
+            r#"{"chat":{"id":"dir:chat-0a1b2c3d4e5f","bot":"legal","title":null,"primary":false,"archived":false,"carried_from":"dir:legal","created_at":"2026-11-13T10:00:00Z","updated_at":"2026-11-13T10:00:00Z","last_message_at":null,"turns":0,"has_summary":true},"carried_from":"dir:legal"}"#.into(),
+        ),
+        (200, r#"{"bot":"legal","refresh_every_turns":25}"#.into()),
+    ]);
+    let list = client.list_bot_chats("legal").unwrap();
+    assert_eq!(list.chats.len(), 1);
+    assert!(list.chats[0].primary);
+    let created = client.create_bot_chat("legal", None).unwrap();
+    assert_eq!(created.chat.id, "dir:chat-0a1b2c3d4e5f");
+    assert_eq!(created.carried_from.as_deref(), Some("dir:legal"));
+    assert_eq!(
+        client
+            .set_bot_refresh("legal", 25)
+            .unwrap()
+            .refresh_every_turns,
+        25
+    );
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("GET /v1/bots/legal/chats"));
+    assert!(requests[1].starts_with("POST /v1/bots/legal/chats"));
+    assert!(requests[2].starts_with("PUT /v1/bots/legal/chat-settings"));
+}
+
+#[test]
 fn a_library_response_with_an_unshaped_hash_is_rejected() {
     let (client, handle) = server(vec![(
         200,

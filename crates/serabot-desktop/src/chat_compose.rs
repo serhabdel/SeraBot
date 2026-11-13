@@ -405,6 +405,7 @@ mod tests {
             ".composer-wrap > .scroll-bottom {\n  position: absolute;",
             "bottom: 100%;",
             ".msg.last-reply .msg-actions {",
+            ".msg-action-time {",
             ".msg.bot .msg-body {\n  max-width: 100%;",
             ".chat-switcher-btn {",
             ".thread-group.new-chat-row {",

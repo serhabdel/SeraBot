@@ -701,6 +701,8 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                         }
                                     }
                                     div { class: "msg-actions", role: "toolbar", "aria-label": "Message actions",
+                                        // The time shows with the actions, on hover or focus.
+                                        span { class: "msg-action-time", "{row.stamp}" }
                                         button {
                                             class: "msg-action",
                                             "aria-label": "Copy message",

@@ -929,3 +929,18 @@
   background: var(--surface-2);
   border: 1px solid var(--hairline);
 }
+
+/* Timestamps live with the hover actions, so a one-to-one transcript stays
+   clean but every message can say when it was sent. */
+.msg-action-time {
+  align-self: center;
+  margin-right: 6px;
+  color: var(--label-3);
+  font-size: var(--fs-micro);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.msg.user .msg-action-time {
+  order: -1;
+}
