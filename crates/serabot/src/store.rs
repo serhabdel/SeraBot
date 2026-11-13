@@ -74,6 +74,7 @@ const MIGRATION_32: &str = include_str!("../migrations/0032_user_tasks.sql");
 const MIGRATION_33: &str = include_str!("../migrations/0033_user_sources.sql");
 const MIGRATION_34: &str = include_str!("../migrations/0034_bot_chats.sql");
 const MIGRATION_35: &str = include_str!("../migrations/0035_marketplace_installs.sql");
+const MIGRATION_36: &str = include_str!("../migrations/0036_console_pages.sql");
 
 /// Fixed admin id written by migration 0008 and mirrored in
 /// `kv['admin_user_id']`. Code resolves the admin through the kv entry (the
@@ -680,6 +681,11 @@ impl Store {
         if version < 35 {
             connection.execute_batch(MIGRATION_35)?;
             connection.pragma_update(None, "user_version", 35)?;
+        }
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < 36 {
+            connection.execute_batch(MIGRATION_36)?;
+            connection.pragma_update(None, "user_version", 36)?;
         }
         // VACUUM INTO (backups) may renumber rowids; rebuild the external-content
         // FTS index only when its row count no longer matches `memories`.
@@ -3328,6 +3334,70 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// `turn.step` events for one of the acting user's conversations, oldest
+    /// first. Another user's conversation id matches nothing.
+    pub fn conversation_steps(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, at, kind, payload_json FROM events
+             WHERE user_id = ?1 AND kind = 'turn.step'
+               AND json_extract(payload_json, '$.conversation_id') = ?2
+             ORDER BY id DESC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![user_id, conversation_id, limit as i64], |row| {
+            Ok(Event {
+                id: row.get(0)?,
+                at: parse_datetime(&row.get::<_, String>(1)?),
+                kind: row.get(2)?,
+                payload: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or(Value::Null),
+            })
+        })?;
+        let mut events = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        events.reverse();
+        Ok(events)
+    }
+
+    /// Remember the last secret-free connector test for this user.
+    pub fn record_connector_check(
+        &self,
+        user_id: &str,
+        connector_id: &str,
+        ok: bool,
+        message: &str,
+    ) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO connector_checks(user_id, connector_id, ok, message, checked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(user_id, connector_id) DO UPDATE SET
+               ok = excluded.ok, message = excluded.message, checked_at = excluded.checked_at",
+            params![user_id, connector_id, ok as i64, message, now_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Last connector tests for the acting user: id, ok, message, checked_at.
+    pub fn connector_checks(&self, user_id: &str) -> Result<Vec<(String, bool, String, String)>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT connector_id, ok, message, checked_at FROM connector_checks WHERE user_id = ?1",
+        )?;
+        let rows = statement.query_map(params![user_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? != 0,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Retention sweep over the global event ledger. Cross-user by design:
     /// the retention window (`server.event_retention_days`) is a server
     /// property, and pruning per user would keep expired rows alive forever
@@ -4044,11 +4114,7 @@ impl Store {
         match daily_limit {
             Some(daily_limit) => {
                 let limit = i64::try_from(daily_limit).unwrap_or(i64::MAX);
-                let day_start = now
-                    .date_naive()
-                    .and_hms_opt(0, 0, 0)
-                    .expect("midnight is a valid time")
-                    .and_utc();
+                let day_start = start_of_utc_day(now.date_naive())?;
                 let transaction =
                     Transaction::new_unchecked(&connection, TransactionBehavior::Immediate)?;
                 let used: i64 = transaction.query_row(
@@ -4096,11 +4162,7 @@ impl Store {
     /// window enforced by [`Store::enqueue_task_with_quota`].
     pub fn daily_task_count(&self, user_id: &str) -> Result<i64> {
         let now = utc_now();
-        let day_start = now
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is a valid time")
-            .and_utc();
+        let day_start = start_of_utc_day(now.date_naive())?;
         let connection = self.connection()?;
         Ok(connection.query_row(
             "SELECT COUNT(*) FROM tasks WHERE user_id = ?1 AND created_at >= ?2",
@@ -4489,9 +4551,7 @@ impl Store {
         user_id: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<u32> {
-        let day_start = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
-        let day_start =
-            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(day_start, chrono::Utc);
+        let day_start = start_of_utc_day(now.date_naive())?;
         let start = day_start.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let connection = self.connection()?;
         let count: i64 = connection.query_row(
@@ -4762,6 +4822,14 @@ fn insert_task_row(
         ],
     )?;
     Ok(())
+}
+
+/// Midnight UTC on `day`. Naive midnight is always a valid time; the error
+/// exists so a request path does not panic if that ever stops being true.
+pub(crate) fn start_of_utc_day(day: chrono::NaiveDate) -> Result<DateTime<Utc>> {
+    day.and_hms_opt(0, 0, 0)
+        .map(|time| time.and_utc())
+        .ok_or_else(|| SeraError::Internal("could not build the start of the UTC day".into()))
 }
 
 pub(crate) fn to_string(value: DateTime<Utc>) -> String {
@@ -5562,7 +5630,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 35);
+        assert_eq!(version, 36);
         connection
             .query_row(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
@@ -5627,7 +5695,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 35);
+        assert_eq!(version, 36);
         assert!(store.list_device_tokens().unwrap().is_empty());
         // The team table arrives with the same migration batch.
         assert!(
@@ -5701,7 +5769,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 35);
+        assert_eq!(version, 36);
         let admin = admin(&store);
         let memory = crate::memory::get(&store, &admin, "mem-legacy").unwrap();
         assert_eq!(memory.origin, "explicit");
@@ -5790,7 +5858,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 35);
+        assert_eq!(version, 36);
 
         let admin = store.admin_user().unwrap().unwrap();
         assert_eq!(admin.id, ADMIN_USER_ID);
@@ -5921,7 +5989,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 35);
+        assert_eq!(version, 36);
 
         // Every scoped table carries user_id = the admin, and the column is
         // NOT NULL with a real foreign key.
@@ -6076,7 +6144,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 35);
+        assert_eq!(version, 36);
 
         // The old row is now the admin's, with the empty prompt the migration
         // header documents; startup seeding fills it from the template.

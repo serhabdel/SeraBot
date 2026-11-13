@@ -1,8 +1,9 @@
 # Orchestration
 
 SeraBot is a single-operator pipeline: one orchestrator bot delegates bounded work
-to specialists. There is no free-form agent-to-agent chat, no multi-user auth, and
-no plugin marketplace. A room may carry a **team** of 1–5 bots: they answer the
+to specialists. There is no free-form agent-to-agent chat and no multi-user auth.
+A plugin catalog exists (`docs/marketplace.md`); nothing in a room calls a plugin.
+A room may carry a **team** of 1–5 bots: they answer the
 owner together and may ask each other one bounded question, but the exchange is
 capped, audited, and deterministic (see [Team rooms](#team-rooms)). Examples below
 use synthetic ids only.
@@ -16,10 +17,12 @@ classes (`routine`, `synthesis`) to models already listed in configuration; it
 does not replace the allowlist or consent gates.
 
 **Orchestrator:** `main` is the only bot with `role = "orchestrator"`. It routes
-owner traffic and may queue up to 8 audited handoffs per turn — several `delegate`
+owner traffic and may queue up to 16 audited handoffs per turn — several `delegate`
 calls in one round fan out to parallel specialist subagents (0.27). It does
 not receive specialist-only tools (maker, analyst, watcher pipelines stay on
-those bots). Specialists cannot delegate.
+those bots). Every bot also gets web search, fetch, memory and `ask_user`.
+A specialist that still lacks a tool calls `ask_teammate` (one hop) instead of
+refusing. `delegate` stays orchestrator-only.
 
 **Handoffs:** delegation is one queue row, not a conversation between models.
 The parent turn finishes and releases its worker permit before the child runs
@@ -149,7 +152,8 @@ specialist reply per orchestrator turn.
    The desktop labels the bubble with that name. Unnamed assistant text stays
    "SeraBot".
 5. A second specialist speaks only on a later owner turn, when `main` delegates
-   again. Specialists cannot delegate.
+   again. Specialists do not call `delegate`. They call `ask_teammate` once
+   when a step needs a tool they do not have.
 
 Direct and legacy conversations do not label the orchestrator. A handoff reply
 is still named with the specialist id, in the same conversation. That holds on

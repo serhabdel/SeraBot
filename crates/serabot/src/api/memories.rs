@@ -21,6 +21,21 @@ pub(super) struct MemoryListQuery {
     status: Option<String>,
     #[serde(default)]
     bot: Option<String>,
+    /// Memory kind: `preference`, `fact`, `decision`, `context`, or `note`.
+    #[serde(default)]
+    category: Option<String>,
+    /// `true`, `false`, `1`, or `0`. Absent lists both.
+    #[serde(default)]
+    pinned: Option<String>,
+}
+
+fn pinned_filter(value: Option<&str>) -> Result<Option<bool>> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some("true" | "1") => Ok(Some(true)),
+        Some("false" | "0") => Ok(Some(false)),
+        Some(_) => Err(SeraError::Validation("pinned must be true or false".into())),
+    }
 }
 
 pub(super) async fn list_memories(
@@ -33,6 +48,8 @@ pub(super) async fn list_memories(
         origin: query.origin.clone(),
         status: query.status.clone(),
         bot: query.bot.clone(),
+        category: query.category.clone(),
+        pinned: pinned_filter(query.pinned.as_deref())?,
     };
     let needle = query
         .q

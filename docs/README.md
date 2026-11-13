@@ -25,7 +25,10 @@ artifacts.
 | [Knowledge packs](knowledge-packs.md) | Import the owner's own accounting guides into the comptable bot's document inbox. |
 | [Multi-user spec](specs/multi-user-reconstruction.md) | Owner-approved and implemented: small-circle multi-user — OIDC sign-in, UID-scoped data, per-user bots, credentials, and connectors. |
 | [Big Wave (0.29–0.31)](specs/big-wave.md) | Visibility, reliability, and deep ops waves — Workflows, traces, per-user schedules, vault/browser polish; checklist in `tasks/big-wave.md`. |
-| [Release 0.37.0](release-0.37.0.md) | Plugin marketplace server (#70), desktop Marketplace screen (#71, open), plugin tool runtime per user (PR-L). |
+| [Release 0.37.0](release-0.37.0.md) | Bots finish the task instead of refusing; live step cards; typed tool results; page data for Tasks, Memory, Connectors, and Providers. |
+| [Events](events.md) | `turn.step` payload for desktop and Android step cards. |
+| [Tool results](tool-results.md) | Audio, file, image, link, and table cards. |
+| [Console pages](console-pages.md) | Tasks, Memory, Connectors, and Providers fields the next desktop pages read. |
 | [Release 0.36.0](release-0.36.0.md) | Message box layout, generated media download fixes, Android build check. |
 | [Release 0.35.0](release-0.35.0.md) | Several chats per bot, memory refresh, steadier chat view, bigger composer, Tasks fix. |
 | [Release 0.34.0](release-0.34.0.md) | Desktop chat view and composer fixes; Tasks, Logs and Browser repairs; workflow management and page layout. |

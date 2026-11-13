@@ -71,6 +71,10 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             if speaker_change {
                 class.push_str(" speaker-change");
             }
+            if !user && Some(index) == last_bot {
+                // The newest reply keeps its actions in view.
+                class.push_str(" last-reply");
+            }
             rows.push(MsgView {
                 id: message.id.clone(),
                 user,
@@ -271,7 +275,11 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     });
     use_effect(move || {
         let external = session.read().composer.clone();
-        if chat_compose::sync_composer_from_session(composer_focused(), external.is_empty()) {
+        if chat_compose::sync_composer_from_session(
+            composer_focused(),
+            external.is_empty(),
+            composer_draft().trim().is_empty(),
+        ) {
             composer_draft.set(external);
         }
     });
@@ -297,7 +305,16 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             }
         }
     });
+    // A chat that was just opened or switched to is ready to type in. The view
+    // is keyed by conversation, so this runs once per switch.
+    use_effect(focus_composer);
     let transcript_error = session.read().state.transcript_error.clone();
+    let chat_failure = session.read().state.chat_failure.clone();
+    let held_draft = session.read().state.held_draft.is_some();
+    let reconnecting = {
+        let state = session.read();
+        state.state.connected && state.events_seen && !state.events_active
+    };
     use_effect(move || {
         let transcript = session.read().state.transcript.clone();
         let Some(text) = transcript else {
@@ -586,37 +603,39 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     }
                                 }
                             }
-                            div { class: "roster",
-                                for (bot_id, bot_name, bot_avatar, bot_enabled, bot_live, bot_role) in roster.clone() {
-                                    div {
-                                        key: "{bot_id}",
-                                        class: "roster-row",
-                                        span { class: "avatar bot", style: avatar_style(&bot_id), "{bot_avatar}" }
-                                        span { class: "thread-title", "{bot_name}" }
-                                        span { class: "thread-meta", "{bot_role}" }
-                                        if !bot_enabled {
-                                            span { class: "chip warn", "disabled" }
-                                        } else if !bot_live {
-                                            span { class: "chip warn", "restart required" }
-                                        }
-                                        button {
-                                            class: "btn ghost sm",
-                                            onclick: {
-                                                let bot_id = bot_id.clone();
-                                                move |_| session.write().open_bot_chat(bot_id.clone())
-                                            },
-                                            "1:1"
-                                        }
-                                        if room {
+                            if !is_one_to_one {
+                                div { class: "roster",
+                                    for (bot_id, bot_name, bot_avatar, bot_enabled, bot_live, bot_role) in roster.clone() {
+                                        div {
+                                            key: "{bot_id}",
+                                            class: "roster-row",
+                                            span { class: "avatar bot", style: avatar_style(&bot_id), "{bot_avatar}" }
+                                            span { class: "thread-title", "{bot_name}" }
+                                            span { class: "thread-meta", "{bot_role}" }
+                                            if !bot_enabled {
+                                                span { class: "chip warn", "disabled" }
+                                            } else if !bot_live {
+                                                span { class: "chip warn", "restart required" }
+                                            }
                                             button {
                                                 class: "btn ghost sm",
-                                                disabled: !bot_enabled || in_team.contains(&bot_id),
-                                                title: if in_team.contains(&bot_id) { "Already in the group" } else { "Add to the group" },
                                                 onclick: {
                                                     let bot_id = bot_id.clone();
-                                                    move |_| session.write().add_team_member(bot_id.clone())
+                                                    move |_| session.write().open_bot_chat(bot_id.clone())
                                                 },
-                                                "add to group"
+                                                "1:1"
+                                            }
+                                            if room {
+                                                button {
+                                                    class: "btn ghost sm",
+                                                    disabled: !bot_enabled || in_team.contains(&bot_id),
+                                                    title: if in_team.contains(&bot_id) { "Already in the group" } else { "Add to the group" },
+                                                    onclick: {
+                                                        let bot_id = bot_id.clone();
+                                                        move |_| session.write().add_team_member(bot_id.clone())
+                                                    },
+                                                    "add to group"
+                                                }
                                             }
                                         }
                                     }
@@ -682,6 +701,8 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                         }
                                     }
                                     div { class: "msg-actions", role: "toolbar", "aria-label": "Message actions",
+                                        // The time shows with the actions, on hover or focus.
+                                        span { class: "msg-action-time", "{row.stamp}" }
                                         button {
                                             class: "msg-action",
                                             "aria-label": "Copy message",
@@ -761,6 +782,12 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     // What the bot is doing right now, in plain words: a
                     // shimmer while it thinks, one row per step, and a small
                     // "N steps" summary once the reply has landed.
+                    if reconnecting {
+                        div { class: "banner warn", role: "status", "aria-live": "polite",
+                            span { class: "step-spin", "aria-hidden": "true" }
+                            "Reconnecting to live updates…"
+                        }
+                    }
                     if sending && live_task.is_none() {
                         div { class: "activity", role: "status",
                             span { class: "shimmer", "Sending…" }
@@ -795,30 +822,78 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     // is at the end of the conversation.
                     div { id: "messages-end", class: "messages-end", "aria-hidden": "true" }
                 }
-                if !at_bottom() {
-                    button {
-                        class: "scroll-bottom jump-pill",
-                        r#type: "button",
-                        "aria-label": if live_task.is_some() { "Jump to the latest message, a reply is still coming in" } else { "Jump to the latest message" },
-                        title: "Jump to latest",
-                        onclick: move |_| {
-                            let _ = dioxus::document::eval(chat_scroll::SCROLL_TO_BOTTOM_JS);
-                            at_bottom.set(true);
-                            unseen.set(0);
-                        },
-                        Icon { name: "arrow-down", size: 16 }
-                        span { class: "jump-label", "Jump to latest" }
-                        if let Some(badge) = chat_feed::unseen_badge(unseen()) {
-                            span { class: "scroll-badge", "aria-label": "{badge} unseen messages", "{badge}" }
-                        }
-                        if live_task.is_some() {
-                            span { class: "jump-live", "aria-hidden": "true" }
+                div { class: "composer-wrap",
+                    // Inside the composer block, so it always sits just above it, at
+                    // any composer height.
+                    if !at_bottom() {
+                        button {
+                            class: "scroll-bottom jump-pill",
+                            r#type: "button",
+                            "aria-label": if live_task.is_some() { "Jump to the latest message, a reply is still coming in" } else { "Jump to the latest message" },
+                            title: "Jump to latest",
+                            onclick: move |_| {
+                                let _ = dioxus::document::eval(chat_scroll::SCROLL_TO_BOTTOM_JS);
+                                at_bottom.set(true);
+                                unseen.set(0);
+                            },
+                            Icon { name: "arrow-down", size: 16 }
+                            span { class: "jump-label", "Jump to latest" }
+                            if let Some(badge) = chat_feed::unseen_badge(unseen()) {
+                                span { class: "scroll-badge", "aria-label": "{badge} unseen messages", "{badge}" }
+                            }
+                            if live_task.is_some() {
+                                span { class: "jump-live", "aria-hidden": "true" }
+                            }
                         }
                     }
-                }
-                div { class: "composer-wrap",
+                    if let Some(failure) = chat_failure.clone() {
+                        div { class: "banner err", role: "alert",
+                            span { "{failure.message}" }
+                            match failure.action {
+                                ChatAction::Retry => rsx! {
+                                    button {
+                                        class: "btn primary sm",
+                                        r#type: "button",
+                                        "aria-label": "Send the message again",
+                                        onclick: move |_| session.write().retry_send(),
+                                        "Retry"
+                                    }
+                                },
+                                ChatAction::Reconnect => rsx! {
+                                    button {
+                                        class: "btn ghost sm",
+                                        r#type: "button",
+                                        "aria-label": "Try the connection again",
+                                        onclick: move |_| session.write().retry_link(),
+                                        "Reconnect"
+                                    }
+                                },
+                                ChatAction::OpenKeys => rsx! {
+                                    button {
+                                        class: "btn ghost sm",
+                                        r#type: "button",
+                                        "aria-label": "Open AI keys",
+                                        onclick: move |_| session.write().open_section(Section::Providers),
+                                        "Open AI keys"
+                                    }
+                                },
+                                ChatAction::None => rsx! {},
+                            }
+                        }
+                    } else if held_draft {
+                        div { class: "banner warn", role: "status",
+                            span { "That message may have reached SeraBot. It is kept here if you want it back in the box." }
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                "aria-label": "Put the message back in the box",
+                                onclick: move |_| session.write().restore_held_draft(),
+                                "Put it back"
+                            }
+                        }
+                    }
                     if let Some(message) = transcript_error {
-                        div { class: "banner err", span { "{message}" } }
+                        div { class: "banner err", role: "alert", span { "{message}" } }
                     }
                     div { class: if composer_expanded() { "composer expanded" } else { "composer" },
                         ComposerFiles { session }

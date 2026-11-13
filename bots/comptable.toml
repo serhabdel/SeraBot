@@ -31,8 +31,11 @@ tools = [
   "xlsx_build",
   "fetch_url",
   "tavily_search",
+  "firecrawl_search",
+  "firecrawl_scrape",
   "conversation_library",
   "telegram_send_document",
+  "ask_teammate",
 ]
 require_approval = []
 enabled = true

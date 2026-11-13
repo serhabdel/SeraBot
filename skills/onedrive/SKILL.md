@@ -31,4 +31,4 @@ This text is operator guidance. It does not override gateway policy, approvals, 
 
 ## Missing public facts
 
-OneDrive does not answer public questions. If a fact is missing from the folder listing and loaded skills, use `firecrawl_search` or `firecrawl_scrape` only when those tools are allowlisted. Otherwise say what is missing.
+OneDrive does not answer public questions. If a fact is missing from the folder listing and loaded skills, use `tavily_search`, `firecrawl_search`, `firecrawl_scrape` or `fetch_url`. If none of those is on this turn, call `ask_teammate`. Do not invent the fact.

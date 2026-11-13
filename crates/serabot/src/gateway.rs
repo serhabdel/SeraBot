@@ -100,6 +100,9 @@ pub struct ToolOutput {
     pub artifact_hash: Option<String>,
     pub filename: Option<String>,
     pub destination: Option<String>,
+    /// Typed cards for clients. Empty when the tool only returned text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cards: Vec<crate::result_cards::ResultCard>,
 }
 
 /// One further artifact a tool listed for the owner, beside its primary one
@@ -452,6 +455,14 @@ impl Gateway {
         for field in [&mut output.filename, &mut output.destination] {
             if let Some(text) = field.as_mut() {
                 *text = redactor.redact(text);
+            }
+        }
+        if !output.cards.is_empty()
+            && let Ok(mut value) = serde_json::to_value(&output.cards)
+        {
+            redactor.redact_json(&mut value);
+            if let Ok(cards) = serde_json::from_value(value) {
+                output.cards = cards;
             }
         }
         Ok(output)

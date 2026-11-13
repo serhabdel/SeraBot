@@ -57,6 +57,7 @@ mod notifier;
 mod prompts;
 mod rag_tool;
 mod recall;
+mod refusal;
 mod routing;
 mod schedules;
 #[cfg(test)]
@@ -93,6 +94,13 @@ pub struct TurnPayload {
     /// Chat attachment ids (already validated as the owner's) for this turn.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
+    /// How many `ask_teammate` hops produced this turn. `delegate` copies it
+    /// onto specialist handoffs so a handed-on task cannot bounce forever.
+    #[serde(default)]
+    pub help_depth: u8,
+    /// Bot that asked for this turn, when `help_depth` is greater than zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub help_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +152,12 @@ struct TurnState {
     team: Option<TeamContext>,
     #[serde(default)]
     team_asked: bool,
+    /// Copied from the task payload so a resumed turn keeps the handoff cap.
+    #[serde(default)]
+    help_depth: u8,
+    /// One `ask_teammate` per turn.
+    #[serde(default)]
+    help_asked: bool,
     /// History rows sent as context at the start of this turn (metadata for
     /// the `model.used` audit row).
     #[serde(default)]

@@ -30,6 +30,7 @@ tools = [
   "xlsx_build",
   "conversation_library",
   "telegram_send_document",
+  "ask_teammate",
 ]
 require_approval = []
 enabled = true

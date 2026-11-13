@@ -43,5 +43,6 @@ or the blocklist.
 
 ## Missing public facts
 
-Use `firecrawl_search` or `firecrawl_scrape` when allowlisted. If they are not,
-say what is missing instead of writing a plausible paragraph.
+Use `tavily_search`, `firecrawl_search`, `firecrawl_scrape` or `fetch_url`. If
+they are not on this turn, call `ask_teammate`. Do not write a plausible
+paragraph in place of a fact you did not find.

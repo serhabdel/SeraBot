@@ -616,6 +616,29 @@ fn require_own_or_new_conversation(state: &ApiState, user_id: &str, id: &str) ->
     Ok(())
 }
 
+/// Recent `turn.step` events for this conversation, oldest first.
+/// Clients render them as step cards after a reload. See `docs/events.md`.
+pub(super) async fn conversation_activity(
+    State(state): State<Arc<ApiState>>,
+    Extension(user): Extension<ActingUser>,
+    Path(id): Path<String>,
+    Query(query): Query<EventLimit>,
+) -> Result<Json<Value>> {
+    require_own_or_new_conversation(&state, &user.id, &id)?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 200);
+    let steps = state.store.conversation_steps(&user.id, &id, limit)?;
+    Ok(Json(json!({
+        "conversation_id": id,
+        "steps": steps,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct EventLimit {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 /// The conversation's goal and todo list, or `{"plan": null}`.
 pub(super) async fn get_conversation_plan(
     State(state): State<Arc<ApiState>>,

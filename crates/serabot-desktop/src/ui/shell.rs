@@ -54,6 +54,7 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                         Section::Usage => rsx! { UsagePage { session } },
                         Section::Logs => rsx! { crate::ui_logs::LogsView { session } },
                         Section::Workflows => rsx! { crate::ui_workflows::WorkflowsView { session } },
+                        Section::Marketplace => rsx! { crate::ui_marketplace::MarketplaceView { session } },
                         Section::Settings => rsx! { SettingsView { session } },
                     }}
                 }
@@ -113,13 +114,14 @@ pub(super) fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, b
     let mut session = session;
     let section = session.read().section;
     let pending = session.read().state.approvals.len();
-    let destinations: [(Section, &str, &str); 11] = [
+    let destinations: [(Section, &str, &str); 12] = [
         (Section::Chat, "chat", "Chats"),
         (Section::Browser, "globe", "Browser"),
         (Section::Tasks, "list", "Tasks"),
         (Section::Approvals, "approvals", "Approvals"),
         (Section::Memory, "memory", "Memory"),
         (Section::Connectors, "connectors", "Connectors"),
+        (Section::Marketplace, "grid", "Plugins"),
         (Section::Vault, "lock", "Vault"),
         (Section::Usage, "usage", "Usage"),
         (Section::Workflows, "workflows", "Workflows"),
@@ -132,7 +134,13 @@ pub(super) fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, b
                 button {
                     key: "{label}",
                     class: if section == target { "rail-btn labeled on" } else { "rail-btn labeled" },
-                    "aria-label": if target == Section::Approvals && pending > 0 { format!("{label}, {pending} pending") } else { label.to_owned() },
+                    "aria-label": if target == Section::Approvals && pending > 0 {
+                        format!("{label}, {pending} pending")
+                    } else if target == Section::Marketplace {
+                        "Plugins. Bots cannot call these yet.".to_owned()
+                    } else {
+                        label.to_owned()
+                    },
                     "aria-current": if section == target { "page" } else { "false" },
                     onclick: move |_| session.write().open_section(target),
                     Icon { name: icon, size: 18 }
@@ -360,13 +368,19 @@ pub(super) fn Sidebar(
         let bot_chats: HashSet<String> = bots.iter().map(|bot| format!("dir:{}", bot.id)).collect();
         let mut items = Vec::new();
 
+        // A bot shows when its name matches or one of its chats does, so the
+        // search (and Ctrl+K, which focuses it) can jump straight to a chat.
         let bot_rows = bots
             .iter()
             .filter(|bot| {
                 matches(
                     &state.bot_display_name(&bot.id),
                     &format!("bot {}", bot.role),
+                ) || !serabot_desktop::bot_chats::chats_matching(
+                    state.state.bot_chats.get(&bot.id),
+                    &needle,
                 )
+                .is_empty()
             })
             .collect::<Vec<_>>();
         if needle.is_empty() || !bot_rows.is_empty() {
@@ -394,14 +408,27 @@ pub(super) fn Sidebar(
                         .unwrap_or_default();
                     let extra = chats.iter().filter(|chat| !chat.primary).count();
                     let has_active = chats.iter().any(|chat| chat.id == current);
-                    // Open when the reader chose so; else when an extra chat
-                    // exists and one of them is the open chat.
-                    let open = chats_open()
-                        .get(&bot.id)
-                        .copied()
-                        .unwrap_or(extra > 0 && has_active);
+                    // Open when the reader chose so; else for the bot being
+                    // talked to, so switching and New chat are always in sight.
+                    let name_matches = matches(
+                        &state.bot_display_name(&bot.id),
+                        &format!("bot {}", bot.role),
+                    );
+                    let chat_hits = serabot_desktop::bot_chats::chats_matching(
+                        state.state.bot_chats.get(&bot.id),
+                        &needle,
+                    );
+                    // A search that hit a chat opens its bot's list.
+                    let open = !chat_hits.is_empty()
+                        || chats_open().get(&bot.id).copied().unwrap_or(
+                            serabot_desktop::bot_chats::default_chats_open(
+                                id == current || has_active,
+                            ),
+                        );
                     items.push(RailItem::Bot {
-                        active: id == current,
+                        // An open bot is a group header; the open chat is
+                        // marked on its own row below.
+                        active: id == current && !open,
                         pinned: pins.contains(&bot.id),
                         id,
                         label: state.bot_display_name(&bot.id),
@@ -413,10 +440,27 @@ pub(super) fn Sidebar(
                         extra_chats: extra,
                         chats_open: open,
                     });
-                    if open && extra > 0 {
+                    if open {
                         let all = chats_all().contains(&bot.id);
-                        let (shown, hidden) =
-                            serabot_desktop::bot_chats::visible_chats(&chats, all, &current);
+                        // While searching, a bot whose name did not match lists
+                        // only the chats that did.
+                        let searching_chats = !needle.is_empty() && !name_matches;
+                        let (shown, hidden) = if searching_chats {
+                            (chat_hits.clone(), 0)
+                        } else {
+                            serabot_desktop::bot_chats::visible_chats(&chats, all, &current)
+                        };
+                        // The main chat is listed even before the list loads.
+                        if needle.is_empty() && !chats.iter().any(|chat| chat.primary) {
+                            let main_id = format!("dir:{}", bot.id);
+                            items.push(RailItem::BotChat {
+                                active: main_id == current,
+                                unread: 0,
+                                id: main_id,
+                                title: "Main chat".to_owned(),
+                                primary: true,
+                            });
+                        }
                         for chat in shown {
                             let chat_unread = conversations
                                 .iter()
@@ -436,6 +480,12 @@ pub(super) fn Sidebar(
                                 bot: bot.id.clone(),
                                 hidden,
                                 all,
+                            });
+                        }
+                        if needle.is_empty() {
+                            items.push(RailItem::NewChat {
+                                bot: bot.id.clone(),
+                                enabled: bot.enabled,
                             });
                         }
                     }
@@ -610,7 +660,7 @@ pub(super) fn Sidebar(
                     class: "input",
                     id: "global-search",
                     value: "{search}",
-                    placeholder: "Search chats",
+                    placeholder: "Search chats (Ctrl+K)",
                     "aria-label": "Search chats and bots",
                     oninput: move |event| search.set(event.value()),
                 }
@@ -694,11 +744,10 @@ pub(super) fn Sidebar(
                                         let toggle_bot = pin_id.clone();
                                         rsx! {
                                             button {
-                                                class: if extra_chats > 0 { "row-chevron" } else { "row-chevron placeholder" },
+                                                class: "row-chevron",
                                                 title: if is_open { "Hide this bot\u{2019}s chats" } else { "Show this bot\u{2019}s chats" },
                                                 "aria-label": if is_open { "Hide chats of {label}" } else { "Show chats of {label}" },
                                                 "aria-expanded": if is_open { "true" } else { "false" },
-                                                disabled: extra_chats == 0,
                                                 onclick: move |event| {
                                                     event.stop_propagation();
                                                     chats_open.write().insert(toggle_bot.clone(), !is_open);
@@ -724,7 +773,12 @@ pub(super) fn Sidebar(
                                             if act.is_some() {
                                                 span { class: "thread-meta working-label", role: "status", "{act_label}" }
                                             }
-                                            span { class: "thread-meta", if enabled { "{role}" } else { "{role} · disabled" } }
+                                            span { class: "thread-meta",
+                                                if enabled { "{role}" } else { "{role} · disabled" }
+                                                if let Some(count) = serabot_desktop::bot_chats::chat_count_label(extra_chats) {
+                                                    " · {count}"
+                                                }
+                                            }
                                         }
                                         if unread > 0 {
                                             span { class: "unread-badge", "{unread}" }
@@ -860,6 +914,20 @@ pub(super) fn Sidebar(
                                             }
                                         }
                                     }
+                                }
+                            }
+                        },
+                        RailItem::NewChat { bot, enabled } => {
+                            rsx! {
+                                button {
+                                    key: "new-{bot}",
+                                    class: "thread-group chat-more new-chat-row",
+                                    r#type: "button",
+                                    disabled: !enabled,
+                                    "aria-label": "Start a new chat with this bot",
+                                    onclick: move |_| session.write().new_bot_chat(bot.clone()),
+                                    Icon { name: "plus", size: 14 }
+                                    "New chat"
                                 }
                             }
                         },
@@ -1038,79 +1106,348 @@ pub(super) fn step_icon(name: &str) -> &'static str {
     }
 }
 
-/// One live step: status icon, plain-language label, and inline Approve and
-/// Deny when it waits on the owner. Decisions use the approvals API, so the
-/// gateway still binds and audits them.
+/// One live step: connector name, a one-line summary, a spinner or a tick,
+/// and Approve / Deny when it waits. Decisions use the approvals API, so the
+/// gateway still binds and audits them. Inputs and results stay behind a
+/// disclosure; secrets were masked before they reached this view.
 #[component]
 pub(super) fn ActivityRow(mut session: Signal<Session>, step: Step) -> Element {
     let state_class = match step.phase {
-        StepPhase::Running => "step running",
+        StepPhase::Running | StepPhase::Progress => "step running",
         StepPhase::Done => "step done",
         StepPhase::Failed => "step failed",
         StepPhase::WaitingApproval => "step waiting",
     };
-    let status_icon = match step.phase {
-        StepPhase::Done => "check",
-        StepPhase::Failed => "x",
-        StepPhase::Running => "",
-        StepPhase::WaitingApproval => "lock",
+    let status_word = match step.phase {
+        StepPhase::Running => "Running",
+        StepPhase::Progress => "Still working",
+        StepPhase::Done => "Done",
+        StepPhase::Failed => "Failed",
+        StepPhase::WaitingApproval => "Waiting for your approval",
     };
+    let title = step.title.clone().unwrap_or_else(|| step.label.clone());
+    let summary = (step.title.is_some() && step.label != title).then(|| step.label.clone());
+    let duration = step
+        .duration_ms
+        .map(serabot_desktop::activity::format_duration);
     let approval = step.approval_id.clone();
+    let can_retry = session.read().state.can_send();
+    let last_user = session
+        .read()
+        .state
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| {
+            (message.role == Role::User && !message.content.trim().is_empty())
+                .then(|| message.content.clone())
+        });
+    let has_body = step.input_summary.is_some()
+        || !step.cards.is_empty()
+        || step.detail.is_some()
+        || step.result_summary.is_some();
+    let described = format!("{title}, {status_word}");
     rsx! {
-        div { class: "{state_class}",
-            span { class: "step-status",
-                if status_icon.is_empty() {
-                    span { class: "pill-dot live" }
-                } else {
-                    Icon { name: status_icon, size: 13 }
+        div { class: "{state_class}", role: "group", "aria-label": "{described}",
+            div { class: "step-head",
+                span { class: "step-status", "aria-hidden": "true",
+                    match step.phase {
+                        StepPhase::Running | StepPhase::Progress => rsx! { span { class: "step-spin" } },
+                        StepPhase::Done => rsx! { Icon { name: "check", size: 13 } },
+                        StepPhase::Failed => rsx! { Icon { name: "x", size: 13 } },
+                        StepPhase::WaitingApproval => rsx! { Icon { name: "lock", size: 13 } },
+                    }
+                }
+                span { class: "step-icon", "aria-hidden": "true",
+                    if let Some(group) = step.icon.strip_prefix("file:") {
+                        match file_icons::file_type_image_src(group) {
+                            Some(src) => rsx! {
+                                img {
+                                    class: "step-file-icon",
+                                    src: "{src}",
+                                    width: "14",
+                                    height: "14",
+                                    draggable: "false",
+                                    alt: "",
+                                }
+                            },
+                            None => rsx! { Icon { name: "folder", size: 14 } },
+                        }
+                    } else {
+                        Icon { name: step_icon(&step.icon), size: 14 }
+                    }
+                }
+                div { class: "step-copy",
+                    span { class: "step-title", "{title}" }
+                    if let Some(summary) = summary.clone() {
+                        span { class: "step-label", "{summary}" }
+                    }
+                }
+                if let Some(duration) = duration.clone() {
+                    span { class: "step-time", "{duration}" }
+                } else if step.phase.spinning() {
+                    span { class: "step-time", "Running" }
                 }
             }
-            span { class: "step-icon",
-                // File steps carry the real file-type icon (vscode-icons):
-                // "file:pdf" renders the vendored PDF glyph, anything else
-                // falls back to the console's folder icon.
-                if let Some(group) = step.icon.strip_prefix("file:") {
-                    match file_icons::file_type_image_src(group) {
-                        Some(src) => rsx! {
-                            img {
-                                class: "step-file-icon",
-                                src: "{src}",
-                                width: "14",
-                                height: "14",
-                                draggable: "false",
-                                alt: "",
+            if step.phase == StepPhase::WaitingApproval {
+                div { class: "step-wait", role: "status", "Waiting for your approval" }
+                if let Some(id) = approval {
+                    span { class: "step-actions",
+                        button {
+                            class: "btn primary sm",
+                            r#type: "button",
+                            "aria-label": "Approve this step",
+                            onclick: {
+                                let id = id.clone();
+                                move |_| session.write().decide(id.clone(), ApprovalDecision::Once)
+                            },
+                            "Approve"
+                        }
+                        button {
+                            class: "btn danger sm",
+                            r#type: "button",
+                            "aria-label": "Deny this step",
+                            onclick: move |_| session.write().decide(id.clone(), ApprovalDecision::Deny),
+                            "Deny"
+                        }
+                    }
+                }
+            }
+            if step.phase == StepPhase::Failed {
+                if let Some(error) = step.error.clone() {
+                    p { class: "step-error", role: "alert", "{error}" }
+                }
+                span { class: "step-actions",
+                    match step.action {
+                        StepAction::Retry => rsx! {
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                disabled: !can_retry || last_user.is_none(),
+                                "aria-label": "Retry this step",
+                                title: if can_retry { "Send your last message again" } else { "Wait until this reply finishes" },
+                                onclick: {
+                                    let text = last_user.clone().unwrap_or_default();
+                                    move |_| {
+                                        if !text.is_empty() {
+                                            session.write().regenerate(text.clone());
+                                        }
+                                    }
+                                },
+                                "Retry"
                             }
                         },
-                        None => rsx! { Icon { name: "folder", size: 14 } },
-                    }
-                } else {
-                    Icon { name: step_icon(&step.icon), size: 14 }
-                }
-            }
-            if let Some(detail) = step.detail.clone() {
-                // The reasoning text a model returned: collapsed, plain text.
-                details { class: "step-thinking",
-                    summary { class: "step-label", "{step.label}" }
-                    pre { class: "step-thinking-text", "{detail}" }
-                }
-            } else {
-                span { class: "step-label", "{step.label}" }
-            }
-            if let Some(id) = approval {
-                span { class: "step-actions",
-                    button {
-                        class: "btn primary sm",
-                        onclick: {
-                            let id = id.clone();
-                            move |_| session.write().decide(id.clone(), ApprovalDecision::Once)
+                        StepAction::Keys => rsx! {
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                "aria-label": "Open AI keys",
+                                onclick: move |_| session.write().open_section(Section::Providers),
+                                "Open AI keys"
+                            }
                         },
-                        "Approve"
+                        StepAction::Reconnect => rsx! {
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                "aria-label": "Try the connection again",
+                                onclick: move |_| session.write().retry_link(),
+                                "Reconnect"
+                            }
+                        },
+                        StepAction::None => rsx! {},
                     }
-                    button {
-                        class: "btn danger sm",
-                        onclick: move |_| session.write().decide(id.clone(), ApprovalDecision::Deny),
-                        "Deny"
+                }
+            }
+            if has_body {
+                details { class: "step-more",
+                    summary { class: "step-more-summary", "Details" }
+                    if let Some(input) = step.input_summary.clone() {
+                        div { class: "step-block",
+                            span { class: "step-k", "Input" }
+                            p { class: "step-v", "{input}" }
+                        }
                     }
+                    for (index, result) in step.cards.iter().cloned().enumerate() {
+                        StepResultBody { key: "{index}", session, result }
+                    }
+                    if step.cards.is_empty()
+                        && let Some(summary) = step.result_summary.clone()
+                    {
+                        div { class: "step-block",
+                            span { class: "step-k", "Result" }
+                            p { class: "step-v", "{summary}" }
+                        }
+                    }
+                    if let Some(detail) = step.detail.clone() {
+                        pre { class: "step-thinking-text", "{detail}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Audio, image, file, table, link, or plain text for one step result.
+#[component]
+fn StepResultBody(mut session: Signal<Session>, result: StepResult) -> Element {
+    let link = result
+        .url
+        .clone()
+        .filter(|url| serabot_desktop::activity::safe_link_url(url));
+    let link_label = result.title.clone().or_else(|| link.clone());
+    let caption = match (result.voice.clone(), result.model.clone()) {
+        (Some(voice), Some(model)) => Some(format!("{voice} · {model}")),
+        (Some(voice), None) => Some(voice),
+        (None, Some(model)) => Some(model),
+        (None, None) => None,
+    };
+    rsx! {
+        div { class: "step-block",
+            match result.kind {
+                ResultKind::Audio => rsx! {
+                    span { class: "step-k", "Audio" }
+                    if let Some(caption) = caption.clone() {
+                        span { class: "step-v", "{caption}" }
+                    }
+                    if let Some(hash) = result.artifact.clone() {
+                        crate::ui_files::InlineMedia {
+                            session,
+                            hash,
+                            mime: result.mime.clone().unwrap_or_else(|| "audio/mpeg".into()),
+                        }
+                    } else if let Some(url) = result.url.clone().filter(|url| serabot_desktop::activity::safe_media_url(url)) {
+                        audio {
+                            class: "media-player",
+                            controls: true,
+                            preload: "metadata",
+                            src: "{url}",
+                            "aria-label": "Audio",
+                        }
+                    }
+                },
+                ResultKind::Image => rsx! {
+                    span { class: "step-k", "Image" }
+                    if let Some(url) = result.url.clone().filter(|url| serabot_desktop::activity::safe_media_url(url)) {
+                        img { class: "step-preview", src: "{url}", alt: "Image from this step" }
+                    } else if let Some(hash) = result.artifact.clone() {
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            "aria-label": "Open the image",
+                            onclick: move |_| session.write().open_artifact(hash.clone()),
+                            "Open image"
+                        }
+                    }
+                },
+                ResultKind::File => rsx! {
+                    FileResult { session, result: result.clone() }
+                },
+                ResultKind::Table => rsx! {
+                    div { class: "md-table-wrap",
+                        table {
+                            if !result.columns.is_empty() {
+                                thead {
+                                    tr {
+                                        for (index, column) in result.columns.iter().cloned().enumerate() {
+                                            th { key: "{index}", "{column}" }
+                                        }
+                                    }
+                                }
+                            }
+                            tbody {
+                                for (row_index, row) in result.rows.iter().cloned().enumerate() {
+                                    tr { key: "{row_index}",
+                                        for (cell_index, cell) in row.iter().cloned().enumerate() {
+                                            td { key: "{cell_index}", "{cell}" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                ResultKind::Link => rsx! {
+                    if let (Some(url), Some(label)) = (link.clone(), link_label.clone()) {
+                        a {
+                            class: "step-link",
+                            href: "{url}",
+                            target: "_blank",
+                            rel: "noopener noreferrer",
+                            "{label}"
+                        }
+                    } else if let Some(text) = result.text.clone() {
+                        p { class: "step-v", "{text}" }
+                    }
+                },
+                ResultKind::Text => rsx! {
+                    if let Some(text) = result.text.clone() {
+                        p { class: "step-v", "{text}" }
+                    }
+                },
+            }
+        }
+    }
+}
+
+#[component]
+fn FileResult(mut session: Signal<Session>, result: StepResult) -> Element {
+    let name = result
+        .name
+        .clone()
+        .or(result.title.clone())
+        .unwrap_or_else(|| "File".into());
+    let size = result.size.map(crate::ui_files::size_label);
+    let open_hash = result.artifact.clone();
+    let save_hash = result.artifact.clone();
+    let link = result
+        .artifact
+        .is_none()
+        .then(|| {
+            result
+                .url
+                .clone()
+                .filter(|url| serabot_desktop::activity::safe_link_url(url))
+        })
+        .flatten();
+    let open_label = format!("Open {name}");
+    let save_label = format!("Save {name}");
+    rsx! {
+        div { class: "step-file",
+            span { class: "step-icon", "aria-hidden": "true",
+                Icon { name: "paperclip", size: 16 }
+            }
+            div { class: "step-copy",
+                span { class: "step-title", "{name}" }
+                if let Some(size) = size {
+                    span { class: "step-time", "{size}" }
+                }
+            }
+            if let Some(hash) = open_hash {
+                button {
+                    class: "btn ghost sm",
+                    r#type: "button",
+                    "aria-label": "{open_label}",
+                    onclick: move |_| session.write().open_artifact(hash.clone()),
+                    "Open"
+                }
+            }
+            if let Some(hash) = save_hash {
+                button {
+                    class: "btn ghost sm",
+                    r#type: "button",
+                    "aria-label": "{save_label}",
+                    onclick: move |_| session.write().save_artifact_as(hash.clone()),
+                    "Save"
+                }
+            }
+            if let Some(url) = link {
+                a {
+                    class: "step-link",
+                    href: "{url}",
+                    target: "_blank",
+                    rel: "noopener noreferrer",
+                    "Open"
                 }
             }
         }
@@ -1129,7 +1466,7 @@ pub(super) fn PlanPanel(plan: serabot_desktop::chat_plan::ChatPlan) -> Element {
     let percent = plan.done() * 100 / total;
     rsx! {
         details { class: if complete { "plan-panel complete" } else { "plan-panel" },
-            summary { class: "plan-summary",
+            summary { class: "plan-summary", "aria-label": "{plan.goal}. {progress}",
                 span { class: "plan-chevron", Icon { name: "chevron-right", size: 12 } }
                 span { class: "plan-goal", title: "{plan.goal}", "{plan.goal}" }
                 span { class: "plan-progress", "{progress}" }
@@ -1203,6 +1540,8 @@ pub(super) enum RailItem {
         hidden: usize,
         all: bool,
     },
+    /// "New chat" under an open bot: a plain text row, not an icon to hunt for.
+    NewChat { bot: String, enabled: bool },
     Thread {
         id: String,
         label: String,
@@ -1457,7 +1796,11 @@ pub(super) fn Topbar(
                 }
             }
             div { class: "chat-header-copy",
-                strong { "{title}" }
+                if let Some(bot) = active_bot.clone() {
+                    ChatSwitcher { session, bot, title: title.clone() }
+                } else {
+                    strong { "{title}" }
+                }
                 if let Some(text) = header_label {
                     span { class: "working-label", role: "status", "{text}" }
                 } else {
@@ -1471,7 +1814,10 @@ pub(super) fn Topbar(
                 "{pill_label}"
             }
             div { class: "chat-header-actions",
-                button {
+                // The member stack belongs to groups and rooms; in a one-to-one
+                // chat it only repeated every enabled bot.
+                if !is_bot_chat {
+                  button {
                     class: "avatar-stack",
                     title: "Bots in this chat",
                     "aria-label": "Bots in this chat",
@@ -1488,6 +1834,7 @@ pub(super) fn Topbar(
                             span { class: "avatar sm bot", style: avatar_style(&id), "{avatar}" }
                         }
                     }
+                }
                 }
                 button {
                     class: "icon-btn",

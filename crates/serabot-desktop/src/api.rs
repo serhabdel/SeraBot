@@ -3455,6 +3455,102 @@ impl ApiClient {
         Ok(page)
     }
 
+    /// `GET /v1/marketplace/plugins`: the catalog with this user's state.
+    pub fn marketplace_plugins(&self) -> Result<Vec<crate::marketplace::PluginSummary>, ApiError> {
+        let list: crate::marketplace::PluginList =
+            self.get(&["v1", "marketplace", "plugins"], &[])?;
+        if list.plugins.len() > crate::marketplace::MAX_PLUGINS
+            || list
+                .plugins
+                .iter()
+                .any(|plugin| !valid_slug_id(&plugin.slug))
+        {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(list.plugins)
+    }
+
+    /// `GET /v1/marketplace/plugins/{slug}`.
+    pub fn marketplace_plugin(
+        &self,
+        slug: &str,
+    ) -> Result<crate::marketplace::PluginDetail, ApiError> {
+        check_slug(slug)?;
+        let detail: crate::marketplace::PluginDetail =
+            self.get(&["v1", "marketplace", "plugins", slug], &[])?;
+        if detail.plugin.slug != slug
+            || detail.plugin.prompts.len() > crate::marketplace::MAX_ITEMS
+            || detail.plugin.apps.len() > crate::marketplace::MAX_ITEMS
+            || detail.plugin.description.len() > crate::marketplace::MAX_TEXT
+        {
+            return Err(ApiError::InvalidResponse);
+        }
+        Ok(detail)
+    }
+
+    /// Install, enable, disable or uninstall one plugin for this user.
+    pub fn marketplace_act(
+        &self,
+        slug: &str,
+        action: crate::marketplace::PluginAction,
+    ) -> Result<(), ApiError> {
+        use crate::marketplace::PluginAction;
+        check_slug(slug)?;
+        let leaf = match action {
+            PluginAction::Install => "install",
+            PluginAction::Enable => "enable",
+            PluginAction::Disable => "disable",
+            PluginAction::Uninstall => "",
+        };
+        let _: serde_json::Value = if action == PluginAction::Uninstall {
+            self.request::<_, ()>(
+                Method::DELETE,
+                &["v1", "marketplace", "plugins", slug],
+                &[],
+                None,
+            )?
+        } else {
+            self.request(
+                Method::POST,
+                &["v1", "marketplace", "plugins", slug, leaf],
+                &[],
+                Some(&serde_json::json!({})),
+            )?
+        };
+        Ok(())
+    }
+
+    /// `PUT /v1/marketplace/plugins/{slug}/config`. The values go straight to
+    /// the server's sealed store; nothing is returned but whether each field
+    /// is configured.
+    pub fn marketplace_config(
+        &self,
+        slug: &str,
+        values: &[(String, Zeroizing<String>)],
+    ) -> Result<(), ApiError> {
+        check_slug(slug)?;
+        if values.is_empty() || values.len() > crate::marketplace::MAX_ITEMS {
+            return Err(ApiError::Validation("Fill in at least one field."));
+        }
+        let mut map = serde_json::Map::new();
+        for (id, value) in values {
+            if !valid_id(id) || !crate::marketplace::valid_secret_input(value) {
+                return Err(ApiError::Validation("Each field must be one line of text."));
+            }
+            map.insert(
+                id.clone(),
+                serde_json::Value::String(value.trim().to_owned()),
+            );
+        }
+        let _: serde_json::Value = self.request(
+            Method::PUT,
+            &["v1", "marketplace", "plugins", slug, "config"],
+            &[],
+            Some(&serde_json::json!({ "values": map })),
+        )?;
+        Ok(())
+    }
+
     /// `GET /v1/bots/{bot}/chats`: the bot's chats, primary chat first.
     pub fn list_bot_chats(&self, bot: &str) -> Result<crate::bot_chats::BotChatList, ApiError> {
         check_id(bot)?;
@@ -5105,6 +5201,23 @@ pub fn valid_conversation_title(title: &str) -> bool {
     !title.is_empty()
         && title.chars().count() <= MAX_CONVERSATION_TITLE_CHARS
         && !title.chars().any(char::is_control)
+}
+
+/// A plugin slug: lowercase letters, digits and dashes, 1 to 64 characters.
+fn valid_slug_id(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= 64
+        && slug
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+fn check_slug(slug: &str) -> Result<(), ApiError> {
+    if valid_slug_id(slug) {
+        Ok(())
+    } else {
+        Err(ApiError::Validation("That plugin name is not valid."))
+    }
 }
 
 fn check_bot_chat(chat: &crate::bot_chats::BotChat) -> Result<(), ApiError> {

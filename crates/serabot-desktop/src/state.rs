@@ -196,8 +196,21 @@ pub struct State {
     pub transcript: Option<String>,
     pub transcript_error: Option<String>,
     pub transcript_loading: bool,
+    /// A failed send, shown in the chat instead of a raw error banner.
+    pub chat_failure: Option<crate::chat_failure::ChatFailure>,
+    /// Text from a send that did not land, or whose outcome is unknown.
+    /// Putting it back fills the composer; it is never sent by itself.
+    pub held_draft: Option<String>,
     pub created_bot: Option<CreatedBot>,
     pub created_conversation: Option<CreatedConversation>,
+    /// The Marketplace catalog with this user's state (owner-scoped).
+    pub marketplace: Vec<crate::marketplace::PluginSummary>,
+    pub marketplace_loaded: bool,
+    /// A server without the marketplace routes (404): the screen says so.
+    pub marketplace_unavailable: bool,
+    pub marketplace_error: Option<String>,
+    /// The open plugin page.
+    pub marketplace_detail: Option<crate::marketplace::PluginDetail>,
     /// Each bot's chats (owner-scoped, kept across conversation switches).
     pub bot_chats: BTreeMap<String, crate::bot_chats::BotChatList>,
     /// Bots whose chat list has been read at least once.
@@ -312,8 +325,15 @@ impl Default for State {
             transcript: None,
             transcript_error: None,
             transcript_loading: false,
+            chat_failure: None,
+            held_draft: None,
             created_bot: None,
             created_conversation: None,
+            marketplace: Vec::new(),
+            marketplace_loaded: false,
+            marketplace_unavailable: false,
+            marketplace_error: None,
+            marketplace_detail: None,
             bot_chats: BTreeMap::new(),
             bot_chats_loaded: std::collections::BTreeSet::new(),
             created_bot_chat: None,
@@ -354,6 +374,11 @@ impl State {
         let conversation_titles = self.conversation_titles;
         let created_bot = self.created_bot.clone();
         let created_conversation = self.created_conversation.clone();
+        let marketplace = self.marketplace.clone();
+        let marketplace_loaded = self.marketplace_loaded;
+        let marketplace_unavailable = self.marketplace_unavailable;
+        let marketplace_error = self.marketplace_error.clone();
+        let marketplace_detail = self.marketplace_detail.clone();
         let bot_chats = self.bot_chats.clone();
         let bot_chats_loaded = self.bot_chats_loaded.clone();
         let created_bot_chat = self.created_bot_chat.clone();
@@ -405,6 +430,11 @@ impl State {
             conversation_titles,
             created_bot,
             created_conversation,
+            marketplace,
+            marketplace_loaded,
+            marketplace_unavailable,
+            marketplace_error,
+            marketplace_detail,
             bot_chats,
             bot_chats_loaded,
             created_bot_chat,
@@ -551,6 +581,38 @@ impl State {
             Reply::CreatedBot(bot) => self.created_bot = Some(bot),
             Reply::CreatedConversation(node) => self.created_conversation = Some(node),
             Reply::CreatedSkill(skill) => self.created_skill = Some(skill),
+            Reply::MarketplacePlugins(plugins) => {
+                self.marketplace = plugins;
+                self.marketplace_loaded = true;
+                self.marketplace_unavailable = false;
+                self.marketplace_error = None;
+            }
+            Reply::MarketplaceDetail(detail) => {
+                self.marketplace_detail = Some(*detail);
+                self.marketplace_error = None;
+            }
+            Reply::MarketplaceChanged {
+                slug,
+                plugins,
+                detail,
+            } => {
+                self.marketplace = plugins;
+                self.marketplace_loaded = true;
+                self.marketplace_unavailable = false;
+                self.marketplace_error = None;
+                if let Some(detail) = detail {
+                    self.marketplace_detail = Some(*detail);
+                } else if self
+                    .marketplace_detail
+                    .as_ref()
+                    .is_some_and(|page| page.plugin.slug == slug)
+                {
+                    // The page could not be re-read. Drop the stale copy so
+                    // its buttons don't describe a state the server didn't
+                    // confirm. The session says so.
+                    self.marketplace_detail = None;
+                }
+            }
             Reply::BotChats(list) => {
                 self.bot_chats_loaded.insert(list.bot.clone());
                 self.bot_chats.insert(list.bot.clone(), list);
@@ -558,11 +620,19 @@ impl State {
             Reply::BotChatCreated { bot, created } => {
                 let carried = created.carried_from.clone();
                 self.created_bot_chat = Some((bot.clone(), created.chat.id.clone(), carried));
-                if let Some(list) = self.bot_chats.get_mut(&bot)
-                    && !list.chats.iter().any(|chat| chat.id == created.chat.id)
-                {
+                // Keep the new chat even when the bot's list was never read:
+                // without it the chat could not be tied back to its bot.
+                let list = self.bot_chats.entry(bot.clone()).or_insert_with(|| {
+                    crate::bot_chats::BotChatList {
+                        bot: bot.clone(),
+                        refresh_every_turns: crate::bot_chats::DEFAULT_REFRESH_TURNS,
+                        chats: Vec::new(),
+                    }
+                });
+                if !list.chats.iter().any(|chat| chat.id == created.chat.id) {
                     list.chats.push(created.chat);
                 }
+                self.bot_chats_loaded.insert(bot);
             }
             Reply::BotRefreshSet(settings) => {
                 if let Some(list) = self.bot_chats.get_mut(&settings.bot) {
@@ -1395,6 +1465,81 @@ mod tests {
             turns: 0,
             has_summary: false,
         }
+    }
+
+    fn plugin(slug: &str, installed: bool) -> crate::marketplace::PluginSummary {
+        crate::marketplace::PluginSummary {
+            slug: slug.into(),
+            name: slug.to_uppercase(),
+            tagline: String::new(),
+            category: "research".into(),
+            version: "1.0.0".into(),
+            installed,
+            enabled: false,
+            status: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_new_chat_is_tied_to_its_bot_even_before_the_list_loaded() {
+        let mut state = State::default();
+        let scope = state.scope.clone();
+        assert!(state.bot_chats.is_empty());
+        state.receive(
+            &scope,
+            Reply::BotChatCreated {
+                bot: "analyst".into(),
+                created: crate::bot_chats::CreatedBotChat {
+                    chat: bot_chat("dir:chat-0a1b2c3d4e5f", false),
+                    carried_from: None,
+                },
+            },
+        );
+        let lists: Vec<_> = state.bot_chats.values().collect();
+        assert_eq!(
+            crate::bot_chats::bot_of_chat(lists, "dir:chat-0a1b2c3d4e5f").as_deref(),
+            Some("analyst")
+        );
+        assert!(state.bot_chats_loaded.contains("analyst"));
+    }
+
+    #[test]
+    fn marketplace_replies_fill_the_catalog_and_keep_it_across_switches() {
+        let mut state = State::default();
+        let scope = state.scope.clone();
+        assert!(!state.marketplace_loaded);
+        state.receive(
+            &scope,
+            Reply::MarketplacePlugins(vec![plugin("search", false), plugin("mail", false)]),
+        );
+        assert!(state.marketplace_loaded);
+        assert_eq!(state.marketplace.len(), 2);
+
+        // A change returns the refreshed list; an uninstall keeps the old page
+        // until the server's detail arrives.
+        state.receive(
+            &scope,
+            Reply::MarketplaceChanged {
+                slug: "search".into(),
+                plugins: vec![plugin("search", true), plugin("mail", false)],
+                detail: None,
+            },
+        );
+        assert!(state.marketplace[0].installed);
+        assert!(state.marketplace_detail.is_none());
+
+        // A failed read earlier is cleared by a good one.
+        state.marketplace_error = Some("old".into());
+        state.receive(
+            &scope,
+            Reply::MarketplacePlugins(vec![plugin("search", true)]),
+        );
+        assert!(state.marketplace_error.is_none());
+
+        // The catalog belongs to the owner, not the open chat.
+        state.new_scope("dir:legal".into(), true);
+        assert_eq!(state.marketplace.len(), 1);
+        assert!(state.marketplace_loaded);
     }
 
     #[test]

@@ -325,6 +325,7 @@ impl Tool for OpenRouterGenerateImageTool {
             artifact_hash: Some(first.hash.clone()),
             filename: Some(first.filename.clone()),
             destination: None,
+            cards: Vec::new(),
         })
     }
 }

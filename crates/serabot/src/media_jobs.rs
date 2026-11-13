@@ -105,6 +105,68 @@ pub enum MediaJobStatus {
     Expired,
 }
 
+/// A `turn.step` card for a background generation, so clients can finish the
+/// step that started as `progress` when the file is saved.
+fn media_step(
+    job: &MediaJob,
+    status: MediaJobStatus,
+    artifact_hash: Option<&str>,
+) -> serde_json::Value {
+    let phase = match status {
+        MediaJobStatus::Done => "done",
+        MediaJobStatus::Failed | MediaJobStatus::Expired => "failed",
+        _ => "progress",
+    };
+    let icon = match job.kind {
+        MediaKind::Audio => "mic",
+        MediaKind::Image => "file:image",
+        MediaKind::Video => "file:video",
+    };
+    let label = match phase {
+        "done" => "Media is ready",
+        "failed" => "Media generation failed",
+        _ => "Generating media",
+    };
+    let mut payload = json!({
+        "conversation_id": job.conversation_id,
+        "bot": job.bot,
+        "call_id": job.id,
+        "step": 0,
+        "phase": phase,
+        "tool": "media_job",
+        "icon": icon,
+        "label": label,
+        "input_summary": label,
+    });
+    if phase == "done" {
+        payload["result_summary"] = json!("Ready");
+        let mime = match job.kind {
+            MediaKind::Audio => "audio/mpeg",
+            MediaKind::Image => "image/png",
+            MediaKind::Video => "video/mp4",
+        };
+        if let Some(hash) = artifact_hash
+            && let Some(card) = crate::result_cards::card_for_file(
+                hash,
+                None,
+                Some(mime),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        {
+            payload["cards"] = json!([card]);
+        }
+    }
+    if phase == "failed" {
+        payload["error"] =
+            json!("The generation failed. Try a shorter request, or test the connection.");
+    }
+    payload
+}
+
 impl MediaJobStatus {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -442,6 +504,11 @@ impl Store {
                     "kind": job.kind.as_str(),
                     "status": status.as_str(),
                 }),
+            )?;
+            self.append_event(
+                user_id,
+                "turn.step",
+                &media_step(&job, status, artifact_hash),
             )?;
         }
         Ok(changed)
