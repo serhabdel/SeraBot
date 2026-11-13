@@ -16,7 +16,7 @@ use serabot_desktop::{
     chat_cards::{self, CardState, CardView},
     chat_compose,
     chat_failure::ChatAction,
-    chat_feed, chat_scroll, file_icons, provider_presets, provider_view,
+    chat_feed, chat_links, chat_scroll, file_icons, provider_presets, provider_view,
     session::{Section, Session, SettingsSection, SignInPhase, Theme, humanize_label},
     teams, ui_highlight,
     working::BotActivity,
@@ -661,6 +661,9 @@ fn App() -> Element {
     // `mut` is needed only by the Windows message pump below.
     #[cfg_attr(not(windows), allow(unused_mut))]
     let mut session = use_signal(Session::new);
+    // Chat links open through the session (the checked open path), so the
+    // markdown renderer reaches it by context instead of a raw anchor.
+    use_context_provider(|| session);
     #[cfg_attr(not(windows), allow(unused_mut))]
     let mut revision = use_signal(|| 0u64);
     use_coroutine(move |_: UnboundedReceiver<()>| async move {
@@ -1130,7 +1133,7 @@ break
         }
 
         match &blocks[1] {
-            MdBlock::Table { headers, rows } => {
+            MdBlock::Table { headers, rows, .. } => {
                 assert_eq!(headers, &["Name", "Role", "Status"]);
                 assert_eq!(rows.len(), 2);
                 assert_eq!(rows[0], &["Analyst", "Finance", "Live"]);
@@ -1138,6 +1141,129 @@ break
             }
             other => panic!("expected Table, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn image_markdown_is_a_chip_never_a_link_or_a_load() {
+        let spans = parse_inline("see ![chart](https://x.example/c.png) now");
+        assert_eq!(
+            spans,
+            vec![
+                InlineSpan::Text("see ".into()),
+                InlineSpan::Image {
+                    alt: "chart".into(),
+                    url: "https://x.example/c.png".into()
+                },
+                InlineSpan::Text(" now".into()),
+            ]
+        );
+        // A lone "!" and a plain link are unchanged.
+        assert_eq!(
+            parse_inline("wow! [a](https://b.example)"),
+            vec![
+                InlineSpan::Text("wow! ".into()),
+                InlineSpan::Link {
+                    label: "a".into(),
+                    url: "https://b.example".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unsafe_link_text_survives_parsing_for_the_renderer_to_refuse() {
+        // The parser keeps the span; the renderer decides with `safe_chat_link`.
+        let spans = parse_inline("[click](javascript:alert(1))");
+        assert!(matches!(
+            &spans[0],
+            InlineSpan::Link { url, .. } if chat_links::safe_chat_link(url).is_none()
+        ));
+    }
+
+    #[test]
+    fn nested_lists_keep_up_to_three_levels() {
+        let blocks = parse_markdown_blocks("- a\n  - b\n    - c\n      - d\n- e");
+        let MdBlock::NestedList { items, .. } = &blocks[0] else {
+            panic!("expected NestedList, got {blocks:?}");
+        };
+        let depths: Vec<u8> = items.iter().map(|item| item.depth).collect();
+        // The fourth level is shown at the third.
+        assert_eq!(depths, vec![0, 1, 2, 2, 0]);
+        // Flat lists stay flat.
+        assert!(matches!(
+            parse_markdown_blocks("- a\n- b")[0],
+            MdBlock::UnorderedList(_)
+        ));
+    }
+
+    #[test]
+    fn two_and_four_space_nesting_both_work() {
+        let mut stack = Vec::new();
+        assert_eq!(list_depth(&mut stack, 0), 0);
+        assert_eq!(list_depth(&mut stack, 4), 1);
+        assert_eq!(list_depth(&mut stack, 8), 2);
+        assert_eq!(list_depth(&mut stack, 4), 1);
+        assert_eq!(list_depth(&mut stack, 0), 0);
+        assert_eq!(leading_indent("\t- x"), 4);
+        assert_eq!(leading_indent("  - x"), 2);
+    }
+
+    #[test]
+    fn bullets_under_a_numbered_item_nest_and_numbers_count_per_level() {
+        let blocks = parse_markdown_blocks("1. one\n   - note\n2. two");
+        let MdBlock::NestedList { start, items } = &blocks[0] else {
+            panic!("expected NestedList, got {blocks:?}");
+        };
+        let markers = nested_markers(*start, items);
+        assert_eq!(markers, vec!["1.", "\u{25e6}", "2."]);
+        let deep = [
+            NestedItem {
+                depth: 0,
+                ordered: true,
+                text: "a".into(),
+            },
+            NestedItem {
+                depth: 1,
+                ordered: true,
+                text: "b".into(),
+            },
+            NestedItem {
+                depth: 1,
+                ordered: true,
+                text: "c".into(),
+            },
+            NestedItem {
+                depth: 0,
+                ordered: true,
+                text: "d".into(),
+            },
+            NestedItem {
+                depth: 1,
+                ordered: true,
+                text: "e".into(),
+            },
+        ];
+        assert_eq!(nested_markers(1, &deep), vec!["1.", "1.", "2.", "2.", "1."]);
+    }
+
+    #[test]
+    fn table_alignment_comes_from_the_separator_row() {
+        assert_eq!(
+            parse_aligns("|:---|:---:|---:|---|"),
+            vec![Align::Left, Align::Center, Align::Right, Align::Left]
+        );
+        let blocks = parse_markdown_blocks("| a | b | c |\n|:--|:-:|--:|\n| 1 | 2 | 3 |");
+        let MdBlock::Table { aligns, .. } = &blocks[0] else {
+            panic!("expected Table");
+        };
+        assert_eq!(aligns, &[Align::Left, Align::Center, Align::Right]);
+    }
+
+    #[test]
+    fn only_long_code_is_capped() {
+        assert!(!code_is_long("one\ntwo"));
+        assert!(!code_is_long(&"x\n".repeat(CODE_LINES_BEFORE_CAP)));
+        assert!(code_is_long(&"x\n".repeat(CODE_LINES_BEFORE_CAP + 1)));
     }
 
     #[test]

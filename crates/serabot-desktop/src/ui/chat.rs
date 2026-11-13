@@ -414,6 +414,13 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         }
     }
     let empty = messages.is_empty();
+    // Until this chat's transcript has arrived, show placeholders instead of
+    // the "start a conversation" empty state (it used to flash on every open).
+    let history_loading = empty && {
+        let state = session.read();
+        state.state.connected && !state.state.history_loaded && state.state.error.is_none()
+    };
+    let conversation_id = session.read().conversation.clone();
     // On a new chat: where it started from (the bot's memory and a summary).
     let memory_note = {
         let state = session.read();
@@ -547,6 +554,8 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                 div {
                     class: if group_like { "messages group" } else { "messages" },
                     id: "messages",
+                    // The page keeps each chat's scroll position by this id.
+                    "data-conv": "{conversation_id}",
                     // A log landmark for screen readers. Live announcements are
                     // off: announcing every streamed token would be noise.
                     role: "log",
@@ -562,7 +571,14 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             }
                         }
                     }
-                    if empty {
+                    if history_loading {
+                        div { class: "transcript-skeleton", role: "status", "aria-label": "Loading messages",
+                            div { class: "sk-row user", span { class: "sk-bar w40" } }
+                            div { class: "sk-row", span { class: "sk-bar w90" } span { class: "sk-bar w75" } span { class: "sk-bar w55" } }
+                            div { class: "sk-row user", span { class: "sk-bar w25" } }
+                            div { class: "sk-row", span { class: "sk-bar w80" } span { class: "sk-bar w60" } }
+                        }
+                    } else if empty {
                         div { class: "empty",
                             div {
                                 class: "empty-icon",
