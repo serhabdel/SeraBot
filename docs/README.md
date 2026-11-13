@@ -26,6 +26,7 @@ artifacts.
 | [Multi-user spec](specs/multi-user-reconstruction.md) | Owner-approved and implemented: small-circle multi-user — OIDC sign-in, UID-scoped data, per-user bots, credentials, and connectors. |
 | [Big Wave (0.29–0.31)](specs/big-wave.md) | Visibility, reliability, and deep ops waves — Workflows, traces, per-user schedules, vault/browser polish; checklist in `tasks/big-wave.md`. |
 | [Release 0.37.0](release-0.37.0.md) | Bots finish the task instead of refusing; live step cards; typed tool results; page data for Tasks, Memory, Connectors, and Providers. |
+| [Release 0.38.0](release-0.38.0.md) | Working chat switching and a steadier chat view; one Integrations screen; plugin tools for bots; safe links and richer markdown in chat. |
 | [Events](events.md) | `turn.step` payload for desktop and Android step cards. |
 | [Tool results](tool-results.md) | Audio, file, image, link, and table cards. |
 | [Console pages](console-pages.md) | Tasks, Memory, Connectors, and Providers fields the next desktop pages read. |

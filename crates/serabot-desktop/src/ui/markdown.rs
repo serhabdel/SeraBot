@@ -116,6 +116,12 @@ pub fn nested_markers(start: usize, items: &[NestedItem]) -> Vec<String> {
 
 /// The alignment of each column from a table separator row such as
 /// `|:---|:---:|---:|`.
+/// A table separator row: pipes around cells made of dashes and optional colons.
+pub fn is_table_separator(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('|') && t.contains('-') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+}
+
 pub fn parse_aligns(separator: &str) -> Vec<Align> {
     separator
         .trim()
@@ -275,11 +281,7 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
         }
 
         // Markdown Table
-        if trimmed.starts_with('|')
-            && i + 1 < lines.len()
-            && lines[i + 1].trim().starts_with('|')
-            && lines[i + 1].contains("---")
-        {
+        if trimmed.starts_with('|') && i + 1 < lines.len() && is_table_separator(lines[i + 1]) {
             let parse_table_row = |row: &str| -> Vec<String> {
                 let trimmed_row = row.trim().trim_start_matches('|').trim_end_matches('|');
                 trimmed_row
@@ -465,7 +467,7 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
                 || p_trim.starts_with("• ")
                 || (p_trim.starts_with('|')
                     && i + 1 < lines.len()
-                    && lines[i + 1].trim().starts_with('|'))
+                    && is_table_separator(lines[i + 1]))
                 || (p_trim == "---" || p_trim == "***" || p_trim == "___")
             {
                 break;
