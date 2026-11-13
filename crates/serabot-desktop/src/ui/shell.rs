@@ -1787,7 +1787,10 @@ pub(super) fn Topbar(
                 "{pill_label}"
             }
             div { class: "chat-header-actions",
-                button {
+                // The member stack belongs to groups and rooms; in a one-to-one
+                // chat it only repeated every enabled bot.
+                if !is_bot_chat {
+                  button {
                     class: "avatar-stack",
                     title: "Bots in this chat",
                     "aria-label": "Bots in this chat",
@@ -1804,6 +1807,7 @@ pub(super) fn Topbar(
                             span { class: "avatar sm bot", style: avatar_style(&id), "{avatar}" }
                         }
                     }
+                }
                 }
                 button {
                     class: "icon-btn",

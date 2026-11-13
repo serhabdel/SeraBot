@@ -600,37 +600,39 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     }
                                 }
                             }
-                            div { class: "roster",
-                                for (bot_id, bot_name, bot_avatar, bot_enabled, bot_live, bot_role) in roster.clone() {
-                                    div {
-                                        key: "{bot_id}",
-                                        class: "roster-row",
-                                        span { class: "avatar bot", style: avatar_style(&bot_id), "{bot_avatar}" }
-                                        span { class: "thread-title", "{bot_name}" }
-                                        span { class: "thread-meta", "{bot_role}" }
-                                        if !bot_enabled {
-                                            span { class: "chip warn", "disabled" }
-                                        } else if !bot_live {
-                                            span { class: "chip warn", "restart required" }
-                                        }
-                                        button {
-                                            class: "btn ghost sm",
-                                            onclick: {
-                                                let bot_id = bot_id.clone();
-                                                move |_| session.write().open_bot_chat(bot_id.clone())
-                                            },
-                                            "1:1"
-                                        }
-                                        if room {
+                            if !is_one_to_one {
+                                div { class: "roster",
+                                    for (bot_id, bot_name, bot_avatar, bot_enabled, bot_live, bot_role) in roster.clone() {
+                                        div {
+                                            key: "{bot_id}",
+                                            class: "roster-row",
+                                            span { class: "avatar bot", style: avatar_style(&bot_id), "{bot_avatar}" }
+                                            span { class: "thread-title", "{bot_name}" }
+                                            span { class: "thread-meta", "{bot_role}" }
+                                            if !bot_enabled {
+                                                span { class: "chip warn", "disabled" }
+                                            } else if !bot_live {
+                                                span { class: "chip warn", "restart required" }
+                                            }
                                             button {
                                                 class: "btn ghost sm",
-                                                disabled: !bot_enabled || in_team.contains(&bot_id),
-                                                title: if in_team.contains(&bot_id) { "Already in the group" } else { "Add to the group" },
                                                 onclick: {
                                                     let bot_id = bot_id.clone();
-                                                    move |_| session.write().add_team_member(bot_id.clone())
+                                                    move |_| session.write().open_bot_chat(bot_id.clone())
                                                 },
-                                                "add to group"
+                                                "1:1"
+                                            }
+                                            if room {
+                                                button {
+                                                    class: "btn ghost sm",
+                                                    disabled: !bot_enabled || in_team.contains(&bot_id),
+                                                    title: if in_team.contains(&bot_id) { "Already in the group" } else { "Add to the group" },
+                                                    onclick: {
+                                                        let bot_id = bot_id.clone();
+                                                        move |_| session.write().add_team_member(bot_id.clone())
+                                                    },
+                                                    "add to group"
+                                                }
                                             }
                                         }
                                     }
