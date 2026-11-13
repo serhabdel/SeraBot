@@ -828,18 +828,6 @@
   color: var(--accent-ink);
 }
 
-/* Connectors and Plugins share one screen: tabs under the title. */
-.integration-tabs {
-  margin-top: 12px;
-  align-self: flex-start;
-}
-
-/* Connectors and Plugins share one screen: tabs under the title. */
-.integration-tabs {
-  margin-top: 12px;
-  align-self: flex-start;
-}
-
 /* ===== Chat view (PR-N) =====
    1. The composer sits in the flow under the transcript instead of floating
       over it. It used to be absolutely positioned while the transcript only

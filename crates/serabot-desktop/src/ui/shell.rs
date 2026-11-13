@@ -114,13 +114,14 @@ pub(super) fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, b
     let mut session = session;
     let section = session.read().section;
     let pending = session.read().state.approvals.len();
-    let destinations: [(Section, &str, &str); 11] = [
+    let destinations: [(Section, &str, &str); 12] = [
         (Section::Chat, "chat", "Chats"),
         (Section::Browser, "globe", "Browser"),
         (Section::Tasks, "list", "Tasks"),
         (Section::Approvals, "approvals", "Approvals"),
         (Section::Memory, "memory", "Memory"),
         (Section::Connectors, "connectors", "Connectors"),
+        (Section::Marketplace, "grid", "Plugins"),
         (Section::Vault, "lock", "Vault"),
         (Section::Usage, "usage", "Usage"),
         (Section::Workflows, "workflows", "Workflows"),
@@ -132,7 +133,7 @@ pub(super) fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, b
             for (target, icon, label) in destinations {
                 button {
                     key: "{label}",
-                    class: if section == target || (target == Section::Connectors && section == Section::Marketplace) { "rail-btn labeled on" } else { "rail-btn labeled" },
+                    class: if section == target { "rail-btn labeled on" } else { "rail-btn labeled" },
                     "aria-label": if target == Section::Approvals && pending > 0 {
                         format!("{label}, {pending} pending")
                     } else if target == Section::Marketplace {
@@ -140,7 +141,7 @@ pub(super) fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, b
                     } else {
                         label.to_owned()
                     },
-                    "aria-current": if section == target || (target == Section::Connectors && section == Section::Marketplace) { "page" } else { "false" },
+                    "aria-current": if section == target { "page" } else { "false" },
                     onclick: move |_| session.write().open_section(target),
                     Icon { name: icon, size: 18 }
                     span { class: "rail-label", "{label}" }

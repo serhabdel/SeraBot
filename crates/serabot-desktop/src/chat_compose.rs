@@ -408,7 +408,6 @@ mod tests {
             ".msg.bot .msg-body {\n  max-width: 100%;",
             ".chat-switcher-btn {",
             ".thread-group.new-chat-row {",
-            ".integration-tabs {",
         ] {
             assert!(css.contains(needle), "missing chat rule: {needle}");
         }
