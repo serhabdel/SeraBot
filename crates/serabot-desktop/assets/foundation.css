@@ -944,3 +944,225 @@
 .msg.user .msg-action-time {
   order: -1;
 }
+
+/* Chat links (PR-P): a link is a button that opens through the app; a link that
+   is not safe is plain text. Images are chips, never loaded. */
+button.md-link {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent-ink);
+  font: inherit;
+  text-align: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+button.md-link:hover {
+  text-decoration-thickness: 2px;
+}
+
+button.md-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+.md-link-blocked {
+  color: inherit;
+}
+
+.md-image-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 2px 10px;
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--label-2);
+  font: inherit;
+  font-size: var(--fs-caption);
+  vertical-align: baseline;
+}
+
+button.md-image-chip {
+  cursor: pointer;
+}
+
+button.md-image-chip:hover {
+  color: var(--label-1);
+  border-color: var(--accent);
+}
+
+.md-image-chip > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Long code is capped at 360 px with a Show all button (PR-P). */
+.md-code-block.capped pre {
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.md-code-more {
+  display: block;
+  width: 100%;
+  padding: 6px 12px;
+  border: 0;
+  border-top: 1px solid var(--hairline);
+  background: var(--code-head-bg);
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+  cursor: pointer;
+}
+
+.md-code-more:hover {
+  color: var(--label-1);
+}
+
+.md-code-more:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* Table columns follow the :---: markers. */
+.md-table th.md-al-left,
+.md-table td.md-al-left {
+  text-align: left;
+}
+
+.md-table th.md-al-center,
+.md-table td.md-al-center {
+  text-align: center;
+}
+
+.md-table th.md-al-right,
+.md-table td.md-al-right {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Nested lists, three levels. */
+.md-list.md-nested {
+  list-style: none;
+  padding-left: 0;
+}
+
+.md-li {
+  display: flex;
+  gap: 8px;
+}
+
+.md-li.md-d1 {
+  margin-left: 20px;
+}
+
+.md-li.md-d2 {
+  margin-left: 40px;
+}
+
+.md-marker {
+  flex: 0 0 auto;
+  min-width: 1.2em;
+  color: var(--label-2);
+  text-align: right;
+}
+
+.md-li-text {
+  min-width: 0;
+}
+
+/* Transcript placeholders while a chat loads. They appear after a beat, so a
+   quick load shows nothing at all. */
+.transcript-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 24px 0;
+  opacity: 0;
+  animation: sk-in 160ms ease-out 300ms forwards;
+}
+
+@keyframes sk-in {
+  to {
+    opacity: 1;
+  }
+}
+
+.sk-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.sk-row.user {
+  align-items: flex-end;
+}
+
+.sk-bar {
+  display: block;
+  height: 14px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+
+.sk-row.user .sk-bar {
+  height: 32px;
+  border-radius: var(--r-md);
+}
+
+.sk-bar.w25 { width: 25%; }
+.sk-bar.w40 { width: 40%; }
+.sk-bar.w55 { width: 55%; }
+.sk-bar.w60 { width: 60%; }
+.sk-bar.w75 { width: 75%; }
+.sk-bar.w80 { width: 80%; }
+.sk-bar.w90 { width: 90%; }
+
+@media (prefers-reduced-motion: reduce) {
+  .transcript-skeleton {
+    animation-duration: 1ms;
+  }
+}
+
+.root[data-motion="reduce"] .transcript-skeleton {
+  animation-duration: 1ms;
+}
+
+/* A tidier chat header on narrow windows: the words on the buttons go, the
+   icons stay, and the title keeps the room. */
+@media (max-width: 1100px) {
+  .chat-header .btn-label {
+    display: none;
+  }
+
+  .chat-header .chat-header-copy {
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .chat-header .chat-header-copy span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .chat-header .pill {
+    display: none;
+  }
+}
+
+@media (max-width: 800px) {
+  .chat-header .yolo-btn,
+  .chat-header .watch-btn {
+    padding-inline: 8px;
+  }
+}

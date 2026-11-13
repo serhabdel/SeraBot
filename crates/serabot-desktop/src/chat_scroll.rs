@@ -101,8 +101,32 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
   let lastHeight = 0;
   let raf = 0;
   const seen = new WeakSet();
+  // Where the reader was in each chat they scrolled away from (kept while the
+  // app runs). `pending` restores one after the transcript has loaded.
+  const saved = {};
+  let pending = null;
 
   const box = () => document.getElementById('messages');
+  const convOf = (b) => (b && b.dataset && b.dataset.conv) || '';
+
+  // Put a remembered position back once the page is tall enough; give up
+  // after a short while so an empty or short chat never waits.
+  const tryRestore = () => {
+    const b = box();
+    if (!b || !pending) return;
+    if (convOf(b) !== pending.conv) {
+      pending = null;
+      return;
+    }
+    pending.tries += 1;
+    const room = b.scrollHeight - b.clientHeight;
+    if (room >= pending.top || pending.tries > 40) {
+      b.scrollTop = Math.min(pending.top, Math.max(0, room));
+      lastTop = b.scrollTop;
+      lastHeight = b.scrollHeight;
+      pending = null;
+    }
+  };
 
   const report = () => {
     if (reported === follow) return;
@@ -129,6 +153,10 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
     if (raf) return;
     raf = requestAnimationFrame(() => {
       raf = 0;
+      if (pending) {
+        tryRestore();
+        return;
+      }
       if (follow) snap();
     });
   };
@@ -139,6 +167,10 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
   };
 
   window.__serabotPinMessages = (force) => {
+    if (pending) {
+      schedule();
+      return;
+    }
     if (force) {
       follow = true;
       snap();
@@ -163,6 +195,13 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
       b.__serabotHooked = true;
       lastTop = b.scrollTop;
       lastHeight = b.scrollHeight;
+      // A chat the reader left scrolled up comes back at the same place.
+      const memory = saved[convOf(b)];
+      if (memory && memory.stick === false) {
+        pending = { conv: convOf(b), top: memory.top, tries: 0 };
+        follow = false;
+        report();
+      }
       b.addEventListener('wheel', (e) => { if (e.deltaY < 0) away(); }, { passive: true });
       b.addEventListener('touchmove', away, { passive: true });
       b.addEventListener('keydown', (e) => {
@@ -174,6 +213,7 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
         if (top < lastTop - 1 && height >= lastHeight) setFollow(false);
         lastTop = top;
         lastHeight = height;
+        if (!pending) saved[convOf(b)] = { top: top, stick: follow };
       }, { passive: true });
       const io = new IntersectionObserver((entries) => {
         for (const entry of entries) {

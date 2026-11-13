@@ -22,8 +22,122 @@ pub enum MdBlock {
     Table {
         headers: Vec<String>,
         rows: Vec<Vec<String>>,
+        /// One per column, from the `:---:` markers of the separator row.
+        aligns: Vec<Align>,
+    },
+    /// A list with indented items (up to three levels), or bullets inside a
+    /// numbered list. Plain flat lists keep the simpler variants above.
+    NestedList {
+        start: usize,
+        items: Vec<NestedItem>,
     },
     Paragraph(String),
+}
+
+/// Column alignment of a table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Align {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+impl Align {
+    pub fn class(self) -> &'static str {
+        match self {
+            Align::Left => "md-al-left",
+            Align::Center => "md-al-center",
+            Align::Right => "md-al-right",
+        }
+    }
+}
+
+/// One line of a nested list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NestedItem {
+    /// 0 to [`MAX_LIST_DEPTH`].
+    pub depth: u8,
+    pub ordered: bool,
+    pub text: String,
+}
+
+/// Deepest list level shown (three levels: 0, 1, 2).
+pub const MAX_LIST_DEPTH: u8 = 2;
+
+/// Spaces before the first character; a tab counts as four.
+pub fn leading_indent(line: &str) -> usize {
+    line.chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .map(|c| if c == '\t' { 4 } else { 1 })
+        .sum()
+}
+
+/// The level of a list line, from its indent and the indents seen so far
+/// (`stack`). A deeper indent opens a level, a shallower one closes levels, so
+/// two- and four-space nesting both work. Capped at [`MAX_LIST_DEPTH`].
+pub fn list_depth(stack: &mut Vec<usize>, indent: usize) -> u8 {
+    while stack.last().is_some_and(|top| indent < *top) {
+        stack.pop();
+    }
+    match stack.last() {
+        Some(top) if *top == indent => {}
+        _ => stack.push(indent),
+    }
+    (stack.len() - 1).min(MAX_LIST_DEPTH as usize) as u8
+}
+
+/// The marker text of each nested item: bullets that change with the level,
+/// and numbers that count per level and restart under a new parent.
+pub fn nested_markers(start: usize, items: &[NestedItem]) -> Vec<String> {
+    let mut counters = [0usize; MAX_LIST_DEPTH as usize + 1];
+    let mut markers = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let depth = item.depth as usize;
+        for deeper in counters.iter_mut().skip(depth + 1) {
+            *deeper = 0;
+        }
+        counters[depth] += 1;
+        markers.push(if item.ordered {
+            let number = if depth == 0 && index == 0 {
+                start
+            } else if depth == 0 {
+                start + counters[0] - 1
+            } else {
+                counters[depth]
+            };
+            format!("{number}.")
+        } else {
+            ["\u{2022}", "\u{25E6}", "\u{25AA}"][depth].to_owned()
+        });
+    }
+    markers
+}
+
+/// The alignment of each column from a table separator row such as
+/// `|:---|:---:|---:|`.
+pub fn parse_aligns(separator: &str) -> Vec<Align> {
+    separator
+        .trim()
+        .trim_start_matches('|')
+        .trim_end_matches('|')
+        .split('|')
+        .map(|cell| {
+            let cell = cell.trim();
+            match (cell.starts_with(':'), cell.ends_with(':')) {
+                (true, true) => Align::Center,
+                (false, true) => Align::Right,
+                _ => Align::Left,
+            }
+        })
+        .collect()
+}
+
+/// Code taller than this shows a Show all button.
+pub const CODE_LINES_BEFORE_CAP: usize = 16;
+
+pub fn code_is_long(code: &str) -> bool {
+    code.lines().count() > CODE_LINES_BEFORE_CAP
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -32,7 +146,15 @@ pub enum InlineSpan {
     Code(String),
     Bold(Vec<InlineSpan>),
     Italic(String),
-    Link { label: String, url: String },
+    Link {
+        label: String,
+        url: String,
+    },
+    /// `![alt](url)`: shown as a chip, never loaded.
+    Image {
+        alt: String,
+        url: String,
+    },
 }
 
 pub(super) const MD_CACHE_MAX: usize = 384;
@@ -166,23 +288,32 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
                     .collect()
             };
             let headers = parse_table_row(trimmed);
+            let mut aligns = parse_aligns(lines[i + 1]);
+            aligns.resize(headers.len(), Align::Left);
             i += 2;
             let mut rows = Vec::new();
             while i < lines.len() && lines[i].trim().starts_with('|') {
                 rows.push(parse_table_row(lines[i]));
                 i += 1;
             }
-            blocks.push(MdBlock::Table { headers, rows });
+            blocks.push(MdBlock::Table {
+                headers,
+                rows,
+                aligns,
+            });
             continue;
         }
 
         // Unordered list
         if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("• ") {
             let mut items = Vec::new();
+            let mut depths: Vec<u8> = Vec::new();
+            let mut indents: Vec<usize> = Vec::new();
             while i < lines.len() {
                 let l_trim = lines[i].trim();
                 if l_trim.starts_with("- ") || l_trim.starts_with("* ") || l_trim.starts_with("• ")
                 {
+                    depths.push(list_depth(&mut indents, leading_indent(lines[i])));
                     let marker_len = if l_trim.starts_with("• ") { 3 } else { 2 };
                     items.push(
                         l_trim
@@ -205,7 +336,22 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
                     break;
                 }
             }
-            blocks.push(MdBlock::UnorderedList(items));
+            if depths.iter().any(|depth| *depth > 0) {
+                blocks.push(MdBlock::NestedList {
+                    start: 1,
+                    items: items
+                        .into_iter()
+                        .zip(depths)
+                        .map(|(text, depth)| NestedItem {
+                            depth,
+                            ordered: false,
+                            text,
+                        })
+                        .collect(),
+                });
+            } else {
+                blocks.push(MdBlock::UnorderedList(items));
+            }
             continue;
         }
 
@@ -224,6 +370,9 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
                 .parse::<usize>()
                 .unwrap_or(1);
             let mut items = Vec::new();
+            let mut depths: Vec<u8> = Vec::new();
+            let mut kinds: Vec<bool> = Vec::new();
+            let mut indents: Vec<usize> = Vec::new();
             while i < lines.len() {
                 let l_trim = lines[i].trim();
                 let fw = l_trim.split_whitespace().next().unwrap_or("");
@@ -248,7 +397,27 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
                 if fw.ends_with('.') && fw.trim_end_matches('.').chars().all(|c| c.is_ascii_digit())
                 {
                     let item_text = l_trim.get(fw.len()..).unwrap_or_default().trim().to_owned();
+                    depths.push(list_depth(&mut indents, leading_indent(lines[i])));
+                    kinds.push(true);
                     items.push(item_text);
+                    i += 1;
+                } else if !items.is_empty()
+                    && leading_indent(lines[i]) > 0
+                    && (l_trim.starts_with("- ")
+                        || l_trim.starts_with("* ")
+                        || l_trim.starts_with("• "))
+                {
+                    // A bullet under a numbered item.
+                    let marker_len = if l_trim.starts_with("• ") { 3 } else { 2 };
+                    depths.push(list_depth(&mut indents, leading_indent(lines[i])));
+                    kinds.push(false);
+                    items.push(
+                        l_trim
+                            .get(marker_len..)
+                            .unwrap_or_default()
+                            .trim()
+                            .to_owned(),
+                    );
                     i += 1;
                 } else if !l_trim.is_empty()
                     && (lines[i].starts_with("  ") || lines[i].starts_with('\t'))
@@ -263,7 +432,22 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
                     break;
                 }
             }
-            blocks.push(MdBlock::OrderedList { start, items });
+            if depths.iter().any(|depth| *depth > 0) || kinds.iter().any(|ordered| !ordered) {
+                blocks.push(MdBlock::NestedList {
+                    start,
+                    items: items
+                        .into_iter()
+                        .zip(depths.into_iter().zip(kinds))
+                        .map(|(text, (depth, ordered))| NestedItem {
+                            depth,
+                            ordered,
+                            text,
+                        })
+                        .collect(),
+                });
+            } else {
+                blocks.push(MdBlock::OrderedList { start, items });
+            }
             continue;
         }
 
@@ -335,6 +519,22 @@ pub fn parse_inline(text: &str) -> Vec<InlineSpan> {
             continue;
         }
 
+        // 4a. Image: ![alt](url). Kept as a chip; the app never fetches it.
+        if rest.starts_with("![")
+            && let Some(close_bracket) = rest.find(']')
+            && rest[close_bracket..].starts_with("](")
+        {
+            let after_bracket = &rest[close_bracket + 2..];
+            if let Some(close_paren) = after_bracket.find(')') {
+                spans.push(InlineSpan::Image {
+                    alt: rest[2..close_bracket].to_owned(),
+                    url: after_bracket[..close_paren].to_owned(),
+                });
+                rest = &after_bracket[close_paren + 1..];
+                continue;
+            }
+        }
+
         // 4. Link: [label](url)
         if rest.starts_with('[')
             && let Some(close_bracket) = rest.find(']')
@@ -372,7 +572,9 @@ pub fn parse_inline(text: &str) -> Vec<InlineSpan> {
         let next_pos = rest
             .char_indices()
             .skip(1)
-            .find(|(_, c)| matches!(c, '*' | '`' | '['))
+            .find(|(idx, c)| {
+                matches!(c, '*' | '`' | '[') || (*c == '!' && rest[idx + 1..].starts_with('['))
+            })
             .map(|(idx, _)| idx)
             .unwrap_or(rest.len());
 
@@ -398,8 +600,12 @@ pub(super) fn CodeBlock(lang: String, code: String) -> Element {
         name => name.to_owned(),
     };
     let tokens = ui_highlight::tokenize(&lang, &code);
+    let mut expanded = use_signal(|| false);
+    let long = code_is_long(&code);
+    let capped = long && !expanded();
+    let lines = code.lines().count();
     rsx! {
-        div { class: "md-code-block",
+        div { class: if capped { "md-code-block capped" } else { "md-code-block" },
             div { class: "md-code-head",
                 span { class: "md-code-lang", "{label}" }
                 button {
@@ -425,6 +631,15 @@ pub(super) fn CodeBlock(lang: String, code: String) -> Element {
                     for (index, token) in tokens.into_iter().enumerate() {
                         span { key: "{index}", class: ui_highlight::css_class(token.kind), "{token.text}" }
                     }
+                }
+            }
+            if long {
+                button {
+                    class: "md-code-more",
+                    r#type: "button",
+                    "aria-expanded": if expanded() { "true" } else { "false" },
+                    onclick: move |_| expanded.set(!expanded()),
+                    if expanded() { "Show less" } else { "Show all {lines} lines" }
                 }
             }
         }
@@ -471,13 +686,30 @@ pub fn MarkdownBody(message_id: String, content: String) -> Element {
                             }
                         }
                     },
-                    MdBlock::Table { headers, rows } => rsx! {
+                    MdBlock::NestedList { start, items } => {
+                        let markers = nested_markers(start, &items);
+                        rsx! {
+                            ul { key: "{idx}", class: "md-list md-nested", role: "list",
+                                for (i_idx, (item, marker)) in items.into_iter().zip(markers).enumerate() {
+                                    li { key: "{i_idx}", class: "md-li md-d{item.depth}",
+                                        span { class: "md-marker", "aria-hidden": "true", "{marker}" }
+                                        span { class: "md-li-text", InlineMarkdown { text: item.text } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    MdBlock::Table { headers, rows, aligns } => rsx! {
                         div { key: "{idx}", class: "md-table-wrap",
                             table { class: "md-table",
                                 thead {
                                     tr {
                                         for (h_idx, header) in headers.into_iter().enumerate() {
-                                            th { key: "{h_idx}", InlineMarkdown { text: header } }
+                                            th {
+                                                key: "{h_idx}",
+                                                class: aligns.get(h_idx).copied().unwrap_or_default().class(),
+                                                InlineMarkdown { text: header }
+                                            }
                                         }
                                     }
                                 }
@@ -485,7 +717,11 @@ pub fn MarkdownBody(message_id: String, content: String) -> Element {
                                     for (r_idx, row) in rows.into_iter().enumerate() {
                                         tr { key: "{r_idx}",
                                             for (c_idx, cell) in row.into_iter().enumerate() {
-                                                td { key: "{c_idx}", InlineMarkdown { text: cell } }
+                                                td {
+                                                    key: "{c_idx}",
+                                                    class: aligns.get(c_idx).copied().unwrap_or_default().class(),
+                                                    InlineMarkdown { text: cell }
+                                                }
                                             }
                                         }
                                     }
@@ -525,8 +761,56 @@ pub(super) fn RenderSpan(span: InlineSpan) -> Element {
             }
         },
         InlineSpan::Italic(s) => rsx! { em { "{s}" } },
-        InlineSpan::Link { label, url } => rsx! {
-            a { class: "md-link", href: "{url}", target: "_blank", rel: "noopener noreferrer", "{label}" }
-        },
+        InlineSpan::Link { label, url } => {
+            let mut session = try_consume_context::<Signal<Session>>();
+            match chat_links::safe_chat_link(&url) {
+                // A button, not an anchor: the page never navigates by itself,
+                // and the click goes through the checked open path.
+                Some(link) => rsx! {
+                    button {
+                        class: "md-link",
+                        r#type: "button",
+                        title: "{link}",
+                        onclick: move |_| {
+                            if let Some(session) = session.as_mut() {
+                                session.write().open_in_browser(link.clone());
+                            }
+                        },
+                        "{label}"
+                    }
+                },
+                // Anything else is plain text: the label, no link.
+                None => rsx! {
+                    span { class: "md-link-blocked", title: "Not a link the app opens (only https links open)", "{label}" }
+                },
+            }
+        }
+        InlineSpan::Image { alt, url } => {
+            let mut session = try_consume_context::<Signal<Session>>();
+            let name = if alt.trim().is_empty() {
+                "image".to_owned()
+            } else {
+                alt.trim().to_owned()
+            };
+            match chat_links::safe_chat_link(&url) {
+                Some(link) => rsx! {
+                    button {
+                        class: "md-image-chip",
+                        r#type: "button",
+                        title: "Open the image in your browser: {link}",
+                        onclick: move |_| {
+                            if let Some(session) = session.as_mut() {
+                                session.write().open_in_browser(link.clone());
+                            }
+                        },
+                        Icon { name: "image", size: 13 }
+                        span { "{name}" }
+                    }
+                },
+                None => rsx! {
+                    span { class: "md-image-chip blocked", title: "Image not shown", Icon { name: "image", size: 13 } span { "{name}" } }
+                },
+            }
+        }
     }
 }
