@@ -142,7 +142,7 @@ fn TabStrip(
 const FOCUS_ADDRESS_JS: &str = "document.getElementById('browser-address')?.focus();";
 
 /// The sign-in refusal banner: the page refuses this automated browser. The
-/// button goes to the Connectors page, where the supported route lives.
+/// button goes to the Integrations page, where the supported route lives.
 #[component]
 fn SigninBanner(session: Signal<Session>, block: SigninBlocked) -> Element {
     let mut session = session;
@@ -151,8 +151,8 @@ fn SigninBanner(session: Signal<Session>, block: SigninBlocked) -> Element {
             p { class: "signin-banner-text", "{block.message}" }
             button {
                 class: "btn ghost sm",
-                onclick: move |_| session.write().open_section(Section::Connectors),
-                "Open Connectors"
+                onclick: move |_| session.write().open_section(Section::Integrations),
+                "Open Integrations"
             }
         }
     }
