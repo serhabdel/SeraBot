@@ -88,10 +88,53 @@ pub fn reconnect_delay(attempt: u32) -> Duration {
     Duration::from_secs(STEPS[(attempt as usize).min(STEPS.len() - 1)])
 }
 
+/// The longest link the console opens. Anything longer is refused.
+pub const MAX_LINK_CHARS: usize = 2048;
+
+/// Whether a link may be handed to the system browser. Only plain `https`
+/// addresses with a host and no credentials pass. This runs at the point of
+/// opening, not only where a link is built, so every caller gets the same rule.
+pub fn external_link_allowed(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_LINK_CHARS {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(trimmed) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str().is_some_and(|host| !host.is_empty())
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn only_plain_https_links_open() {
+        assert!(external_link_allowed(
+            "https://dashboard.example.invalid/keys"
+        ));
+        assert!(external_link_allowed("  https://example.invalid/a?b=c  "));
+        for refused in [
+            "http://example.invalid/",
+            "file:///C:/Users/owner/secret.txt",
+            "javascript:alert(1)",
+            "ms-settings:privacy",
+            "https://user:pass@example.invalid/",
+            "https://",
+            "",
+            "   ",
+            "not a link",
+        ] {
+            assert!(!external_link_allowed(refused), "{refused} must be refused");
+        }
+        let long = format!("https://example.invalid/{}", "a".repeat(MAX_LINK_CHARS));
+        assert!(!external_link_allowed(&long));
+    }
 
     #[test]
     fn slow_calls_get_the_long_timeout() {

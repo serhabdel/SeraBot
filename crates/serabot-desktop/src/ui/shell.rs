@@ -45,7 +45,6 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                         Section::Conversations => rsx! { ConversationsView { session } },
                         Section::Memory => rsx! { MemoryView { session } },
                         Section::Providers => rsx! { ProvidersView { session, overlay } },
-                        Section::Connectors => rsx! { ConnectorsView { session } },
                         Section::Approvals => rsx! { ApprovalsView { session } },
                         Section::Browser => rsx! { BrowserView { session, overlay } },
 
@@ -54,7 +53,7 @@ pub(super) fn Shell(session: Signal<Session>) -> Element {
                         Section::Usage => rsx! { UsagePage { session } },
                         Section::Logs => rsx! { crate::ui_logs::LogsView { session } },
                         Section::Workflows => rsx! { crate::ui_workflows::WorkflowsView { session } },
-                        Section::Marketplace => rsx! { crate::ui_marketplace::MarketplaceView { session } },
+                        Section::Integrations => rsx! { crate::ui_integrations::IntegrationsView { session } },
                         Section::Settings => rsx! { SettingsView { session } },
                     }}
                 }
@@ -114,14 +113,13 @@ pub(super) fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, b
     let mut session = session;
     let section = session.read().section;
     let pending = session.read().state.approvals.len();
-    let destinations: [(Section, &str, &str); 12] = [
+    let destinations: [(Section, &str, &str); 11] = [
         (Section::Chat, "chat", "Chats"),
         (Section::Browser, "globe", "Browser"),
         (Section::Tasks, "list", "Tasks"),
         (Section::Approvals, "approvals", "Approvals"),
         (Section::Memory, "memory", "Memory"),
-        (Section::Connectors, "connectors", "Connectors"),
-        (Section::Marketplace, "grid", "Plugins"),
+        (Section::Integrations, "connectors", "Integrations"),
         (Section::Vault, "lock", "Vault"),
         (Section::Usage, "usage", "Usage"),
         (Section::Workflows, "workflows", "Workflows"),
@@ -136,8 +134,6 @@ pub(super) fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, b
                     class: if section == target { "rail-btn labeled on" } else { "rail-btn labeled" },
                     "aria-label": if target == Section::Approvals && pending > 0 {
                         format!("{label}, {pending} pending")
-                    } else if target == Section::Marketplace {
-                        "Plugins. Bots cannot call these yet.".to_owned()
                     } else {
                         label.to_owned()
                     },

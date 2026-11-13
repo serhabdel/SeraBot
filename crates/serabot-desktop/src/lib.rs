@@ -19,6 +19,7 @@ pub mod connector_card;
 pub mod creds;
 pub mod events;
 pub mod file_icons;
+pub mod integrations;
 pub mod jobs;
 pub mod jobs_reliability;
 pub mod local_folders;

@@ -749,7 +749,7 @@ pub fn CapabilityToggles(session: Signal<Session>, bot: String) -> Element {
                             "aria-label": "Connect {missing.name} for {label}",
                             onclick: move |_| {
                                 let section = match missing.page {
-                                    capabilities::MissingPage::Connectors => Section::Connectors,
+                                    capabilities::MissingPage::Connectors => Section::Integrations,
                                     capabilities::MissingPage::Settings => Section::Settings,
                                 };
                                 session.write().open_section(section);
