@@ -368,13 +368,19 @@ pub(super) fn Sidebar(
         let bot_chats: HashSet<String> = bots.iter().map(|bot| format!("dir:{}", bot.id)).collect();
         let mut items = Vec::new();
 
+        // A bot shows when its name matches or one of its chats does, so the
+        // search (and Ctrl+K, which focuses it) can jump straight to a chat.
         let bot_rows = bots
             .iter()
             .filter(|bot| {
                 matches(
                     &state.bot_display_name(&bot.id),
                     &format!("bot {}", bot.role),
+                ) || !serabot_desktop::bot_chats::chats_matching(
+                    state.state.bot_chats.get(&bot.id),
+                    &needle,
                 )
+                .is_empty()
             })
             .collect::<Vec<_>>();
         if needle.is_empty() || !bot_rows.is_empty() {
@@ -402,14 +408,27 @@ pub(super) fn Sidebar(
                         .unwrap_or_default();
                     let extra = chats.iter().filter(|chat| !chat.primary).count();
                     let has_active = chats.iter().any(|chat| chat.id == current);
-                    // Open when the reader chose so; else when an extra chat
-                    // exists and one of them is the open chat.
-                    let open = chats_open()
-                        .get(&bot.id)
-                        .copied()
-                        .unwrap_or(extra > 0 && has_active);
+                    // Open when the reader chose so; else for the bot being
+                    // talked to, so switching and New chat are always in sight.
+                    let name_matches = matches(
+                        &state.bot_display_name(&bot.id),
+                        &format!("bot {}", bot.role),
+                    );
+                    let chat_hits = serabot_desktop::bot_chats::chats_matching(
+                        state.state.bot_chats.get(&bot.id),
+                        &needle,
+                    );
+                    // A search that hit a chat opens its bot's list.
+                    let open = !chat_hits.is_empty()
+                        || chats_open().get(&bot.id).copied().unwrap_or(
+                            serabot_desktop::bot_chats::default_chats_open(
+                                id == current || has_active,
+                            ),
+                        );
                     items.push(RailItem::Bot {
-                        active: id == current,
+                        // An open bot is a group header; the open chat is
+                        // marked on its own row below.
+                        active: id == current && !open,
                         pinned: pins.contains(&bot.id),
                         id,
                         label: state.bot_display_name(&bot.id),
@@ -421,10 +440,27 @@ pub(super) fn Sidebar(
                         extra_chats: extra,
                         chats_open: open,
                     });
-                    if open && extra > 0 {
+                    if open {
                         let all = chats_all().contains(&bot.id);
-                        let (shown, hidden) =
-                            serabot_desktop::bot_chats::visible_chats(&chats, all, &current);
+                        // While searching, a bot whose name did not match lists
+                        // only the chats that did.
+                        let searching_chats = !needle.is_empty() && !name_matches;
+                        let (shown, hidden) = if searching_chats {
+                            (chat_hits.clone(), 0)
+                        } else {
+                            serabot_desktop::bot_chats::visible_chats(&chats, all, &current)
+                        };
+                        // The main chat is listed even before the list loads.
+                        if needle.is_empty() && !chats.iter().any(|chat| chat.primary) {
+                            let main_id = format!("dir:{}", bot.id);
+                            items.push(RailItem::BotChat {
+                                active: main_id == current,
+                                unread: 0,
+                                id: main_id,
+                                title: "Main chat".to_owned(),
+                                primary: true,
+                            });
+                        }
                         for chat in shown {
                             let chat_unread = conversations
                                 .iter()
@@ -444,6 +480,12 @@ pub(super) fn Sidebar(
                                 bot: bot.id.clone(),
                                 hidden,
                                 all,
+                            });
+                        }
+                        if needle.is_empty() {
+                            items.push(RailItem::NewChat {
+                                bot: bot.id.clone(),
+                                enabled: bot.enabled,
                             });
                         }
                     }
@@ -618,7 +660,7 @@ pub(super) fn Sidebar(
                     class: "input",
                     id: "global-search",
                     value: "{search}",
-                    placeholder: "Search chats",
+                    placeholder: "Search chats (Ctrl+K)",
                     "aria-label": "Search chats and bots",
                     oninput: move |event| search.set(event.value()),
                 }
@@ -702,11 +744,10 @@ pub(super) fn Sidebar(
                                         let toggle_bot = pin_id.clone();
                                         rsx! {
                                             button {
-                                                class: if extra_chats > 0 { "row-chevron" } else { "row-chevron placeholder" },
+                                                class: "row-chevron",
                                                 title: if is_open { "Hide this bot\u{2019}s chats" } else { "Show this bot\u{2019}s chats" },
                                                 "aria-label": if is_open { "Hide chats of {label}" } else { "Show chats of {label}" },
                                                 "aria-expanded": if is_open { "true" } else { "false" },
-                                                disabled: extra_chats == 0,
                                                 onclick: move |event| {
                                                     event.stop_propagation();
                                                     chats_open.write().insert(toggle_bot.clone(), !is_open);
@@ -732,7 +773,12 @@ pub(super) fn Sidebar(
                                             if act.is_some() {
                                                 span { class: "thread-meta working-label", role: "status", "{act_label}" }
                                             }
-                                            span { class: "thread-meta", if enabled { "{role}" } else { "{role} · disabled" } }
+                                            span { class: "thread-meta",
+                                                if enabled { "{role}" } else { "{role} · disabled" }
+                                                if let Some(count) = serabot_desktop::bot_chats::chat_count_label(extra_chats) {
+                                                    " · {count}"
+                                                }
+                                            }
                                         }
                                         if unread > 0 {
                                             span { class: "unread-badge", "{unread}" }
@@ -868,6 +914,20 @@ pub(super) fn Sidebar(
                                             }
                                         }
                                     }
+                                }
+                            }
+                        },
+                        RailItem::NewChat { bot, enabled } => {
+                            rsx! {
+                                button {
+                                    key: "new-{bot}",
+                                    class: "thread-group chat-more new-chat-row",
+                                    r#type: "button",
+                                    disabled: !enabled,
+                                    "aria-label": "Start a new chat with this bot",
+                                    onclick: move |_| session.write().new_bot_chat(bot.clone()),
+                                    Icon { name: "plus", size: 14 }
+                                    "New chat"
                                 }
                             }
                         },
@@ -1480,6 +1540,8 @@ pub(super) enum RailItem {
         hidden: usize,
         all: bool,
     },
+    /// "New chat" under an open bot: a plain text row, not an icon to hunt for.
+    NewChat { bot: String, enabled: bool },
     Thread {
         id: String,
         label: String,
@@ -1734,7 +1796,11 @@ pub(super) fn Topbar(
                 }
             }
             div { class: "chat-header-copy",
-                strong { "{title}" }
+                if let Some(bot) = active_bot.clone() {
+                    ChatSwitcher { session, bot, title: title.clone() }
+                } else {
+                    strong { "{title}" }
+                }
                 if let Some(text) = header_label {
                     span { class: "working-label", role: "status", "{text}" }
                 } else {
@@ -1748,7 +1814,10 @@ pub(super) fn Topbar(
                 "{pill_label}"
             }
             div { class: "chat-header-actions",
-                button {
+                // The member stack belongs to groups and rooms; in a one-to-one
+                // chat it only repeated every enabled bot.
+                if !is_bot_chat {
+                  button {
                     class: "avatar-stack",
                     title: "Bots in this chat",
                     "aria-label": "Bots in this chat",
@@ -1765,6 +1834,7 @@ pub(super) fn Topbar(
                             span { class: "avatar sm bot", style: avatar_style(&id), "{avatar}" }
                         }
                     }
+                }
                 }
                 button {
                     class: "icon-btn",
