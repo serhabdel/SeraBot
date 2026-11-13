@@ -930,3 +930,14 @@
 .day-sep {
   margin: 18px 0 6px;
 }
+
+/* Row buttons must not sit on top of the title or the unread badge: the row
+   keeps room for them. The hover "+" gets a surface so it reads over text. */
+.thread:has(> .row-more) > .thread-main {
+  padding-right: 34px;
+}
+
+.thread .row-new {
+  background: var(--surface-2);
+  border: 1px solid var(--hairline);
+}

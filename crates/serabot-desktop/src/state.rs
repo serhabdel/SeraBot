@@ -620,11 +620,19 @@ impl State {
             Reply::BotChatCreated { bot, created } => {
                 let carried = created.carried_from.clone();
                 self.created_bot_chat = Some((bot.clone(), created.chat.id.clone(), carried));
-                if let Some(list) = self.bot_chats.get_mut(&bot)
-                    && !list.chats.iter().any(|chat| chat.id == created.chat.id)
-                {
+                // Keep the new chat even when the bot's list was never read:
+                // without it the chat could not be tied back to its bot.
+                let list = self.bot_chats.entry(bot.clone()).or_insert_with(|| {
+                    crate::bot_chats::BotChatList {
+                        bot: bot.clone(),
+                        refresh_every_turns: crate::bot_chats::DEFAULT_REFRESH_TURNS,
+                        chats: Vec::new(),
+                    }
+                });
+                if !list.chats.iter().any(|chat| chat.id == created.chat.id) {
                     list.chats.push(created.chat);
                 }
+                self.bot_chats_loaded.insert(bot);
             }
             Reply::BotRefreshSet(settings) => {
                 if let Some(list) = self.bot_chats.get_mut(&settings.bot) {
@@ -1470,6 +1478,29 @@ mod tests {
             enabled: false,
             status: String::new(),
         }
+    }
+
+    #[test]
+    fn a_new_chat_is_tied_to_its_bot_even_before_the_list_loaded() {
+        let mut state = State::default();
+        let scope = state.scope.clone();
+        assert!(state.bot_chats.is_empty());
+        state.receive(
+            &scope,
+            Reply::BotChatCreated {
+                bot: "analyst".into(),
+                created: crate::bot_chats::CreatedBotChat {
+                    chat: bot_chat("dir:chat-0a1b2c3d4e5f", false),
+                    carried_from: None,
+                },
+            },
+        );
+        let lists: Vec<_> = state.bot_chats.values().collect();
+        assert_eq!(
+            crate::bot_chats::bot_of_chat(lists, "dir:chat-0a1b2c3d4e5f").as_deref(),
+            Some("analyst")
+        );
+        assert!(state.bot_chats_loaded.contains("analyst"));
     }
 
     #[test]
