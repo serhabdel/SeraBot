@@ -11,6 +11,8 @@
 //! manifest's egress list, and every resolved address public. Calls are audited
 //! by plugin and tool name only; arguments and results are never written.
 
+use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +38,9 @@ const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_OUTPUT_CHARS: usize = 8_000;
 /// Longest description kept from a plugin's tool list.
 const MAX_DESCRIPTION_CHARS: usize = 400;
+/// Largest input schema passed to the model. A bigger one is skipped, not truncated,
+/// since a cut-off schema would describe arguments wrongly.
+const MAX_SCHEMA_BYTES: usize = 8 * 1024;
 
 /// The plugins a user can call: installed and enabled, with an http server.
 #[derive(Clone)]
@@ -119,10 +124,19 @@ impl PluginTools {
             return Ok(cached.as_ref().clone());
         }
         let (client, secret) = self.client_for(user_id, manifest).await?;
-        let tools = client
+        let listed = client
             .list_tools(secret.expose_secret(), REQUEST_TIMEOUT)
             .await
             .map_err(|error| external(&manifest.slug, &error))?;
+        let total = listed.len();
+        let tools: Vec<Value> = listed.into_iter().filter(schema_within_limit).collect();
+        if tools.len() < total {
+            tracing::warn!(
+                plugin = %manifest.slug,
+                skipped = total - tools.len(),
+                "plugin tools with an oversized input schema were skipped"
+            );
+        }
         self.cache.put(&owner, Arc::new(tools.clone()));
         Ok(tools)
     }
@@ -150,13 +164,17 @@ impl PluginTools {
             SeraError::Validation(format!("plugin {} is not set up yet", manifest.slug))
         })?;
         // Resolve last: a plugin the caller has not set up never reaches DNS.
-        check_resolved_addresses(url).await?;
-        let client = McpClient::new(
+        // The client is pinned to the addresses checked here, so the key is
+        // sent only to them, whatever DNS says later.
+        let pinned = resolve_checked(url, system_lookup).await?;
+        let client = McpClient::new_pinned(
             "plugin",
             url.to_owned(),
             McpAuth::Bearer,
             REQUEST_TIMEOUT,
             MAX_RESPONSE_BYTES,
+            &pinned.host,
+            &pinned.addrs,
         )
         .map_err(|error| external(&manifest.slug, &error))?;
         Ok((client, secret))
@@ -187,8 +205,22 @@ fn http_url(manifest: &PluginManifest) -> Option<&str> {
     })
 }
 
+/// Whether a tool's input schema is small enough to offer the model. A tool
+/// without a schema is fine: the default one is used.
+fn schema_within_limit(tool: &Value) -> bool {
+    match tool.get("inputSchema") {
+        None => true,
+        Some(schema) => {
+            serde_json::to_vec(schema).is_ok_and(|bytes| bytes.len() <= MAX_SCHEMA_BYTES)
+        }
+    }
+}
+
 /// The spec for one MCP tool entry, namespaced to its plugin.
 fn spec_of(slug: &str, tool: &Value) -> Option<ToolSpec> {
+    if !schema_within_limit(tool) {
+        return None;
+    }
     let name = tool.get("name")?.as_str()?;
     let description = tool
         .get("description")
@@ -252,10 +284,31 @@ pub fn check_egress(url: &str, allowed_hosts: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the host and refuse any non-public address, the same rule the
-/// watcher fetch uses. A DNS answer that changes after this check is not
-/// covered; the connection itself is not pinned to the checked address.
-pub async fn check_resolved_addresses(url: &str) -> Result<()> {
+/// The addresses one plugin connection is pinned to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedAddresses {
+    /// The bare host name the connection is pinned for.
+    pub host: String,
+    /// Every address the host resolved to. All of them passed the check.
+    pub addrs: Vec<SocketAddr>,
+}
+
+/// The system resolver, as the lookup [`resolve_checked`] uses in production.
+async fn system_lookup(host: String, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+    Ok(tokio::net::lookup_host((host.as_str(), port))
+        .await?
+        .collect())
+}
+
+/// Resolve the plugin's host once and refuse unless every address is public,
+/// the same rule the watcher fetch uses. The returned addresses are the only
+/// ones the connection may use, so a DNS answer that changes later cannot
+/// send the request, or the plugin key, to an unchecked address.
+pub async fn resolve_checked<F, Fut>(url: &str, lookup: F) -> Result<PinnedAddresses>
+where
+    F: FnOnce(String, u16) -> Fut,
+    Fut: Future<Output = std::io::Result<Vec<SocketAddr>>>,
+{
     let parsed =
         Url::parse(url).map_err(|_| SeraError::Validation("plugin URL is invalid".into()))?;
     let host = parsed
@@ -263,16 +316,18 @@ pub async fn check_resolved_addresses(url: &str) -> Result<()> {
         .ok_or_else(|| SeraError::Validation("plugin URL has no host".into()))?
         .to_owned();
     // An IPv6 literal keeps its brackets in the URL; the resolver wants bare text.
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let bare = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned();
     let port = parsed.port_or_known_default().unwrap_or(443);
-    let addresses: Vec<std::net::SocketAddr> = tokio::net::lookup_host((bare, port))
+    let addrs = lookup(bare.clone(), port)
         .await
-        .map_err(|_| SeraError::External(format!("could not resolve {host}")))?
-        .collect();
-    if addresses.is_empty() {
+        .map_err(|_| SeraError::External(format!("could not resolve {host}")))?;
+    if addrs.is_empty() {
         return Err(SeraError::External(format!("no address for {host}")));
     }
-    if addresses
+    if addrs
         .iter()
         .any(|address| crate::fetch::is_forbidden_ip(address.ip()))
     {
@@ -280,7 +335,7 @@ pub async fn check_resolved_addresses(url: &str) -> Result<()> {
             "{host} resolves to a non-public address"
         )));
     }
-    Ok(())
+    Ok(PinnedAddresses { host: bare, addrs })
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -455,7 +510,7 @@ mod tests {
             "https://[::1]/mcp",
             "https://[fe80::1]/mcp",
         ] {
-            let error = check_resolved_addresses(url).await.err();
+            let error = resolve_checked(url, system_lookup).await.err();
             assert!(
                 matches!(error, Some(SeraError::Forbidden(_))),
                 "{url} should be refused as non-public, got {error:?}"
@@ -553,5 +608,126 @@ mod tests {
             rt.block_on(tools.tool_for(&user, "plugin.unknown.scrape"))
                 .is_none()
         );
+    }
+
+    /// A host whose answer changes: public on the first lookup, private after.
+    /// The check must ask once, and the connection must use only what it checked.
+    #[tokio::test]
+    async fn the_checked_answer_is_the_only_one_used() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let lookup = move |_host: String, port: u16| {
+            let call = counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let ip = if call == 0 {
+                    "93.184.216.34"
+                } else {
+                    "10.0.0.5"
+                };
+                Ok::<Vec<SocketAddr>, std::io::Error>(vec![SocketAddr::new(
+                    ip.parse().unwrap(),
+                    port,
+                )])
+            }
+        };
+        let pinned = resolve_checked("https://mcp.example.invalid/mcp", lookup)
+            .await
+            .expect("public answer passes");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "DNS asked exactly once");
+        assert_eq!(pinned.host, "mcp.example.invalid");
+        assert_eq!(
+            pinned.addrs,
+            vec![SocketAddr::new("93.184.216.34".parse().unwrap(), 443)]
+        );
+    }
+
+    /// One private address in the answer refuses the whole plugin.
+    #[tokio::test]
+    async fn a_private_address_among_public_ones_is_refused() {
+        let lookup = |_host: String, port: u16| async move {
+            Ok::<Vec<SocketAddr>, std::io::Error>(vec![
+                SocketAddr::new("93.184.216.34".parse().unwrap(), port),
+                SocketAddr::new("169.254.169.254".parse().unwrap(), port),
+            ])
+        };
+        let error = resolve_checked("https://mcp.example.invalid/mcp", lookup)
+            .await
+            .err();
+        assert!(matches!(error, Some(SeraError::Forbidden(_))), "{error:?}");
+    }
+
+    /// The connection goes only to the pinned address. The host name does not
+    /// resolve in DNS (".invalid"), so a request that succeeds proves the pin.
+    #[tokio::test]
+    async fn a_pinned_connection_reaches_only_the_checked_address() {
+        use serde_json::json;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        struct Rpc;
+        impl wiremock::Respond for Rpc {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                let id = body.get("id").cloned().unwrap_or(Value::Null);
+                match body.get("method").and_then(Value::as_str) {
+                    Some("initialize") => ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/json")
+                        .insert_header("mcp-session-id", "synthetic-session")
+                        .set_body_json(json!({"jsonrpc": "2.0", "id": id, "result": {
+                            "protocolVersion": "2025-06-18"
+                        }})),
+                    Some("tools/list") => ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/json")
+                        .set_body_json(json!({"jsonrpc": "2.0", "id": id, "result": {
+                            "tools": [{"name": "scrape", "inputSchema": {"type": "object"}}]
+                        }})),
+                    _ => ResponseTemplate::new(202),
+                }
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(Rpc)
+            .mount(&server)
+            .await;
+        let addr = *server.address();
+        let url = format!("http://mcp.example.invalid:{}/mcp", addr.port());
+        let client = McpClient::new_pinned(
+            "plugin",
+            url,
+            McpAuth::Bearer,
+            Duration::from_secs(5),
+            1_000_000,
+            "mcp.example.invalid",
+            &[addr],
+        )
+        .expect("client builds");
+        let tools = client
+            .list_tools("synthetic-test-key", Duration::from_secs(5))
+            .await
+            .expect("pinned address answers");
+        assert_eq!(tools[0]["name"], "scrape");
+    }
+
+    #[test]
+    fn an_oversized_input_schema_is_not_offered_to_the_model() {
+        let small = json!({"name": "scrape", "inputSchema": {"type": "object"}});
+        assert!(spec_of("firecrawl", &small).is_some());
+
+        let padding = "x".repeat(MAX_SCHEMA_BYTES + 1);
+        let big = json!({
+            "name": "huge",
+            "description": "A tool with a huge schema.",
+            "inputSchema": {"type": "object", "description": padding}
+        });
+        assert!(!schema_within_limit(&big));
+        assert!(spec_of("firecrawl", &big).is_none());
+
+        // No schema at all is fine: the default one is used.
+        let bare = json!({"name": "bare"});
+        assert!(spec_of("firecrawl", &bare).is_some());
     }
 }
