@@ -173,6 +173,34 @@ impl McpClient {
         })
     }
 
+    /// Like [`McpClient::new`], but the connection to `host` goes only to the
+    /// given addresses. The caller has already checked each one, so a DNS
+    /// answer that changes later cannot send the request, or its secret, to an
+    /// unchecked address.
+    pub fn new_pinned(
+        label: &'static str,
+        url: String,
+        auth: McpAuth,
+        timeout: Duration,
+        max_bytes: usize,
+        host: &str,
+        addrs: &[std::net::SocketAddr],
+    ) -> Result<Self, McpError> {
+        let http = reqwest::Client::builder()
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(host, addrs)
+            .build()
+            .map_err(|error| McpError::Other(format!("{label} MCP client: {error}")))?;
+        Ok(Self {
+            http,
+            url,
+            auth,
+            label,
+            max_bytes,
+        })
+    }
+
     pub fn url(&self) -> &str {
         &self.url
     }
