@@ -210,3 +210,93 @@ pub(crate) fn RenameField(
         }
     }
 }
+
+/// The chat switcher in the chat header: the open chat's name with a chevron.
+/// It lists the bot's chats, marks the open one, and starts a new chat. It is
+/// always there for a bot chat, so switching never depends on finding a
+/// hidden control in the sidebar.
+#[component]
+pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String) -> Element {
+    let mut session = session;
+    let mut open = use_signal(|| false);
+    let (entries, enabled) = {
+        let state = session.read();
+        let entries = serabot_desktop::bot_chats::switcher_entries(
+            state.state.bot_chats.get(&bot),
+            &bot,
+            &state.conversation,
+        );
+        let enabled = state
+            .state
+            .listed_bots
+            .iter()
+            .find(|item| item.id == bot)
+            .is_none_or(|item| item.enabled);
+        (entries, enabled)
+    };
+    let count = entries.len();
+    rsx! {
+        div { class: "chat-switcher",
+            button {
+                class: "chat-switcher-btn",
+                r#type: "button",
+                title: "Switch chat or start a new one",
+                "aria-haspopup": "menu",
+                "aria-expanded": if open() { "true" } else { "false" },
+                onclick: move |_| open.set(!open()),
+                strong { "{title}" }
+                if count > 1 {
+                    span { class: "chat-switcher-count", "{count}" }
+                }
+                Icon { name: if open() { "chevron-up" } else { "chevron-down" }, size: 14 }
+            }
+            if open() {
+                div {
+                    class: "row-menu-scrim",
+                    onclick: move |_| open.set(false),
+                }
+                div {
+                    class: "row-menu chat-switcher-menu",
+                    role: "menu",
+                    "aria-label": "Chats with this bot",
+                    onkeydown: move |event: KeyboardEvent| {
+                        if event.key() == Key::Escape {
+                            open.set(false);
+                        }
+                    },
+                    for entry in entries {
+                        button {
+                            key: "{entry.id}",
+                            class: if entry.active { "row-menu-item active" } else { "row-menu-item" },
+                            role: "menuitemradio",
+                            "aria-checked": if entry.active { "true" } else { "false" },
+                            onclick: {
+                                let id = entry.id.clone();
+                                move |_| {
+                                    open.set(false);
+                                    session.write().open_conversation(id.clone());
+                                }
+                            },
+                            Icon { name: if entry.active { "check" } else { "chat" }, size: 15 }
+                            span { class: "chat-switcher-title", "{entry.title}" }
+                        }
+                    }
+                    button {
+                        class: "row-menu-item new",
+                        role: "menuitem",
+                        disabled: !enabled,
+                        onclick: {
+                            let bot = bot.clone();
+                            move |_| {
+                                open.set(false);
+                                session.write().new_bot_chat(bot.clone());
+                            }
+                        },
+                        Icon { name: "plus", size: 15 }
+                        span { "New chat" }
+                    }
+                }
+            }
+        }
+    }
+}
