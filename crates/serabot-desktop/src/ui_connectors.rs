@@ -10,6 +10,7 @@
 //! write-only through the admin connector route.
 
 use crate::ui::{BrandLogo, Icon};
+use crate::ui_widgets::IntegrationTabs;
 use dioxus::prelude::*;
 use serabot_desktop::ConnectorStatus;
 use serabot_desktop::connector_card::{
@@ -214,6 +215,7 @@ pub(crate) fn ConnectorsView(session: Signal<Session>) -> Element {
                 div {
                     h1 { class: "pane-title", "Connectors" }
                     p { class: "muted", "Let your bots use your accounts and tools." }
+                    IntegrationTabs { session }
                 }
                 button {
                     class: "btn ghost",

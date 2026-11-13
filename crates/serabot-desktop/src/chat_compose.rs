@@ -395,6 +395,26 @@ mod tests {
     }
 
     #[test]
+    fn chat_view_layout_rules_stay_in_place() {
+        // Guards PR-N: the composer sits in the flow (so it can never cover the
+        // last messages or the jump button), the jump button hangs above it,
+        // replies are plain text, and chat switching has its own styles.
+        let css = include_str!("../assets/foundation.css");
+        for needle in [
+            ".chat-column > .composer-wrap {\n  position: relative;",
+            ".composer-wrap > .scroll-bottom {\n  position: absolute;",
+            "bottom: 100%;",
+            ".msg.last-reply .msg-actions {",
+            ".msg.bot .msg-body {\n  max-width: 100%;",
+            ".chat-switcher-btn {",
+            ".thread-group.new-chat-row {",
+            ".integration-tabs {",
+        ] {
+            assert!(css.contains(needle), "missing chat rule: {needle}");
+        }
+    }
+
+    #[test]
     fn composer_layout_rules_stay_in_place() {
         // Guards the PR-I fix: a column container, a full-width borderless text
         // area (no focus outline of its own), a toolbar row, and the hint kept
