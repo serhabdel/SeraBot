@@ -353,7 +353,7 @@ impl SafeFetcher {
 /// Reject addresses that must never be reached by a watcher: loopback,
 /// private, link-local, unique-local, unspecified, multicast and the common
 /// reserved/benchmark blocks.
-fn is_forbidden_ip(ip: IpAddr) -> bool {
+pub(crate) fn is_forbidden_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_forbidden_v4(v4),
         IpAddr::V6(v6) => is_forbidden_v6(v6),

@@ -21,6 +21,7 @@ use tracing::{info, warn};
 
 use crate::domain::{Action, Approval, ApprovalState, Id, LlmMessage};
 use crate::error::{Result, SeraError};
+use crate::plugin_runtime::{PREFIX as PLUGIN_PREFIX, PluginTools};
 use crate::policy::Policy;
 use crate::store::Store;
 use crate::user_secrets::UserSecrets;
@@ -300,6 +301,9 @@ pub struct Gateway {
     vault: Option<Arc<UserSecrets>>,
     /// Values recently read from a password manager, scrubbed with the vault.
     resolved: Arc<ResolvedValues>,
+    /// Per-user plugin tools (`plugin.<slug>.<tool>`). They are not in the
+    /// registry: each user sees only the plugins they have enabled.
+    plugins: Option<PluginTools>,
 }
 
 impl Gateway {
@@ -319,7 +323,42 @@ impl Gateway {
             respect_bot_lists: false,
             vault: None,
             resolved: Arc::default(),
+            plugins: None,
         }
+    }
+
+    /// Serve the installed marketplace plugins' tools to their users.
+    pub fn with_plugin_tools(mut self, plugins: PluginTools) -> Self {
+        self.plugins = Some(plugins);
+        self
+    }
+
+    /// Specs for the user's enabled plugin tools. Each one is also added to
+    /// `context.allowed_tools`, so the turn and any approval resume can run it.
+    /// Empty when no plugin runtime is wired.
+    pub async fn enable_plugin_tools(&self, context: &mut ToolContext) -> Vec<ToolSpec> {
+        let Some(plugins) = &self.plugins else {
+            return Vec::new();
+        };
+        let specs = plugins.specs_for(&context.user_id).await;
+        context
+            .allowed_tools
+            .extend(specs.iter().map(|spec| spec.name.clone()));
+        specs
+    }
+
+    /// The tool for `name`: a registered tool, or for a `plugin.` name, the
+    /// caller's enabled plugin tool. Nothing else resolves.
+    async fn resolve_tool(&self, name: &str, user_id: &str) -> Option<Arc<dyn Tool>> {
+        if let Some(tool) = self.registry.get(name) {
+            return Some(tool);
+        }
+        if !name.starts_with(PLUGIN_PREFIX) {
+            return None;
+        }
+        let plugins = self.plugins.as_ref()?;
+        let tool = plugins.tool_for(user_id, name).await?;
+        Some(Arc::new(tool))
     }
 
     /// Let bot `require_approval` lists add approval for non-destructive
@@ -456,8 +495,8 @@ impl Gateway {
             )));
         }
         let tool = self
-            .registry
-            .get(name)
+            .resolve_tool(name, &context.user_id)
+            .await
             .ok_or_else(|| SeraError::NotFound(format!("tool {name}")))?;
         tracing::info!(
             user_id = %context.user_id,
@@ -749,8 +788,8 @@ impl Gateway {
             None,
         )?;
         let tool = self
-            .registry
-            .get(&action.tool)
+            .resolve_tool(&action.tool, &context.user_id)
+            .await
             .ok_or_else(|| SeraError::NotFound(format!("tool {}", action.tool)))?;
         if !context.allowed_tools.contains(&action.tool) {
             self.store.update_action(

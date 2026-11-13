@@ -208,7 +208,9 @@ impl Runtime {
             .pending
             .clone()
             .ok_or_else(|| SeraError::InvalidState("turn has no pending approval".into()))?;
-        let context = self.tool_context(task, &turn, bot, &state)?;
+        let mut context = self.tool_context(task, &turn, bot, &state)?;
+        // An approved plugin call must still be on the allowlist to run.
+        self.gateway.enable_plugin_tools(&mut context).await;
         if payload.decision == "approved" {
             match self
                 .gateway
@@ -496,7 +498,9 @@ impl Runtime {
                 .ok_or_else(|| SeraError::NotFound(format!("bot {}", turn.bot)))?
         };
         let user = task.user_id.clone();
-        let context = self.tool_context(task, turn, &bot, &state)?;
+        let mut context = self.tool_context(task, turn, &bot, &state)?;
+        // The user's enabled plugin tools, offered to each of their bots.
+        let plugin_specs = self.gateway.enable_plugin_tools(&mut context).await;
         let mut tool_names = bot.config.tools.clone();
         for extra in [TEAM_ASK_TOOL, TEAM_REPLY_TOOL, crate::plans::PLAN_TOOL] {
             if context.allowed_tools.contains(extra) && !tool_names.iter().any(|name| name == extra)
@@ -532,7 +536,7 @@ impl Runtime {
                 "bot lists tools whose connector is not connected; skipped"
             );
         }
-        let tool_specs = self
+        let mut tool_specs = self
             .gateway
             .registry()
             .tools_for(&tool_names)
@@ -544,6 +548,7 @@ impl Runtime {
                 context.allowed_tools.contains(&spec.name)
             })
             .collect::<Vec<_>>();
+        tool_specs.extend(plugin_specs);
         upsert_tool_notice(&mut state.messages, &tool_specs);
         let temperature = bot.config.temperature;
         self.checked_route(&user, &state.route)?;

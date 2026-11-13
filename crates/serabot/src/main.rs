@@ -958,7 +958,12 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
     )
     .with_respect_bot_lists(config.approvals.respect_bot_lists)
     .with_vault(users.clone())
-    .with_resolved_values(providers.resolved_values());
+    .with_resolved_values(providers.resolved_values())
+    .with_plugin_tools(serabot::plugin_runtime::PluginTools::new(
+        store.clone(),
+        users.clone(),
+        serabot::marketplace::load_catalog(&config.path("plugins")).0,
+    ));
 
     let runtime = Runtime::with_fleet(
         config.clone(),

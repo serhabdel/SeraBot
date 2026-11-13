@@ -55,6 +55,7 @@ pub mod pdf_ops;
 pub mod personal;
 pub mod personal_tasks;
 pub mod plans;
+pub mod plugin_runtime;
 pub mod policy;
 #[cfg(feature = "pptx")]
 pub mod pptx_ops;
