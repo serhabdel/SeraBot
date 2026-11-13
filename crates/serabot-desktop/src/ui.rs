@@ -32,7 +32,7 @@ use std::time::Instant;
 use crate::ui_bots::{MeetTeamSheet, NewBotSheet, NewGroupSheet, OnboardingView};
 use crate::ui_browser::BrowserView;
 use crate::ui_cards::ChatCardRow;
-use crate::ui_connectors::ConnectorsView;
+
 use crate::ui_dock::BrowserDock;
 use crate::ui_files::{
     COMPOSER_CARET_BRIDGE_JS, COMPOSER_CARET_SETUP_JS, CONFIRM_RESET_JS, ComposerFiles, MediaCards,

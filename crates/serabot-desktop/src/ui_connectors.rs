@@ -1,4 +1,4 @@
-//! The Connectors screen.
+//! The connector cards shown in the Integrations screen's detail sheet.
 //!
 //! Per-user products (Outlook, Google, Notion) draw from the account's own
 //! state: Not set up yet (with a short admin hint), Connect, Connected as
@@ -14,10 +14,11 @@ use dioxus::prelude::*;
 use serabot_desktop::ConnectorStatus;
 use serabot_desktop::connector_card::{
     CardState, DEFAULT_ADMIN_HINT, GOOGLE_CONSOLE_URL, GOOGLE_SETUP_STEPS, NOTION_SHARE_HINT,
-    connector_card_state, editable_roles, google_is_set_up, google_redirect_uri,
-    google_setup_offered, is_internal_role, legacy_connected, supports_sign_in, token_help,
+    connector_card_state, editable_roles, is_internal_role, legacy_connected, supports_sign_in,
+    token_help,
 };
-use serabot_desktop::session::{Session, humanize_label};
+use serabot_desktop::integrations::{connector_blurb, connector_title};
+use serabot_desktop::session::Session;
 
 /// Connectors whose saved credentials live in the server-wide store and can
 /// be removed from the card (0.26.0). Per-account sign-ins use Disconnect.
@@ -137,55 +138,6 @@ fn connector_action(connector: &ConnectorStatus, connected: bool) -> Option<Conn
     None
 }
 
-fn connector_title(id: &str) -> String {
-    match id {
-        "onedrive" => "OneDrive",
-        "google_drive" => "Google Drive",
-        "google_sheets" => "Google Sheets",
-        "google_calendar" => "Google Calendar",
-        "gmail" => "Gmail",
-        "outlook" => "Outlook",
-        "outlook_calendar" => "Outlook Calendar",
-        "notion" => "Notion",
-        "github" => "GitHub",
-        "todoist" => "Todoist",
-        "slack" => "Slack",
-        "exa" => "Exa Search",
-        "agentmail" => "AgentMail",
-        "tavily" => "Tavily Search",
-        "firecrawl" => "Firecrawl",
-        "elevenlabs" => "ElevenLabs",
-        "elevenlabs_api_key" => "ElevenLabs API key",
-        other => return humanize_label(other),
-    }
-    .to_owned()
-}
-
-fn connector_blurb(id: &str) -> &'static str {
-    match id {
-        "onedrive" => "Save and read files in your OneDrive.",
-        "google_drive" => "Files in your Google Drive.",
-        "google_sheets" => "Your Google spreadsheets.",
-        "google_calendar" => "Your Google calendar.",
-        "gmail" => "Read and send email.",
-        "outlook" => "Read and send email.",
-        "outlook_calendar" => "Your Outlook calendar.",
-        "notion" => "Your notes and pages.",
-        "github" => {
-            "Search repositories, read issues and files, and file issues with your approval."
-        }
-        "todoist" => "Your to-do list.",
-        "slack" => "Read channels and post with your approval.",
-        "agentmail" => "A mailbox for your bots.",
-        "tavily" | "firecrawl" | "exa" => "Let bots search and read the web.",
-        "elevenlabs" => {
-            "Sign in with your ElevenLabs account: voices, music, sound, images, video and agents your plan includes."
-        }
-        "elevenlabs_api_key" => "Voice, sound and images with the owner's ElevenLabs API key.",
-        _ => "",
-    }
-}
-
 /// A key field name in everyday words ("api_key" becomes "API key").
 fn secret_label(role: &str) -> String {
     let words = role.replace(['_', '-'], " ");
@@ -200,92 +152,10 @@ fn secret_label(role: &str) -> String {
     }
 }
 
-#[component]
-pub(crate) fn ConnectorsView(session: Signal<Session>) -> Element {
-    let connectors = session.read().state.connectors.clone();
-    let loaded = session.read().state.connectors_loaded;
-    let is_admin = session.read().is_admin();
-    let google_offered = google_setup_offered(&connectors, is_admin);
-    let google_ready = google_is_set_up(&connectors);
-    let google_redirect = google_redirect_uri(&connectors);
-    rsx! {
-        div { class: "pane",
-            div { class: "pane-head",
-                div {
-                    h1 { class: "pane-title", "Connectors" }
-                    p { class: "muted", "Let your bots use your accounts and tools." }
-                }
-                button {
-                    class: "btn ghost",
-                    title: "Check for changes",
-                    onclick: move |_| session.write().refresh_connectors(),
-                    Icon { name: "refresh", size: 15 }
-                    "Refresh"
-                }
-            }
-            div { class: "pane-body",
-                if !loaded {
-                    div { class: "card",
-                        div { class: "skeleton title" }
-                        div { class: "skeleton block" }
-                    }
-                }
-                if loaded && connectors.is_empty() {
-                    div { class: "empty",
-                        div { class: "empty-icon", Icon { name: "connectors", size: 20 } }
-                        h2 { class: "empty-title", "No connectors available" }
-                        p { class: "empty-text", "The server did not list any connectors. Check the connection and try again." }
-                        button {
-                            class: "btn primary",
-                            onclick: move |_| session.write().refresh_connectors(),
-                            "Refresh"
-                        }
-                    }
-                }
-                for (suite_title, suite_ids) in [
-                    ("Microsoft", &["onedrive", "outlook", "outlook_calendar"][..]),
-                    ("Google", &["google_drive", "google_sheets", "google_calendar", "gmail"][..]),
-                    ("Notes and email", &["notion", "agentmail"][..]),
-                    ("Code and tasks", &["github", "todoist"][..]),
-                    ("Messages", &["slack"][..]),
-                    ("Web search", &["tavily", "firecrawl", "exa"][..]),
-                    ("Voice", &["elevenlabs", "elevenlabs_api_key"][..]),
-                    ("Apps and tools", &["composio"][..]),
-                ] {
-                    {
-                        let suite_connectors: Vec<_> = suite_ids
-                            .iter()
-                            .filter_map(|id| connectors.iter().find(|c| c.id == *id))
-                            .cloned()
-                            .collect();
-                        let show_google_setup = suite_title == "Google" && google_offered;
-                        let google_redirect = google_redirect.clone();
-                        if !suite_connectors.is_empty() {
-                            rsx! {
-                                h2 { class: "connector-suite-title", "{suite_title}" }
-                                if show_google_setup {
-                                    GoogleSetupCard { session, configured: google_ready, redirect: google_redirect }
-                                }
-                                div { class: "card-grid",
-                                    for connector in suite_connectors {
-                                        ConnectorCard { key: "{connector.id}", session, connector }
-                                    }
-                                }
-                            }
-                        } else {
-                            rsx! {}
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// One connector. Per-user products draw their own account's state; the rest
 /// keep the server-wide card.
 #[component]
-fn ConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> Element {
+pub(crate) fn ConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> Element {
     if connector.id == "composio" {
         rsx! { crate::ui_composio::ComposioCard { session, connector } }
     } else if connector.personal.is_some() {
@@ -496,7 +366,7 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
 /// Admin only: the steps to create a Google OAuth client, and the two fields
 /// that save it on the server. The values are write-only.
 #[component]
-fn GoogleSetupCard(
+pub(crate) fn GoogleSetupCard(
     session: Signal<Session>,
     configured: bool,
     redirect: Option<String>,
@@ -725,7 +595,7 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                             class: "btn primary",
                             disabled: od_busy,
                             onclick: move |_| session.write().panel.connect_onedrive(),
-                            if od_busy { "OpeningÔÇª" } else { "Connect OneDrive" }
+                            if od_busy { "Opening…" } else { "Connect OneDrive" }
                         }
                     },
                     Some(ConnectorAction::DisconnectOneDrive) => rsx! {
@@ -752,7 +622,7 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                                     let id = id.clone();
                                     move |_| session.write().sign_in_connector(id.clone(), callback_uri.clone())
                                 },
-                                if signing_in { "Signing inÔÇª" } else if signed_in_with_account { "Reconnect" } else { "Sign in with {title}" }
+                                if signing_in { "Signing in…" } else if signed_in_with_account { "Reconnect" } else { "Sign in with {title}" }
                             }
                             if signed_in_with_account {
                                 button {
@@ -862,7 +732,7 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                                         let id = id.clone();
                                         move |_| session.write().test_connector(id.clone())
                                     },
-                                    if testing { "TestingÔÇª" } else { "Test" }
+                                    if testing { "Testing…" } else { "Test" }
                                 }
                             }
                         }
