@@ -305,6 +305,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             }
         }
     });
+    // A chat that was just opened or switched to is ready to type in. The view
+    // is keyed by conversation, so this runs once per switch.
+    use_effect(move || focus_composer());
     let transcript_error = session.read().state.transcript_error.clone();
     let chat_failure = session.read().state.chat_failure.clone();
     let held_draft = session.read().state.held_draft.is_some();
