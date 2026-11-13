@@ -722,3 +722,211 @@
   color: var(--label-2);
   line-height: 1.45;
 }
+
+/* Chat switching in the sidebar (PR-N): the chevron is always there, an open
+   bot lists its chats, and "New chat" is a text row, not an icon to hunt for. */
+.thread .row-chevron.placeholder {
+  visibility: visible;
+}
+
+.thread-group.new-chat-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--accent-ink);
+  font-weight: 500;
+}
+
+.thread-group.new-chat-row:disabled {
+  color: var(--label-3);
+  cursor: not-allowed;
+}
+
+/* The small + on a bot row is now a hover shortcut; the text row is the way. */
+.thread .row-new {
+  opacity: 0;
+}
+
+.thread:hover .row-new,
+.thread:focus-within .row-new {
+  opacity: 1;
+}
+
+/* Chat switcher in the chat header (PR-N). */
+.chat-switcher {
+  position: relative;
+  display: inline-flex;
+}
+
+.chat-switcher-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 2px 6px 2px 4px;
+  margin-left: -4px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: var(--clear);
+  color: var(--label-1);
+  font: inherit;
+  cursor: pointer;
+}
+
+.chat-switcher-btn:hover,
+.chat-switcher-btn[aria-expanded="true"] {
+  background: var(--hover);
+}
+
+.chat-switcher-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.chat-switcher-btn strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-switcher-count {
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: var(--r-pill);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  font-size: var(--fs-micro);
+  line-height: 18px;
+  text-align: center;
+}
+
+.chat-switcher-menu {
+  left: 0;
+  right: auto;
+  top: calc(100% + 4px);
+  min-width: 240px;
+  max-width: 320px;
+}
+
+.chat-switcher-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row-menu-item.active {
+  background: var(--active);
+  font-weight: 600;
+}
+
+.row-menu-item.new {
+  margin-top: 2px;
+  border-top: 1px solid var(--hairline);
+  border-radius: 0 0 var(--r-xs) var(--r-xs);
+  color: var(--accent-ink);
+}
+
+/* Connectors and Plugins share one screen: tabs under the title. */
+.integration-tabs {
+  margin-top: 12px;
+  align-self: flex-start;
+}
+
+/* Connectors and Plugins share one screen: tabs under the title. */
+.integration-tabs {
+  margin-top: 12px;
+  align-self: flex-start;
+}
+
+/* ===== Chat view (PR-N) =====
+   1. The composer sits in the flow under the transcript instead of floating
+      over it. It used to be absolutely positioned while the transcript only
+      reserved 108 px, so the larger composer covered the last messages and the
+      jump button. Now the transcript simply ends where the composer begins.
+   2. Replies read as text, not as boxed cards; the speaker's avatar shows once
+      per run; the newest reply keeps its actions in view. */
+.chat-column > .composer-wrap {
+  position: relative;
+  left: auto;
+  right: auto;
+  bottom: auto;
+  flex: 0 0 auto;
+  width: 100%;
+  max-width: 796px;
+  margin: 0 auto;
+  padding: 0 18px 16px;
+  box-sizing: border-box;
+}
+
+.chat-column > .composer-wrap::before {
+  display: none;
+}
+
+.chat-column > .messages {
+  padding-bottom: 12px;
+}
+
+/* The jump button hangs just above the composer, centred. */
+.composer-wrap > .scroll-bottom {
+  position: absolute;
+  left: 50%;
+  bottom: 100%;
+  margin-bottom: 10px;
+  transform: translateX(-50%);
+}
+
+.messages {
+  gap: 6px;
+}
+
+.msg.speaker-change {
+  margin-top: 22px;
+}
+
+.msg.speaker-change:first-child {
+  margin-top: 0;
+}
+
+/* Replies: plain text on the page, no card. */
+.msg.bot .msg-body {
+  max-width: 100%;
+  width: 100%;
+  padding: 2px 0 0;
+  background: var(--clear);
+  border: 0;
+  border-radius: 0;
+  font-size: var(--fs-msg);
+  line-height: 1.65;
+}
+
+/* Several bots can speak in a group, so groups keep an avatar on every row; a
+   one-to-one chat shows it once per run. */
+.messages:not(.group) .msg.bot:not(.speaker-change) .msg-avatar {
+  visibility: hidden;
+}
+
+/* Keep a reply's text clear of the avatar column but let it use the width. */
+.msg.bot .msg-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.msg.last-reply .msg-actions {
+  opacity: 1;
+}
+
+.msg.user .msg-body {
+  font-size: var(--fs-msg);
+  line-height: 1.55;
+}
+
+/* Quieter, steadier rows. */
+.msg-actions {
+  min-height: 24px;
+}
+
+.day-sep {
+  margin: 18px 0 6px;
+}

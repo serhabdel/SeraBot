@@ -71,6 +71,10 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
             if speaker_change {
                 class.push_str(" speaker-change");
             }
+            if !user && Some(index) == last_bot {
+                // The newest reply keeps its actions in view.
+                class.push_str(" last-reply");
+            }
             rows.push(MsgView {
                 id: message.id.clone(),
                 user,
@@ -811,28 +815,30 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     // is at the end of the conversation.
                     div { id: "messages-end", class: "messages-end", "aria-hidden": "true" }
                 }
-                if !at_bottom() {
-                    button {
-                        class: "scroll-bottom jump-pill",
-                        r#type: "button",
-                        "aria-label": if live_task.is_some() { "Jump to the latest message, a reply is still coming in" } else { "Jump to the latest message" },
-                        title: "Jump to latest",
-                        onclick: move |_| {
-                            let _ = dioxus::document::eval(chat_scroll::SCROLL_TO_BOTTOM_JS);
-                            at_bottom.set(true);
-                            unseen.set(0);
-                        },
-                        Icon { name: "arrow-down", size: 16 }
-                        span { class: "jump-label", "Jump to latest" }
-                        if let Some(badge) = chat_feed::unseen_badge(unseen()) {
-                            span { class: "scroll-badge", "aria-label": "{badge} unseen messages", "{badge}" }
-                        }
-                        if live_task.is_some() {
-                            span { class: "jump-live", "aria-hidden": "true" }
+                div { class: "composer-wrap",
+                    // Inside the composer block, so it always sits just above it, at
+                    // any composer height.
+                    if !at_bottom() {
+                        button {
+                            class: "scroll-bottom jump-pill",
+                            r#type: "button",
+                            "aria-label": if live_task.is_some() { "Jump to the latest message, a reply is still coming in" } else { "Jump to the latest message" },
+                            title: "Jump to latest",
+                            onclick: move |_| {
+                                let _ = dioxus::document::eval(chat_scroll::SCROLL_TO_BOTTOM_JS);
+                                at_bottom.set(true);
+                                unseen.set(0);
+                            },
+                            Icon { name: "arrow-down", size: 16 }
+                            span { class: "jump-label", "Jump to latest" }
+                            if let Some(badge) = chat_feed::unseen_badge(unseen()) {
+                                span { class: "scroll-badge", "aria-label": "{badge} unseen messages", "{badge}" }
+                            }
+                            if live_task.is_some() {
+                                span { class: "jump-live", "aria-hidden": "true" }
+                            }
                         }
                     }
-                }
-                div { class: "composer-wrap",
                     if let Some(failure) = chat_failure.clone() {
                         div { class: "banner err", role: "alert",
                             span { "{failure.message}" }

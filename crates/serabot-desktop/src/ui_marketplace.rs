@@ -7,7 +7,7 @@
 //! request when sent and wiped, and is never shown again.
 
 use crate::ui::Icon;
-use crate::ui_widgets::{SecretField, StatusChip};
+use crate::ui_widgets::{IntegrationTabs, SecretField, StatusChip};
 use dioxus::prelude::*;
 use serabot_desktop::marketplace::{
     self, ConfigField, PluginAction, PluginDetail, PluginStatus, PluginSummary,
@@ -377,8 +377,9 @@ pub fn MarketplaceView(session: Signal<Session>) -> Element {
         div { class: "pane mp-page",
             div { class: "pane-head",
                 div {
-                    h1 { class: "pane-title", "Marketplace" }
+                    h1 { class: "pane-title", "Connectors" }
                     p { class: "muted", "Plugins your bots will be able to use. Browse the catalog. They cannot be turned on yet." }
+                    IntegrationTabs { session }
                 }
                 button {
                     class: "btn ghost sm",

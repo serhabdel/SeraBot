@@ -69,3 +69,30 @@ pub fn SecretField(
         }
     }
 }
+
+/// The tabs shared by Connectors and Plugins, which are one place now: the
+/// accounts your bots use, and the plugins that add tools.
+#[component]
+pub fn IntegrationTabs(session: Signal<serabot_desktop::session::Session>) -> Element {
+    use serabot_desktop::session::Section;
+    let mut session = session;
+    let section = session.read().section;
+    rsx! {
+        div { class: "seg integration-tabs", role: "tablist", "aria-label": "Connectors and plugins",
+            button {
+                class: if section == Section::Connectors { "seg-btn active" } else { "seg-btn" },
+                role: "tab",
+                "aria-selected": if section == Section::Connectors { "true" } else { "false" },
+                onclick: move |_| session.write().open_section(Section::Connectors),
+                "Connectors"
+            }
+            button {
+                class: if section == Section::Marketplace { "seg-btn active" } else { "seg-btn" },
+                role: "tab",
+                "aria-selected": if section == Section::Marketplace { "true" } else { "false" },
+                onclick: move |_| session.write().open_section(Section::Marketplace),
+                "Plugins"
+            }
+        }
+    }
+}

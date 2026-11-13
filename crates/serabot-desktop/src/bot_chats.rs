@@ -183,6 +183,64 @@ pub fn memory_divider(
     )
 }
 
+/// One entry of the chat switcher: a bot's chat, as the header menu lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwitcherEntry {
+    pub id: String,
+    pub title: String,
+    pub primary: bool,
+    pub active: bool,
+}
+
+/// The chats to offer in the header switcher: the main chat first, then the
+/// others by recent activity. The main chat is always listed, even before the
+/// list has loaded, so the switcher is never empty and a bot with a single chat
+/// still shows where New chat lives.
+pub fn switcher_entries(list: Option<&BotChatList>, bot: &str, active: &str) -> Vec<SwitcherEntry> {
+    let main_id = format!("dir:{bot}");
+    let mut entries: Vec<SwitcherEntry> = list
+        .map(|list| {
+            live_chats(list)
+                .into_iter()
+                .map(|chat| SwitcherEntry {
+                    id: chat.id.clone(),
+                    title: chat_title(chat),
+                    primary: chat.primary,
+                    active: chat.id == active,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !entries.iter().any(|entry| entry.primary) {
+        entries.insert(
+            0,
+            SwitcherEntry {
+                id: main_id.clone(),
+                title: "Main chat".to_owned(),
+                primary: true,
+                active: main_id == active,
+            },
+        );
+    }
+    entries
+}
+
+/// "2 chats" for a bot row, or nothing for a bot with only its main chat.
+pub fn chat_count_label(extra_chats: usize) -> Option<String> {
+    match extra_chats {
+        0 => None,
+        1 => Some("2 chats".to_owned()),
+        n => Some(format!("{} chats", n + 1)),
+    }
+}
+
+/// Whether a bot's chats show in the sidebar when the reader has not chosen.
+/// They open for the bot being talked to (main or any of its chats), so the
+/// way to switch and to start a new chat is always in sight.
+pub fn default_chats_open(bot_is_active: bool) -> bool {
+    bot_is_active
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,5 +430,36 @@ mod tests {
             memory_divider(&chat("dir:analyst", true, "x"), None, "Analyst"),
             None
         );
+    }
+    #[test]
+    fn the_switcher_always_lists_the_main_chat_and_marks_the_open_one() {
+        // Before the list loads: just the main chat.
+        let before = switcher_entries(None, "analyst", "dir:analyst");
+        assert_eq!(before.len(), 1);
+        assert!(before[0].primary && before[0].active);
+        assert_eq!(before[0].title, "Main chat");
+
+        let l = list(vec![
+            chat("dir:analyst", true, "2026-11-01T00:00:00Z"),
+            chat("dir:chat-aa", false, "2026-11-05T00:00:00Z"),
+        ]);
+        let entries = switcher_entries(Some(&l), "analyst", "dir:chat-aa");
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].primary && !entries[0].active);
+        assert!(entries[1].active);
+        // A list that lacks the main chat still gets one at the top.
+        let only_extra = list(vec![chat("dir:chat-aa", false, "x")]);
+        let e = switcher_entries(Some(&only_extra), "analyst", "dir:chat-aa");
+        assert_eq!(e[0].id, "dir:analyst");
+        assert_eq!(e.len(), 2);
+    }
+
+    #[test]
+    fn chat_counts_read_naturally() {
+        assert_eq!(chat_count_label(0), None);
+        assert_eq!(chat_count_label(1).as_deref(), Some("2 chats"));
+        assert_eq!(chat_count_label(4).as_deref(), Some("5 chats"));
+        assert!(default_chats_open(true));
+        assert!(!default_chats_open(false));
     }
 }
