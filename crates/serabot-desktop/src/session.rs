@@ -131,7 +131,6 @@ pub enum Section {
     Conversations,
     Memory,
     Providers,
-    Connectors,
     Approvals,
     Browser,
     Vault,
@@ -142,20 +141,20 @@ pub enum Section {
     Logs,
     /// Scheduled routines, source health and active plans (0.29.0).
     Workflows,
-    /// Plugins: install, turn on and off, and set up (v0.37).
-    Marketplace,
+    /// Connectors, Composio and plugins in one place (v0.38): tabs for
+    /// Installed, Marketplace and Composio.
+    Integrations,
 }
 
 impl Section {
-    pub const NAV: [Self; 13] = [
+    pub const NAV: [Self; 12] = [
         Self::Chat,
         Self::Conversations,
         Self::Browser,
         Self::Tasks,
         Self::Memory,
         Self::Providers,
-        Self::Connectors,
-        Self::Marketplace,
+        Self::Integrations,
         Self::Approvals,
         Self::Vault,
         Self::Usage,
@@ -169,7 +168,6 @@ impl Section {
             Self::Conversations => "Conversations",
             Self::Memory => "Memory",
             Self::Providers => "Providers",
-            Self::Connectors => "Connectors",
             Self::Approvals => "Approvals",
             Self::Browser => "Browser",
             Self::Vault => "Vault",
@@ -178,7 +176,7 @@ impl Section {
             Self::Settings => "Settings",
             Self::Logs => "Logs",
             Self::Workflows => "Workflows",
-            Self::Marketplace => "Marketplace",
+            Self::Integrations => "Integrations",
         }
     }
 }
@@ -723,6 +721,8 @@ pub struct Session {
     bot_chats_pending: Option<String>,
     /// The plugin whose page is open on the Marketplace screen.
     pub marketplace_open: Option<String>,
+    /// The connector whose card is open in the Integrations detail sheet (v0.38).
+    pub integration_open: Option<String>,
     /// A change is in flight (so its buttons wait).
     pub marketplace_busy: bool,
     /// The bot config write in flight: (bot id, update), kept so the cached
@@ -882,6 +882,7 @@ impl Session {
             bot_detail_pending: None,
             bot_chats_pending: None,
             marketplace_open: None,
+            integration_open: None,
             marketplace_busy: false,
             bot_config_pending: None,
             pending_team: None,
@@ -1291,7 +1292,7 @@ impl Session {
         if section == Section::Workflows {
             self.refresh_workflows();
         }
-        if section == Section::Marketplace {
+        if section == Section::Integrations {
             self.refresh_marketplace();
         }
         self.ensure_section_data();
@@ -1347,6 +1348,15 @@ impl Session {
     }
 
     /// Open a plugin's page: show what the list already knows and read the rest.
+    /// Open one connector's card in the Integrations detail sheet.
+    pub fn open_connector_sheet(&mut self, id: String) {
+        self.integration_open = Some(id);
+    }
+
+    pub fn close_connector_sheet(&mut self) {
+        self.integration_open = None;
+    }
+
     pub fn open_plugin(&mut self, slug: String) {
         if !self.state.connected || !crate::valid_id(&slug) {
             return;
@@ -1976,6 +1986,12 @@ impl Session {
 
     /// Open `url` in the default browser without blocking the UI thread.
     pub fn open_in_browser(&mut self, url: String) {
+        // Checked here, where the link is opened, so no caller can bypass it.
+        if !crate::net_policy::external_link_allowed(&url) {
+            self.toast =
+                Some("That link is not a secure web address, so it was not opened.".into());
+            return;
+        }
         self.launch(move || match webbrowser::open(&url) {
             Ok(()) => "Opened your browser.".to_owned(),
             Err(error) => format!("Could not open the browser: {error}"),
@@ -4337,7 +4353,6 @@ impl Session {
                 }
             }
             Section::Providers => (!self.state.providers_loaded).then_some(Operation::Providers),
-            Section::Connectors => (!self.state.connectors_loaded).then_some(Operation::Connectors),
             Section::Approvals => {
                 if !self.state.approvals_loaded {
                     Some(Operation::Approvals)
@@ -4359,9 +4374,15 @@ impl Session {
                 query: self.logs_query.clone(),
             }),
             Section::Workflows => (!self.state.workflows_loaded).then_some(Operation::Workflows),
-            Section::Marketplace => (!self.state.marketplace_loaded
-                && !self.state.marketplace_unavailable)
-                .then_some(Operation::MarketplaceList),
+            Section::Integrations => {
+                if !self.state.connectors_loaded {
+                    Some(Operation::Connectors)
+                } else if !self.state.marketplace_loaded && !self.state.marketplace_unavailable {
+                    Some(Operation::MarketplaceList)
+                } else {
+                    None
+                }
+            }
             Section::Browser | Section::Vault | Section::Usage | Section::Settings => None,
         }
     }

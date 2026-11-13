@@ -17,6 +17,8 @@ mod ui_dock;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_files;
 #[cfg(any(windows, feature = "ui-check"))]
+mod ui_integrations;
+#[cfg(any(windows, feature = "ui-check"))]
 mod ui_jobs;
 #[cfg(any(windows, feature = "ui-check"))]
 mod ui_logs;

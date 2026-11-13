@@ -197,7 +197,7 @@ pub fn legacy_connected(connector: &ConnectorStatus) -> bool {
     })
 }
 
-const GOOGLE_IDS: [&str; 4] = ["google_drive", "google_sheets", "google_calendar", "gmail"];
+pub const GOOGLE_IDS: [&str; 4] = ["google_drive", "google_sheets", "google_calendar", "gmail"];
 
 fn google_connectors(connectors: &[ConnectorStatus]) -> impl Iterator<Item = &PersonalStatus> {
     connectors
