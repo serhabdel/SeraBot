@@ -48,7 +48,11 @@ use serabot::util::sha256_hex;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Parser)]
-#[command(name = "serabot", version, about = "Single-operator self-hosted agent")]
+#[command(
+    name = "serabot",
+    version,
+    about = "Small-circle invitation-only multi-user agent"
+)]
 struct Cli {
     #[arg(long, global = true, default_value = "serabot.toml")]
     config: PathBuf,
@@ -1133,23 +1137,60 @@ async fn run(config_path: &std::path::Path) -> anyhow::Result<()> {
                         // The scheduler claims routines across users (the
                         // service is shared) and enqueues each occurrence
                         // under the routine's owning user.
-                        let due = due_routines(&store, chrono::Utc::now(), tz)?;
+                        let due = match due_routines(&store, chrono::Utc::now(), tz) {
+                            Ok(due) => due,
+                            Err(error) => {
+                                tracing::warn!(%error, "scheduler due_routines check failed");
+                                continue;
+                            }
+                        };
                         for routine in due {
                             let kind = serabot::config::task_kind_for_routine(&routine.name);
-                            let conversation_id = store
-                                .default_scheduled_conversation_id(&routine.user_id)?;
-                            let payload = ScheduledPayload {
+                            let conversation_id = match store
+                                .default_scheduled_conversation_id(&routine.user_id)
+                            {
+                                Ok(id) => id,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        user_id = %routine.user_id,
+                                        routine = %routine.name,
+                                        "failed to resolve scheduled conversation"
+                                    );
+                                    continue;
+                                }
+                            };
+                            let payload = match serde_json::to_value(ScheduledPayload {
                                 conversation_id,
                                 user_id: routine.user_id.clone(),
+                            }) {
+                                Ok(payload) => payload,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        user_id = %routine.user_id,
+                                        routine = %routine.name,
+                                        "failed to serialize scheduled payload"
+                                    );
+                                    continue;
+                                }
                             };
-                            store.enqueue_task(
+                            if let Err(error) = store.enqueue_task(
                                 &routine.user_id,
                                 kind,
                                 "watcher",
-                                &serde_json::to_value(&payload)?,
+                                &payload,
                                 5,
                                 chrono::Utc::now(),
-                            )?;
+                            ) {
+                                tracing::warn!(
+                                    %error,
+                                    user_id = %routine.user_id,
+                                    routine = %routine.name,
+                                    "failed to enqueue scheduled task"
+                                );
+                                continue;
+                            }
                             tracing::info!(routine = %routine.name, local_date = %routine.scheduled_for_local_date, "scheduled task enqueued");
                         }
                     }

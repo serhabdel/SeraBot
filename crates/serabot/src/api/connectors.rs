@@ -1,10 +1,24 @@
 use super::*;
 use crate::connectors::ConnectorKind;
 
+/// Server-level secret status: admins see the age secret name alongside
+/// presence; non-admins receive `name: null` while preserving `configured`
+/// so UI capability checks still reflect whether a server connector is active.
+fn visible_secret_status(secrets: &SharedSecrets, name: Option<&str>, is_admin: bool) -> Value {
+    if is_admin {
+        return secret_status(secrets, name);
+    }
+    let configured = name
+        .filter(|name| !name.is_empty())
+        .is_some_and(|name| secrets.has(name));
+    json!({"name": Value::Null, "configured": configured})
+}
+
 pub(super) async fn list_providers(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
 ) -> Result<Json<Value>> {
+    let is_admin = user.is_admin();
     let catalog = state.runtime.model_catalog(&user.id)?;
     let llm = &state.config.llm;
     let mut settings: BTreeMap<String, ProviderConfig> = llm.providers.clone();
@@ -33,24 +47,27 @@ pub(super) async fn list_providers(
                         || matches!(c.kind.as_str(), "google-antigravity" | "muse-code")
                 }) || matches!(provider.kind.as_str(), "google-antigravity" | "muse-code");
             let mut secrets = json!({
-                "api_key": secret_status(&state.secrets, config.map(|c| c.api_key_secret.as_str())),
+                "api_key": visible_secret_status(&state.secrets, config.map(|c| c.api_key_secret.as_str()), is_admin),
             });
             if is_oauth || config.is_some_and(|c| !c.refresh_token_secret.is_empty()) {
-                secrets["refresh_token"] = secret_status(
+                secrets["refresh_token"] = visible_secret_status(
                     &state.secrets,
                     config.map(|c| c.refresh_token_secret.as_str()),
+                    is_admin,
                 );
             }
             if is_oauth || config.is_some_and(|c| !c.oauth_client_id_secret.is_empty()) {
-                secrets["oauth_client_id"] = secret_status(
+                secrets["oauth_client_id"] = visible_secret_status(
                     &state.secrets,
                     config.map(|c| c.oauth_client_id_secret.as_str()),
+                    is_admin,
                 );
             }
             if is_oauth || config.is_some_and(|c| !c.oauth_client_secret_secret.is_empty()) {
-                secrets["oauth_client_secret"] = secret_status(
+                secrets["oauth_client_secret"] = visible_secret_status(
                     &state.secrets,
                     config.map(|c| c.oauth_client_secret_secret.as_str()),
+                    is_admin,
                 );
             }
             Ok(json!({
@@ -85,22 +102,27 @@ pub(super) async fn list_providers(
                 let is_oauth = profile.auth.eq_ignore_ascii_case("oauth")
                     || matches!(profile.kind.as_str(), "google-antigravity" | "muse-code");
                 let mut secrets = json!({
-                    "api_key": secret_status(&state.secrets, Some(profile.api_key_secret.as_str())),
+                    "api_key": visible_secret_status(&state.secrets, Some(profile.api_key_secret.as_str()), is_admin),
                 });
                 if is_oauth || !profile.refresh_token_secret.is_empty() {
-                    secrets["refresh_token"] =
-                        secret_status(&state.secrets, Some(profile.refresh_token_secret.as_str()));
+                    secrets["refresh_token"] = visible_secret_status(
+                        &state.secrets,
+                        Some(profile.refresh_token_secret.as_str()),
+                        is_admin,
+                    );
                 }
                 if is_oauth || !profile.oauth_client_id_secret.is_empty() {
-                    secrets["oauth_client_id"] = secret_status(
+                    secrets["oauth_client_id"] = visible_secret_status(
                         &state.secrets,
                         Some(profile.oauth_client_id_secret.as_str()),
+                        is_admin,
                     );
                 }
                 if is_oauth || !profile.oauth_client_secret_secret.is_empty() {
-                    secrets["oauth_client_secret"] = secret_status(
+                    secrets["oauth_client_secret"] = visible_secret_status(
                         &state.secrets,
                         Some(profile.oauth_client_secret_secret.as_str()),
+                        is_admin,
                     );
                 }
                 let routing_classes = llm
@@ -144,6 +166,7 @@ pub(super) async fn list_connectors(
     State(state): State<Arc<ApiState>>,
     Extension(user): Extension<ActingUser>,
 ) -> Result<Json<Value>> {
+    let is_admin = user.is_admin();
     let connectors = &state.config.connectors;
     let oauth: [(&str, &dyn OAuthConnectorSettings); 7] = [
         ("google_drive", &connectors.google_drive),
@@ -156,7 +179,7 @@ pub(super) async fn list_connectors(
     ];
     let mut views = oauth
         .into_iter()
-        .map(|(id, connector)| oauth_connector_view(&state, id, connector))
+        .map(|(id, connector)| oauth_connector_view(&state, id, connector, is_admin))
         .collect::<Vec<_>>();
     // Per-user products report this account's own state; "not set up" carries
     // an admin hint instead of a sign-in action.
@@ -178,9 +201,9 @@ pub(super) async fn list_connectors(
         "enabled": agentmail.enabled,
         "redirect_uri": Value::Null,
         "api_base": if api_base.is_empty() { Value::Null } else { json!(api_base) },
-        "default_inbox_id": if inbox_id.is_empty() { Value::Null } else { json!(inbox_id) },
+        "default_inbox_id": if is_admin && !inbox_id.is_empty() { json!(inbox_id) } else { Value::Null },
         "secrets": {
-            "api_key": secret_status(&state.secrets, Some(agentmail.api_key_secret.as_str())),
+            "api_key": visible_secret_status(&state.secrets, Some(agentmail.api_key_secret.as_str()), is_admin),
         },
     }));
     // ElevenLabs sign-in: a per-account connector. `connected` is this
@@ -223,7 +246,7 @@ pub(super) async fn list_connectors(
             "redirect_uri": Value::Null,
             "api_base": api_base,
             "secrets": {
-                "api_key": secret_status(&state.secrets, Some(key_secret)),
+                "api_key": visible_secret_status(&state.secrets, Some(key_secret), is_admin),
             },
         }));
     }
@@ -1220,6 +1243,7 @@ pub(super) fn oauth_connector_view(
     state: &ApiState,
     id: &str,
     connector: &dyn OAuthConnectorSettings,
+    is_admin: bool,
 ) -> Value {
     let redirect = connector.redirect_uri().trim();
     json!({
@@ -1228,9 +1252,211 @@ pub(super) fn oauth_connector_view(
         "enabled": connector.oauth_enabled(),
         "redirect_uri": if redirect.is_empty() { Value::Null } else { json!(redirect) },
         "secrets": {
-            "client_id": secret_status(&state.secrets, Some(connector.client_id_secret_name())),
-            "client_secret": secret_status(&state.secrets, Some(connector.client_secret_secret_name())),
-            "refresh_token": secret_status(&state.secrets, Some(connector.refresh_token_secret_name())),
+            "client_id": visible_secret_status(&state.secrets, Some(connector.client_id_secret_name()), is_admin),
+            "client_secret": visible_secret_status(&state.secrets, Some(connector.client_secret_secret_name()), is_admin),
+            "refresh_token": visible_secret_status(&state.secrets, Some(connector.refresh_token_secret_name()), is_admin),
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gateway::{Gateway, ToolRegistry};
+    use crate::llm::LlmClient;
+    use crate::policy::Policy;
+    use crate::runtime::NullNotifier;
+    use tower::ServiceExt;
+
+    fn test_app_with_connectors() -> (Router, Store) {
+        let dir = std::env::temp_dir().join(format!("serabot-conn-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = Config::default();
+        config.api.enabled = true;
+        config.api.token_hash = sha256_hex("test-token-that-is-long-enough-123");
+        config.llm.model = "test".into();
+        config.llm.base_url = "https://example.com/v1".into();
+        config.base_dir = dir.clone();
+        config.tavily.enabled = true;
+        config.connectors.agentmail.enabled = true;
+        config.connectors.agentmail.default_inbox_id = "bot-inbox@agentmail.invalid".into();
+        let db_path = dir.join("serabot.db");
+        config.database.path = db_path.to_string_lossy().into_owned();
+        let config = Arc::new(config);
+        let store = Store::open(&db_path, 384, 5000).unwrap();
+        let gateway = Gateway::new(
+            store.clone(),
+            Arc::new(Policy::empty()),
+            ToolRegistry::default(),
+            1,
+            false,
+        );
+        let llm = LlmClient::new("https://example.com/v1", "test", 5, 50)
+            .unwrap()
+            .with_model("test");
+        let runtime = Runtime::new(
+            config.clone(),
+            store.clone(),
+            gateway,
+            crate::model_router::ModelRouter::new(
+                &config.llm,
+                BTreeMap::from([("default".into(), llm)]),
+            )
+            .unwrap(),
+            vec![crate::config::LoadedBot {
+                config: BotConfig {
+                    title: None,
+                    description: None,
+                    name: "main".into(),
+                    trigger: "command".into(),
+                    model: None,
+                    system_prompt: "prompts/main.txt".into(),
+                    skills: vec![],
+                    tools: vec![],
+                    require_approval: vec![],
+                    enabled: true,
+                    temperature: None,
+                    thinking: None,
+                    role: BotRole::Orchestrator,
+                    delegates: vec![],
+                },
+                prompt: "test prompt".into(),
+            }],
+            Arc::new(NullNotifier),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        let artifacts = Arc::new(ArtifactStore::new(dir.join("artifacts")).unwrap());
+        let secrets = SharedSecrets::new(crate::secrets::SecretStore::from_map(BTreeMap::from([
+            (config.llm.api_key_secret.clone(), "synthetic-llm".into()),
+            ("tavily_api_key".into(), "synthetic-tavily".into()),
+            ("agentmail_api_key".into(), "synthetic-agentmail".into()),
+            ("google_oauth_client_id".into(), "synthetic-gid".into()),
+        ])));
+        let users = Arc::new(UserSecrets::with_master_key(store.clone(), [8u8; 32]).unwrap());
+        let state = ApiState::new(
+            runtime,
+            store.clone(),
+            config,
+            artifacts,
+            secrets,
+            users,
+            None,
+        )
+        .unwrap();
+        (crate::api::router(state), store)
+    }
+
+    async fn get_json(app: &Router, token: &str, uri: &str) -> Value {
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET {uri}");
+        let bytes = axum::body::to_bytes(resp.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn find_by_id<'a>(list: &'a [Value], id: &str) -> &'a Value {
+        list.iter()
+            .find(|item| item["id"] == id)
+            .unwrap_or_else(|| panic!("missing id {id}"))
+    }
+
+    #[tokio::test]
+    async fn connectors_and_providers_redact_server_secret_names_and_inbox_for_non_admins() {
+        let (app, store) = test_app_with_connectors();
+        let admin_id = store.admin_user_id().unwrap();
+        let member = store
+            .create_user("sub-conn-lp", "lp@example.example", "LP Member")
+            .unwrap();
+        let admin_token = store
+            .mint_session(&admin_id, chrono::Duration::hours(1))
+            .unwrap();
+        let member_token = store
+            .mint_session(&member.id, chrono::Duration::hours(1))
+            .unwrap();
+
+        // Admin sees server-level age secret names and agentmail default_inbox_id.
+        let admin_conn = get_json(&app, &admin_token, "/v1/connectors").await;
+        let admin_list = admin_conn["connectors"].as_array().unwrap();
+        let admin_agentmail = find_by_id(admin_list, "agentmail");
+        assert_eq!(
+            admin_agentmail["default_inbox_id"],
+            "bot-inbox@agentmail.invalid"
+        );
+        assert_eq!(
+            admin_agentmail["secrets"]["api_key"]["name"],
+            "agentmail_api_key"
+        );
+        assert_eq!(admin_agentmail["secrets"]["api_key"]["configured"], true);
+        let admin_tavily = find_by_id(admin_list, "tavily");
+        assert_eq!(admin_tavily["secrets"]["api_key"]["name"], "tavily_api_key");
+        assert_eq!(admin_tavily["secrets"]["api_key"]["configured"], true);
+        let admin_gmail = find_by_id(admin_list, "gmail");
+        assert_eq!(
+            admin_gmail["secrets"]["client_id"]["name"],
+            "google_oauth_client_id"
+        );
+
+        // Non-admin does NOT see age secret names or agentmail.default_inbox_id,
+        // while capability flags (`configured`, `enabled`, `health`, `personal`) stay intact.
+        let member_conn = get_json(&app, &member_token, "/v1/connectors").await;
+        let member_list = member_conn["connectors"].as_array().unwrap();
+        let member_agentmail = find_by_id(member_list, "agentmail");
+        assert!(member_agentmail["default_inbox_id"].is_null());
+        assert!(member_agentmail["secrets"]["api_key"]["name"].is_null());
+        assert_eq!(member_agentmail["secrets"]["api_key"]["configured"], true);
+        assert_eq!(member_agentmail["enabled"], true);
+        assert_eq!(member_agentmail["health"], "ok");
+
+        let member_tavily = find_by_id(member_list, "tavily");
+        assert!(member_tavily["secrets"]["api_key"]["name"].is_null());
+        assert_eq!(member_tavily["secrets"]["api_key"]["configured"], true);
+        assert_eq!(member_tavily["enabled"], true);
+        assert_eq!(member_tavily["health"], "ok");
+
+        let member_gmail = find_by_id(member_list, "gmail");
+        assert!(member_gmail["secrets"]["client_id"]["name"].is_null());
+        assert_eq!(member_gmail["secrets"]["client_id"]["configured"], true);
+        assert!(member_gmail["secrets"]["client_secret"]["name"].is_null());
+        assert!(member_gmail["secrets"]["refresh_token"]["name"].is_null());
+        assert!(member_gmail["personal"].is_object());
+
+        let member_text = member_conn.to_string();
+        for redacted in [
+            "bot-inbox@agentmail.invalid",
+            "agentmail_api_key",
+            "tavily_api_key",
+            "google_oauth_client_id",
+        ] {
+            assert!(
+                !member_text.contains(redacted),
+                "member payload leaked {redacted}: {member_text}"
+            );
+        }
+
+        // Providers also redact server-level age secret names for non-admins.
+        let admin_prov = get_json(&app, &admin_token, "/v1/providers").await;
+        let admin_default = find_by_id(admin_prov["providers"].as_array().unwrap(), "default");
+        assert_eq!(admin_default["secrets"]["api_key"]["name"], "llm_api_key");
+        assert_eq!(admin_default["secrets"]["api_key"]["configured"], true);
+
+        let member_prov = get_json(&app, &member_token, "/v1/providers").await;
+        let member_default = find_by_id(member_prov["providers"].as_array().unwrap(), "default");
+        assert!(member_default["secrets"]["api_key"]["name"].is_null());
+        assert_eq!(member_default["secrets"]["api_key"]["configured"], true);
+        assert!(!member_prov.to_string().contains("llm_api_key"));
+    }
 }

@@ -170,8 +170,8 @@ impl ArtifactStore {
     }
 
     /// Approve the Italian artifact's content for the acting user. The
-    /// approval marker is content-addressed in `kv` (untouched this phase);
-    /// the audit row records the acting user's id.
+    /// approval marker is scoped to `(user_id, hash)` in `kv`, and the audit
+    /// row records the acting user's id.
     pub fn approve(&self, store: &Store, user_id: &str, hash: &str) -> Result<()> {
         let artifact = self.load(hash)?;
         if artifact.meta.language != Language::It {
@@ -179,7 +179,7 @@ impl ArtifactStore {
                 "only an Italian draft can be approved for French generation".into(),
             ));
         }
-        store.kv_set(&format!("deck_approved:{hash}"), "1")?;
+        store.kv_set(&format!("deck_approved:{user_id}:{hash}"), "1")?;
         store.record_audit(
             user_id,
             "deck.italian_content_approved",
@@ -193,8 +193,11 @@ impl ArtifactStore {
         Ok(())
     }
 
-    pub fn is_approved(&self, store: &Store, hash: &str) -> Result<bool> {
-        Ok(store.kv_get(&format!("deck_approved:{hash}"))?.as_deref() == Some("1"))
+    pub fn is_approved(&self, store: &Store, user_id: &str, hash: &str) -> Result<bool> {
+        Ok(store
+            .kv_get(&format!("deck_approved:{user_id}:{hash}"))?
+            .as_deref()
+            == Some("1"))
     }
 
     /// Copy one file from the acting user's inbox area into the store.
@@ -386,7 +389,10 @@ impl Tool for DeckBuildTool {
                         "source_artifact must be an Italian deck".into(),
                     ));
                 }
-                if !self.artifacts.is_approved(&self.store, source)? {
+                if !self
+                    .artifacts
+                    .is_approved(&self.store, &context.user_id, source)?
+                {
                     return Err(SeraError::Forbidden(
                         "the Italian draft has not been approved by the owner".into(),
                     ));
@@ -902,6 +908,46 @@ mod tests {
             .approve(&store, &store.admin_user_id().unwrap(), &italian)
             .unwrap();
         assert!(tool.execute(args, &context()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn deck_approval_is_scoped_per_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory(384).unwrap();
+        let user_a = store
+            .create_user("sub-deck-a", "deck-a@example.example", "Deck A")
+            .unwrap();
+        let user_b = store
+            .create_user("sub-deck-b", "deck-b@example.example", "Deck B")
+            .unwrap();
+        let artifacts = Arc::new(ArtifactStore::new(dir.path()).unwrap());
+        let tool = DeckBuildTool::new(Arc::new(brand()), artifacts.clone(), store.clone(), 10);
+
+        let mut ctx_a = context();
+        ctx_a.user_id = user_a.id.clone();
+        let mut ctx_b = context();
+        ctx_b.user_id = user_b.id.clone();
+
+        let italian = tool
+            .execute(json!({"spec": deck(Language::It)}), &ctx_a)
+            .await
+            .unwrap()
+            .artifact_hash
+            .unwrap();
+
+        artifacts.approve(&store, &user_a.id, &italian).unwrap();
+        assert!(artifacts.is_approved(&store, &user_a.id, &italian).unwrap());
+        assert!(!artifacts.is_approved(&store, &user_b.id, &italian).unwrap());
+
+        let args = json!({"spec": deck(Language::Fr), "source_artifact": italian});
+        assert!(tool.execute(args.clone(), &ctx_a).await.is_ok());
+        assert!(matches!(
+            tool.execute(args.clone(), &ctx_b).await,
+            Err(SeraError::Forbidden(_))
+        ));
+
+        artifacts.approve(&store, &user_b.id, &italian).unwrap();
+        assert!(tool.execute(args, &ctx_b).await.is_ok());
     }
 
     #[test]

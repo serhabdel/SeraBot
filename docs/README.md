@@ -1,6 +1,6 @@
 # SeraBot documentation
 
-SeraBot is a single-operator, self-hosted Rust agent. These documents describe
+SeraBot is a small-circle, invitation-only multi-user self-hosted Rust agent. These documents describe
 the current implementation and operational procedures. Examples are synthetic;
 never commit real credentials, private policy terms, business documents, or
 artifacts.
@@ -27,6 +27,7 @@ artifacts.
 | [Big Wave (0.29–0.31)](specs/big-wave.md) | Visibility, reliability, and deep ops waves — Workflows, traces, per-user schedules, vault/browser polish; checklist in `tasks/big-wave.md`. |
 | [Release 0.37.0](release-0.37.0.md) | Bots finish the task instead of refusing; live step cards; typed tool results; page data for Tasks, Memory, Connectors, and Providers. |
 | [Release 0.38.0](release-0.38.0.md) | Working chat switching and a steadier chat view; one Integrations screen; plugin tools for bots; safe links and richer markdown in chat. |
+| [Release 0.39.0](release-0.39.0.md) | Per-user isolation & reliability fixes: scheduled/direct `dir:main` isolation, resilient scheduler loop, UID-scoped `kv` & `/v1/models` ownership, per-user monitoring sources, multi-user RAG vector recall, least-privilege `/v1/connectors`, Windows ACLs, and batched media jobs. |
 | [Events](events.md) | `turn.step` payload for desktop and Android step cards. |
 | [Tool results](tool-results.md) | Audio, file, image, link, and table cards. |
 | [Console pages](console-pages.md) | Tasks, Memory, Connectors, and Providers fields the next desktop pages read. |
@@ -63,7 +64,7 @@ Bots that send or delete anything through an external account keep approval
 on: `telegram_send_document`, `composio_execute` (for the messaging bots), and
 `onedrive_upload`. Every bot gets `conversation_library` (find artifact hashes,
 media results and local files itself) and `telegram_send_document` (0.27).
-Only `main` has the `delegate` tool, and it may fan out up to 8 handoffs in one
+Only `main` has the `delegate` tool, and it may fan out up to 16 handoffs in one
 turn to run parallel subagents.
 
 Related sources of truth:

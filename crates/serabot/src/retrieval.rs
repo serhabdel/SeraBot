@@ -101,6 +101,10 @@ impl Retriever for SqliteRetriever {
         }
 
         let limit = if k == 0 { self.k } else { k.min(self.k) }.clamp(1, MAX_K);
+        // Oversample the global sqlite-vec KNN subquery before filtering by
+        // `d.user_id` and `d.status`, so a user with many indexed chunks cannot
+        // starve another user's vector recall.
+        let knn_k = (limit.max(1) * 10).max(100) as i64;
         let mut embeddings = self.embedder.embed(vec![query.to_owned()]).await?;
         if embeddings.len() != 1 {
             return Err(SeraError::Internal(format!(
@@ -136,9 +140,10 @@ impl Retriever for SqliteRetriever {
              JOIN documents d ON d.id = c.document_id
              WHERE d.status = 'ready' AND d.user_id = ?3
                AND c.page >= 1 AND length(trim(c.text)) > 0
-             ORDER BY knn.distance ASC, c.id ASC",
+             ORDER BY knn.distance ASC, c.id ASC
+             LIMIT ?4",
         )?;
-        let rows = statement.query_map(params![blob, limit as i64, user_id], |row| {
+        let rows = statement.query_map(params![blob, knn_k, user_id, limit as i64], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -329,6 +334,92 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn large_corpus_user_does_not_starve_other_users_recall() {
+        let store = Store::open_in_memory(384).expect("store");
+        let user_a = store
+            .create_user("microsoft:user-a", "a@example.example", "User A")
+            .unwrap();
+        let user_b = store
+            .create_user("microsoft:user-b", "b@example.example", "User B")
+            .unwrap();
+
+        let embedder = DeterministicTestEmbedder::new(384);
+        let a_texts: Vec<String> = (0..50).map(|_| "alpha".to_owned()).collect();
+        let a_vectors = embedder.embed(a_texts.clone()).await.expect("a vectors");
+        let b_texts = vec!["alpha".to_owned(), "omega".to_owned()];
+        let b_vectors = embedder.embed(b_texts.clone()).await.expect("b vectors");
+
+        {
+            let connection = store.connection().expect("connection");
+            connection
+                .execute(
+                    "INSERT INTO documents(id, source_path, sha256, title, mime, pages, status, error, created_at, updated_at, user_id)
+                     VALUES ('doc-user-a', '/tmp/ua.txt', 'sha-ua', 'User A Doc', 'text/plain', 50, 'ready', NULL, ?1, ?1, ?2)",
+                    params![NOW, user_a.id],
+                )
+                .expect("doc-user-a");
+            for (index, (text, vector)) in a_texts.iter().zip(a_vectors.iter()).enumerate() {
+                let chunk_id = format!("chunk-a-{index}");
+                connection
+                    .execute(
+                        "INSERT INTO chunks(id, document_id, page, ordinal, text, created_at)
+                         VALUES (?1, 'doc-user-a', ?2, ?2, ?3, ?4)",
+                        params![chunk_id, (index + 1) as i64, text, NOW],
+                    )
+                    .expect("chunk-a");
+                connection
+                    .execute(
+                        "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES (?1, ?2)",
+                        params![chunk_id, encode_vector(vector)],
+                    )
+                    .expect("vec-a");
+            }
+
+            connection
+                .execute(
+                    "INSERT INTO documents(id, source_path, sha256, title, mime, pages, status, error, created_at, updated_at, user_id)
+                     VALUES ('doc-user-b', '/tmp/ub.txt', 'sha-ub', 'User B Doc', 'text/plain', 2, 'ready', NULL, ?1, ?1, ?2)",
+                    params![NOW, user_b.id],
+                )
+                .expect("doc-user-b");
+            for (index, (text, vector)) in b_texts.iter().zip(b_vectors.iter()).enumerate() {
+                let chunk_id = format!("chunk-b-{index}");
+                connection
+                    .execute(
+                        "INSERT INTO chunks(id, document_id, page, ordinal, text, created_at)
+                         VALUES (?1, 'doc-user-b', ?2, ?2, ?3, ?4)",
+                        params![chunk_id, (index + 1) as i64, text, NOW],
+                    )
+                    .expect("chunk-b");
+                connection
+                    .execute(
+                        "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES (?1, ?2)",
+                        params![chunk_id, encode_vector(vector)],
+                    )
+                    .expect("vec-b");
+            }
+        }
+
+        let retriever =
+            SqliteRetriever::new(store, Arc::new(DeterministicTestEmbedder::new(384)), 8);
+        let b_chunks = retriever
+            .retrieve(&user_b.id, "alpha", 2)
+            .await
+            .expect("user b retrieval");
+        assert_eq!(b_chunks.len(), 2);
+        assert!(b_chunks.iter().all(|c| c.document_id == "doc-user-b"));
+        assert_eq!(b_chunks[0].chunk_id, "chunk-b-0");
+        assert_eq!(b_chunks[1].chunk_id, "chunk-b-1");
+
+        let a_chunks = retriever
+            .retrieve(&user_a.id, "alpha", 2)
+            .await
+            .expect("user a retrieval");
+        assert_eq!(a_chunks.len(), 2);
+        assert!(a_chunks.iter().all(|c| c.document_id == "doc-user-a"));
     }
 
     #[test]

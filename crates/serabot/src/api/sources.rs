@@ -104,6 +104,12 @@ pub(super) async fn add_member_rss(
     Extension(user): Extension<ActingUser>,
     Json(body): Json<AddRssBody>,
 ) -> Result<Json<Value>> {
+    if body.name.trim().is_empty()
+        || body.name.chars().count() > 128
+        || body.name.chars().any(char::is_control)
+    {
+        return Err(SeraError::Validation("invalid source name".into()));
+    }
     let url = crate::sources::validate_member_rss_url(&state.config, &body.url)?;
     if crate::config::load_sources(&state.config)?
         .iter()
@@ -149,4 +155,145 @@ pub(super) async fn delete_member_source(
         return Err(SeraError::NotFound(format!("source {name}")));
     }
     Ok(Json(json!({"deleted": name})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gateway::{Gateway, ToolRegistry};
+    use crate::llm::LlmClient;
+    use crate::policy::Policy;
+    use crate::runtime::NullNotifier;
+    use tower::ServiceExt;
+
+    fn test_app_for_sources() -> (Router, Store) {
+        let dir = std::env::temp_dir().join(format!("serabot-src-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = Config::default();
+        config.api.enabled = true;
+        config.api.token_hash = sha256_hex("test-token-that-is-long-enough-123");
+        config.llm.model = "test".into();
+        config.llm.base_url = "https://example.com/v1".into();
+        config.base_dir = dir.clone();
+        config.watcher.rss_allowlist_hosts = vec!["feeds.example.invalid".into()];
+        let db_path = dir.join("serabot.db");
+        config.database.path = db_path.to_string_lossy().into_owned();
+        let config = Arc::new(config);
+        let store = Store::open(&db_path, 384, 5000).unwrap();
+        let gateway = Gateway::new(
+            store.clone(),
+            Arc::new(Policy::empty()),
+            ToolRegistry::default(),
+            1,
+            false,
+        );
+        let llm = LlmClient::new("https://example.com/v1", "test", 5, 50)
+            .unwrap()
+            .with_model("test");
+        let runtime = Runtime::new(
+            config.clone(),
+            store.clone(),
+            gateway,
+            crate::model_router::ModelRouter::new(
+                &config.llm,
+                BTreeMap::from([("default".into(), llm)]),
+            )
+            .unwrap(),
+            vec![crate::config::LoadedBot {
+                config: BotConfig {
+                    title: None,
+                    description: None,
+                    name: "main".into(),
+                    trigger: "command".into(),
+                    model: None,
+                    system_prompt: "prompts/main.txt".into(),
+                    skills: vec![],
+                    tools: vec![],
+                    require_approval: vec![],
+                    enabled: true,
+                    temperature: None,
+                    thinking: None,
+                    role: BotRole::Orchestrator,
+                    delegates: vec![],
+                },
+                prompt: "test prompt".into(),
+            }],
+            Arc::new(NullNotifier),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        let artifacts = Arc::new(ArtifactStore::new(dir.join("artifacts")).unwrap());
+        let secrets = SharedSecrets::new(crate::secrets::SecretStore::from_map(BTreeMap::new()));
+        let users = Arc::new(UserSecrets::with_master_key(store.clone(), [6u8; 32]).unwrap());
+        let state = ApiState::new(
+            runtime,
+            store.clone(),
+            config,
+            artifacts,
+            secrets,
+            users,
+            None,
+        )
+        .unwrap();
+        (crate::api::router(state), store)
+    }
+
+    #[tokio::test]
+    async fn add_member_rss_rejects_control_characters_in_name() {
+        let (app, store) = test_app_for_sources();
+        let member = store
+            .create_user("sub-src-ctrl", "src-ctrl@example.example", "Src")
+            .unwrap();
+        let token = store
+            .mint_session(&member.id, chrono::Duration::hours(1))
+            .unwrap();
+
+        for bad_name in ["feed\nline", "feed\rret", "feed\x00nul", "feed\ttab"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/sources/rss")
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            json!({
+                                "name": bad_name,
+                                "url": "https://feeds.example.invalid/rss.xml",
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "expected 422 for name {bad_name:?}"
+            );
+        }
+
+        let ok_response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/sources/rss")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "clean-feed",
+                            "url": "https://feeds.example.invalid/rss.xml",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_response.status(), StatusCode::OK);
+    }
 }

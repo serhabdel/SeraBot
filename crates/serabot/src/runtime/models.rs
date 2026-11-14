@@ -103,7 +103,7 @@ impl Runtime {
         bot: &crate::config::LoadedBot,
     ) -> Result<()> {
         let hint = self.bot_model_hint(bot);
-        let intended = match self.stored_model_selection(conversation_id)? {
+        let intended = match self.stored_model_selection(user_id, conversation_id)? {
             Some(stored) => stored,
             None => self.user_default_selection(user_id, hint.as_deref()),
         };
@@ -120,7 +120,7 @@ impl Runtime {
             "stored model is no longer available; fell back"
         );
         self.store.kv_set(
-            &format!("model_selection:{conversation_id}"),
+            &Self::model_selection_key(user_id, conversation_id),
             &serde_json::to_string(&resolved)?,
         )?;
         self.store.append_message(
@@ -136,16 +136,58 @@ impl Runtime {
         Ok(())
     }
 
-    fn thinking_key(conversation_id: &str) -> String {
+    fn thinking_key(user_id: &str, conversation_id: &str) -> String {
+        format!("thinking:{user_id}:{conversation_id}")
+    }
+
+    fn legacy_thinking_key(conversation_id: &str) -> String {
         format!("thinking:{conversation_id}")
     }
 
-    /// The conversation's own thinking level, when the owner picked one.
-    pub fn conversation_thinking(&self, conversation_id: &str) -> Result<Option<String>> {
-        Ok(self
+    fn model_selection_key(user_id: &str, conversation_id: &str) -> String {
+        format!("model_selection:{user_id}:{conversation_id}")
+    }
+
+    fn legacy_model_selection_key(conversation_id: &str) -> String {
+        format!("model_selection:{conversation_id}")
+    }
+
+    fn can_read_legacy_conversation_kv(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<bool> {
+        if self
             .store
-            .kv_get(&Self::thinking_key(conversation_id))?
-            .filter(|level| crate::thinking::is_known_level(level)))
+            .get_conversation(user_id, conversation_id)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        Ok(!self.store.conversation_exists(conversation_id)?
+            && self.store.admin_user_id().ok().as_deref() == Some(user_id))
+    }
+
+    /// The conversation's own thinking level, when the owner picked one.
+    pub fn conversation_thinking(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<String>> {
+        validate_conversation_id(conversation_id)?;
+        self.guard_conversation_scope(user_id, conversation_id)?;
+        let value = match self
+            .store
+            .kv_get(&Self::thinking_key(user_id, conversation_id))?
+        {
+            Some(value) => Some(value),
+            None if self.can_read_legacy_conversation_kv(user_id, conversation_id)? => {
+                self.store
+                    .kv_get(&Self::legacy_thinking_key(conversation_id))?
+            }
+            None => None,
+        };
+        Ok(value.filter(|level| crate::thinking::is_known_level(level)))
     }
 
     /// The thinking levels the conversation's current model accepts.
@@ -171,7 +213,7 @@ impl Runtime {
     ) -> Result<Option<String>> {
         validate_conversation_id(conversation_id)?;
         self.guard_conversation_scope(user_id, conversation_id)?;
-        let key = Self::thinking_key(conversation_id);
+        let key = Self::thinking_key(user_id, conversation_id);
         let Some(level) = level else {
             self.store.kv_set(&key, "")?;
             return Ok(None);
@@ -205,10 +247,11 @@ impl Runtime {
     /// router ignores it when the model does not support it.
     pub(super) fn turn_thinking(
         &self,
+        user_id: &str,
         conversation_id: &str,
         bot: &crate::config::LoadedBot,
     ) -> Option<String> {
-        self.conversation_thinking(conversation_id)
+        self.conversation_thinking(user_id, conversation_id)
             .ok()
             .flatten()
             .or_else(|| {
@@ -335,11 +378,23 @@ impl Runtime {
         }
     }
 
-    fn stored_model_selection(&self, conversation_id: &str) -> Result<Option<ModelSelection>> {
-        match self
+    fn stored_model_selection(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<ModelSelection>> {
+        let value = match self
             .store
-            .kv_get(&format!("model_selection:{conversation_id}"))?
+            .kv_get(&Self::model_selection_key(user_id, conversation_id))?
         {
+            Some(value) => Some(value),
+            None if self.can_read_legacy_conversation_kv(user_id, conversation_id)? => {
+                self.store
+                    .kv_get(&Self::legacy_model_selection_key(conversation_id))?
+            }
+            None => None,
+        };
+        match value {
             Some(value) => Ok(Some(serde_json::from_str(&value).map_err(|_| {
                 SeraError::InvalidState("stored model selection is invalid".into())
             })?)),
@@ -387,7 +442,7 @@ impl Runtime {
         let bot = fleet
             .get(bot)
             .ok_or_else(|| SeraError::NotFound("bot not found".into()))?;
-        let selection = match self.stored_model_selection(conversation_id)? {
+        let selection = match self.stored_model_selection(user_id, conversation_id)? {
             Some(stored) => stored,
             None => self.user_default_selection(user_id, self.bot_model_hint(bot).as_deref()),
         };
@@ -410,7 +465,7 @@ impl Runtime {
         let bot = fleet
             .get(bot)
             .ok_or_else(|| SeraError::NotFound("bot not found".into()))?;
-        let stored = match self.stored_model_selection(conversation_id)? {
+        let stored = match self.stored_model_selection(user_id, conversation_id)? {
             Some(stored) => stored,
             None => self.user_default_selection(user_id, self.bot_model_hint(bot).as_deref()),
         };
@@ -461,7 +516,7 @@ impl Runtime {
             Some(&serde_json::to_value(&stored)?),
         )?;
         self.store
-            .kv_set(&format!("model_selection:{conversation_id}"), &value)?;
+            .kv_set(&Self::model_selection_key(user_id, conversation_id), &value)?;
         Ok(stored)
     }
 
@@ -505,7 +560,19 @@ impl Runtime {
                     model: model.to_owned(),
                 }
             }
-            None => self.effective_model_selection(user_id, &format!("dir:{bot}"), bot)?,
+            None => {
+                let candidate = format!("dir:{bot}");
+                if self.store.get_conversation(user_id, &candidate)?.is_some()
+                    || !self.store.conversation_exists(&candidate)?
+                {
+                    self.effective_model_selection(user_id, &candidate, bot)?
+                } else {
+                    let prefix: String = bot.chars().take(15).collect();
+                    let scoped =
+                        format!("dir:{prefix}-{}", &crate::util::sha256_hex(user_id)[..16]);
+                    self.effective_model_selection(user_id, &scoped, bot)?
+                }
+            }
         };
         let route = Some(self.router.pin(&selection)?);
         let route = self.checked_route(user_id, &route)?;

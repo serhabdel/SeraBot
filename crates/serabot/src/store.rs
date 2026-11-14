@@ -2937,11 +2937,72 @@ impl Store {
     }
 
     /// Conversation that receives scheduled brief and watch notifications for
-    /// the acting user (`dir:main`, created if missing).
+    /// the acting user: `dir:main` when it is unoccupied or already owned by
+    /// `user_id`, otherwise a deterministic user-scoped `dir:main-<16hex>` id.
     pub fn default_scheduled_conversation_id(&self, user_id: &str) -> Result<String> {
-        let id = "dir:main";
-        self.ensure_conversation_accepts_turns(user_id, id)?;
-        Ok(id.to_string())
+        let legacy = "dir:main";
+        if self.get_conversation(user_id, legacy)?.is_some() {
+            self.ensure_conversation_accepts_turns(user_id, legacy)?;
+            return Ok(legacy.to_string());
+        }
+        let scoped = format!("dir:main-{}", &sha256_hex(user_id)[..16]);
+        if self.get_conversation(user_id, &scoped)?.is_some() {
+            self.ensure_conversation_accepts_turns(user_id, &scoped)?;
+            return Ok(scoped);
+        }
+        if !self.conversation_exists(legacy)? {
+            match self.ensure_conversation_accepts_turns(user_id, legacy) {
+                Ok(()) if self.get_conversation(user_id, legacy)?.is_some() => {
+                    return Ok(legacy.to_string());
+                }
+                Ok(()) | Err(SeraError::InvalidState(_)) => {
+                    // Another user claimed `dir:main` concurrently.
+                }
+                Err(other) => return Err(other),
+            }
+        }
+        self.ensure_conversation_accepts_turns(user_id, &scoped)?;
+        Ok(scoped)
+    }
+
+    /// The acting user's media jobs across all their conversations, newest
+    /// activity first.
+    pub fn list_media_jobs_for_user(
+        &self,
+        user_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::media_jobs::MediaJob>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, user_id, conversation_id, bot, provider, kind, external_id, status,
+                    artifact_hash, error, created_at, updated_at, deadline
+             FROM media_jobs
+             WHERE user_id = ?1
+             ORDER BY updated_at DESC, rowid DESC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![user_id, limit.clamp(1, 500) as i64], |row| {
+            let kind: String = row.get(5)?;
+            let status: String = row.get(7)?;
+            Ok(crate::media_jobs::MediaJob {
+                id: row.get(0)?,
+                user_id: row.get(1)?,
+                conversation_id: row.get(2)?,
+                bot: row.get(3)?,
+                provider: row.get(4)?,
+                kind: crate::media_jobs::MediaKind::parse(&kind)
+                    .unwrap_or(crate::media_jobs::MediaKind::Image),
+                external_id: row.get(6)?,
+                status: crate::media_jobs::MediaJobStatus::parse(&status)
+                    .unwrap_or(crate::media_jobs::MediaJobStatus::Failed),
+                artifact_hash: row.get(8)?,
+                error: row.get(9)?,
+                created_at: parse_datetime(&row.get::<_, String>(10)?),
+                updated_at: parse_datetime(&row.get::<_, String>(11)?),
+                deadline: parse_datetime(&row.get::<_, String>(12)?),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Whether the acting user owns a routine with this name.
@@ -7791,5 +7852,119 @@ mod tests {
             Some("app")
         );
         assert!(store.set_conversation_origin(&admin, "other", "x").is_err());
+    }
+
+    #[test]
+    fn default_scheduled_conversation_id_isolates_multiple_users() {
+        let store = store();
+        let admin_id = admin(&store);
+        let user_a = store
+            .create_user("sub-sched-a", "sched-a@example.example", "Sched A")
+            .unwrap();
+        let user_b = store
+            .create_user("sub-sched-b", "sched-b@example.example", "Sched B")
+            .unwrap();
+
+        // Admin claims legacy `dir:main`; subsequent users receive deterministic
+        // user-scoped `dir:main-<16hex>` ids without colliding.
+        let admin_conv = store.default_scheduled_conversation_id(&admin_id).unwrap();
+        assert_eq!(admin_conv, "dir:main");
+        let a_conv = store.default_scheduled_conversation_id(&user_a.id).unwrap();
+        let b_conv = store.default_scheduled_conversation_id(&user_b.id).unwrap();
+        assert_ne!(a_conv, "dir:main");
+        assert_ne!(b_conv, "dir:main");
+        assert_ne!(a_conv, b_conv);
+        assert!(a_conv.starts_with("dir:main-"));
+        assert!(b_conv.starts_with("dir:main-"));
+
+        // Deterministic on repeat calls and safe for turn/routine writes.
+        assert_eq!(
+            store.default_scheduled_conversation_id(&user_a.id).unwrap(),
+            a_conv
+        );
+        assert_eq!(
+            store.default_scheduled_conversation_id(&user_b.id).unwrap(),
+            b_conv
+        );
+        store
+            .ensure_conversation_accepts_turns(&user_a.id, &a_conv)
+            .unwrap();
+        store
+            .ensure_conversation_accepts_turns(&user_b.id, &b_conv)
+            .unwrap();
+    }
+
+    #[test]
+    fn list_media_jobs_for_user_is_batched_ordered_and_scoped() {
+        let store = store();
+        let user_a = store
+            .create_user("sub-mj-a", "mja@example.example", "MJ A")
+            .unwrap();
+        let user_b = store
+            .create_user("sub-mj-b", "mjb@example.example", "MJ B")
+            .unwrap();
+        store
+            .create_conversation(&user_a.id, "dir:mj-one", "direct", None)
+            .unwrap();
+        store
+            .create_conversation(&user_a.id, "dir:mj-two", "direct", None)
+            .unwrap();
+        store
+            .create_conversation(&user_b.id, "dir:mj-other", "direct", None)
+            .unwrap();
+
+        let job_1 = store
+            .create_media_job(
+                &user_a.id,
+                "dir:mj-one",
+                "main",
+                "synthetic",
+                crate::media_jobs::MediaKind::Image,
+                "ext-a1",
+            )
+            .unwrap();
+        let job_2 = store
+            .create_media_job(
+                &user_a.id,
+                "dir:mj-two",
+                "main",
+                "synthetic",
+                crate::media_jobs::MediaKind::Video,
+                "ext-a2",
+            )
+            .unwrap();
+        store
+            .create_media_job(
+                &user_b.id,
+                "dir:mj-other",
+                "main",
+                "synthetic",
+                crate::media_jobs::MediaKind::Audio,
+                "ext-b1",
+            )
+            .unwrap();
+
+        // Make job_1 newer than job_2 so we prove ordering by updated_at DESC.
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE media_jobs SET updated_at = '2099-01-01T00:00:00.000Z' WHERE id = ?1",
+                params![job_1.id],
+            )
+            .unwrap();
+
+        let jobs = store.list_media_jobs_for_user(&user_a.id, 10).unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].id, job_1.id);
+        assert_eq!(jobs[1].id, job_2.id);
+
+        let limited = store.list_media_jobs_for_user(&user_a.id, 1).unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, job_1.id);
+
+        let b_jobs = store.list_media_jobs_for_user(&user_b.id, 10).unwrap();
+        assert_eq!(b_jobs.len(), 1);
+        assert_eq!(b_jobs[0].external_id, "ext-b1");
     }
 }

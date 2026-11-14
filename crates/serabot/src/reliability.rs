@@ -45,8 +45,9 @@ pub fn enqueue_source_reliability_recoveries(
         if !store.user_has_stale_failed_sources(&user_id, &enabled_names, cutoff)? {
             continue;
         }
+        let conversation_id = store.default_scheduled_conversation_id(&user_id)?;
         let payload = ScheduledPayload {
-            conversation_id: "dir:main".into(),
+            conversation_id,
             user_id: user_id.clone(),
         };
         store.enqueue_task(
@@ -142,5 +143,70 @@ mod tests {
             )
             .unwrap();
         assert_eq!(queued, 1);
+    }
+
+    #[test]
+    fn enqueues_for_multiple_users_without_dir_main_collision() {
+        let store = store();
+        let user_a = store.admin_user_id().unwrap();
+        let user_b = store
+            .create_user("sub-rel-b", "rel-b@example.example", "Rel B")
+            .unwrap()
+            .id;
+        let config = config();
+        let sources = crate::config::load_sources(&config).unwrap();
+        let Some(source_name) = sources.first().map(|s| s.name.clone()) else {
+            return;
+        };
+        let kind = sources.first().map(|s| s.kind.as_str()).unwrap_or("rss");
+        let now = Utc::now();
+        let old = (now - chrono::Duration::hours(72))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+        for user_id in [&user_a, &user_b] {
+            store
+                .upsert_user_source_overlay(user_id, &source_name, true, kind)
+                .unwrap();
+            store
+                .connection()
+                .unwrap()
+                .execute(
+                    "INSERT INTO source_runs(id, source, started_at, finished_at, ok, error, items_seen, user_id)
+                     VALUES (?1, ?2, ?3, ?3, 0, 'synthetic', 0, ?4)",
+                    rusqlite::params![new_id(), source_name, old, user_id],
+                )
+                .unwrap();
+        }
+
+        let enqueued = enqueue_source_reliability_recoveries(&store, &config, now).unwrap();
+        assert_eq!(enqueued, 2);
+
+        let a_conv: String = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT json_extract(payload_json, '$.conversation_id') FROM tasks WHERE user_id = ?1 AND kind = 'watch'",
+                rusqlite::params![user_a],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let b_conv: String = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT json_extract(payload_json, '$.conversation_id') FROM tasks WHERE user_id = ?1 AND kind = 'watch'",
+                rusqlite::params![user_b],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(a_conv, "dir:main");
+        assert_ne!(b_conv, "dir:main");
+        assert!(b_conv.starts_with("dir:main-"));
+        store
+            .ensure_conversation_accepts_turns(&user_a, &a_conv)
+            .unwrap();
+        store
+            .ensure_conversation_accepts_turns(&user_b, &b_conv)
+            .unwrap();
     }
 }

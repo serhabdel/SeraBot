@@ -805,7 +805,12 @@ async fn selection_is_persistent_and_applies_only_to_future_tasks() {
             .payload,
         original.payload
     );
-    assert!(store.kv_get("model_selection:owner").unwrap().is_some());
+    assert!(
+        store
+            .kv_get(&format!("model_selection:{}:owner", admin(&store)))
+            .unwrap()
+            .is_some()
+    );
     let response = app
         .clone()
         .oneshot(request(
@@ -840,7 +845,12 @@ async fn selection_does_not_grant_egress_consent() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert!(store.kv_get("model_selection:owner").unwrap().is_none());
+    assert!(
+        store
+            .kv_get(&format!("model_selection:{}:owner", admin(&store)))
+            .unwrap()
+            .is_none()
+    );
     let response = app
         .clone()
         .oneshot(request(
@@ -905,7 +915,12 @@ async fn selection_rejects_client_supplied_endpoint() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    assert!(store.kv_get("model_selection:owner").unwrap().is_none());
+    assert!(
+        store
+            .kv_get(&format!("model_selection:{}:owner", admin(&store)))
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -972,7 +987,12 @@ async fn model_selection_rejects_unknown_provider_without_changing_state() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    assert!(store.kv_get("model_selection:owner").unwrap().is_none());
+    assert!(
+        store
+            .kv_get(&format!("model_selection:{}:owner", admin(&store)))
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
