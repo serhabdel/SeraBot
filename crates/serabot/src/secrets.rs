@@ -365,7 +365,81 @@ pub(crate) fn restrict_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn current_windows_principal() -> Option<String> {
+    if let Ok(output) = std::process::Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        && output.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(sid) = stdout
+            .trim()
+            .rsplit(',')
+            .next()
+            .map(|s| s.trim().trim_matches('"'))
+            .filter(|s| s.starts_with("S-1-") && !s.chars().any(char::is_control))
+        {
+            return Some(format!("*{sid}"));
+        }
+    }
+    let user = std::env::var("USERNAME")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))?;
+    let domain = std::env::var("USERDOMAIN")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty() && !s.chars().any(char::is_control));
+    Some(match domain {
+        Some(domain) => format!("{domain}\\{user}"),
+        None => user,
+    })
+}
+
+#[cfg(windows)]
+pub(crate) fn restrict_permissions(path: &Path) -> Result<()> {
+    let Some(principal) = current_windows_principal() else {
+        tracing::warn!(
+            path = %path.display(),
+            "could not resolve current Windows user; file ACLs unchanged"
+        );
+        return Ok(());
+    };
+    let grant_user = format!("{principal}:F");
+    match std::process::Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(&grant_user)
+        .arg("/grant:r")
+        // Well-known SID for NT AUTHORITY\SYSTEM, independent of OS locale.
+        .arg("*S-1-5-18:F")
+        .output()
+    {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::warn!(
+                status = %output.status,
+                stderr = %stderr.trim(),
+                path = %path.display(),
+                "icacls failed; file ACLs unchanged"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "icacls unavailable; file ACLs unchanged"
+            );
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn restrict_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
@@ -431,5 +505,34 @@ mod tests {
         let text = String::from_utf8_lossy(&raw);
         assert!(!text.contains("refresh-old"));
         assert!(!text.contains("refresh-new"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restrict_permissions_removes_inheritance_and_limits_acls_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("master.key");
+        std::fs::write(&file, b"synthetic-key-material").unwrap();
+
+        restrict_permissions(&file).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"synthetic-key-material");
+
+        if let Ok(output) = std::process::Command::new("icacls").arg(&file).output()
+            && output.status.success()
+        {
+            let acl = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                !acl.contains("(I)"),
+                "inherited ACE remained after restrict_permissions: {acl}"
+            );
+            assert!(
+                acl.contains("SYSTEM:(F)"),
+                "SYSTEM full control ACE missing: {acl}"
+            );
+            assert!(
+                !acl.contains("BUILTIN\\Users") && !acl.contains("Everyone"),
+                "broad principal ACE remained: {acl}"
+            );
+        }
     }
 }

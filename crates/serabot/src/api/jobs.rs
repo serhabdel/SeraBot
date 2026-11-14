@@ -7,9 +7,6 @@ use super::*;
 
 /// Task statuses that count as in flight for the jobs panel.
 const ACTIVE_TASK_STATUSES: [&str; 3] = ["queued", "running", "awaiting_approval"];
-/// Conversations scanned for media jobs (the per-conversation list is capped
-/// at 100 rows each).
-const JOBS_CONVERSATION_SCAN: usize = 200;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,19 +37,7 @@ pub(super) async fn list_jobs(
     };
 
     let tasks = list_active_tasks(&state.store, &user.id, status_filter, limit)?;
-
-    // Media jobs across conversations: the store lists them per conversation
-    // (owner-scoped), so fan out over the acting user's conversations.
-    let conversations =
-        state
-            .store
-            .list_conversations(&user.id, JOBS_CONVERSATION_SCAN, None, true)?;
-    let mut media_jobs = Vec::new();
-    for conversation in &conversations {
-        media_jobs.extend(state.store.list_media_jobs(&user.id, &conversation.id)?);
-    }
-    media_jobs.sort_by_key(|job| std::cmp::Reverse(job.updated_at));
-    media_jobs.truncate(limit);
+    let media_jobs = state.store.list_media_jobs_for_user(&user.id, limit)?;
 
     let reliability_limit = 50;
     let uncertain_tasks = list_uncertain_tasks(&state.store, &user.id, reliability_limit)?;
@@ -172,4 +157,174 @@ fn list_outcome_unknown_actions(store: &Store, user_id: &str, limit: usize) -> R
         }))
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gateway::{Gateway, ToolRegistry};
+    use crate::llm::LlmClient;
+    use crate::media_jobs::MediaKind;
+    use crate::policy::Policy;
+    use crate::runtime::NullNotifier;
+    use tower::ServiceExt;
+
+    fn test_app_for_jobs() -> (Router, Store) {
+        let dir = std::env::temp_dir().join(format!("serabot-jobs-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = Config::default();
+        config.api.enabled = true;
+        config.api.token_hash = sha256_hex("test-token-that-is-long-enough-123");
+        config.llm.model = "test".into();
+        config.llm.base_url = "https://example.com/v1".into();
+        config.base_dir = dir.clone();
+        let db_path = dir.join("serabot.db");
+        config.database.path = db_path.to_string_lossy().into_owned();
+        let config = Arc::new(config);
+        let store = Store::open(&db_path, 384, 5000).unwrap();
+        let gateway = Gateway::new(
+            store.clone(),
+            Arc::new(Policy::empty()),
+            ToolRegistry::default(),
+            1,
+            false,
+        );
+        let llm = LlmClient::new("https://example.com/v1", "test", 5, 50)
+            .unwrap()
+            .with_model("test");
+        let runtime = Runtime::new(
+            config.clone(),
+            store.clone(),
+            gateway,
+            crate::model_router::ModelRouter::new(
+                &config.llm,
+                BTreeMap::from([("default".into(), llm)]),
+            )
+            .unwrap(),
+            vec![crate::config::LoadedBot {
+                config: BotConfig {
+                    title: None,
+                    description: None,
+                    name: "main".into(),
+                    trigger: "command".into(),
+                    model: None,
+                    system_prompt: "prompts/main.txt".into(),
+                    skills: vec![],
+                    tools: vec![],
+                    require_approval: vec![],
+                    enabled: true,
+                    temperature: None,
+                    thinking: None,
+                    role: BotRole::Orchestrator,
+                    delegates: vec![],
+                },
+                prompt: "test prompt".into(),
+            }],
+            Arc::new(NullNotifier),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .unwrap();
+        let artifacts = Arc::new(ArtifactStore::new(dir.join("artifacts")).unwrap());
+        let secrets = SharedSecrets::new(crate::secrets::SecretStore::from_map(BTreeMap::new()));
+        let users = Arc::new(UserSecrets::with_master_key(store.clone(), [5u8; 32]).unwrap());
+        let state = ApiState::new(
+            runtime,
+            store.clone(),
+            config,
+            artifacts,
+            secrets,
+            users,
+            None,
+        )
+        .unwrap();
+        (crate::api::router(state), store)
+    }
+
+    #[tokio::test]
+    async fn list_jobs_batches_media_jobs_across_conversations_and_respects_limit() {
+        let (app, store) = test_app_for_jobs();
+        let alice = store
+            .create_user("sub-jobs-batch-a", "jba@example.example", "Alice")
+            .unwrap();
+        let bob = store
+            .create_user("sub-jobs-batch-b", "jbb@example.example", "Bob")
+            .unwrap();
+        let alice_token = store
+            .mint_session(&alice.id, chrono::Duration::hours(1))
+            .unwrap();
+
+        for idx in 0..3 {
+            let conv = format!("dir:conv-{idx}");
+            store
+                .create_conversation(&alice.id, &conv, "direct", None)
+                .unwrap();
+            store
+                .create_media_job(
+                    &alice.id,
+                    &conv,
+                    "main",
+                    "synthetic",
+                    MediaKind::Image,
+                    &format!("ext-a-{idx}"),
+                )
+                .unwrap();
+        }
+        store
+            .create_conversation(&bob.id, "dir:bob", "direct", None)
+            .unwrap();
+        store
+            .create_media_job(
+                &bob.id,
+                "dir:bob",
+                "main",
+                "synthetic",
+                MediaKind::Video,
+                "ext-bob",
+            )
+            .unwrap();
+
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/v1/jobs?limit=2")
+                    .header("authorization", format!("Bearer {alice_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let media_jobs = body["media_jobs"].as_array().unwrap();
+        assert_eq!(media_jobs.len(), 2);
+        assert!(
+            media_jobs
+                .iter()
+                .all(|job| job["external_id"].as_str().unwrap().starts_with("ext-a-"))
+        );
+
+        let all_resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/v1/jobs")
+                    .header("authorization", format!("Bearer {alice_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(all_resp.status(), StatusCode::OK);
+        let all_bytes = axum::body::to_bytes(all_resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let all_body: Value = serde_json::from_slice(&all_bytes).unwrap();
+        assert_eq!(all_body["media_jobs"].as_array().unwrap().len(), 3);
+    }
 }

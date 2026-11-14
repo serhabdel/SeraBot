@@ -10,19 +10,20 @@ free-form agent-to-agent chatter, or a web UI beyond the existing console
 pages (landing, login, health, downloads).
 
 A plugin marketplace exists. The server catalog and per-user install state
-are `/v1/marketplace/*` (see `docs/marketplace.md`). The desktop Marketplace
-screen browses that catalog. Limits, which are part of the product and not
-a gap to fill in passing:
+are `/v1/marketplace/*` (see `docs/marketplace.md`), and installed/enabled
+`http` MCP plugins expose per-user `plugin.<slug>.<tool>` tools via
+`crates/serabot/src/plugin_runtime.rs` (HTTPS, public-IP pinned, egress-listed,
+approval-gated). Limits, which are part of the product and not a gap to fill
+in passing:
 
-- The runtime that calls a plugin is not built. Do not add one, or a path
-  that invokes a plugin host, without a new design.
+- Local-program (`stdio`) plugins are not runnable; do not add a local-process
+  plugin runner without a new security design.
 - The shipped manifests under `plugins/` use placeholder hosts
   (`*.example.invalid`). They are not real services.
-- The desktop keeps Install and Enable off until a plugin can actually be
-  called (`RUNTIME_CALLS_PLUGINS` in `crates/serabot-desktop/src/marketplace.rs`).
-  Placeholder hosts and local-program plugins stay off after that. Do not
-  offer those actions, and do not ask the user to paste a secret for a
-  plugin that cannot run.
+- The desktop keeps Install and Enable off while `RUNTIME_CALLS_PLUGINS` in
+  `crates/serabot-desktop/src/marketplace.rs` is `false`. Placeholder hosts and
+  local-program plugins stay off after that. Do not offer those actions, and do
+  not ask the user to paste a secret for a plugin that cannot run.
 - Secrets are write-only in the per-user store. The admin cannot read them.
 
 Everything user-owned is UID-scoped — bots, skills, memory, documents,
@@ -79,8 +80,8 @@ OVH is read-only unless the owner explicitly authorizes an additive installation
 - `crates/serabot/src/watcher.rs`, `scheduler.rs`, `brief.rs` — monitoring and deadlines.
 - `crates/serabot/src/analyst.rs`, `spreadsheets.rs` — document and finance analysis.
 - `crates/serabot/src/deck.rs`, `render.rs`, `maker.rs`, `onedrive.rs` — deterministic deliverables; OneDrive is per user.
-- `crates/serabot/src/marketplace.rs`, `api/marketplace.rs` — plugin catalog and per-user install state (v0.36). No plugin runtime.
-- `crates/serabot-desktop/src/marketplace.rs`, `ui_marketplace.rs` — Marketplace screen (v0.37). Browse only until plugins can be called.
+- `crates/serabot/src/marketplace.rs`, `plugin_runtime.rs`, `mcp_client.rs`, `api/marketplace.rs` — plugin catalog, per-user install state (v0.36), and per-user `http` MCP plugin tools (v0.38.0).
+- `crates/serabot-desktop/src/marketplace.rs`, `ui_marketplace.rs`, `ui_integrations.rs` — Integrations & Marketplace screen (v0.37–v0.38). Desktop Install/Enable stay off while `RUNTIME_CALLS_PLUGINS` is `false`.
 - `plugins/` — synthetic catalog manifests. Hosts are placeholders (`*.example.invalid`).
 - `bots/` + `prompts/` — default fleet templates, seeded per user.
 - `tasks/plan.md`, `tasks/todo.md` — reconstruction execution status.

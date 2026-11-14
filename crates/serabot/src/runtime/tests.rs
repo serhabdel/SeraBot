@@ -406,7 +406,12 @@ async fn bot_defaults_catalog_and_unapproved_reads_are_preserved() {
             .submit_text(&admin(&store), "owner", "synthetic", None)
             .is_err()
     );
-    assert!(store.kv_get("model_selection:owner").unwrap().is_none());
+    assert!(
+        store
+            .kv_get(&format!("model_selection:{}:owner", admin(&store)))
+            .unwrap()
+            .is_none()
+    );
     assert!(
         runtime
             .submit_text(&admin(&store), "owner", "/brief", None)
@@ -505,8 +510,13 @@ async fn auto_mode_stores_explicit_preference_and_pins_resolved_route() {
             model: "test".into(),
         }
     );
-    let persisted: ModelSelection =
-        serde_json::from_str(&store.kv_get("model_selection:owner").unwrap().unwrap()).unwrap();
+    let persisted: ModelSelection = serde_json::from_str(
+        &store
+            .kv_get(&format!("model_selection:{}:owner", admin(&store)))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(persisted, ModelSelection::auto_mode());
 }
 
@@ -581,8 +591,13 @@ async fn conversation_selection_is_isolated_persisted_and_pinned_at_enqueue() {
             .unwrap(),
         initial
     );
-    let persisted: ModelSelection =
-        serde_json::from_str(&store.kv_get("model_selection:one").unwrap().unwrap()).unwrap();
+    let persisted: ModelSelection = serde_json::from_str(
+        &store
+            .kv_get(&format!("model_selection:{}:one", admin(&store)))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(persisted, alternative);
     let mut config = (*runtime.config).clone();
     config.llm.models.push("alternative".into());
@@ -643,7 +658,12 @@ async fn policy_scans_catalog_selection_and_all_message_metadata() {
             .select_model(&admin(&store), "owner", selection.clone())
             .is_err()
     );
-    assert!(store.kv_get("model_selection:owner").unwrap().is_none());
+    assert!(
+        store
+            .kv_get(&format!("model_selection:{}:owner", admin(&store)))
+            .unwrap()
+            .is_none()
+    );
     store
         .kv_set(
             "model_selection:owner",
@@ -2861,10 +2881,15 @@ async fn mount_live_list(server: &MockServer, ids: &[&str]) {
         .await;
 }
 
-fn stored_model(store: &Store, conversation: &str) -> String {
+fn stored_model(store: &Store, user: &str, conversation: &str) -> String {
     let value = store
-        .kv_get(&format!("model_selection:{conversation}"))
+        .kv_get(&format!("model_selection:{user}:{conversation}"))
         .unwrap()
+        .or_else(|| {
+            store
+                .kv_get(&format!("model_selection:{conversation}"))
+                .unwrap()
+        })
         .unwrap();
     serde_json::from_str::<ModelSelection>(&value)
         .unwrap()
@@ -2900,7 +2925,7 @@ async fn live_only_stored_model_survives_a_restart_once_the_list_is_loaded() {
     runtime
         .submit_text(&user, "owner", "synthetic", None)
         .unwrap();
-    assert_eq!(stored_model(&store, "owner"), "test");
+    assert_eq!(stored_model(&store, &user, "owner"), "test");
     assert_eq!(notices(&store, &user, "owner"), 1);
 
     // With the list loaded first (what the send handler does) the stored
@@ -2915,7 +2940,10 @@ async fn live_only_stored_model_survives_a_restart_once_the_list_is_loaded() {
     runtime
         .submit_text(&user, "two", "synthetic", None)
         .unwrap();
-    assert_eq!(stored_model(&store, "two"), "magistral-medium-latest");
+    assert_eq!(
+        stored_model(&store, &user, "two"),
+        "magistral-medium-latest"
+    );
     assert_eq!(notices(&store, &user, "two"), 0);
 }
 
@@ -2942,7 +2970,7 @@ async fn removed_model_falls_back_and_says_so_once() {
     );
     runtime.submit_text(&user, "owner", "first", None).unwrap();
     runtime.submit_text(&user, "owner", "second", None).unwrap();
-    assert_eq!(stored_model(&store, "owner"), "test");
+    assert_eq!(stored_model(&store, &user, "owner"), "test");
     assert_eq!(notices(&store, &user, "owner"), 1);
     let history = store.list_messages(&user, "owner", 100).unwrap();
     assert!(
@@ -3120,5 +3148,140 @@ async fn bot_thinking_applies_unless_the_conversation_overrides_and_unsupported_
             .await
             .get("reasoning_effort")
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn thinking_and_model_selection_kv_keys_are_uid_scoped() {
+    let server = MockServer::start().await;
+    let (runtime, store, _notifier) = thinking_runtime(&server).await;
+    let admin_id = admin(&store);
+    let member = store
+        .create_user("sub-kv-member", "kvmember@example.example", "KV Member")
+        .unwrap();
+    runtime.ensure_model_catalogs(&admin_id).await;
+    runtime.ensure_model_catalogs(&member.id).await;
+
+    // Each user owns their own conversation and sets distinct thinking/model kv rows.
+    store
+        .ensure_conversation_accepts_turns(&admin_id, "dir:alpha")
+        .unwrap();
+    store
+        .ensure_conversation_accepts_turns(&member.id, "dir:beta")
+        .unwrap();
+
+    runtime
+        .set_conversation_thinking(&admin_id, "dir:alpha", "main", Some("high"))
+        .unwrap();
+    runtime
+        .set_conversation_thinking(&member.id, "dir:beta", "main", Some("off"))
+        .unwrap();
+    assert_eq!(
+        store
+            .kv_get(&format!("thinking:{admin_id}:dir:alpha"))
+            .unwrap()
+            .as_deref(),
+        Some("high")
+    );
+    assert_eq!(
+        store
+            .kv_get(&format!("thinking:{}:dir:beta", member.id))
+            .unwrap()
+            .as_deref(),
+        Some("off")
+    );
+    assert!(store.kv_get("thinking:dir:alpha").unwrap().is_none());
+
+    let admin_pick = ModelSelection {
+        provider: "default".into(),
+        model: "mistral-large-latest".into(),
+    };
+    let member_pick = ModelSelection {
+        provider: "default".into(),
+        model: "mistral-small-2603".into(),
+    };
+    runtime
+        .select_model(&admin_id, "dir:alpha", admin_pick.clone())
+        .unwrap();
+    runtime
+        .select_model(&member.id, "dir:beta", member_pick.clone())
+        .unwrap();
+    assert_eq!(
+        runtime
+            .model_selection(&admin_id, "dir:alpha", "main")
+            .unwrap(),
+        admin_pick
+    );
+    assert_eq!(
+        runtime
+            .model_selection(&member.id, "dir:beta", "main")
+            .unwrap(),
+        member_pick
+    );
+
+    // Cross-user access fails closed.
+    assert!(
+        runtime
+            .conversation_thinking(&member.id, "dir:alpha")
+            .is_err()
+    );
+    assert!(
+        runtime
+            .model_selection(&member.id, "dir:alpha", "main")
+            .is_err()
+    );
+
+    // Legacy unscoped keys are only read when the acting user owns that conversation
+    // (or for the bootstrap admin on an uncreated legacy id).
+    store
+        .ensure_conversation_accepts_turns(&admin_id, "dir:legacy-admin")
+        .unwrap();
+    store.kv_set("thinking:dir:legacy-admin", "high").unwrap();
+    store
+        .kv_set(
+            "model_selection:dir:legacy-admin",
+            r#"{"provider":"default","model":"mistral-large-latest"}"#,
+        )
+        .unwrap();
+    assert_eq!(
+        runtime
+            .conversation_thinking(&admin_id, "dir:legacy-admin")
+            .unwrap()
+            .as_deref(),
+        Some("high")
+    );
+    assert_eq!(
+        runtime
+            .model_selection(&admin_id, "dir:legacy-admin", "main")
+            .unwrap()
+            .model,
+        "mistral-large-latest"
+    );
+    assert!(
+        runtime
+            .conversation_thinking(&member.id, "dir:legacy-admin")
+            .is_err()
+    );
+
+    // A member cannot read an uncreated legacy unscoped key either.
+    store.kv_set("thinking:dir:uncreated", "high").unwrap();
+    store
+        .kv_set(
+            "model_selection:dir:uncreated",
+            r#"{"provider":"default","model":"mistral-large-latest"}"#,
+        )
+        .unwrap();
+    assert_eq!(
+        runtime
+            .conversation_thinking(&member.id, "dir:uncreated")
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        runtime
+            .model_selection(&member.id, "dir:uncreated", "main")
+            .unwrap()
+            .model,
+        "mistral-small-2603"
     );
 }

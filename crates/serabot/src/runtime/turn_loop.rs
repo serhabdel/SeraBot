@@ -595,7 +595,7 @@ impl Runtime {
                 .scan_egress(&user, &serde_json::to_string(&tool_specs)?)?;
             // Vault values never reach a model: redact a copy of the request.
             let outgoing = self.gateway.redact_messages(&user, &state.messages)?;
-            let thinking = self.turn_thinking(conversation_id, &bot);
+            let thinking = self.turn_thinking(&user, conversation_id, &bot);
             let response = self
                 .router
                 .complete_with_thinking(
@@ -890,7 +890,7 @@ impl Runtime {
         let route = self.checked_route(user, &state.route).ok()?;
         self.scan_model_messages(user, transcript).ok()?;
         let outgoing = self.gateway.redact_messages(user, transcript).ok()?;
-        let thinking = self.turn_thinking(conversation_id, bot);
+        let thinking = self.turn_thinking(user, conversation_id, bot);
         let response = self
             .router
             .complete_with_thinking(

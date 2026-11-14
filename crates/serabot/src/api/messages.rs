@@ -43,6 +43,17 @@ pub(super) async fn models(
     Query(query): Query<ModelQuery>,
 ) -> Result<Json<Value>> {
     validate_conversation_id(&query.conversation_id)?;
+    if state
+        .store
+        .get_conversation(&user.id, &query.conversation_id)?
+        .is_none()
+        && state.store.conversation_exists(&query.conversation_id)?
+    {
+        return Err(SeraError::NotFound(format!(
+            "conversation {}",
+            query.conversation_id
+        )));
+    }
     state.runtime.refresh_model_catalogs(&user.id).await?;
     let bot = query.bot.as_deref().unwrap_or("main");
     let selection = state
@@ -62,7 +73,9 @@ pub(super) async fn models(
         "selection": selection,
         "effective_selection": effective_selection,
         "thinking": {
-            "level": state.runtime.conversation_thinking(&query.conversation_id)?,
+            "level": state
+                .runtime
+                .conversation_thinking(&user.id, &query.conversation_id)?,
             "levels": levels,
         },
     })))
