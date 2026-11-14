@@ -70,12 +70,7 @@ pub fn parse_jobs_reliability(body: &Value) -> Option<JobsReliabilitySnapshot> {
                 kind,
                 bot,
                 status,
-                last_error: row.get("last_error").and_then(|v| v.as_str()).map(|s| {
-                    s.chars()
-                        .filter(|c| !c.is_control())
-                        .take(MAX_ERROR)
-                        .collect()
-                }),
+                last_error: clean(row, "last_error", MAX_ERROR),
                 conversation_id: clean(row, "conversation_id", MAX_CONVERSATION),
             });
         }
@@ -98,4 +93,61 @@ pub fn parse_jobs_reliability(body: &Value) -> Option<JobsReliabilitySnapshot> {
         }
     }
     Some(snapshot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_reliability_and_strips_controls() {
+        let body = json!({
+            "reliability": {
+                "traces_path": "trace\u{0007}s",
+                "uncertain_tasks": [
+                    { "id": "", "kind": "ignored" },
+                    {
+                        "id": "task-1",
+                        "kind": "turn",
+                        "bot": "researcher",
+                        "status": "outcome_unknown",
+                        "last_error": "  timed out\nwaiting  ",
+                        "conversation_id": "conv-1"
+                    },
+                    {
+                        "id": "task-2",
+                        "last_error": "   "
+                    }
+                ],
+                "unknown_actions": [
+                    {
+                        "id": "act-1",
+                        "tool": "web.fetch",
+                        "conversation_id": "conv-1",
+                        "destination": "https://example.invalid/doc"
+                    }
+                ]
+            }
+        });
+        let snap = parse_jobs_reliability(&body).expect("reliability block");
+        assert!(snap.supported);
+        assert_eq!(snap.traces_path.as_deref(), Some("traces"));
+        assert_eq!(snap.uncertain_tasks.len(), 2);
+        assert_eq!(
+            snap.uncertain_tasks[0].last_error.as_deref(),
+            Some("timed outwaiting")
+        );
+        assert_eq!(snap.uncertain_tasks[1].last_error, None);
+        assert_eq!(snap.unknown_actions.len(), 1);
+        assert_eq!(
+            snap.unknown_actions[0].destination.as_deref(),
+            Some("https://example.invalid/doc")
+        );
+    }
+
+    #[test]
+    fn missing_reliability_key_returns_none() {
+        assert!(parse_jobs_reliability(&json!({})).is_none());
+    }
 }

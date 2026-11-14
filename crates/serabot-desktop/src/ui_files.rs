@@ -136,6 +136,16 @@ pub fn is_image_name(name: &str) -> bool {
         .any(|ext| lower.ends_with(ext))
 }
 
+/// Real vendored file-type icon `data:` URI for `filename`, when its extension
+/// is recognized.
+pub fn file_icon_src(filename: &str) -> Option<String> {
+    let (_, ext) = filename.rsplit_once('.')?;
+    if ext.is_empty() {
+        return None;
+    }
+    serabot_desktop::file_icons::file_ext_image_src(ext)
+}
+
 /// A picture shown at full size over the transcript. Clicking anywhere, or
 /// pressing Escape, closes it.
 #[component]
@@ -147,12 +157,26 @@ pub fn Lightbox(src: String, alt: String, onclose: EventHandler<()>) -> Element 
             "aria-modal": "true",
             "aria-label": "{alt}",
             tabindex: -1,
+            onmounted: move |event| async move {
+                let _ = event.data().set_focus(true).await;
+            },
             onclick: move |_| onclose.call(()),
             onkeydown: move |event: KeyboardEvent| {
                 if event.key() == Key::Escape {
+                    event.stop_propagation();
                     onclose.call(());
                 }
             },
+            button {
+                class: "btn icon ghost lightbox-close",
+                r#type: "button",
+                "aria-label": "Close image",
+                onclick: move |event| {
+                    event.stop_propagation();
+                    onclose.call(());
+                },
+                Icon { name: "x", size: 16 }
+            }
             img { class: "lightbox-image", src: "{src}", alt: "{alt}" }
         }
     }
@@ -196,6 +220,8 @@ pub fn MessageFiles(session: Signal<Session>, id: String) -> Element {
                             },
                             img { src: "{url}", alt: "" }
                         }
+                    } else if let Some(icon_src) = file_icon_src(&file.filename) {
+                        img { class: "file-ext-icon", src: "{icon_src}", alt: "" }
                     } else {
                         Icon { name: if file.is_image { "image" } else { "paperclip" }, size: 13 }
                     }
@@ -283,9 +309,13 @@ pub fn ComposerFiles(session: Signal<Session>) -> Element {
 #[component]
 pub fn MediaCards(session: Signal<Session>) -> Element {
     let mut open_previews = use_signal(std::collections::BTreeSet::<String>::new);
-    let (entries, pending, downloading) = {
+    let mut show_all = use_signal(|| false);
+    let mut active_hash = use_signal(|| Option::<String>::None);
+    let (entries, total_library, pending, downloading) = {
         let state = session.read();
         let open = open_previews();
+        let total_library = state.state.library.len();
+        let limit = if show_all() { total_library } else { MAX_CARDS };
         let entries: Vec<(
             serabot_desktop::LibraryEntry,
             Option<serabot_desktop::preview::PreviewKind>,
@@ -294,7 +324,7 @@ pub fn MediaCards(session: Signal<Session>) -> Element {
             .state
             .library
             .iter()
-            .take(MAX_CARDS)
+            .take(limit)
             .cloned()
             .map(|entry| {
                 let kind = serabot_desktop::preview::preview_kind_for_name(
@@ -306,6 +336,7 @@ pub fn MediaCards(session: Signal<Session>) -> Element {
             .collect();
         (
             entries,
+            total_library,
             serabot_desktop::media_view::pending_jobs(&state.state.media_jobs)
                 .into_iter()
                 .cloned()
@@ -313,6 +344,9 @@ pub fn MediaCards(session: Signal<Session>) -> Element {
             state.downloading,
         )
     };
+    if !downloading && active_hash.read().is_some() {
+        active_hash.set(None);
+    }
     if entries.is_empty() && pending.is_empty() {
         return rsx! {};
     }
@@ -331,65 +365,108 @@ pub fn MediaCards(session: Signal<Session>) -> Element {
             for (entry, preview_kind, preview_open) in entries {
                 // 0.28.0: documents the server can render (pdf/pptx/xlsx/docx/md)
                 // get a Preview toggle next to Open.
-                div { key: "{entry.hash}", class: "media-card", role: "listitem",
-                    span { class: "media-card-icon",
-                        Icon {
-                            name: if is_image_name(entry.filename.as_deref().unwrap_or_default()) { "image" } else { "paperclip" },
-                            size: 18,
-                        }
-                    }
-                    div { class: "media-card-copy",
-                        span { class: "media-card-title",
-                            "{entry.title.clone().or(entry.filename.clone()).unwrap_or_else(|| entry.hash.clone())}"
-                        }
-                        span { class: "media-card-meta", "{humanize_label(&entry.tool)}" }
-                        InlineMedia {
-                            session,
-                            hash: entry.hash.clone(),
-                            mime: entry.mime.clone().unwrap_or_default(),
-                        }
-                        if let Some(kind) = preview_kind {
+                {
+                    let fname = entry.filename.as_deref().unwrap_or_default();
+                    let ext_icon = file_icon_src(fname);
+                    let is_this_busy = downloading
+                        && active_hash.read().as_deref() == Some(entry.hash.as_str());
+                    rsx! {
+                        div { key: "{entry.hash}", class: "media-card", role: "listitem",
+                            span { class: "media-card-icon",
+                                if let Some(icon_src) = ext_icon {
+                                    img { class: "file-ext-icon", src: "{icon_src}", alt: "" }
+                                } else {
+                                    Icon {
+                                        name: if is_image_name(fname) { "image" } else { "paperclip" },
+                                        size: 18,
+                                    }
+                                }
+                            }
+                            div { class: "media-card-copy",
+                                span { class: "media-card-title",
+                                    "{entry.title.clone().or(entry.filename.clone()).unwrap_or_else(|| entry.hash.clone())}"
+                                }
+                                span { class: "media-card-meta", "{humanize_label(&entry.tool)}" }
+                                InlineMedia {
+                                    session,
+                                    hash: entry.hash.clone(),
+                                    mime: entry.mime.clone().unwrap_or_default(),
+                                }
+                                if let Some(kind) = preview_kind {
+                                    button {
+                                        class: "btn small",
+                                        r#type: "button",
+                                        "aria-expanded": if preview_open { "true" } else { "false" },
+                                        onclick: {
+                                            let hash = entry.hash.clone();
+                                            move |_| {
+                                                let mut open = open_previews.write();
+                                                let opening = if open.remove(&hash) {
+                                                    false
+                                                } else {
+                                                    open.insert(hash.clone());
+                                                    true
+                                                };
+                                                drop(open);
+                                                if opening {
+                                                    session.write().request_doc_preview(hash.clone());
+                                                }
+                                            }
+                                        },
+                                        if preview_open { "Hide preview" } else { "Preview" }
+                                    }
+                                    if preview_open {
+                                        DocPreviewPane {
+                                            session,
+                                            hash: entry.hash.clone(),
+                                            label: kind.label().to_owned(),
+                                        }
+                                    }
+                                }
+                            }
                             button {
                                 class: "btn small",
+                                r#type: "button",
+                                disabled: downloading,
                                 onclick: {
                                     let hash = entry.hash.clone();
                                     move |_| {
-                                        let mut open = open_previews.write();
-                                        if !open.remove(&hash) {
-                                            open.insert(hash.clone());
-                                        }
-                                        drop(open);
-                                        session.write().request_doc_preview(hash.clone());
+                                        active_hash.set(Some(hash.clone()));
+                                        session.write().open_artifact(hash.clone());
                                     }
                                 },
-                                if preview_open { "Hide preview" } else { "Preview" }
-                            }
-                            if preview_open {
-                                DocPreviewPane {
-                                    session,
-                                    hash: entry.hash.clone(),
-                                    label: kind.label().to_owned(),
+                                if is_this_busy {
+                                    span { class: "spinner", role: "status", "aria-label": "Downloading" }
+                                } else {
+                                    "Open"
                                 }
+                            }
+                            button {
+                                class: "btn small",
+                                r#type: "button",
+                                disabled: downloading,
+                                onclick: {
+                                    let hash = entry.hash.clone();
+                                    move |_| {
+                                        active_hash.set(Some(hash.clone()));
+                                        session.write().save_artifact_as(hash.clone());
+                                    }
+                                },
+                                "Save as\u{2026}"
                             }
                         }
                     }
-                    button {
-                        class: "btn small",
-                        disabled: downloading,
-                        onclick: {
-                            let hash = entry.hash.clone();
-                            move |_| session.write().open_artifact(hash.clone())
-                        },
-                        "Open"
-                    }
-                    button {
-                        class: "btn small",
-                        disabled: downloading,
-                        onclick: {
-                            let hash = entry.hash.clone();
-                            move |_| session.write().save_artifact_as(hash.clone())
-                        },
-                        "Save as\u{2026}"
+                }
+            }
+            if total_library > MAX_CARDS {
+                button {
+                    class: "btn ghost sm media-cards-more",
+                    r#type: "button",
+                    onclick: move |_| show_all.toggle(),
+                    if show_all() {
+                        "Show fewer"
+                    } else {
+                        "Show all ({total_library})"
                     }
                 }
             }
@@ -450,7 +527,19 @@ fn DocPreviewPane(session: Signal<Session>, hash: String, label: String) -> Elem
                 }
             }
         },
-        None => rsx! {},
+        None => rsx! {
+            div { class: "doc-preview",
+                div { class: "doc-preview-head",
+                    span { class: "grow", "Preview unavailable." }
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        onclick: move |_| session.write().request_doc_preview(hash.clone()),
+                        "Retry"
+                    }
+                }
+            }
+        },
     }
 }
 
@@ -548,5 +637,13 @@ mod tests {
             data: String::new(),
         });
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn file_icon_src_resolves_known_extensions() {
+        let pdf = file_icon_src("report.PDF").expect("pdf icon");
+        assert!(pdf.starts_with("data:image/svg+xml;base64,"));
+        assert!(file_icon_src("README").is_none());
+        assert!(file_icon_src("archive.unknownext").is_none());
     }
 }

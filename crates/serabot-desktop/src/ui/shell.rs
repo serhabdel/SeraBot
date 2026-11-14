@@ -129,20 +129,30 @@ pub(super) fn IconRail(session: Signal<Session>, toast: Signal<Option<(String, b
     rsx! {
         nav { class: "rail", "aria-label": "Main navigation",
             for (target, icon, label) in destinations {
-                button {
-                    key: "{label}",
-                    class: if section == target { "rail-btn labeled on" } else { "rail-btn labeled" },
-                    "aria-label": if target == Section::Approvals && pending > 0 {
-                        format!("{label}, {pending} pending")
+                {
+                    let item_title = if target == Section::Approvals && pending > 0 {
+                        format!("{label} ({pending} pending)")
                     } else {
                         label.to_owned()
-                    },
-                    "aria-current": if section == target { "page" } else { "false" },
-                    onclick: move |_| session.write().open_section(target),
-                    Icon { name: icon, size: 18 }
-                    span { class: "rail-label", "{label}" }
-                    if target == Section::Approvals && pending > 0 {
-                        span { class: "rail-badge", if pending > 99 { "99+" } else { "{pending}" } }
+                    };
+                    rsx! {
+                        button {
+                            key: "{label}",
+                            class: if section == target { "rail-btn labeled on" } else { "rail-btn labeled" },
+                            title: "{item_title}",
+                            "aria-label": if target == Section::Approvals && pending > 0 {
+                                format!("{label}, {pending} pending")
+                            } else {
+                                label.to_owned()
+                            },
+                            "aria-current": if section == target { "page" } else { "false" },
+                            onclick: move |_| session.write().open_section(target),
+                            Icon { name: icon, size: 18 }
+                            span { class: "rail-label", "{label}" }
+                            if target == Section::Approvals && pending > 0 {
+                                span { class: "rail-badge", if pending > 99 { "99+" } else { "{pending}" } }
+                            }
+                        }
                     }
                 }
             }
@@ -338,6 +348,7 @@ pub(super) fn Sidebar(
     undo: Signal<Option<String>>,
 ) -> Element {
     let mut overlay = overlay;
+    let mut drawer_open = drawer_open;
     let mut toast = toast;
     let mut search = use_signal(String::new);
     let mut collapsed = use_signal(HashSet::<String>::new);
@@ -659,6 +670,22 @@ pub(super) fn Sidebar(
                     placeholder: "Search chats (Ctrl+K)",
                     "aria-label": "Search chats and bots",
                     oninput: move |event| search.set(event.value()),
+                    onkeydown: move |event: KeyboardEvent| {
+                        if event.key() == Key::Escape && !search().is_empty() {
+                            event.stop_propagation();
+                            search.set(String::new());
+                        }
+                    },
+                }
+                if searching {
+                    button {
+                        class: "icon-btn search-clear",
+                        r#type: "button",
+                        title: "Clear search",
+                        "aria-label": "Clear search",
+                        onclick: move |_| search.set(String::new()),
+                        Icon { name: "x", size: 13 }
+                    }
                 }
             }
             div { class: "thread-list",
@@ -758,6 +785,7 @@ pub(super) fn Sidebar(
                                             let id = id.clone();
                                             move |_| {
                                                 let bot = id.strip_prefix("dir:").unwrap_or(&id).to_owned();
+                                                drawer_open.set(false);
                                                 session.write().open_bot_chat(bot);
                                             }
                                         },
@@ -800,6 +828,7 @@ pub(super) fn Sidebar(
                                                     let bot = pin_id.clone();
                                                     move |event| {
                                                         event.stop_propagation();
+                                                        drawer_open.set(false);
                                                         session.write().new_bot_chat(bot.clone());
                                                     }
                                                 },
@@ -867,7 +896,10 @@ pub(super) fn Sidebar(
                                             "aria-current": if active { "true" } else { "false" },
                                             onclick: {
                                                 let id = id.clone();
-                                                move |_| session.write().open_conversation(id.clone())
+                                                move |_| {
+                                                    drawer_open.set(false);
+                                                    session.write().open_conversation(id.clone());
+                                                }
                                             },
                                             div { class: "thread-copy",
                                                 span { class: if unread > 0 { "thread-title unread" } else { "thread-title" }, "{title}" }
@@ -921,7 +953,10 @@ pub(super) fn Sidebar(
                                     r#type: "button",
                                     disabled: !enabled,
                                     "aria-label": "Start a new chat with this bot",
-                                    onclick: move |_| session.write().new_bot_chat(bot.clone()),
+                                    onclick: move |_| {
+                                        drawer_open.set(false);
+                                        session.write().new_bot_chat(bot.clone());
+                                    },
                                     Icon { name: "plus", size: 14 }
                                     "New chat"
                                 }
@@ -1025,7 +1060,10 @@ pub(super) fn Sidebar(
                                             class: "thread-main thread-bot",
                                             onclick: {
                                                 let id = id.clone();
-                                                move |_| session.write().open_conversation(id.clone())
+                                                move |_| {
+                                                    drawer_open.set(false);
+                                                    session.write().open_conversation(id.clone());
+                                                }
                                             },
                                             span { class: "avatar-wrap", "data-activity": activity_attr(act.as_ref()),
                                                 span { class: "avatar bot", style: conversation_avatar_style(&id), "{initial_of(&label)}" }
@@ -1559,16 +1597,34 @@ pub(super) fn UserMenu(session: Signal<Session>, toast: Signal<Option<(String, b
     let mut open = use_signal(|| false);
     let theme = session.read().theme;
     let offline = !session.read().state.connected;
+    let (user_initial, user_label) = {
+        let s = session.read();
+        let label = s
+            .state
+            .user
+            .as_ref()
+            .map(|u| u.label())
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or_else(|| "Owner".to_owned());
+        let initial = initial_of(&label);
+        let full = if offline {
+            format!("{label} \u{b7} offline")
+        } else {
+            label
+        };
+        (initial, full)
+    };
     rsx! {
         div { class: "menu-wrap rail-account",
             button {
                 class: "rail-btn rail-avatar menu-trigger",
+                title: "{user_label}",
                 "data-tip": if offline { "Account (offline)" } else { "Account" },
                 "aria-label": if offline { "Account menu, offline" } else { "Account menu" },
                 "aria-haspopup": "menu",
                 "aria-expanded": if open() { "true" } else { "false" },
                 onclick: move |_| open.set(!open()),
-                span { class: "avatar user", "Y" }
+                span { class: "avatar user", "{user_initial}" }
                 // Nominal connection state is silent; only the exception
                 // (offline) gets a surface.
                 if offline {
@@ -1582,7 +1638,7 @@ pub(super) fn UserMenu(session: Signal<Session>, toast: Signal<Option<(String, b
                         open.set(false);
                     }
                 },
-                div { class: "menu-label", if offline { "Owner · offline" } else { "Owner" } }
+                div { class: "menu-label", "{user_label}" }
                 button {
                     class: "menu-item",
                     onclick: move |_| {
@@ -1792,7 +1848,9 @@ pub(super) fn Topbar(
                 }
             }
             div { class: "chat-header-copy",
-                if let Some(bot) = active_bot.clone() {
+                if header_rename().as_ref().is_some_and(|(edit, _)| edit == &header_ids.0) {
+                    RenameField { session, toast, renaming: header_rename, id: header_ids.0.clone() }
+                } else if let Some(bot) = active_bot.clone() {
                     ChatSwitcher { session, bot, title: title.clone() }
                 } else {
                     strong { "{title}" }
@@ -1936,7 +1994,17 @@ pub(super) fn StatusBanner(session: Signal<Session>) -> Element {
     });
     let error_view = error.map(|message| {
         rsx! {
-            div { class: "banner err", span { "{message}" } }
+            div { class: "banner err", role: "alert",
+                span { class: "grow", "{message}" }
+                button {
+                    class: "btn icon ghost sm banner-close",
+                    r#type: "button",
+                    title: "Dismiss",
+                    "aria-label": "Dismiss error",
+                    onclick: move |_| session.write().state.error = None,
+                    Icon { name: "x", size: 13 }
+                }
+            }
         }
     });
     let credential_view = session.read().credential_save_failed.then(|| {
@@ -1985,15 +2053,23 @@ pub(super) fn StatusBanner(session: Signal<Session>) -> Element {
         });
     let admin_error_view = admin_error.map(|message| {
         rsx! {
-            div { class: "banner err",
-                span { "{message}" }
+            div { class: "banner err", role: "alert",
+                span { class: "grow", "{message}" }
+                button {
+                    class: "btn icon ghost sm banner-close",
+                    r#type: "button",
+                    title: "Dismiss",
+                    "aria-label": "Dismiss notice",
+                    onclick: move |_| session.write().admin_error = None,
+                    Icon { name: "x", size: 13 }
+                }
             }
         }
     });
     let admin_notice_view = admin_notice.map(|message| {
         rsx! {
             div { class: "banner",
-                span { "{message}" }
+                span { class: "grow", "{message}" }
                 if restart_pending {
                     button {
                         class: "btn primary sm",
@@ -2001,6 +2077,14 @@ pub(super) fn StatusBanner(session: Signal<Session>) -> Element {
                         onclick: move |_| session.write().request_restart(),
                         "Restart server and apply"
                     }
+                }
+                button {
+                    class: "btn icon ghost sm banner-close",
+                    r#type: "button",
+                    title: "Dismiss",
+                    "aria-label": "Dismiss notice",
+                    onclick: move |_| session.write().admin_notice = None,
+                    Icon { name: "x", size: 13 }
                 }
             }
         }
@@ -2054,7 +2138,10 @@ pub(super) fn format_size(bytes: u64) -> String {
 #[component]
 pub(super) fn UpdateBanner(session: Signal<Session>) -> Element {
     let mut dismissed = use_signal(|| false);
-    let info = session.read().update.info.clone();
+    let (info, update_error) = {
+        let s = session.read();
+        (s.update.info.clone(), s.update.error.clone())
+    };
     let Some(info) = info else {
         return rsx! {};
     };
@@ -2085,6 +2172,9 @@ pub(super) fn UpdateBanner(session: Signal<Session>) -> Element {
                     onclick: move |_| dismissed.set(true),
                     "Later"
                 }
+            }
+            if let Some(err) = update_error {
+                p { class: "tiny error-text", role: "alert", "{err}" }
             }
             details {
                 summary { "Release notes" }

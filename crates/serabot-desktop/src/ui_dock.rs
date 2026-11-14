@@ -12,19 +12,34 @@
 //! reports to the coroutine below; the network calls run on the panel worker.
 
 use crate::ui::Icon;
+use crate::ui_files::{CONFIRM_RESET_JS, copy_script};
 use dioxus::prelude::*;
 use serabot_desktop::panel::address_to_url;
-use serabot_desktop::session::Session;
+use serabot_desktop::session::{Section, Session};
 use serabot_desktop::{BrowserController, BrowserInput};
 
 /// Reports focus changes and, while `#dock-stage[data-control=user]`, the
 /// user's clicks (scaled to screenshot pixels), wheel, keys and pastes.
 const DOCK_JS: &str = r#"
 (function () {
-  const out = (m) => dioxus.send(m);
-  const stage = () => document.getElementById('dock-stage');
-  const mine = () => { const s = stage(); return s && s.dataset.control === 'user' ? s : null; };
+  window.__serabotDockOut = (m) => dioxus.send(m);
+  const out = (m) => { if (window.__serabotDockOut) window.__serabotDockOut(m); };
   const reportFocus = () => out({ t: 'focus', v: document.hasFocus() && !document.hidden });
+  if (window.__serabotDockInit) {
+    reportFocus();
+    return;
+  }
+  window.__serabotDockInit = true;
+  const stage = () => document.getElementById('dock-stage');
+  const slotOpen = () => {
+    const slot = document.querySelector('.dock-slot');
+    return slot && slot.classList.contains('open');
+  };
+  const mine = () => {
+    if (!slotOpen()) return null;
+    const s = stage();
+    return s && s.dataset.control === 'user' ? s : null;
+  };
   window.addEventListener('focus', reportFocus);
   window.addEventListener('blur', reportFocus);
   document.addEventListener('visibilitychange', reportFocus);
@@ -47,6 +62,7 @@ const DOCK_JS: &str = r#"
   // image, and replay the click ripple when `data-seq` changes.
   let lastSeq = '';
   const placePointer = () => {
+    if (!slotOpen()) return;
     const p = document.getElementById('dock-pointer');
     const img = document.getElementById('dock-shot');
     const s = stage();
@@ -63,7 +79,7 @@ const DOCK_JS: &str = r#"
       if (p.dataset.action === 'click') p.classList.add('pulse');
     }
   };
-  setInterval(placePointer, 100);
+  setInterval(placePointer, 120);
   window.addEventListener('resize', placePointer);
 
   document.addEventListener('click', (e) => {
@@ -177,6 +193,7 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
     let mut editing = use_signal(|| false);
     let mut draft = use_signal(String::new);
     let mut more_open = use_signal(|| false);
+    let mut copied_url = use_signal(|| false);
 
     let (open, in_control, busy, info, shot, error, bot_name, dock_pointer) = {
         let s = session.read();
@@ -245,6 +262,63 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
                 div { class: "dock-head",
                     strong { class: "dock-title", "Browser" }
                     span { class: "{pill_class}", role: "status", "{pill_label}" }
+                    div { class: "dock-head-actions",
+                        if in_control && !url.is_empty() {
+                            button {
+                                class: "btn icon ghost sm",
+                                r#type: "button",
+                                title: "Reload page",
+                                "aria-label": "Reload page",
+                                onclick: {
+                                    let reload_url = url.clone();
+                                    move |_| {
+                                        session
+                                            .write()
+                                            .panel
+                                            .send_input(BrowserInput::Navigate { url: reload_url.clone() });
+                                    }
+                                },
+                                Icon { name: "refresh", size: 14 }
+                            }
+                        }
+                        if !url.is_empty() {
+                            button {
+                                class: "btn icon ghost sm",
+                                r#type: "button",
+                                title: if copied_url() { "Copied" } else { "Copy URL" },
+                                "aria-label": "Copy URL",
+                                onclick: {
+                                    let url_copy = url.clone();
+                                    move |_| {
+                                        let _ = document::eval(&copy_script(&url_copy));
+                                        copied_url.set(true);
+                                        spawn(async move {
+                                            let mut eval = document::eval(CONFIRM_RESET_JS);
+                                            let _ = eval.recv::<bool>().await;
+                                            copied_url.set(false);
+                                        });
+                                    }
+                                },
+                                Icon { name: if copied_url() { "check" } else { "copy" }, size: 14 }
+                            }
+                        }
+                        button {
+                            class: "btn icon ghost sm",
+                            r#type: "button",
+                            title: "Open full Browser view",
+                            "aria-label": "Open full Browser view",
+                            onclick: move |_| session.write().open_section(Section::Browser),
+                            Icon { name: "maximize", size: 14 }
+                        }
+                        button {
+                            class: "btn icon ghost sm",
+                            r#type: "button",
+                            title: "Hide browser dock",
+                            "aria-label": "Hide browser dock",
+                            onclick: move |_| session.write().panel.hide(),
+                            Icon { name: "x", size: 14 }
+                        }
+                    }
                 }
                 p { class: "dock-status caption", "aria-live": "polite", "{control_text}" }
                 if in_control {
@@ -263,7 +337,17 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
                             oninput: move |event| draft.set(event.value()),
                             onkeydown: move |event: KeyboardEvent| {
                                 event.stop_propagation();
-                                if event.key() == Key::Enter {
+                                if event.key() == Key::Escape {
+                                    let original = session
+                                        .read()
+                                        .panel
+                                        .info
+                                        .as_ref()
+                                        .and_then(|i| i.url.clone())
+                                        .unwrap_or_default();
+                                    draft.set(original);
+                                    editing.set(false);
+                                } else if event.key() == Key::Enter {
                                     match address_to_url(&draft()) {
                                         Some(url) => {
                                             session.write().panel.send_input(BrowserInput::Navigate { url });
@@ -376,5 +460,17 @@ pub fn BrowserDock(session: Signal<Session>) -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DOCK_JS;
+
+    #[test]
+    fn dock_script_guards_listeners_and_skips_when_closed() {
+        assert!(DOCK_JS.contains("window.__serabotDockInit"));
+        assert!(DOCK_JS.contains("slot.classList.contains('open')"));
+        assert!(DOCK_JS.contains("window.__serabotDockOut"));
     }
 }

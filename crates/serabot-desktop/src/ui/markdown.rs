@@ -31,7 +31,16 @@ pub enum MdBlock {
         start: usize,
         items: Vec<NestedItem>,
     },
+    /// A checklist (`- [ ] todo`, `- [x] done`).
+    TaskList(Vec<TaskItem>),
     Paragraph(String),
+}
+
+/// One checkbox item of a markdown task list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskItem {
+    pub checked: bool,
+    pub text: String,
 }
 
 /// Column alignment of a table.
@@ -152,6 +161,7 @@ pub enum InlineSpan {
     Code(String),
     Bold(Vec<InlineSpan>),
     Italic(String),
+    Strike(Vec<InlineSpan>),
     Link {
         label: String,
         url: String,
@@ -173,24 +183,158 @@ pub(super) fn markdown_content_hash(content: &str) -> u64 {
     hasher.finish()
 }
 
-/// Parsed markdown blocks keyed by message id and content hash.
+/// Parsed markdown blocks keyed by message id and content hash, with bounded
+/// FIFO eviction so streaming replies do not flush the entire cache at once.
 pub(super) fn parse_markdown_cached(message_id: &str, content: &str) -> Vec<MdBlock> {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::{Mutex, OnceLock};
-    type MarkdownCache = HashMap<(String, u64), Vec<MdBlock>>;
+    #[derive(Default)]
+    struct MarkdownCache {
+        order: VecDeque<(String, u64)>,
+        entries: HashMap<(String, u64), Vec<MdBlock>>,
+    }
     static CACHE: OnceLock<Mutex<MarkdownCache>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = CACHE.get_or_init(|| Mutex::new(MarkdownCache::default()));
     let key = (message_id.to_owned(), markdown_content_hash(content));
     let mut guard = cache.lock().expect("markdown cache");
-    if let Some(blocks) = guard.get(&key) {
+    if let Some(blocks) = guard.entries.get(&key) {
         return blocks.clone();
     }
     let blocks = parse_markdown_blocks(content);
-    if guard.len() >= MD_CACHE_MAX {
-        guard.clear();
+    while guard.entries.len() >= MD_CACHE_MAX {
+        if let Some(oldest) = guard.order.pop_front() {
+            guard.entries.remove(&oldest);
+        } else {
+            guard.entries.clear();
+            break;
+        }
     }
-    guard.insert(key, blocks.clone());
+    guard.order.push_back(key.clone());
+    guard.entries.insert(key, blocks.clone());
     blocks
+}
+
+fn is_horizontal_rule(trimmed: &str) -> bool {
+    let mut non_space = trimmed.chars().filter(|c| !c.is_whitespace());
+    let Some(marker) = non_space.next() else {
+        return false;
+    };
+    if !matches!(marker, '-' | '*' | '_') {
+        return false;
+    }
+    trimmed.chars().all(|c| c == marker || c.is_whitespace())
+        && trimmed.chars().filter(|c| *c == marker).count() >= 3
+}
+
+fn parse_fence_open(trimmed: &str) -> Option<(char, usize, String)> {
+    let ch = trimmed.chars().next()?;
+    if ch != '`' && ch != '~' {
+        return None;
+    }
+    let len = trimmed.chars().take_while(|c| *c == ch).count();
+    if len < 3 {
+        return None;
+    }
+    let lang = trimmed[len..].trim();
+    if ch == '`' && lang.contains('`') {
+        return None;
+    }
+    Some((ch, len, lang.to_owned()))
+}
+
+fn is_fence_close(trimmed: &str, ch: char, open_len: usize) -> bool {
+    trimmed.chars().all(|c| c == ch) && trimmed.chars().count() >= open_len
+}
+
+fn is_heading_line(trimmed: &str) -> Option<(usize, String)> {
+    if !trimmed.starts_with('#') {
+        return None;
+    }
+    let hash_count = trimmed.chars().take_while(|c| *c == '#').count();
+    let after_hashes = trimmed.get(hash_count..).unwrap_or_default();
+    if hash_count > 6 || !after_hashes.starts_with(' ') {
+        return None;
+    }
+    let rest = after_hashes.trim();
+    let title = rest
+        .strip_prefix("**")
+        .and_then(|inner| inner.strip_suffix("**"))
+        .unwrap_or(rest);
+    Some((hash_count, title.trim().to_owned()))
+}
+
+fn unordered_item_text(trimmed: &str) -> Option<&str> {
+    trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+        .or_else(|| trimmed.strip_prefix("• "))
+        .map(str::trim)
+}
+
+fn parse_task_marker(text: &str) -> Option<(bool, String)> {
+    if let Some(rest) = text.strip_prefix("[ ] ") {
+        Some((false, rest.trim().to_owned()))
+    } else {
+        text.strip_prefix("[x] ")
+            .or_else(|| text.strip_prefix("[X] "))
+            .map(|rest| (true, rest.trim().to_owned()))
+    }
+}
+
+fn parse_ordered_prefix(trimmed: &str) -> Option<(usize, &str)> {
+    let digits_end = trimmed
+        .char_indices()
+        .find(|(_, c)| !c.is_ascii_digit())
+        .map(|(i, _)| i)?;
+    if digits_end == 0 {
+        return None;
+    }
+    let after = &trimmed[digits_end..];
+    let sep = after.chars().next()?;
+    if sep != '.' && sep != ')' {
+        return None;
+    }
+    let rest = &after[1..];
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let num = trimmed[..digits_end].parse::<usize>().ok()?;
+    Some((num, rest.trim()))
+}
+
+fn parse_table_row(row: &str) -> Vec<String> {
+    let mut trimmed = row.trim();
+    if let Some(stripped) = trimmed.strip_prefix('|') {
+        trimmed = stripped;
+    }
+    if trimmed.ends_with('|') && !trimmed.ends_with("\\|") {
+        trimmed = &trimmed[..trimmed.len() - 1];
+    }
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut in_code = false;
+    let mut chars = trimmed.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && chars.peek() == Some(&'|') {
+            chars.next();
+            current.push('|');
+            continue;
+        }
+        if ch == '`' {
+            in_code = !in_code;
+            current.push(ch);
+            continue;
+        }
+        if ch == '|' && !in_code {
+            cells.push(current.trim().to_owned());
+            current.clear();
+            continue;
+        }
+        current.push(ch);
+    }
+    cells.push(current.trim().to_owned());
+    cells
 }
 
 pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
@@ -205,13 +349,12 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
             continue;
         }
 
-        // Fenced code block
-        if trimmed.starts_with("```") {
-            let lang = trimmed.trim_start_matches('`').trim().to_owned();
+        // Fenced code block (``` or ~~~, supporting longer outer fences)
+        if let Some((fence_ch, fence_len, lang)) = parse_fence_open(trimmed) {
             let mut code_lines = Vec::new();
             i += 1;
             while i < lines.len() {
-                if lines[i].trim().starts_with("```") {
+                if is_fence_close(lines[i].trim(), fence_ch, fence_len) {
                     i += 1;
                     break;
                 }
@@ -226,31 +369,17 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
         }
 
         // Horizontal rule (---, ***, ___)
-        if (trimmed == "---" || trimmed == "***" || trimmed == "___")
-            || (trimmed.len() >= 3 && trimmed.chars().all(|c| c == '-' || c == '*' || c == '_'))
-        {
+        if is_horizontal_rule(trimmed) {
             blocks.push(MdBlock::Rule);
             i += 1;
             continue;
         }
 
         // Heading
-        if trimmed.starts_with('#') {
-            let hash_count = trimmed.chars().take_while(|c| *c == '#').count();
-            let after_hashes = trimmed.get(hash_count..).unwrap_or_default();
-            if hash_count <= 6 && after_hashes.starts_with(' ') {
-                let rest = after_hashes.trim();
-                let title = rest
-                    .strip_prefix("**")
-                    .and_then(|inner| inner.strip_suffix("**"))
-                    .unwrap_or(rest);
-                blocks.push(MdBlock::Heading {
-                    level: hash_count,
-                    text: title.trim().to_owned(),
-                });
-                i += 1;
-                continue;
-            }
+        if let Some((level, text)) = is_heading_line(trimmed) {
+            blocks.push(MdBlock::Heading { level, text });
+            i += 1;
+            continue;
         }
 
         // Blockquote
@@ -266,9 +395,11 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
                     i += 1;
                 } else if !q_trim.is_empty()
                     && !quote_lines.is_empty()
-                    && !q_trim.starts_with('#')
-                    && !q_trim.starts_with('-')
-                    && !q_trim.starts_with("```")
+                    && is_heading_line(q_trim).is_none()
+                    && unordered_item_text(q_trim).is_none()
+                    && parse_ordered_prefix(q_trim).is_none()
+                    && parse_fence_open(q_trim).is_none()
+                    && !is_horizontal_rule(q_trim)
                 {
                     quote_lines.push(q_trim.to_owned());
                     i += 1;
@@ -282,13 +413,6 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
 
         // Markdown Table
         if trimmed.starts_with('|') && i + 1 < lines.len() && is_table_separator(lines[i + 1]) {
-            let parse_table_row = |row: &str| -> Vec<String> {
-                let trimmed_row = row.trim().trim_start_matches('|').trim_end_matches('|');
-                trimmed_row
-                    .split('|')
-                    .map(|c| c.trim().to_owned())
-                    .collect()
-            };
             let headers = parse_table_row(trimmed);
             let mut aligns = parse_aligns(lines[i + 1]);
             aligns.resize(headers.len(), Align::Left);
@@ -306,24 +430,27 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
             continue;
         }
 
-        // Unordered list
-        if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("• ") {
+        // Unordered list (including loose lists, `+ ` bullets, and `- [ ]` tasks)
+        if unordered_item_text(trimmed).is_some() {
             let mut items = Vec::new();
             let mut depths: Vec<u8> = Vec::new();
             let mut indents: Vec<usize> = Vec::new();
             while i < lines.len() {
                 let l_trim = lines[i].trim();
-                if l_trim.starts_with("- ") || l_trim.starts_with("* ") || l_trim.starts_with("• ")
-                {
+                if l_trim.is_empty() && !items.is_empty() {
+                    let next = lines[i + 1..]
+                        .iter()
+                        .map(|l| l.trim())
+                        .find(|l| !l.is_empty());
+                    if next.is_some_and(|l| unordered_item_text(l).is_some()) {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if let Some(item_text) = unordered_item_text(l_trim) {
                     depths.push(list_depth(&mut indents, leading_indent(lines[i])));
-                    let marker_len = if l_trim.starts_with("• ") { 3 } else { 2 };
-                    items.push(
-                        l_trim
-                            .get(marker_len..)
-                            .unwrap_or_default()
-                            .trim()
-                            .to_owned(),
-                    );
+                    items.push(item_text.to_owned());
                     i += 1;
                 } else if !l_trim.is_empty()
                     && (lines[i].starts_with("  ") || lines[i].starts_with('\t'))
@@ -351,75 +478,58 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
                         })
                         .collect(),
                 });
+            } else if !items.is_empty()
+                && items.iter().all(|item| parse_task_marker(item).is_some())
+            {
+                let tasks = items
+                    .into_iter()
+                    .filter_map(|item| {
+                        parse_task_marker(&item).map(|(checked, text)| TaskItem { checked, text })
+                    })
+                    .collect();
+                blocks.push(MdBlock::TaskList(tasks));
             } else {
                 blocks.push(MdBlock::UnorderedList(items));
             }
             continue;
         }
 
-        // Ordered list
-        let first_word = trimmed.split_whitespace().next().unwrap_or("");
-        if first_word.ends_with('.')
-            && first_word
-                .trim_end_matches('.')
-                .chars()
-                .all(|c| c.is_ascii_digit())
-        {
+        // Ordered list (`1. ` or `1) `)
+        if let Some((start, _)) = parse_ordered_prefix(trimmed) {
             // The first number is the list's start: a list that continues
             // after other blocks (or a blank line) must not restart at 1.
-            let start = first_word
-                .trim_end_matches('.')
-                .parse::<usize>()
-                .unwrap_or(1);
             let mut items = Vec::new();
             let mut depths: Vec<u8> = Vec::new();
             let mut kinds: Vec<bool> = Vec::new();
             let mut indents: Vec<usize> = Vec::new();
             while i < lines.len() {
                 let l_trim = lines[i].trim();
-                let fw = l_trim.split_whitespace().next().unwrap_or("");
                 if l_trim.is_empty() && !items.is_empty() {
                     // A blank line inside a loose list keeps it one list.
                     let next = lines[i + 1..]
                         .iter()
                         .map(|l| l.trim())
                         .find(|l| !l.is_empty());
-                    let continues = next.is_some_and(|l| {
-                        let w = l.split_whitespace().next().unwrap_or("");
-                        w.ends_with('.')
-                            && !w.trim_end_matches('.').is_empty()
-                            && w.trim_end_matches('.').chars().all(|c| c.is_ascii_digit())
-                    });
+                    let continues = next.is_some_and(|l| parse_ordered_prefix(l).is_some());
                     if continues {
                         i += 1;
                         continue;
                     }
                     break;
                 }
-                if fw.ends_with('.') && fw.trim_end_matches('.').chars().all(|c| c.is_ascii_digit())
-                {
-                    let item_text = l_trim.get(fw.len()..).unwrap_or_default().trim().to_owned();
+                if let Some((_, item_text)) = parse_ordered_prefix(l_trim) {
                     depths.push(list_depth(&mut indents, leading_indent(lines[i])));
                     kinds.push(true);
-                    items.push(item_text);
+                    items.push(item_text.to_owned());
                     i += 1;
                 } else if !items.is_empty()
                     && leading_indent(lines[i]) > 0
-                    && (l_trim.starts_with("- ")
-                        || l_trim.starts_with("* ")
-                        || l_trim.starts_with("• "))
+                    && let Some(item_text) = unordered_item_text(l_trim)
                 {
                     // A bullet under a numbered item.
-                    let marker_len = if l_trim.starts_with("• ") { 3 } else { 2 };
                     depths.push(list_depth(&mut indents, leading_indent(lines[i])));
                     kinds.push(false);
-                    items.push(
-                        l_trim
-                            .get(marker_len..)
-                            .unwrap_or_default()
-                            .trim()
-                            .to_owned(),
-                    );
+                    items.push(item_text.to_owned());
                     i += 1;
                 } else if !l_trim.is_empty()
                     && (lines[i].starts_with("  ") || lines[i].starts_with('\t'))
@@ -458,17 +568,16 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
         while i < lines.len() {
             let p_trim = lines[i].trim();
             if p_trim.is_empty()
-                || p_trim.starts_with("```")
-                || p_trim.starts_with('#')
+                || parse_fence_open(p_trim).is_some()
+                || is_heading_line(p_trim).is_some()
                 || p_trim.starts_with("> ")
                 || p_trim == ">"
-                || p_trim.starts_with("- ")
-                || p_trim.starts_with("* ")
-                || p_trim.starts_with("• ")
+                || unordered_item_text(p_trim).is_some()
+                || parse_ordered_prefix(p_trim).is_some()
                 || (p_trim.starts_with('|')
                     && i + 1 < lines.len()
                     && is_table_separator(lines[i + 1]))
-                || (p_trim == "---" || p_trim == "***" || p_trim == "___")
+                || is_horizontal_rule(p_trim)
             {
                 break;
             }
@@ -482,11 +591,76 @@ pub fn parse_markdown_blocks(content: &str) -> Vec<MdBlock> {
     blocks
 }
 
+fn push_inline_text(spans: &mut Vec<InlineSpan>, chunk: &str) {
+    if chunk.is_empty() {
+        return;
+    }
+    if let Some(InlineSpan::Text(last_text)) = spans.last_mut() {
+        last_text.push_str(chunk);
+    } else {
+        spans.push(InlineSpan::Text(chunk.to_owned()));
+    }
+}
+
+fn is_escapeable_punct(c: char) -> bool {
+    matches!(
+        c,
+        '\\' | '*' | '_' | '`' | '[' | ']' | '(' | ')' | '~' | '|' | '!' | '#' | '-' | '+' | '.'
+    )
+}
+
+fn prev_char_is_word(spans: &[InlineSpan]) -> bool {
+    spans
+        .last()
+        .and_then(|span| match span {
+            InlineSpan::Text(s) => s.chars().last(),
+            _ => None,
+        })
+        .is_some_and(char::is_alphanumeric)
+}
+
+fn trim_bare_url(raw: &str) -> &str {
+    let mut end = raw.len();
+    while end > "https://".len() {
+        let ch = raw[..end].chars().next_back().unwrap_or(' ');
+        if matches!(ch, '.' | ',' | ';' | ':' | '!' | '?') {
+            end -= ch.len_utf8();
+            continue;
+        }
+        if ch == ')' {
+            let slice = &raw[..end];
+            let opens = slice.matches('(').count();
+            let closes = slice.matches(')').count();
+            if closes > opens {
+                end -= 1;
+                continue;
+            }
+        }
+        break;
+    }
+    &raw[..end]
+}
+
 pub fn parse_inline(text: &str) -> Vec<InlineSpan> {
+    parse_inline_with_opts(text, true, true)
+}
+
+fn parse_inline_with_opts(text: &str, allow_italic: bool, allow_links: bool) -> Vec<InlineSpan> {
     let mut spans = Vec::new();
     let mut rest = text;
 
     while !rest.is_empty() {
+        // 0. Backslash escape on markdown punctuation.
+        if rest.starts_with('\\')
+            && let Some(next) = rest[1..].chars().next()
+            && is_escapeable_punct(next)
+        {
+            let mut buf = [0u8; 4];
+            push_inline_text(&mut spans, next.encode_utf8(&mut buf));
+            rest = &rest[1 + next.len_utf8()..];
+            continue;
+        }
+
         // 1. Bold with inline code: **`code`**
         if rest.starts_with("**`")
             && let Some(end_code) = rest[3..].find('`')
@@ -500,15 +674,41 @@ pub fn parse_inline(text: &str) -> Vec<InlineSpan> {
             }
         }
 
+        // 1b. Bold + italic: ***...***
+        if allow_italic
+            && rest.starts_with("***")
+            && let Some(end) = rest[3..].find("***")
+        {
+            let inner = &rest[3..3 + end];
+            if !inner.is_empty() {
+                spans.push(InlineSpan::Bold(vec![InlineSpan::Italic(inner.to_owned())]));
+                rest = &rest[3 + end + 3..];
+                continue;
+            }
+        }
+
         // 2. Bold: **...**
         if rest.starts_with("**")
             && let Some(end) = rest[2..].find("**")
         {
             let inner = &rest[2..2 + end];
-            let sub_spans = parse_inline(inner);
+            let sub_spans = parse_inline_with_opts(inner, allow_italic, allow_links);
             spans.push(InlineSpan::Bold(sub_spans));
             rest = &rest[2 + end + 2..];
             continue;
+        }
+
+        // 2b. Strikethrough: ~~...~~
+        if rest.starts_with("~~")
+            && let Some(end) = rest[2..].find("~~")
+        {
+            let inner = &rest[2..2 + end];
+            if !inner.is_empty() {
+                let sub_spans = parse_inline_with_opts(inner, allow_italic, allow_links);
+                spans.push(InlineSpan::Strike(sub_spans));
+                rest = &rest[2 + end + 2..];
+                continue;
+            }
         }
 
         // 3. Inline Code: `...`
@@ -538,7 +738,8 @@ pub fn parse_inline(text: &str) -> Vec<InlineSpan> {
         }
 
         // 4. Link: [label](url)
-        if rest.starts_with('[')
+        if allow_links
+            && rest.starts_with('[')
             && let Some(close_bracket) = rest.find(']')
             && rest[close_bracket..].starts_with("](")
         {
@@ -555,8 +756,28 @@ pub fn parse_inline(text: &str) -> Vec<InlineSpan> {
             }
         }
 
+        // 4b. Bare https://... autolink (checked via safe_chat_link)
+        if allow_links && rest.starts_with("https://") && !prev_char_is_word(&spans) {
+            let raw_end = rest
+                .char_indices()
+                .find(|(_, c)| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\''))
+                .map(|(idx, _)| idx)
+                .unwrap_or(rest.len());
+            let candidate = trim_bare_url(&rest[..raw_end]);
+            if candidate.len() > "https://".len() && chat_links::safe_chat_link(candidate).is_some()
+            {
+                spans.push(InlineSpan::Link {
+                    label: candidate.to_owned(),
+                    url: candidate.to_owned(),
+                });
+                rest = &rest[candidate.len()..];
+                continue;
+            }
+        }
+
         // 5. Italic: *...* (where not **)
-        if rest.starts_with('*')
+        if allow_italic
+            && rest.starts_with('*')
             && !rest.starts_with("**")
             && let Some(end) = rest[1..].find('*')
         {
@@ -568,6 +789,27 @@ pub fn parse_inline(text: &str) -> Vec<InlineSpan> {
             }
         }
 
+        // 5b. Italic with underscores: _..._ on word boundaries (never breaks snake_case)
+        if allow_italic
+            && rest.starts_with('_')
+            && !rest.starts_with("__")
+            && !prev_char_is_word(&spans)
+            && let Some(end) = rest[1..].find('_')
+        {
+            let inner = &rest[1..1 + end];
+            let after = &rest[1 + end + 1..];
+            let followed_by_word = after.chars().next().is_some_and(char::is_alphanumeric);
+            if !inner.is_empty()
+                && !inner.starts_with(['_', ' '])
+                && !inner.ends_with(['_', ' '])
+                && !followed_by_word
+            {
+                spans.push(InlineSpan::Italic(inner.to_owned()));
+                rest = after;
+                continue;
+            }
+        }
+
         // Consume normal text up to the next formatting token. Skip the first
         // *char* (not byte): slicing at byte 1 panics when `rest` starts with a
         // multibyte character (emoji, accented letters).
@@ -575,17 +817,14 @@ pub fn parse_inline(text: &str) -> Vec<InlineSpan> {
             .char_indices()
             .skip(1)
             .find(|(idx, c)| {
-                matches!(c, '*' | '`' | '[') || (*c == '!' && rest[idx + 1..].starts_with('['))
+                matches!(c, '\\' | '*' | '_' | '`' | '~' | '[')
+                    || (*c == '!' && rest[idx + 1..].starts_with('['))
+                    || (allow_links && *c == 'h' && rest[*idx..].starts_with("https://"))
             })
             .map(|(idx, _)| idx)
             .unwrap_or(rest.len());
 
-        let chunk = &rest[..next_pos];
-        if let Some(InlineSpan::Text(last_text)) = spans.last_mut() {
-            last_text.push_str(chunk);
-        } else {
-            spans.push(InlineSpan::Text(chunk.to_owned()));
-        }
+        push_inline_text(&mut spans, &rest[..next_pos]);
         rest = &rest[next_pos..];
     }
 
@@ -610,8 +849,12 @@ pub(super) fn CodeBlock(lang: String, code: String) -> Element {
         div { class: if capped { "md-code-block capped" } else { "md-code-block" },
             div { class: "md-code-head",
                 span { class: "md-code-lang", "{label}" }
+                span { class: "md-code-meta",
+                    if lines == 1 { "1 line" } else { "{lines} lines" }
+                }
                 button {
-                    class: "md-code-copy",
+                    class: if copied() { "md-code-copy copied" } else { "md-code-copy" },
+                    r#type: "button",
                     "aria-label": "Copy code",
                     onclick: {
                         let code = code.clone();
@@ -625,7 +868,13 @@ pub(super) fn CodeBlock(lang: String, code: String) -> Element {
                             });
                         }
                     },
-                    if copied() { "Copied" } else { "Copy" }
+                    if copied() {
+                        Icon { name: "check", size: 12 }
+                        " Copied"
+                    } else {
+                        Icon { name: "copy", size: 12 }
+                        " Copy"
+                    }
                 }
             }
             pre {
@@ -670,7 +919,9 @@ pub fn MarkdownBody(message_id: String, content: String) -> Element {
                     MdBlock::Quote(lines) => rsx! {
                         blockquote { key: "{idx}", class: "md-quote",
                             for (l_idx, line) in lines.into_iter().enumerate() {
-                                p { key: "{l_idx}", InlineMarkdown { text: line } }
+                                if !line.is_empty() {
+                                    p { key: "{l_idx}", InlineMarkdown { text: line } }
+                                }
                             }
                         }
                     },
@@ -678,6 +929,24 @@ pub fn MarkdownBody(message_id: String, content: String) -> Element {
                         ul { key: "{idx}", class: "md-list",
                             for (i_idx, item) in items.into_iter().enumerate() {
                                 li { key: "{i_idx}", InlineMarkdown { text: item } }
+                            }
+                        }
+                    },
+                    MdBlock::TaskList(items) => rsx! {
+                        ul { key: "{idx}", class: "md-list md-task-list", role: "list",
+                            for (i_idx, item) in items.into_iter().enumerate() {
+                                li {
+                                    key: "{i_idx}",
+                                    class: if item.checked { "md-task done" } else { "md-task" },
+                                    span {
+                                        class: if item.checked { "md-task-box checked" } else { "md-task-box" },
+                                        "aria-hidden": "true",
+                                        if item.checked {
+                                            Icon { name: "check", size: 11 }
+                                        }
+                                    }
+                                    span { class: "md-li-text", InlineMarkdown { text: item.text } }
+                                }
                             }
                         }
                     },
@@ -762,9 +1031,26 @@ pub(super) fn RenderSpan(span: InlineSpan) -> Element {
                 }
             }
         },
-        InlineSpan::Italic(s) => rsx! { em { "{s}" } },
+        InlineSpan::Italic(s) => {
+            let sub_spans = parse_inline_with_opts(&s, false, true);
+            rsx! {
+                em {
+                    for (idx, sub) in sub_spans.into_iter().enumerate() {
+                        RenderSpan { key: "{idx}", span: sub }
+                    }
+                }
+            }
+        }
+        InlineSpan::Strike(sub_spans) => rsx! {
+            del { class: "md-del",
+                for (idx, sub) in sub_spans.into_iter().enumerate() {
+                    RenderSpan { key: "{idx}", span: sub }
+                }
+            }
+        },
         InlineSpan::Link { label, url } => {
             let mut session = try_consume_context::<Signal<Session>>();
+            let label_spans = parse_inline_with_opts(&label, true, false);
             match chat_links::safe_chat_link(&url) {
                 // A button, not an anchor: the page never navigates by itself,
                 // and the click goes through the checked open path.
@@ -778,12 +1064,18 @@ pub(super) fn RenderSpan(span: InlineSpan) -> Element {
                                 session.write().open_in_browser(link.clone());
                             }
                         },
-                        "{label}"
+                        for (idx, sub) in label_spans.into_iter().enumerate() {
+                            RenderSpan { key: "{idx}", span: sub }
+                        }
                     }
                 },
                 // Anything else is plain text: the label, no link.
                 None => rsx! {
-                    span { class: "md-link-blocked", title: "Not a link the app opens (only https links open)", "{label}" }
+                    span { class: "md-link-blocked", title: "Not a link the app opens (only https links open)",
+                        for (idx, sub) in label_spans.into_iter().enumerate() {
+                            RenderSpan { key: "{idx}", span: sub }
+                        }
+                    }
                 },
             }
         }
@@ -813,6 +1105,106 @@ pub(super) fn RenderSpan(span: InlineSpan) -> Element {
                     span { class: "md-image-chip blocked", title: "Image not shown", Icon { name: "image", size: 13 } span { "{name}" } }
                 },
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paragraphs_break_before_ordered_lists_and_fences_and_tasks() {
+        let blocks =
+            parse_markdown_blocks("Intro line\n1. First\n2) Second\n\n- [ ] Todo\n- [x] Done");
+        assert_eq!(
+            blocks,
+            vec![
+                MdBlock::Paragraph("Intro line".into()),
+                MdBlock::OrderedList {
+                    start: 1,
+                    items: vec!["First".into(), "Second".into()],
+                },
+                MdBlock::TaskList(vec![
+                    TaskItem {
+                        checked: false,
+                        text: "Todo".into(),
+                    },
+                    TaskItem {
+                        checked: true,
+                        text: "Done".into(),
+                    },
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn loose_unordered_lists_and_tilde_or_longer_fences_parse() {
+        let md = "- one\n\n+ two\n\n~~~~markdown\n```rust\nfn x() {}\n```\n~~~~";
+        let blocks = parse_markdown_blocks(md);
+        assert_eq!(
+            blocks,
+            vec![
+                MdBlock::UnorderedList(vec!["one".into(), "two".into()]),
+                MdBlock::CodeBlock {
+                    lang: "markdown".into(),
+                    code: "```rust\nfn x() {}\n```".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn table_row_keeps_escaped_and_code_pipes() {
+        let md = "| Expr | Escaped |\n|---|---|\n| `a | b` | x \\| y |";
+        let blocks = parse_markdown_blocks(md);
+        assert_eq!(
+            blocks,
+            vec![MdBlock::Table {
+                headers: vec!["Expr".into(), "Escaped".into()],
+                rows: vec![vec!["`a | b`".into(), "x | y".into()]],
+                aligns: vec![Align::Left, Align::Left],
+            }]
+        );
+    }
+
+    #[test]
+    fn inline_supports_strike_underscore_escapes_bold_italic_and_safe_autolinks() {
+        assert_eq!(
+            parse_inline("~~old~~ _em_ snake_case_name \\*lit\\* ***both***"),
+            vec![
+                InlineSpan::Strike(vec![InlineSpan::Text("old".into())]),
+                InlineSpan::Text(" ".into()),
+                InlineSpan::Italic("em".into()),
+                InlineSpan::Text(" snake_case_name *lit* ".into()),
+                InlineSpan::Bold(vec![InlineSpan::Italic("both".into())]),
+            ]
+        );
+        assert_eq!(
+            parse_inline("visit https://docs.example.com/a_(b). now"),
+            vec![
+                InlineSpan::Text("visit ".into()),
+                InlineSpan::Link {
+                    label: "https://docs.example.com/a_(b)".into(),
+                    url: "https://docs.example.com/a_(b)".into(),
+                },
+                InlineSpan::Text(". now".into()),
+            ]
+        );
+        // http:// is never autolinked as clickable.
+        assert_eq!(
+            parse_inline("plain http://insecure.example"),
+            vec![InlineSpan::Text("plain http://insecure.example".into())]
+        );
+    }
+
+    #[test]
+    fn markdown_cache_evicts_bounded_without_clearing_recent() {
+        for idx in 0..=MD_CACHE_MAX + 5 {
+            let id = format!("cache-test-{idx}");
+            let parsed = parse_markdown_cached(&id, &format!("msg {idx}"));
+            assert_eq!(parsed, vec![MdBlock::Paragraph(format!("msg {idx}"))]);
         }
     }
 }

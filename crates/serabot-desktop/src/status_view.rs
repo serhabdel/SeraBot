@@ -93,6 +93,42 @@ pub fn member_label(display_name: &str, email: &str) -> String {
     }
 }
 
+/// Severity tone token (`"ok"`, `"warn"`, or `"watch"`) for a 0..=100
+/// utilization percentage.
+#[allow(dead_code)]
+pub fn usage_tone(pct: u32) -> &'static str {
+    if pct >= 90 {
+        "watch"
+    } else if pct >= 75 {
+        "warn"
+    } else {
+        "ok"
+    }
+}
+
+/// Severity tone token (`"ok"`, `"warn"`, or `"watch"`) for host CPU load.
+#[allow(dead_code)]
+pub fn cpu_tone(cpu_percent: f32) -> &'static str {
+    if !cpu_percent.is_finite() {
+        return "ok";
+    }
+    usage_tone(cpu_percent.clamp(0.0, 100.0).round() as u32)
+}
+
+/// Compact `used / total (pct%)` summary for host metrics.
+#[allow(dead_code)]
+pub fn format_ratio_bytes(used: u64, total: u64) -> String {
+    if total == 0 {
+        return format_bytes(used);
+    }
+    format!(
+        "{} / {} ({}%)",
+        format_bytes(used),
+        format_bytes(total),
+        percent(used, total)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +188,18 @@ mod tests {
     fn member_label_falls_back_to_email() {
         assert_eq!(member_label("Ana", "a@x.example"), "Ana");
         assert_eq!(member_label("  ", "a@x.example"), "a@x.example");
+    }
+
+    #[test]
+    fn usage_tones_and_ratios_flag_thresholds() {
+        assert_eq!(usage_tone(0), "ok");
+        assert_eq!(usage_tone(74), "ok");
+        assert_eq!(usage_tone(75), "warn");
+        assert_eq!(usage_tone(89), "warn");
+        assert_eq!(usage_tone(90), "watch");
+        assert_eq!(cpu_tone(f32::NAN), "ok");
+        assert_eq!(cpu_tone(95.2), "watch");
+        assert_eq!(format_ratio_bytes(512, 0), "512 B");
+        assert_eq!(format_ratio_bytes(512, 1024), "512 B / 1.0 KB (50%)");
     }
 }

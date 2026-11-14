@@ -111,14 +111,48 @@ pub fn filter_entries<'a>(
         .collect()
 }
 
-/// Short clock time for a row: the `HH:MM:SS` part of an ISO timestamp.
+/// Short clock time for a row: the `HH:MM:SS` part of an ISO/space timestamp.
 pub fn time_of(ts: &str) -> &str {
     let bytes = ts.as_bytes();
-    if bytes.len() >= 19 && bytes[10] == b'T' && bytes[13] == b':' && bytes[16] == b':' {
+    if bytes.len() >= 19
+        && (bytes[10] == b'T' || bytes[10] == b' ')
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+    {
         &ts[11..19]
     } else {
         ts
     }
+}
+
+/// Format a single log entry as a plain text line for clipboard export.
+#[allow(dead_code)]
+pub fn format_line(entry: &LogEntry) -> String {
+    let ts = if entry.ts.is_empty() {
+        "-"
+    } else {
+        time_of(&entry.ts)
+    };
+    let level = if entry.level.is_empty() {
+        "log"
+    } else {
+        &entry.level
+    };
+    if entry.target.trim().is_empty() {
+        format!("[{ts}] {level} {}", entry.message)
+    } else {
+        format!("[{ts}] {level} {} — {}", entry.target, entry.message)
+    }
+}
+
+/// Join visible log lines for copying.
+#[allow(dead_code)]
+pub fn format_plain_lines(entries: &[&LogEntry]) -> String {
+    entries
+        .iter()
+        .map(|entry| format_line(entry))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The CSS-ish tone class per level for the row.
@@ -214,7 +248,19 @@ mod tests {
     #[test]
     fn time_of_extracts_the_clock_part() {
         assert_eq!(time_of("2026-11-08T10:00:02.000Z"), "10:00:02");
+        assert_eq!(time_of("2026-11-08 10:00:02"), "10:00:02");
         assert_eq!(time_of("short"), "short");
+    }
+
+    #[test]
+    fn format_plain_lines_outputs_readable_lines() {
+        let parsed = entries();
+        let refs: Vec<&LogEntry> = parsed.iter().take(2).collect();
+        let text = format_plain_lines(&refs);
+        assert_eq!(
+            text,
+            "[10:00:00] info serabot::api — listening on :8080\n[10:00:01] warn serabot::gateway — slow approval"
+        );
     }
 
     #[test]

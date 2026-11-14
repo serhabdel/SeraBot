@@ -7,23 +7,33 @@
 //! before the request starts, and it never enters chat state or messages.
 
 use crate::ui::{Icon, avatar_style};
+use crate::ui_files::CONFIRM_RESET_JS;
 use dioxus::prelude::*;
-use serabot_desktop::chat_cards::{self, CardBody, CardState, CardView, QuestionCard, SecretCard};
+use serabot_desktop::chat_cards::{
+    self, CardBody, CardState, CardView, MAX_ANSWER, QuestionCard, SecretCard,
+};
 use serabot_desktop::session::Session;
 use zeroize::Zeroizing;
 
 /// One card at the foot of the feed. A pending card takes its full form; a
-/// resolved one is a single line.
+/// resolved one is a single line with its prompt context.
 #[component]
 pub(crate) fn ChatCardRow(mut session: Signal<Session>, card: CardView) -> Element {
     if card.state != CardState::Pending {
         let avatar = session.read().bot_avatar(&card.bot);
         let style = avatar_style(&card.bot);
         let line = chat_cards::resolved_line(&card);
+        let prompt = chat_cards::resolved_prompt(&card);
         return rsx! {
             div { class: "chat-card-resolved", role: "status",
                 span { class: "avatar bot sm", style: "{style}", "{avatar}" }
-                span { class: "chat-card-resolved-text", "{line}" }
+                div { class: "chat-card-resolved-copy",
+                    if let Some(prompt) = prompt {
+                        span { class: "tiny muted", "{prompt}" }
+                        " · "
+                    }
+                    span { class: "chat-card-resolved-text", "{line}" }
+                }
             }
         };
     }
@@ -37,6 +47,15 @@ pub(crate) fn ChatCardRow(mut session: Signal<Session>, card: CardView) -> Eleme
     }
 }
 
+fn pulse_submitting(mut submitting: Signal<bool>) {
+    submitting.set(true);
+    spawn(async move {
+        let mut done = dioxus::document::eval(CONFIRM_RESET_JS);
+        let _ = done.recv::<bool>().await;
+        submitting.set(false);
+    });
+}
+
 #[component]
 fn QuestionPrompt(
     mut session: Signal<Session>,
@@ -45,14 +64,44 @@ fn QuestionPrompt(
     question: QuestionCard,
 ) -> Element {
     let mut free = use_signal(String::new);
+    let mut input_focused = use_signal(|| false);
+    let submitting = use_signal(|| false);
     let text = free();
-    let sendable = chat_cards::clean_answer(&text).is_some();
+    let chars = text.chars().count();
+    let over_limit = chars > MAX_ANSWER;
+    let sendable = !submitting() && chat_cards::clean_answer(&text).is_some();
     let name = session.read().bot_display_name(&bot);
     let avatar = session.read().bot_avatar(&bot);
     let style = avatar_style(&bot);
     let aria = format!("Question from {name}");
+    let options = question.options.clone();
     rsx! {
-        section { class: "chat-card question", "aria-label": "{aria}",
+        section {
+            class: "chat-card question",
+            "aria-label": "{aria}",
+            onkeydown: {
+                let id = id.clone();
+                let options = options.clone();
+                move |event: KeyboardEvent| {
+                    if submitting() || input_focused() || event.is_composing() {
+                        return;
+                    }
+                    let mods = event.modifiers();
+                    if mods.ctrl() || mods.meta() || mods.alt() {
+                        return;
+                    }
+                    if let Key::Character(ch) = event.key()
+                        && let Some(digit) = ch.chars().next().filter(|c| ('1'..='6').contains(c))
+                    {
+                        let idx = (digit as usize) - ('1' as usize);
+                        if let Some(option) = options.get(idx) {
+                            event.prevent_default();
+                            pulse_submitting(submitting);
+                            session.write().answer_card(id.clone(), option.clone());
+                        }
+                    }
+                }
+            },
             div { class: "chat-card-head",
                 span { class: "avatar bot sm", style: "{style}", "{avatar}" }
                 span { class: "chat-card-title", "{name} asks" }
@@ -61,18 +110,25 @@ fn QuestionPrompt(
             if let Some(context) = question.context.clone() {
                 p { class: "chat-card-context", "{context}" }
             }
-            if !question.options.is_empty() {
+            if !options.is_empty() {
                 div { class: "chat-card-options", role: "group", "aria-label": "Answers",
-                    for option in question.options.clone() {
+                    for (idx, option) in options.iter().enumerate() {
                         button {
                             key: "{option}",
                             class: "btn sm chat-card-option",
+                            r#type: "button",
+                            disabled: submitting(),
+                            title: "Choose option {idx + 1}",
                             onclick: {
                                 let id = id.clone();
                                 let option = option.clone();
-                                move |_| session.write().answer_card(id.clone(), option.clone())
+                                move |_| {
+                                    pulse_submitting(submitting);
+                                    session.write().answer_card(id.clone(), option.clone());
+                                }
                             },
-                            "{option}"
+                            span { class: "kbd", "{idx + 1}" }
+                            " {option}"
                         }
                     }
                 }
@@ -80,20 +136,25 @@ fn QuestionPrompt(
             if question.allow_free_text {
                 div { class: "chat-card-free",
                     input {
-                        class: "chat-card-input",
+                        class: if over_limit { "chat-card-input invalid" } else { "chat-card-input" },
                         r#type: "text",
+                        disabled: submitting(),
                         "aria-label": "Your answer",
+                        "aria-invalid": if over_limit { "true" } else { "false" },
                         placeholder: "Type another answer",
                         value: "{text}",
+                        onfocus: move |_| input_focused.set(true),
+                        onblur: move |_| input_focused.set(false),
                         oninput: move |event| free.set(event.value()),
                         onkeydown: {
                             let id = id.clone();
                             move |event: KeyboardEvent| {
-                                if event.key() == Key::Enter {
+                                if event.key() == Key::Enter && !event.is_composing() && !submitting() {
                                     // The read guard ends with this statement, before the write.
                                     let answer = chat_cards::clean_answer(&free.read());
                                     if let Some(answer) = answer {
                                         free.set(String::new());
+                                        pulse_submitting(submitting);
                                         session.write().answer_card(id.clone(), answer);
                                     }
                                 }
@@ -102,6 +163,7 @@ fn QuestionPrompt(
                     }
                     button {
                         class: "btn primary sm",
+                        r#type: "button",
                         disabled: !sendable,
                         onclick: {
                             let id = id.clone();
@@ -109,18 +171,34 @@ fn QuestionPrompt(
                                 let answer = chat_cards::clean_answer(&free.read());
                                 if let Some(answer) = answer {
                                     free.set(String::new());
+                                    pulse_submitting(submitting);
                                     session.write().answer_card(id.clone(), answer);
                                 }
                             }
                         },
-                        "Send"
+                        if submitting() { "Sending\u{2026}" } else { "Send" }
+                    }
+                }
+                if chars >= (MAX_ANSWER * 4) / 5 {
+                    p {
+                        class: if over_limit { "field-error" } else { "tiny muted" },
+                        if over_limit {
+                            "Answer is {chars - MAX_ANSWER} characters over the {MAX_ANSWER}-character limit."
+                        } else {
+                            "{chars} / {MAX_ANSWER} characters"
+                        }
                     }
                 }
             }
             div { class: "chat-card-actions",
                 button {
                     class: "btn ghost sm",
-                    onclick: move |_| session.write().decline_card(id.clone()),
+                    r#type: "button",
+                    disabled: submitting(),
+                    onclick: move |_| {
+                        pulse_submitting(submitting);
+                        session.write().decline_card(id.clone());
+                    },
                     "Skip"
                 }
             }
@@ -137,7 +215,8 @@ fn SecretPrompt(
 ) -> Element {
     let mut value = use_signal(String::new);
     let mut reveal = use_signal(|| false);
-    let filled = !value.read().is_empty();
+    let submitting = use_signal(|| false);
+    let filled = !value.read().is_empty() && !submitting();
     let shown = value();
     let input_type = if reveal() { "text" } else { "password" };
     let reveal_label = if reveal() { "Hide" } else { "Show" };
@@ -164,7 +243,7 @@ fn SecretPrompt(
                 }
             }
             if secret.replaces {
-                p { class: "chat-card-note", "This replaces your existing “{secret.name}” entry." }
+                p { class: "chat-card-note", "This replaces your existing \u{201C}{secret.name}\u{201D} entry." }
             }
             if !secret.domains.is_empty() {
                 div { class: "chat-card-domains", "aria-label": "Sites",
@@ -183,21 +262,41 @@ fn SecretPrompt(
                 input {
                     class: "chat-card-input",
                     r#type: "{input_type}",
+                    disabled: submitting(),
                     autocomplete: "off",
                     spellcheck: "false",
                     "aria-label": "Secret value",
                     value: "{shown}",
                     oninput: move |event| value.set(event.value()),
+                    onkeydown: {
+                        let id = id.clone();
+                        move |event: KeyboardEvent| {
+                            if event.key() == Key::Enter && !event.is_composing() && !submitting() {
+                                let secret = Zeroizing::new(std::mem::take(&mut *value.write()));
+                                if !secret.is_empty() {
+                                    reveal.set(false);
+                                    pulse_submitting(submitting);
+                                    session.write().submit_secret_card(id.clone(), secret);
+                                }
+                            }
+                        }
+                    },
                 }
                 button {
                     class: "btn ghost sm",
+                    r#type: "button",
+                    disabled: submitting(),
+                    "aria-pressed": if reveal() { "true" } else { "false" },
+                    "aria-label": if reveal() { "Hide what I typed" } else { "Show what I typed" },
+                    title: "{reveal_label}",
                     onclick: move |_| reveal.set(!reveal()),
-                    "{reveal_label}"
+                    Icon { name: if reveal() { "eye-off" } else { "eye" }, size: 15 }
                 }
             }
             div { class: "chat-card-actions",
                 button {
                     class: "btn primary sm",
+                    r#type: "button",
                     disabled: !filled,
                     onclick: {
                         let id = id.clone();
@@ -205,16 +304,22 @@ fn SecretPrompt(
                             // Move the value out of the signal: nothing is left behind.
                             let secret = Zeroizing::new(std::mem::take(&mut *value.write()));
                             if !secret.is_empty() {
+                                reveal.set(false);
+                                pulse_submitting(submitting);
                                 session.write().submit_secret_card(id.clone(), secret);
                             }
                         }
                     },
-                    "Save to vault"
+                    if submitting() { "Saving\u{2026}" } else { "Save to vault" }
                 }
                 button {
                     class: "btn ghost sm",
+                    r#type: "button",
+                    disabled: submitting(),
                     onclick: move |_| {
                         value.set(String::new());
+                        reveal.set(false);
+                        pulse_submitting(submitting);
                         session.write().decline_card(id.clone());
                     },
                     "Decline"

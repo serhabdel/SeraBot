@@ -28,6 +28,7 @@ artifacts.
 | [Release 0.37.0](release-0.37.0.md) | Bots finish the task instead of refusing; live step cards; typed tool results; page data for Tasks, Memory, Connectors, and Providers. |
 | [Release 0.38.0](release-0.38.0.md) | Working chat switching and a steadier chat view; one Integrations screen; plugin tools for bots; safe links and richer markdown in chat. |
 | [Release 0.39.0](release-0.39.0.md) | Per-user isolation & reliability fixes: scheduled/direct `dir:main` isolation, resilient scheduler loop, UID-scoped `kv` & `/v1/models` ownership, per-user monitoring sources, multi-user RAG vector recall, least-privilege `/v1/connectors`, Windows ACLs, and batched media jobs. |
+| [Release 0.40.0](release-0.40.0.md) | Desktop UI/UX overhaul: chat & composer shortcuts, richer markdown & bounded cache, approvals & conversations polish, shell/search/banner fixes, Tasks/Workflows/Logs/Files/Jobs/Bots/Dock upgrades, and CSS/responsive refinements. |
 | [Events](events.md) | `turn.step` payload for desktop and Android step cards. |
 | [Tool results](tool-results.md) | Audio, file, image, link, and table cards. |
 | [Console pages](console-pages.md) | Tasks, Memory, Connectors, and Providers fields the next desktop pages read. |

@@ -72,11 +72,36 @@
 }
 
 .job.failed .job-mark {
-  color: var(--err, #e5534b);
+  color: var(--danger);
 }
 
 .job.waiting .job-mark {
   color: var(--warn);
+}
+
+.job-row-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.job-row-wrap .job {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.job-detail {
+  margin-left: 26px;
+  padding: 6px 10px;
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  user-select: text;
 }
 
 .job-icon {
@@ -132,11 +157,27 @@
 
 .log-row {
   display: grid;
-  grid-template-columns: 72px 56px minmax(120px, 220px) 1fr;
+  grid-template-columns: 72px 56px minmax(110px, 210px) 1fr auto;
+  align-items: baseline;
   gap: 10px;
-  padding: 3px 12px;
+  padding: 4px 12px;
+  white-space: nowrap;
+}
+
+.logs-wrap .log-row {
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.log-copy {
+  opacity: 0;
+  min-height: 22px;
+  padding: 2px 5px;
+}
+
+.log-row:hover .log-copy,
+.log-row:focus-within .log-copy {
+  opacity: 1;
 }
 
 .log-row:hover {
@@ -161,7 +202,7 @@
 }
 
 .log-error .log-level {
-  color: var(--err, #e5534b);
+  color: var(--danger);
 }
 
 .log-trace .log-level {
@@ -176,6 +217,13 @@
 
 .log-message {
   color: var(--label-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.logs-wrap .log-message {
+  overflow: visible;
+  text-overflow: clip;
 }
 
 /* --- Document preview pane (0.28.0) --- */
@@ -296,11 +344,13 @@
 }
 
 .wf-pill.ok {
-  color: var(--accent-2);
+  color: var(--ok);
+  background: var(--ok-soft);
 }
 
 .wf-pill.err {
-  color: var(--err, #e5534b);
+  color: var(--danger);
+  background: var(--danger-soft);
 }
 
 .wf-pill.muted {
@@ -311,9 +361,37 @@
   margin: 0 0 10px;
   padding: 8px 10px;
   border-radius: var(--r-md);
-  border: 1px solid var(--err, #e5534b);
-  color: var(--err, #e5534b);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  background: var(--danger-soft);
   font-size: var(--fs-body-2);
+}
+
+.wf-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.wf-search {
+  flex: 1 1 220px;
+  min-width: 160px;
+}
+
+.wf-inline-err {
+  grid-column: 1 / -1;
+  margin: 4px 0 0;
+  color: var(--danger);
+  font-size: var(--fs-caption);
+}
+
+.wf-chat-link {
+  justify-self: start;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .wf-head-actions {
@@ -591,8 +669,8 @@
 }
 
 .tasks-add .tasks-due {
-  flex: 0 0 128px;
-  width: 128px;
+  flex: 0 0 156px;
+  width: 156px;
 }
 
 .tasks-add > .btn {
@@ -661,4 +739,33 @@
   .ap-actions {
     justify-content: flex-start;
   }
+
+  .wf-row-routine,
+  .wf-row-source,
+  .wf-row-plan {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+  }
+
+  .log-row {
+    grid-template-columns: 64px 48px minmax(0, 1fr) auto;
+  }
+
+  .log-target {
+    display: none;
+  }
+
+  .tasks-add {
+    flex-wrap: wrap;
+  }
+
+  .tasks-add .tasks-due {
+    flex: 1 1 140px;
+    width: auto;
+  }
+}
+
+.root[data-motion="reduce"] .wf-switch-track,
+.root[data-motion="reduce"] .wf-switch-knob {
+  transition: none;
 }

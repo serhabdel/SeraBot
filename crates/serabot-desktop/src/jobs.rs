@@ -81,6 +81,8 @@ pub struct JobItem {
     pub bot: String,
     pub title: String,
     pub state: JobState,
+    /// Optional longer detail (error message or destination target).
+    pub detail: Option<String>,
     /// When set, the console can open this chat for trace context (B6).
     pub trace_conversation: Option<String>,
 }
@@ -144,6 +146,7 @@ pub fn build(
             bot: task.bot.clone(),
             title,
             state,
+            detail: None,
             trace_conversation: None,
         });
     }
@@ -152,12 +155,19 @@ pub fn build(
         let Some(state) = media_state(&job.status) else {
             continue;
         };
+        let detail = job
+            .error
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         items.push(JobItem {
             kind: JobKind::Media,
             id: format!("media:{}", job.id),
             bot: job.bot.clone(),
             title: placeholder_label(job),
             state,
+            detail,
             trace_conversation: None,
         });
     }
@@ -179,6 +189,7 @@ pub fn build(
             bot: bot.clone(),
             title: format!("Handed off to {bot}"),
             state,
+            detail: None,
             trace_conversation: None,
         });
     }
@@ -195,6 +206,7 @@ pub fn build(
             bot: row.bot.clone(),
             title,
             state: JobState::Failed,
+            detail: row.last_error.clone(),
             trace_conversation: row.conversation_id.clone(),
         });
     }
@@ -205,6 +217,10 @@ pub fn build(
             bot: row.tool.clone(),
             title: format!("Unknown outcome: {}", row.tool),
             state: JobState::Failed,
+            detail: row
+                .destination
+                .as_ref()
+                .map(|dest| format!("Destination: {dest}")),
             trace_conversation: row.conversation_id.clone(),
         });
     }
@@ -247,6 +263,13 @@ pub fn headline(items: &[JobItem]) -> String {
         1 => "1 job running".into(),
         n => format!("{n} jobs running"),
     }
+}
+
+/// Auto-expand the Jobs panel only when active work starts (`0 -> >0`), so a
+/// manual collapse stays respected while jobs continue running.
+#[allow(dead_code)]
+pub fn should_auto_open(prev_active: usize, next_active: usize) -> bool {
+    prev_active == 0 && next_active > 0
 }
 
 #[cfg(test)]
@@ -406,6 +429,7 @@ mod tests {
                 bot: "main".into(),
                 title: "x".into(),
                 state: JobState::Running,
+                detail: None,
                 trace_conversation: None,
             },
             JobItem {
@@ -414,6 +438,7 @@ mod tests {
                 bot: "maker".into(),
                 title: "y".into(),
                 state: JobState::Done,
+                detail: None,
                 trace_conversation: None,
             },
         ];
@@ -427,9 +452,51 @@ mod tests {
             bot: "a".into(),
             title: "z".into(),
             state: JobState::Queued,
+            detail: None,
             trace_conversation: None,
         });
         assert_eq!(headline(&two), "2 jobs running");
+    }
+
+    #[test]
+    fn reliability_preserves_destination_and_auto_open_only_on_zero_to_active() {
+        let snap = crate::jobs_reliability::parse_jobs_reliability(&json!({
+            "reliability": {
+                "uncertain_tasks": [{
+                    "id": "u1",
+                    "kind": "turn",
+                    "bot": "main",
+                    "status": "outcome_unknown",
+                    "last_error": "gateway timed out",
+                    "conversation_id": "conv-1"
+                }],
+                "unknown_actions": [{
+                    "id": "a1",
+                    "tool": "email.send",
+                    "conversation_id": "conv-2",
+                    "destination": "ops@example.invalid"
+                }]
+            }
+        }))
+        .unwrap();
+        let items = build(
+            None,
+            &[],
+            &WorkingBots::default(),
+            &Activity::default(),
+            "dir:main",
+            &snap,
+            Instant::now(),
+        );
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].detail.as_deref(), Some("gateway timed out"));
+        assert_eq!(
+            items[1].detail.as_deref(),
+            Some("Destination: ops@example.invalid")
+        );
+        assert!(should_auto_open(0, 1));
+        assert!(!should_auto_open(1, 2));
+        assert!(!should_auto_open(1, 0));
     }
 
     #[test]
