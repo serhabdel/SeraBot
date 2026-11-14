@@ -35,6 +35,8 @@ pub fn IntegrationsView(session: Signal<Session>) -> Element {
             state.marketplace_open.is_some(),
         )
     };
+    let show_search = tab() != Tab::Composio;
+    let query_empty = query().trim().is_empty();
     rsx! {
         div { class: "pane mp-page integrations",
             div { class: "pane-head",
@@ -45,10 +47,15 @@ pub fn IntegrationsView(session: Signal<Session>) -> Element {
                 button {
                     class: "btn ghost sm",
                     r#type: "button",
-                    title: "Check for changes",
-                    onclick: move |_| {
-                        session.write().refresh_connectors();
-                        session.write().refresh_marketplace();
+                    title: "Refresh this tab",
+                    onclick: move |_| match tab() {
+                        Tab::Installed => session.write().refresh_connectors(),
+                        Tab::Marketplace => session.write().refresh_marketplace(),
+                        Tab::Composio => {
+                            let mut s = session.write();
+                            s.refresh_connectors();
+                            s.panel.composio.load("");
+                        }
                     },
                     Icon { name: "refresh", size: 14 }
                     "Refresh"
@@ -69,13 +76,31 @@ pub fn IntegrationsView(session: Signal<Session>) -> Element {
                             }
                         }
                     }
-                    input {
-                        class: "input mp-search",
-                        r#type: "search",
-                        placeholder: "Search integrations",
-                        "aria-label": "Search integrations",
-                        value: "{query}",
-                        oninput: move |event| query.set(event.value()),
+                    if show_search {
+                        div { class: "search-wrap",
+                            input {
+                                class: "input mp-search",
+                                r#type: "search",
+                                placeholder: if tab() == Tab::Marketplace { "Search plugins" } else { "Search integrations" },
+                                "aria-label": if tab() == Tab::Marketplace { "Search plugins" } else { "Search integrations" },
+                                value: "{query}",
+                                oninput: move |event| query.set(event.value()),
+                                onkeydown: move |event: KeyboardEvent| {
+                                    if event.key() == Key::Escape && !query.read().is_empty() {
+                                        event.prevent_default();
+                                        query.set(String::new());
+                                    }
+                                },
+                            }
+                            if !query_empty {
+                                button {
+                                    class: "btn ghost sm",
+                                    r#type: "button",
+                                    onclick: move |_| query.set(String::new()),
+                                    "Clear"
+                                }
+                            }
+                        }
                     }
                 }
                 {match tab() {
@@ -128,13 +153,25 @@ pub fn IntegrationCard(session: Signal<Session>, entry: Entry) -> Element {
 /// by suite. The search filters both.
 #[component]
 fn InstalledTab(session: Signal<Session>, query: Signal<String>, tab: Signal<Tab>) -> Element {
-    let (connectors, plugins, connectors_loaded, marketplace_loaded, errors) = {
+    let (
+        connectors,
+        plugins,
+        connectors_loaded,
+        marketplace_loaded,
+        marketplace_unavailable,
+        marketplace_error,
+        state_error,
+        errors,
+    ) = {
         let state = session.read();
         (
             state.state.connectors.clone(),
             state.state.marketplace.clone(),
             state.state.connectors_loaded,
             state.state.marketplace_loaded,
+            state.state.marketplace_unavailable,
+            state.state.marketplace_error.clone(),
+            state.state.error.clone(),
             state.panel.connectors.errors.clone(),
         )
     };
@@ -161,8 +198,22 @@ fn InstalledTab(session: Signal<Session>, query: Signal<String>, tab: Signal<Tab
         .filter(|(_, cards)| !cards.is_empty())
         .collect();
     let nothing = set_up.is_empty() && available.is_empty();
-    let loading = !connectors_loaded && !marketplace_loaded;
+    let marketplace_pending =
+        !marketplace_loaded && !marketplace_unavailable && marketplace_error.is_none();
+    let loading = nothing && (!connectors_loaded || marketplace_pending);
+    let inline_error = state_error.or(marketplace_error);
     rsx! {
+        if let Some(message) = inline_error {
+            div { class: "banner err", role: "alert",
+                span { class: "grow", "{message}" }
+                button {
+                    class: "btn ghost sm",
+                    r#type: "button",
+                    onclick: move |_| session.write().refresh_connectors(),
+                    "Retry"
+                }
+            }
+        }
         if loading {
             div { role: "status", "aria-busy": "true",
                 p { class: "tiny", "Loading integrations\u{2026}" }
@@ -185,8 +236,9 @@ fn InstalledTab(session: Signal<Session>, query: Signal<String>, tab: Signal<Tab
                 }
             }
         } else if nothing {
-            div { class: "card",
-                p { class: "card-sub", "No integrations match that search." }
+            div { class: "empty compact",
+                h3 { class: "empty-title", "No integrations match that search" }
+                p { class: "empty-text", "Try another name, category, or suite (like Microsoft or Google)." }
                 button {
                     class: "btn sm",
                     r#type: "button",
@@ -230,21 +282,50 @@ fn entry_key(entry: &Entry) -> String {
 /// The Composio tab: its key form when there is none, then its apps.
 #[component]
 fn ComposioTab(session: Signal<Session>) -> Element {
-    let connector = session
-        .read()
-        .state
-        .connectors
-        .iter()
-        .find(|connector| connector.id == COMPOSIO_ID)
-        .cloned();
+    let (loaded, connector) = {
+        let state = session.read();
+        (
+            state.state.connectors_loaded,
+            state
+                .state
+                .connectors
+                .iter()
+                .find(|connector| connector.id == COMPOSIO_ID)
+                .cloned(),
+        )
+    };
     match connector {
         Some(connector) => rsx! { ComposioCard { session, connector } },
+        None if !loaded => rsx! {
+            div { role: "status", "aria-busy": "true",
+                p { class: "tiny", "Loading Composio\u{2026}" }
+                div { class: "mp-card skeleton", " " }
+            }
+        },
         None => rsx! {
-            div { class: "card",
-                p { class: "card-sub", "Composio is not listed on this server." }
+            div { class: "empty compact", role: "status",
+                h3 { class: "empty-title", "Composio is not listed on this server" }
+                p { class: "empty-text", "Check with your server admin if Composio should be enabled." }
+                button {
+                    class: "btn ghost sm",
+                    r#type: "button",
+                    onclick: move |_| session.write().refresh_connectors(),
+                    "Refresh"
+                }
             }
         },
     }
+}
+
+fn close_connector_with_reset(mut session: Signal<Session>, id: &str, saved_enabled: Option<bool>) {
+    let mut s = session.write();
+    if let Some(saved) = saved_enabled
+        && let Some(draft) = s.connector_drafts.get_mut(id)
+    {
+        draft.enabled = saved;
+        draft.values.clear();
+    }
+    s.close_connector_sheet();
 }
 
 /// A connector's card in the detail sheet: the shared frame, then the
@@ -261,30 +342,48 @@ fn ConnectorSheet(session: Signal<Session>, id: String) -> Element {
             state.is_admin(),
         )
     };
+    let saved_enabled = connector.as_ref().map(|c| c.enabled);
     let title = connector_title(&id);
-    let close = move |_| session.write().close_connector_sheet();
+    let close_id = id.clone();
+    let close_scrim_id = id.clone();
+    let close_key_id = id.clone();
     rsx! {
-        div { class: "mp-sheet-scrim", onclick: close }
+        div {
+            class: "mp-sheet-scrim",
+            onclick: move |_| close_connector_with_reset(session, &close_scrim_id, saved_enabled),
+        }
         aside {
             class: "mp-sheet",
             role: "dialog",
             "aria-modal": "true",
             "aria-label": "{title}",
+            tabindex: "0",
             onkeydown: move |event: KeyboardEvent| {
                 if event.key() == Key::Escape {
-                    session.write().close_connector_sheet();
+                    event.prevent_default();
+                    close_connector_with_reset(session, &close_key_id, saved_enabled);
                 }
             },
             div { class: "mp-sheet-head",
                 h2 { class: "mp-sheet-title", "{title}" }
-                button {
-                    class: "icon-btn",
-                    r#type: "button",
-                    title: "Close",
-                    "aria-label": "Close",
-                    autofocus: true,
-                    onclick: close,
-                    Icon { name: "x", size: 16 }
+                div { class: "row",
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        title: "Refresh connector status",
+                        onclick: move |_| session.write().refresh_connectors(),
+                        Icon { name: "refresh", size: 14 }
+                        "Refresh"
+                    }
+                    button {
+                        class: "icon-btn",
+                        r#type: "button",
+                        title: "Close",
+                        "aria-label": "Close",
+                        autofocus: true,
+                        onclick: move |_| close_connector_with_reset(session, &close_id, saved_enabled),
+                        Icon { name: "x", size: 16 }
+                    }
                 }
             }
             div { class: "mp-sheet-body",

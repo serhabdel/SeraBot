@@ -74,7 +74,18 @@ pub fn SettingsPanel(session: Signal<Session>, overlay: Signal<Overlay>) -> Elem
     rsx! {
         aside {
             class: if open { "inspector settings-panel open" } else { "inspector settings-panel" },
+            tabindex: "-1",
             "aria-label": "Settings",
+            onkeydown: move |event: KeyboardEvent| {
+                if event.key() == Key::Escape && session.read().bot_settings.open {
+                    event.stop_propagation();
+                    if session.read().bot_settings.confirm_close {
+                        session.write().keep_editing_bot_settings();
+                    } else {
+                        session.write().request_close_bot_settings();
+                    }
+                }
+            },
             div { class: "settings-head",
                 span { class: "avatar lg bot", style: "{head_style}", "{avatar}" }
                 div { class: "settings-head-copy",
@@ -85,6 +96,7 @@ pub fn SettingsPanel(session: Signal<Session>, overlay: Signal<Overlay>) -> Elem
                 }
                 button {
                     class: "icon-btn",
+                    r#type: "button",
                     title: "Close",
                     "aria-label": "Close settings",
                     onclick: move |_| session.write().request_close_bot_settings(),
@@ -99,6 +111,7 @@ pub fn SettingsPanel(session: Signal<Session>, overlay: Signal<Overlay>) -> Elem
                         button {
                             class: "btn primary sm",
                             r#type: "button",
+                            autofocus: true,
                             onclick: move |_| session.write().save_and_close_bot_settings(),
                             "Save"
                         }
@@ -186,12 +199,13 @@ fn MemoryRefreshCard(session: Signal<Session>, id: String) -> Element {
                 "Every so many of your messages, this bot summarises the recent turns and saves the lasting facts to its memory, in the background. It covers all of this bot\u{2019}s chats. Default 40."
             }
             label { class: "field",
-                span { "Refresh every (turns)" }
+                span { class: "field-label", "Refresh every (turns)" }
                 input {
-                    class: "input",
+                    class: if invalid { "input invalid" } else { "input" },
                     r#type: "number",
                     min: "{serabot_desktop::bot_chats::MIN_REFRESH_TURNS}",
                     max: "{serabot_desktop::bot_chats::MAX_REFRESH_TURNS}",
+                    placeholder: if current.is_none() { "Loading\u{2026}" } else { "40" },
                     value: "{draft}",
                     disabled: current.is_none(),
                     "aria-invalid": if invalid { "true" } else { "false" },
@@ -199,11 +213,12 @@ fn MemoryRefreshCard(session: Signal<Session>, id: String) -> Element {
                 }
             }
             if invalid {
-                p { class: "tiny", role: "alert", "Enter a whole number from 5 to 500." }
+                p { class: "field-error tiny", role: "alert", "Enter a whole number from 5 to 500." }
             }
             div { class: "row-actions",
                 button {
-                    class: "btn primary small",
+                    class: "btn primary sm",
+                    r#type: "button",
                     disabled: !changed,
                     onclick: move |_| {
                         if let Some(every) = parsed {
@@ -281,6 +296,12 @@ fn BotForm(session: Signal<Session>, id: String) -> Element {
                 session.write().save_bot_settings();
             },
             div { class: "settings-scroll",
+                if !hydrated {
+                    div { class: "banner info", role: "status",
+                        span { class: "spinner" }
+                        span { "Loading bot settings\u{2026}" }
+                    }
+                }
                 div { class: "field",
                     span { class: "field-label", "Picture" }
                     AvatarPicker {
@@ -510,26 +531,32 @@ fn SkillsSection(session: Signal<Session>, id: String) -> Element {
         })
         .unwrap_or_default();
     let needle = add_query().trim().to_lowercase();
-    let addable: Vec<(String, String, String)> = session
-        .read()
-        .state
-        .listed_skills
-        .iter()
-        .filter(|skill| valid_skill_id(&skill.id))
-        .filter(|skill| !attached.iter().any(|s| s == &skill.id))
-        .filter(|skill| {
-            needle.is_empty()
-                || skill.id.to_lowercase().contains(&needle)
-                || skill.name.to_lowercase().contains(&needle)
-        })
-        .map(|skill| {
-            (
-                skill.id.clone(),
-                skill.name.clone(),
-                skill.description.clone(),
-            )
-        })
-        .collect();
+    let (skills_loaded, addable): (bool, Vec<(String, String, String)>) = {
+        let s = session.read();
+        let addable = s
+            .state
+            .listed_skills
+            .iter()
+            .filter(|skill| valid_skill_id(&skill.id))
+            .filter(|skill| !attached.iter().any(|s| s == &skill.id))
+            .filter(|skill| {
+                needle.is_empty()
+                    || skill.id.to_lowercase().contains(&needle)
+                    || skill.name.to_lowercase().contains(&needle)
+            })
+            .map(|skill| {
+                (
+                    skill.id.clone(),
+                    skill.name.clone(),
+                    skill.description.clone(),
+                )
+            })
+            .collect();
+        (s.state.skills_loaded, addable)
+    };
+    let trimmed_new_id = new_id().trim().to_owned();
+    let new_id_valid = valid_skill_id(&trimmed_new_id);
+    let show_id_error = !trimmed_new_id.is_empty() && !new_id_valid;
     let full = attached.len() >= MAX_BOT_SKILLS;
     rsx! {
         details { class: "advanced skills-box",
@@ -568,13 +595,29 @@ fn SkillsSection(session: Signal<Session>, id: String) -> Element {
                         }
                     }
                 }
-                input {
-                    class: "input",
-                    placeholder: "Add a skill…",
-                    value: "{add_query}",
-                    oninput: move |event| add_query.set(event.value()),
+                div { class: "search-wrap",
+                    input {
+                        class: "input",
+                        r#type: "search",
+                        placeholder: "Add a skill\u{2026}",
+                        "aria-label": "Filter available skills",
+                        value: "{add_query}",
+                        oninput: move |event| add_query.set(event.value()),
+                    }
+                    if !needle.is_empty() {
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            onclick: move |_| add_query.set(String::new()),
+                            "Clear"
+                        }
+                    }
                 }
-                if !addable.is_empty() {
+                if !skills_loaded && addable.is_empty() {
+                    p { class: "tiny", role: "status", "Loading skills\u{2026}" }
+                } else if !needle.is_empty() && addable.is_empty() {
+                    p { class: "hint", "No available skills match \u{201c}{add_query}\u{201d}." }
+                } else if !addable.is_empty() {
                     div { class: "pop-list skill-pop",
                         for (skill_id, name, description) in addable {
                             {
@@ -616,10 +659,14 @@ fn SkillsSection(session: Signal<Session>, id: String) -> Element {
                     summary { "Write a new skill" }
                     div { class: "advanced-body",
                         input {
-                            class: "input",
+                            class: if show_id_error { "input invalid" } else { "input" },
                             placeholder: "Skill name, like venue-booking",
+                            "aria-invalid": if show_id_error { "true" } else { "false" },
                             value: "{new_id}",
                             oninput: move |event| new_id.set(event.value()),
+                        }
+                        if show_id_error {
+                            span { class: "field-error", "Use lowercase letters, numbers, and hyphens only (e.g. venue-booking)." }
                         }
                         input {
                             class: "input",
@@ -636,8 +683,12 @@ fn SkillsSection(session: Signal<Session>, id: String) -> Element {
                         button {
                             class: "btn sm",
                             r#type: "button",
+                            disabled: !new_id_valid,
                             onclick: move |_| {
-                                session.write().create_skill(new_id(), new_desc(), new_body());
+                                if !valid_skill_id(new_id().trim()) {
+                                    return;
+                                }
+                                session.write().create_skill(trimmed_new_id.clone(), new_desc(), new_body());
                                 new_id.set(String::new());
                                 new_desc.set(String::new());
                                 new_body.set(String::new());
@@ -814,6 +865,7 @@ fn AdvancedSection(session: Signal<Session>, id: String) -> Element {
 #[component]
 fn FilesTab(session: Signal<Session>) -> Element {
     let mut session = session;
+    let mut file_query = use_signal(String::new);
     let (library, loaded, loading, error, downloading) = {
         let s = session.read();
         (
@@ -823,6 +875,24 @@ fn FilesTab(session: Signal<Session>) -> Element {
             s.state.library_error.clone(),
             s.downloading,
         )
+    };
+    let needle = file_query.read().trim().to_ascii_lowercase();
+    let visible: Vec<_> = if needle.is_empty() {
+        library.clone()
+    } else {
+        library
+            .iter()
+            .filter(|entry| {
+                let label = entry
+                    .title
+                    .as_deref()
+                    .or(entry.filename.as_deref())
+                    .unwrap_or(&entry.hash);
+                label.to_ascii_lowercase().contains(&needle)
+                    || entry.tool.to_ascii_lowercase().contains(&needle)
+            })
+            .cloned()
+            .collect()
     };
     rsx! {
         div { class: "settings-scroll",
@@ -835,53 +905,81 @@ fn FilesTab(session: Signal<Session>) -> Element {
                     }
                 }
                 if let Some(error) = error {
-                    p { class: "hint", "{error}" }
+                    p { class: "field-error", role: "alert", "{error}" }
                 }
                 if !loaded {
-                    p { class: "hint", "Files load together with the chat." }
+                    p { class: "hint", role: "status", "Files load together with the chat." }
                 } else if library.is_empty() {
                     p { class: "hint", "No files yet. Decks and documents the bots make will show up here." }
                 } else {
-                    div { class: "roster",
-                        for entry in library {
-                            div { key: "{entry.action_id}", class: "roster-row",
-                                div { class: "thread-copy",
-                                    span { class: "thread-title",
-                                        "{entry.title.clone().or(entry.filename.clone()).unwrap_or_else(|| entry.hash.clone())}"
+                    div { class: "search-wrap",
+                        input {
+                            class: "input",
+                            r#type: "search",
+                            placeholder: "Filter chat files\u{2026}",
+                            "aria-label": "Filter chat files",
+                            value: "{file_query}",
+                            oninput: move |event| file_query.set(event.value()),
+                        }
+                        if !needle.is_empty() {
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                onclick: move |_| file_query.set(String::new()),
+                                "Clear"
+                            }
+                        }
+                    }
+                    if visible.is_empty() {
+                        p { class: "hint", "No files match \u{201c}{file_query}\u{201d}." }
+                    } else {
+                        div { class: "roster",
+                            for entry in visible {
+                                div { key: "{entry.action_id}", class: "roster-row",
+                                    div { class: "thread-copy",
+                                        span { class: "thread-title",
+                                            "{entry.title.clone().or(entry.filename.clone()).unwrap_or_else(|| entry.hash.clone())}"
+                                        }
+                                        span { class: "thread-meta",
+                                            "{humanize_label(&entry.tool)} · {stamp(&entry.created_at)}"
+                                        }
                                     }
-                                    span { class: "thread-meta",
-                                        "{humanize_label(&entry.tool)} · {stamp(&entry.created_at)}"
+                                    button {
+                                        class: "btn icon",
+                                        r#type: "button",
+                                        title: "Open",
+                                        "aria-label": "Open file",
+                                        disabled: downloading,
+                                        onclick: {
+                                            let hash = entry.hash.clone();
+                                            move |_| session.write().open_artifact(hash.clone())
+                                        },
+                                        Icon { name: "external", size: 15 }
                                     }
-                                }
-                                button {
-                                    class: "btn icon",
-                                    title: "Open",
-                                    disabled: downloading,
-                                    onclick: {
-                                        let hash = entry.hash.clone();
-                                        move |_| session.write().open_artifact(hash.clone())
-                                    },
-                                    Icon { name: "external", size: 15 }
-                                }
-                                button {
-                                    class: "btn icon",
-                                    title: "Show in Explorer",
-                                    disabled: downloading,
-                                    onclick: {
-                                        let hash = entry.hash.clone();
-                                        move |_| session.write().reveal_artifact(hash.clone())
-                                    },
-                                    Icon { name: "folder", size: 15 }
-                                }
-                                button {
-                                    class: "btn icon",
-                                    title: "Save to Downloads",
-                                    disabled: downloading,
-                                    onclick: {
-                                        let hash = entry.hash.clone();
-                                        move |_| session.write().download_artifact(hash.clone())
-                                    },
-                                    Icon { name: "download", size: 15 }
+                                    button {
+                                        class: "btn icon",
+                                        r#type: "button",
+                                        title: "Show in Explorer",
+                                        "aria-label": "Show file in Explorer",
+                                        disabled: downloading,
+                                        onclick: {
+                                            let hash = entry.hash.clone();
+                                            move |_| session.write().reveal_artifact(hash.clone())
+                                        },
+                                        Icon { name: "folder", size: 15 }
+                                    }
+                                    button {
+                                        class: "btn icon",
+                                        r#type: "button",
+                                        title: "Save to Downloads",
+                                        "aria-label": "Save file to Downloads",
+                                        disabled: downloading,
+                                        onclick: {
+                                            let hash = entry.hash.clone();
+                                            move |_| session.write().download_artifact(hash.clone())
+                                        },
+                                        Icon { name: "download", size: 15 }
+                                    }
                                 }
                             }
                         }
@@ -923,10 +1021,22 @@ fn PinnedCard(session: Signal<Session>) -> Element {
                     div {
                         key: "{pin}",
                         class: "pin-row",
+                        role: "button",
+                        tabindex: "0",
                         title: "Open {label}",
+                        "aria-label": "Open pinned chat {label}",
                         onclick: {
                             let pin = pin.clone();
                             move |_| session.write().open_pin(pin.clone())
+                        },
+                        onkeydown: {
+                            let pin = pin.clone();
+                            move |event: KeyboardEvent| {
+                                if event.key() == Key::Enter || event.key() == Key::Character(" ".into()) {
+                                    event.prevent_default();
+                                    session.write().open_pin(pin.clone());
+                                }
+                            }
                         },
                         if is_bot {
                             span { class: "avatar sm bot", style: avatar_style(&pin), "{avatar}" }
@@ -950,7 +1060,7 @@ fn MembersTab(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
     let conversation = session.read().conversation.clone();
     let is_room = teams::is_room(&conversation);
     let rules = session.read().team_rules_draft.clone();
-    let (members, loaded, loading) = {
+    let (members, saved_rules, loaded, loading, team_error) = {
         let s = session.read();
         (
             s.state
@@ -958,10 +1068,19 @@ fn MembersTab(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                 .as_ref()
                 .map(teams::member_ids)
                 .unwrap_or_default(),
+            s.state
+                .team
+                .as_ref()
+                .map(|t| t.rules.clone())
+                .unwrap_or_default(),
             s.state.team_loaded,
             s.state.team_loading,
+            s.state.team_error.clone(),
         )
     };
+    let rules_dirty = rules.trim() != saved_rules.trim();
+    let rules_chars = rules.trim().chars().count();
+    let rules_too_long = rules_chars > 4_000;
     let rows: Vec<(String, String, String, bool)> = {
         let s = session.read();
         members
@@ -984,11 +1103,18 @@ fn MembersTab(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
     };
     rsx! {
         div { class: "settings-scroll",
+            if let Some(error) = team_error {
+                div { class: "banner error", role: "alert", "{error}" }
+            }
             div { class: "card",
                 div { class: "card-head",
                     h3 { class: "card-title", "Who is in this chat" }
+                    if loading {
+                        span { class: "spinner", title: "Loading team" }
+                    }
                     button {
                         class: "btn ghost sm",
+                        r#type: "button",
                         onclick: move |_| {
                             session.write().refresh_team();
                             overlay.set(Overlay::Team);
@@ -996,8 +1122,10 @@ fn MembersTab(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                         "Change"
                     }
                 }
-                if is_room && !loaded && !loading {
-                    button { class: "btn ghost sm", onclick: move |_| session.write().refresh_team(), "Load members" }
+                if is_room && loading && !loaded {
+                    p { class: "hint", role: "status", "Loading members\u{2026}" }
+                } else if is_room && !loaded && !loading {
+                    button { class: "btn ghost sm", r#type: "button", onclick: move |_| session.write().refresh_team(), "Load members" }
                 } else if rows.is_empty() {
                     p { class: "hint", "Nobody is picked, so every bot that is switched on can answer." }
                 } else {
@@ -1018,10 +1146,11 @@ fn MembersTab(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                 div { class: "card",
                     div { class: "card-head",
                         h3 { class: "card-title", "Group rules" }
+                        span { class: if rules_too_long { "tiny error-text" } else { "tiny" }, "{rules_chars}/4000" }
                     }
                     p { class: "hint", "Rules every bot in this group reads before it answers." }
                     textarea {
-                        class: "textarea",
+                        class: if rules_too_long { "textarea invalid" } else { "textarea" },
                         value: "{rules}",
                         placeholder: "For example: answer in English, name your sources, keep it short.",
                         oninput: move |event| session.write().team_rules_draft = event.value(),
@@ -1029,8 +1158,10 @@ fn MembersTab(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
                     div { class: "row",
                         button {
                             class: "btn primary sm",
+                            r#type: "button",
+                            disabled: loading || !rules_dirty || rules_too_long,
                             onclick: move |_| session.write().save_team_rules(),
-                            "Save rules"
+                            if loading { "Saving\u{2026}" } else { "Save rules" }
                         }
                     }
                 }

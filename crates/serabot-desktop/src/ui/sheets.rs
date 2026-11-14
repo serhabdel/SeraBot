@@ -110,6 +110,8 @@ pub(super) fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Ove
     let picked_count = picked().len();
     let members_empty = members.is_empty();
     let team_full = picked_count >= MAX_TEAM_MEMBERS;
+    let can_create = !title.trim().is_empty();
+    let sheet_title = format!("New {}", kind.label().to_lowercase());
     rsx! {
         div {
             class: "scrim open",
@@ -118,15 +120,20 @@ pub(super) fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Ove
         div {
             class: "sheet open",
             role: "dialog",
+            "aria-modal": "true",
+            "aria-label": "{sheet_title}",
+            tabindex: "-1",
             onkeydown: move |event: KeyboardEvent| {
                 if event.key() == Key::Escape {
+                    event.stop_propagation();
                     overlay.set(Overlay::None);
                 }
             },
             div { class: "sheet-head",
-                h2 { class: "sheet-title", "New {kind.label().to_lowercase()}" }
+                h2 { class: "sheet-title", "{sheet_title}" }
                 button {
                     class: "icon-btn escape-close",
+                    r#type: "button",
                     title: "Close",
                     "aria-label": "Close",
                     onclick: move |_| overlay.set(Overlay::None),
@@ -135,8 +142,9 @@ pub(super) fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Ove
             }
             div { class: "sheet-body",
                 div { class: "field",
-                    label { class: "field-label", "Kind" }
+                    label { class: "field-label", r#for: "new-conv-kind", "Kind" }
                     select {
+                        id: "new-conv-kind",
                         class: "select",
                         value: "{kind.as_str()}",
                         onchange: move |event| {
@@ -153,13 +161,42 @@ pub(super) fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Ove
                     }
                 }
                 div { class: "field",
-                    label { class: "field-label", "Name" }
+                    label { class: "field-label", r#for: "new-conv-title", "Name" }
                     input {
+                        id: "new-conv-title",
                         class: "input",
                         autofocus: true,
                         value: "{title}",
                         placeholder: "name (for example Finance)",
                         oninput: move |event| session.write().fleet.conv_title = event.value(),
+                        onkeydown: move |event: KeyboardEvent| {
+                            if event.key() == Key::Enter && !session.read().fleet.conv_title.trim().is_empty() {
+                                event.prevent_default();
+                                let kind = session.read().fleet.conv_kind;
+                                let title = session.read().fleet.conv_title.clone();
+                                let slug = session.read().fleet.conv_slug.clone();
+                                let slug = if slug.trim().is_empty() {
+                                    serabot_desktop::preview_id(&title, "item")
+                                } else {
+                                    slug
+                                };
+                                let parent = session.read().fleet.conv_parent.trim().to_owned();
+                                let parent = (!parent.is_empty()).then_some(parent);
+                                let members = picked();
+                                if kind == ConversationKind::Room && !members.is_empty() {
+                                    session.write().create_conversation_with_team(
+                                        kind,
+                                        slug,
+                                        parent,
+                                        title,
+                                        members,
+                                    );
+                                } else {
+                                    session.write().create_conversation(kind, slug, parent, title);
+                                }
+                                overlay.set(Overlay::None);
+                            }
+                        },
                     }
                 }
                 details { class: "advanced",
@@ -282,14 +319,20 @@ pub(super) fn NewConversationSheet(session: Signal<Session>, overlay: Signal<Ove
             div { class: "sheet-foot",
                 button {
                     class: "btn ghost",
+                    r#type: "button",
                     onclick: move |_| overlay.set(Overlay::None),
                     "Cancel"
                 }
                 button {
                     class: "btn primary",
+                    r#type: "button",
+                    disabled: !can_create,
                     onclick: move |_| {
-                        let kind = session.read().fleet.conv_kind;
                         let title = session.read().fleet.conv_title.clone();
+                        if title.trim().is_empty() {
+                            return;
+                        }
+                        let kind = session.read().fleet.conv_kind;
                         let slug = session.read().fleet.conv_slug.clone();
                         let slug = if slug.trim().is_empty() {
                             serabot_desktop::preview_id(&title, "item")
@@ -398,6 +441,10 @@ pub(super) fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
         .collect();
     let picker_empty = picker_rows.is_empty();
     let team_full = member_ids.len() >= MAX_TEAM_MEMBERS;
+    let saved_rules = team.as_ref().map(|t| t.rules.clone()).unwrap_or_default();
+    let rules_dirty = rules_draft.trim() != saved_rules.trim();
+    let rules_chars = rules_draft.trim().chars().count();
+    let rules_too_long = rules_chars > 4_000;
     rsx! {
         div {
             class: "scrim open",
@@ -406,8 +453,12 @@ pub(super) fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
         div {
             class: "sheet open",
             role: "dialog",
+            "aria-modal": "true",
+            "aria-label": "Group members",
+            tabindex: "-1",
             onkeydown: move |event: KeyboardEvent| {
                 if event.key() == Key::Escape {
+                    event.stop_propagation();
                     overlay.set(Overlay::None);
                 }
             },
@@ -419,13 +470,16 @@ pub(super) fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
                     }
                     button {
                         class: "icon-btn",
+                        r#type: "button",
                         title: "Refresh members",
                         "aria-label": "Refresh members",
+                        disabled: loading,
                         onclick: move |_| session.write().refresh_team(),
                         Icon { name: "refresh", size: 16 }
                     }
                     button {
                         class: "icon-btn escape-close",
+                        r#type: "button",
                         title: "Close",
                         "aria-label": "Close",
                         onclick: move |_| overlay.set(Overlay::None),
@@ -436,7 +490,7 @@ pub(super) fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
             div { class: "sheet-body",
                 p { class: "hint", "Group: {conversation}" }
                 if let Some(error) = error {
-                    div { class: "banner err", span { "{error}" } }
+                    div { class: "banner err", role: "alert", span { "{error}" } }
                 }
                 if !is_room {
                     div { class: "banner warn",
@@ -445,10 +499,12 @@ pub(super) fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
                 }
                 if is_room {
                     div { class: "field",
-                        label { class: "field-label", "Mode" }
+                        label { class: "field-label", r#for: "team-mode-select", "Mode" }
                         select {
+                            id: "team-mode-select",
                             class: "select",
                             value: "{mode_value}",
+                            disabled: loading,
                             onchange: move |event| {
                                 let next = if event.value() == "all" {
                                     TeamMode::All
@@ -538,18 +594,24 @@ pub(super) fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
                         }
                     }
                     div { class: "field",
-                        label { class: "field-label", "Group instructions" }
+                        div { class: "card-head",
+                            label { class: "field-label", r#for: "team-rules-input", "Group instructions" }
+                            span { class: if rules_too_long { "tiny error-text" } else { "tiny" }, "{rules_chars}/4000" }
+                        }
                         textarea {
-                            class: "textarea",
+                            id: "team-rules-input",
+                            class: if rules_too_long { "textarea invalid" } else { "textarea" },
                             value: "{rules_draft}",
-                            placeholder: "Standing rules every member reads before answering here…",
+                            placeholder: "Standing rules every member reads before answering here\u{2026}",
                             oninput: move |event| session.write().team_rules_draft = event.value(),
                         }
                         div { class: "row",
                             button {
                                 class: "btn primary sm",
+                                r#type: "button",
+                                disabled: loading || !rules_dirty || rules_too_long,
                                 onclick: move |_| session.write().save_team_rules(),
-                                "Save instructions"
+                                if loading { "Saving\u{2026}" } else { "Save instructions" }
                             }
                             span { class: "hint", "Saved with the current members and mode." }
                         }
@@ -559,6 +621,7 @@ pub(super) fn TeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> E
             div { class: "sheet-foot",
                 button {
                     class: "btn ghost",
+                    r#type: "button",
                     onclick: move |_| overlay.set(Overlay::None),
                     "Close"
                 }

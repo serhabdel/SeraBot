@@ -9,6 +9,7 @@
 //! Links and help text are fixed here. The console never opens an address the
 //! server sent for a help link.
 
+use crate::theme::Tone;
 use crate::{ConnectorStatus, PersonalStatus};
 
 /// Where a Notion user creates an internal integration and copies its token.
@@ -109,6 +110,16 @@ impl CardState {
         matches!(self, Self::Connected { .. })
     }
 
+    /// Status tone (colour + icon pairing) for `StatusChip`.
+    pub fn tone(&self) -> Tone {
+        match self {
+            Self::NotSetUp { .. } => Tone::Muted,
+            Self::Connect { .. } => Tone::Warn,
+            Self::Connected { .. } => Tone::Ok,
+            Self::Error { .. } => Tone::Danger,
+        }
+    }
+
     /// "Connected as name@example.example", or "Connected" without a name.
     pub fn connected_line(&self) -> Option<String> {
         match self {
@@ -146,6 +157,17 @@ pub fn personal_card_state(personal: &PersonalStatus, error: Option<&str>) -> Ca
                 .filter(|hint| !hint.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_ADMIN_HINT.to_owned()),
         },
+    }
+}
+
+/// Status tone for a server-wide connector card.
+pub fn legacy_tone(connected: bool, needs_attention: bool) -> Tone {
+    if needs_attention {
+        Tone::Danger
+    } else if connected {
+        Tone::Ok
+    } else {
+        Tone::Warn
     }
 }
 
@@ -438,5 +460,29 @@ mod tests {
             &[status("notion", Some(personal("ready")))],
             true
         ));
+    }
+
+    #[test]
+    fn card_state_and_legacy_tones_match_status() {
+        assert_eq!(
+            personal_card_state(&personal("not_set_up"), None).tone(),
+            Tone::Muted
+        );
+        assert_eq!(
+            personal_card_state(&personal("ready"), None).tone(),
+            Tone::Warn
+        );
+        assert_eq!(
+            personal_card_state(&personal("connected"), None).tone(),
+            Tone::Ok
+        );
+        assert_eq!(
+            personal_card_state(&personal("ready"), Some("Auth failed")).tone(),
+            Tone::Danger
+        );
+        assert_eq!(legacy_tone(true, false), Tone::Ok);
+        assert_eq!(legacy_tone(true, true), Tone::Danger);
+        assert_eq!(legacy_tone(false, false), Tone::Warn);
+        assert_eq!(legacy_tone(false, true), Tone::Danger);
     }
 }

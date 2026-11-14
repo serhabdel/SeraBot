@@ -13,7 +13,9 @@ use crate::ui_integrations::IntegrationCard;
 use crate::ui_widgets::{SecretField, StatusChip};
 use dioxus::prelude::*;
 use serabot_desktop::integrations::{plugin_entry, plugin_tone};
-use serabot_desktop::marketplace::{self, ConfigField, PluginAction, PluginDetail, PluginSummary};
+use serabot_desktop::marketplace::{
+    self, ConfigField, PluginAction, PluginDetail, PluginSummary, StatusFilter,
+};
 use serabot_desktop::session::Session;
 use serabot_desktop::theme::Tone;
 use zeroize::Zeroizing;
@@ -179,7 +181,11 @@ fn PluginPage(session: Signal<Session>, detail: PluginDetail) -> Element {
             onkeydown: move |event: KeyboardEvent| {
                 if event.key() == Key::Escape {
                     event.prevent_default();
-                    session.write().close_plugin();
+                    if confirming() {
+                        confirming.set(false);
+                    } else {
+                        session.write().close_plugin();
+                    }
                 }
             },
             div { class: "mp-sheet-head",
@@ -213,7 +219,9 @@ fn PluginPage(session: Signal<Session>, detail: PluginDetail) -> Element {
                     div { class: "banner err mp-soon", role: "alert", span { "{message}" } }
                 }
                 if let Some(reason) = block {
-                    p { class: "mp-soon-note", "{reason.message()}" }
+                    div { class: "banner info mp-soon", role: "status",
+                        span { "{reason.message()}" }
+                    }
                 }
                 if !detail.plugin.description.is_empty() {
                     p { class: "mp-description", "{detail.plugin.description}" }
@@ -319,6 +327,7 @@ fn PluginPage(session: Signal<Session>, detail: PluginDetail) -> Element {
 #[component]
 pub fn MarketplaceTab(session: Signal<Session>, query: Signal<String>) -> Element {
     let mut category = use_signal(String::new);
+    let mut status_filter = use_signal(|| StatusFilter::All);
     let (plugins, loaded, unavailable, error, connected) = {
         let state = session.read();
         (
@@ -330,17 +339,21 @@ pub fn MarketplaceTab(session: Signal<Session>, query: Signal<String>) -> Elemen
         )
     };
     let mut session = session;
-    let categories = marketplace::categories(&plugins);
-    let shown: Vec<PluginSummary> = marketplace::filter_plugins(&plugins, &query(), &category())
-        .into_iter()
-        .cloned()
-        .collect();
-    let filtering = !query().trim().is_empty() || !category().is_empty();
+    let categories = marketplace::category_counts(&plugins);
+    let total_plugins = plugins.len();
+    let shown: Vec<PluginSummary> =
+        marketplace::filter_plugins_with_status(&plugins, &query(), &category(), status_filter())
+            .into_iter()
+            .cloned()
+            .collect();
+    let filtering = !query().trim().is_empty()
+        || !category().is_empty()
+        || status_filter() != StatusFilter::All;
     rsx! {
         if unavailable {
-            div { class: "card", role: "status",
-                p { class: "card-sub", "Marketplace unavailable on this server." }
-                p { class: "tiny", "This server has no plugin catalog. Update the server, then check again." }
+            div { class: "empty compact", role: "status",
+                h3 { class: "empty-title", "Marketplace unavailable on this server" }
+                p { class: "empty-text", "This server does not expose a plugin catalog yet. Update the server, then check again." }
                 button {
                     class: "btn sm",
                     r#type: "button",
@@ -349,8 +362,9 @@ pub fn MarketplaceTab(session: Signal<Session>, query: Signal<String>) -> Elemen
                 }
             }
         } else if !connected && !loaded {
-            div { class: "card",
-                p { class: "card-sub", "Sign in to see plugins." }
+            div { class: "empty compact", role: "status",
+                h3 { class: "empty-title", "Sign in to view plugins" }
+                p { class: "empty-text", "The plugin catalog loads once your SeraBot session is connected." }
             }
         } else if !loaded && error.is_none() {
             div { role: "status", "aria-busy": "true",
@@ -363,7 +377,7 @@ pub fn MarketplaceTab(session: Signal<Session>, query: Signal<String>) -> Elemen
             }
         } else if let (false, Some(message)) = (loaded, error.clone()) {
             div { class: "banner err", role: "alert",
-                span { "{message}" }
+                span { class: "grow", "{message}" }
                 button {
                     class: "btn ghost sm",
                     r#type: "button",
@@ -373,13 +387,13 @@ pub fn MarketplaceTab(session: Signal<Session>, query: Signal<String>) -> Elemen
             }
         } else {
             if !marketplace::RUNTIME_CALLS_PLUGINS {
-                div { class: "banner mp-soon", role: "status",
+                div { class: "banner info mp-soon", role: "status",
                     span { "{marketplace::COMING_SOON}" }
                 }
             }
             if let Some(message) = error.clone() {
                 div { class: "banner err", role: "alert",
-                    span { "{message}" }
+                    span { class: "grow", "{message}" }
                     button {
                         class: "btn ghost sm",
                         r#type: "button",
@@ -389,22 +403,22 @@ pub fn MarketplaceTab(session: Signal<Session>, query: Signal<String>) -> Elemen
                 }
             }
             if plugins.is_empty() {
-                div { class: "card",
-                    p { class: "card-sub", "No plugins in this catalog yet." }
-                    p { class: "tiny", "Ask the server admin to add plugins to the catalog." }
+                div { class: "empty compact",
+                    h3 { class: "empty-title", "No plugins in this catalog yet" }
+                    p { class: "empty-text", "Ask your server admin to add plugins to the catalog." }
                 }
             } else {
-                if !categories.is_empty() {
-                    div { class: "mp-toolbar",
+                div { class: "mp-toolbar",
+                    if !categories.is_empty() {
                         div { class: "seg", role: "group", "aria-label": "Category",
                             button {
                                 class: if category().is_empty() { "seg-btn active" } else { "seg-btn" },
                                 r#type: "button",
                                 "aria-pressed": if category().is_empty() { "true" } else { "false" },
                                 onclick: move |_| category.set(String::new()),
-                                "All"
+                                "All ({total_plugins})"
                             }
-                            for name in categories.clone() {
+                            for (name, count) in categories.clone() {
                                 button {
                                     key: "{name}",
                                     r#type: "button",
@@ -414,15 +428,31 @@ pub fn MarketplaceTab(session: Signal<Session>, query: Signal<String>) -> Elemen
                                         let name = name.clone();
                                         move |_| category.set(name.clone())
                                     },
-                                    "{name}"
+                                    "{name} ({count})"
                                 }
                             }
                         }
                     }
+                    div { class: "seg", role: "group", "aria-label": "Status",
+                        for filter_opt in [StatusFilter::All, StatusFilter::Installed, StatusFilter::ComingSoon] {
+                            button {
+                                key: "{filter_opt.label()}",
+                                r#type: "button",
+                                class: if status_filter() == filter_opt { "seg-btn active" } else { "seg-btn" },
+                                "aria-pressed": if status_filter() == filter_opt { "true" } else { "false" },
+                                onclick: move |_| status_filter.set(filter_opt),
+                                "{filter_opt.label()}"
+                            }
+                        }
+                    }
+                    if filtering {
+                        span { class: "tiny muted", role: "status", "{shown.len()} shown" }
+                    }
                 }
                 if shown.is_empty() {
-                    div { class: "card",
-                        p { class: "card-sub", "No plugins match." }
+                    div { class: "empty compact",
+                        h3 { class: "empty-title", "No plugins match" }
+                        p { class: "empty-text", "Try clearing your search or changing the category and status filters." }
                         if filtering {
                             button {
                                 class: "btn sm",
@@ -430,6 +460,7 @@ pub fn MarketplaceTab(session: Signal<Session>, query: Signal<String>) -> Elemen
                                 onclick: move |_| {
                                     query.set(String::new());
                                     category.set(String::new());
+                                    status_filter.set(StatusFilter::All);
                                 },
                                 "Clear filters"
                             }
@@ -478,6 +509,7 @@ pub fn PluginSheet(session: Signal<Session>) -> Element {
                 role: "dialog",
                 "aria-modal": "true",
                 "aria-label": "Loading plugin",
+                tabindex: "0",
                 onkeydown: move |event: KeyboardEvent| {
                     if event.key() == Key::Escape {
                         session.write().close_plugin();
@@ -495,7 +527,12 @@ pub fn PluginSheet(session: Signal<Session>) -> Element {
                         Icon { name: "x", size: 16 }
                     }
                 }
-                div { class: "mp-sheet-body", p { class: "muted", "Loading\u{2026}" } }
+                div { class: "mp-sheet-body",
+                    div { class: "row", role: "status", "aria-busy": "true",
+                        span { class: "spinner", "aria-hidden": "true" }
+                        span { class: "muted", "Loading plugin details\u{2026}" }
+                    }
+                }
             }
         };
     };
@@ -506,6 +543,7 @@ pub fn PluginSheet(session: Signal<Session>) -> Element {
             role: "alertdialog",
             "aria-modal": "true",
             "aria-label": "Plugin could not be opened",
+            tabindex: "0",
             onkeydown: move |event: KeyboardEvent| {
                 if event.key() == Key::Escape {
                     session.write().close_plugin();
@@ -525,7 +563,7 @@ pub fn PluginSheet(session: Signal<Session>) -> Element {
             }
             div { class: "mp-sheet-body",
                 div { class: "banner err", role: "alert",
-                    span { "{message}" }
+                    span { class: "grow", "{message}" }
                     button {
                         class: "btn ghost sm",
                         r#type: "button",

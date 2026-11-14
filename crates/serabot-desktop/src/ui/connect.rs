@@ -2,6 +2,7 @@ use super::*;
 
 #[component]
 pub(super) fn ConnectView(session: Signal<Session>) -> Element {
+    let mut copied_link = use_signal(|| false);
     let server = session.read().server.clone();
     let error = session.read().connect_error.clone();
     let connecting = session.read().connecting;
@@ -25,6 +26,11 @@ pub(super) fn ConnectView(session: Signal<Session>) -> Element {
     // Same check the session runs on connect, shown as the user types.
     let server_invalid =
         !server_empty && serabot_desktop::validate_endpoint(server.trim()).is_err();
+    let invite_trimmed = invite_code.trim();
+    let invite_invalid = show_invite
+        && !invite_trimmed.is_empty()
+        && (invite_trimmed.chars().count() > 128 || invite_trimmed.chars().any(char::is_control));
+    let can_sign_in = !busy && !server_empty && !server_invalid && !invite_invalid;
     rsx! {
         div { class: "connect",
             div { class: "connect-card",
@@ -40,22 +46,29 @@ pub(super) fn ConnectView(session: Signal<Session>) -> Element {
                         placeholder: "https://bot.seradyx.tech",
                         disabled: busy,
                         "aria-invalid": if server_invalid { "true" } else { "false" },
+                        "aria-describedby": if server_invalid { Some("server-error") } else { None },
                         oninput: move |event| session.write().server = event.value(),
+                        onkeydown: move |event: KeyboardEvent| {
+                            if event.key() == Key::Enter && can_sign_in {
+                                event.prevent_default();
+                                session.write().start_sign_in();
+                            }
+                        },
                     }
                     if server_invalid {
-                        p { class: "field-error", role: "alert",
+                        p { id: "server-error", class: "field-error", role: "alert",
                             "Use an https:// address. Plain http works only for localhost."
                         }
                     }
                 }
                 if connecting && phase == SignInPhase::Idle {
-                    div { class: "row",
+                    div { class: "row", role: "status",
                         span { class: "spinner", title: "Checking your saved session" }
                         p { class: "tiny", "Checking your saved session…" }
                     }
                 }
                 if phase == SignInPhase::Waiting {
-                    div { class: "banner info",
+                    div { class: "banner info", role: "status",
                         span { class: "spinner", title: "Waiting for the browser" }
                         span { "Finish signing in in your browser, then come back here." }
                     }
@@ -68,48 +81,86 @@ pub(super) fn ConnectView(session: Signal<Session>) -> Element {
                                 label { class: "field-label", r#for: "sign-in-link",
                                     "Your browser did not open. Open this link to finish signing in:"
                                 }
-                                input {
-                                    class: "input",
-                                    id: "sign-in-link",
-                                    readonly: true,
-                                    value: "{link}",
-                                }
-                                button {
-                                    class: "btn ghost sm",
-                                    onclick: move |_| {
-                                        let _ = dioxus::document::eval(&copy_script(&copy_text));
-                                    },
-                                    "Copy link"
+                                div { class: "copy-row",
+                                    input {
+                                        class: "input",
+                                        id: "sign-in-link",
+                                        readonly: true,
+                                        value: "{link}",
+                                    }
+                                    button {
+                                        class: "btn ghost sm",
+                                        r#type: "button",
+                                        onclick: move |_| {
+                                            let _ = dioxus::document::eval(&copy_script(&copy_text));
+                                            copied_link.set(true);
+                                            spawn(async move {
+                                                let mut done = dioxus::document::eval(CONFIRM_RESET_JS);
+                                                let _ = done.recv::<bool>().await;
+                                                copied_link.set(false);
+                                            });
+                                        },
+                                        if copied_link() { "Copied" } else { "Copy link" }
+                                    }
                                 }
                             }
                         }
                     }
                 }
                 if let Some(message) = sign_in_notice {
-                    div { class: "banner info", span { "{message}" } }
+                    div { class: "banner info", role: "status", span { "{message}" } }
                 }
                 if let Some(message) = sign_in_error {
-                    div { class: "banner err", span { "{message}" } }
+                    div { class: "banner err", role: "alert", span { "{message}" } }
                 }
                 if let Some(message) = error {
-                    div { class: "banner err", span { "{message}" } }
+                    div { class: "banner err", role: "alert", span { "{message}" } }
                 }
                 if show_invite {
                     div { class: "field",
-                        label { class: "field-label", "Invite code" }
+                        div { class: "row",
+                            label { class: "field-label", r#for: "invite-code-input", "Invite code" }
+                            if !busy {
+                                button {
+                                    class: "btn ghost sm",
+                                    r#type: "button",
+                                    onclick: move |_| {
+                                        let mut s = session.write();
+                                        s.sign_in.invite_code.clear();
+                                        s.sign_in.show_invite = false;
+                                    },
+                                    "Remove"
+                                }
+                            }
+                        }
                         input {
-                            class: "input",
+                            id: "invite-code-input",
+                            class: if invite_invalid { "input invalid" } else { "input" },
                             value: "{invite_code}",
-                            placeholder: "only needed the first time",
+                            placeholder: "Only needed the first time",
                             disabled: busy,
+                            "aria-invalid": if invite_invalid { "true" } else { "false" },
+                            "aria-describedby": if invite_invalid { Some("invite-error") } else { None },
                             oninput: move |event| session.write().sign_in.invite_code = event.value(),
+                            onkeydown: move |event: KeyboardEvent| {
+                                if event.key() == Key::Enter && can_sign_in {
+                                    event.prevent_default();
+                                    session.write().start_sign_in();
+                                }
+                            },
+                        }
+                        if invite_invalid {
+                            p { id: "invite-error", class: "field-error", role: "alert",
+                                "Invite codes must be 128 characters or fewer without control characters."
+                            }
                         }
                     }
                 }
                 div { class: "row",
                     button {
                         class: "btn primary",
-                        disabled: busy || server_empty,
+                        r#type: "button",
+                        disabled: !can_sign_in,
                         title: "Open the Microsoft sign-in page in your browser",
                         onclick: move |_| session.write().start_sign_in(),
                         match phase {
@@ -121,6 +172,7 @@ pub(super) fn ConnectView(session: Signal<Session>) -> Element {
                     if phase != SignInPhase::Idle {
                         button {
                             class: "btn ghost",
+                            r#type: "button",
                             onclick: move |_| session.write().cancel_sign_in(),
                             "Cancel"
                         }
@@ -128,6 +180,7 @@ pub(super) fn ConnectView(session: Signal<Session>) -> Element {
                     if can_retry && !connecting && phase == SignInPhase::Idle {
                         button {
                             class: "btn ghost",
+                            r#type: "button",
                             onclick: move |_| session.write().connect_now(),
                             "Try again"
                         }
@@ -139,6 +192,7 @@ pub(super) fn ConnectView(session: Signal<Session>) -> Element {
                 if !show_invite && !busy {
                     button {
                         class: "btn ghost sm",
+                        r#type: "button",
                         onclick: move |_| session.write().sign_in.show_invite = true,
                         "I have an invite code"
                     }
@@ -146,6 +200,7 @@ pub(super) fn ConnectView(session: Signal<Session>) -> Element {
                 div { class: "row",
                     button {
                         class: "btn ghost sm",
+                        r#type: "button",
                         onclick: move |_| {
                             let next = session.read().theme.toggled();
                             session.write().set_theme(next);

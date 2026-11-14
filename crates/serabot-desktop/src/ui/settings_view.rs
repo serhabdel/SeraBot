@@ -2,8 +2,13 @@ use super::*;
 
 #[component]
 pub(super) fn SettingsView(session: Signal<Session>) -> Element {
+    let mut confirm_sign_out = use_signal(|| false);
+    let mut copied_telegram = use_signal(|| false);
+    let mut voice_auto_requested = use_signal(|| false);
     let signed_in_user = session.read().state.user.clone();
     let signing_out = session.read().sign_out.in_flight;
+    let admin_error = session.read().admin_error.clone();
+    let admin_notice = session.read().admin_notice.clone();
     let server = session.read().server.clone();
     let version = session.read().state.version.clone();
     let update = session.read().update.info.clone();
@@ -127,6 +132,10 @@ pub(super) fn SettingsView(session: Signal<Session>) -> Element {
     let gated_empty = gated_tools.is_empty();
     let egress_empty = egress.is_empty();
     let sel = session.read().settings_section;
+    if sel == SettingsSection::Voice && !voice_loaded && !voice_loading && !voice_auto_requested() {
+        voice_auto_requested.set(true);
+        session.write().load_voice();
+    }
     let settings_new_cards = rsx! {
         if sel == SettingsSection::Appearance {
             AppearanceCard { session }
@@ -192,16 +201,40 @@ pub(super) fn SettingsView(session: Signal<Session>) -> Element {
                         } else {
                             p { class: "tiny", "Signed in with a saved session." }
                         }
-                        div { class: "card-actions",
-                            button {
-                                class: "btn danger",
-                                disabled: signing_out,
-                                title: "End this session on the server and remove it from this device",
-                                onclick: move |_| session.write().sign_out(),
-                                if signing_out { "Signing out…" } else { "Sign out" }
+                        if confirm_sign_out() {
+                            div { class: "vault-confirm", role: "alertdialog", "aria-label": "Confirm sign out",
+                                span { class: "caption", "Sign out and remove the saved session from this device?" }
+                                button {
+                                    class: "btn danger sm",
+                                    r#type: "button",
+                                    disabled: signing_out,
+                                    onclick: move |_| {
+                                        confirm_sign_out.set(false);
+                                        session.write().sign_out();
+                                    },
+                                    if signing_out { "Signing out\u{2026}" } else { "Sign out" }
+                                }
+                                button {
+                                    class: "btn ghost sm",
+                                    r#type: "button",
+                                    disabled: signing_out,
+                                    onclick: move |_| confirm_sign_out.set(false),
+                                    "Cancel"
+                                }
                             }
-                            if signing_out {
-                                span { class: "spinner", title: "Signing out" }
+                        } else {
+                            div { class: "card-actions",
+                                button {
+                                    class: "btn danger",
+                                    r#type: "button",
+                                    disabled: signing_out,
+                                    title: "End this session on the server and remove it from this device",
+                                    onclick: move |_| confirm_sign_out.set(true),
+                                    if signing_out { "Signing out\u{2026}" } else { "Sign out" }
+                                }
+                                if signing_out {
+                                    span { class: "spinner", title: "Signing out" }
+                                }
                             }
                         }
                     }
@@ -298,7 +331,22 @@ pub(super) fn SettingsView(session: Signal<Session>) -> Element {
                         if let Some(link) = telegram_link {
                             div { class: "field",
                                 label { class: "field-label", "Send this command to the SeraBot bot" }
-                                code { class: "link-code", "{link.command()}" }
+                                div { class: "copy-row",
+                                    code { class: "link-code", "{link.command()}" }
+                                    button {
+                                        class: "btn ghost sm",
+                                        r#type: "button",
+                                        onclick: {
+                                            let cmd = link.command();
+                                            move |_| {
+                                                document::eval(&crate::ui_files::copy_script(&cmd));
+                                                copied_telegram.set(true);
+                                            }
+                                        },
+                                        Icon { name: "copy", size: 14 }
+                                        if copied_telegram() { "Copied" } else { "Copy" }
+                                    }
+                                }
                                 p { class: "tiny",
                                     "The code works once and expires 10 minutes after it was requested. After sending it, press Refresh status."
                                 }
@@ -353,7 +401,7 @@ pub(super) fn SettingsView(session: Signal<Session>) -> Element {
                                     }
                                 }
                             } else {
-                                span { class: "hint", "unknown" }
+                                span { class: "hint", role: "status", "Loading bot approval rules\u{2026}" }
                             }
                         }
                         if !pending_tools_empty {
@@ -380,7 +428,7 @@ pub(super) fn SettingsView(session: Signal<Session>) -> Element {
                                     }
                                 }
                             } else {
-                                span { class: "hint", "unknown" }
+                                span { class: "hint", role: "status", "Loading AI provider rules\u{2026}" }
                             }
                         }
                     }
@@ -458,8 +506,14 @@ pub(super) fn SettingsView(session: Signal<Session>) -> Element {
                             }
                             span { "Turn on audio transcription and understanding" }
                         }
+                        if let Some(message) = admin_error.clone() {
+                            div { class: "banner err", role: "alert", span { "{message}" } }
+                        } else if let Some(message) = admin_notice.clone() {
+                            div { class: "settings-notice-ok", role: "status", "{message}" }
+                        }
                         button {
                             class: "btn primary",
+                            r#type: "button",
                             disabled: !can_admin,
                             onclick: move |_| session.write().save_audio(),
                             "Save audio settings"
@@ -470,8 +524,18 @@ pub(super) fn SettingsView(session: Signal<Session>) -> Element {
                     div { class: "card",
                         div { class: "card-head",
                             h3 { class: "card-title", "Voice and scanned pages" }
-                            if voice_loading {
-                                span { class: "chip muted", "Loading" }
+                            div { class: "row",
+                                if voice_loading {
+                                    span { class: "spinner", title: "Loading voice settings" }
+                                }
+                                button {
+                                    class: "btn ghost sm",
+                                    r#type: "button",
+                                    disabled: voice_loading,
+                                    onclick: move |_| session.write().load_voice(),
+                                    Icon { name: "refresh", size: 14 }
+                                    "Refresh"
+                                }
                             }
                         }
                         div { class: "card-actions",
@@ -489,14 +553,19 @@ pub(super) fn SettingsView(session: Signal<Session>) -> Element {
                             }
                         }
                         if !voice_loaded {
-                            p { class: "tiny",
-                                "Load the settings to see whether speech-to-text, voice replies and scanned-page reading can run on this server."
-                            }
-                            button {
-                                class: "btn ghost",
-                                disabled: voice_loading,
-                                onclick: move |_| session.write().load_voice(),
-                                "Load voice settings"
+                            if voice_loading {
+                                p { class: "tiny", role: "status", "Loading voice and scanned-page settings\u{2026}" }
+                            } else {
+                                p { class: "tiny",
+                                    "Could not load voice settings automatically. Press Refresh to retry."
+                                }
+                                button {
+                                    class: "btn ghost",
+                                    r#type: "button",
+                                    disabled: voice_loading,
+                                    onclick: move |_| session.write().load_voice(),
+                                    "Load voice settings"
+                                }
                             }
                         } else {
                             p { class: "tiny",
@@ -572,9 +641,15 @@ pub(super) fn SettingsView(session: Signal<Session>) -> Element {
                             p { class: "tiny",
                                 "Voice replies stop at {voice_max_chars} characters. In Telegram, /voice and /text switch the style for that chat."
                             }
+                            if let Some(message) = admin_error.clone() {
+                                div { class: "banner err", role: "alert", span { "{message}" } }
+                            } else if let Some(message) = admin_notice.clone() {
+                                div { class: "settings-notice-ok", role: "status", "{message}" }
+                            }
                             button {
                                 class: "btn primary",
-                                disabled: !can_admin,
+                                r#type: "button",
+                                disabled: !can_admin || voice_loading,
                                 onclick: move |_| session.write().save_voice(),
                                 "Save voice settings"
                             }

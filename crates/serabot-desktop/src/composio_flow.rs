@@ -39,6 +39,8 @@ pub struct ComposioFlow {
     pub query: String,
     /// The app whose sign-in page was opened and is awaiting the user.
     pub waiting: Option<String>,
+    /// Set when an open sign-in wait passes `WAIT_LIMIT` without finishing.
+    pub timed_out: Option<String>,
     waiting_since: Option<Instant>,
     next_poll: Instant,
     pub(crate) want_load: Option<String>,
@@ -57,6 +59,7 @@ impl Default for ComposioFlow {
             loaded: false,
             query: String::new(),
             waiting: None,
+            timed_out: None,
             waiting_since: None,
             next_poll: Instant::now(),
             want_load: None,
@@ -91,8 +94,21 @@ impl ComposioFlow {
 
     pub(crate) fn begin_wait(&mut self, toolkit: &str, now: Instant) {
         self.waiting = Some(toolkit.to_owned());
+        self.timed_out = None;
         self.waiting_since = Some(now);
         self.next_poll = now + POLL_EVERY;
+    }
+
+    /// Cancel an active sign-in wait without clearing loaded apps.
+    pub fn cancel_wait(&mut self) {
+        self.waiting = None;
+        self.waiting_since = None;
+        self.timed_out = None;
+    }
+
+    /// Dismiss a timeout notice after the user has seen it.
+    pub fn dismiss_timeout(&mut self) {
+        self.timed_out = None;
     }
 
     /// The next load to send: a requested one, or a poll while waiting.
@@ -109,7 +125,7 @@ impl ComposioFlow {
                 .waiting_since
                 .is_some_and(|since| now.duration_since(since) > WAIT_LIMIT)
             {
-                self.waiting = None;
+                self.timed_out = self.waiting.take();
                 self.waiting_since = None;
                 return None;
             }
@@ -204,5 +220,19 @@ mod tests {
         let late = now + WAIT_LIMIT + POLL_EVERY;
         assert!(flow.next_load(late).is_none());
         assert!(flow.waiting.is_none());
+        assert_eq!(flow.timed_out.as_deref(), Some("gmail"));
+        flow.dismiss_timeout();
+        assert!(flow.timed_out.is_none());
+    }
+
+    #[test]
+    fn cancel_wait_clears_waiting_and_timeout() {
+        let mut flow = ComposioFlow::default();
+        let now = Instant::now();
+        flow.begin_wait("slack", now);
+        flow.cancel_wait();
+        assert!(flow.waiting.is_none());
+        assert!(flow.timed_out.is_none());
+        assert!(flow.next_load(now + POLL_EVERY).is_none());
     }
 }

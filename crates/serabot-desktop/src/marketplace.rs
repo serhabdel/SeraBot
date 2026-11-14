@@ -26,7 +26,7 @@ pub const MAX_ITEMS: usize = 64;
 pub const RUNTIME_CALLS_PLUGINS: bool = false;
 
 /// The line at the top of the screen while [`RUNTIME_CALLS_PLUGINS`] is false.
-pub const COMING_SOON: &str = "Coming soon. You can browse plugins. Install and Enable stay off until SeraBot can call them, and a plugin whose host is still a placeholder (example.invalid) stays off after that.";
+pub const COMING_SOON: &str = "Coming soon. You can browse plugins and see what they connect to. Install and Enable stay off until plugin calling is turned on and each plugin points at a live service.";
 
 /// What a card shows as its status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,7 +221,7 @@ impl ActivationBlock {
                 "Coming soon. SeraBot cannot call plugins yet, so this one cannot be installed or turned on."
             }
             Self::PlaceholderHost => {
-                "Coming soon. This plugin still points at a placeholder host (example.invalid), so it cannot be installed or turned on."
+                "Coming soon. This plugin does not point at a live service yet, so it cannot be installed or turned on."
             }
             Self::LocalProgram => {
                 "This plugin starts a program on the server, which is not supported yet."
@@ -437,6 +437,36 @@ fn actions_when(detail: &PluginDetail, blocked: bool) -> Vec<PluginAction> {
     actions
 }
 
+/// Quick status filter for the Marketplace tab.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StatusFilter {
+    #[default]
+    All,
+    Installed,
+    ComingSoon,
+}
+
+impl StatusFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Installed => "Installed",
+            Self::ComingSoon => "Coming soon",
+        }
+    }
+
+    pub fn matches(self, status: PluginStatus) -> bool {
+        match self {
+            Self::All => true,
+            Self::Installed => matches!(
+                status,
+                PluginStatus::Installed | PluginStatus::Enabled | PluginStatus::NeedsSetup
+            ),
+            Self::ComingSoon => status == PluginStatus::ComingSoon,
+        }
+    }
+}
+
 /// Case-insensitive search over name, tagline and category, plus an optional
 /// category. An empty category means all.
 pub fn filter_plugins<'a>(
@@ -444,10 +474,21 @@ pub fn filter_plugins<'a>(
     query: &str,
     category: &str,
 ) -> Vec<&'a PluginSummary> {
+    filter_plugins_with_status(plugins, query, category, StatusFilter::All)
+}
+
+/// Case-insensitive search combined with category and install-status filter.
+pub fn filter_plugins_with_status<'a>(
+    plugins: &'a [PluginSummary],
+    query: &str,
+    category: &str,
+    status_filter: StatusFilter,
+) -> Vec<&'a PluginSummary> {
     let needle = query.trim().to_lowercase();
     plugins
         .iter()
         .filter(|plugin| category.is_empty() || plugin.category.eq_ignore_ascii_case(category))
+        .filter(|plugin| status_filter.matches(plugin.state()))
         .filter(|plugin| {
             needle.is_empty()
                 || plugin.name.to_lowercase().contains(&needle)
@@ -455,6 +496,27 @@ pub fn filter_plugins<'a>(
                 || plugin.category.to_lowercase().contains(&needle)
         })
         .collect()
+}
+
+/// The categories present, sorted, without repeats or blanks, with counts.
+pub fn category_counts(plugins: &[PluginSummary]) -> Vec<(String, usize)> {
+    let mut found: Vec<(String, usize)> = Vec::new();
+    for plugin in plugins {
+        let cat = plugin.category.trim();
+        if cat.is_empty() {
+            continue;
+        }
+        if let Some((_, count)) = found
+            .iter_mut()
+            .find(|(existing, _)| existing.eq_ignore_ascii_case(cat))
+        {
+            *count += 1;
+        } else {
+            found.push((cat.to_owned(), 1));
+        }
+    }
+    found.sort_by_key(|(category, _)| category.to_lowercase());
+    found
 }
 
 /// The categories present, sorted, without repeats or blanks.
@@ -839,5 +901,35 @@ mod tests {
             config_values(&fields, |id| if id == "b" { "two\nlines" } else { "" }).unwrap_err();
         assert!(err.contains('B'));
         assert!(!err.contains("two"), "the message must not echo the value");
+    }
+
+    #[test]
+    fn status_filters_and_category_counts_are_accurate() {
+        const {
+            assert!(!RUNTIME_CALLS_PLUGINS);
+        }
+        assert!(!COMING_SOON.contains("example.invalid"));
+        assert!(
+            !ActivationBlock::PlaceholderHost
+                .message()
+                .contains("example.invalid")
+        );
+        let all = vec![
+            summary("a", "Firecrawl", "research", false, false, ""),
+            summary("b", "Resend", "Email", true, false, "needs_config"),
+            summary("c", "Brave Search", "research", true, true, ""),
+        ];
+        assert_eq!(
+            category_counts(&all),
+            vec![("Email".into(), 1), ("research".into(), 2)]
+        );
+        assert_eq!(
+            filter_plugins_with_status(&all, "", "", StatusFilter::Installed).len(),
+            2
+        );
+        assert_eq!(
+            filter_plugins_with_status(&all, "", "", StatusFilter::ComingSoon).len(),
+            1
+        );
     }
 }

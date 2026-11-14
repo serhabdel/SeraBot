@@ -53,6 +53,9 @@
   --fs-body-2: 12px;
   --fs-body: 13px;
   --fs-msg: 14px;
+  --fs-title: 15px;
+  --fs-display: 19px;
+  --fs-hero: 24px;
 }
 
 .root[data-text="large"] {
@@ -61,6 +64,9 @@
   --fs-body-2: 15px;
   --fs-body: 16px;
   --fs-msg: 17px;
+  --fs-title: 18px;
+  --fs-display: 25px;
+  --fs-hero: 31px;
 }
 
 /* Reduce motion preference. */
@@ -70,6 +76,171 @@
   animation-duration: 0.001ms !important;
   animation-iteration-count: 1 !important;
   transition-duration: 0.001ms !important;
+}
+
+/* Shared search/copy rows (used across Settings, Vault, Memory & Integrations). */
+.search-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.search-wrap .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.copy-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Provider directory & card layout hooks. */
+.provider-key-row .secret-field {
+  flex: 1;
+  min-width: 0;
+}
+
+.provider-dir-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  margin-bottom: 12px;
+}
+
+.provider-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.provider-card-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.provider-card-sub {
+  color: var(--label-2);
+  font-size: var(--fs-caption);
+}
+
+.provider-card-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+.provider-test-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--fs-caption);
+  color: var(--label-2);
+}
+
+/* Settings cards: web search & local folder bot scope picker. */
+.websearch-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+}
+
+.bot-scope {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Vault filter, pending rows & import picker. */
+.vault-filter {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.vault-filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.vault-filter-row .input {
+  flex: 1 1 180px;
+  min-width: 0;
+}
+
+.vault-pending {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--hairline);
+  background: var(--surface-2);
+}
+
+.vault-row-pending {
+  border-style: dashed;
+}
+
+.vault-import {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--hairline);
+  background: var(--card-bg);
+}
+
+.vault-import-pick {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 360px;
+  overflow-y: auto;
+  padding: 10px 12px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--hairline);
+  background: var(--surface-2);
+}
+
+/* Browser pane subtitle & folder/memory helpers. */
+.pane-subtitle {
+  margin: 2px 0 0;
+  color: var(--label-2);
+  font-size: var(--fs-body-2);
+}
+
+.settings-error-inline {
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: var(--fs-caption);
+}
+
+.settings-notice-ok {
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  background: var(--ok-soft);
+  color: var(--ok);
+  font-size: var(--fs-caption);
 }
 
 @media (max-width: 720px) {

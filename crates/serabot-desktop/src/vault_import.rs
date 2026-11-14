@@ -49,6 +49,27 @@ pub struct ImportItem {
     pub suggested_name: String,
 }
 
+impl ImportItem {
+    /// Returns true if this item matches a case-insensitive user filter query
+    /// across its visible metadata (title, vault, username, domain).
+    pub fn matches_filter(&self, query: &str) -> bool {
+        let needle = query.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return true;
+        }
+        self.title.to_ascii_lowercase().contains(&needle)
+            || self.vault.to_ascii_lowercase().contains(&needle)
+            || self
+                .username
+                .as_deref()
+                .is_some_and(|u| u.to_ascii_lowercase().contains(&needle))
+            || self
+                .domain
+                .as_deref()
+                .is_some_and(|d| d.to_ascii_lowercase().contains(&needle))
+    }
+}
+
 fn text_field<'a>(item: &'a Value, key: &str) -> Option<&'a str> {
     item.get(key)
         .and_then(Value::as_str)
@@ -442,5 +463,24 @@ mod tests {
     fn the_cli_is_looked_up_only_on_path() {
         assert!(find_on_path("serabot-no-such-cli-0123").is_none());
         assert!(list_items(VaultSource::Local).is_err());
+    }
+
+    #[test]
+    fn import_item_filter_matches_title_vault_username_and_domain() {
+        let item = ImportItem {
+            source: VaultSource::OnePassword,
+            reference: "op://Work/GitHub/password".into(),
+            title: "GitHub Enterprise".into(),
+            vault: "Engineering".into(),
+            username: Some("alice@acme.test".into()),
+            domain: Some("github.acme.test".into()),
+            suggested_name: "github-enterprise".into(),
+        };
+        assert!(item.matches_filter(""));
+        assert!(item.matches_filter("enterprise"));
+        assert!(item.matches_filter("engineering"));
+        assert!(item.matches_filter("alice@"));
+        assert!(item.matches_filter("acme.test"));
+        assert!(!item.matches_filter("gitlab"));
     }
 }

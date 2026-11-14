@@ -360,10 +360,10 @@ fn handle_connection(
     };
     let page = match &outcome {
         Ok(_) => {
-            "<!doctype html><title>SeraBot</title><body style=\"font-family:system-ui;margin:3rem\"><h2>Signed in</h2><p>You can close this tab and return to SeraBot.</p></body>"
+            "<!doctype html><meta charset=\"utf-8\"><title>SeraBot</title><body style=\"font-family:system-ui;margin:3rem\"><h2>Signed in</h2><p>You can close this tab and return to SeraBot.</p></body>"
         }
         Err(_) => {
-            "<!doctype html><title>SeraBot</title><body style=\"font-family:system-ui;margin:3rem\"><h2>Sign-in failed</h2><p>Return to SeraBot and start again.</p></body>"
+            "<!doctype html><meta charset=\"utf-8\"><title>SeraBot</title><body style=\"font-family:system-ui;margin:3rem\"><h2>Sign-in failed</h2><p>Return to SeraBot and start again.</p></body>"
         }
     };
     respond(&mut stream, "200 OK", page);
@@ -627,5 +627,23 @@ mod tests {
             redirect_uri(port),
             format!("http://127.0.0.1:{port}/oauth-callback")
         );
+    }
+
+    #[test]
+    fn callback_html_pages_include_utf8_meta_charset() {
+        let (listener, port) = bind_loopback().unwrap();
+        let waiter = std::thread::spawn(move || {
+            wait_for_callback(&listener, "expected-state", Duration::from_secs(5))
+        });
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            stream,
+            "GET /oauth-callback?code=ok&state=expected-state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        )
+        .unwrap();
+        let mut reply = String::new();
+        let _ = stream.read_to_string(&mut reply);
+        assert!(reply.contains("<meta charset=\"utf-8\">"));
+        assert_eq!(waiter.join().unwrap().unwrap().as_str(), "ok");
     }
 }
