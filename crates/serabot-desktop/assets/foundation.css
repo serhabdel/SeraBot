@@ -1154,10 +1154,14 @@ button.md-image-chip:hover {
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+}
 
-  .chat-header .pill {
-    display: none;
-  }
+.input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.input[aria-invalid="true"]:focus-visible {
+  box-shadow: 0 0 0 3px var(--danger-soft);
 }
 
 @media (max-width: 800px) {

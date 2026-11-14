@@ -264,6 +264,11 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let mut composer_expanded = use_signal(|| false);
     let mut composer_focused = use_signal(|| false);
     let mut copied = use_signal(|| Option::<String>::None);
+    let mut confirm_regen = use_signal(|| Option::<String>::None);
+    let mut dismissed_failure = use_signal(|| Option::<String>::None);
+    let mut dismissed_held = use_signal(|| false);
+    let mut dismissed_transcript_err = use_signal(|| Option::<String>::None);
+    let enter_sends_pref = session.read().prefs.enter_sends;
     let mut composer_room = use_signal(|| session.read().conversation.clone());
     use_effect(move || {
         let conversation = session.read().conversation.clone();
@@ -311,6 +316,27 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     let transcript_error = session.read().state.transcript_error.clone();
     let chat_failure = session.read().state.chat_failure.clone();
     let held_draft = session.read().state.held_draft.is_some();
+    if chat_failure.as_ref().map(|f| f.message.as_str()) != dismissed_failure().as_deref()
+        && chat_failure.is_none()
+        && dismissed_failure().is_some()
+    {
+        dismissed_failure.set(None);
+    }
+    if !held_draft && dismissed_held() {
+        dismissed_held.set(false);
+    }
+    if transcript_error.is_none() && dismissed_transcript_err().is_some() {
+        dismissed_transcript_err.set(None);
+    }
+    let show_failure = chat_failure
+        .as_ref()
+        .filter(|f| dismissed_failure().as_deref() != Some(f.message.as_str()))
+        .cloned();
+    let show_held = held_draft && !dismissed_held();
+    let show_transcript_error = transcript_error
+        .as_ref()
+        .filter(|msg| dismissed_transcript_err().as_deref() != Some(msg.as_str()))
+        .cloned();
     let reconnecting = {
         let state = session.read();
         state.state.connected && state.events_seen && !state.events_active
@@ -386,8 +412,18 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
         let previous = *last_count.peek();
         if count != previous {
             if count > previous && !*at_bottom.peek() && !own_send {
-                let added = *unseen.peek() + (count - previous);
-                unseen.set(added);
+                let incoming = session
+                    .read()
+                    .state
+                    .messages
+                    .iter()
+                    .skip(previous)
+                    .filter(|message| message.role != Role::User)
+                    .count();
+                if incoming > 0 {
+                    let added = *unseen.peek() + incoming;
+                    unseen.set(added);
+                }
             }
             last_count.set(count);
         }
@@ -488,8 +524,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
     // Copies for the key handler closures (they move their captures).
     let key_mention_bots = mention_bots.clone();
     let key_mention_conns = mention_conns.clone();
+    let key_slash_actions = slash_actions.clone();
     let key_slash_skills = slash_skills.clone();
-    let key_slash_tools = slash_tool_matches(&slash_q);
+    let key_slash_tools = slash_tools.clone();
     let composer_text = composer_draft();
     let composer_chars = composer_text.chars().count();
     let length_note = chat_compose::length_message(composer_chars);
@@ -721,6 +758,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                         span { class: "msg-action-time", "{row.stamp}" }
                                         button {
                                             class: "msg-action",
+                                            r#type: "button",
                                             "aria-label": "Copy message",
                                             title: "Copy",
                                             onclick: {
@@ -739,21 +777,50 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                                     });
                                                 }
                                             },
-                                            Icon { name: "copy", size: 13 }
+                                            Icon {
+                                                name: if copied().as_deref() == Some(row.id.as_str()) { "check" } else { "copy" },
+                                                size: 13
+                                            }
                                             span { class: "msg-action-label",
                                                 if copied().as_deref() == Some(row.id.as_str()) { "Copied" } else { "Copy" }
+                                            }
+                                        }
+                                        if accepts && !row.content.trim().is_empty() {
+                                            button {
+                                                class: "msg-action",
+                                                r#type: "button",
+                                                "aria-label": "Quote message in composer",
+                                                title: "Quote in composer",
+                                                onclick: {
+                                                    let text = row.content.clone();
+                                                    move |_| {
+                                                        confirm_regen.set(None);
+                                                        let next = chat_compose::quote_reply_text(
+                                                            &composer_draft(),
+                                                            &text,
+                                                        );
+                                                        composer_draft.set(next.clone());
+                                                        session.write().composer = next;
+                                                        focus_composer();
+                                                    }
+                                                },
+                                                Icon { name: "chat", size: 13 }
+                                                span { class: "msg-action-label", "Quote" }
                                             }
                                         }
                                         if row.edit {
                                             button {
                                                 class: "msg-action",
+                                                r#type: "button",
                                                 "aria-label": "Edit message",
                                                 title: "Put this message back in the composer",
                                                 onclick: {
                                                     let text = row.content.clone();
                                                     move |_| {
+                                                        confirm_regen.set(None);
                                                         composer_draft.set(text.clone());
                                                         session.write().edit_text(text.clone());
+                                                        focus_composer();
                                                     }
                                                 },
                                                 Icon { name: "edit", size: 13 }
@@ -761,18 +828,35 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                             }
                                         }
                                         if let Some(text) = row.regen.clone() {
-                                            button {
-                                                class: "msg-action",
-                                                "aria-label": "Regenerate reply",
-                                                title: "Send your last message again",
-                                                onclick: move |_| session.write().regenerate(text.clone()),
-                                                Icon { name: "refresh", size: 13 }
-                                                span { class: "msg-action-label", "Regenerate" }
+                                            {
+                                                let confirming = confirm_regen().as_deref() == Some(row.id.as_str());
+                                                let row_id = row.id.clone();
+                                                rsx! {
+                                                    button {
+                                                        class: if confirming { "msg-action warn" } else { "msg-action" },
+                                                        r#type: "button",
+                                                        "aria-label": if confirming { "Confirm overwrite of draft and regenerate reply" } else { "Regenerate reply" },
+                                                        title: if confirming { "Click again to replace your unsent draft and resend" } else { "Send your last message again" },
+                                                        onclick: move |_| {
+                                                            if composer_draft().trim().is_empty() || confirming {
+                                                                confirm_regen.set(None);
+                                                                session.write().regenerate(text.clone());
+                                                            } else {
+                                                                confirm_regen.set(Some(row_id.clone()));
+                                                            }
+                                                        },
+                                                        Icon { name: "refresh", size: 13 }
+                                                        span { class: "msg-action-label",
+                                                            if confirming { "Replace draft?" } else { "Regenerate" }
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                         if row.continue_offer {
                                             button {
                                                 class: "msg-action",
+                                                r#type: "button",
                                                 "aria-label": "Continue from where the bot stopped",
                                                 title: "Ask the bot to carry on from its tool limit",
                                                 onclick: move |_| session.write().continue_from_limit(),
@@ -862,7 +946,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             }
                         }
                     }
-                    if let Some(failure) = chat_failure.clone() {
+                    if let Some(failure) = show_failure.clone() {
                         div { class: "banner err", role: "alert",
                             span { "{failure.message}" }
                             match failure.action {
@@ -895,8 +979,16 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 },
                                 ChatAction::None => rsx! {},
                             }
+                            button {
+                                class: "btn ghost sm chat-banner-close",
+                                r#type: "button",
+                                title: "Dismiss",
+                                "aria-label": "Dismiss error",
+                                onclick: move |_| dismissed_failure.set(Some(failure.message.clone())),
+                                Icon { name: "x", size: 13 }
+                            }
                         }
-                    } else if held_draft {
+                    } else if show_held {
                         div { class: "banner warn", role: "status",
                             span { "That message may have reached SeraBot. It is kept here if you want it back in the box." }
                             button {
@@ -906,10 +998,28 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 onclick: move |_| session.write().restore_held_draft(),
                                 "Put it back"
                             }
+                            button {
+                                class: "btn ghost sm chat-banner-close",
+                                r#type: "button",
+                                title: "Dismiss",
+                                "aria-label": "Dismiss draft notice",
+                                onclick: move |_| dismissed_held.set(true),
+                                Icon { name: "x", size: 13 }
+                            }
                         }
                     }
-                    if let Some(message) = transcript_error {
-                        div { class: "banner err", role: "alert", span { "{message}" } }
+                    if let Some(message) = show_transcript_error {
+                        div { class: "banner err", role: "alert",
+                            span { "{message}" }
+                            button {
+                                class: "btn ghost sm chat-banner-close",
+                                r#type: "button",
+                                title: "Dismiss",
+                                "aria-label": "Dismiss voice notice",
+                                onclick: move |_| dismissed_transcript_err.set(Some(message.clone())),
+                                Icon { name: "x", size: 13 }
+                            }
+                        }
                     }
                     div { class: if composer_expanded() { "composer expanded" } else { "composer" },
                         ComposerFiles { session }
@@ -925,6 +1035,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                             onblur: move |_| composer_focused.set(false),
                             oninput: move |event| {
                                 let value = event.value();
+                                confirm_regen.set(None);
                                 composer_draft.set(value.clone());
                                 session.write().composer = value.clone();
                                 mention.set(mention_query(&value));
@@ -967,7 +1078,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                 // Same priority as the render below: slash wins.
                                 let mention_open = mention().is_some() && slash().is_none();
                                 let slash_open = slash().is_some();
-                                if mention_open || slash_open {
+                                if (mention_open || slash_open) && !event.is_composing() {
                                     match event.key() {
                                         Key::ArrowDown => {
                                             event.prevent_default();
@@ -977,7 +1088,9 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                                     mention_idx.set((mention_idx() + 1).min(count - 1));
                                                 }
                                             } else {
-                                                let count = key_slash_skills.len() + key_slash_tools.len();
+                                                let count = key_slash_actions.len()
+                                                    + key_slash_skills.len()
+                                                    + key_slash_tools.len();
                                                 if count > 0 {
                                                     slash_idx.set((slash_idx() + 1).min(count - 1));
                                                 }
@@ -991,7 +1104,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                                 slash_idx.set(slash_idx().saturating_sub(1));
                                             }
                                         }
-                                        Key::Enter => {
+                                        Key::Enter | Key::Tab => {
                                             event.prevent_default();
                                             event.stop_propagation();
                                             if mention_open {
@@ -1008,21 +1121,47 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                                     composer_draft.set(next.clone());
                                                     session.write().composer = next;
                                                     mention.set(None);
+                                                    mention_idx.set(0);
+                                                    focus_composer();
                                                 }
                                             } else {
-                                                let count = key_slash_skills.len() + key_slash_tools.len();
-                                                let idx = slash_idx().min(count.saturating_sub(1));
-                                                let id = if idx < key_slash_skills.len() {
-                                                    key_slash_skills.get(idx).map(|s| s.0.clone())
-                                                } else {
-                                                    key_slash_tools.get(idx - key_slash_skills.len()).map(|t| t.to_string())
-                                                };
-                                                if let Some(id) = id {
-                                                    let text = composer_draft();
-                                                    let next = insert_slash_text(&text, &id);
-                                                    composer_draft.set(next.clone());
-                                                    session.write().composer = next;
-                                                    slash.set(None);
+                                                let a_len = key_slash_actions.len();
+                                                let s_len = key_slash_skills.len();
+                                                let t_len = key_slash_tools.len();
+                                                let total = a_len + s_len + t_len;
+                                                let idx = slash_idx().min(total.saturating_sub(1));
+                                                match chat_compose::slash_pick_at(idx, a_len, s_len, t_len) {
+                                                    Some(chat_compose::SlashPick::Action(i)) => {
+                                                        if let Some((command, _, _)) = key_slash_actions.get(i) {
+                                                            let next = format!("/{command}");
+                                                            composer_draft.set(next.clone());
+                                                            session.write().composer = next;
+                                                            slash.set(None);
+                                                            slash_idx.set(0);
+                                                            focus_composer();
+                                                        }
+                                                    }
+                                                    Some(chat_compose::SlashPick::Skill(i)) => {
+                                                        if let Some((id, _, _)) = key_slash_skills.get(i) {
+                                                            let next = insert_slash_text(&composer_draft(), id);
+                                                            composer_draft.set(next.clone());
+                                                            session.write().composer = next;
+                                                            slash.set(None);
+                                                            slash_idx.set(0);
+                                                            focus_composer();
+                                                        }
+                                                    }
+                                                    Some(chat_compose::SlashPick::Tool(i)) => {
+                                                        if let Some(tool) = key_slash_tools.get(i) {
+                                                            let next = insert_slash_text(&composer_draft(), tool);
+                                                            composer_draft.set(next.clone());
+                                                            session.write().composer = next;
+                                                            slash.set(None);
+                                                            slash_idx.set(0);
+                                                            focus_composer();
+                                                        }
+                                                    }
+                                                    None => {}
                                                 }
                                             }
                                         }
@@ -1131,6 +1270,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     title: if recording() { "Stop recording" } else { "Record a voice note" },
                                     "aria-label": if recording() { "Stop recording" } else { "Record a voice note" },
                                     class: if recording() { "composer-mic recording" } else { "composer-mic" },
+                                    disabled: !accepts,
                                     onclick: move |_| async move {
                                         if recording() {
                                             // Take the recorder out of the signal
@@ -1210,7 +1350,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                     }
                     // The key hint sits under the container, always, so it never
                     // overlaps the text and the box never jumps when focus moves.
-                    div { class: "composer-hint", "{chat_compose::COMPOSER_HINT}" }
+                    div { class: "composer-hint", "{chat_compose::composer_hint(enter_sends_pref)}" }
                     if show_mention {
                         div { class: "mention-pop pop above open",
                             // Hidden closer: GLOBAL_KEYS_JS clicks it on Esc /
@@ -1292,17 +1432,19 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     div { class: "pop-empty", "No commands, skills or tools match." }
                                 }
                                 if !slash_actions.is_empty() {
-                                    div { class: "pop-group", "Actions (type the command, then Enter)" }
-                                    for (command, description, _) in slash_actions.iter() {
+                                    div { class: "pop-group", "Actions (pick, then Enter)" }
+                                    for (index, (command, description, _)) in slash_actions.iter().enumerate() {
                                         button {
                                             key: "{command}",
-                                            class: "pop-item",
+                                            class: if index == slash_active { "pop-item active" } else { "pop-item" },
                                             onclick: {
                                                 let command = (*command).to_owned();
                                                 move |_| {
                                                     let text = format!("/{command}");
                                                     composer_draft.set(text.clone());
                                                     session.write().composer = text;
+                                                    slash.set(None);
+                                                    slash_idx.set(0);
                                                     focus_composer();
                                                 }
                                             },
@@ -1316,7 +1458,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     for (index, (id, name, description)) in slash_skills.iter().enumerate() {
                                         button {
                                             key: "{id}",
-                                            class: if index == slash_active { "pop-item active" } else { "pop-item" },
+                                            class: if slash_actions.len() + index == slash_active { "pop-item active" } else { "pop-item" },
                                             onclick: {
                                                 let id = id.clone();
                                                 move |_| {
@@ -1326,6 +1468,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                                     session.write().composer = next;
                                                     slash.set(None);
                                                     slash_idx.set(0);
+                                                    focus_composer();
                                                 }
                                             },
                                             div { style: "display: flex; flex-direction: column; align-items: flex-start; min-width: 0;",
@@ -1343,7 +1486,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                     for (offset, tool) in slash_tools.iter().enumerate() {
                                         button {
                                             key: "{tool}",
-                                            class: if slash_skills.len() + offset == slash_active { "pop-item active" } else { "pop-item" },
+                                            class: if slash_actions.len() + slash_skills.len() + offset == slash_active { "pop-item active" } else { "pop-item" },
                                             onclick: {
                                                 let tool = tool.to_string();
                                                 move |_| {
@@ -1353,6 +1496,7 @@ pub(crate) fn ChatView(session: Signal<Session>, overlay: Signal<Overlay>) -> El
                                                     session.write().composer = next;
                                                     slash.set(None);
                                                     slash_idx.set(0);
+                                                    focus_composer();
                                                 }
                                             },
                                             div { style: "display: flex; flex-direction: column; align-items: flex-start; min-width: 0;",
@@ -1566,6 +1710,17 @@ pub(super) fn ModelBar(
                             {
                                 let mut session = session.write();
                                 set_model_draft(&mut session, item_value);
+                                if compact {
+                                    let parsed = parse_model_value(item_value);
+                                    if session
+                                        .state
+                                        .catalog
+                                        .as_ref()
+                                        .is_some_and(|catalog| catalog.allows(&parsed))
+                                    {
+                                        session.apply_model(parsed);
+                                    }
+                                }
                                 open.set(false);
                                 query.set(String::new());
                             }
@@ -1615,7 +1770,7 @@ pub(super) fn ModelBar(
                         } else if filtered.is_empty() {
                             div { class: "pop-empty", "No models match." }
                         }
-                        for (index, item_value, label, header, row) in render_rows {
+                        for (pos, (_index, item_value, label, header, row)) in render_rows.into_iter().enumerate() {
                             div { key: "{item_value}",
                             if let Some((brand, name)) = header {
                                 div { class: "pop-group model-group",
@@ -1624,12 +1779,23 @@ pub(super) fn ModelBar(
                                 }
                             }
                             button {
-                                class: if index == active { "pop-item active" } else { "pop-item" },
+                                class: if pos == active { "pop-item active" } else { "pop-item" },
                                 onclick: {
                                     let item_value = item_value.clone();
                                     move |_| {
                                         let mut session = session.write();
                                         set_model_draft(&mut session, &item_value);
+                                        if compact {
+                                            let parsed = parse_model_value(&item_value);
+                                            if session
+                                                .state
+                                                .catalog
+                                                .as_ref()
+                                                .is_some_and(|catalog| catalog.allows(&parsed))
+                                            {
+                                                session.apply_model(parsed);
+                                            }
+                                        }
                                         open.set(false);
                                         query.set(String::new());
                                     }
@@ -1698,12 +1864,18 @@ pub(super) fn ModelBar(
             } else if changed {
                 button {
                     class: "btn primary sm",
+                    r#type: "button",
                     disabled: !allowed,
+                    title: if allowed {
+                        "Apply the selected model before sending"
+                    } else {
+                        "This provider is not approved for egress"
+                    },
                     onclick: move |_| {
                         let draft = session.read().state.draft.clone();
                         session.write().apply_model(draft);
                     },
-                    "Apply"
+                    if allowed { "Apply model" } else { "Not approved" }
                 }
             } else if !compact {
                 span { class: "tiny", "Saved {saved}" }

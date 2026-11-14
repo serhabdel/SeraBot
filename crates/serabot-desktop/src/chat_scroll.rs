@@ -167,20 +167,22 @@ pub const CHAT_SCROLL_BRIDGE_JS: &str = r#"
   };
 
   window.__serabotPinMessages = (force) => {
+    if (force) {
+      pending = null;
+      follow = true;
+      snap();
+      report();
+      return;
+    }
     if (pending) {
       schedule();
       return;
     }
-    if (force) {
-      follow = true;
-      snap();
-      report();
-    } else {
-      schedule();
-    }
+    schedule();
   };
 
   window.__serabotJumpToLatest = () => {
+    pending = null;
     follow = true;
     snap();
     report();
@@ -383,5 +385,22 @@ mod tests {
     fn switch_is_detected_only_on_a_different_conversation() {
         assert!(!conversation_switched("dir:main", "dir:main"));
         assert!(conversation_switched("dir:legal", "dir:main"));
+    }
+
+    #[test]
+    fn force_pin_and_jump_to_latest_clear_pending_restore() {
+        let pin_start = CHAT_SCROLL_BRIDGE_JS
+            .find("window.__serabotPinMessages")
+            .expect("pin handler exists");
+        let jump_start = CHAT_SCROLL_BRIDGE_JS
+            .find("window.__serabotJumpToLatest")
+            .expect("jump handler exists");
+        let pin_block = &CHAT_SCROLL_BRIDGE_JS[pin_start..jump_start];
+        assert!(pin_block.contains("if (force) {\n      pending = null;"));
+        let jump_end = CHAT_SCROLL_BRIDGE_JS[jump_start..]
+            .find("};")
+            .expect("jump handler closes");
+        let jump_block = &CHAT_SCROLL_BRIDGE_JS[jump_start..jump_start + jump_end];
+        assert!(jump_block.contains("pending = null;"));
     }
 }

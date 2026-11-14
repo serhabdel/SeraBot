@@ -326,6 +326,27 @@ pub fn plan_progress(done: usize, total: usize) -> String {
     }
 }
 
+/// True when a watcher/RSS feed URL parses as HTTP/HTTPS with a non-empty host.
+#[allow(dead_code)]
+pub fn is_valid_feed_url(raw: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw.trim()) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https") && parsed.has_host()
+}
+
+/// Case-insensitive substring filter helper for the Workflows screen.
+#[allow(dead_code)]
+pub fn matches_workflow_filter(needle: &str, haystacks: &[&str]) -> bool {
+    let needle = needle.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    haystacks
+        .iter()
+        .any(|text| text.to_ascii_lowercase().contains(&needle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,5 +447,20 @@ mod tests {
             plan_conversation_label(None, "0123456789abcdefghij"),
             "0123456789abc\u{2026}"
         );
+    }
+
+    #[test]
+    fn feed_url_and_filter_validation() {
+        assert!(is_valid_feed_url("https://example.invalid/rss.xml"));
+        assert!(is_valid_feed_url(" http://news.example.invalid/feed "));
+        assert!(!is_valid_feed_url("ftp://example.invalid/feed"));
+        assert!(!is_valid_feed_url("javascript:alert(1)"));
+        assert!(!is_valid_feed_url("not a url"));
+        assert!(matches_workflow_filter("", &["morning_brief"]));
+        assert!(matches_workflow_filter("BRIEF", &["morning_brief", "rss"]));
+        assert!(!matches_workflow_filter(
+            "podcast",
+            &["morning_brief", "rss"]
+        ));
     }
 }

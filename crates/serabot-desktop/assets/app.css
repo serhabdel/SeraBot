@@ -4646,7 +4646,7 @@ html[data-reduce-transparency="true"] .chat-header {
 }
 
 .browser-last-nav {
-  color: var(--text-2);
+  color: var(--label-2);
 }
 
 /* Browser page: a grid of live cards. */
@@ -5284,7 +5284,7 @@ html[data-reduce-transparency="true"] .chat-header {
 }
 
 .tasks-head-actions .seg {
-  border: 1px solid var(--line-2);
+  border: 1px solid var(--hairline-strong);
   background: transparent;
   color: var(--label-2);
   border-radius: 8px;
@@ -5311,11 +5311,52 @@ html[data-reduce-transparency="true"] .chat-header {
 .tasks-add {
   display: flex;
   gap: 8px;
-  margin: 10px 0 14px;
+  margin: 4px 0 12px;
 }
 
 .tasks-add .tasks-due {
-  width: 150px;
+  width: 156px;
+}
+
+.tasks-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+
+.tasks-search {
+  flex: 1 1 200px;
+  min-width: 140px;
+}
+
+.tasks-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tasks-filters .seg {
+  border: 1px solid var(--hairline);
+  background: transparent;
+  color: var(--label-2);
+  border-radius: 8px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.tasks-filters .seg.on {
+  background: var(--accent-soft);
+  color: var(--label-1);
+  border-color: var(--accent);
+}
+
+.tasks-inline-err {
+  margin: 0 0 10px;
+  color: var(--danger);
+  font-size: var(--fs-caption);
 }
 
 .task-row {
@@ -5323,16 +5364,31 @@ html[data-reduce-transparency="true"] .chat-header {
   align-items: center;
   gap: 10px;
   padding: 8px 10px;
-  border: 1px solid var(--line-1);
+  border: 1px solid var(--hairline);
   border-radius: 10px;
   margin-bottom: 6px;
-  background: var(--bg-2);
+  background: var(--surface-2);
+}
+
+.task-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 .task-row .task-title {
-  flex: 1;
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+.task-notes {
+  color: var(--label-3);
+  font-size: var(--fs-caption);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .task-row .task-status {
@@ -5342,15 +5398,22 @@ html[data-reduce-transparency="true"] .chat-header {
   font-size: 11px;
   cursor: pointer;
   text-transform: capitalize;
+  flex: 0 0 auto;
 }
 
-.task-row .task-status.todo { background: var(--bg-3); color: var(--label-2); }
+.task-row .task-status.todo { background: var(--surface); color: var(--label-2); }
 .task-row .task-status.doing { background: var(--warn-soft); color: var(--label-1); }
 .task-row .task-status.done { background: var(--ok-soft); color: var(--label-1); text-decoration: line-through; }
 
 .task-row .task-due {
   font-size: 12px;
   color: var(--label-2);
+  flex: 0 0 auto;
+}
+
+.task-row .task-due.overdue {
+  color: var(--danger);
+  font-weight: 600;
 }
 
 .task-row .task-synced {
@@ -5372,30 +5435,44 @@ html[data-reduce-transparency="true"] .chat-header {
 }
 
 .kanban-col {
-  background: var(--bg-2);
-  border: 1px solid var(--line-1);
+  background: var(--surface-2);
+  border: 1px solid var(--hairline);
   border-radius: 12px;
   padding: 10px;
   min-height: 120px;
+  min-width: 0;
 }
 
 .kanban-col h3 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   margin: 0 0 8px;
   font-size: 12px;
-  text-transform: capitalize;
   color: var(--label-2);
+}
+
+.kanban-count {
+  color: var(--label-3);
+  font-weight: 500;
+}
+
+.kanban-empty {
+  margin: 8px 0 4px;
+  font-size: var(--fs-caption);
+  color: var(--label-3);
 }
 
 .cal-head {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin: 8px 0 10px;
+  gap: 10px;
+  margin: 4px 0 12px;
 }
 
 .cal-grid {
   display: grid;
-  grid-template-columns: repeat(7, 1fr);
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   gap: 4px;
 }
 
@@ -5407,11 +5484,17 @@ html[data-reduce-transparency="true"] .chat-header {
 }
 
 .cal-cell {
-  border: 1px solid var(--line-1);
+  border: 1px solid var(--hairline);
   border-radius: 8px;
-  min-height: 64px;
+  min-height: 76px;
   padding: 4px 6px;
-  background: var(--bg-2);
+  background: var(--surface-2);
+  min-width: 0;
+}
+
+.cal-cell.today {
+  border-color: var(--accent);
+  background: var(--accent-soft);
 }
 
 .cal-cell.empty {
@@ -5420,9 +5503,34 @@ html[data-reduce-transparency="true"] .chat-header {
 }
 
 .cal-day {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   font-size: 11px;
   color: var(--label-2);
   margin-bottom: 4px;
+}
+
+.cal-add {
+  opacity: 0;
+  border: 0;
+  background: transparent;
+  color: var(--label-2);
+  cursor: pointer;
+  padding: 1px 3px;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+}
+
+.cal-cell:hover .cal-add,
+.cal-cell:focus-within .cal-add {
+  opacity: 1;
+}
+
+.cal-add:hover {
+  background: var(--hover);
+  color: var(--label-1);
 }
 
 .cal-item {
@@ -5436,7 +5544,13 @@ html[data-reduce-transparency="true"] .chat-header {
 }
 
 .cal-item.task { background: var(--accent-soft); color: var(--label-1); }
-.cal-item.event { background: var(--bg-3); color: var(--label-2); }
+.cal-item.event { background: var(--surface); color: var(--label-2); }
+
+.cal-more {
+  margin-top: 3px;
+  font-size: 10.5px;
+  color: var(--label-3);
+}
 
 .step.running .step-label {
   color: var(--label-1);
@@ -6635,8 +6749,8 @@ html[data-reduce-transparency="true"] .chat-header {
   opacity: 0;
   transform: scale(0.94);
   transition:
-    opacity 240ms var(--ease-out, ease-out),
-    transform 240ms var(--ease-out, ease-out);
+    opacity 240ms var(--ease),
+    transform 240ms var(--ease);
   pointer-events: none;
 }
 
@@ -6753,4 +6867,132 @@ html[data-reduce-transparency="true"] .chat-header {
 
 .root[data-motion="reduce"] .working-label {
   animation: none;
+}
+
+/* --- Wave 3 Shell, Screens & Chat UX Polish --- */
+
+.sidebar-search .input {
+  padding-right: 30px;
+}
+
+.search-clear {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 22px;
+  height: 22px;
+  border-radius: var(--r-pill);
+  color: var(--label-3);
+}
+
+.banner .grow {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.banner-close,
+.chat-banner-close {
+  margin-left: auto;
+  min-width: 24px;
+  min-height: 24px;
+  padding: 2px;
+  flex: 0 0 auto;
+}
+
+.dock-head-actions {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.row-between {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.chip-remove {
+  min-height: 18px;
+  padding: 0 4px;
+  margin-left: 2px;
+  line-height: 1;
+}
+
+.cap-filter {
+  margin-bottom: 10px;
+}
+
+/* Shared markdown, conversation & approval UX hooks */
+.md-del {
+  text-decoration: line-through;
+  opacity: 0.78;
+}
+
+.md-task {
+  list-style: none;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.md-task-box {
+  margin-top: 3px;
+  accent-color: var(--accent);
+  flex: 0 0 auto;
+}
+
+.md-code-meta {
+  margin-left: auto;
+  font-size: var(--fs-caption);
+  color: var(--label-3);
+}
+
+.conv-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.approval-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 8px 0 12px;
+}
+
+@container main (max-width: 720px) {
+  .kanban {
+    grid-template-columns: 1fr;
+  }
+
+  .cal-grid {
+    gap: 2px;
+  }
+
+  .cal-cell {
+    min-height: 58px;
+    padding: 3px;
+  }
+}
+
+.root[data-motion="reduce"] .skeleton,
+.root[data-motion="reduce"] .spinner,
+.root[data-motion="reduce"] .toast,
+.root[data-motion="reduce"] .pane-head,
+.root[data-motion="reduce"] .scroll-bottom,
+.root[data-motion="reduce"] .composer-mic.recording {
+  animation: none;
+  transition: none;
 }

@@ -40,19 +40,37 @@ fn state_mark(state: JobState) -> Element {
 /// One row of the panel.
 #[component]
 fn JobRow(item: JobItem, session: Signal<Session>) -> Element {
+    let mut show_detail = use_signal(|| false);
     let trace = item.trace_conversation.clone();
+    let detail = item.detail.clone();
     rsx! {
-        div { class: "{state_class(item.state)}", role: "listitem",
-            span { class: "job-mark", {state_mark(item.state)} }
-            span { class: "job-icon", Icon { name: item.icon().to_owned(), size: 13 } }
-            span { class: "job-title", title: "{item.title}", "{item.title}" }
-            span { class: "job-meta", "{item.bot} \u{b7} {item.state.label()}" }
-            if let Some(conversation) = trace {
-                button {
-                    class: "btn ghost sm job-trace",
-                    title: "Open chat for trace context",
-                    onclick: move |_| session.write().open_conversation(conversation.clone()),
-                    "Trace"
+        div { class: "job-row-wrap", role: "listitem",
+            div { class: "{state_class(item.state)}",
+                span { class: "job-mark", {state_mark(item.state)} }
+                span { class: "job-icon", Icon { name: item.icon().to_owned(), size: 13 } }
+                span { class: "job-title", title: "{item.title}", "{item.title}" }
+                span { class: "job-meta", "{item.bot} \u{b7} {item.state.label()}" }
+                if detail.is_some() {
+                    button {
+                        class: "btn ghost sm job-detail-toggle",
+                        title: if show_detail() { "Hide details" } else { "Show details" },
+                        "aria-expanded": show_detail(),
+                        onclick: move |_| show_detail.toggle(),
+                        if show_detail() { "Less" } else { "Details" }
+                    }
+                }
+                if let Some(conversation) = trace {
+                    button {
+                        class: "btn ghost sm job-trace",
+                        title: "Open chat for trace context",
+                        onclick: move |_| session.write().open_conversation(conversation.clone()),
+                        "Trace"
+                    }
+                }
+            }
+            if show_detail() {
+                if let Some(detail) = detail {
+                    div { class: "job-detail", "{detail}" }
                 }
             }
         }
@@ -75,14 +93,33 @@ pub fn JobsPanel(session: Signal<Session>) -> Element {
             Instant::now(),
         )
     };
+    let active = items.iter().filter(|item| item.is_active()).count();
+    let mut expanded = use_signal(|| active > 0);
+    let mut prev_active = use_signal(|| active);
+    if active != prev_active() {
+        if jobs::should_auto_open(prev_active(), active) {
+            expanded.set(true);
+        }
+        prev_active.set(active);
+    }
     if items.is_empty() {
         return rsx! {};
     }
-    let active = items.iter().filter(|item| item.is_active()).count();
     let headline = jobs::headline(&items);
+    let summary_label = if active > 0 {
+        format!("{headline}, {active} active")
+    } else {
+        headline.clone()
+    };
     rsx! {
-        details { class: "jobs-panel", open: active > 0,
-            summary { class: "jobs-summary", "aria-label": "{headline}",
+        details { class: "jobs-panel", open: expanded(),
+            summary {
+                class: "jobs-summary",
+                "aria-label": "{summary_label}",
+                onclick: move |evt| {
+                    evt.prevent_default();
+                    expanded.toggle();
+                },
                 span { class: if active > 0 { "pill-dot live" } else { "plan-dot" }, "aria-hidden": "true" }
                 span { class: "jobs-headline", "{headline}" }
                 Icon { name: "chevron-right", size: 12 }

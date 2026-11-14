@@ -35,6 +35,9 @@ pub fn SecretField(
     label: String,
     placeholder: String,
     #[props(default = "input".to_owned())] class: String,
+    #[props(default = false)] disabled: bool,
+    #[props(default = false)] invalid: bool,
+    #[props(default)] on_submit: Option<EventHandler<()>>,
 ) -> Element {
     let mut value = value;
     let mut shown = use_signal(|| false);
@@ -52,14 +55,27 @@ pub fn SecretField(
                 r#type: if revealed { "text" } else { "password" },
                 autocomplete: "off",
                 spellcheck: false,
+                disabled,
                 "aria-label": "{label}",
+                "aria-invalid": if invalid { "true" } else { "false" },
                 placeholder: "{placeholder}",
                 value: "{value}",
                 oninput: move |event| value.set(event.value()),
+                onkeydown: move |event: KeyboardEvent| {
+                    if event.key() == Key::Enter
+                        && !disabled
+                        && !event.is_composing()
+                        && let Some(handler) = on_submit
+                    {
+                        event.prevent_default();
+                        handler.call(());
+                    }
+                },
             }
             button {
                 class: "btn ghost sm secret-toggle",
                 r#type: "button",
+                disabled,
                 "aria-pressed": if revealed { "true" } else { "false" },
                 "aria-label": if revealed { "Hide what I typed" } else { "Show what I typed" },
                 title: if revealed { "Hide" } else { "Show" },

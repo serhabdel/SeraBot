@@ -229,6 +229,18 @@ pub fn secret_kind_label(kind: SecretKind) -> &'static str {
     }
 }
 
+/// Short prompt context for a resolved card so the transcript shows what was asked.
+pub fn resolved_prompt(view: &CardView) -> Option<String> {
+    match &view.body {
+        CardBody::Question(question) => Some(question.question.clone()),
+        CardBody::Secret(secret) => Some(format!(
+            "{} ({})",
+            secret.name,
+            secret_kind_label(secret.kind)
+        )),
+    }
+}
+
 /// The line that stands in for a card once it is resolved.
 pub fn resolved_line(view: &CardView) -> String {
     match (&view.body, view.state) {
@@ -391,6 +403,14 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(resolved_line(&declined), "You skipped this question.");
+        assert_eq!(resolved_prompt(&declined).as_deref(), Some("Which format?"));
+
+        let saved_secret =
+            CardView::from_card(&card("secret_request", "answered", secret_payload())).unwrap();
+        assert_eq!(
+            resolved_prompt(&saved_secret).as_deref(),
+            Some("vendor-portal (Password)")
+        );
     }
 
     #[test]

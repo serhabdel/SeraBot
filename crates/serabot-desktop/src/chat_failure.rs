@@ -29,6 +29,18 @@ pub fn classify_send_error(error: &ApiError) -> ChatFailure {
             message: "Can't reach SeraBot. Your message is still in the box. Check the connection, then send it again.".into(),
             action: ChatAction::Retry,
         },
+        ApiError::Http(401 | 403) => ChatFailure {
+            message: "Your session is no longer valid. Your message is still in the box. Reconnect, then send it again.".into(),
+            action: ChatAction::Reconnect,
+        },
+        ApiError::Http(404) => ChatFailure {
+            message: "This conversation could not be found. Your text is still in the box. Try switching chats or starting a new one.".into(),
+            action: ChatAction::None,
+        },
+        ApiError::Http(413) => ChatFailure {
+            message: "That message or attachment is too large for the server. Shorten it or remove a file, then try again.".into(),
+            action: ChatAction::None,
+        },
         ApiError::Http(408 | 504) => ChatFailure {
             message: "The request timed out. Your message is still in the box. Send it again.".into(),
             action: ChatAction::Retry,
@@ -95,7 +107,11 @@ fn keyish(text: &str) -> bool {
 
 fn looks_like_payload(text: &str) -> bool {
     let trimmed = text.trim_start();
-    trimmed.starts_with('{') || trimmed.starts_with('[')
+    let lower = trimmed.to_ascii_lowercase();
+    trimmed.starts_with('{')
+        || trimmed.starts_with('[')
+        || lower.starts_with("<!doctype")
+        || lower.starts_with("<html")
 }
 
 #[cfg(test)]
@@ -141,5 +157,29 @@ mod tests {
         assert_eq!(restore_unsent_draft("already typing", Some("hello")), None);
         assert_eq!(restore_unsent_draft("", Some("  ")), None);
         assert_eq!(restore_unsent_draft("", None), None);
+    }
+
+    #[test]
+    fn auth_size_missing_and_html_errors_map_cleanly() {
+        let auth = classify_send_error(&ApiError::Http(401));
+        assert_eq!(auth.action, ChatAction::Reconnect);
+        assert!(auth.message.contains("still in the box"));
+
+        let forbidden = classify_send_error(&ApiError::Http(403));
+        assert_eq!(forbidden.action, ChatAction::Reconnect);
+
+        let missing = classify_send_error(&ApiError::Http(404));
+        assert_eq!(missing.action, ChatAction::None);
+        assert!(missing.message.contains("not be found"));
+
+        let large = classify_send_error(&ApiError::Http(413));
+        assert_eq!(large.action, ChatAction::None);
+        assert!(large.message.contains("too large"));
+
+        let html = classify_send_error(&ApiError::Rejected(
+            "<!DOCTYPE html><html>502</html>".into(),
+        ));
+        assert_eq!(html.action, ChatAction::Retry);
+        assert!(!html.message.contains('<'));
     }
 }

@@ -13,8 +13,20 @@ pub const MAX_MESSAGE_BYTES: u64 = MAX_ATTACHMENT_BYTES as u64;
 /// The server's limit on message text, in characters.
 pub const MAX_TEXT_CHARS: usize = 8000;
 
-/// Shown under an empty composer. Plain words, no key glyphs.
+/// Shown under an empty composer when Enter sends. Plain words, no key glyphs.
 pub const COMPOSER_HINT: &str = "Enter sends, Shift+Enter adds a line";
+
+/// Shown under an empty composer when Enter inserts a newline.
+pub const COMPOSER_HINT_MOD_ENTER: &str = "Ctrl+Enter sends, Enter adds a line";
+
+/// Hint text matching the owner's Enter-to-send setting.
+pub fn composer_hint(enter_sends_pref: bool) -> &'static str {
+    if enter_sends_pref {
+        COMPOSER_HINT
+    } else {
+        COMPOSER_HINT_MOD_ENTER
+    }
+}
 
 /// Images at most this big get an inline thumbnail. Larger pictures show the
 /// file icon, so the bytes never double in memory for a preview.
@@ -286,6 +298,60 @@ pub fn recall_text(texts: &[&str]) -> Option<String> {
         .map(|text| (*text).to_owned())
 }
 
+/// Which group of slash-picker rows a flattened zero-based index points to:
+/// built-in actions first, then bot skills, then attached tools.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlashPick {
+    Action(usize),
+    Skill(usize),
+    Tool(usize),
+}
+
+/// Map a flattened active index across `(actions, skills, tools)` to the exact
+/// section and local index so highlighting, Arrow keys, Tab and Enter never drift.
+pub fn slash_pick_at(
+    index: usize,
+    actions: usize,
+    skills: usize,
+    tools: usize,
+) -> Option<SlashPick> {
+    if index < actions {
+        Some(SlashPick::Action(index))
+    } else if index < actions + skills {
+        Some(SlashPick::Skill(index - actions))
+    } else if index < actions + skills + tools {
+        Some(SlashPick::Tool(index - actions - skills))
+    } else {
+        None
+    }
+}
+
+/// Format `body` as a markdown blockquote and append it cleanly to `existing`.
+pub fn quote_reply_text(existing: &str, body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return existing.to_owned();
+    }
+    let quoted = trimmed
+        .lines()
+        .map(|line| {
+            let line = line.trim_end();
+            if line.is_empty() {
+                ">".to_owned()
+            } else {
+                format!("> {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let head = existing.trim_end();
+    if head.is_empty() {
+        format!("{quoted}\n\n")
+    } else {
+        format!("{head}\n\n{quoted}\n\n")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,5 +565,31 @@ mod tests {
         );
         assert_eq!(recall_text(&["   "]), None);
         assert_eq!(recall_text(&[]), None);
+    }
+
+    #[test]
+    fn composer_hint_reflects_enter_preference() {
+        assert_eq!(composer_hint(true), COMPOSER_HINT);
+        assert_eq!(composer_hint(false), COMPOSER_HINT_MOD_ENTER);
+    }
+
+    #[test]
+    fn slash_pick_at_maps_actions_skills_and_tools_in_order() {
+        assert_eq!(slash_pick_at(0, 2, 3, 1), Some(SlashPick::Action(0)));
+        assert_eq!(slash_pick_at(1, 2, 3, 1), Some(SlashPick::Action(1)));
+        assert_eq!(slash_pick_at(2, 2, 3, 1), Some(SlashPick::Skill(0)));
+        assert_eq!(slash_pick_at(4, 2, 3, 1), Some(SlashPick::Skill(2)));
+        assert_eq!(slash_pick_at(5, 2, 3, 1), Some(SlashPick::Tool(0)));
+        assert_eq!(slash_pick_at(6, 2, 3, 1), None);
+    }
+
+    #[test]
+    fn quote_reply_formats_multiline_quotes_and_preserves_existing_draft() {
+        assert_eq!(
+            quote_reply_text("", "line 1\n\nline 2"),
+            "> line 1\n>\n> line 2\n\n"
+        );
+        assert_eq!(quote_reply_text("Draft", "quoted"), "Draft\n\n> quoted\n\n");
+        assert_eq!(quote_reply_text("Draft", "   "), "Draft");
     }
 }

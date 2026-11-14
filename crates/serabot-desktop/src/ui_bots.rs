@@ -23,6 +23,7 @@ pub fn AvatarPicker(
     on_clear: EventHandler<()>,
     #[props(default = "Choose image".to_owned())] label: String,
 ) -> Element {
+    let mut size_error = use_signal(|| Option::<String>::None);
     rsx! {
         div { class: "avatar-pick",
             span { class: "avatar xl bot", style: "{style}",
@@ -48,9 +49,10 @@ pub fn AvatarPicker(
                                     };
                                     // Refuse before reading a huge file into memory.
                                     if file.size() > MAX_AVATAR_UPLOAD_BYTES as u64 {
-                                        on_pick.call(vec![0; MAX_AVATAR_UPLOAD_BYTES + 1]);
+                                        size_error.set(Some("Image must be 1 MB or smaller.".into()));
                                         return;
                                     }
+                                    size_error.set(None);
                                     if let Ok(bytes) = file.read_bytes().await {
                                         on_pick.call(bytes.to_vec());
                                     }
@@ -63,12 +65,20 @@ pub fn AvatarPicker(
                     if has_image {
                         button {
                             class: "btn ghost sm",
-                            onclick: move |_| on_clear.call(()),
+                            r#type: "button",
+                            onclick: move |_| {
+                                size_error.set(None);
+                                on_clear.call(());
+                            },
                             "Remove"
                         }
                     }
                 }
-                span { class: "hint", "PNG, JPEG or WebP, up to 1 MB." }
+                if let Some(err) = size_error() {
+                    span { class: "error-text", role: "alert", "{err}" }
+                } else {
+                    span { class: "hint", "PNG, JPEG or WebP, up to 1 MB." }
+                }
             }
         }
     }
@@ -128,6 +138,7 @@ pub fn NewBotSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Elemen
         .unwrap_or_else(|| "B".into());
     let id_preview = preview_id(&name, "bot");
     let can_create = serabot_desktop::valid_display_name(&name);
+    let busy = !session.read().ready();
     rsx! {
         div { class: "scrim open", onclick: move |_| overlay.set(Overlay::None) }
         div {
@@ -162,7 +173,7 @@ pub fn NewBotSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Elemen
                         placeholder: "For example Recruiter",
                         oninput: move |event| session.write().new_bot.name = event.value(),
                         onkeydown: move |event: KeyboardEvent| {
-                            if event.key() == Key::Enter && session.write().submit_new_bot() {
+                            if event.key() == Key::Enter && !event.is_composing() && session.write().submit_new_bot() {
                                 overlay.set(Overlay::None);
                             }
                         },
@@ -225,16 +236,17 @@ pub fn NewBotSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Elemen
                 }
             }
             div { class: "sheet-foot",
-                button { class: "btn ghost", onclick: move |_| overlay.set(Overlay::None), "Cancel" }
+                button { class: "btn ghost", r#type: "button", onclick: move |_| overlay.set(Overlay::None), "Cancel" }
                 button {
                     class: "btn primary",
-                    disabled: !can_create,
+                    r#type: "button",
+                    disabled: !can_create || busy,
                     onclick: move |_| {
                         if session.write().submit_new_bot() {
                             overlay.set(Overlay::None);
                         }
                     },
-                    "Create bot"
+                    if busy { "Creating\u{2026}" } else { "Create bot" }
                 }
             }
         }
@@ -287,7 +299,15 @@ pub fn NewGroupSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Elem
         .unwrap_or_else(|| "G".into());
     let id_preview = preview_id(&name, "group");
     let can_create = serabot_desktop::valid_display_name(&name);
+    let busy = !session.read().ready();
     let count = members.len();
+    let selected_members: Vec<(String, String)> = {
+        let state = session.read();
+        members
+            .iter()
+            .map(|id| (id.clone(), state.bot_display_name(id)))
+            .collect()
+    };
     rsx! {
         div { class: "scrim open", onclick: move |_| overlay.set(Overlay::None) }
         div {
@@ -345,9 +365,38 @@ pub fn NewGroupSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Elem
                 }
                 div { class: "field",
                     label { class: "field-label", "Members" }
-                    span { class: "member-count", "{count} of {MAX_TEAM_MEMBERS} chosen" }
+                    div { class: "row-between",
+                        span { class: "member-count", "{count} of {MAX_TEAM_MEMBERS} chosen" }
+                        if !selected_members.is_empty() {
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                onclick: move |_| session.write().new_group.members.clear(),
+                                "Clear all"
+                            }
+                        }
+                    }
+                    if !selected_members.is_empty() {
+                        div { class: "chips",
+                            for (mid, mlabel) in selected_members {
+                                span { key: "{mid}", class: "chip",
+                                    "{mlabel}"
+                                    button {
+                                        class: "btn ghost sm chip-remove",
+                                        r#type: "button",
+                                        "aria-label": "Remove {mlabel}",
+                                        onclick: move |_| {
+                                            session.write().new_group.members.retain(|m| *m != mid);
+                                        },
+                                        "\u{00d7}"
+                                    }
+                                }
+                            }
+                        }
+                    }
                     input {
                         class: "input",
+                        r#type: "search",
                         placeholder: "Search bots",
                         value: "{query}",
                         oninput: move |event| query.set(event.value()),
@@ -422,16 +471,17 @@ pub fn NewGroupSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Elem
                 }
             }
             div { class: "sheet-foot",
-                button { class: "btn ghost", onclick: move |_| overlay.set(Overlay::None), "Cancel" }
+                button { class: "btn ghost", r#type: "button", onclick: move |_| overlay.set(Overlay::None), "Cancel" }
                 button {
                     class: "btn primary",
-                    disabled: !can_create,
+                    r#type: "button",
+                    disabled: !can_create || busy,
                     onclick: move |_| {
                         if session.write().submit_new_group() {
                             overlay.set(Overlay::None);
                         }
                     },
-                    "Create group"
+                    if busy { "Creating\u{2026}" } else { "Create group" }
                 }
             }
         }
@@ -444,9 +494,11 @@ pub fn NewGroupSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Elem
 #[component]
 pub fn MeetTeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Element {
     let mut overlay = overlay;
-    let (rows, loaded, installing, error) = {
+    let mut query = use_signal(String::new);
+    let needle = query().trim().to_ascii_lowercase();
+    let (rows, total_count, loaded, installing, error) = {
         let state = session.read();
-        let rows = meet_order(&state.state.shipped_bots)
+        let all_rows = meet_order(&state.state.shipped_bots)
             .into_iter()
             .map(|bot| {
                 let name = shipped_label(bot);
@@ -465,8 +517,19 @@ pub fn MeetTeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Elem
                 )
             })
             .collect::<Vec<_>>();
+        let total = all_rows.len();
+        let filtered = all_rows
+            .into_iter()
+            .filter(|(_, name, _, role, desc, _)| {
+                needle.is_empty()
+                    || name.to_ascii_lowercase().contains(&needle)
+                    || role.to_ascii_lowercase().contains(&needle)
+                    || desc.to_ascii_lowercase().contains(&needle)
+            })
+            .collect::<Vec<_>>();
         (
-            rows,
+            filtered,
+            total,
             state.state.shipped_loaded,
             state.state.shipped_installing.clone(),
             state.state.shipped_error.clone(),
@@ -495,16 +558,28 @@ pub fn MeetTeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Elem
             }
             div { class: "sheet-body",
                 p { class: "hint", "The bots SeraBot ships. Each one you add becomes your own bot." }
+                if total_count > 3 {
+                    input {
+                        class: "input",
+                        r#type: "search",
+                        placeholder: "Search shipped bots\u{2026}",
+                        "aria-label": "Search shipped bots",
+                        value: "{query}",
+                        oninput: move |e| query.set(e.value()),
+                    }
+                }
                 if let Some(message) = error {
                     div { class: "banner err", span { "{message}" } }
                 }
                 if !loaded {
                     div { class: "row",
                         span { class: "spinner", title: "Loading the team" }
-                        span { class: "hint", "Loading the team…" }
+                        span { class: "hint", "Loading the team\u{2026}" }
                     }
-                } else if rows.is_empty() {
+                } else if total_count == 0 {
                     p { class: "hint", "No shipped bots are available on this server." }
+                } else if rows.is_empty() {
+                    p { class: "hint", "No shipped bots match \"{query}\"." }
                 }
                 div { class: "roster",
                     for (id, name, letter, role, description, installed) in rows {
@@ -518,17 +593,32 @@ pub fn MeetTeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Elem
                                 }
                             }
                             if installed {
-                                span { class: "chip ok", "In your team" }
+                                div { class: "row-actions",
+                                    span { class: "chip ok", "In your team" }
+                                    button {
+                                        class: "btn ghost sm",
+                                        r#type: "button",
+                                        onclick: {
+                                            let id = id.clone();
+                                            move |_| {
+                                                overlay.set(Overlay::None);
+                                                session.write().open_bot_chat(id.clone());
+                                            }
+                                        },
+                                        "Chat"
+                                    }
+                                }
                             } else {
                                 button {
                                     class: "btn primary sm",
+                                    r#type: "button",
                                     disabled: installing.is_some(),
                                     onclick: {
                                         let id = id.clone();
                                         move |_| session.write().install_shipped_bot(id.clone())
                                     },
                                     if installing.as_deref() == Some(id.as_str()) {
-                                        "Adding…"
+                                        "Adding\u{2026}"
                                     } else {
                                         "Add to my team"
                                     }
@@ -539,7 +629,7 @@ pub fn MeetTeamSheet(session: Signal<Session>, overlay: Signal<Overlay>) -> Elem
                 }
             }
             div { class: "sheet-foot",
-                button { class: "btn ghost", onclick: move |_| overlay.set(Overlay::None), "Done" }
+                button { class: "btn ghost", r#type: "button", onclick: move |_| overlay.set(Overlay::None), "Done" }
             }
         }
     }
@@ -557,9 +647,20 @@ pub fn OnboardingView(session: Signal<Session>) -> Element {
         )
     };
     let (bot, input, waiting, error) = ui;
-    let (name, avatar) = {
+    let (name, avatar, user_initial) = {
         let state = session.read();
-        (state.bot_display_name(&bot), state.bot_avatar(&bot))
+        let initial = state
+            .state
+            .user
+            .as_ref()
+            .and_then(|u| u.label().chars().next())
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "Y".into());
+        (
+            state.bot_display_name(&bot),
+            state.bot_avatar(&bot),
+            initial,
+        )
     };
     let (lines, can_confirm, done) = {
         let state = session.read();
@@ -614,7 +715,7 @@ pub fn OnboardingView(session: Signal<Session>) -> Element {
                                 span {
                                     class: if user { "msg-avatar avatar user" } else { "msg-avatar avatar bot" },
                                     style: if user { String::new() } else { avatar_style(&bot) },
-                                    if user { "Y" } else { "{avatar}" }
+                                    if user { "{user_initial}" } else { "{avatar}" }
                                 }
                                 div { class: "msg-main",
                                     if !user {
@@ -671,21 +772,26 @@ pub fn OnboardingView(session: Signal<Session>) -> Element {
                             div { class: "composer",
                                 textarea {
                                     class: "composer-input",
-                                    rows: 1,
+                                    rows: "{input.lines().count().clamp(1, 5)}",
                                     "aria-label": "Your answer",
                                     value: "{input}",
                                     placeholder: "Answer {name}",
                                     disabled: waiting,
                                     oninput: move |event| session.write().onboarding_ui.input = event.value(),
                                     onkeydown: move |event: KeyboardEvent| {
-                                        if event.key() == Key::Enter && !event.modifiers().contains(Modifiers::SHIFT) {
+                                        if event.key() == Key::Enter
+                                            && !event.is_composing()
+                                            && !event.modifiers().contains(Modifiers::SHIFT)
+                                        {
                                             event.prevent_default();
                                             session.write().send_onboarding_reply();
                                         }
                                     },
                                 }
                                 div { class: "composer-row",
-                                    div { class: "team-row" }
+                                    div { class: "team-row",
+                                        span { class: "hint", "Enter to send · Shift+Enter for new line" }
+                                    }
                                     div { class: "composer-actions",
                                         button {
                                             class: "btn primary send-btn",
@@ -713,11 +819,20 @@ pub fn OnboardingView(session: Signal<Session>) -> Element {
 #[component]
 pub fn CapabilityToggles(session: Signal<Session>, bot: String) -> Element {
     let _ = &bot;
+    let mut filter = use_signal(String::new);
     let tools = session.read().bot_settings.draft.tools.clone();
     let hydrated = session.read().bot_settings.hydrated;
+    let needle = filter().trim().to_ascii_lowercase();
     let mut last_group = "";
     let mut rows = Vec::new();
     for (index, capability) in capabilities::CAPABILITIES.iter().enumerate() {
+        if !needle.is_empty()
+            && !capability.label.to_ascii_lowercase().contains(&needle)
+            && !capability.hint.to_ascii_lowercase().contains(&needle)
+            && !capability.group.to_ascii_lowercase().contains(&needle)
+        {
+            continue;
+        }
         let heading = (capability.group != last_group).then_some(capability.group);
         last_group = capability.group;
         rows.push((
@@ -732,7 +847,25 @@ pub fn CapabilityToggles(session: Signal<Session>, bot: String) -> Element {
     let raw = tools.clone();
     let uncovered = capabilities::uncovered(&tools);
     rsx! {
+        div { class: "cap-filter",
+            input {
+                class: "input",
+                r#type: "search",
+                placeholder: "Filter abilities\u{2026}",
+                "aria-label": "Filter abilities",
+                value: "{filter}",
+                oninput: move |e| filter.set(e.value()),
+                onkeydown: move |e: KeyboardEvent| {
+                    if e.key() == Key::Escape {
+                        filter.set(String::new());
+                    }
+                },
+            }
+        }
         div { class: "cap-list",
+            if rows.is_empty() {
+                p { class: "hint", "No abilities match \"{filter}\"." }
+            }
             for (index, heading, label, hint, on, missing) in rows {
                 if let Some(heading) = heading {
                     h3 { key: "h{index}", class: "cap-group", "{heading}" }
