@@ -6,14 +6,15 @@
 //! available instead of guessed.
 
 use dioxus::prelude::*;
-use serabot_desktop::UsageReport;
 use serabot_desktop::pc_stats::FoldersSize;
 use serabot_desktop::session::{Session, humanize_label};
 use serabot_desktop::status_view::{
     Health, bar_percent, format_bytes, format_percent, format_uptime, health, member_label, percent,
 };
 use serabot_desktop::theme::{Level, Tone};
+use serabot_desktop::{UsageBucket, UsageModel, UsageReport};
 
+use crate::ui::{Icon, human_provider};
 use crate::ui_widgets::{LevelChip, StatusChip};
 
 /// How often the health cards refresh while the Usage page is open.
@@ -68,14 +69,128 @@ pub fn chart_bars(report: &UsageReport) -> Vec<(String, i64, u32)> {
         .collect()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UsageSort {
+    TokensDesc,
+    CallsDesc,
+    NameAsc,
+}
+
+fn cmp_usage_row(
+    a_tokens: i64,
+    a_calls: i64,
+    a_name: &str,
+    b_tokens: i64,
+    b_calls: i64,
+    b_name: &str,
+    sort: UsageSort,
+) -> std::cmp::Ordering {
+    match sort {
+        UsageSort::TokensDesc => b_tokens
+            .cmp(&a_tokens)
+            .then_with(|| b_calls.cmp(&a_calls))
+            .then_with(|| a_name.cmp(b_name)),
+        UsageSort::CallsDesc => b_calls
+            .cmp(&a_calls)
+            .then_with(|| b_tokens.cmp(&a_tokens))
+            .then_with(|| a_name.cmp(b_name)),
+        UsageSort::NameAsc => a_name
+            .to_ascii_lowercase()
+            .cmp(&b_name.to_ascii_lowercase()),
+    }
+}
+
+fn filter_sort_models(rows: &[UsageModel], query: &str, sort: UsageSort) -> Vec<UsageModel> {
+    let needle = query.trim().to_ascii_lowercase();
+    let mut out: Vec<UsageModel> = rows
+        .iter()
+        .filter(|row| {
+            needle.is_empty()
+                || row.provider.to_ascii_lowercase().contains(&needle)
+                || row.model.to_ascii_lowercase().contains(&needle)
+                || human_provider(&row.provider)
+                    .to_ascii_lowercase()
+                    .contains(&needle)
+        })
+        .cloned()
+        .collect();
+    out.sort_by(|a, b| {
+        let a_key = format!("{}/{}", a.provider, a.model);
+        let b_key = format!("{}/{}", b.provider, b.model);
+        cmp_usage_row(
+            a.total_tokens,
+            a.calls,
+            &a_key,
+            b.total_tokens,
+            b.calls,
+            &b_key,
+            sort,
+        )
+    });
+    out
+}
+
+fn filter_sort_bots(rows: &[UsageBucket], query: &str, sort: UsageSort) -> Vec<UsageBucket> {
+    let needle = query.trim().to_ascii_lowercase();
+    let mut out: Vec<UsageBucket> = rows
+        .iter()
+        .filter(|row| {
+            let bot = row.bot.as_deref().unwrap_or_default();
+            needle.is_empty()
+                || bot.to_ascii_lowercase().contains(&needle)
+                || humanize_label(bot).to_ascii_lowercase().contains(&needle)
+        })
+        .cloned()
+        .collect();
+    out.sort_by(|a, b| {
+        let a_bot = a.bot.as_deref().unwrap_or_default();
+        let b_bot = b.bot.as_deref().unwrap_or_default();
+        cmp_usage_row(
+            a.total_tokens,
+            a.calls,
+            a_bot,
+            b.total_tokens,
+            b.calls,
+            b_bot,
+            sort,
+        )
+    });
+    out
+}
+
+fn chart_axis_summary(bars: &[(String, i64, u32)]) -> (String, String, String) {
+    let Some(first) = bars.first() else {
+        return (String::new(), "Peak 0 tokens".to_owned(), String::new());
+    };
+    let last = bars.last().unwrap_or(first);
+    let peak = bars.iter().map(|(_, tokens, _)| *tokens).max().unwrap_or(0);
+    (
+        first.0.clone(),
+        format!("Peak {} tokens", group_digits(peak)),
+        if last.0 == first.0 {
+            String::new()
+        } else {
+            last.0.clone()
+        },
+    )
+}
+
 #[component]
 pub fn UsagePage(session: Signal<Session>) -> Element {
     let mut session = session;
-    let (days, loading, report) = {
+    let mut filter = use_signal(String::new);
+    let mut sort_by = use_signal(|| UsageSort::TokensDesc);
+    let (days, loading, report, error) = {
         let s = session.read();
-        (s.usage_days, s.usage_loading, s.state.usage.clone())
+        (
+            s.usage_days,
+            s.usage_loading,
+            s.state.usage.clone(),
+            s.state.error.clone(),
+        )
     };
     let bars = report.as_ref().map(chart_bars).unwrap_or_default();
+    let (axis_start, axis_peak, axis_end) = chart_axis_summary(&bars);
     let tool_runs: i64 = report
         .as_ref()
         .map(|report| report.tools.iter().map(|t| t.completed + t.failed).sum())
@@ -83,6 +198,15 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
     let empty = report
         .as_ref()
         .is_some_and(|report| report.totals.calls == 0);
+    let filter_text = filter.read().clone();
+    let model_rows = report
+        .as_ref()
+        .map(|r| filter_sort_models(&r.per_model, &filter_text, sort_by()))
+        .unwrap_or_default();
+    let bot_rows = report
+        .as_ref()
+        .map(|r| filter_sort_bots(&r.per_bot, &filter_text, sort_by()))
+        .unwrap_or_default();
     let is_admin = session.read().is_admin();
     // Refresh the health cards every 30 s, only while this page is open
     // (the future ends when the page is left).
@@ -108,6 +232,7 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                         button {
                             key: "{value}",
                             class: if days == value { "seg-btn active" } else { "seg-btn" },
+                            r#type: "button",
                             "aria-pressed": if days == value { "true" } else { "false" },
                             disabled: loading,
                             onclick: move |_| session.write().load_usage_days(value),
@@ -136,7 +261,7 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                 }
                 h2 { class: "usage-section-title", "Activity" }
                 if loading && report.is_none() {
-                    p { class: "caption", "Loading your usage…" }
+                    p { class: "caption", role: "status", "Loading your usage\u{2026}" }
                 } else if let Some(report) = report {
                     if empty {
                         div { class: "card",
@@ -173,14 +298,65 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                                     span { class: "spinner", title: "Refreshing" }
                                 }
                             }
-                            div { class: "usage-chart", role: "img", "aria-label": "Tokens used per day",
-                                for (day, tokens, height) in bars {
-                                    div {
-                                        key: "{day}",
-                                        class: "usage-bar-col",
-                                        title: "{day}: {group_digits(tokens)} tokens",
-                                        div { class: "usage-bar", style: "height: {height}%;" }
+                            if bars.is_empty() {
+                                p { class: "tiny", "No daily breakdown reported for this period." }
+                            } else {
+                                div { class: "usage-chart-wrap",
+                                    div { class: "usage-chart", role: "img", "aria-label": "Tokens used per day",
+                                        for (day, tokens, height) in bars {
+                                            div {
+                                                key: "{day}",
+                                                class: "usage-bar-col",
+                                                title: "{day}: {group_digits(tokens)} tokens",
+                                                div { class: "usage-bar", style: "height: {height}%;" }
+                                            }
+                                        }
                                     }
+                                    div { class: "usage-chart-axis",
+                                        span { "{axis_start}" }
+                                        span { "{axis_peak}" }
+                                        span { "{axis_end}" }
+                                    }
+                                }
+                            }
+                        }
+                        div { class: "usage-toolbar",
+                            div { class: "search-wrap",
+                                input {
+                                    class: "input",
+                                    r#type: "search",
+                                    placeholder: "Filter models or bots\u{2026}",
+                                    "aria-label": "Filter usage tables",
+                                    value: "{filter}",
+                                    oninput: move |event| filter.set(event.value()),
+                                }
+                                if !filter.read().trim().is_empty() {
+                                    button {
+                                        class: "btn ghost sm",
+                                        r#type: "button",
+                                        onclick: move |_| filter.set(String::new()),
+                                        "Clear"
+                                    }
+                                }
+                            }
+                            div { class: "seg", role: "group", "aria-label": "Sort usage rows",
+                                button {
+                                    class: if sort_by() == UsageSort::TokensDesc { "seg-btn active" } else { "seg-btn" },
+                                    r#type: "button",
+                                    onclick: move |_| sort_by.set(UsageSort::TokensDesc),
+                                    "By tokens"
+                                }
+                                button {
+                                    class: if sort_by() == UsageSort::CallsDesc { "seg-btn active" } else { "seg-btn" },
+                                    r#type: "button",
+                                    onclick: move |_| sort_by.set(UsageSort::CallsDesc),
+                                    "By replies"
+                                }
+                                button {
+                                    class: if sort_by() == UsageSort::NameAsc { "seg-btn active" } else { "seg-btn" },
+                                    r#type: "button",
+                                    onclick: move |_| sort_by.set(UsageSort::NameAsc),
+                                    "Name"
                                 }
                             }
                         }
@@ -188,20 +364,34 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                             div { class: "card-head",
                                 h3 { class: "card-title", "By model" }
                             }
-                            table { class: "usage-table",
-                                thead {
-                                    tr {
-                                        th { "Model" }
-                                        th { class: "num", "Replies" }
-                                        th { class: "num", "Tokens" }
+                            if model_rows.is_empty() {
+                                p { class: "tiny",
+                                    if filter.read().trim().is_empty() {
+                                        "No per-model breakdown reported for this period."
+                                    } else {
+                                        "No models match \u{201c}{filter}\u{201d}."
                                     }
                                 }
-                                tbody {
-                                    for row in report.per_model.clone() {
-                                        tr { key: "{row.provider}/{row.model}",
-                                            td { "{row.model}" }
-                                            td { class: "num", "{group_digits(row.calls)}" }
-                                            td { class: "num", "{group_digits(row.total_tokens)}" }
+                            } else {
+                                div { class: "usage-table-wrap",
+                                    table { class: "usage-table",
+                                        thead {
+                                            tr {
+                                                th { "Provider" }
+                                                th { "Model" }
+                                                th { class: "num", "Replies" }
+                                                th { class: "num", "Tokens" }
+                                            }
+                                        }
+                                        tbody {
+                                            for row in model_rows {
+                                                tr { key: "{row.provider}/{row.model}",
+                                                    td { "{human_provider(&row.provider)}" }
+                                                    td { "{row.model}" }
+                                                    td { class: "num", "{group_digits(row.calls)}" }
+                                                    td { class: "num", "{group_digits(row.total_tokens)}" }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -211,20 +401,32 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                             div { class: "card-head",
                                 h3 { class: "card-title", "By bot" }
                             }
-                            table { class: "usage-table",
-                                thead {
-                                    tr {
-                                        th { "Bot" }
-                                        th { class: "num", "Replies" }
-                                        th { class: "num", "Tokens" }
+                            if bot_rows.is_empty() {
+                                p { class: "tiny",
+                                    if filter.read().trim().is_empty() {
+                                        "No per-bot breakdown reported for this period."
+                                    } else {
+                                        "No bots match \u{201c}{filter}\u{201d}."
                                     }
                                 }
-                                tbody {
-                                    for row in report.per_bot.clone() {
-                                        tr { key: "{row.bot.clone().unwrap_or_default()}",
-                                            td { "{humanize_label(&row.bot.clone().unwrap_or_default())}" }
-                                            td { class: "num", "{group_digits(row.calls)}" }
-                                            td { class: "num", "{group_digits(row.total_tokens)}" }
+                            } else {
+                                div { class: "usage-table-wrap",
+                                    table { class: "usage-table",
+                                        thead {
+                                            tr {
+                                                th { "Bot" }
+                                                th { class: "num", "Replies" }
+                                                th { class: "num", "Tokens" }
+                                            }
+                                        }
+                                        tbody {
+                                            for row in bot_rows {
+                                                tr { key: "{row.bot.clone().unwrap_or_default()}",
+                                                    td { "{humanize_label(&row.bot.clone().unwrap_or_default())}" }
+                                                    td { class: "num", "{group_digits(row.calls)}" }
+                                                    td { class: "num", "{group_digits(row.total_tokens)}" }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -232,7 +434,20 @@ pub fn UsagePage(session: Signal<Session>) -> Element {
                         }
                     }
                 } else {
-                    p { class: "caption", "Usage could not be loaded. Pick a period to try again." }
+                    div { class: "card",
+                        p { class: "field-error", role: "alert",
+                            "{error.as_deref().unwrap_or(\"Usage could not be loaded.\")}"
+                        }
+                        div { class: "card-actions",
+                            button {
+                                class: "btn sm",
+                                r#type: "button",
+                                onclick: move |_| session.write().load_usage_days(days),
+                                Icon { name: "refresh", size: 14 }
+                                "Retry"
+                            }
+                        }
+                    }
                 }
                 h2 { class: "usage-section-title", "This computer" }
                 ThisPcCard { session }
@@ -611,6 +826,13 @@ fn ThisPcCard(session: Signal<Session>) -> Element {
                     h3 { class: "card-title", "This PC" }
                     p { class: "tiny", "What SeraBot uses on this computer." }
                 }
+                button {
+                    class: "btn ghost sm",
+                    r#type: "button",
+                    onclick: move |_| session.read().refresh_pc(),
+                    Icon { name: "refresh", size: 14 }
+                    "Refresh"
+                }
             }
             div { class: "health-summary",
                 HealthItem {
@@ -722,5 +944,54 @@ mod tests {
         assert_eq!(bars[1].2, 100);
         assert_eq!(bars[2].2, 0);
         assert!(chart_bars(&UsageReport::default()).is_empty());
+        assert_eq!(
+            chart_axis_summary(&bars),
+            (
+                "2026-01-01".into(),
+                "Peak 100 tokens".into(),
+                "2026-01-03".into()
+            )
+        );
+    }
+
+    #[test]
+    fn filter_and_sort_buckets_works_for_models_and_bots() {
+        let model = |provider: &str, name: &str, calls: i64, tokens: i64| UsageModel {
+            provider: provider.into(),
+            model: name.into(),
+            calls,
+            total_tokens: tokens,
+            ..UsageModel::default()
+        };
+        let rows = vec![
+            model("openai", "gpt-5", 2, 100),
+            model("mistral", "mistral-large", 5, 50),
+            model("anthropic", "claude-sonnet", 1, 300),
+        ];
+        let by_calls = filter_sort_models(&rows, "", UsageSort::CallsDesc);
+        assert_eq!(by_calls[0].model, "mistral-large");
+        let filtered = filter_sort_models(&rows, "mistral", UsageSort::TokensDesc);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].provider, "mistral");
+        let by_name = filter_sort_models(&rows, "", UsageSort::NameAsc);
+        assert_eq!(by_name[0].provider, "anthropic");
+
+        let bots = vec![
+            UsageBucket {
+                bot: Some("research".into()),
+                calls: 3,
+                total_tokens: 90,
+                ..UsageBucket::default()
+            },
+            UsageBucket {
+                bot: Some("analyst".into()),
+                calls: 1,
+                total_tokens: 200,
+                ..UsageBucket::default()
+            },
+        ];
+        let sorted_bots = filter_sort_bots(&bots, "ana", UsageSort::TokensDesc);
+        assert_eq!(sorted_bots.len(), 1);
+        assert_eq!(sorted_bots[0].bot.as_deref(), Some("analyst"));
     }
 }

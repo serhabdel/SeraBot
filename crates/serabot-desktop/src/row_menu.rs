@@ -118,6 +118,20 @@ pub fn header_actions(kind: &RowKind, pinned: bool) -> Vec<RowAction> {
         .collect()
 }
 
+/// Computes the next focused index in a menu of `len` enabled items when
+/// moving by `step` (+1 for ArrowDown, -1 for ArrowUp), wrapping around.
+pub fn next_menu_index(current: Option<usize>, len: usize, step: isize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let idx = match current {
+        Some(i) if i < len => i as isize + step,
+        _ if step >= 0 => 0,
+        _ => len as isize - 1,
+    };
+    Some(idx.rem_euclid(len as isize) as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +220,15 @@ mod tests {
             assert!(!action.label().is_empty());
             assert!(!action.icon().is_empty());
         }
+    }
+
+    #[test]
+    fn next_menu_index_wraps_both_ways() {
+        assert_eq!(next_menu_index(None, 0, 1), None);
+        assert_eq!(next_menu_index(None, 3, 1), Some(0));
+        assert_eq!(next_menu_index(None, 3, -1), Some(2));
+        assert_eq!(next_menu_index(Some(2), 3, 1), Some(0));
+        assert_eq!(next_menu_index(Some(0), 3, -1), Some(2));
+        assert_eq!(next_menu_index(Some(1), 3, 1), Some(2));
     }
 }

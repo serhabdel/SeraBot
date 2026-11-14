@@ -251,7 +251,8 @@ fn ProfilePicker(session: Signal<Session>, current: String) -> Element {
 #[component]
 fn BrowserGrid(session: Signal<Session>) -> Element {
     let mut session = session;
-    let (cards, loaded, idle_ttl, helpers, idle_profiles) = {
+    let mut query = use_signal(String::new);
+    let (cards, loaded, idle_ttl, helpers, idle_profiles, browser_error) = {
         let s = session.read();
         let cards: Vec<Card> = s
             .panel
@@ -280,7 +281,36 @@ fn BrowserGrid(session: Signal<Session>) -> Element {
             s.panel.idle_timeout_secs,
             s.panel.signin_helpers.clone(),
             idle_profiles,
+            s.panel.browser_error.clone(),
         )
+    };
+    let needle = query.read().trim().to_ascii_lowercase();
+    let visible_cards: Vec<Card> = if needle.is_empty() {
+        cards.clone()
+    } else {
+        cards
+            .iter()
+            .filter(|(info, _, bot)| {
+                info.profile_name.to_ascii_lowercase().contains(&needle)
+                    || info
+                        .url
+                        .as_deref()
+                        .is_some_and(|u| u.to_ascii_lowercase().contains(&needle))
+                    || bot
+                        .as_ref()
+                        .is_some_and(|(_, name)| name.to_ascii_lowercase().contains(&needle))
+            })
+            .cloned()
+            .collect()
+    };
+    let visible_idle: Vec<(String, String)> = if needle.is_empty() {
+        idle_profiles.clone()
+    } else {
+        idle_profiles
+            .iter()
+            .filter(|(_, name)| name.to_ascii_lowercase().contains(&needle))
+            .cloned()
+            .collect()
     };
     rsx! {
         div { class: "pane browser-page",
@@ -292,6 +322,29 @@ fn BrowserGrid(session: Signal<Session>) -> Element {
                 }
             }
             div { class: "pane-body",
+                if let Some(err) = browser_error {
+                    div { class: "banner err", role: "alert", span { "{err}" } }
+                }
+                if loaded && (cards.len() + idle_profiles.len() > 1) {
+                    div { class: "search-wrap",
+                        input {
+                            class: "input",
+                            r#type: "search",
+                            placeholder: "Filter browsers by profile, site, or bot\u{2026}",
+                            "aria-label": "Filter browsers",
+                            value: "{query}",
+                            oninput: move |event| query.set(event.value()),
+                        }
+                        if !needle.is_empty() {
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                onclick: move |_| query.set(String::new()),
+                                "Clear"
+                            }
+                        }
+                    }
+                }
                 if !loaded {
                     div { class: "browser-grid", "aria-busy": "true",
                         div { class: "browser-card skeleton-card", div { class: "skeleton block", " " } }
@@ -303,9 +356,11 @@ fn BrowserGrid(session: Signal<Session>) -> Element {
                         h2 { class: "empty-title", "No browser is running." }
                         p { class: "empty-text", "Open one from the list below, or ask a bot to open a website." }
                     }
+                } else if visible_cards.is_empty() {
+                    p { class: "hint", "No running browsers match \u{201c}{query}\u{201d}." }
                 } else {
                     div { class: "browser-grid",
-                        for (info, shot, bot) in cards {
+                        for (info, shot, bot) in visible_cards {
                             {
                                 let (pill, label) = controller_pill(info.controller);
                                 let host = host_label(info.url.as_deref());
@@ -365,14 +420,14 @@ fn BrowserGrid(session: Signal<Session>) -> Element {
                         }
                     }
                 }
-                if !idle_profiles.is_empty() {
+                if !visible_idle.is_empty() {
                     section { class: "browser-ready", "aria-label": "Browsers ready to open",
                         h2 { class: "pane-subtitle", "Ready to open" }
                         p { class: "muted",
                             "Opening a browser starts it here. A bot can also start one when it needs it."
                         }
                         div { class: "browser-grid",
-                            for (id, name) in idle_profiles.clone() {
+                            for (id, name) in visible_idle.clone() {
                                 div { key: "{id}", class: "browser-card browser-card-idle",
                                     div { class: "browser-card-copy",
                                         strong { class: "browser-profile", "{name}" }
@@ -446,6 +501,8 @@ fn ProfilesSection(session: Signal<Session>) -> Element {
             div { class: "profile-list",
                 if !loaded {
                     div { class: "skeleton row", " " }
+                } else if rows.is_empty() {
+                    p { class: "hint", "No profiles yet." }
                 }
                 for (profile, users) in rows {
                     {
@@ -567,8 +624,11 @@ fn ProfilesSection(session: Signal<Session>) -> Element {
                 class: "profile-add",
                 onsubmit: move |event| {
                     event.prevent_default();
-                    session.write().panel.create_profile(&new_name());
-                    new_name.set(String::new());
+                    let candidate = new_name();
+                    session.write().panel.create_profile(&candidate);
+                    if session.read().panel.profiles_error.is_none() {
+                        new_name.set(String::new());
+                    }
                 },
                 input {
                     class: "input",
@@ -741,29 +801,63 @@ fn FocusView(session: Signal<Session>, overlay: Signal<Overlay>, id: String) -> 
                                     opening.set(false);
                                 },
                                 oninput: move |event| draft.set(event.value()),
-                                onkeydown: move |event: KeyboardEvent| {
-                                    event.stop_propagation();
-                                    if event.key() == Key::Escape {
-                                        opening.set(false);
-                                    } else if event.key() == Key::Enter && opening() {
-                                        if session.write().panel.open_tab(&draft()) {
+                                onkeydown: {
+                                    let url_reset = url.clone();
+                                    move |event: KeyboardEvent| {
+                                        event.stop_propagation();
+                                        if event.key() == Key::Escape {
                                             opening.set(false);
                                             editing.set(false);
-                                        } else {
-                                            session.write().panel.browser_error = Some("Enter a web address.".into());
-                                        }
-                                    } else if event.key() == Key::Enter {
-                                        match address_to_url(&draft()) {
-                                            Some(url) => {
-                                                session.write().panel.send_input(BrowserInput::Navigate { url });
+                                            draft.set(url_reset.clone());
+                                            session.write().panel.browser_error = None;
+                                        } else if event.key() == Key::Enter && opening() {
+                                            if session.write().panel.open_tab(&draft()) {
+                                                opening.set(false);
                                                 editing.set(false);
-                                            }
-                                            None => {
+                                            } else {
                                                 session.write().panel.browser_error = Some("Enter a web address.".into());
+                                            }
+                                        } else if event.key() == Key::Enter {
+                                            match address_to_url(&draft()) {
+                                                Some(url) => {
+                                                    session.write().panel.send_input(BrowserInput::Navigate { url });
+                                                    editing.set(false);
+                                                }
+                                                None => {
+                                                    session.write().panel.browser_error = Some("Enter a web address.".into());
+                                                }
                                             }
                                         }
                                     }
                                 },
+                            }
+                            if editing() {
+                                button {
+                                    class: "btn ghost sm",
+                                    r#type: "button",
+                                    onmousedown: move |event| event.prevent_default(),
+                                    onclick: move |_| {
+                                        if opening() {
+                                            if session.write().panel.open_tab(&draft()) {
+                                                opening.set(false);
+                                                editing.set(false);
+                                            } else {
+                                                session.write().panel.browser_error = Some("Enter a web address.".into());
+                                            }
+                                        } else {
+                                            match address_to_url(&draft()) {
+                                                Some(url) => {
+                                                    session.write().panel.send_input(BrowserInput::Navigate { url });
+                                                    editing.set(false);
+                                                }
+                                                None => {
+                                                    session.write().panel.browser_error = Some("Enter a web address.".into());
+                                                }
+                                            }
+                                        }
+                                    },
+                                    "Go"
+                                }
                             }
                         }
                     }

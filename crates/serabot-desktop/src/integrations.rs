@@ -272,15 +272,20 @@ pub fn installed(
 }
 
 /// Whether a card matches the search text. Case-insensitive; an empty search
-/// matches every card.
+/// matches every card. Also matches the connector's suite title (e.g. "Google").
 pub fn matches(entry: &Entry, query: &str) -> bool {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
         return true;
     }
-    [&entry.name, &entry.blurb, &entry.meta, &entry.pill]
-        .iter()
-        .any(|text| text.to_lowercase().contains(&needle))
+    let suite_match = match &entry.source {
+        Source::Connector(id) => suite_of(id).to_lowercase().contains(&needle),
+        Source::Plugin(_) => false,
+    };
+    suite_match
+        || [&entry.name, &entry.blurb, &entry.meta, &entry.pill]
+            .iter()
+            .any(|text| text.to_lowercase().contains(&needle))
 }
 
 #[cfg(test)]
@@ -409,13 +414,18 @@ mod tests {
     }
 
     #[test]
-    fn search_matches_name_blurb_and_meta_ignoring_case() {
+    fn search_matches_name_blurb_meta_and_suite_ignoring_case() {
         let entry = connector_entry(&personal("gmail", "ready"), None);
         assert!(matches(&entry, ""));
         assert!(matches(&entry, "  MAIL "));
         assert!(matches(&entry, "read and send"));
         assert!(matches(&entry, "your account"));
+        assert!(matches(&entry, "google"));
         assert!(!matches(&entry, "calendar"));
+
+        let onedrive = connector_entry(&personal("onedrive", "ready"), None);
+        assert!(matches(&onedrive, "microsoft"));
+        assert!(!matches(&onedrive, "voice"));
     }
 
     #[test]

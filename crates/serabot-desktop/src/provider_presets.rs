@@ -41,6 +41,76 @@ pub struct ProviderPreset {
     pub sign_in: &'static str,
 }
 
+/// Filter tabs for the Provider Directory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DirectoryFilter {
+    #[default]
+    All,
+    ApiKey,
+    OAuth,
+    Local,
+    Connected,
+}
+
+impl DirectoryFilter {
+    pub const ALL: [Self; 5] = [
+        Self::All,
+        Self::ApiKey,
+        Self::OAuth,
+        Self::Local,
+        Self::Connected,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::ApiKey => "API Key",
+            Self::OAuth => "OAuth",
+            Self::Local => "Local",
+            Self::Connected => "Connected",
+        }
+    }
+}
+
+/// Whether a configured provider id/kind matches `preset`.
+pub fn provider_matches_preset(
+    provider_id: &str,
+    provider_kind: &str,
+    preset: &ProviderPreset,
+) -> bool {
+    provider_id == preset.id || (provider_kind == preset.kind && preset.kind != "openai-compatible")
+}
+
+/// Filter `presets()` by search query and directory filter.
+pub fn filter_presets(
+    query: &str,
+    filter: DirectoryFilter,
+    is_connected: impl Fn(&ProviderPreset) -> bool,
+) -> Vec<&'static ProviderPreset> {
+    let needle = query.trim().to_lowercase();
+    PRESETS
+        .iter()
+        .filter(|preset| match filter {
+            DirectoryFilter::All => true,
+            DirectoryFilter::ApiKey => preset.auth == "api_key",
+            DirectoryFilter::OAuth => preset.auth == "oauth" || !preset.sign_in.is_empty(),
+            DirectoryFilter::Local => preset.auth == "none",
+            DirectoryFilter::Connected => is_connected(preset),
+        })
+        .filter(|preset| {
+            needle.is_empty()
+                || preset.label.to_lowercase().contains(&needle)
+                || preset.subtitle.to_lowercase().contains(&needle)
+                || preset.kind.to_lowercase().contains(&needle)
+                || preset.id.to_lowercase().contains(&needle)
+                || preset
+                    .models
+                    .iter()
+                    .any(|m| m.to_lowercase().contains(&needle))
+        })
+        .collect()
+}
+
 const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "antigravity",
@@ -631,5 +701,31 @@ mod tests {
             assert_eq!((preset.auth, preset.sign_in), ("api_key", ""), "{id}");
         }
         assert_eq!(preset_for("ollama").unwrap().auth, "none");
+    }
+
+    #[test]
+    fn directory_filters_and_search_cover_presets() {
+        let all = filter_presets("", DirectoryFilter::All, |_| false);
+        assert_eq!(all.len(), presets().len());
+
+        let local = filter_presets("", DirectoryFilter::Local, |_| false);
+        assert!(local.iter().all(|p| p.auth == "none"));
+        assert!(local.iter().any(|p| p.id == "ollama"));
+
+        let oauth = filter_presets("", DirectoryFilter::OAuth, |_| false);
+        assert!(oauth.iter().any(|p| p.id == "antigravity"));
+        assert!(oauth.iter().any(|p| p.id == "openrouter"));
+
+        let connected = filter_presets("", DirectoryFilter::Connected, |p| p.id == "openai");
+        assert_eq!(connected.len(), 1);
+        assert_eq!(connected[0].id, "openai");
+
+        let by_model = filter_presets("deepseek-reasoner", DirectoryFilter::All, |_| false);
+        assert!(by_model.iter().any(|p| p.id == "deepseek"));
+        assert!(provider_matches_preset(
+            "openai",
+            "openai",
+            preset_for("openai").unwrap()
+        ));
     }
 }

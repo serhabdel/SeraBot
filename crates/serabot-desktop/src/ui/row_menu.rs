@@ -1,6 +1,35 @@
 use super::*;
 use serabot_desktop::row_menu::{self, RowAction, RowKind};
 
+/// Move keyboard focus within the currently focused `[role="menu"]` across
+/// enabled `[role^="menuitem"]` children (`step`: 1, -1, or extreme Home/End).
+fn handle_menu_key(key: &Key) -> bool {
+    let script = match key {
+        Key::ArrowDown => Some(
+            "(() => { const m = document.activeElement && document.activeElement.closest('[role=\"menu\"]'); if (!m) return; const items = Array.from(m.querySelectorAll('[role^=\"menuitem\"]:not([disabled])')); if (!items.length) return; const i = items.indexOf(document.activeElement); items[(i + 1 + items.length) % items.length].focus(); })()",
+        ),
+        Key::ArrowUp => Some(
+            "(() => { const m = document.activeElement && document.activeElement.closest('[role=\"menu\"]'); if (!m) return; const items = Array.from(m.querySelectorAll('[role^=\"menuitem\"]:not([disabled])')); if (!items.length) return; const i = items.indexOf(document.activeElement); items[(i <= 0 ? items.length - 1 : i - 1)].focus(); })()",
+        ),
+        Key::Home => Some(
+            "(() => { const m = document.activeElement && document.activeElement.closest('[role=\"menu\"]'); const first = m && m.querySelector('[role^=\"menuitem\"]:not([disabled])'); if (first) first.focus(); })()",
+        ),
+        Key::End => Some(
+            "(() => { const m = document.activeElement && document.activeElement.closest('[role=\"menu\"]'); if (!m) return; const items = Array.from(m.querySelectorAll('[role^=\"menuitem\"]:not([disabled])')); if (items.length) items[items.length - 1].focus(); })()",
+        ),
+        _ => None,
+    };
+    if let Some(js) = script {
+        document::eval(js);
+        true
+    } else {
+        false
+    }
+}
+
+/// Keep a floating `.row-menu` inside the viewport if it overflows the bottom edge.
+const FLIP_OVERFLOW_MENU_JS: &str = "requestAnimationFrame(() => { for (const m of document.querySelectorAll('.row-menu[role=\"menu\"]')) { const r = m.getBoundingClientRect(); if (r.bottom > window.innerHeight - 8 && r.top > r.height + 16) { m.style.top = 'auto'; m.style.bottom = 'calc(100% - 4px)'; } } })";
+
 /// Fires after five seconds; the undo bar listens for it.
 const UNDO_TIMER_JS: &str = "setTimeout(() => dioxus.send(true), 5000);";
 
@@ -100,18 +129,28 @@ pub(crate) fn RowMenu(
         div {
             class: if header { "row-menu header" } else { "row-menu" },
             role: "menu",
+            tabindex: "-1",
             "aria-label": "Actions for {label}",
+            onmounted: move |_| {
+                document::eval(FLIP_OVERFLOW_MENU_JS);
+            },
             onkeydown: move |event: KeyboardEvent| {
-                if event.key() == Key::Escape {
+                let key = event.key();
+                if key == Key::Escape {
                     event.stop_propagation();
                     menu.set(None);
+                } else if handle_menu_key(&key) {
+                    event.prevent_default();
+                    event.stop_propagation();
                 }
             },
-            for action in items {
+            for (idx, action) in items.into_iter().enumerate() {
                 button {
                     key: "{action.label()}",
                     class: if action.is_danger() { "row-menu-item danger" } else { "row-menu-item" },
+                    r#type: "button",
                     role: "menuitem",
+                    autofocus: idx == 0,
                     onclick: {
                         let id = id.clone();
                         let pin_id = pin_id.clone();
@@ -258,17 +297,28 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
                 div {
                     class: "row-menu chat-switcher-menu",
                     role: "menu",
+                    tabindex: "-1",
                     "aria-label": "Chats with this bot",
+                    onmounted: move |_| {
+                        document::eval(FLIP_OVERFLOW_MENU_JS);
+                    },
                     onkeydown: move |event: KeyboardEvent| {
-                        if event.key() == Key::Escape {
+                        let key = event.key();
+                        if key == Key::Escape {
+                            event.stop_propagation();
                             open.set(false);
+                        } else if handle_menu_key(&key) {
+                            event.prevent_default();
+                            event.stop_propagation();
                         }
                     },
-                    for entry in entries {
+                    for (idx, entry) in entries.into_iter().enumerate() {
                         button {
                             key: "{entry.id}",
                             class: if entry.active { "row-menu-item active" } else { "row-menu-item" },
+                            r#type: "button",
                             role: "menuitemradio",
+                            autofocus: idx == 0,
                             "aria-checked": if entry.active { "true" } else { "false" },
                             onclick: {
                                 let id = entry.id.clone();
@@ -283,6 +333,7 @@ pub(crate) fn ChatSwitcher(session: Signal<Session>, bot: String, title: String)
                     }
                     button {
                         class: "row-menu-item new",
+                        r#type: "button",
                         role: "menuitem",
                         disabled: !enabled,
                         onclick: {

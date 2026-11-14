@@ -46,8 +46,8 @@ impl PreviewKind {
 /// Whether a file name is one the preview endpoint can render.
 pub fn preview_kind_for_name(name: &str) -> Option<PreviewKind> {
     let lower = name.trim().to_ascii_lowercase();
-    let ext = lower.rsplit('.').next()?;
-    if ext == lower {
+    let (stem, ext) = lower.rsplit_once('.')?;
+    if stem.is_empty() {
         return None;
     }
     match ext {
@@ -133,10 +133,12 @@ impl ArtifactPreview {
             if bytes.is_empty() || bytes.len() > MAX_IMAGE_B64 {
                 return None;
             }
-            let mime = if self.content_type.starts_with("image/") {
-                self.content_type.trim()
-            } else {
-                "image/png"
+            let mime = match self.content_type.trim().to_ascii_lowercase().as_str() {
+                "image/png" => "image/png",
+                "image/jpeg" | "image/jpg" => "image/jpeg",
+                "image/webp" => "image/webp",
+                "image/gif" => "image/gif",
+                _ => "image/png",
             };
             return Some(PreviewContent::Image(format!("data:{mime};base64,{b64}")));
         }
@@ -166,6 +168,7 @@ mod tests {
             Some(PreviewKind::Markdown)
         );
         assert_eq!(preview_kind_for_name("photo.png"), None);
+        assert_eq!(preview_kind_for_name(".pdf"), None);
         assert_eq!(preview_kind_for_name("noextension"), None);
         assert_eq!(preview_kind_for_name(""), None);
         for kind in [
@@ -213,6 +216,15 @@ mod tests {
         .unwrap();
         assert!(
             matches!(other.render(), Some(PreviewContent::Image(url)) if url.starts_with("data:image/png;base64,"))
+        );
+        // An untrusted or active image MIME (e.g. svg+xml) falls back to png.
+        let svg = ArtifactPreview::parse(&json!({
+            "content_type": "image/svg+xml",
+            "image_b64": "aGk="
+        }))
+        .unwrap();
+        assert!(
+            matches!(svg.render(), Some(PreviewContent::Image(url)) if url.starts_with("data:image/png;base64,"))
         );
     }
 

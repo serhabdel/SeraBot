@@ -16,6 +16,28 @@ use serabot_desktop::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
+fn entry_matches(entry: &VaultEntry, query: &str, kind: Option<VaultKind>) -> bool {
+    if let Some(k) = kind
+        && entry.kind != k
+    {
+        return false;
+    }
+    let needle = query.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    entry.name.to_ascii_lowercase().contains(&needle)
+        || entry
+            .username
+            .as_deref()
+            .is_some_and(|u| u.to_ascii_lowercase().contains(&needle))
+        || entry
+            .domains
+            .iter()
+            .any(|d| d.to_ascii_lowercase().contains(&needle))
+        || entry.kind.label().to_ascii_lowercase().contains(&needle)
+}
+
 fn kind_icon(kind: VaultKind) -> &'static str {
     match kind {
         VaultKind::Password => "lock",
@@ -31,6 +53,8 @@ fn kind_icon(kind: VaultKind) -> &'static str {
 #[component]
 pub fn VaultPage(session: Signal<Session>) -> Element {
     let mut session = session;
+    let mut local_query = use_signal(String::new);
+    let mut kind_filter = use_signal(|| Option::<VaultKind>::None);
 
     let (loaded, loading, error, notice, entries, pending, domain_filter, has_form) = {
         let s = session.read();
@@ -46,14 +70,23 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
             v.form.is_some(),
         )
     };
+    let filtered_entries: Vec<VaultEntry> = entries
+        .iter()
+        .filter(|entry| entry_matches(entry, &local_query.read(), kind_filter()))
+        .cloned()
+        .collect();
+    let any_filter_active = !domain_filter.trim().is_empty()
+        || !local_query.read().trim().is_empty()
+        || kind_filter().is_some();
 
     rsx! {
         div {
             class: "pane vault-page",
+            tabindex: "-1",
             onkeydown: move |event: KeyboardEvent| {
-                if event.key() == Key::Escape && session.read().panel.vault.form.is_some() {
+                if event.key() == Key::Escape && session.read().panel.vault.import.is_some() {
                     event.stop_propagation();
-                    session.write().panel.close_form();
+                    session.write().panel.close_import();
                 }
             },
             div { class: "pane-head",
@@ -63,9 +96,10 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
                         "Passwords and keys your bots can use. They never see the values."
                     }
                 }
-                if !has_form && loaded && !entries.is_empty() {
+                if !has_form && loaded {
                     button {
                         class: "btn primary",
+                        r#type: "button",
                         onclick: move |_| session.write().panel.open_add_form(),
                         Icon { name: "plus", size: 15 }
                         "Add"
@@ -89,14 +123,23 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
                         PasswordManagersPanel { session }
                         if loaded || !entries.is_empty() || !pending.is_empty() {
                             div { class: "vault-filter",
-                                label { class: "field-label", r#for: "vault-domain-filter", "Filter by site" }
+                                label { class: "field-label", r#for: "vault-domain-filter", "Search & filter" }
                                 div { class: "vault-filter-row",
                                     input {
+                                        class: "input",
+                                        r#type: "search",
+                                        value: "{local_query}",
+                                        placeholder: "Search name, user, or site\u{2026}",
+                                        "aria-label": "Search saved entries",
+                                        oninput: move |event| local_query.set(event.value()),
+                                    }
+                                    input {
                                         id: "vault-domain-filter",
-                                        class: "field",
-                                        r#type: "text",
+                                        class: "input",
+                                        r#type: "search",
                                         value: "{domain_filter}",
-                                        placeholder: "example.com",
+                                        placeholder: "Server site filter (example.com)",
+                                        "aria-label": "Filter on server by site",
                                         oninput: move |event| {
                                             session.write().panel.set_vault_domain_filter(event.value());
                                         },
@@ -109,9 +152,43 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
                                     }
                                     button {
                                         class: "btn sm",
+                                        r#type: "button",
                                         disabled: loading,
                                         onclick: move |_| session.write().panel.apply_vault_domain_filter(),
-                                        "Apply"
+                                        "Apply site"
+                                    }
+                                    if any_filter_active {
+                                        button {
+                                            class: "btn ghost sm",
+                                            r#type: "button",
+                                            disabled: loading,
+                                            onclick: move |_| {
+                                                local_query.set(String::new());
+                                                kind_filter.set(None);
+                                                if !session.read().panel.vault.domain_filter.trim().is_empty() {
+                                                    session.write().panel.set_vault_domain_filter(String::new());
+                                                    session.write().panel.apply_vault_domain_filter();
+                                                }
+                                            },
+                                            "Clear"
+                                        }
+                                    }
+                                }
+                                div { class: "seg", role: "group", "aria-label": "Filter by type",
+                                    button {
+                                        class: if kind_filter().is_none() { "seg-btn active" } else { "seg-btn" },
+                                        r#type: "button",
+                                        onclick: move |_| kind_filter.set(None),
+                                        "All ({entries.len()})"
+                                    }
+                                    for option in VaultKind::ALL {
+                                        button {
+                                            key: "{option.as_str()}",
+                                            class: if kind_filter() == Some(option) { "seg-btn active" } else { "seg-btn" },
+                                            r#type: "button",
+                                            onclick: move |_| kind_filter.set(Some(option)),
+                                            "{option.label()}"
+                                        }
                                     }
                                 }
                             }
@@ -131,31 +208,57 @@ pub fn VaultPage(session: Signal<Session>) -> Element {
                                 div { class: "skeleton row", " " }
                                 div { class: "skeleton row", " " }
                             }
-                        } else if loaded && entries.is_empty() {
-                            div { class: "vault-empty",
-                                div { class: "empty-icon", Icon { name: "key", size: 20 } }
-                                h2 { class: "empty-title", "Nothing saved yet" }
-                                p { class: "empty-text",
-                                    "Add a login or an API key. Your bots can use it to sign in for you, but never see the actual value."
+                        } else if loaded && filtered_entries.is_empty() {
+                            if any_filter_active {
+                                div { class: "vault-empty",
+                                    div { class: "empty-icon", Icon { name: "search", size: 20 } }
+                                    h2 { class: "empty-title", "No entries match your filter" }
+                                    p { class: "empty-text",
+                                        "Try clearing your search or site filter."
+                                    }
+                                    button {
+                                        class: "btn",
+                                        r#type: "button",
+                                        onclick: move |_| {
+                                            local_query.set(String::new());
+                                            kind_filter.set(None);
+                                            if !session.read().panel.vault.domain_filter.trim().is_empty() {
+                                                session.write().panel.set_vault_domain_filter(String::new());
+                                                session.write().panel.apply_vault_domain_filter();
+                                            }
+                                        },
+                                        "Reset filters"
+                                    }
                                 }
-                                button {
-                                    class: "btn primary",
-                                    onclick: move |_| session.write().panel.open_add_form(),
-                                    "Add"
+                            } else {
+                                div { class: "vault-empty",
+                                    div { class: "empty-icon", Icon { name: "key", size: 20 } }
+                                    h2 { class: "empty-title", "Nothing saved yet" }
+                                    p { class: "empty-text",
+                                        "Add a login or an API key. Your bots can use it to sign in for you, but never see the actual value."
+                                    }
+                                    button {
+                                        class: "btn primary",
+                                        r#type: "button",
+                                        onclick: move |_| session.write().panel.open_add_form(),
+                                        "Add"
+                                    }
                                 }
                             }
                         } else if !loaded {
                             // The first load failed: say so, offer a retry.
                             div { class: "vault-empty",
+                                p { class: "empty-text", "Could not load your vault entries." }
                                 button {
                                     class: "btn",
+                                    r#type: "button",
                                     onclick: move |_| session.write().panel.ask_vault_list(),
                                     "Try again"
                                 }
                             }
                         } else {
                             ul { class: "vault-list", role: "list",
-                                for entry in entries {
+                                for entry in filtered_entries {
                                     VaultRow { key: "{entry.name}", session, entry }
                                 }
                             }
@@ -275,6 +378,7 @@ fn VaultRow(session: Signal<Session>, entry: VaultEntry) -> Element {
 #[component]
 fn VaultFormView(session: Signal<Session>) -> Element {
     let mut session = session;
+    let mut confirm_discard = use_signal(|| false);
     let (
         replacing,
         name,
@@ -287,6 +391,7 @@ fn VaultFormView(session: Signal<Session>) -> Element {
         domain_error,
         saving,
         name_hint,
+        has_secret,
     ) = {
         let s = session.read();
         let Some(form) = s.panel.vault.form.as_ref() else {
@@ -304,6 +409,7 @@ fn VaultFormView(session: Signal<Session>) -> Element {
             form.domain_error.clone(),
             form.saving,
             form.name_hint(),
+            !form.value.is_empty(),
         )
     };
     let (source, reference) = {
@@ -313,6 +419,14 @@ fn VaultFormView(session: Signal<Session>) -> Element {
             None => (VaultSource::Local, String::new()),
         }
     };
+    let has_unsaved = has_secret
+        || !domain_draft.trim().is_empty()
+        || !reference.trim().is_empty()
+        || (!replacing
+            && (!name.trim().is_empty()
+                || !username.trim().is_empty()
+                || !domains.is_empty()
+                || !note.trim().is_empty()));
     let value_label = match kind {
         VaultKind::Password => "Password",
         VaultKind::ApiKey => "API key",
@@ -326,8 +440,22 @@ fn VaultFormView(session: Signal<Session>) -> Element {
     rsx! {
         form {
             class: "vault-form",
+            tabindex: "-1",
+            onkeydown: move |event: KeyboardEvent| {
+                if event.key() == Key::Escape {
+                    event.stop_propagation();
+                    if confirm_discard() {
+                        confirm_discard.set(false);
+                    } else if has_unsaved && !saving {
+                        confirm_discard.set(true);
+                    } else if !saving {
+                        session.write().panel.close_form();
+                    }
+                }
+            },
             onsubmit: move |event| {
                 event.prevent_default();
+                confirm_discard.set(false);
                 session.write().panel.save_vault_form();
             },
             h3 { class: "vault-form-title", "{title}" }
@@ -365,6 +493,9 @@ fn VaultFormView(session: Signal<Session>) -> Element {
                                 onclick: move |_| {
                                     if let Some(form) = session.write().panel.vault.form.as_mut() {
                                         form.source = option;
+                                        if option.is_reference() && form.kind == VaultKind::Note {
+                                            form.kind = VaultKind::Password;
+                                        }
                                     }
                                 },
                                 "{option.label()}"
@@ -381,6 +512,7 @@ fn VaultFormView(session: Signal<Session>) -> Element {
                                 r#type: "button",
                                 role: "radio",
                                 class: if option == kind { "seg-btn active" } else { "seg-btn" },
+                                disabled: source.is_reference() && option == VaultKind::Note,
                                 "aria-checked": if option == kind { "true" } else { "false" },
                                 onclick: move |_| {
                                     if let Some(form) = session.write().panel.vault.form.as_mut() {
@@ -390,6 +522,9 @@ fn VaultFormView(session: Signal<Session>) -> Element {
                                 "{option.label()}"
                             }
                         }
+                    }
+                    if source.is_reference() {
+                        span { class: "tiny vault-hint", "Notes can only be saved in this Vault, not as external references." }
                     }
                 }
                 if kind == VaultKind::Password {
@@ -535,12 +670,35 @@ fn VaultFormView(session: Signal<Session>) -> Element {
             if let Some(message) = error {
                 div { class: "error-text", role: "alert", "{message}" }
             }
+            if confirm_discard() {
+                div { class: "vault-confirm", role: "alertdialog", "aria-label": "Discard unsaved changes?",
+                    span { class: "caption", "Discard this unsaved entry?" }
+                    button {
+                        r#type: "button",
+                        class: "btn danger sm",
+                        onclick: move |_| session.write().panel.close_form(),
+                        "Discard"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "btn ghost sm",
+                        onclick: move |_| confirm_discard.set(false),
+                        "Keep editing"
+                    }
+                }
+            }
             div { class: "vault-form-foot",
                 button {
                     r#type: "button",
                     class: "btn ghost",
                     disabled: saving,
-                    onclick: move |_| session.write().panel.close_form(),
+                    onclick: move |_| {
+                        if has_unsaved {
+                            confirm_discard.set(true);
+                        } else {
+                            session.write().panel.close_form();
+                        }
+                    },
                     "Cancel"
                 }
                 button { r#type: "submit", class: "btn primary", disabled: saving,
@@ -758,6 +916,7 @@ fn ProbeResult(probe: PasswordManagerProbe, #[props(default)] prefix: String) ->
 fn ProviderRow(session: Signal<Session>, manager: PasswordManager) -> Element {
     let mut session = session;
     let mut token = use_signal(String::new);
+    let mut confirm_clear = use_signal(|| false);
     let id = manager.id.clone();
     let busy = session.read().panel.vault.provider_busy.as_deref() == Some(id.as_str());
     let testing = session.read().panel.vault.provider_testing.as_deref() == Some(id.as_str());
@@ -769,8 +928,10 @@ fn ProviderRow(session: Signal<Session>, manager: PasswordManager) -> Element {
         "No access token saved"
     };
     let cli_line = if !manager.enabled {
-        "Off on this server (experimental): the server admin sets protonpass_enabled in [vault]."
-            .to_owned()
+        format!(
+            "Off on this server: ask your admin to enable {} in [vault].",
+            manager.name
+        )
     } else if manager.cli_found {
         "CLI found on this server".to_owned()
     } else {
@@ -798,6 +959,7 @@ fn ProviderRow(session: Signal<Session>, manager: PasswordManager) -> Element {
                 }
                 button {
                     class: "btn primary sm",
+                    r#type: "button",
                     disabled: busy || testing || !filled,
                     onclick: move |_| {
                         // Move the token out of the signal: nothing is left behind.
@@ -808,12 +970,35 @@ fn ProviderRow(session: Signal<Session>, manager: PasswordManager) -> Element {
                     },
                     "Save token"
                 }
-                if manager.configured {
+                if manager.configured && !confirm_clear() {
                     button {
                         class: "btn ghost sm",
+                        r#type: "button",
                         disabled: busy || testing,
-                        onclick: move |_| session.write().panel.clear_password_manager(&clear_id),
+                        onclick: move |_| confirm_clear.set(true),
                         "Remove"
+                    }
+                }
+            }
+            if manager.configured && confirm_clear() {
+                div { class: "vault-confirm", role: "alertdialog", "aria-label": "Remove {manager.name} token?",
+                    span { class: "caption", "Remove the saved {manager.name} token?" }
+                    button {
+                        class: "btn danger sm",
+                        r#type: "button",
+                        disabled: busy || testing,
+                        onclick: move |_| {
+                            confirm_clear.set(false);
+                            session.write().panel.clear_password_manager(&clear_id);
+                        },
+                        "Remove"
+                    }
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        disabled: busy || testing,
+                        onclick: move |_| confirm_clear.set(false),
+                        "Keep"
                     }
                 }
             }
@@ -850,6 +1035,7 @@ fn ProviderRow(session: Signal<Session>, manager: PasswordManager) -> Element {
 #[component]
 fn ImportPickerView(session: Signal<Session>) -> Element {
     let mut session = session;
+    let mut query = use_signal(String::new);
     let (source, items, picked, saving, error) = {
         let s = session.read();
         match s.panel.vault.import.as_ref() {
@@ -864,6 +1050,13 @@ fn ImportPickerView(session: Signal<Session>) -> Element {
         }
     };
     let count = picked.iter().filter(|chosen| **chosen).count();
+    let filter_text = query.read().clone();
+    let matching_indices: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.matches_filter(&filter_text))
+        .map(|(i, _)| i)
+        .collect();
     let label = source.label();
     let action = if saving {
         "Importing\u{2026}".to_owned()
@@ -871,38 +1064,107 @@ fn ImportPickerView(session: Signal<Session>) -> Element {
         format!("Import {count}")
     };
     rsx! {
-        section { class: "vault-import", "aria-label": "Import from {label}",
+        section {
+            class: "vault-import",
+            tabindex: "-1",
+            "aria-label": "Import from {label}",
+            onkeydown: move |event: KeyboardEvent| {
+                if event.key() == Key::Escape && !saving {
+                    event.stop_propagation();
+                    session.write().panel.close_import();
+                }
+            },
             h3 { class: "vault-form-title", "Import from {label}" }
             p { class: "tiny vault-hint",
                 "Each login becomes a reference: the password stays in {label} and is read only when a bot types it."
             }
-            if items.is_empty() {
-                p { class: "caption", "No logins were listed." }
-            }
-            ul { class: "vault-list", role: "list",
-                for (index, item) in items.iter().enumerate() {
-                    li { key: "{item.reference}", class: "vault-row",
-                        label { class: "vault-import-pick",
-                            input {
-                                r#type: "checkbox",
-                                checked: picked.get(index).copied().unwrap_or(false),
-                                onchange: move |_| session.write().panel.toggle_import_item(index),
-                            }
-                            div { class: "vault-row-main",
-                                strong { class: "vault-name", "{item.title}" }
-                                span { class: "vault-meta caption",
-                                    {
-                                        [item.username.clone(), Some(item.vault.clone()).filter(|v| !v.is_empty())]
-                                            .into_iter()
-                                            .flatten()
-                                            .collect::<Vec<_>>()
-                                            .join(" \u{b7} ")
+            if !items.is_empty() {
+                div { class: "vault-filter-row",
+                    input {
+                        class: "input",
+                        r#type: "search",
+                        placeholder: "Filter logins by title, user, vault, or site\u{2026}",
+                        "aria-label": "Filter logins to import",
+                        value: "{query}",
+                        oninput: move |event| query.set(event.value()),
+                    }
+                    if !filter_text.trim().is_empty() {
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            onclick: move |_| query.set(String::new()),
+                            "Clear"
+                        }
+                    }
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        disabled: saving || matching_indices.is_empty(),
+                        onclick: {
+                            let idxs = matching_indices.clone();
+                            move |_| {
+                                if let Some(picker) = session.write().panel.vault.import.as_mut() {
+                                    for i in &idxs {
+                                        if let Some(flag) = picker.picked.get_mut(*i) {
+                                            *flag = true;
+                                        }
                                     }
                                 }
-                                if let Some(domain) = item.domain.clone() {
-                                    span { class: "chip mono", "{domain}" }
-                                } else {
-                                    span { class: "tiny vault-hint", "No site in this item. Add one after importing." }
+                            }
+                        },
+                        "Select all"
+                    }
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        disabled: saving || count == 0,
+                        onclick: {
+                            let idxs = matching_indices.clone();
+                            move |_| {
+                                if let Some(picker) = session.write().panel.vault.import.as_mut() {
+                                    for i in &idxs {
+                                        if let Some(flag) = picker.picked.get_mut(*i) {
+                                            *flag = false;
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "Select none"
+                    }
+                }
+            }
+            if items.is_empty() {
+                p { class: "caption", "No logins were listed." }
+            } else if matching_indices.is_empty() {
+                p { class: "caption", "No logins match \u{201c}{query}\u{201d}." }
+            }
+            ul { class: "vault-list", role: "list",
+                for index in matching_indices {
+                    if let Some(item) = items.get(index) {
+                        li { key: "{item.reference}", class: "vault-row",
+                            label { class: "vault-import-pick",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: picked.get(index).copied().unwrap_or(false),
+                                    onchange: move |_| session.write().panel.toggle_import_item(index),
+                                }
+                                div { class: "vault-row-main",
+                                    strong { class: "vault-name", "{item.title}" }
+                                    span { class: "vault-meta caption",
+                                        {
+                                            [item.username.clone(), Some(item.vault.clone()).filter(|v| !v.is_empty())]
+                                                .into_iter()
+                                                .flatten()
+                                                .collect::<Vec<_>>()
+                                                .join(" \u{b7} ")
+                                        }
+                                    }
+                                    if let Some(domain) = item.domain.clone() {
+                                        span { class: "chip mono", "{domain}" }
+                                    } else {
+                                        span { class: "tiny vault-hint", "No site in this item. Add one after importing." }
+                                    }
                                 }
                             }
                         }
@@ -929,5 +1191,32 @@ fn ImportPickerView(session: Signal<Session>) -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn entry_matches_checks_name_username_domain_and_kind() {
+        let entry = VaultEntry {
+            name: "stripe-key".into(),
+            kind: VaultKind::ApiKey,
+            source: VaultSource::Local,
+            reference: None,
+            username: Some("billing@acme.test".into()),
+            domains: vec!["api.stripe.com".into()],
+            note: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            last_used_at: None,
+        };
+        assert!(entry_matches(&entry, "", None));
+        assert!(entry_matches(&entry, "stripe", Some(VaultKind::ApiKey)));
+        assert!(entry_matches(&entry, "billing@", None));
+        assert!(entry_matches(&entry, "api.stripe", None));
+        assert!(!entry_matches(&entry, "stripe", Some(VaultKind::Password)));
+        assert!(!entry_matches(&entry, "github", None));
     }
 }

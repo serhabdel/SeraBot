@@ -20,6 +20,12 @@ use serde::{Deserialize, Serialize};
 use crate::local_fs::Budget;
 use crate::{ApiClient, ApiError};
 
+/// Returns true when a device-local folder notice describes a failure
+/// (validation refusal or persistence error) rather than a confirmation.
+pub fn notice_is_error(notice: &str) -> bool {
+    !notice.starts_with("Added.") && !notice.starts_with("Removed.")
+}
+
 /// Write ceiling per request, and read ceiling per call.
 pub const MAX_FILE_BYTES: u64 = 256 * 1024;
 /// Folders a user can allow.
@@ -859,5 +865,15 @@ mod tests {
     fn components_helper_flags_dot_and_traversal() {
         assert_eq!(components("./a/b").unwrap(), vec!["a", "b"]);
         assert!(components("a/./../b").is_err());
+    }
+
+    #[test]
+    fn notice_classification_distinguishes_success_from_errors() {
+        assert!(!notice_is_error("Added. The bot can read this folder."));
+        assert!(!notice_is_error(
+            "Removed. The bot can no longer see that folder."
+        ));
+        assert!(notice_is_error("Could not save the folder list: denied"));
+        assert!(notice_is_error("Only real folders can be allowed."));
     }
 }

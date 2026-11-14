@@ -31,12 +31,42 @@
   font-weight: 600;
 }
 
+.usage-chart-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
 .usage-chart {
   display: flex;
   align-items: flex-end;
   gap: 3px;
   height: 140px;
   padding-top: 8px;
+}
+
+.usage-chart-axis {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  color: var(--label-3);
+  font-size: var(--fs-caption);
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.usage-table-wrap {
+  width: 100%;
+  overflow-x: auto;
 }
 
 .usage-bar-col {
@@ -101,7 +131,7 @@
 
 .health-value {
   color: var(--label-1);
-  font-size: var(--fs-body-1, 1.05rem);
+  font-size: var(--fs-title);
   font-weight: 600;
   overflow-wrap: anywhere;
 }

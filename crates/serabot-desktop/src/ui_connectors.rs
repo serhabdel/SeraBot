@@ -10,15 +10,19 @@
 //! write-only through the admin connector route.
 
 use crate::ui::{BrandLogo, Icon};
+use crate::ui_files::{CONFIRM_RESET_JS, copy_script};
+use crate::ui_widgets::{SecretField, StatusChip};
 use dioxus::prelude::*;
 use serabot_desktop::ConnectorStatus;
 use serabot_desktop::connector_card::{
     CardState, DEFAULT_ADMIN_HINT, GOOGLE_CONSOLE_URL, GOOGLE_SETUP_STEPS, NOTION_SHARE_HINT,
-    connector_card_state, editable_roles, is_internal_role, legacy_connected, supports_sign_in,
-    token_help,
+    connector_card_state, editable_roles, is_internal_role, legacy_connected, legacy_tone,
+    supports_sign_in, token_help,
 };
 use serabot_desktop::integrations::{connector_blurb, connector_title};
 use serabot_desktop::session::Session;
+use serabot_desktop::theme::Tone;
+use std::collections::BTreeSet;
 
 /// Connectors whose saved credentials live in the server-wide store and can
 /// be removed from the card (0.26.0). Per-account sign-ins use Disconnect.
@@ -152,6 +156,31 @@ fn secret_label(role: &str) -> String {
     }
 }
 
+#[component]
+fn CopyUriRow(uri: String) -> Element {
+    let mut copied = use_signal(|| false);
+    let copy_text = uri.clone();
+    rsx! {
+        div { class: "copy-row",
+            code { class: "tiny", "{uri}" }
+            button {
+                class: "btn ghost sm",
+                r#type: "button",
+                onclick: move |_| {
+                    let _ = dioxus::document::eval(&copy_script(&copy_text));
+                    copied.set(true);
+                    spawn(async move {
+                        let mut done = dioxus::document::eval(CONFIRM_RESET_JS);
+                        let _ = done.recv::<bool>().await;
+                        copied.set(false);
+                    });
+                },
+                if copied() { "Copied" } else { "Copy" }
+            }
+        }
+    }
+}
+
 /// One connector. Per-user products draw their own account's state; the rest
 /// keep the server-wide card.
 #[component]
@@ -170,6 +199,7 @@ pub(crate) fn ConnectorCard(session: Signal<Session>, connector: ConnectorStatus
 fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element {
     let mut session = session;
     let mut token = use_signal(String::new);
+    let mut confirm_action = use_signal(|| None::<&'static str>);
     let is_admin = session.read().is_admin();
     let id = connector.id.clone();
     let title = connector_title(&id);
@@ -186,11 +216,16 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
     let state = connector_card_state(&connector, error.as_deref()).unwrap_or(CardState::NotSetUp {
         hint: DEFAULT_ADMIN_HINT.to_owned(),
     });
-    let pill_class = if state.is_connected() {
-        "status-pill connected"
-    } else {
-        "status-pill disconnected"
-    };
+    let connected_now = state.is_connected();
+    use_effect(move || {
+        if connected_now {
+            if !token.read().is_empty() {
+                token.set(String::new());
+            }
+        } else {
+            confirm_action.set(None);
+        }
+    });
     let redirect = connector
         .personal
         .as_ref()
@@ -199,6 +234,7 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
     let help = token_help(&id);
     let token_label = help.map_or("Token", |help| help.label);
     let token_hint = help.map_or("", |help| help.hint);
+    let testing = session.read().connector_testing.as_deref() == Some(id.as_str());
     rsx! {
         div { class: "card connector-card",
             div { class: "card-head",
@@ -211,7 +247,10 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
                         }
                     }
                 }
-                span { class: pill_class, "{state.pill()}" }
+                StatusChip {
+                    tone: state.tone(),
+                    text: state.pill().to_owned(),
+                }
             }
             {match state.clone() {
                 CardState::NotSetUp { hint } => rsx! {
@@ -220,14 +259,20 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
                 CardState::Connect { oauth, token: takes_token } => rsx! {
                     if takes_token {
                         div { class: "field",
-                            label { class: "field-label", "{token_label}" }
-                            input {
-                                class: "input",
-                                "type": "password",
-                                autocomplete: "off",
-                                value: "{token}",
-                                placeholder: "Paste it here",
-                                oninput: move |event| token.set(event.value()),
+                            span { class: "field-label", "{token_label}" }
+                            SecretField {
+                                value: token,
+                                label: token_label.to_owned(),
+                                placeholder: "Paste it here".to_owned(),
+                                disabled: busy,
+                                on_submit: {
+                                    let id = id.clone();
+                                    move |_| {
+                                        if !busy && !token().trim().is_empty() {
+                                            session.write().panel.connect_connector_token(&id, &token());
+                                        }
+                                    }
+                                },
                             }
                         }
                         if !token_hint.is_empty() {
@@ -235,20 +280,30 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
                         }
                     }
                     if waiting {
-                        p { class: "tiny", role: "status",
-                            "Finish signing in in your browser, then press Refresh."
+                        div { class: "banner info", role: "status",
+                            span { class: "spinner", title: "Waiting for browser sign-in" }
+                            span { class: "grow",
+                                "Finish signing in in your browser, then check status."
+                            }
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                disabled: busy,
+                                onclick: move |_| session.write().refresh_connectors(),
+                                "Check status"
+                            }
                         }
                     }
                     div { class: "card-actions",
                         if takes_token {
                             button {
                                 class: "btn primary",
+                                r#type: "button",
                                 disabled: busy || token().trim().is_empty(),
                                 onclick: {
                                     let id = id.clone();
                                     move |_| {
                                         session.write().panel.connect_connector_token(&id, &token());
-                                        token.set(String::new());
                                     }
                                 },
                                 if busy { "Connecting…" } else { "Connect" }
@@ -256,6 +311,7 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
                             if let Some(help) = help {
                                 button {
                                     class: "btn ghost",
+                                    r#type: "button",
                                     title: "Open the page where you create this token",
                                     onclick: move |_| session.write().open_in_browser(help.url.to_owned()),
                                     Icon { name: "external", size: 14 }
@@ -266,6 +322,7 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
                         if oauth {
                             button {
                                 class: if takes_token { "btn ghost" } else { "btn primary" },
+                                r#type: "button",
                                 disabled: busy,
                                 onclick: {
                                     let id = id.clone();
@@ -289,41 +346,69 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
                     if account.is_none() && is_notion {
                         p { class: "tiny", "{NOTION_SHARE_HINT}" }
                     }
-                    div { class: "card-actions",
-                        button {
-                            class: "btn ghost",
-                            disabled: busy,
-                            onclick: {
-                                let id = id.clone();
-                                move |_| session.write().panel.disconnect_connector(&id)
-                            },
-                            if busy { "Working…" } else { "Disconnect" }
-                        }
-                        {
-                            let testing = session.read().state.connector_tests.contains_key(&id);
-                            rsx! {
-                                button {
-                                    class: "btn ghost sm",
-                                    title: "Run a read-only check against the provider with the saved credentials",
-                                    disabled: busy || testing,
-                                    onclick: {
-                                        let id = id.clone();
-                                        move |_| session.write().test_connector(id.clone())
-                                    },
-                                    if testing { "Testing…" } else { "Test" }
+                    if let Some(action_kind) = confirm_action() {
+                        div { class: "mp-confirm", role: "alertdialog", "aria-label": "Confirm connector change",
+                            span { class: "tiny",
+                                if action_kind == "remove_key" {
+                                    "Delete the saved credentials from the server?"
+                                } else {
+                                    "Disconnect this account?"
                                 }
                             }
-                        }
-                        if is_admin && REMOVABLE_SECRET_CONNECTORS.contains(&id.as_str()) {
                             button {
-                                class: "btn ghost sm",
-                                title: "Delete the saved credentials from the server (the sign-in itself stays per account)",
+                                class: "btn danger sm",
+                                r#type: "button",
                                 disabled: busy,
                                 onclick: {
                                     let id = id.clone();
-                                    move |_| session.write().panel.remove_connector_secrets(&id)
+                                    move |_| {
+                                        confirm_action.set(None);
+                                        if action_kind == "remove_key" {
+                                            session.write().panel.remove_connector_secrets(&id);
+                                        } else {
+                                            session.write().panel.disconnect_connector(&id);
+                                        }
+                                    }
                                 },
-                                "Remove saved key"
+                                if action_kind == "remove_key" { "Confirm remove" } else { "Confirm disconnect" }
+                            }
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                disabled: busy,
+                                onclick: move |_| confirm_action.set(None),
+                                "Cancel"
+                            }
+                        }
+                    } else {
+                        div { class: "card-actions",
+                            button {
+                                class: "btn ghost",
+                                r#type: "button",
+                                disabled: busy,
+                                onclick: move |_| confirm_action.set(Some("disconnect")),
+                                if busy { "Working…" } else { "Disconnect" }
+                            }
+                            button {
+                                class: "btn ghost sm",
+                                r#type: "button",
+                                title: "Run a read-only check against the provider with the saved credentials",
+                                disabled: busy || testing,
+                                onclick: {
+                                    let id = id.clone();
+                                    move |_| session.write().test_connector(id.clone())
+                                },
+                                if testing { "Testing…" } else { "Test" }
+                            }
+                            if is_admin && REMOVABLE_SECRET_CONNECTORS.contains(&id.as_str()) {
+                                button {
+                                    class: "btn ghost sm",
+                                    r#type: "button",
+                                    title: "Delete the saved credentials from the server (the sign-in itself stays per account)",
+                                    disabled: busy,
+                                    onclick: move |_| confirm_action.set(Some("remove_key")),
+                                    "Remove saved key"
+                                }
                             }
                         }
                     }
@@ -332,18 +417,24 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
                     }
                 },
                 CardState::Error { message } => rsx! {
-                    p { class: "banner err", role: "alert", "{message}" }
+                    div { class: "banner err", role: "alert",
+                        span { class: "grow", "{message}" }
+                    }
                     div { class: "card-actions",
                         button {
                             class: "btn ghost",
+                            r#type: "button",
                             onclick: {
                                 let id = id.clone();
-                                move |_| {
-                                    session.write().panel.clear_connector_error(&id);
-                                    session.write().refresh_connectors();
-                                }
+                                move |_| session.write().panel.clear_connector_error(&id)
                             },
                             "Try again"
+                        }
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            onclick: move |_| session.write().refresh_connectors(),
+                            "Refresh"
                         }
                     }
                 },
@@ -354,7 +445,7 @@ fn PersonalCard(session: Signal<Session>, connector: ConnectorStatus) -> Element
                         summary { "Advanced" }
                         div { class: "advanced-body",
                             p { class: "tiny", "Redirect address registered with the provider:" }
-                            code { class: "tiny", "{uri}" }
+                            CopyUriRow { uri }
                         }
                     }
                 }
@@ -374,6 +465,7 @@ pub(crate) fn GoogleSetupCard(
     let mut session = session;
     let mut client_id = use_signal(String::new);
     let mut client_secret = use_signal(String::new);
+    let mut local_submitted = use_signal(|| false);
     let (busy, error, saved) = {
         let state = session.read();
         let flow = &state.panel.connectors;
@@ -383,11 +475,17 @@ pub(crate) fn GoogleSetupCard(
             flow.google_saved,
         )
     };
-    let pill_class = if configured {
-        "status-pill connected"
-    } else {
-        "status-pill disconnected"
-    };
+    let show_saved = saved && local_submitted();
+    use_effect(move || {
+        if show_saved {
+            if !client_id.read().is_empty() {
+                client_id.set(String::new());
+            }
+            if !client_secret.read().is_empty() {
+                client_secret.set(String::new());
+            }
+        }
+    });
     let can_save = !busy && !client_id().trim().is_empty() && !client_secret().trim().is_empty();
     rsx! {
         div { class: "card connector-card",
@@ -399,7 +497,10 @@ pub(crate) fn GoogleSetupCard(
                         span { class: "card-sub", "One Google app for everyone. Each person then connects their own account." }
                     }
                 }
-                span { class: pill_class, if configured { "Set up" } else { "Not set up yet" } }
+                StatusChip {
+                    tone: if configured { Tone::Ok } else { Tone::Muted },
+                    text: if configured { "Set up".to_owned() } else { "Not set up yet".to_owned() },
+                }
             }
             details { class: "advanced", open: !configured,
                 summary { if configured { "Replace the Google app" } else { "Steps" } }
@@ -411,11 +512,12 @@ pub(crate) fn GoogleSetupCard(
                     }
                     if let Some(uri) = redirect {
                         p { class: "tiny", "Redirect address to add:" }
-                        code { class: "tiny", "{uri}" }
+                        CopyUriRow { uri }
                     }
                     div { class: "card-actions",
                         button {
                             class: "btn ghost sm",
+                            r#type: "button",
                             onclick: move |_| session.write().open_in_browser(GOOGLE_CONSOLE_URL.to_owned()),
                             Icon { name: "external", size: 14 }
                             "Open Google Cloud Console"
@@ -423,42 +525,46 @@ pub(crate) fn GoogleSetupCard(
                     }
                     div { class: "form-grid",
                         div { class: "field",
-                            label { class: "field-label", "Client ID" }
-                            input {
-                                class: "input",
-                                "type": "password",
-                                autocomplete: "off",
-                                value: "{client_id}",
-                                placeholder: "Paste it here",
-                                oninput: move |event| client_id.set(event.value()),
+                            span { class: "field-label", "Client ID" }
+                            SecretField {
+                                value: client_id,
+                                label: "Client ID".to_owned(),
+                                placeholder: "Paste it here".to_owned(),
+                                disabled: busy,
+                                invalid: error.is_some(),
                             }
                         }
                         div { class: "field",
-                            label { class: "field-label", "Client secret" }
-                            input {
-                                class: "input",
-                                "type": "password",
-                                autocomplete: "off",
-                                value: "{client_secret}",
-                                placeholder: "Paste it here",
-                                oninput: move |event| client_secret.set(event.value()),
+                            span { class: "field-label", "Client secret" }
+                            SecretField {
+                                value: client_secret,
+                                label: "Client secret".to_owned(),
+                                placeholder: "Paste it here".to_owned(),
+                                disabled: busy,
+                                invalid: error.is_some(),
+                                on_submit: move |_| {
+                                    if !busy && !client_id().trim().is_empty() && !client_secret().trim().is_empty() {
+                                        local_submitted.set(true);
+                                        session.write().panel.save_google_setup(&client_id(), &client_secret());
+                                    }
+                                },
                             }
                         }
                     }
                     if let Some(message) = error {
-                        p { class: "banner err", role: "alert", "{message}" }
+                        div { class: "banner err", role: "alert", span { "{message}" } }
                     }
-                    if saved {
-                        p { class: "banner ok", role: "status", "Saved. People can connect Google now." }
+                    if show_saved {
+                        div { class: "banner ok", role: "status", span { "Saved. People can connect Google now." } }
                     }
                     div { class: "card-actions",
                         button {
                             class: "btn primary",
+                            r#type: "button",
                             disabled: !can_save,
                             onclick: move |_| {
+                                local_submitted.set(true);
                                 session.write().panel.save_google_setup(&client_id(), &client_secret());
-                                client_id.set(String::new());
-                                client_secret.set(String::new());
                             },
                             if busy { "Saving…" } else { "Save" }
                         }
@@ -474,6 +580,8 @@ pub(crate) fn GoogleSetupCard(
 #[component]
 fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> Element {
     let mut session = session;
+    let mut revealed_roles = use_signal(BTreeSet::<String>::new);
+    let mut confirm_action = use_signal(|| None::<&'static str>);
     let can_save = session.read().can_admin();
     let is_admin = session.read().is_admin();
     let id = connector.id.clone();
@@ -518,6 +626,7 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
             )
         );
     let has_values = values.values().any(|value| !value.trim().is_empty());
+    let dirty = enabled != connector.enabled || has_values;
     rsx! {
         div { class: "card connector-card",
             div { class: "card-head",
@@ -530,15 +639,15 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                         }
                     }
                 }
-                span {
-                    class: if connected && !needs_attention { "status-pill connected" } else { "status-pill disconnected" },
-                    if needs_attention {
-                        "Needs attention"
+                StatusChip {
+                    tone: legacy_tone(connected, needs_attention),
+                    text: if needs_attention {
+                        "Needs attention".to_owned()
                     } else if connected {
-                        "Connected"
+                        "Connected".to_owned()
                     } else {
-                        "Not connected"
-                    }
+                        "Not connected".to_owned()
+                    },
                 }
             }
             if signed_in_with_account {
@@ -551,20 +660,58 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                             let role = role.clone();
                             let label = secret_label(&role);
                             let value = values.get(&role).cloned().unwrap_or_default();
+                            let input_id = format!("connector-{id}-{role}");
+                            let is_revealed = !value.is_empty() && revealed_roles.read().contains(&role);
                             rsx! {
                                 div { class: "field", key: "{role}",
-                                    label { class: "field-label", "{label}" }
-                                    input {
-                                        class: "input",
-                                        "type": "password",
-                                        value: "{value}",
-                                        autocomplete: "off",
-                                        placeholder: if secret.configured { "Paste a new one to replace it" } else { "Paste it here" },
-                                        oninput: {
-                                            let id = id.clone();
-                                            let role = role.clone();
-                                            move |event| session.write().set_connector_value(&id, &role, event.value())
-                                        },
+                                    label { class: "field-label", r#for: "{input_id}", "{label}" }
+                                    div { class: "secret-field",
+                                        input {
+                                            id: "{input_id}",
+                                            class: "input",
+                                            r#type: if is_revealed { "text" } else { "password" },
+                                            value: "{value}",
+                                            autocomplete: "off",
+                                            spellcheck: false,
+                                            placeholder: if secret.configured { "Paste a new one to replace it" } else { "Paste it here" },
+                                            oninput: {
+                                                let id = id.clone();
+                                                let role = role.clone();
+                                                move |event| {
+                                                    let next = event.value();
+                                                    if next.is_empty() {
+                                                        revealed_roles.write().remove(&role);
+                                                    }
+                                                    session.write().set_connector_value(&id, &role, next);
+                                                }
+                                            },
+                                            onkeydown: {
+                                                let id = id.clone();
+                                                move |event: KeyboardEvent| {
+                                                    if event.key() == Key::Enter && can_save && has_values {
+                                                        event.prevent_default();
+                                                        session.write().add_connector_key(id.clone());
+                                                    }
+                                                }
+                                            },
+                                        }
+                                        button {
+                                            class: "btn icon ghost sm secret-toggle",
+                                            r#type: "button",
+                                            title: if is_revealed { "Hide value" } else { "Show value" },
+                                            "aria-label": if is_revealed { format!("Hide {label}") } else { format!("Show {label}") },
+                                            "aria-pressed": if is_revealed { "true" } else { "false" },
+                                            onclick: {
+                                                let role = role.clone();
+                                                move |_| {
+                                                    let mut set = revealed_roles.write();
+                                                    if !set.remove(&role) {
+                                                        set.insert(role.clone());
+                                                    }
+                                                }
+                                            },
+                                            Icon { name: if is_revealed { "eye-off".to_owned() } else { "eye".to_owned() }, size: 14 }
+                                        }
                                     }
                                 }
                             }
@@ -573,104 +720,155 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                 }
             }
             if od_waiting && id == "onedrive" && !connected {
-                p { class: "tiny", role: "status",
-                    "Finish signing in with Microsoft in your browser, then press Refresh."
+                div { class: "banner info", role: "status",
+                    span { class: "spinner", title: "Waiting for Microsoft sign-in" }
+                    span { class: "grow",
+                        "Finish signing in with Microsoft in your browser, then check status."
+                    }
+                    button {
+                        class: "btn ghost sm",
+                        r#type: "button",
+                        disabled: od_busy,
+                        onclick: move |_| session.write().refresh_connectors(),
+                        "Check status"
+                    }
                 }
             }
             if id == "onedrive" {
                 if let Some(message) = od_error {
-                    p { class: "banner err", role: "alert", "{message}" }
+                    div { class: "banner err", role: "alert", span { "{message}" } }
                 }
             }
             if needs_admin && !connected {
                 p { class: "tiny", "Your admin sets this one up." }
             }
             if let Some(result) = test_result {
-                p { class: if result.ok { "banner ok" } else { "banner err" }, "{result.message}" }
+                div { class: if result.ok { "banner ok" } else { "banner err" }, role: "status",
+                    span { "{result.message}" }
+                }
             }
             div { class: "card-actions",
-                {match action.clone() {
-                    Some(ConnectorAction::ConnectOneDrive) => rsx! {
-                        button {
-                            class: "btn primary",
-                            disabled: od_busy,
-                            onclick: move |_| session.write().panel.connect_onedrive(),
-                            if od_busy { "Opening…" } else { "Connect OneDrive" }
-                        }
-                    },
-                    Some(ConnectorAction::DisconnectOneDrive) => rsx! {
-                        button {
-                            class: "btn ghost",
-                            disabled: od_busy,
-                            onclick: move |_| session.write().panel.disconnect_onedrive(),
-                            "Disconnect"
-                        }
-                    },
-                    Some(ConnectorAction::SignIn) if is_admin => {
-                        let callback_uri = connector
-                            .oauth
-                            .as_ref()
-                            .and_then(|o| o.callback_uri.clone())
-                            .unwrap_or_default();
-                        let id = id.clone();
-                        rsx! {
-                            button {
-                                class: if connected { "btn ghost" } else { "btn primary" },
-                                title: "Sign in with your account in your browser",
-                                disabled: signing_in || !can_save,
-                                onclick: {
-                                    let id = id.clone();
-                                    move |_| session.write().sign_in_connector(id.clone(), callback_uri.clone())
-                                },
-                                if signing_in { "Signing in…" } else if signed_in_with_account { "Reconnect" } else { "Sign in with {title}" }
+                if let Some(kind) = confirm_action() {
+                    div { class: "mp-confirm", role: "alertdialog", "aria-label": "Confirm disconnect",
+                        span { class: "tiny",
+                            if kind == "sign_out" {
+                                "Sign out of your {title} account?"
+                            } else {
+                                "Disconnect OneDrive for this account?"
                             }
-                            if signed_in_with_account {
+                        }
+                        button {
+                            class: "btn danger sm",
+                            r#type: "button",
+                            disabled: od_busy || !can_save,
+                            onclick: {
+                                let id = id.clone();
+                                move |_| {
+                                    confirm_action.set(None);
+                                    if kind == "sign_out" {
+                                        session.write().sign_out_connector(id.clone());
+                                    } else {
+                                        session.write().panel.disconnect_onedrive();
+                                    }
+                                }
+                            },
+                            if kind == "sign_out" { "Confirm sign out" } else { "Confirm disconnect" }
+                        }
+                        button {
+                            class: "btn ghost sm",
+                            r#type: "button",
+                            onclick: move |_| confirm_action.set(None),
+                            "Cancel"
+                        }
+                    }
+                } else {
+                    {match action.clone() {
+                        Some(ConnectorAction::ConnectOneDrive) => rsx! {
+                            button {
+                                class: "btn primary",
+                                r#type: "button",
+                                disabled: od_busy,
+                                onclick: move |_| session.write().panel.connect_onedrive(),
+                                if od_busy { "Opening…" } else { "Connect OneDrive" }
+                            }
+                        },
+                        Some(ConnectorAction::DisconnectOneDrive) => rsx! {
+                            button {
+                                class: "btn ghost",
+                                r#type: "button",
+                                disabled: od_busy,
+                                onclick: move |_| confirm_action.set(Some("disconnect_od")),
+                                "Disconnect"
+                            }
+                        },
+                        Some(ConnectorAction::SignIn) if is_admin => {
+                            let callback_uri = connector
+                                .oauth
+                                .as_ref()
+                                .and_then(|o| o.callback_uri.clone())
+                                .unwrap_or_default();
+                            let id = id.clone();
+                            rsx! {
                                 button {
-                                    class: "btn ghost",
-                                    title: "Stop using this account sign-in",
-                                    disabled: !can_save,
+                                    class: if connected { "btn ghost" } else { "btn primary" },
+                                    r#type: "button",
+                                    title: "Sign in with your account in your browser",
+                                    disabled: signing_in || !can_save,
                                     onclick: {
                                         let id = id.clone();
-                                        move |_| session.write().sign_out_connector(id.clone())
+                                        move |_| session.write().sign_in_connector(id.clone(), callback_uri.clone())
                                     },
-                                    "Sign out"
+                                    if signing_in { "Signing in…" } else if signed_in_with_account { "Reconnect" } else { "Sign in with {title}" }
+                                }
+                                if signed_in_with_account {
+                                    button {
+                                        class: "btn ghost",
+                                        r#type: "button",
+                                        title: "Stop using this account sign-in",
+                                        disabled: !can_save,
+                                        onclick: move |_| confirm_action.set(Some("sign_out")),
+                                        "Sign out"
+                                    }
                                 }
                             }
-                        }
-                    },
-                    Some(ConnectorAction::Authorize(url)) if is_admin => rsx! {
-                        button {
-                            class: if connected { "btn ghost" } else { "btn primary" },
-                            title: "Open the sign-in page in your browser",
-                            onclick: move |_| session.write().open_in_browser(url.clone()),
-                            Icon { name: "external", size: 14 }
-                            if connected { "Reconnect" } else { "Connect" }
-                        }
-                    },
-                    Some(ConnectorAction::AddKey | ConnectorAction::ReplaceKey) if is_admin => {
-                        let id = id.clone();
-                        let key_page = connector_auth_url(&id, connector.redirect_uri.as_deref());
-                        rsx! {
+                        },
+                        Some(ConnectorAction::Authorize(url)) if is_admin => rsx! {
                             button {
                                 class: if connected { "btn ghost" } else { "btn primary" },
-                                disabled: !can_save || !has_values,
-                                title: if has_values { "Save the key" } else { "Paste the key first" },
-                                onclick: move |_| session.write().add_connector_key(id.clone()),
-                                if connected { "Replace key" } else { "Add key" }
+                                r#type: "button",
+                                title: "Open the sign-in page in your browser",
+                                onclick: move |_| session.write().open_in_browser(url.clone()),
+                                Icon { name: "external", size: 14 }
+                                if connected { "Reconnect" } else { "Connect" }
                             }
-                            if let Some(url) = key_page {
+                        },
+                        Some(ConnectorAction::AddKey | ConnectorAction::ReplaceKey) if is_admin => {
+                            let id = id.clone();
+                            let key_page = connector_auth_url(&id, connector.redirect_uri.as_deref());
+                            rsx! {
                                 button {
-                                    class: "btn ghost",
-                                    title: "Open the provider's site to get a key",
-                                    onclick: move |_| session.write().open_in_browser(url.clone()),
-                                    Icon { name: "external", size: 14 }
-                                    "Get a key"
+                                    class: if connected { "btn ghost" } else { "btn primary" },
+                                    r#type: "button",
+                                    disabled: !can_save || !has_values,
+                                    title: if has_values { "Save the key" } else { "Paste the key first" },
+                                    onclick: move |_| session.write().add_connector_key(id.clone()),
+                                    if connected { "Replace key" } else { "Add key" }
+                                }
+                                if let Some(url) = key_page {
+                                    button {
+                                        class: "btn ghost",
+                                        r#type: "button",
+                                        title: "Open the provider's site to get a key",
+                                        onclick: move |_| session.write().open_in_browser(url.clone()),
+                                        Icon { name: "external", size: 14 }
+                                        "Get a key"
+                                    }
                                 }
                             }
-                        }
-                    },
-                    _ => rsx! {},
-                }}
+                        },
+                        _ => rsx! {},
+                    }}
+                }
             }
             if is_admin {
                 details { class: "advanced",
@@ -680,6 +878,9 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                             span { class: "chip mono", "{connector.kind}" }
                             span { class: if enabled { "chip ok" } else { "chip muted" },
                                 if enabled { "enabled" } else { "disabled" }
+                            }
+                            if dirty {
+                                StatusChip { tone: Tone::Warn, text: "Unsaved changes".to_owned() }
                             }
                             if let Some(oauth) = connector.oauth.as_ref() {
                                 span { class: "chip mono accent", "client_id: {oauth.client_id}" }
@@ -695,7 +896,7 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                             }
                         }
                         if let Some(uri) = connector.redirect_uri.clone() {
-                            code { class: "tiny", "{uri}" }
+                            CopyUriRow { uri }
                         }
                         if id != "onedrive" {
                             p { class: "tiny",
@@ -709,6 +910,7 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                             div { class: "card-actions",
                                 button {
                                     class: if enabled { "btn ghost sm" } else { "btn primary sm" },
+                                    r#type: "button",
                                     onclick: {
                                         let id = id.clone();
                                         move |_| session.write().toggle_connector(&id)
@@ -717,6 +919,7 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                                 }
                                 button {
                                     class: "btn ghost sm",
+                                    r#type: "button",
                                     disabled: !can_save,
                                     onclick: {
                                         let id = id.clone();
@@ -724,8 +927,27 @@ fn LegacyConnectorCard(session: Signal<Session>, connector: ConnectorStatus) -> 
                                     },
                                     "Save settings"
                                 }
+                                if dirty {
+                                    button {
+                                        class: "btn ghost sm",
+                                        r#type: "button",
+                                        onclick: {
+                                            let id = id.clone();
+                                            let saved_enabled = connector.enabled;
+                                            move |_| {
+                                                let mut s = session.write();
+                                                if let Some(draft) = s.connector_drafts.get_mut(&id) {
+                                                    draft.enabled = saved_enabled;
+                                                    draft.values.clear();
+                                                }
+                                            }
+                                        },
+                                        "Discard"
+                                    }
+                                }
                                 button {
                                     class: "btn ghost sm",
+                                    r#type: "button",
                                     title: "Run a read-only check of the saved credentials",
                                     disabled: !can_save || testing,
                                     onclick: {

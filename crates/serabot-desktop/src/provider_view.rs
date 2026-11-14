@@ -3,7 +3,9 @@
 //! Pure functions, no I/O and no UI, so the wording and the grouping are
 //! tested on every platform.
 
-use crate::api::{CatalogEntry, ProviderStatus};
+use crate::api::{CatalogEntry, ProviderStatus, ProviderTest};
+use crate::theme::Tone;
+use std::collections::BTreeSet;
 
 /// How a provider card describes the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +41,137 @@ impl Connection {
 
     pub fn is_connected(self) -> bool {
         matches!(self, Self::Connected | Self::SignedIn)
+    }
+
+    /// Status tone (colour + icon pairing) for `StatusChip`.
+    pub fn tone(self) -> Tone {
+        match self {
+            Self::Connected | Self::SignedIn => Tone::Ok,
+            Self::NotConnected | Self::NotSignedIn => Tone::Warn,
+            Self::KeyRejected => Tone::Danger,
+        }
+    }
+}
+
+/// Human-friendly provider kind label.
+pub fn human_kind(kind: &str) -> &str {
+    match kind {
+        "openai" => "OpenAI",
+        "openai-compatible" => "OpenAI-compatible",
+        "anthropic" => "Anthropic",
+        "google" | "gemini" => "Google Gemini",
+        "google-antigravity" => "Google Cloud Code",
+        "mistral" => "Mistral AI",
+        "groq" => "Groq",
+        "deepseek" => "DeepSeek",
+        "openrouter" => "OpenRouter",
+        "ollama" => "Ollama (Local)",
+        "together" => "Together AI",
+        "fireworks" => "Fireworks AI",
+        "perplexity" => "Perplexity",
+        "xai" => "xAI",
+        "minimax" => "MiniMax",
+        other => other,
+    }
+}
+
+/// Render a `ProviderTest` result as a status tone and plain-word summary.
+pub fn format_provider_test(test: &ProviderTest) -> (Tone, String) {
+    if test.ok {
+        let summary = if test.model_count > 0 {
+            let noun = if test.model_count == 1 {
+                "model"
+            } else {
+                "models"
+            };
+            format!("Check passed \u{b7} {} live {noun} found", test.model_count)
+        } else {
+            "Check passed".to_owned()
+        };
+        (Tone::Ok, summary)
+    } else {
+        let message = match test.status.as_str() {
+            "key_rejected" => "Provider rejected the key.".to_owned(),
+            "unreachable" => "Provider did not answer.".to_owned(),
+            "" => "Check failed.".to_owned(),
+            other => format!("Check failed: {}", other.replace('_', " ")),
+        };
+        (Tone::Danger, message)
+    }
+}
+
+/// Inline validation result for the "Add provider" sheet.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProviderDraftCheck {
+    pub id_error: Option<&'static str>,
+    pub kind_error: Option<&'static str>,
+    pub base_url_error: Option<&'static str>,
+    pub models_error: Option<&'static str>,
+    pub secret_error: Option<&'static str>,
+    pub duplicate_id_warning: bool,
+}
+
+impl ProviderDraftCheck {
+    pub fn is_valid(&self) -> bool {
+        self.id_error.is_none()
+            && self.kind_error.is_none()
+            && self.base_url_error.is_none()
+            && self.models_error.is_none()
+            && self.secret_error.is_none()
+    }
+}
+
+/// Validate provider draft fields inline before calling `Session::save_provider`.
+pub fn validate_provider_draft(
+    id: &str,
+    kind: &str,
+    base_url: &str,
+    models_raw: &str,
+    secret_name: &str,
+    existing_ids: &[&str],
+) -> ProviderDraftCheck {
+    let id = id.trim();
+    let kind = kind.trim();
+    let base_url = base_url.trim();
+    let secret = secret_name.trim();
+    let models: Vec<&str> = models_raw
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let id_error = (!crate::valid_provider_id(id))
+        .then_some("Provider id must be 1\u{2013}64 letters, digits, '_' or '-'.");
+    let kind_error = (kind.is_empty() || kind.len() > 32).then_some("Choose a provider kind.");
+    let base_url_error = if base_url.is_empty() || base_url.len() > 2_048 {
+        Some("Enter the provider base URL.")
+    } else if !url::Url::parse(base_url)
+        .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
+    {
+        Some("Enter a valid http:// or https:// URL.")
+    } else {
+        None
+    };
+    let models_error = if models.is_empty() || models.len() > 256 {
+        Some("List at least one model id.")
+    } else if models.iter().any(|m| !crate::valid_model_id(m)) {
+        Some("Model ids cannot be empty or contain control characters.")
+    } else if models.iter().collect::<BTreeSet<_>>().len() != models.len() {
+        Some("Each model id can be listed once.")
+    } else {
+        None
+    };
+    let secret_error = (!crate::valid_secret_name(secret))
+        .then_some("Secret name must be 1\u{2013}128 letters, digits, '_' or '-'.");
+    let duplicate_id_warning = !id.is_empty() && existing_ids.contains(&id);
+
+    ProviderDraftCheck {
+        id_error,
+        kind_error,
+        base_url_error,
+        models_error,
+        secret_error,
+        duplicate_id_warning,
     }
 }
 
@@ -309,5 +442,53 @@ mod tests {
         let bare: CatalogEntry =
             serde_json::from_str(r#"{"provider":"default","model":"m"}"#).unwrap();
         assert!(bare.tags.is_empty() && bare.name.is_none());
+    }
+
+    #[test]
+    fn tones_test_formatting_and_draft_validation() {
+        assert_eq!(Connection::Connected.tone(), Tone::Ok);
+        assert_eq!(Connection::NotConnected.tone(), Tone::Warn);
+        assert_eq!(Connection::KeyRejected.tone(), Tone::Danger);
+        assert_eq!(human_kind("openai-compatible"), "OpenAI-compatible");
+
+        let ok = ProviderTest {
+            ok: true,
+            status: "ok".into(),
+            model_count: 12,
+        };
+        assert_eq!(
+            format_provider_test(&ok),
+            (
+                Tone::Ok,
+                "Check passed \u{b7} 12 live models found".to_owned()
+            )
+        );
+        let rejected = ProviderTest {
+            ok: false,
+            status: "key_rejected".into(),
+            model_count: 0,
+        };
+        assert_eq!(
+            format_provider_test(&rejected),
+            (Tone::Danger, "Provider rejected the key.".to_owned())
+        );
+
+        let valid = validate_provider_draft(
+            "work",
+            "openai",
+            "https://api.openai.com/v1",
+            "gpt-5, gpt-5-mini",
+            "WORK_API_KEY",
+            &["work"],
+        );
+        assert!(valid.is_valid());
+        assert!(valid.duplicate_id_warning);
+
+        let bad = validate_provider_draft("", "openai", "not-a-url", "m1, m1", "bad name", &[]);
+        assert!(!bad.is_valid());
+        assert!(bad.id_error.is_some());
+        assert!(bad.base_url_error.is_some());
+        assert!(bad.models_error.is_some());
+        assert!(bad.secret_error.is_some());
     }
 }
