@@ -512,7 +512,9 @@ pub fn detect_sensitive_draft(text: &str) -> Option<SensitiveDraftMatch> {
             }
 
             // OpenAI / Anthropic keys: sk-ant-..., sk-proj-..., sk-...
-            if rest.starts_with("sk-ant-") || rest.starts_with("sk-proj-") || rest.starts_with("sk-")
+            if rest.starts_with("sk-ant-")
+                || rest.starts_with("sk-proj-")
+                || rest.starts_with("sk-")
             {
                 let end = scan_while(bytes, i, is_key_char);
                 if end - i >= 20 {
@@ -930,18 +932,12 @@ mod tests {
                 "Use ops_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abc123",
                 SensitiveKind::OnePasswordToken,
             ),
-            (
-                "key: sk-1234567890abcdef123456",
-                SensitiveKind::ApiKey,
-            ),
+            ("key: sk-1234567890abcdef123456", SensitiveKind::ApiKey),
             (
                 "anthropic sk-ant-api03-abcdef1234567890xyz",
                 SensitiveKind::ApiKey,
             ),
-            (
-                "openai sk-proj-abcdef1234567890xyz",
-                SensitiveKind::ApiKey,
-            ),
+            ("openai sk-proj-abcdef1234567890xyz", SensitiveKind::ApiKey),
             (
                 "token ghp_1234567890abcdef1234567890abcdef",
                 SensitiveKind::GitHubToken,
@@ -962,10 +958,7 @@ mod tests {
                 "google AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGt",
                 SensitiveKind::GoogleApiKey,
             ),
-            (
-                "aws AKIAIOSFODNN7EXAMPLE",
-                SensitiveKind::AwsAccessKey,
-            ),
+            ("aws AKIAIOSFODNN7EXAMPLE", SensitiveKind::AwsAccessKey),
             (
                 "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----",
                 SensitiveKind::PrivateKeyPem,
